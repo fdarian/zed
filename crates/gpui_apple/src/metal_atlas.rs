@@ -58,8 +58,12 @@ impl MetalAtlas {
         }
     }
 
-    pub(crate) fn metal_texture(&self, id: AtlasTextureId) -> metal::Texture {
-        self.state.lock().texture(id).metal_texture.clone()
+    /// Returns the GPU texture backing `id`, or `None` once every tile in it
+    /// has been removed. A scene can still reference such a texture when a
+    /// cached view replays a paint from before the image was dropped, so
+    /// callers must skip those sprites rather than assume the texture exists.
+    pub(crate) fn metal_texture(&self, id: AtlasTextureId) -> Option<metal::Texture> {
+        Some(self.state.lock().texture(id)?.metal_texture.clone())
     }
 }
 
@@ -87,7 +91,9 @@ impl PlatformAtlas for MetalAtlas {
             let tile = lock
                 .allocate(size, key.texture_kind())
                 .context("failed to allocate")?;
-            let texture = lock.texture(tile.texture_id);
+            let texture = lock
+                .texture(tile.texture_id)
+                .context("allocated tile refers to a missing texture")?;
             texture.upload(tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile);
             Ok(Some(tile))
@@ -104,7 +110,9 @@ impl PlatformAtlas for MetalAtlas {
         let lock = self.state.lock();
         if let Some(tile) = lock.tiles_by_key.get(key).copied() {
             if tile.bounds.size == size {
-                lock.texture(tile.texture_id).upload(tile.bounds, bytes);
+                lock.texture(tile.texture_id)
+                    .context("tracked tile refers to a missing texture")?
+                    .upload(tile.bounds, bytes);
                 return Ok(Some(tile));
             }
         }
@@ -241,13 +249,13 @@ impl MetalAtlasState {
         .unwrap()
     }
 
-    fn texture(&self, id: AtlasTextureId) -> &MetalAtlasTexture {
+    fn texture(&self, id: AtlasTextureId) -> Option<&MetalAtlasTexture> {
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &self.monochrome_textures,
             AtlasTextureKind::Polychrome => &self.polychrome_textures,
             AtlasTextureKind::Subpixel => unreachable!(),
         };
-        textures[id.index as usize].as_ref().unwrap()
+        textures.textures.get(id.index as usize)?.as_ref()
     }
 }
 
@@ -427,7 +435,30 @@ mod tests {
         let tile_a2 = insert_tile(&atlas, &key_a, small);
 
         // The texture must actually exist — this would panic before the fix.
-        let _texture = atlas.metal_texture(tile_a2.texture_id);
+        assert!(atlas.metal_texture(tile_a2.texture_id).is_some());
+    }
+
+    #[test]
+    fn test_metal_texture_is_none_after_last_tile_removed() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+
+        let key = make_image_key(1, 0);
+        let tile = insert_tile(
+            &atlas,
+            &key,
+            Size {
+                width: DevicePixels(64),
+                height: DevicePixels(64),
+            },
+        );
+        assert!(atlas.metal_texture(tile.texture_id).is_some());
+
+        // A scene built before the removal may still carry `tile`; looking its
+        // texture up must report the gap instead of panicking.
+        atlas.remove(&key);
+        assert!(atlas.metal_texture(tile.texture_id).is_none());
     }
 
     #[test]
@@ -471,7 +502,9 @@ mod tests {
     }
 
     fn texture_extent(atlas: &MetalAtlas, tile: &AtlasTile) -> (u64, u64) {
-        let texture = atlas.metal_texture(tile.texture_id);
+        let texture = atlas
+            .metal_texture(tile.texture_id)
+            .expect("the tile's texture is live");
         (texture.width(), texture.height())
     }
 
