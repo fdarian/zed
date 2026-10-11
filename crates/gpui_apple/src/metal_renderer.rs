@@ -477,6 +477,7 @@ impl MetalRenderer {
             }
         };
 
+        log_presented_time(&drawable);
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -1625,5 +1626,41 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+/// Debug only: when `GPUIX_PRESENT_LOG` names a file, appends the
+/// `MTLDrawable.presentedTime` (seconds, CACurrentMediaTime clock) of every
+/// frame that reaches the screen, one per line. Off unless the variable is set.
+fn log_presented_time(drawable: &metal::MetalDrawableRef) {
+    use std::io::Write as _;
+    use std::sync::OnceLock;
+
+    static LOG: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    let Some(log) = LOG
+        .get_or_init(|| {
+            let path = std::env::var_os("GPUIX_PRESENT_LOG")?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(std::sync::Mutex::new(file))
+        })
+        .as_ref()
+    else {
+        return;
+    };
+    let handler = ConcreteBlock::new(move |presented: *mut objc::runtime::Object| {
+        let presented_time: f64 = unsafe { msg_send![presented, presentedTime] };
+        if presented_time > 0.0 {
+            if let Ok(mut file) = log.lock() {
+                writeln!(file, "{presented_time:.6}").ok();
+            }
+        }
+    });
+    let handler = handler.copy();
+    unsafe {
+        let _: () = msg_send![drawable, addPresentedHandler: &*handler];
     }
 }
