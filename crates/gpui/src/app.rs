@@ -660,6 +660,11 @@ impl GpuiMode {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn is_test(&self) -> bool {
+        matches!(self, GpuiMode::Test { .. })
+    }
+
     #[inline]
     pub(crate) fn skip_drawing(&self) -> bool {
         match self {
@@ -1708,18 +1713,24 @@ impl App {
                     }
                 }
             } else {
+                // Test contexts never run a display link, so they draw here.
+                // An app on a real platform (GpuiMode::Production) is drawn by
+                // the platform's frame callback; drawing inline as well would
+                // cost a full draw on every input event and every update.
                 #[cfg(any(test, feature = "test-support", feature = "bench"))]
-                for window in self
-                    .windows
-                    .values()
-                    .filter_map(|window| {
-                        let window = window.as_deref()?;
-                        window.invalidator.is_dirty().then_some(window.handle)
-                    })
-                    .collect::<Vec<_>>()
-                {
-                    self.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
-                        .unwrap();
+                if self.mode.is_test() {
+                    for window in self
+                        .windows
+                        .values()
+                        .filter_map(|window| {
+                            let window = window.as_deref()?;
+                            window.invalidator.is_dirty().then_some(window.handle)
+                        })
+                        .collect::<Vec<_>>()
+                    {
+                        self.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                            .unwrap();
+                    }
                 }
 
                 if self.pending_effects.is_empty() {
