@@ -1588,6 +1588,16 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Runs when this element has prepainted its children, with its bounds, so an overlay can
+    /// insert hitboxes that sit above them (see [`Self::paint_overlay`]). Only [`Div`] runs it.
+    fn prepaint_overlay(
+        mut self,
+        prepainter: impl FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().overlay_prepainter = Some(Box::new(prepainter));
+        self
+    }
+
     /// Paint something over this element's children, inside its content mask. `painter`
     /// gets the element's bounds, which a scroll offset does not move, and takes no part
     /// in layout, so unlike a child it cannot extend what the element scrolls. Only
@@ -2035,6 +2045,7 @@ impl Element for Div {
             scroll_handle.scroll_to_active_item();
         }
 
+        let overlay_prepainter = self.interactivity.overlay_prepainter.take();
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2066,6 +2077,9 @@ impl Element for Div {
 
                     if let Some(listener) = self.prepaint_listener.as_ref() {
                         listener(children_bounds, window, cx);
+                    }
+                    if let Some(prepainter) = overlay_prepainter {
+                        prepainter(bounds, window, cx);
                     }
                 });
 
@@ -2171,6 +2185,8 @@ pub struct Interactivity {
     pub(crate) overscroll_behavior: Point<OverscrollBehavior>,
     pub(crate) programmatic_scroll_only: Point<bool>,
     pub(crate) overlay_painter:
+        Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static>>,
+    pub(crate) overlay_prepainter:
         Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static>>,
     pub(crate) key_context: Option<KeyContext>,
     pub(crate) focusable: bool,
