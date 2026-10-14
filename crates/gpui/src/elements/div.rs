@@ -1581,6 +1581,18 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Paint something over this element's children, inside its content mask. `painter`
+    /// gets the element's bounds, which a scroll offset does not move, and takes no part
+    /// in layout, so unlike a child it cannot extend what the element scrolls. Only
+    /// [`Div`] paints it.
+    fn paint_overlay(
+        mut self,
+        painter: impl FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().overlay_painter = Some(Box::new(painter));
+        self
+    }
+
     /// Track the scroll state of this element with the given handle.
     fn anchor_scroll(mut self, scroll_anchor: Option<ScrollAnchor>) -> Self {
         self.interactivity().scroll_anchor = scroll_anchor;
@@ -1972,11 +1984,13 @@ impl Element for Div {
             0
         });
 
-        let mut child_min = point(Pixels::MAX, Pixels::MAX);
-        let mut child_max = Point::default();
+        // The far corner of the children, which is where this div's scrollable overflow
+        // ends. Nothing that starts before the origin counts, as in CSS.
+        let mut child_max = bounds.origin;
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
         }
+        let mut child_min = point(Pixels::MAX, Pixels::MAX);
         let content_size = if request_layout.child_layout_ids.is_empty() {
             bounds.size
         } else if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
@@ -2001,6 +2015,7 @@ impl Element for Div {
             }
             (child_max - child_min).into()
         };
+        self.interactivity.content_end = Some(child_max - bounds.origin);
 
         if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
             scroll_handle.scroll_to_active_item();
@@ -2061,6 +2076,7 @@ impl Element for Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
+        let overlay_painter = self.interactivity.overlay_painter.take();
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
@@ -2077,6 +2093,9 @@ impl Element for Div {
 
                     for child in &mut self.children {
                         child.paint(window, cx);
+                    }
+                    if let Some(painter) = overlay_painter {
+                        painter(bounds, window, cx);
                     }
                 },
             )
@@ -2132,6 +2151,11 @@ pub struct Interactivity {
     pub hovered: Option<bool>,
     pub(crate) tooltip_id: Option<TooltipId>,
     pub(crate) content_size: Size<Pixels>,
+    /// Where the children end, measured from the border box origin. A `Div` sets it so
+    /// that its scroll range follows CSS scrollable overflow, `content_size` otherwise.
+    pub(crate) content_end: Option<Point<Pixels>>,
+    pub(crate) overlay_painter:
+        Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static>>,
     pub(crate) key_context: Option<KeyContext>,
     pub(crate) focusable: bool,
     pub(crate) tracked_focus_handle: Option<FocusHandle>,
@@ -2455,15 +2479,28 @@ impl Interactivity {
 
             let rem_size = window.rem_size();
             let padding = style.padding.to_pixels(bounds.size.into(), rem_size);
-            let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
+            let border = style.border_widths.to_pixels(rem_size);
+            // The far edge of the scrollable overflow, measured from the origin: the
+            // children's, plus the padding and border after them, which CSS adds to the
+            // overflow so the last child can scroll clear of the edge.
+            let far_edge = match self.content_end {
+                Some(content_end) => point(
+                    content_end.x + padding.right + border.right,
+                    content_end.y + padding.bottom + border.bottom,
+                ),
+                None => {
+                    let padding_size =
+                        size(padding.left + padding.right, padding.top + padding.bottom);
+                    (self.content_size + padding_size).into()
+                }
+            };
             // The floating point values produced by Taffy and ours often vary
             // slightly after ~5 decimal places. This can lead to cases where after
             // subtracting these, the container becomes scrollable for less than
             // 0.00000x pixels. As we generally don't benefit from a precision that
             // high for the maximum scroll, we round the scroll max to 2 decimal
             // places here.
-            let padded_content_size = self.content_size + padding_size;
-            let scroll_max = Point::from(padded_content_size - bounds.size)
+            let scroll_max = (far_edge - Point::from(bounds.size))
                 .map(round_to_two_decimals)
                 .max(&Default::default());
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
@@ -2480,6 +2517,13 @@ impl Interactivity {
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
+                scroll_handle_state.padding_box = Bounds::new(
+                    point(bounds.origin.x + border.left, bounds.origin.y + border.top),
+                    size(
+                        bounds.size.width - border.left - border.right,
+                        bounds.size.height - border.top - border.bottom,
+                    ),
+                );
             }
 
             *scroll_offset
@@ -4159,6 +4203,7 @@ struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
+    padding_box: Bounds<Pixels>,
     max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,
     scroll_to_bottom: bool,
@@ -4243,6 +4288,12 @@ impl ScrollHandle {
             Ok(ix) => ix,
             Err(ix) => ix.min(state.child_bounds.len().saturating_sub(1)),
         }
+    }
+
+    /// The scrollport as of the last layout: the border box without its borders, which is
+    /// what CSS calls the client area. Scrollbars are overlays and take nothing from it.
+    pub fn padding_box(&self) -> Bounds<Pixels> {
+        self.0.borrow().padding_box
     }
 
     /// Return the bounds into which this child is painted
