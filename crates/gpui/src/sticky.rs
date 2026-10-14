@@ -119,6 +119,12 @@ pub(crate) fn within<R>(
     result
 }
 
+/// The size percentage insets resolve against: the scrollport of the nearest scroll container,
+/// or the window's `viewport` if none scrolls around the element.
+pub(crate) fn port_size(viewport: Size<Pixels>) -> Size<Pixels> {
+    SCROLLPORT.get().map_or(viewport, |port| port.size)
+}
+
 /// How far a sticky element at `natural` (where layout and scrolling put it) is moved. The
 /// window's `viewport` is the scrollport when no container scrolls around it.
 pub(crate) fn offset(

@@ -8,6 +8,8 @@ use crate::{
 };
 use collections::{FxHashMap, FxHashSet};
 use std::{fmt::Debug, ops::Range};
+
+mod containing_block;
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -35,6 +37,13 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+    /// Nodes with [`crate::Position::Static`]. They lay out as taffy `Relative` but are not
+    /// containing blocks, which taffy has no way to say.
+    static_nodes: FxHashSet<LayoutId>,
+    /// Nodes whose containing block may not be their taffy parent, with the style they were
+    /// requested with. Taffy always resolves an absolute node against its parent, so
+    /// `compute_layout` rewrites these styles to where the real containing block is.
+    escapable_absolutes: Vec<containing_block::EscapableAbsolute>,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -49,6 +58,8 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            static_nodes: FxHashSet::default(),
+            escapable_absolutes: Vec::new(),
         }
     }
 
@@ -57,6 +68,8 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+        self.static_nodes.clear();
+        self.escapable_absolutes.clear();
     }
 
     pub fn request_layout(
@@ -67,8 +80,10 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let escapable = containing_block::EscapableKind::of(style.position)
+            .map(|kind| (kind, taffy_style.clone()));
 
-        if children.is_empty() {
+        let id: LayoutId = if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
                 .expect(EXPECT_MESSAGE)
@@ -79,7 +94,9 @@ impl TaffyLayoutEngine {
                 .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE)
                 .into()
-        }
+        };
+        self.track_position(id, style.position, escapable);
+        id
     }
 
     pub fn request_measured_layout(
@@ -96,14 +113,19 @@ impl TaffyLayoutEngine {
         + 'static,
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
+        let escapable = containing_block::EscapableKind::of(style.position)
+            .map(|kind| (kind, taffy_style.clone()));
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
 
-        self.taffy
+        let id: LayoutId = self
+            .taffy
             .new_leaf_with_context(taffy_style, NodeContext { measure })
             .expect(EXPECT_MESSAGE)
-            .into()
+            .into();
+        self.track_position(id, style.position, escapable);
+        id
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -232,6 +254,18 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        self.run_taffy(id, available_space, scale_factor, window, cx);
+        self.settle_containing_blocks(id, available_space, scale_factor, window, cx);
+    }
+
+    fn run_taffy(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
@@ -485,8 +519,12 @@ impl ToTaffy<taffy::style::Style> for Style {
             overflow: self.overflow.into(),
             scrollbar_width: self.scrollbar_width.to_taffy(rem_size, scale_factor),
             position: self.position.into(),
-            // A sticky element is moved when it is prepainted, not by layout.
-            inset: if self.position == crate::Position::Sticky {
+            // A sticky element is moved when it is prepainted, not by layout, and a static one
+            // ignores its insets.
+            inset: if matches!(
+                self.position,
+                crate::Position::Static | crate::Position::Sticky
+            ) {
                 Edges::auto().to_taffy(rem_size, scale_factor)
             } else {
                 self.inset.to_taffy(rem_size, scale_factor)

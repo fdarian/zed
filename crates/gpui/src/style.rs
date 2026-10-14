@@ -1279,13 +1279,18 @@ pub enum Overflow {
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
 // Copy of taffy::style type of the same name, to derive JsonSchema.
 pub enum Position {
+    /// Laid out like [`Position::Relative`] but ignores `inset`, and is not a containing block
+    /// for [`Position::AbsoluteInAncestor`] and [`Position::Fixed`] descendants.
+    Static,
     /// The offset is computed relative to the final position given by the layout algorithm.
     /// Offsets do not affect the position of any other items; they are effectively a correction factor applied at the end.
     #[default]
     Relative,
-    /// The offset is computed relative to this item's closest positioned ancestor, if any.
-    /// Otherwise, it is placed relative to the origin.
+    /// The offset is computed relative to this item's parent.
     /// No space is created for the item in the page layout, and its size will not be altered.
+    ///
+    /// Unlike CSS this does not look past a [`Position::Static`] parent for a positioned ancestor,
+    /// which is what GPUI's own elements want: every `div` is [`Position::Relative`] by default.
     ///
     /// WARNING: to opt-out of layouting entirely, you must use [`Display::None`] instead on your [`Style`] object.
     Absolute,
@@ -1293,6 +1298,13 @@ pub enum Position {
     /// moved to stay inside the scrollport of its nearest scroll container, inset by `top`,
     /// `right`, `bottom` and `left`, and never out of its parent's content box.
     Sticky,
+    /// CSS `position: absolute`. The offset, percentage sizes and margins resolve against the
+    /// padding box of the closest ancestor that is not [`Position::Static`], or the root of the
+    /// layout tree if there is none. Auto insets keep the static position.
+    AbsoluteInAncestor,
+    /// CSS `position: fixed`. Resolves against the root of the layout tree, which is the window
+    /// for the main element tree.
+    Fixed,
 }
 
 impl From<AlignItems> for taffy::style::AlignItems {
@@ -1371,8 +1383,8 @@ impl From<Overflow> for taffy::style::Overflow {
 impl From<Position> for taffy::style::Position {
     fn from(value: Position) -> Self {
         match value {
-            Position::Relative | Position::Sticky => Self::Relative,
-            Position::Absolute => Self::Absolute,
+            Position::Static | Position::Relative | Position::Sticky => Self::Relative,
+            Position::Absolute | Position::AbsoluteInAncestor | Position::Fixed => Self::Absolute,
         }
     }
 }

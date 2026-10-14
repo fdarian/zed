@@ -1992,7 +1992,11 @@ impl Element for Div {
         if style.position != Some(Position::Sticky) {
             return Point::default();
         }
-        let insets = StickyInsets::resolve(&style.inset, window.viewport_size(), window);
+        let insets = StickyInsets::resolve(
+            &style.inset,
+            sticky::port_size(window.viewport_size()),
+            window,
+        );
         if !insets.any() {
             return Point::default();
         }
