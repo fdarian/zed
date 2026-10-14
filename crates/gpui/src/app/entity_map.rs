@@ -148,6 +148,12 @@ impl EntityMap {
         }
     }
 
+    /// Whether the entity is on the stack, leased by an update that has not
+    /// returned.
+    pub fn is_leased(&self, id: EntityId) -> bool {
+        !self.entities.contains_key(id)
+    }
+
     /// Returns an entity after moving it to the stack.
     pub fn end_lease<T>(&mut self, mut lease: Lease<T>) {
         self.entities.insert(lease.id, lease.entity.take().unwrap());
@@ -463,6 +469,13 @@ impl<T: 'static> Entity<T> {
     #[inline]
     pub fn read<'a>(&self, cx: &'a App) -> &'a T {
         cx.entities.read(self)
+    }
+
+    /// Whether an update of this entity is on the stack. Updating it now would
+    /// panic.
+    #[inline]
+    pub fn is_updating(&self, cx: &App) -> bool {
+        cx.entities.is_leased(self.entity_id)
     }
 
     /// Read the entity referenced by this handle with the given function.
