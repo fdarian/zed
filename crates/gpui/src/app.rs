@@ -3036,6 +3036,9 @@ pub struct KeystrokeEvent {
 
     /// The context stack at the time
     pub context_stack: Vec<KeyContext>,
+
+    /// Whether the key is auto-repeating because it is held down
+    pub is_held: bool,
 }
 
 struct NullHttpClient;
