@@ -1564,6 +1564,10 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
+                    PrimitiveBatch::EffectGroups(_) => {
+                        // Never produced: this renderer has no offscreen groups, so the scene
+                        // draws them flat.
+                    }
                     PrimitiveBatch::Surfaces(range) => {
                         self.draw_surfaces(&scene.surfaces[range], &mut pass)
                     }

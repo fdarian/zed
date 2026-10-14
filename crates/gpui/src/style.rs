@@ -5,7 +5,8 @@ use std::{
 };
 
 use crate::{
-    AbsoluteLength, App, Background, BackgroundBoxes, BackgroundLayer, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
+    AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundLayer, BackgroundTag,
+    BorderStyle, ClipPath, FilterFunction, GroupEffect, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
@@ -285,6 +286,18 @@ pub struct Style {
     /// Gradient layers painted above the background color, like CSS `background-image`. The first
     /// layer is on top.
     pub background_layers: Vec<BackgroundLayer>,
+
+    /// CSS `filter`, applied in order to the element and everything in it.
+    pub filter: Vec<FilterFunction>,
+
+    /// CSS `backdrop-filter`, applied in order to what is behind the element.
+    pub backdrop_filter: Vec<FilterFunction>,
+
+    /// CSS `mask-image` layers, first on top. The element is multiplied by their alpha.
+    pub mask_layers: Vec<BackgroundLayer>,
+
+    /// CSS `clip-path`.
+    pub clip_path: Option<ClipPath>,
 
     /// The border color of each side of this element. A transparent side draws nothing.
     #[refineable]
@@ -770,10 +783,143 @@ impl Style {
         }
     }
 
+    /// Paints the element like [`Style::paint`], as one offscreen group when it has an effect
+    /// that applies to the element as a whole: group opacity, `filter`, `backdrop-filter`,
+    /// `mask-image` or `clip-path`.
+    pub fn paint_with_effects(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
+        match self.group_effect(bounds, window) {
+            Some(effect) => window.with_effect_group(effect, None, |window| {
+                self.paint(bounds, window, cx, continuation)
+            }),
+            None => window.with_element_opacity(self.opacity, |window| {
+                self.paint(bounds, window, cx, continuation)
+            }),
+        }
+    }
+
+    /// The offscreen group effect the style asks for, if any.
+    fn group_effect(&self, bounds: Bounds<Pixels>, window: &Window) -> Option<GroupEffect> {
+        let opacity = self.opacity.unwrap_or(1.).clamp(0., 1.);
+        if opacity >= 1.
+            && self.filter.is_empty()
+            && self.backdrop_filter.is_empty()
+            && self.mask_layers.is_empty()
+            && self.clip_path.is_none()
+        {
+            return None;
+        }
+
+        let scale_factor = window.scale_factor();
+        let rem_size = window.rem_size();
+        let corner_radii = self.border_box_radii(bounds, rem_size);
+        let boxes = self.background_boxes(bounds, corner_radii, rem_size);
+        let resolve = |filters: &[FilterFunction]| {
+            filters
+                .iter()
+                .map(|filter| filter.resolve(scale_factor))
+                .collect::<Vec<_>>()
+        };
+
+        let mask = (!self.mask_layers.is_empty()).then(|| {
+            let mut quads = Vec::new();
+            for layer in self.mask_layers.iter().rev() {
+                let Some(resolved) = layer.resolve(&boxes) else {
+                    continue;
+                };
+                for chunk in resolved.chunks {
+                    quads.push(
+                        window.device_quad(
+                            quad(
+                                resolved.bounds,
+                                resolved.corner_radii,
+                                chunk,
+                                Edges::default(),
+                                Hsla::default(),
+                                self.border_style,
+                            )
+                            .background_tile(resolved.tile),
+                            1.,
+                        ),
+                    );
+                }
+            }
+            quads
+        });
+
+        Some(GroupEffect {
+            opacity,
+            filters: resolve(&self.filter),
+            backdrop_filters: resolve(&self.backdrop_filter),
+            mask,
+            clip_path: self
+                .clip_path
+                .as_ref()
+                .map(|clip_path| clip_path.resolve(boxes.region(clip_path.reference), scale_factor)),
+            reference: bounds.scale(scale_factor),
+            reference_radii: corner_radii.scale(scale_factor),
+            text_mask: false,
+        })
+    }
+
+    fn border_box_radii(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> Corners<Pixels> {
+        self.corner_radii
+            .to_pixels(rem_size)
+            .clamp_radii_for_quad_size(bounds.size)
+    }
+
+    fn background_boxes(
+        &self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        rem_size: Pixels,
+    ) -> BackgroundBoxes {
+        BackgroundBoxes::new(
+            bounds,
+            corner_radii,
+            self.border_widths.to_pixels(rem_size),
+            // Percentage padding is relative to the containing block, which isn't known here;
+            // the element's own size is the closest stand-in.
+            self.padding.to_pixels(
+                size(
+                    AbsoluteLength::Pixels(bounds.size.width),
+                    AbsoluteLength::Pixels(bounds.size.height),
+                ),
+                rem_size,
+            ),
+        )
+    }
+
     /// Paints the background of an element styled with this style.
     pub fn paint(
         &self,
         bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
+        let text_clip = self
+            .background_layers
+            .iter()
+            .any(|layer| layer.clip == BackgroundBox::Text);
+        if text_clip {
+            window.with_text_clip(|window| {
+                self.paint_box(bounds, true, window, cx, continuation)
+            });
+        } else {
+            self.paint_box(bounds, false, window, cx, continuation);
+        }
+    }
+
+    fn paint_box(
+        &self,
+        bounds: Bounds<Pixels>,
+        text_clip: bool,
         window: &mut Window,
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
@@ -789,41 +935,36 @@ impl Style {
         }
 
         let rem_size = window.rem_size();
-        let corner_radii = self
-            .corner_radii
-            .to_pixels(rem_size)
-            .clamp_radii_for_quad_size(bounds.size);
+        let corner_radii = self.border_box_radii(bounds, rem_size);
 
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
-        let background_color = self.background.as_ref().and_then(Fill::color);
-        if background_color.is_some_and(|color| !color.is_transparent()) {
-            let mut border_color = match background_color {
-                Some(color) => match color.tag {
-                    BackgroundTag::Solid
-                    | BackgroundTag::PatternSlash
-                    | BackgroundTag::Checkerboard => color.solid,
-
-                    BackgroundTag::LinearGradient | BackgroundTag::Gradient => color
-                        .colors
-                        .first()
-                        .map(|stop| stop.color)
-                        .unwrap_or_default(),
-                },
-                None => Hsla::default(),
-            };
-            border_color.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background_color.unwrap_or_default(),
-                Edges::default(),
-                border_color,
-                self.border_style,
-            ));
+        // The colour is clipped by the last layer's `background-clip`, as in CSS.
+        let colour_in_text = text_clip
+            && self
+                .background_layers
+                .last()
+                .is_some_and(|layer| layer.clip == BackgroundBox::Text);
+        if !colour_in_text {
+            self.paint_background_color(bounds, corner_radii, window);
         }
-
-        self.paint_background_layers(bounds, corner_radii, window, rem_size);
+        let boxes = self.background_boxes(bounds, corner_radii, rem_size);
+        self.paint_background_layers(&boxes, false, window);
+        if text_clip {
+            let effect = GroupEffect {
+                text_mask: true,
+                reference: bounds.scale(window.scale_factor()),
+                reference_radii: corner_radii.scale(window.scale_factor()),
+                ..GroupEffect::default()
+            };
+            // Pinned to the border box so the fill stays below the text painted after it.
+            window.with_effect_group(effect, Some(bounds), |window| {
+                if colour_in_text {
+                    self.paint_background_color(bounds, corner_radii, window);
+                }
+                self.paint_background_layers(&boxes, true, window);
+            });
+        }
 
         window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
 
@@ -881,32 +1022,47 @@ impl Style {
         }
     }
 
-    fn paint_background_layers(
+    fn paint_background_color(
         &self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         window: &mut Window,
-        rem_size: Pixels,
     ) {
-        if self.background_layers.is_empty() {
-            return;
+        let background_color = self.background.as_ref().and_then(Fill::color);
+        if background_color.is_some_and(|color| !color.is_transparent()) {
+            let mut border_color = match background_color {
+                Some(color) => match color.tag {
+                    BackgroundTag::Solid
+                    | BackgroundTag::PatternSlash
+                    | BackgroundTag::Checkerboard => color.solid,
+
+                    BackgroundTag::LinearGradient | BackgroundTag::Gradient => color
+                        .colors
+                        .first()
+                        .map(|stop| stop.color)
+                        .unwrap_or_default(),
+                },
+                None => Hsla::default(),
+            };
+            border_color.a = 0.;
+            window.paint_quad(quad(
+                bounds,
+                corner_radii,
+                background_color.unwrap_or_default(),
+                Edges::default(),
+                border_color,
+                self.border_style,
+            ));
         }
-        let boxes = BackgroundBoxes::new(
-            bounds,
-            corner_radii,
-            self.border_widths.to_pixels(rem_size),
-            // Percentage padding is relative to the containing block, which isn't known here;
-            // the element's own size is the closest stand-in.
-            self.padding.to_pixels(
-                size(
-                    AbsoluteLength::Pixels(bounds.size.width),
-                    AbsoluteLength::Pixels(bounds.size.height),
-                ),
-                rem_size,
-            ),
-        );
+    }
+
+    /// Paints the layers clipped to the glyphs when `text` is set, and the others otherwise.
+    fn paint_background_layers(&self, boxes: &BackgroundBoxes, text: bool, window: &mut Window) {
         for layer in self.background_layers.iter().rev() {
-            let Some(resolved) = layer.resolve(&boxes) else {
+            if (layer.clip == BackgroundBox::Text) != text {
+                continue;
+            }
+            let Some(resolved) = layer.resolve(boxes) else {
                 continue;
             };
             for chunk in resolved.chunks {
@@ -984,6 +1140,10 @@ impl Default for Style {
             flex_basis: Length::Auto,
             background: None,
             background_layers: Vec::new(),
+            filter: Vec::new(),
+            backdrop_filter: Vec::new(),
+            mask_layers: Vec::new(),
+            clip_path: None,
             border_colors: Edges::default(),
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),

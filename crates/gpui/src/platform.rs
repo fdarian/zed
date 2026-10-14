@@ -890,6 +890,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
+    /// Whether the renderer composites offscreen effect groups, which opacity groups, filters,
+    /// masks and clip paths need. Without it, a group is drawn flat into the scene with only its
+    /// opacity applied.
+    fn supports_effect_groups(&self) -> bool {
+        false
+    }
+
     // macOS specific methods
     fn get_title(&self) -> String {
         String::new()
@@ -1053,6 +1060,11 @@ pub trait PlatformHeadlessRenderer {
 
     /// Returns the sprite atlas used by this renderer.
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+
+    /// Whether this renderer composites offscreen effect groups.
+    fn supports_effect_groups(&self) -> bool {
+        false
+    }
 }
 
 /// Type alias for runnables with metadata.

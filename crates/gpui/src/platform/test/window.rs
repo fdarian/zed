@@ -328,6 +328,14 @@ impl PlatformWindow for TestWindow {
         false
     }
 
+    fn supports_effect_groups(&self) -> bool {
+        self.0
+            .lock()
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.supports_effect_groups())
+    }
+
     fn set_title(&mut self, title: &str) {
         self.0.lock().title = Some(title.to_owned());
     }

@@ -1788,6 +1788,10 @@ impl PlatformWindow for MacWindow {
         false
     }
 
+    fn supports_effect_groups(&self) -> bool {
+        true
+    }
+
     fn set_edited(&mut self, edited: bool) {
         unsafe {
             let window = self.0.lock().native_window;

@@ -2693,8 +2693,8 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
 
-                window.with_element_opacity(style.opacity, |window| {
-                    style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                {
+                    style.paint_with_effects(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(
                                 style.overflow_mask(bounds, window.rem_size()),
@@ -2783,7 +2783,7 @@ impl Interactivity {
                             );
                         });
                     });
-                });
+                }
 
                 ((), element_state)
             },

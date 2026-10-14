@@ -5,8 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, BackgroundTile, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, BackgroundTile, Bounds, ContentMask, Corners, Edges,
+    GroupEffect, Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    visual_bounds,
 };
 use std::{
     fmt::Debug,
@@ -50,6 +51,47 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Offscreen effect groups, each a scene of its own composited into this one.
+    pub groups: Vec<EffectGroup>,
+    effect_groups_enabled: bool,
+    /// A scene nested in a group has no paint operations of its own: the root records them all.
+    is_sub_scene: bool,
+    group_stack: Vec<GroupBuilder>,
+    /// Without effect groups, the opacities of the groups being drawn flat into the scene.
+    flat_opacities: Vec<f32>,
+    text_clips: Vec<TextClip>,
+    next_group_id: u64,
+}
+
+/// A group under construction: its content goes to its own scene until the group ends.
+struct GroupBuilder {
+    id: u64,
+    effect: GroupEffect,
+    content_mask: ContentMask<ScaledPixels>,
+    reserved_order: Option<DrawOrder>,
+    scene: Scene,
+}
+
+/// Glyphs painted while a text clip is open are also kept here, for `background-clip: text`.
+struct TextClip {
+    scene: Scene,
+    group_id: Option<u64>,
+}
+
+/// A group of primitives drawn on their own and composited into the scene they are in, which is
+/// how opacity, filters, masks and clip paths apply to the group as a whole.
+#[expect(missing_docs)]
+pub struct EffectGroup {
+    pub id: u64,
+    pub order: DrawOrder,
+    /// Where the group paints in the enclosing scene: its content plus what the filters add,
+    /// in whole device pixels. The group's own scene has its origin here.
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub effect: GroupEffect,
+    pub scene: Scene,
+    /// The glyphs the group is multiplied by, for `background-clip: text`.
+    pub text_mask: Option<Scene>,
 }
 
 #[expect(missing_docs)]
@@ -66,26 +108,89 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.groups.clear();
+        self.group_stack.clear();
+        self.flat_opacities.clear();
+        self.text_clips.clear();
     }
 
     pub fn len(&self) -> usize {
         self.paint_operations.len()
     }
 
+    /// Whether the renderer composites offscreen groups. Without it, a group is drawn straight
+    /// into the scene with only its opacity applied, one primitive at a time.
+    pub fn set_effect_groups_enabled(&mut self, enabled: bool) {
+        self.effect_groups_enabled = enabled;
+    }
+
+    pub fn effect_groups_enabled(&self) -> bool {
+        self.effect_groups_enabled
+    }
+
+    fn sub_scene() -> Scene {
+        Scene {
+            is_sub_scene: true,
+            ..Scene::default()
+        }
+    }
+
+    fn record(&mut self, operation: PaintOperation) {
+        if !self.is_sub_scene {
+            self.paint_operations.push(operation);
+        }
+    }
+
+    /// The scene primitives currently go to: the innermost open group's, or this one.
+    fn current_mut(&mut self) -> &mut Scene {
+        if self.group_stack.is_empty() {
+            self
+        } else {
+            let group = self.group_stack.last_mut();
+            &mut group.expect("the stack is not empty").scene
+        }
+    }
+
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
-        self.paint_operations
-            .push(PaintOperation::StartLayer(bounds));
+        self.record(PaintOperation::StartLayer(bounds));
+        let current = self.current_mut();
+        let order = current.primitive_bounds.insert(bounds);
+        current.layer_stack.push(order);
     }
 
     pub fn pop_layer(&mut self) {
-        self.layer_stack.pop();
-        self.paint_operations.push(PaintOperation::EndLayer);
+        self.record(PaintOperation::EndLayer);
+        self.current_mut().layer_stack.pop();
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        let primitive = primitive.into();
+        if primitive
+            .bounds()
+            .intersect(&primitive.content_mask().bounds)
+            .is_empty()
+        {
+            return;
+        }
+        self.record(PaintOperation::Primitive(primitive.clone()));
+
+        let mut primitive = primitive;
+        if !self.effect_groups_enabled {
+            let opacity: f32 = self.flat_opacities.iter().product();
+            if opacity < 1. {
+                primitive.apply_opacity(opacity);
+            }
+        }
+        if let Some(glyph) = primitive.as_glyph_mask() {
+            for clip in &mut self.text_clips {
+                clip.scene.insert_primitive_local(glyph.clone());
+            }
+        }
+        self.current_mut().insert_primitive_local(primitive);
+    }
+
+    /// Stores the primitive in this scene with an order, without recording or routing it.
+    fn insert_primitive_local(&mut self, mut primitive: Primitive) {
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -134,8 +239,298 @@ impl Scene {
                 self.surfaces.push(surface.clone());
             }
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+    }
+
+    /// How many primitives and groups this scene holds.
+    fn item_count(&self) -> usize {
+        self.shadows.len()
+            + self.quads.len()
+            + self.paths.len()
+            + self.underlines.len()
+            + self.monochrome_sprites.len()
+            + self.subpixel_sprites.len()
+            + self.polychrome_sprites.len()
+            + self.surfaces.len()
+            + self.groups.len()
+    }
+
+    /// The area this scene paints, each primitive clipped to its content mask.
+    fn content_bounds(&self) -> Option<Bounds<ScaledPixels>> {
+        let mut union: Option<Bounds<ScaledPixels>> = None;
+        let mut add = |bounds: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+            let clipped = bounds.intersect(&mask.bounds);
+            if !clipped.is_empty() {
+                union = Some(union.map_or(clipped, |union| union.union(&clipped)));
+            }
+        };
+        for shadow in &self.shadows {
+            add(shadow.bounds, &shadow.content_mask);
+        }
+        for quad in &self.quads {
+            add(quad.bounds, &quad.content_mask);
+        }
+        for path in &self.paths {
+            add(path.bounds, &path.content_mask);
+        }
+        for underline in &self.underlines {
+            add(underline.bounds, &underline.content_mask);
+        }
+        for sprite in &self.monochrome_sprites {
+            add(sprite.bounds, &sprite.content_mask);
+        }
+        for sprite in &self.subpixel_sprites {
+            add(sprite.bounds, &sprite.content_mask);
+        }
+        for sprite in &self.polychrome_sprites {
+            add(sprite.bounds, &sprite.content_mask);
+        }
+        for surface in &self.surfaces {
+            add(surface.bounds, &surface.content_mask);
+        }
+        for group in &self.groups {
+            add(group.bounds, &group.content_mask);
+        }
+        union
+    }
+
+    /// The only primitive of a scene that holds exactly one and no groups.
+    fn take_only_primitive(&mut self) -> Option<Primitive> {
+        if self.item_count() != 1 || !self.groups.is_empty() {
+            return None;
+        }
+        if let Some(shadow) = self.shadows.pop() {
+            return Some(Primitive::Shadow(shadow));
+        }
+        if let Some(quad) = self.quads.pop() {
+            return Some(Primitive::Quad(quad));
+        }
+        if let Some(path) = self.paths.pop() {
+            return Some(Primitive::Path(path));
+        }
+        if let Some(underline) = self.underlines.pop() {
+            return Some(Primitive::Underline(underline));
+        }
+        if let Some(sprite) = self.monochrome_sprites.pop() {
+            return Some(Primitive::MonochromeSprite(sprite));
+        }
+        if let Some(sprite) = self.subpixel_sprites.pop() {
+            return Some(Primitive::SubpixelSprite(sprite));
+        }
+        if let Some(sprite) = self.polychrome_sprites.pop() {
+            return Some(Primitive::PolychromeSprite(sprite));
+        }
+        self.surfaces.pop().map(Primitive::Surface)
+    }
+
+    /// Moves everything in the scene, so a group's content can be drawn into a texture that
+    /// starts at the group's origin.
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        for shadow in &mut self.shadows {
+            shadow.translate(delta);
+        }
+        for quad in &mut self.quads {
+            quad.translate(delta);
+        }
+        for path in &mut self.paths {
+            path.translate(delta);
+        }
+        for underline in &mut self.underlines {
+            underline.translate(delta);
+        }
+        for sprite in &mut self.monochrome_sprites {
+            sprite.translate(delta);
+        }
+        for sprite in &mut self.subpixel_sprites {
+            sprite.translate(delta);
+        }
+        for sprite in &mut self.polychrome_sprites {
+            sprite.translate(delta);
+        }
+        for surface in &mut self.surfaces {
+            surface.translate(delta);
+        }
+        for group in &mut self.groups {
+            group.bounds.origin = group.bounds.origin + delta;
+            translate_mask(&mut group.content_mask, delta);
+        }
+    }
+
+    /// Opens a group. Until [`Scene::end_group`], primitives go to a scene of their own that is
+    /// composited with `effect` into this one. `reserved` fixes where the group sits in the
+    /// stacking order up front rather than by what it ends up covering, for a group that must
+    /// stay below what is painted after it.
+    pub fn start_group(
+        &mut self,
+        effect: GroupEffect,
+        content_mask: ContentMask<ScaledPixels>,
+        reserved: Option<Bounds<ScaledPixels>>,
+    ) {
+        self.record(PaintOperation::StartGroup {
+            effect: effect.clone(),
+            content_mask,
+            reserved,
+        });
+        if !self.effect_groups_enabled {
+            self.flat_opacities.push(effect.opacity);
+            return;
+        }
+        let reserved_order = reserved.map(|bounds| {
+            let current = self.current_mut();
+            current
+                .layer_stack
+                .last()
+                .copied()
+                .unwrap_or_else(|| current.primitive_bounds.insert(bounds))
+        });
+        let id = self.next_group_id;
+        self.next_group_id += 1;
+        self.group_stack.push(GroupBuilder {
+            id,
+            effect,
+            content_mask,
+            reserved_order,
+            scene: Scene::sub_scene(),
+        });
+    }
+
+    pub fn end_group(&mut self) {
+        self.record(PaintOperation::EndGroup);
+        if !self.effect_groups_enabled {
+            self.flat_opacities.pop();
+            return;
+        }
+        let Some(builder) = self.group_stack.pop() else {
+            return;
+        };
+        let GroupBuilder {
+            id,
+            mut effect,
+            content_mask,
+            reserved_order,
+            mut scene,
+        } = builder;
+
+        let has_backdrop = !effect.backdrop_filters.is_empty();
+        if scene.item_count() == 0 && !has_backdrop {
+            return;
+        }
+        if effect.is_opacity_only() && reserved_order.is_none() {
+            if let Some(mut only) = scene.take_only_primitive() {
+                only.apply_opacity(effect.opacity);
+                self.current_mut().insert_primitive_local(only);
+                return;
+            }
+        }
+
+        let mut visual = scene
+            .content_bounds()
+            .map(|content| visual_bounds(content, &effect.filters));
+        if has_backdrop || effect.text_mask {
+            let reference = visual_bounds(effect.reference, &[]);
+            visual = Some(visual.map_or(reference, |visual| visual.union(&reference)));
+        }
+        let Some(visual) = visual else {
+            return;
+        };
+
+        let delta = Point::new(ScaledPixels(-visual.origin.x.0), ScaledPixels(-visual.origin.y.0));
+        scene.translate(delta);
+        scene.finish();
+        effect.translate(delta);
+        if let Some(quads) = &mut effect.mask {
+            let local = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), visual.size);
+            for quad in quads {
+                quad.content_mask = ContentMask {
+                    bounds: local,
+                    corner_radii: Corners::default(),
+                };
+            }
+        }
+
+        if effect.text_mask {
+            if let Some(clip) = self
+                .text_clips
+                .iter_mut()
+                .rev()
+                .find(|clip| clip.group_id.is_none())
+            {
+                clip.group_id = Some(id);
+            }
+        }
+
+        self.current_mut().insert_group_local(
+            EffectGroup {
+                id,
+                order: 0,
+                bounds: visual,
+                content_mask,
+                effect,
+                scene,
+                text_mask: None,
+            },
+            reserved_order,
+        );
+    }
+
+    fn insert_group_local(&mut self, mut group: EffectGroup, reserved_order: Option<DrawOrder>) {
+        let clipped = group.bounds.intersect(&group.content_mask.bounds);
+        if clipped.is_empty() {
+            return;
+        }
+        group.order = reserved_order.unwrap_or_else(|| {
+            self.layer_stack
+                .last()
+                .copied()
+                .unwrap_or_else(|| self.primitive_bounds.insert(clipped))
+        });
+        self.groups.push(group);
+    }
+
+    /// Starts keeping a copy of every glyph painted from now until [`Scene::end_text_clip`]. The
+    /// next group opened with a text mask is multiplied by the glyphs' alpha.
+    pub fn start_text_clip(&mut self) {
+        self.record(PaintOperation::StartTextClip);
+        if self.effect_groups_enabled {
+            self.text_clips.push(TextClip {
+                scene: Scene::sub_scene(),
+                group_id: None,
+            });
+        }
+    }
+
+    pub fn end_text_clip(&mut self) {
+        self.record(PaintOperation::EndTextClip);
+        if !self.effect_groups_enabled {
+            return;
+        }
+        let Some(clip) = self.text_clips.pop() else {
+            return;
+        };
+        let Some(group_id) = clip.group_id else {
+            return;
+        };
+        let mut glyphs = clip.scene;
+        let current = self.current_mut();
+        if let Some(group) = current.groups.iter_mut().rev().find(|group| group.id == group_id) {
+            glyphs.translate(Point::new(
+                ScaledPixels(-group.bounds.origin.x.0),
+                ScaledPixels(-group.bounds.origin.y.0),
+            ));
+            glyphs.finish();
+            group.text_mask = Some(glyphs);
+        }
+    }
+
+    /// The quads of this scene and of the groups inside it, in this scene's coordinates.
+    pub fn quads_with_groups(&self) -> Vec<Quad> {
+        let mut quads = self.quads.clone();
+        for group in &self.groups {
+            for mut quad in group.scene.quads_with_groups() {
+                quad.translate(group.bounds.origin);
+                quads.push(quad);
+            }
+        }
+        quads
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -144,6 +539,14 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartGroup {
+                    effect,
+                    content_mask,
+                    reserved,
+                } => self.start_group(effect.clone(), *content_mask, *reserved),
+                PaintOperation::EndGroup => self.end_group(),
+                PaintOperation::StartTextClip => self.start_text_clip(),
+                PaintOperation::EndTextClip => self.end_text_clip(),
             }
         }
     }
@@ -160,6 +563,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.groups.sort_by_key(|group| group.order);
     }
 
     #[cfg_attr(
@@ -187,6 +591,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            groups_start: 0,
+            groups_iter: self.groups.iter().peekable(),
         }
     }
 }
@@ -209,12 +615,21 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    EffectGroup,
 }
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    StartGroup {
+        effect: GroupEffect,
+        content_mask: ContentMask<ScaledPixels>,
+        reserved: Option<Bounds<ScaledPixels>>,
+    },
+    EndGroup,
+    StartTextClip,
+    EndTextClip,
 }
 
 #[derive(Clone)]
@@ -245,6 +660,53 @@ impl Primitive {
         }
     }
 
+    /// Scales the primitive's alpha, as a group's opacity does when it is drawn flat.
+    pub fn apply_opacity(&mut self, opacity: f32) {
+        match self {
+            Primitive::Shadow(shadow) => shadow.color = shadow.color.opacity(opacity),
+            Primitive::Quad(quad) => {
+                quad.background = quad.background.opacity(opacity);
+                quad.border_colors = quad.border_colors.map(|color| color.opacity(opacity));
+            }
+            Primitive::Path(path) => path.color = path.color.opacity(opacity),
+            Primitive::Underline(underline) => {
+                underline.color = underline.color.opacity(opacity)
+            }
+            Primitive::MonochromeSprite(sprite) => sprite.color = sprite.color.opacity(opacity),
+            Primitive::SubpixelSprite(sprite) => sprite.color = sprite.color.opacity(opacity),
+            Primitive::PolychromeSprite(sprite) => sprite.opacity *= opacity,
+            Primitive::Surface(_) => {}
+        }
+    }
+
+    /// A glyph as it counts for a text clip: opaque, so it masks by its shape alone.
+    fn as_glyph_mask(&self) -> Option<Primitive> {
+        match self {
+            Primitive::MonochromeSprite(sprite) => {
+                let mut sprite = *sprite;
+                sprite.color = Hsla {
+                    h: 0.,
+                    s: 0.,
+                    l: 1.,
+                    a: 1.,
+                };
+                Some(Primitive::MonochromeSprite(sprite))
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                let mut sprite = *sprite;
+                sprite.color = Hsla {
+                    h: 0.,
+                    s: 0.,
+                    l: 1.,
+                    a: 1.,
+                };
+                Some(Primitive::SubpixelSprite(sprite))
+            }
+            Primitive::PolychromeSprite(sprite) => Some(Primitive::PolychromeSprite(*sprite)),
+            _ => None,
+        }
+    }
+
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
@@ -255,6 +717,85 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+        }
+    }
+}
+
+
+fn translate_bounds(bounds: &mut Bounds<ScaledPixels>, delta: Point<ScaledPixels>) {
+    bounds.origin = bounds.origin + delta;
+}
+
+fn translate_mask(mask: &mut ContentMask<ScaledPixels>, delta: Point<ScaledPixels>) {
+    translate_bounds(&mut mask.bounds, delta);
+}
+
+#[expect(missing_docs)]
+impl Quad {
+    pub fn translate(&mut self, delta: Point<ScaledPixels>) {
+        translate_bounds(&mut self.bounds, delta);
+        translate_mask(&mut self.content_mask, delta);
+        if self.background_tile.width > 0. {
+            self.background_tile.origin_x += delta.x.0;
+            self.background_tile.origin_y += delta.y.0;
+        }
+    }
+}
+
+impl Shadow {
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        translate_bounds(&mut self.bounds, delta);
+        translate_bounds(&mut self.element_bounds, delta);
+        translate_mask(&mut self.content_mask, delta);
+    }
+}
+
+impl Underline {
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        translate_bounds(&mut self.bounds, delta);
+        translate_mask(&mut self.content_mask, delta);
+    }
+}
+
+impl MonochromeSprite {
+    /// Moves through the transformation rather than the bounds, which is where a sprite's
+    /// position ends up whatever the rest of the matrix does.
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        self.transformation.translation[0] += delta.x.0;
+        self.transformation.translation[1] += delta.y.0;
+        translate_mask(&mut self.content_mask, delta);
+    }
+}
+
+impl SubpixelSprite {
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        self.transformation.translation[0] += delta.x.0;
+        self.transformation.translation[1] += delta.y.0;
+        translate_mask(&mut self.content_mask, delta);
+    }
+}
+
+impl PolychromeSprite {
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        translate_bounds(&mut self.bounds, delta);
+        translate_mask(&mut self.content_mask, delta);
+    }
+}
+
+impl PaintSurface {
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        translate_bounds(&mut self.bounds, delta);
+        translate_mask(&mut self.content_mask, delta);
+    }
+}
+
+impl Path<ScaledPixels> {
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        translate_bounds(&mut self.bounds, delta);
+        translate_mask(&mut self.content_mask, delta);
+        for vertex in &mut self.vertices {
+            vertex.xy_position = vertex.xy_position + delta;
+            translate_mask(&mut vertex.content_mask, delta);
         }
     }
 }
@@ -283,6 +824,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    groups_start: usize,
+    groups_iter: Peekable<slice::Iter<'a, EffectGroup>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +858,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.groups_iter.peek().map(|group| group.order),
+                PrimitiveKind::EffectGroup,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +1008,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::EffectGroup => {
+                let groups_start = self.groups_start;
+                let mut groups_end = groups_start + 1;
+                self.groups_iter.next();
+                while self
+                    .groups_iter
+                    .next_if(|group| (group.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    groups_end += 1;
+                }
+                self.groups_start = groups_end;
+                Some(PrimitiveBatch::EffectGroups(groups_start..groups_end))
+            }
         }
     }
 }
@@ -493,6 +1054,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    EffectGroups(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +1087,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::EffectGroups(range) => format!("effect groups ({})", range.len()),
         }
     }
 }
@@ -967,5 +1530,320 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AtlasTextureKind, GroupEffect, ResolvedFilter, TileId, TransformationMatrix, red, size,
+    };
+
+    const WINDOW: f32 = 400.;
+
+    fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    fn mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: bounds(0., 0., WINDOW, WINDOW),
+            corner_radii: Corners::default(),
+        }
+    }
+
+    fn quad(x: f32, y: f32, width: f32, height: f32) -> Quad {
+        Quad {
+            bounds: bounds(x, y, width, height),
+            content_mask: mask(),
+            background: red().into(),
+            ..Quad::default()
+        }
+    }
+
+    fn glyph(x: f32, y: f32) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: bounds(x, y, 8., 8.),
+            content_mask: mask(),
+            color: Hsla {
+                h: 0.,
+                s: 0.,
+                l: 0.,
+                a: 0.,
+            },
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            transformation: TransformationMatrix::unit(),
+        }
+    }
+
+    fn scene() -> Scene {
+        let mut scene = Scene::default();
+        scene.set_effect_groups_enabled(true);
+        scene
+    }
+
+    fn fade(opacity: f32) -> GroupEffect {
+        GroupEffect {
+            opacity,
+            ..GroupEffect::default()
+        }
+    }
+
+    fn blurred() -> GroupEffect {
+        GroupEffect {
+            filters: vec![ResolvedFilter::Blur(2.)],
+            ..GroupEffect::default()
+        }
+    }
+
+    #[test]
+    fn a_group_keeps_its_primitives_in_a_scene_of_its_own() {
+        let mut scene = scene();
+        scene.start_group(fade(0.5), mask(), None);
+        scene.insert_primitive(quad(20., 30., 10., 10.));
+        scene.insert_primitive(quad(25., 35., 10., 10.));
+        scene.end_group();
+        scene.finish();
+
+        assert!(scene.quads.is_empty());
+        assert_eq!(scene.groups.len(), 1);
+        let group = &scene.groups[0];
+        assert_eq!(group.bounds, bounds(20., 30., 15., 15.));
+        // The group's content is drawn from its own origin.
+        let inner: Vec<_> = group.scene.quads.iter().map(|quad| quad.bounds.origin).collect();
+        assert_eq!(
+            inner,
+            vec![
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                point(ScaledPixels(5.), ScaledPixels(5.))
+            ]
+        );
+        // Overlapping content is ordered inside the group, not against the rest of the scene.
+        assert!(group.scene.quads[1].order > group.scene.quads[0].order);
+    }
+
+    #[test]
+    fn filters_grow_the_group_beyond_its_content() {
+        let mut scene = scene();
+        scene.start_group(blurred(), mask(), None);
+        scene.insert_primitive(quad(50., 50., 20., 20.));
+        scene.end_group();
+        // Two sigma of 2 reach 6 pixels each way.
+        assert_eq!(scene.groups[0].bounds, bounds(44., 44., 32., 32.));
+        assert_eq!(
+            scene.groups[0].scene.quads[0].bounds.origin,
+            point(ScaledPixels(6.), ScaledPixels(6.))
+        );
+    }
+
+    #[test]
+    fn a_fade_over_a_single_primitive_needs_no_group() {
+        let mut scene = scene();
+        scene.start_group(fade(0.5), mask(), None);
+        scene.insert_primitive(quad(10., 10., 20., 20.));
+        scene.end_group();
+
+        assert!(scene.groups.is_empty());
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(scene.quads[0].bounds, bounds(10., 10., 20., 20.));
+        assert_eq!(scene.quads[0].background.as_solid().unwrap().a, 0.5);
+    }
+
+    #[test]
+    fn two_overlapping_primitives_make_a_real_group() {
+        let mut scene = scene();
+        scene.start_group(fade(0.5), mask(), None);
+        scene.insert_primitive(quad(10., 10., 20., 20.));
+        scene.insert_primitive(quad(15., 15., 20., 20.));
+        scene.end_group();
+        assert_eq!(scene.groups.len(), 1);
+        // Each primitive keeps its own alpha: the fade is applied to the composite.
+        assert_eq!(scene.groups[0].scene.quads[0].background.as_solid().unwrap().a, 1.);
+    }
+
+    #[test]
+    fn empty_groups_paint_nothing_unless_they_filter_the_backdrop() {
+        let mut scene = scene();
+        scene.start_group(blurred(), mask(), None);
+        scene.end_group();
+        assert!(scene.groups.is_empty());
+
+        let backdrop = GroupEffect {
+            backdrop_filters: vec![ResolvedFilter::Blur(2.)],
+            reference: bounds(10., 10., 50., 50.),
+            ..GroupEffect::default()
+        };
+        scene.start_group(backdrop, mask(), None);
+        scene.end_group();
+        assert_eq!(scene.groups.len(), 1);
+        assert_eq!(scene.groups[0].bounds, bounds(10., 10., 50., 50.));
+    }
+
+    #[test]
+    fn a_group_is_ordered_by_what_it_covers() {
+        let mut scene = scene();
+        scene.insert_primitive(quad(0., 0., 100., 100.));
+        scene.start_group(blurred(), mask(), None);
+        scene.insert_primitive(quad(40., 40., 20., 20.));
+        scene.end_group();
+        scene.insert_primitive(quad(45., 45., 10., 10.));
+        scene.finish();
+
+        let below = scene.quads.iter().find(|quad| quad.bounds.size.width.0 == 100.).unwrap();
+        let above = scene.quads.iter().find(|quad| quad.bounds.size.width.0 == 10.).unwrap();
+        let group = &scene.groups[0];
+        assert!(below.order < group.order);
+        assert!(group.order < above.order);
+    }
+
+    #[test]
+    fn a_reserved_group_stays_below_what_is_painted_after_it() {
+        let mut scene = scene();
+        let region = bounds(0., 0., 100., 100.);
+        scene.start_group(blurred(), mask(), Some(region));
+        scene.insert_primitive(quad(10., 10., 20., 20.));
+        scene.end_group();
+        scene.insert_primitive(quad(10., 10., 20., 20.));
+        scene.finish();
+
+        assert!(scene.groups[0].order < scene.quads[0].order);
+    }
+
+    #[test]
+    fn nested_groups_composite_into_the_group_around_them() {
+        let mut scene = scene();
+        scene.start_group(blurred(), mask(), None);
+        scene.insert_primitive(quad(100., 100., 40., 40.));
+        scene.start_group(blurred(), mask(), None);
+        scene.insert_primitive(quad(110., 110., 10., 10.));
+        scene.insert_primitive(quad(112., 112., 10., 10.));
+        scene.end_group();
+        scene.end_group();
+
+        assert_eq!(scene.groups.len(), 1);
+        let outer = &scene.groups[0];
+        assert_eq!(outer.scene.groups.len(), 1);
+        assert_eq!(outer.scene.quads.len(), 1);
+        let inner = &outer.scene.groups[0];
+        assert_eq!(inner.scene.quads.len(), 2);
+        // The inner group's position is relative to the outer group's origin.
+        assert_eq!(
+            inner.bounds.origin.x.0 + outer.bounds.origin.x.0,
+            110. - 6.
+        );
+        // The outer group covers the inner one and the margin around both.
+        assert_eq!(outer.bounds, bounds(94., 94., 52., 52.));
+    }
+
+    #[test]
+    fn replaying_operations_rebuilds_the_same_groups() {
+        let mut previous = scene();
+        previous.insert_primitive(quad(0., 0., 10., 10.));
+        let start = previous.len();
+        previous.start_group(blurred(), mask(), None);
+        previous.insert_primitive(quad(40., 40., 20., 20.));
+        previous.insert_primitive(quad(45., 45., 20., 20.));
+        previous.end_group();
+        let end = previous.len();
+        previous.finish();
+
+        let mut next = scene();
+        next.replay(start..end, &previous);
+        next.finish();
+
+        assert!(next.quads.is_empty());
+        assert_eq!(next.groups.len(), 1);
+        assert_eq!(next.groups[0].bounds, previous.groups[0].bounds);
+        assert_eq!(next.groups[0].scene.quads.len(), 2);
+        assert_eq!(next.len(), end - start);
+    }
+
+    #[test]
+    fn without_group_support_the_opacity_is_applied_per_primitive() {
+        let mut scene = Scene::default();
+        scene.start_group(fade(0.5), mask(), None);
+        scene.insert_primitive(quad(0., 0., 10., 10.));
+        scene.start_group(fade(0.5), mask(), None);
+        scene.insert_primitive(quad(20., 0., 10., 10.));
+        scene.end_group();
+        scene.end_group();
+        scene.insert_primitive(quad(40., 0., 10., 10.));
+
+        assert!(scene.groups.is_empty());
+        let alphas: Vec<f32> = scene
+            .quads
+            .iter()
+            .map(|quad| quad.background.as_solid().unwrap().a)
+            .collect();
+        assert_eq!(alphas, vec![0.5, 0.25, 1.]);
+    }
+
+    #[test]
+    fn text_clips_keep_a_copy_of_the_glyphs_for_the_group_before_them() {
+        let mut scene = scene();
+        let region = bounds(0., 0., 100., 50.);
+        scene.start_text_clip();
+        let effect = GroupEffect {
+            text_mask: true,
+            reference: region,
+            ..GroupEffect::default()
+        };
+        scene.start_group(effect, mask(), Some(region));
+        scene.insert_primitive(quad(0., 0., 100., 50.));
+        scene.end_group();
+        scene.insert_primitive(glyph(10., 10.));
+        scene.insert_primitive(glyph(20., 10.));
+        scene.end_text_clip();
+        // Glyphs painted once the clip is over don't count.
+        scene.insert_primitive(glyph(30., 10.));
+        scene.finish();
+
+        assert_eq!(scene.monochrome_sprites.len(), 3, "the glyphs still paint normally");
+        let mask_scene = scene.groups[0].text_mask.as_ref().expect("the group has a text mask");
+        assert_eq!(mask_scene.monochrome_sprites.len(), 2);
+        // Opaque, whatever colour the text has.
+        assert_eq!(mask_scene.monochrome_sprites[0].color.a, 1.);
+    }
+
+    #[test]
+    fn groups_are_batched_in_order_with_the_primitives() {
+        let mut scene = scene();
+        scene.insert_primitive(quad(0., 0., 100., 100.));
+        scene.start_group(blurred(), mask(), None);
+        scene.insert_primitive(quad(40., 40., 20., 20.));
+        scene.end_group();
+        scene.insert_primitive(quad(45., 45., 10., 10.));
+        scene.finish();
+
+        let batches: Vec<String> = scene.batches().map(|batch| batch.label()).collect();
+        assert_eq!(
+            batches,
+            vec!["quads (1)", "effect groups (1)", "quads (1)"]
+        );
+    }
+
+    #[test]
+    fn painted_quads_include_the_ones_inside_groups() {
+        let mut scene = scene();
+        scene.start_group(blurred(), mask(), None);
+        scene.insert_primitive(quad(100., 120., 20., 20.));
+        scene.end_group();
+        let quads = scene.quads_with_groups();
+        assert_eq!(quads.len(), 1);
+        assert_eq!(quads[0].bounds, bounds(100., 120., 20., 20.));
     }
 }

@@ -26,8 +26,14 @@ pub enum LengthPercentage {
     Percent(f32),
 }
 
+impl Default for LengthPercentage {
+    fn default() -> Self {
+        LengthPercentage::Length(Pixels::ZERO)
+    }
+}
+
 impl LengthPercentage {
-    fn resolve(self, reference: Pixels) -> Pixels {
+    pub(crate) fn resolve(self, reference: Pixels) -> Pixels {
         match self {
             LengthPercentage::Length(length) => length,
             LengthPercentage::Percent(fraction) => reference * fraction,
@@ -64,7 +70,7 @@ impl BackgroundPositionAxis {
 
     /// Where the point of an item sitting at this position lies in a container, as for a
     /// gradient's `at <position>`.
-    fn resolve_point(self, container: Pixels) -> Pixels {
+    pub(crate) fn resolve_point(self, container: Pixels) -> Pixels {
         let offset = self.offset.resolve(container);
         if self.from_end {
             container - offset
@@ -313,6 +319,9 @@ pub enum BackgroundBox {
     PaddingBox,
     /// The content edge, inside the padding.
     ContentBox,
+    /// For `background-clip` only: the glyphs of the element's text. Elsewhere it is the border
+    /// box.
+    Text,
 }
 
 /// One layer of `background-image` with its `background-size`, `-position`, `-repeat`, `-origin`
@@ -411,9 +420,9 @@ impl BackgroundBoxes {
         }
     }
 
-    fn region(&self, which: BackgroundBox) -> BoxRegion {
+    pub(crate) fn region(&self, which: BackgroundBox) -> BoxRegion {
         match which {
-            BackgroundBox::BorderBox => self.border,
+            BackgroundBox::BorderBox | BackgroundBox::Text => self.border,
             BackgroundBox::PaddingBox => self.padding,
             BackgroundBox::ContentBox => self.content,
         }

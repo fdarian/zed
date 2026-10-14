@@ -385,6 +385,9 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Never produced: this renderer has no offscreen groups, so the scene draws
+                // them flat.
+                PrimitiveBatch::EffectGroups(_) => {}
             }
             .with_context(|| {
                 format!(

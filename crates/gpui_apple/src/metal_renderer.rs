@@ -733,6 +733,7 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::EffectGroups(_) => {}
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }

@@ -6,7 +6,7 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, Bounds, BoxShadow,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -2635,7 +2635,7 @@ impl Window {
     /// whose bounds don't intersect their content mask are culled at paint time and won't appear.
     #[cfg(any(test, feature = "test-support"))]
     pub fn painted_quads(&self) -> Vec<Quad> {
-        self.rendered_frame.scene.quads.clone()
+        self.rendered_frame.scene.quads_with_groups()
     }
 
     /// Surfaces in the most recently rendered frame. Used by tests to assert a
@@ -3182,6 +3182,10 @@ impl Window {
         }
         if !cx.mode.skip_drawing() {
             self.captured_hitbox = None;
+            let effect_groups = self.platform_window.supports_effect_groups();
+            self.next_frame
+                .scene
+                .set_effect_groups_enabled(effect_groups);
             self.draw_roots(cx);
             if self.captured_identity.is_some() && self.captured_hitbox.is_none() {
                 self.captured_identity = None;
@@ -3938,6 +3942,42 @@ impl Window {
         result
     }
 
+    /// Paints `f` as a group that is composited as a whole with `effect`: its opacity, filters,
+    /// mask and clip path apply to everything `f` paints, not to each primitive. `reserved` pins
+    /// the group's place in the stacking order to those bounds rather than to what it covers
+    /// once finished. Without renderer support only the opacity applies, per primitive.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_effect_group<R>(
+        &mut self,
+        effect: GroupEffect,
+        reserved: Option<Bounds<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let content_mask = self.snapped_content_mask();
+        let reserved = reserved.map(|bounds| self.cover_bounds(bounds));
+        self.next_frame
+            .scene
+            .start_group(effect, content_mask, reserved);
+        let result = f(self);
+        self.next_frame.scene.end_group();
+        result
+    }
+
+    /// Runs `f` while keeping a copy of every glyph it paints. The first group opened inside with
+    /// [`GroupEffect::text_mask`] is multiplied by those glyphs' alpha once `f` is done, which is
+    /// how `background-clip: text` fills text with a background.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_text_clip<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.scene.start_text_clip();
+        let result = f(self);
+        self.next_frame.scene.end_text_clip();
+        result
+    }
+
     pub(crate) fn with_element_opacity<R>(
         &mut self,
         opacity: Option<f32>,
@@ -4432,6 +4472,26 @@ impl Window {
         }
     }
 
+    /// The quad in device pixels, snapped and masked the way painting it would.
+    pub(crate) fn device_quad(&self, quad: PaintQuad, opacity: f32) -> Quad {
+        let snapped_bounds = self.snap_bounds(quad.bounds);
+        let snapped_border_widths = self.snap_border_widths(quad.border_widths);
+        Quad {
+            order: 0,
+            bounds: snapped_bounds,
+            content_mask: self.snapped_content_mask(),
+            background: quad
+                .background
+                .opacity(opacity)
+                .scale_gradient(self.scale_factor()),
+            background_tile: quad.background_tile.scale(self.scale_factor()),
+            border_colors: quad.border_colors.map(|color| color.opacity(opacity)),
+            corner_radii: quad.corner_radii.scale(self.scale_factor()),
+            border_widths: snapped_border_widths,
+            border_style: quad.border_style,
+        }
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.
@@ -4445,22 +4505,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let opacity = self.element_opacity();
-        let snapped_bounds = self.snap_bounds(quad.bounds);
-        let snapped_border_widths = self.snap_border_widths(quad.border_widths);
-        let quad = Quad {
-            order: 0,
-            bounds: snapped_bounds,
-            content_mask: self.snapped_content_mask(),
-            background: quad
-                .background
-                .opacity(opacity)
-                .scale_gradient(self.scale_factor()),
-            background_tile: quad.background_tile.scale(self.scale_factor()),
-            border_colors: quad.border_colors.map(|color| color.opacity(opacity)),
-            corner_radii: quad.corner_radii.scale(self.scale_factor()),
-            border_widths: snapped_border_widths,
-            border_style: quad.border_style,
-        };
+        let quad = self.device_quad(quad, opacity);
 
         if !quad.background.is_transparent() {
             self.next_frame.scene.insert_primitive(quad);

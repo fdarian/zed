@@ -17,6 +17,7 @@ mod assets;
 mod bounds_tree;
 mod background_layer;
 mod color;
+mod effects;
 /// The default colors used by GPUI.
 pub mod colors;
 #[cfg(feature = "profiler")]
@@ -102,6 +103,7 @@ pub use asset_cache::*;
 pub use assets::*;
 pub use background_layer::*;
 pub use color::*;
+pub use effects::*;
 pub use ctor::ctor;
 #[cfg(feature = "profiler")]
 pub use debug_overlay::*;
