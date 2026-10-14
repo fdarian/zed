@@ -6896,4 +6896,52 @@ mod tests {
         assert_color(&image, 36, 36, [0, 0, 255]);
         assert!(is_cleared(&image, 12, 12));
     }
+
+    /// A renderer whose target is cleared to transparent, as a window with a transparent or
+    /// blurred background is.
+    fn transparent_renderer() -> MetalRenderer {
+        let device = MetalRenderer::create_device();
+        MetalRenderer::new_sharing(
+            std::rc::Rc::new(super::DeviceState::new(device)),
+            None,
+            false,
+            Arc::new(Mutex::new(InstanceBufferPool::default())),
+        )
+    }
+
+    #[test]
+    fn translucent_quads_over_a_transparent_target_composite_with_source_over_alpha() {
+        let half_white = Hsla {
+            h: 0.,
+            s: 0.,
+            l: 1.,
+            a: 0.5,
+        };
+        let mut scene = Scene::default();
+        let mut left = quad(half_white, Edges::default(), 0.);
+        left.order = 1;
+        left.bounds.size.width = ScaledPixels(SIZE * 0.75);
+        scene.insert_primitive(left);
+        let mut right = quad(half_white, Edges::default(), 0.);
+        right.order = 2;
+        right.bounds.origin.x = ScaledPixels(SIZE * 0.25);
+        right.bounds.size.width = ScaledPixels(SIZE * 0.75);
+        scene.insert_primitive(right);
+        scene.finish();
+
+        let image = transparent_renderer()
+            .render_scene_to_image(
+                &scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
+            .expect("scene should render");
+
+        let alone = image.get_pixel(2, 20).0[3] as i32;
+        let overlap = image.get_pixel(20, 20).0[3] as i32;
+        assert!((alone - 128).abs() <= 2, "one layer is half covered: {alone}");
+        assert!(
+            (overlap - 191).abs() <= 2,
+            "two half layers cover three quarters (source-over), not all: {overlap}"
+        );
+    }
 }

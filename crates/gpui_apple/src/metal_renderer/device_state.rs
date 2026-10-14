@@ -93,7 +93,11 @@ impl DeviceState {
             MTLPixelFormat::BGRA8Unorm,
             PATH_SAMPLE_COUNT,
         );
-        let root_pipelines = Pipelines::new(&device, &library, metal::MTLBlendFactor::One);
+        let root_pipelines = Pipelines::new(
+            &device,
+            &library,
+            metal::MTLBlendFactor::OneMinusSourceAlpha,
+        );
         let group_pipelines = Pipelines::new(
             &device,
             &library,
