@@ -323,6 +323,29 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
     )
 }
 
+/// Whether we currently owe AppKit an `[NSCursor unhide]`. `hide` and `unhide` are counted by
+/// AppKit, so every call is gated on this flag to keep them balanced.
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Hides or restores the cursor for `CursorStyle::None`. Idempotent.
+///
+/// # Safety
+///
+/// Must be called on the AppKit main thread.
+unsafe fn set_cursor_hidden(hidden: bool) {
+    if CURSOR_HIDDEN.swap(hidden, Ordering::Relaxed) == hidden {
+        return;
+    }
+    // SAFETY: The caller guarantees AppKit main-thread access.
+    unsafe {
+        if hidden {
+            let _: () = msg_send![class!(NSCursor), hide];
+        } else {
+            let _: () = msg_send![class!(NSCursor), unhide];
+        }
+    }
+}
+
 /// Stores the cursor style on the active GPUI window and invalidates its cursor rects.
 ///
 /// # Safety
@@ -346,6 +369,7 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
         };
 
         let Some(active_window) = active_window else {
+            set_cursor_hidden(false);
             return;
         };
 
@@ -358,6 +382,7 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
                 invalidateCursorRectsForView: window_state.native_view.as_ptr()
             ];
         }
+        set_cursor_hidden(style == CursorStyle::None);
     }
 }
 
@@ -2321,6 +2346,8 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            // Hidden through `set_cursor_hidden`; the rect still needs a valid cursor.
+            CursorStyle::None => msg_send![class!(NSCursor), arrowCursor],
         };
 
         let bounds = NSView::bounds(this as *const Object as id);
@@ -2815,6 +2842,10 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
+    if !is_active {
+        // SAFETY: AppKit delivers window delegate callbacks on the main thread.
+        unsafe { set_cursor_hidden(false) };
+    }
 
     // When opening a pop-up while the application isn't active, Cocoa sends a spurious
     // `windowDidBecomeKey` message to the previous key window even though that window
@@ -2918,6 +2949,8 @@ extern "C" fn close_window(this: &Object, _: Sel) {
         if simple_fullscreen_state.is_some() {
             pop_simple_fullscreen_presentation_options();
         }
+
+        set_cursor_hidden(false);
 
         if let Some(callback) = close_callback {
             callback();

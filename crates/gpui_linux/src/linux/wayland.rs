@@ -38,5 +38,7 @@ pub(super) fn to_shape(style: CursorStyle) -> Shape {
         CursorStyle::DragLink => Shape::Alias,
         CursorStyle::DragCopy => Shape::Copy,
         CursorStyle::ContextualMenu => Shape::ContextMenu,
+        // Stub: `CursorStyle::None` is not hidden on Wayland yet, the default cursor is shown.
+        CursorStyle::None => Shape::Default,
     }
 }
