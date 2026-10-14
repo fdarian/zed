@@ -10,8 +10,9 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size,
-    StatefulInteractiveElement, Style, StyleRefinement, Styled, Window, point, px, size,
+    Interactivity, IntoElement, IsZero, Overflow, OverscrollBehavior, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, Size, StatefulInteractiveElement, Style, StyleRefinement, Styled, Window,
+    point, px, scroll_routing, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -939,6 +940,14 @@ impl StateInner {
         scroll_top.item_ix..cursor.start().count + 1
     }
 
+    /// The scroll position of the list's first visible edge, and the furthest it can go.
+    fn scroll_extent(&self, scroll_top: &ListOffset, height: Pixels) -> (Pixels, Pixels) {
+        let padding = self.last_padding.unwrap_or_default();
+        let scroll_max =
+            (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
+        (self.scroll_top(scroll_top), scroll_max)
+    }
+
     fn scroll(
         &mut self,
         scroll_top: &ListOffset,
@@ -1684,21 +1693,51 @@ impl Element for List {
         let list_state = self.state.clone();
         let height = bounds.size.height;
         let scroll_top = prepaint.layout.scroll_top;
-        let hitbox_id = prepaint.hitbox.id;
-        let mut accumulated_scroll_delta = ScrollDelta::default();
+        let hitbox = prepaint.hitbox.clone();
+        // Set with `InteractiveElement::overscroll_behavior`; a list scrolls along y only.
+        let overscroll = self.interactivity.overscroll_behavior.y;
+        let scroller = scroll_routing::scroller_id_of_state(&list_state.0);
+        // How far the content has been moved this frame, measured from where the frame began:
+        // `scroll` moves relative to `scroll_top`, which stays fixed until the next layout.
+        let mut moved = Pixels::ZERO;
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                list_state.0.borrow_mut().scroll(
-                    &scroll_top,
-                    height,
-                    pixel_delta,
-                    current_view,
-                    window,
-                    cx,
-                )
+            if phase == DispatchPhase::Capture {
+                scroll_routing::begin(window, cx, event);
             }
+        });
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let (base_top, scroll_max) = list_state.0.borrow().scroll_extent(&scroll_top, height);
+            let offset = point(Pixels::ZERO, moved - base_top);
+            let claim = scroll_routing::Claim {
+                scroller,
+                under_pointer: scroll_routing::is_candidate(window, &hitbox),
+                event: event.clone(),
+                // Lists have always read a line of a mouse wheel as 20 pixels.
+                line_height: px(20.),
+                overflow: point(Overflow::Visible, Overflow::Scroll),
+                overscroll: point(OverscrollBehavior::Auto, overscroll),
+                offset,
+                max_offset: point(Pixels::ZERO, scroll_max),
+            };
+            let Some(new_offset) = scroll_routing::claim(window, cx, claim) else {
+                return;
+            };
+            let taken = new_offset.y - offset.y;
+            if taken.is_zero() {
+                return;
+            }
+            moved += taken;
+            list_state.0.borrow_mut().scroll(
+                &scroll_top,
+                height,
+                point(Pixels::ZERO, moved),
+                current_view,
+                window,
+                cx,
+            );
         });
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {

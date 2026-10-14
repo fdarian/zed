@@ -3403,7 +3403,7 @@ impl Interactivity {
             // container claims the event the whole delta is waiting to be claimed.
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture {
-                    scroll_routing::begin(window, cx, event, event.delta.pixel_delta(line_height));
+                    scroll_routing::begin(window, cx, event);
                 }
             });
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
@@ -3415,6 +3415,7 @@ impl Interactivity {
                     scroller,
                     under_pointer: scroll_routing::is_candidate(window, &hitbox),
                     event: event.clone(),
+                    line_height,
                     overflow,
                     overscroll,
                     offset: old_scroll_offset,

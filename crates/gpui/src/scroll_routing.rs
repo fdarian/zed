@@ -19,7 +19,7 @@ use web_time::Instant;
 
 use crate::{
     App, Global, Hitbox, IsZero, Overflow, Pixels, Point, ScrollWheelEvent, TouchPhase, Window,
-    WindowId,
+    WindowId, point,
 };
 
 /// How long a latched container keeps the wheel once events stop. Momentum events
@@ -43,14 +43,21 @@ pub enum OverscrollBehavior {
 /// Identifies one scroll container across frames: the address of its offset cell.
 pub(crate) type ScrollerId = usize;
 
+/// The id of a scroller that is not a `Div`, from the address of its state.
+pub(crate) fn scroller_id_of_state<T>(state: &Rc<T>) -> ScrollerId {
+    Rc::as_ptr(state) as usize
+}
+
 pub(crate) fn scroller_id(offset: &Rc<RefCell<Point<Pixels>>>) -> ScrollerId {
     Rc::as_ptr(offset) as usize
 }
 
 #[derive(Default)]
 struct WindowRouting {
-    /// Delta of the event being dispatched that no container has taken yet.
-    remaining: Point<Pixels>,
+    /// The share of the event's delta that no container has taken yet, per axis, from 1 down to
+    /// 0. A share rather than pixels because a mouse wheel's lines are pixels at a rate each
+    /// container chooses.
+    remaining: Point<f32>,
     latch: Option<Latch>,
     /// The latch was chosen during this dispatch, so containers further up still
     /// take their share of the remainder.
@@ -78,7 +85,7 @@ pub(crate) fn is_candidate(window: &Window, hitbox: &Hitbox) -> bool {
 
 /// Starts routing one wheel event. Every container calls it from its capture-phase
 /// listener, which runs before any bubble-phase listener, so repeating it is harmless.
-pub(crate) fn begin(window: &Window, cx: &mut App, event: &ScrollWheelEvent, delta: Point<Pixels>) {
+pub(crate) fn begin(window: &Window, cx: &mut App, event: &ScrollWheelEvent) {
     let routing = cx
         .default_global::<WheelRouting>()
         .0
@@ -98,7 +105,7 @@ pub(crate) fn begin(window: &Window, cx: &mut App, event: &ScrollWheelEvent, del
     }
     routing.last_event = Some(now);
     routing.latched_this_event = false;
-    routing.remaining = delta;
+    routing.remaining = point(1.0, 1.0);
 }
 
 /// One container's claim on the wheel event being dispatched.
@@ -107,6 +114,8 @@ pub(crate) struct Claim {
     /// The pointer is over the container. A latched container does not need this.
     pub under_pointer: bool,
     pub event: ScrollWheelEvent,
+    /// What a line of a mouse wheel is worth, in pixels, to this container.
+    pub line_height: Pixels,
     pub overflow: Point<Overflow>,
     pub overscroll: Point<OverscrollBehavior>,
     pub offset: Point<Pixels>,
@@ -142,15 +151,18 @@ pub(crate) fn claim(window: &Window, cx: &mut App, claim: Claim) -> Option<Point
     let mut taken_any = false;
     let mut absorbed = false;
     let mut remaining = routing.remaining;
+    let delta = claim.event.delta.pixel_delta(claim.line_height);
 
     for axis in [Axis2::X, Axis2::Y] {
         if axis.get(claim.overflow) != Overflow::Scroll {
             continue;
         }
-        let wanted = axis.pixels(remaining);
-        if wanted.is_zero() {
+        let full = axis.pixels(delta);
+        let share = axis.share(remaining);
+        if full.is_zero() || share <= 0.0 {
             continue;
         }
+        let wanted = full * share;
         let max = axis.pixels(claim.max_offset);
         let current = axis.pixels(offset);
         let target = (current + wanted).clamp(-max, Pixels::ZERO);
@@ -160,19 +172,20 @@ pub(crate) fn claim(window: &Window, cx: &mut App, claim: Claim) -> Option<Point
         if !taken.is_zero() {
             axis.set_pixels(&mut offset, target);
         }
-        axis.set_pixels(&mut remaining, wanted - taken);
+        let leftover = wanted - taken;
+        axis.set_share(&mut remaining, f32::from(leftover) / f32::from(full));
         taken_any |= !taken.is_zero();
 
-        let leftover = !(wanted - taken).is_zero();
-        if leftover && axis.get_overscroll(claim.overscroll) != OverscrollBehavior::Auto {
-            axis.set_pixels(&mut remaining, Pixels::ZERO);
+        if !leftover.is_zero() && axis.get_overscroll(claim.overscroll) != OverscrollBehavior::Auto
+        {
+            axis.set_share(&mut remaining, 0.0);
             absorbed = true;
         }
     }
 
     if latched {
         // Whatever the latched container cannot use is dropped, not chained.
-        remaining = Point::default();
+        remaining = point(0.0, 0.0);
     } else if (taken_any || absorbed) && routing.latch.is_none() {
         routing.latch = Some(Latch {
             scroller: claim.scroller,
@@ -216,6 +229,20 @@ impl Axis2 {
         match self {
             Axis2::X => value.x = pixels,
             Axis2::Y => value.y = pixels,
+        }
+    }
+
+    fn share(self, value: Point<f32>) -> f32 {
+        match self {
+            Axis2::X => value.x,
+            Axis2::Y => value.y,
+        }
+    }
+
+    fn set_share(self, value: &mut Point<f32>, share: f32) {
+        match self {
+            Axis2::X => value.x = share,
+            Axis2::Y => value.y = share,
         }
     }
 }
