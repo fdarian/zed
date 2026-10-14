@@ -7,8 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, PaintSurface, Path,
+    Point, PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
+    filter_margin, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -25,7 +26,10 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice,
+    sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -119,13 +123,19 @@ pub struct MetalRenderer {
     opaque: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
-    path_sprites_pipeline_state: metal::RenderPipelineState,
-    shadows_pipeline_state: metal::RenderPipelineState,
-    quads_pipeline_state: metal::RenderPipelineState,
-    underlines_pipeline_state: metal::RenderPipelineState,
-    monochrome_sprites_pipeline_state: metal::RenderPipelineState,
-    polychrome_sprites_pipeline_state: metal::RenderPipelineState,
-    surfaces_pipeline_state: metal::RenderPipelineState,
+    /// Pipelines for drawing into the window.
+    root_pipelines: Pipelines,
+    /// Pipelines for drawing into an effect group's texture, which blend alpha as "over" so the
+    /// texture stays correctly premultiplied.
+    group_pipelines: Pipelines,
+    effect_pipelines: EffectPipelines,
+    /// How many effect groups deep the scene being encoded is; the group pipelines draw when it is
+    /// not zero.
+    group_depth: Cell<usize>,
+    /// Textures for effect groups and their filters, free to be used again.
+    texture_pool: Vec<metal::Texture>,
+    /// Path rasterization targets for groups, by texture size.
+    group_path_intermediates: HashMap<(u32, u32), PathIntermediate>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -268,62 +278,10 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             PATH_SAMPLE_COUNT,
         );
-        let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &library,
-            "path_sprites",
-            "path_sprite_vertex",
-            "path_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let shadows_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "shadows",
-            "shadow_vertex",
-            "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let quads_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "quads",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let underlines_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "underlines",
-            "underline_vertex",
-            "underline_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "monochrome_sprites",
-            "monochrome_sprite_vertex",
-            "monochrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "polychrome_sprites",
-            "polychrome_sprite_vertex",
-            "polychrome_sprite_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let surfaces_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "surfaces",
-            "surface_vertex",
-            "surface_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
+        let root_pipelines = Pipelines::new(&device, &library, metal::MTLBlendFactor::One);
+        let group_pipelines =
+            Pipelines::new(&device, &library, metal::MTLBlendFactor::OneMinusSourceAlpha);
+        let effect_pipelines = EffectPipelines::new(&device, &library);
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -339,13 +297,12 @@ impl MetalRenderer {
             opaque,
             command_queue,
             paths_rasterization_pipeline_state,
-            path_sprites_pipeline_state,
-            shadows_pipeline_state,
-            quads_pipeline_state,
-            underlines_pipeline_state,
-            monochrome_sprites_pipeline_state,
-            polychrome_sprites_pipeline_state,
-            surfaces_pipeline_state,
+            root_pipelines,
+            group_pipelines,
+            effect_pipelines,
+            group_depth: Cell::new(0),
+            texture_pool: Vec::new(),
+            group_path_intermediates: HashMap::new(),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -406,32 +363,22 @@ impl MetalRenderer {
             return;
         }
 
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(size.width.0 as u64);
-        texture_descriptor.set_height(size.height.0 as u64);
-        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        texture_descriptor
-            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
+        let intermediate = make_path_intermediate(
+            &self.device,
+            size.width.0 as u32,
+            size.height.0 as u32,
+            self.path_sample_count,
+            self.is_apple_gpu,
+        );
+        self.path_intermediate_texture = Some(intermediate.texture);
+        self.path_intermediate_msaa_texture = intermediate.msaa;
+    }
 
-        if self.path_sample_count > 1 {
-            // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
-            // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
-            let storage_mode = if self.is_apple_gpu {
-                metal::MTLStorageMode::Memoryless
-            } else {
-                metal::MTLStorageMode::Private
-            };
-
-            let msaa_descriptor = texture_descriptor;
-            msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
-            msaa_descriptor.set_storage_mode(storage_mode);
-            msaa_descriptor.set_sample_count(self.path_sample_count as _);
-            self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
-        } else {
-            self.path_intermediate_msaa_texture = None;
-        }
+    fn path_intermediate(&self) -> Option<PathIntermediate> {
+        Some(PathIntermediate {
+            texture: self.path_intermediate_texture.clone()?,
+            msaa: self.path_intermediate_msaa_texture.clone(),
+        })
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -500,21 +447,8 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         );
-        let instance_bindings = write_instances(scene, &mut writer).with_context(|| {
-            format!(
-                "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
-                scene.paths.len(),
-                scene.shadows.len(),
-                scene.quads.len(),
-                scene.underlines.len(),
-                scene.monochrome_sprites.len(),
-                scene.polychrome_sprites.len(),
-                scene.surfaces.len(),
-            )
-        })?;
         let command_buffer = self.draw_primitives_to_texture(
             scene,
-            &instance_bindings,
             &mut writer,
             texture,
             viewport_size,
@@ -653,7 +587,6 @@ impl MetalRenderer {
     fn draw_primitives_to_texture(
         &mut self,
         scene: &Scene,
-        instance_bindings: &InstanceBindings,
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
@@ -661,28 +594,134 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
+        let clear_color = metal::MTLClearColor::new(0., 0., 0., alpha);
+        let path_intermediate = self.path_intermediate();
 
-        let mut command_encoder = new_command_encoder_for_texture(
+        // A backdrop filter reads what is already drawn, which a drawable that is only a render
+        // target can't be asked for. Draw into a texture first, then copy it over.
+        let reads_target = scene
+            .groups
+            .iter()
+            .any(|group| !group.effect.backdrop_filters.is_empty());
+        let readable = texture
+            .usage()
+            .contains(metal::MTLTextureUsage::ShaderRead);
+        if reads_target && !readable {
+            let frame = self.acquire_texture(
+                viewport_size.width.0 as u32,
+                viewport_size.height.0 as u32,
+            );
+            self.encode_scene(
+                scene,
+                command_buffer,
+                &frame,
+                viewport_size,
+                Some(clear_color),
+                writer,
+                path_intermediate,
+                false,
+            )?;
+            self.copy_pass(command_buffer, &frame, texture);
+            self.release_texture(frame);
+        } else {
+            self.encode_scene(
+                scene,
+                command_buffer,
+                texture,
+                viewport_size,
+                Some(clear_color),
+                writer,
+                path_intermediate,
+                false,
+            )?;
+        }
+
+        // Dynamic atlas updates use CPU replacement, so retain the newest
+        // submission as a fence until the GPU has finished sampling it.
+        self.sprite_atlas.track_submission(command_buffer);
+        Ok(command_buffer.to_owned())
+    }
+
+    /// Draws every batch of the scene into the texture, with the viewport the size of the texture.
+    /// `in_group` is set for a scene that is the content of an effect group.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        command_buffer: &metal::CommandBufferRef,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        clear_color: Option<metal::MTLClearColor>,
+        writer: &mut InstanceBufferWriter,
+        path_intermediate: Option<PathIntermediate>,
+        in_group: bool,
+    ) -> Result<()> {
+        let previous_depth = self.group_depth.get();
+        self.group_depth.set(usize::from(in_group));
+        let result = self.encode_batches(
+            scene,
             command_buffer,
             texture,
             viewport_size,
-            Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
+            clear_color,
+            writer,
+            path_intermediate,
         );
+        self.group_depth.set(previous_depth);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batches(
+        &mut self,
+        scene: &Scene,
+        command_buffer: &metal::CommandBufferRef,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        clear_color: Option<metal::MTLClearColor>,
+        writer: &mut InstanceBufferWriter,
+        path_intermediate: Option<PathIntermediate>,
+    ) -> Result<()> {
+        let instance_bindings = write_instances(scene, writer).with_context(|| {
+            format!(
+                "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                scene.paths.len(),
+                scene.shadows.len(),
+                scene.quads.len(),
+                scene.underlines.len(),
+                scene.monochrome_sprites.len(),
+                scene.polychrome_sprites.len(),
+                scene.surfaces.len(),
+            )
+        })?;
+
+        let mut command_encoder =
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color);
 
         for batch in scene.batches() {
             match batch {
-                PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
-                }
+                PrimitiveBatch::Shadows(range) => self.draw_shadows(
+                    range,
+                    &instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Quads(range) => self.draw_quads(
+                    range,
+                    &instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
 
+                    let Some(intermediate) = path_intermediate.as_ref() else {
+                        anyhow::bail!("missing path intermediate texture");
+                    };
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
+                        intermediate,
                         writer,
                         viewport_size,
                         command_buffer,
@@ -698,6 +737,7 @@ impl MetalRenderer {
                     if did_draw {
                         if let Err(error) = self.draw_paths_from_intermediate(
                             paths,
+                            intermediate,
                             writer,
                             viewport_size,
                             command_encoder,
@@ -707,14 +747,17 @@ impl MetalRenderer {
                         }
                     }
                 }
-                PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
-                }
+                PrimitiveBatch::Underlines(range) => self.draw_underlines(
+                    range,
+                    &instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
                         texture_id,
                         range,
-                        instance_bindings,
+                        &instance_bindings,
                         viewport_size,
                         command_encoder,
                     ),
@@ -722,33 +765,41 @@ impl MetalRenderer {
                     .draw_polychrome_sprites(
                         texture_id,
                         range,
-                        instance_bindings,
+                        &instance_bindings,
                         viewport_size,
                         command_encoder,
                     ),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range.clone()],
                     range.start,
-                    instance_bindings,
+                    &instance_bindings,
                     viewport_size,
                     command_encoder,
                 ),
-                PrimitiveBatch::EffectGroups(_) => {}
+                PrimitiveBatch::EffectGroups(range) => {
+                    command_encoder.end_encoding();
+                    for group in &scene.groups[range] {
+                        self.composite_group(group, command_buffer, writer, texture, viewport_size)?;
+                    }
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    );
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
 
         command_encoder.end_encoding();
-
-        // Dynamic atlas updates use CPU replacement, so retain the newest
-        // submission as a fence until the GPU has finished sampling it.
-        self.sprite_atlas.track_submission(command_buffer);
-        Ok(command_buffer.to_owned())
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        intermediate: &PathIntermediate,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
@@ -756,10 +807,7 @@ impl MetalRenderer {
         if paths.is_empty() {
             return Ok(false);
         }
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
+        let intermediate_texture = &intermediate.texture;
 
         let mut vertices = Vec::new();
         for path in paths {
@@ -781,7 +829,7 @@ impl MetalRenderer {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
 
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+        if let Some(msaa_texture) = &intermediate.msaa {
             color_attachment.set_texture(Some(msaa_texture));
             color_attachment.set_resolve_texture(Some(intermediate_texture));
             color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
@@ -828,7 +876,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.shadows_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines().shadows);
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -866,11 +914,21 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
+        self.draw_quad_instances(&instance_bindings.quads, quads, viewport_size, command_encoder);
+    }
+
+    fn draw_quad_instances(
+        &self,
+        binding: &InstanceBinding,
+        quads: Range<usize>,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
         if quads.is_empty() {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines().quads);
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -878,13 +936,13 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Quads as u64,
-            Some(&instance_bindings.quads.buffer),
-            instance_bindings.quads.offset as u64,
+            Some(&binding.buffer),
+            binding.offset as u64,
         );
         command_encoder.set_fragment_buffer(
             QuadInputIndex::Quads as u64,
-            Some(&instance_bindings.quads.buffer),
-            instance_bindings.quads.offset as u64,
+            Some(&binding.buffer),
+            binding.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             QuadInputIndex::ViewportSize as u64,
@@ -904,6 +962,7 @@ impl MetalRenderer {
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        intermediate: &PathIntermediate,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
@@ -911,12 +970,9 @@ impl MetalRenderer {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
-        let intermediate_texture = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
+        let intermediate_texture = &intermediate.texture;
 
-        command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines().path_sprites);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -983,7 +1039,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.underlines_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines().underlines);
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1031,7 +1087,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.monochrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines().monochrome_sprites);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1085,7 +1141,7 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines().polychrome_sprites);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1134,7 +1190,7 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.pipelines().surfaces);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1216,6 +1272,882 @@ impl MetalRenderer {
     }
 }
 
+
+/// Offscreen effect groups: each is drawn into a texture of its own, run through its filters,
+/// and composited into the target with its opacity, masks and clip path.
+impl MetalRenderer {
+    fn pipelines(&self) -> &Pipelines {
+        if self.group_depth.get() > 0 {
+            &self.group_pipelines
+        } else {
+            &self.root_pipelines
+        }
+    }
+
+    fn acquire_texture(&mut self, width: u32, height: u32) -> metal::Texture {
+        if let Some(index) = self
+            .texture_pool
+            .iter()
+            .position(|texture| texture.width() == width as u64 && texture.height() == height as u64)
+        {
+            return self.texture_pool.swap_remove(index);
+        }
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        self.device.new_texture(&descriptor)
+    }
+
+    fn release_texture(&mut self, texture: metal::Texture) {
+        const MAX_POOLED_TEXTURES: usize = 32;
+        if self.texture_pool.len() >= MAX_POOLED_TEXTURES {
+            self.texture_pool.remove(0);
+        }
+        self.texture_pool.push(texture);
+    }
+
+    fn group_path_intermediate(&mut self, width: u32, height: u32) -> PathIntermediate {
+        const MAX_CACHED_SIZES: usize = 6;
+        if let Some(intermediate) = self.group_path_intermediates.get(&(width, height)) {
+            return intermediate.clone();
+        }
+        if self.group_path_intermediates.len() >= MAX_CACHED_SIZES {
+            self.group_path_intermediates.clear();
+        }
+        let intermediate = make_path_intermediate(
+            &self.device,
+            width,
+            height,
+            self.path_sample_count,
+            self.is_apple_gpu,
+        );
+        self.group_path_intermediates
+            .insert((width, height), intermediate.clone());
+        intermediate
+    }
+
+    /// Draws a quad over the whole target with a pipeline that has no vertex input of its own.
+    fn run_pass(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        target: &metal::TextureRef,
+        pipeline: &metal::RenderPipelineState,
+        bind: impl FnOnce(&metal::RenderCommandEncoderRef),
+    ) {
+        let viewport_size = size(
+            DevicePixels(target.width() as i32),
+            DevicePixels(target.height() as i32),
+        );
+        let encoder = new_command_encoder_for_texture(
+            command_buffer,
+            target,
+            viewport_size,
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+        );
+        encoder.set_render_pipeline_state(pipeline);
+        encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+        bind(encoder);
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        encoder.end_encoding();
+    }
+
+    /// Scales `source` to the size of `target`.
+    fn resample_pass(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        target: &metal::TextureRef,
+    ) {
+        let target_size = [target.width() as f32, target.height() as f32];
+        self.run_pass(command_buffer, target, &self.effect_pipelines.resample, |encoder| {
+            encoder.set_fragment_bytes(
+                0,
+                mem::size_of_val(&target_size) as u64,
+                target_size.as_ptr() as *const _,
+            );
+            encoder.set_fragment_texture(0, Some(source));
+        });
+    }
+
+    fn copy_pass(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        target: &metal::TextureRef,
+    ) {
+        self.resample_pass(command_buffer, source, target);
+    }
+
+    fn color_filter_pass(
+        &mut self,
+        input: metal::Texture,
+        matrices: &[gpui::ColorMatrix],
+        command_buffer: &metal::CommandBufferRef,
+    ) -> metal::Texture {
+        let mut values: Vec<[f32; 4]> = Vec::with_capacity(matrices.len() * 5);
+        for matrix in matrices {
+            for row in &matrix.rows {
+                values.push([row[0], row[1], row[2], row[3]]);
+            }
+            values.push([
+                matrix.rows[0][4],
+                matrix.rows[1][4],
+                matrix.rows[2][4],
+                matrix.rows[3][4],
+            ]);
+        }
+        let count = matrices.len() as u32;
+        let output = self.acquire_texture(input.width() as u32, input.height() as u32);
+        self.run_pass(command_buffer, &output, &self.effect_pipelines.filter_color, |encoder| {
+            encoder.set_fragment_bytes(0, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);
+            encoder.set_fragment_bytes(
+                1,
+                (values.len() * mem::size_of::<[f32; 4]>()) as u64,
+                values.as_ptr() as *const _,
+            );
+            encoder.set_fragment_texture(0, Some(&input));
+        });
+        self.release_texture(input);
+        output
+    }
+
+    fn blur_pass(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        target: &metal::TextureRef,
+        vertical: bool,
+        sigma: f32,
+        clamp_to_edge: bool,
+    ) {
+        let step = if vertical {
+            [0., 1. / source.height() as f32]
+        } else {
+            [1. / source.width() as f32, 0.]
+        };
+        let params = BlurParams {
+            step,
+            sigma,
+            radius: (sigma * 3.).ceil().max(1.) as i32,
+            clamp_to_edge: clamp_to_edge as u32,
+            pad: 0,
+        };
+        self.run_pass(command_buffer, target, &self.effect_pipelines.blur, |encoder| {
+            encoder.set_fragment_bytes(
+                0,
+                mem::size_of::<BlurParams>() as u64,
+                &params as *const BlurParams as *const _,
+            );
+            encoder.set_fragment_texture(0, Some(source));
+        });
+    }
+
+    /// A Gaussian blur of the texture in a new texture of the same size. Large blurs run on a
+    /// reduced copy, which is how they stay affordable.
+    fn blur_texture(
+        &mut self,
+        input: &metal::Texture,
+        sigma: f32,
+        clamp_to_edge: bool,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> metal::Texture {
+        const MAX_SIGMA_IN_PASS: f32 = 6.;
+        let mut sizes = vec![(input.width() as u32, input.height() as u32)];
+        let mut scale = 1.;
+        while sigma / scale > MAX_SIGMA_IN_PASS && sizes.len() < 4 {
+            let (width, height) = *sizes.last().expect("sizes starts with one entry");
+            sizes.push((width.div_ceil(2).max(1), height.div_ceil(2).max(1)));
+            scale *= 2.;
+        }
+
+        let mut working: Option<metal::Texture> = None;
+        for &(width, height) in &sizes[1..] {
+            let next = self.acquire_texture(width, height);
+            self.resample_pass(command_buffer, working.as_ref().unwrap_or(input), &next);
+            if let Some(previous) = working.replace(next) {
+                self.release_texture(previous);
+            }
+        }
+
+        let (width, height) = *sizes.last().expect("sizes starts with one entry");
+        let sigma = sigma / scale;
+        let horizontal = self.acquire_texture(width, height);
+        self.blur_pass(
+            command_buffer,
+            working.as_ref().unwrap_or(input),
+            &horizontal,
+            false,
+            sigma,
+            clamp_to_edge,
+        );
+        if let Some(previous) = working.take() {
+            self.release_texture(previous);
+        }
+        let mut result = self.acquire_texture(width, height);
+        self.blur_pass(command_buffer, &horizontal, &result, true, sigma, clamp_to_edge);
+        self.release_texture(horizontal);
+
+        for &(width, height) in sizes[..sizes.len() - 1].iter().rev() {
+            let next = self.acquire_texture(width, height);
+            self.resample_pass(command_buffer, &result, &next);
+            self.release_texture(mem::replace(&mut result, next));
+        }
+        result
+    }
+
+    /// Runs the filters in order, each reading the last one's output.
+    fn apply_filters(
+        &mut self,
+        mut texture: metal::Texture,
+        filters: &[ResolvedFilter],
+        clamp_to_edge: bool,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> metal::Texture {
+        let mut index = 0;
+        while index < filters.len() {
+            match filters[index] {
+                ResolvedFilter::Color(_) => {
+                    let mut matrices = Vec::new();
+                    while let Some(ResolvedFilter::Color(matrix)) = filters.get(index) {
+                        if matrices.len() == MAX_MATRICES_PER_PASS {
+                            break;
+                        }
+                        matrices.push(*matrix);
+                        index += 1;
+                    }
+                    texture = self.color_filter_pass(texture, &matrices, command_buffer);
+                }
+                ResolvedFilter::Blur(sigma) => {
+                    index += 1;
+                    if sigma > 0. {
+                        let blurred =
+                            self.blur_texture(&texture, sigma, clamp_to_edge, command_buffer);
+                        self.release_texture(mem::replace(&mut texture, blurred));
+                    }
+                }
+                ResolvedFilter::DropShadow {
+                    dx,
+                    dy,
+                    sigma,
+                    color,
+                } => {
+                    index += 1;
+                    let blurred = (sigma > 0.)
+                        .then(|| self.blur_texture(&texture, sigma, clamp_to_edge, command_buffer));
+                    let rgba = gpui::Rgba::from(color);
+                    let params = DropShadowParams {
+                        offset: [dx, dy],
+                        pad: [0.; 2],
+                        color: [rgba.r * rgba.a, rgba.g * rgba.a, rgba.b * rgba.a, rgba.a],
+                    };
+                    let output = self.acquire_texture(texture.width() as u32, texture.height() as u32);
+                    self.run_pass(command_buffer, &output, &self.effect_pipelines.drop_shadow, |encoder| {
+                        encoder.set_fragment_bytes(
+                            0,
+                            mem::size_of::<DropShadowParams>() as u64,
+                            &params as *const DropShadowParams as *const _,
+                        );
+                        encoder.set_fragment_texture(0, Some(&texture));
+                        encoder.set_fragment_texture(1, Some(blurred.as_ref().unwrap_or(&texture)));
+                    });
+                    if let Some(blurred) = blurred {
+                        self.release_texture(blurred);
+                    }
+                    self.release_texture(mem::replace(&mut texture, output));
+                }
+            }
+        }
+        texture
+    }
+
+    fn render_mask_quads(
+        &mut self,
+        quads: &[Quad],
+        texture_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        writer: &mut InstanceBufferWriter,
+    ) -> Result<metal::Texture> {
+        let texture = self.acquire_texture(texture_size.width.0 as u32, texture_size.height.0 as u32);
+        let binding = writer.write(quads)?;
+        let encoder = new_command_encoder_for_texture(
+            command_buffer,
+            &texture,
+            texture_size,
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+        );
+        let previous_depth = self.group_depth.replace(1);
+        self.draw_quad_instances(&binding, 0..quads.len(), texture_size, encoder);
+        self.group_depth.set(previous_depth);
+        encoder.end_encoding();
+        Ok(texture)
+    }
+
+    /// The composite parameters for drawing `dest` of the target from a source texture whose first
+    /// texel lands at `source_origin`.
+    #[allow(clippy::too_many_arguments)]
+    fn composite_params(
+        group: &EffectGroup,
+        dest: &Bounds<ScaledPixels>,
+        source_origin: [f32; 2],
+        source_size: [f32; 2],
+        mask_a_size: Option<[f32; 2]>,
+        mask_b_size: Option<[f32; 2]>,
+        reference: Option<(Bounds<ScaledPixels>, gpui::Corners<ScaledPixels>)>,
+    ) -> (CompositeParams, Option<Vec<[f32; 2]>>) {
+        let effect = &group.effect;
+        let origin = group.bounds.origin;
+        let mut params = CompositeParams {
+            dest: rect_array(dest),
+            source: [
+                source_origin[0],
+                source_origin[1],
+                1. / source_size[0],
+                1. / source_size[1],
+            ],
+            content_mask: rect_array(&group.content_mask.bounds),
+            content_radii: radii_array(&group.content_mask.corner_radii),
+            group: [origin.x.0, origin.y.0, 0., 0.],
+            misc: [
+                effect.opacity,
+                0.,
+                mask_a_size.is_some() as u32 as f32,
+                mask_b_size.is_some() as u32 as f32,
+            ],
+            ..CompositeParams::default()
+        };
+        if let Some(size) = mask_a_size {
+            params.mask_a = [origin.x.0, origin.y.0, 1. / size[0], 1. / size[1]];
+        }
+        if let Some(size) = mask_b_size {
+            params.mask_b = [origin.x.0, origin.y.0, 1. / size[0], 1. / size[1]];
+        }
+        if let Some((bounds, radii)) = reference {
+            params.reference = rect_array(&bounds);
+            params.reference_radii = radii_array(&radii);
+        }
+
+        let mut polygon = None;
+        match &effect.clip_path {
+            None => {}
+            Some(ResolvedClipPath::RoundedRect {
+                bounds,
+                corner_radii,
+            }) => {
+                params.group[2] = 1.;
+                params.clip_a = rect_array(bounds);
+                params.clip_radii = radii_array(corner_radii);
+            }
+            Some(ResolvedClipPath::Ellipse { center, radii }) => {
+                params.group[2] = 2.;
+                params.clip_a = [center.x, center.y, radii.width.max(1e-3), radii.height.max(1e-3)];
+            }
+            Some(ResolvedClipPath::Polygon { points, even_odd }) => {
+                params.group[2] = 3.;
+                params.group[3] = points.len() as f32;
+                params.misc[1] = *even_odd as u32 as f32;
+                polygon = Some(points.iter().map(|point| [point.x, point.y]).collect());
+            }
+        }
+        (params, polygon)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_composite(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        target: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        params: &CompositeParams,
+        polygon: Option<&InstanceBinding>,
+        source: &metal::TextureRef,
+        mask_a: Option<&metal::TextureRef>,
+        mask_b: Option<&metal::TextureRef>,
+    ) {
+        let encoder = new_command_encoder_for_texture(command_buffer, target, viewport_size, None);
+        encoder.set_render_pipeline_state(&self.effect_pipelines.composite);
+        encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+        let params_size = mem::size_of::<CompositeParams>() as u64;
+        let params_pointer = params as *const CompositeParams as *const _;
+        encoder.set_vertex_bytes(1, params_size, params_pointer);
+        encoder.set_vertex_bytes(
+            2,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        encoder.set_fragment_bytes(1, params_size, params_pointer);
+        match polygon {
+            Some(binding) => {
+                encoder.set_fragment_buffer(3, Some(&binding.buffer), binding.offset as u64)
+            }
+            None => encoder.set_fragment_buffer(3, Some(&self.unit_vertices), 0),
+        }
+        encoder.set_fragment_texture(0, Some(source));
+        encoder.set_fragment_texture(1, Some(mask_a.unwrap_or(source)));
+        encoder.set_fragment_texture(2, Some(mask_b.unwrap_or(source)));
+        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        encoder.end_encoding();
+    }
+
+    /// Draws a group into the target: its content through its filters, behind it the filtered
+    /// backdrop, and over everything the group's opacity, masks and clip path.
+    fn composite_group(
+        &mut self,
+        group: &EffectGroup,
+        command_buffer: &metal::CommandBufferRef,
+        writer: &mut InstanceBufferWriter,
+        target: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<()> {
+        let effect = &group.effect;
+        let width = group.bounds.size.width.0.ceil().max(1.) as u32;
+        let height = group.bounds.size.height.0.ceil().max(1.) as u32;
+        let texture_width = texture_size_class(width);
+        let texture_height = texture_size_class(height);
+        let texture_size = size(
+            DevicePixels(texture_width as i32),
+            DevicePixels(texture_height as i32),
+        );
+        let transparent = metal::MTLClearColor::new(0., 0., 0., 0.);
+
+        let content = self.acquire_texture(texture_width, texture_height);
+        let path_intermediate = (!group.scene.paths.is_empty())
+            .then(|| self.group_path_intermediate(texture_width, texture_height));
+        self.encode_scene(
+            &group.scene,
+            command_buffer,
+            &content,
+            texture_size,
+            Some(transparent),
+            writer,
+            path_intermediate,
+            true,
+        )?;
+        let content = self.apply_filters(content, &effect.filters, false, command_buffer);
+
+        let mask_a = match &effect.mask {
+            Some(quads) => {
+                Some(self.render_mask_quads(quads, texture_size, command_buffer, writer)?)
+            }
+            None => None,
+        };
+        let mask_b = match &group.text_mask {
+            Some(glyphs) => {
+                let texture = self.acquire_texture(texture_width, texture_height);
+                self.encode_scene(
+                    glyphs,
+                    command_buffer,
+                    &texture,
+                    texture_size,
+                    Some(transparent),
+                    writer,
+                    None,
+                    true,
+                )?;
+                Some(texture)
+            }
+            None => None,
+        };
+        let mask_extent = [texture_width as f32, texture_height as f32];
+
+        if !effect.backdrop_filters.is_empty() {
+            self.draw_backdrop(
+                group,
+                mask_a.as_ref().map(|_| mask_extent),
+                mask_b.as_ref().map(|_| mask_extent),
+                [mask_a.as_ref(), mask_b.as_ref()],
+                command_buffer,
+                writer,
+                target,
+                viewport_size,
+            )?;
+        }
+
+        let dest = group.bounds.intersect(&group.content_mask.bounds);
+        if !dest.is_empty() {
+            let (params, polygon) = Self::composite_params(
+                group,
+                &dest,
+                [group.bounds.origin.x.0, group.bounds.origin.y.0],
+                mask_extent,
+                mask_a.as_ref().map(|_| mask_extent),
+                mask_b.as_ref().map(|_| mask_extent),
+                None,
+            );
+            let polygon = match polygon {
+                Some(points) if !points.is_empty() => Some(writer.write(&points)?),
+                _ => None,
+            };
+            self.draw_composite(
+                command_buffer,
+                target,
+                viewport_size,
+                &params,
+                polygon.as_ref(),
+                &content,
+                mask_a.as_deref(),
+                mask_b.as_deref(),
+            );
+        }
+
+        self.release_texture(content);
+        if let Some(texture) = mask_a {
+            self.release_texture(texture);
+        }
+        if let Some(texture) = mask_b {
+            self.release_texture(texture);
+        }
+        Ok(())
+    }
+
+    /// Filters the part of the target behind the group and draws it back clipped to the group's
+    /// border box, before the group itself goes over it. The target is whatever has been painted
+    /// into it so far, which makes the target the group's backdrop root.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_backdrop(
+        &mut self,
+        group: &EffectGroup,
+        mask_a_size: Option<[f32; 2]>,
+        mask_b_size: Option<[f32; 2]>,
+        masks: [Option<&metal::Texture>; 2],
+        command_buffer: &metal::CommandBufferRef,
+        writer: &mut InstanceBufferWriter,
+        target: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<()> {
+        if !target
+            .usage()
+            .contains(metal::MTLTextureUsage::ShaderRead)
+        {
+            log::warn!("backdrop-filter skipped: the target can't be read back");
+            return Ok(());
+        }
+        let effect = &group.effect;
+        let origin = group.bounds.origin;
+        let reference = Bounds {
+            origin: effect.reference.origin + origin,
+            size: effect.reference.size,
+        };
+        let viewport = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(
+                ScaledPixels(viewport_size.width.0 as f32),
+                ScaledPixels(viewport_size.height.0 as f32),
+            ),
+        );
+        let region = reference
+            .intersect(&group.content_mask.bounds)
+            .intersect(&viewport);
+        if region.is_empty() {
+            return Ok(());
+        }
+
+        // The pixels to filter reach past the region by what the filters spread.
+        let margin = filter_margin(&effect.backdrop_filters);
+        let left = (region.origin.x.0 - margin.left).floor().max(0.);
+        let top = (region.origin.y.0 - margin.top).floor().max(0.);
+        let right = (region.bottom_right().x.0 + margin.right)
+            .ceil()
+            .min(viewport.size.width.0);
+        let bottom = (region.bottom_right().y.0 + margin.bottom)
+            .ceil()
+            .min(viewport.size.height.0);
+        let (copy_width, copy_height) = ((right - left) as u32, (bottom - top) as u32);
+        if copy_width == 0 || copy_height == 0 {
+            return Ok(());
+        }
+
+        let backdrop = self.acquire_texture(copy_width, copy_height);
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            target,
+            0,
+            0,
+            metal::MTLOrigin {
+                x: left as u64,
+                y: top as u64,
+                z: 0,
+            },
+            metal::MTLSize {
+                width: copy_width as u64,
+                height: copy_height as u64,
+                depth: 1,
+            },
+            &backdrop,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+        let filtered = self.apply_filters(backdrop, &effect.backdrop_filters, true, command_buffer);
+
+        let (params, polygon) = Self::composite_params(
+            group,
+            &region,
+            [left, top],
+            [copy_width as f32, copy_height as f32],
+            mask_a_size,
+            mask_b_size,
+            Some((reference, effect.reference_radii)),
+        );
+        let polygon = match polygon {
+            Some(points) if !points.is_empty() => Some(writer.write(&points)?),
+            _ => None,
+        };
+        self.draw_composite(
+            command_buffer,
+            target,
+            viewport_size,
+            &params,
+            polygon.as_ref(),
+            &filtered,
+            masks[0].map(|texture| &**texture),
+            masks[1].map(|texture| &**texture),
+        );
+        self.release_texture(filtered);
+        Ok(())
+    }
+}
+
+/// Where paths are rasterized before being copied into a target of the same size.
+#[derive(Clone)]
+struct PathIntermediate {
+    texture: metal::Texture,
+    msaa: Option<metal::Texture>,
+}
+
+fn make_path_intermediate(
+    device: &metal::DeviceRef,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+    is_apple_gpu: bool,
+) -> PathIntermediate {
+    let texture_descriptor = metal::TextureDescriptor::new();
+    texture_descriptor.set_width(width as u64);
+    texture_descriptor.set_height(height as u64);
+    texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+    texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+    texture_descriptor
+        .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&texture_descriptor);
+
+    let msaa = (sample_count > 1).then(|| {
+        // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
+        // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
+        let storage_mode = if is_apple_gpu {
+            metal::MTLStorageMode::Memoryless
+        } else {
+            metal::MTLStorageMode::Private
+        };
+
+        let msaa_descriptor = texture_descriptor;
+        msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
+        msaa_descriptor.set_storage_mode(storage_mode);
+        msaa_descriptor.set_sample_count(sample_count as _);
+        device.new_texture(&msaa_descriptor)
+    });
+    PathIntermediate { texture, msaa }
+}
+
+/// The pipelines for the primitive kinds, which differ between drawing into the window and into
+/// an effect group's texture only in how they blend alpha.
+struct Pipelines {
+    path_sprites: metal::RenderPipelineState,
+    shadows: metal::RenderPipelineState,
+    quads: metal::RenderPipelineState,
+    underlines: metal::RenderPipelineState,
+    monochrome_sprites: metal::RenderPipelineState,
+    polychrome_sprites: metal::RenderPipelineState,
+    surfaces: metal::RenderPipelineState,
+}
+
+impl Pipelines {
+    fn new(
+        device: &metal::DeviceRef,
+        library: &metal::LibraryRef,
+        destination_alpha: metal::MTLBlendFactor,
+    ) -> Self {
+        let format = MTLPixelFormat::BGRA8Unorm;
+        let pipeline = |label, vertex, fragment| {
+            build_pipeline_state(
+                device,
+                library,
+                label,
+                vertex,
+                fragment,
+                format,
+                destination_alpha,
+            )
+        };
+        Self {
+            path_sprites: build_path_sprite_pipeline_state(
+                device,
+                library,
+                "path_sprites",
+                "path_sprite_vertex",
+                "path_sprite_fragment",
+                format,
+                destination_alpha,
+            ),
+            shadows: pipeline("shadows", "shadow_vertex", "shadow_fragment"),
+            quads: pipeline("quads", "quad_vertex", "quad_fragment"),
+            underlines: pipeline("underlines", "underline_vertex", "underline_fragment"),
+            monochrome_sprites: pipeline(
+                "monochrome_sprites",
+                "monochrome_sprite_vertex",
+                "monochrome_sprite_fragment",
+            ),
+            polychrome_sprites: pipeline(
+                "polychrome_sprites",
+                "polychrome_sprite_vertex",
+                "polychrome_sprite_fragment",
+            ),
+            surfaces: pipeline("surfaces", "surface_vertex", "surface_fragment"),
+        }
+    }
+}
+
+/// The passes that put effect groups together.
+struct EffectPipelines {
+    composite: metal::RenderPipelineState,
+    filter_color: metal::RenderPipelineState,
+    blur: metal::RenderPipelineState,
+    resample: metal::RenderPipelineState,
+    drop_shadow: metal::RenderPipelineState,
+}
+
+impl EffectPipelines {
+    fn new(device: &metal::DeviceRef, library: &metal::LibraryRef) -> Self {
+        let format = MTLPixelFormat::BGRA8Unorm;
+        let overwrite = |label, vertex, fragment| {
+            build_effect_pipeline_state(device, library, label, vertex, fragment, format, false)
+        };
+        Self {
+            // A premultiplied source drawn over the target.
+            composite: build_effect_pipeline_state(
+                device,
+                library,
+                "effect_composite",
+                "composite_vertex",
+                "composite_fragment",
+                format,
+                true,
+            ),
+            filter_color: overwrite("effect_filter_color", "fullscreen_vertex", "filter_color_fragment"),
+            blur: overwrite("effect_blur", "fullscreen_vertex", "blur_fragment"),
+            resample: overwrite("effect_resample", "fullscreen_vertex", "resample_fragment"),
+            drop_shadow: overwrite("effect_drop_shadow", "fullscreen_vertex", "drop_shadow_fragment"),
+        }
+    }
+}
+
+fn build_effect_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+    blend_premultiplied_over: bool,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    if blend_premultiplied_over {
+        color_attachment.set_blending_enabled(true);
+        color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+        color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+        color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+        color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+        color_attachment
+            .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        color_attachment
+            .set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    }
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+/// Mirrors `CompositeParams` in the shaders.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CompositeParams {
+    dest: [f32; 4],
+    source: [f32; 4],
+    mask_a: [f32; 4],
+    mask_b: [f32; 4],
+    content_mask: [f32; 4],
+    content_radii: [f32; 4],
+    clip_a: [f32; 4],
+    clip_radii: [f32; 4],
+    group: [f32; 4],
+    misc: [f32; 4],
+    reference: [f32; 4],
+    reference_radii: [f32; 4],
+}
+
+/// Mirrors `BlurParams` in the shaders.
+#[repr(C)]
+struct BlurParams {
+    step: [f32; 2],
+    sigma: f32,
+    radius: i32,
+    clamp_to_edge: u32,
+    pad: u32,
+}
+
+/// Mirrors `DropShadowParams` in the shaders.
+#[repr(C)]
+struct DropShadowParams {
+    offset: [f32; 2],
+    pad: [f32; 2],
+    color: [f32; 4],
+}
+
+/// How many colour matrices one filter pass applies; longer runs take several passes.
+const MAX_MATRICES_PER_PASS: usize = 8;
+
+/// Textures are sized in steps so that groups of nearly the same size share them.
+const TEXTURE_SIZE_STEP: u32 = 32;
+
+fn texture_size_class(extent: u32) -> u32 {
+    extent.max(1).next_multiple_of(TEXTURE_SIZE_STEP)
+}
+
+fn rect_array(bounds: &Bounds<ScaledPixels>) -> [f32; 4] {
+    [
+        bounds.origin.x.0,
+        bounds.origin.y.0,
+        bounds.size.width.0,
+        bounds.size.height.0,
+    ]
+}
+
+fn radii_array(radii: &gpui::Corners<ScaledPixels>) -> [f32; 4] {
+    [
+        radii.top_left.0,
+        radii.top_right.0,
+        radii.bottom_right.0,
+        radii.bottom_left.0,
+    ]
+}
+
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
@@ -1285,6 +2217,7 @@ fn build_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
+    destination_alpha: metal::MTLBlendFactor,
 ) -> metal::RenderPipelineState {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
@@ -1305,7 +2238,7 @@ fn build_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(destination_alpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1319,6 +2252,7 @@ fn build_path_sprite_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
+    destination_alpha: metal::MTLBlendFactor,
 ) -> metal::RenderPipelineState {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
@@ -1339,7 +2273,7 @@ fn build_path_sprite_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(destination_alpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1635,6 +2569,10 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
     }
+
+    fn supports_effect_groups(&self) -> bool {
+        true
+    }
 }
 
 /// Debug only: when `GPUIX_PRESENT_LOG` names a file, appends the
@@ -1679,7 +2617,7 @@ mod tests {
     use gpui::{
         Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundLayer,
         BackgroundPosition, BackgroundRepeat, BackgroundSize, Bounds, ColorSpace, ContentMask,
-        Corners, DevicePixels, Edges, Gradient, GradientItem, GradientShape, GradientStop, Hsla,
+        Corners, DevicePixels, Edges, Gradient, GradientItem, GradientShape, GradientStop, GroupEffect, Hsla,
         LengthPercentage, LinearDirection, PlatformHeadlessRenderer, Quad, RadialShape,
         RadialSize, RepeatStyle, ScaledPixels, Scene, StopPosition, point, px, size,
     };
@@ -2022,5 +2960,539 @@ mod tests {
         let image = render(&mut scene);
         assert!(is_cleared(&image, 0, 0));
         assert_color(&image, 20, 20, [255, 0, 0]);
+    }
+
+    fn groups_scene() -> Scene {
+        let mut scene = Scene::default();
+        scene.set_effect_groups_enabled(true);
+        scene
+    }
+
+    fn window_mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: full_bounds(),
+            corner_radii: Corners::default(),
+        }
+    }
+
+    fn solid(x: f32, y: f32, width: f32, height: f32, color: u32) -> Quad {
+        let mut solid = quad(hex(color), Edges::all(gpui::transparent_black()), 0.);
+        solid.bounds = Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            size(ScaledPixels(width), ScaledPixels(height)),
+        );
+        solid
+    }
+
+    fn group(scene: &mut Scene, effect: GroupEffect, quads: &[Quad]) {
+        scene.start_group(effect, window_mask(), None);
+        for quad in quads {
+            scene.insert_primitive(*quad);
+        }
+        scene.end_group();
+    }
+
+    fn filtered(filters: Vec<gpui::FilterFunction>) -> GroupEffect {
+        GroupEffect {
+            filters: filters.iter().map(|filter| filter.resolve(1.)).collect(),
+            ..GroupEffect::default()
+        }
+    }
+
+    #[test]
+    fn group_opacity_applies_to_the_composite_not_to_each_child() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            &[
+                solid(5., 5., 20., 20., 0xff0000),
+                solid(15., 15., 20., 20., 0x0000ff),
+            ],
+        );
+        let image = render(&mut scene);
+        assert_color(&image, 8, 8, [128, 0, 0]);
+        // Where they overlap the blue covers the red outright, so only blue shows through.
+        // Per-child opacity would leave a quarter of the red in it.
+        assert_color(&image, 20, 20, [0, 0, 128]);
+        assert_color(&image, 30, 30, [0, 0, 128]);
+        assert!(is_cleared(&image, 38, 2));
+    }
+
+    #[test]
+    fn nested_groups_multiply_their_opacity() {
+        let mut scene = groups_scene();
+        scene.start_group(
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.insert_primitive(solid(25., 25., 12., 12., 0x0000ff));
+        group(
+            &mut scene,
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            &[
+                solid(2., 2., 14., 14., 0xff0000),
+                solid(6., 6., 14., 14., 0xff0000),
+            ],
+        );
+        scene.end_group();
+        let image = render(&mut scene);
+        assert_color(&image, 4, 4, [64, 0, 0]);
+        assert_color(&image, 10, 10, [64, 0, 0]);
+        assert_color(&image, 30, 30, [0, 0, 128]);
+    }
+
+    #[test]
+    fn a_blur_spreads_the_group_without_changing_its_total() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            filtered(vec![gpui::FilterFunction::Blur(px(3.))]),
+            &[solid(15., 15., 10., 10., 0xffffff)],
+        );
+        let image = render(&mut scene);
+        let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0];
+        let centre = brightness(20, 20);
+        assert!(centre > 140 && centre < 250, "centre is {centre}");
+        // Outside the square, where nothing was drawn, the blur has reached.
+        assert!(brightness(12, 20) > 10, "no bleed at 12: {}", brightness(12, 20));
+        assert!(brightness(12, 20) < brightness(14, 20));
+        assert!(brightness(27, 20) > 10);
+        assert!(brightness(0, 20) < 4);
+        // Symmetric around the square.
+        assert!(brightness(12, 20).abs_diff(brightness(27, 20)) <= 4);
+    }
+
+    #[test]
+    fn a_large_blur_runs_on_a_reduced_copy_and_still_lines_up() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            filtered(vec![gpui::FilterFunction::Blur(px(14.))]),
+            &[solid(10., 10., 20., 20., 0xffffff)],
+        );
+        let image = render(&mut scene);
+        let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0] as i32;
+        assert!(brightness(20, 20) > 40, "{}", brightness(20, 20));
+        assert!((brightness(13, 20) - brightness(26, 20)).abs() <= 12);
+        assert!((brightness(20, 13) - brightness(20, 26)).abs() <= 12);
+        assert!(brightness(20, 20) > brightness(8, 20));
+    }
+
+    #[test]
+    fn colour_filters_follow_the_matrices_in_order() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            filtered(vec![gpui::FilterFunction::Grayscale(1.)]),
+            &[solid(0., 0., 20., 40., 0xff0000)],
+        );
+        group(
+            &mut scene,
+            filtered(vec![gpui::FilterFunction::Invert(1.)]),
+            &[solid(20., 0., 20., 20., 0xff0000)],
+        );
+        group(
+            &mut scene,
+            filtered(vec![
+                gpui::FilterFunction::Brightness(0.5),
+                gpui::FilterFunction::Invert(1.),
+            ]),
+            &[solid(20., 20., 20., 20., 0xff0000)],
+        );
+        let image = render(&mut scene);
+        assert_color(&image, 10, 20, [54, 54, 54]);
+        assert_color(&image, 30, 10, [0, 255, 255]);
+        // Halved to (128, 0, 0), then inverted: not the same as inverting first.
+        assert_color(&image, 30, 30, [127, 255, 255]);
+    }
+
+    #[test]
+    fn a_drop_shadow_goes_under_the_content() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            filtered(vec![gpui::FilterFunction::DropShadow {
+                offset: point(px(8.), px(8.)),
+                blur: px(0.),
+                color: hex(0x0000ff),
+            }]),
+            &[solid(8., 8., 14., 14., 0xff0000)],
+        );
+        let image = render(&mut scene);
+        assert_color(&image, 12, 12, [255, 0, 0]);
+        // Inside the shadow but outside the square.
+        assert_color(&image, 26, 26, [0, 0, 255]);
+        // Under the square the shadow is hidden.
+        assert_color(&image, 20, 20, [255, 0, 0]);
+        assert!(is_cleared(&image, 35, 35));
+    }
+
+    #[test]
+    fn a_blurred_drop_shadow_is_soft() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            filtered(vec![gpui::FilterFunction::DropShadow {
+                offset: point(px(0.), px(0.)),
+                blur: px(3.),
+                color: hex(0xffffff),
+            }]),
+            &[solid(15., 15., 10., 10., 0x000000)],
+        );
+        let image = render(&mut scene);
+        let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0];
+        // The black square keeps its colour, with a halo of the shadow's white around it.
+        assert!(brightness(20, 20) < 4);
+        assert!(brightness(13, 20) > 20);
+        assert!(brightness(13, 20) > brightness(10, 20));
+        assert!(brightness(0, 20) < 4);
+    }
+
+    fn stripes(scene: &mut Scene) {
+        for column in 0..20 {
+            let color = if column % 2 == 0 { 0xffffff } else { 0x000000 };
+            scene.insert_primitive(solid(column as f32 * 2., 0., 2., SIZE, color));
+        }
+    }
+
+    #[test]
+    fn a_backdrop_blur_filters_what_is_behind_the_group() {
+        let mut scene = groups_scene();
+        stripes(&mut scene);
+        let region = Bounds::new(
+            point(ScaledPixels(10.), ScaledPixels(10.)),
+            size(ScaledPixels(20.), ScaledPixels(20.)),
+        );
+        scene.start_group(
+            GroupEffect {
+                backdrop_filters: vec![gpui::FilterFunction::Blur(px(4.)).resolve(1.)],
+                reference: region,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.end_group();
+        let image = render(&mut scene);
+        let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0] as i32;
+        // Outside the element the stripes are untouched.
+        assert!(brightness(4, 20) > 250 && brightness(2, 20) < 5 || brightness(4, 20) < 5 && brightness(2, 20) > 250);
+        // Inside it they have run together.
+        for x in 14..26 {
+            let value = brightness(x, 20);
+            assert!((100..155).contains(&value), "x = {x} is {value}");
+        }
+        // The blur doesn't leak out of the element's box.
+        assert!(brightness(8, 20) > 250 || brightness(8, 20) < 5);
+    }
+
+    #[test]
+    fn a_backdrop_blur_keeps_the_rounded_corners_of_its_box() {
+        let mut scene = groups_scene();
+        stripes(&mut scene);
+        let region = Bounds::new(
+            point(ScaledPixels(5.), ScaledPixels(5.)),
+            size(ScaledPixels(30.), ScaledPixels(30.)),
+        );
+        scene.start_group(
+            GroupEffect {
+                backdrop_filters: vec![gpui::FilterFunction::Blur(px(4.)).resolve(1.)],
+                reference: region,
+                reference_radii: Corners::all(ScaledPixels(14.)),
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.end_group();
+        let image = render(&mut scene);
+        let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0] as i32;
+        // The corner of the box is outside the rounding, so the stripe shows sharp there.
+        assert!(brightness(6, 6) > 250 || brightness(6, 6) < 5);
+        // Its middle is blurred.
+        assert!((100..155).contains(&brightness(20, 20)));
+    }
+
+    #[test]
+    fn a_backdrop_blur_sits_below_the_elements_own_content() {
+        let mut scene = groups_scene();
+        stripes(&mut scene);
+        let region = Bounds::new(
+            point(ScaledPixels(10.), ScaledPixels(10.)),
+            size(ScaledPixels(20.), ScaledPixels(20.)),
+        );
+        scene.start_group(
+            GroupEffect {
+                backdrop_filters: vec![gpui::FilterFunction::Blur(px(4.)).resolve(1.)],
+                reference: region,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.insert_primitive(solid(12., 12., 6., 6., 0xff0000));
+        scene.end_group();
+        let image = render(&mut scene);
+        assert_color(&image, 14, 14, [255, 0, 0]);
+        assert!((100..155).contains(&(image.get_pixel(24, 24).0[0] as i32)));
+    }
+
+    fn fade_mask(width: f32) -> Vec<Quad> {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(width), px(SIZE)));
+        let boxes = BackgroundBoxes::new(bounds, Corners::default(), Edges::default(), Edges::default());
+        let fade = layer(
+            GradientShape::Linear(LinearDirection::ToRight),
+            vec![
+                GradientItem::Stop(GradientStop {
+                    color: hex(0xffffff),
+                    position: None,
+                }),
+                GradientItem::Stop(GradientStop {
+                    color: Hsla {
+                        h: 0.,
+                        s: 0.,
+                        l: 1.,
+                        a: 0.,
+                    },
+                    position: None,
+                }),
+            ],
+            false,
+        );
+        let resolved = fade.resolve(&boxes).expect("the mask has something to paint");
+        resolved
+            .chunks
+            .into_iter()
+            .map(|chunk| {
+                let mut quad = quad(chunk, Edges::all(gpui::transparent_black()), 0.);
+                quad.background_tile = resolved.tile;
+                quad
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_gradient_mask_fades_the_group_out() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                mask: Some(fade_mask(SIZE)),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        let image = render(&mut scene);
+        let red = |x: u32| image.get_pixel(x, 20).0[0] as i32;
+        assert!(red(1) > 230, "{}", red(1));
+        assert!((red(20) - 128).abs() < 20, "{}", red(20));
+        assert!(red(38) < 30, "{}", red(38));
+        assert!(red(5) > red(20) && red(20) > red(35));
+    }
+
+    #[test]
+    fn an_empty_mask_hides_the_group() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                mask: Some(Vec::new()),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        let image = render(&mut scene);
+        assert!(is_cleared(&image, 20, 20));
+    }
+
+    #[test]
+    fn a_circular_clip_path_cuts_the_group() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                clip_path: Some(gpui::ResolvedClipPath::Ellipse {
+                    center: gpui::Point::new(20., 20.),
+                    radii: gpui::Size {
+                        width: 12.,
+                        height: 12.,
+                    },
+                }),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        let image = render(&mut scene);
+        assert_color(&image, 20, 20, [255, 0, 0]);
+        assert_color(&image, 20, 30, [255, 0, 0]);
+        assert!(is_cleared(&image, 2, 2));
+        assert!(is_cleared(&image, 20, 34));
+        assert!(is_cleared(&image, 31, 31));
+    }
+
+    #[test]
+    fn a_polygon_clip_path_follows_its_edges() {
+        let triangle = gpui::ResolvedClipPath::Polygon {
+            points: vec![
+                gpui::Point::new(20., 4.),
+                gpui::Point::new(36., 36.),
+                gpui::Point::new(4., 36.),
+            ],
+            even_odd: false,
+        };
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                clip_path: Some(triangle),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        let image = render(&mut scene);
+        assert_color(&image, 20, 25, [255, 0, 0]);
+        assert_color(&image, 12, 33, [255, 0, 0]);
+        assert!(is_cleared(&image, 6, 10));
+        assert!(is_cleared(&image, 34, 10));
+        assert!(is_cleared(&image, 20, 2));
+    }
+
+    #[test]
+    fn a_rounded_clip_path_rounds_the_group() {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                clip_path: Some(gpui::ResolvedClipPath::RoundedRect {
+                    bounds: full_bounds(),
+                    corner_radii: Corners::all(ScaledPixels(16.)),
+                }),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        let image = render(&mut scene);
+        assert!(is_cleared(&image, 1, 1));
+        assert_color(&image, 20, 1, [255, 0, 0]);
+        assert_color(&image, 20, 20, [255, 0, 0]);
+    }
+
+    #[test]
+    fn a_group_is_clipped_by_the_content_mask_it_was_opened_under() {
+        let mut scene = groups_scene();
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(20.), ScaledPixels(40.)),
+            ),
+            corner_radii: Corners::default(),
+        };
+        scene.start_group(filtered(vec![gpui::FilterFunction::Blur(px(1.))]), mask, None);
+        let mut inside = solid(0., 0., SIZE, SIZE, 0xff0000);
+        inside.content_mask = mask;
+        scene.insert_primitive(inside);
+        scene.end_group();
+        let image = render(&mut scene);
+        assert_color(&image, 5, 20, [255, 0, 0]);
+        assert!(is_cleared(&image, 30, 20));
+    }
+
+    #[test]
+    fn background_clip_text_shows_the_fill_only_through_the_glyphs() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let atlas = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer);
+        let tile = atlas
+            .get_or_insert_with(
+                &gpui::AtlasKey::Svg(gpui::RenderSvgParams {
+                    path: "solid".into(),
+                    size: size(DevicePixels(16), DevicePixels(16)),
+                }),
+                &mut || Ok(Some((size(DevicePixels(16), DevicePixels(16)), vec![255u8; 256].into()))),
+            )
+            .expect("the atlas takes the tile")
+            .expect("the tile exists");
+
+        let mut scene = groups_scene();
+        let region = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(SIZE), ScaledPixels(SIZE)),
+        );
+        scene.start_text_clip();
+        scene.start_group(
+            GroupEffect {
+                text_mask: true,
+                reference: region,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            Some(region),
+        );
+        scene.insert_primitive(solid(0., 0., SIZE, SIZE, 0xff0000));
+        scene.end_group();
+        // The text itself is invisible, as with a transparent fill colour.
+        scene.insert_primitive(gpui::MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(10.), ScaledPixels(12.)),
+                size(ScaledPixels(16.), ScaledPixels(16.)),
+            ),
+            content_mask: window_mask(),
+            color: gpui::transparent_black(),
+            tile,
+            transformation: gpui::TransformationMatrix::unit(),
+        });
+        scene.end_text_clip();
+        scene.finish();
+
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .expect("scene should render");
+        assert_color(&image, 18, 20, [255, 0, 0]);
+        assert!(is_cleared(&image, 4, 4));
+        assert!(is_cleared(&image, 32, 20));
+        assert!(is_cleared(&image, 18, 33));
+    }
+
+    #[test]
+    fn paths_inside_a_group_are_rasterized_at_the_groups_size() {
+        let mut path = gpui::Path::new(point(px(6.), px(30.)));
+        path.line_to(point(px(30.), px(30.)));
+        path.line_to(point(px(6.), px(6.)));
+        path.line_to(point(px(6.), px(30.)));
+        path.color = hex(0xff0000).into();
+        path.content_mask = ContentMask::from_bounds(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(SIZE), px(SIZE)),
+        ));
+        let path = path.scale(1.);
+
+        let mut scene = groups_scene();
+        scene.start_group(
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.insert_primitive(solid(26., 14., 10., 10., 0x0000ff));
+        scene.insert_primitive(path);
+        scene.end_group();
+        let image = render(&mut scene);
+        assert_color(&image, 10, 26, [128, 0, 0]);
+        assert_color(&image, 31, 19, [0, 0, 128]);
+        assert!(is_cleared(&image, 28, 8));
     }
 }

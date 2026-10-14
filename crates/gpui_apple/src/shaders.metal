@@ -1475,3 +1475,230 @@ float4 css_gradient_color(Background background, float2 position, Bounds_ScaledP
   }
   return dither(color, position);
 }
+
+// ---------------------------------------------------------------------------
+// Offscreen effect groups: compositing, filters, blur
+// ---------------------------------------------------------------------------
+
+struct EffectVertexOutput {
+  float4 position [[position]];
+};
+
+// Everything the composite pass needs. All the vectors are float4 so the layout is the same on
+// both sides without padding.
+struct CompositeParams {
+  // Where the source is drawn in the target: x, y, width, height.
+  float4 dest;
+  // Where the source texture's first texel lands in the target (x, y), then 1 / texture size.
+  float4 source;
+  // The same for the first and the second mask texture.
+  float4 mask_a;
+  float4 mask_b;
+  // The content mask: x, y, width, height, then its corner radii (top left, top right, bottom
+  // right, bottom left).
+  float4 content_mask;
+  float4 content_radii;
+  // The clip path in group space. A rounded rectangle is x, y, width, height and radii; an ellipse
+  // is the centre and radii. Polygon points come in a buffer.
+  float4 clip_a;
+  float4 clip_radii;
+  // The target position of group space's origin, the clip kind (0 none, 1 rounded rectangle,
+  // 2 ellipse, 3 polygon) and the polygon's vertex count.
+  float4 group;
+  // Opacity, even-odd fill, mask A present, mask B present.
+  float4 misc;
+  // A rounded rectangle in target space the result is also clipped to, when it has a width.
+  float4 reference;
+  float4 reference_radii;
+};
+
+float rounded_rect_sdf(float2 position, float4 rect, float4 radii) {
+  float2 half_size = rect.zw / 2.0;
+  float2 center = rect.xy + half_size;
+  float2 offset = position - center;
+  float radius = offset.x < 0.0
+    ? (offset.y < 0.0 ? radii.x : radii.w)
+    : (offset.y < 0.0 ? radii.y : radii.z);
+  float2 corner = fabs(offset) - half_size + radius;
+  return length(max(corner, float2(0.0))) + min(max(corner.x, corner.y), 0.0) - radius;
+}
+
+// Distance to an ellipse, good enough to antialias its edge.
+float ellipse_sdf(float2 position, float2 center, float2 radii) {
+  float2 offset = position - center;
+  float k0 = length(offset / radii);
+  float k1 = length(offset / (radii * radii));
+  return k1 > 0.0 ? k0 * (k0 - 1.0) / k1 : -min(radii.x, radii.y);
+}
+
+// Signed distance to a polygon: negative inside.
+float polygon_sdf(float2 position, constant float2 *points, uint count, bool even_odd) {
+  float min_distance_squared = 1e20;
+  int winding = 0;
+  uint crossings = 0;
+  for (uint i = 0; i < count; i++) {
+    float2 start = points[i];
+    float2 end = points[(i + 1) % count];
+    float2 edge = end - start;
+    float2 to_point = position - start;
+    float along = clamp(dot(to_point, edge) / max(dot(edge, edge), 1e-12), 0.0, 1.0);
+    float2 nearest = to_point - edge * along;
+    min_distance_squared = min(min_distance_squared, dot(nearest, nearest));
+
+    float side = edge.x * to_point.y - to_point.x * edge.y;
+    if (start.y <= position.y) {
+      if (end.y > position.y && side > 0.0) {
+        winding++;
+        crossings++;
+      }
+    } else if (end.y <= position.y && side < 0.0) {
+      winding--;
+      crossings++;
+    }
+  }
+  bool inside = even_odd ? (crossings % 2 == 1) : (winding != 0);
+  float distance = sqrt(min_distance_squared);
+  return inside ? -distance : distance;
+}
+
+vertex EffectVertexOutput composite_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(0)]],
+    constant CompositeParams &params [[buffer(1)]],
+    constant Size_DevicePixels *viewport_size [[buffer(2)]]) {
+  float2 position = unit_vertices[unit_vertex_id] * params.dest.zw + params.dest.xy;
+  float2 viewport = float2((float)viewport_size->width, (float)viewport_size->height);
+  float2 device_position = position / viewport * float2(2., -2.) + float2(-1., 1.);
+  return EffectVertexOutput{float4(device_position, 0., 1.)};
+}
+
+fragment float4 composite_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant CompositeParams &params [[buffer(1)]],
+    constant float2 *polygon [[buffer(3)]],
+    texture2d<float> source [[texture(0)]],
+    texture2d<float> mask_a [[texture(1)]],
+    texture2d<float> mask_b [[texture(2)]]) {
+  constexpr sampler linear(mag_filter::linear, min_filter::linear, address::clamp_to_zero);
+  float2 position = input.position.xy;
+
+  // Premultiplied.
+  float4 color = source.sample(linear, (position - params.source.xy) * params.source.zw);
+
+  float coverage = saturate(0.5 - rounded_rect_sdf(position, params.content_mask, params.content_radii));
+
+  if (params.reference.z > 0.0) {
+    coverage *= saturate(0.5 - rounded_rect_sdf(position, params.reference, params.reference_radii));
+  }
+
+  float2 local = position - params.group.xy;
+  uint clip_kind = (uint)params.group.z;
+  if (clip_kind == 1) {
+    coverage *= saturate(0.5 - rounded_rect_sdf(local, params.clip_a, params.clip_radii));
+  } else if (clip_kind == 2) {
+    coverage *= saturate(0.5 - ellipse_sdf(local, params.clip_a.xy, params.clip_a.zw));
+  } else if (clip_kind == 3) {
+    coverage *= saturate(0.5 - polygon_sdf(local, polygon, (uint)params.group.w, params.misc.y > 0.5));
+  }
+
+  if (params.misc.z > 0.5) {
+    coverage *= mask_a.sample(linear, (position - params.mask_a.xy) * params.mask_a.zw).a;
+  }
+  if (params.misc.w > 0.5) {
+    coverage *= mask_b.sample(linear, (position - params.mask_b.xy) * params.mask_b.zw).a;
+  }
+
+  return color * (coverage * params.misc.x);
+}
+
+// A pass over the whole target.
+vertex EffectVertexOutput fullscreen_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(0)]]) {
+  float2 unit = unit_vertices[unit_vertex_id];
+  return EffectVertexOutput{float4(unit * float2(2., -2.) + float2(-1., 1.), 0., 1.)};
+}
+
+struct FilterColorParams {
+  uint matrix_count;
+};
+
+// Runs of CSS colour filters. Each matrix is five float4s: the weights of the red, green, blue
+// and alpha outputs on (r, g, b, a), then the offsets.
+fragment float4 filter_color_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant FilterColorParams &params [[buffer(0)]],
+    constant float4 *matrices [[buffer(1)]],
+    texture2d<float> source [[texture(0)]]) {
+  float4 premultiplied = source.read(uint2(input.position.xy));
+  float4 color = premultiplied.a > 0.0
+    ? float4(premultiplied.rgb / premultiplied.a, premultiplied.a)
+    : float4(0.0);
+  for (uint i = 0; i < params.matrix_count; i++) {
+    constant float4 *matrix = matrices + i * 5;
+    float4 result = float4(
+      dot(matrix[0], color) + matrix[4].x,
+      dot(matrix[1], color) + matrix[4].y,
+      dot(matrix[2], color) + matrix[4].z,
+      dot(matrix[3], color) + matrix[4].w);
+    color = saturate(result);
+  }
+  return float4(color.rgb * color.a, color.a);
+}
+
+struct BlurParams {
+  // One texel along the blur axis, in uv units.
+  float2 step;
+  float sigma;
+  int radius;
+  // Nonzero to repeat the edge pixels instead of reading transparency past them.
+  uint clamp_to_edge;
+};
+
+fragment float4 blur_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant BlurParams &params [[buffer(0)]],
+    texture2d<float> source [[texture(0)]]) {
+  constexpr sampler zero(mag_filter::linear, min_filter::linear, address::clamp_to_zero);
+  constexpr sampler edge(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+  float2 uv = input.position.xy / float2(source.get_width(), source.get_height());
+  float4 sum = float4(0.0);
+  float total = 0.0;
+  for (int i = -params.radius; i <= params.radius; i++) {
+    float weight = exp(-(float)(i * i) / (2.0 * params.sigma * params.sigma));
+    float2 at = uv + params.step * (float)i;
+    sum += weight * (params.clamp_to_edge != 0u ? source.sample(edge, at) : source.sample(zero, at));
+    total += weight;
+  }
+  return sum / total;
+}
+
+// Copies the source scaled to the size of the target, filtering bilinearly.
+fragment float4 resample_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant float2 &target_size [[buffer(0)]],
+    texture2d<float> source [[texture(0)]]) {
+  constexpr sampler linear(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+  return source.sample(linear, input.position.xy / target_size);
+}
+
+struct DropShadowParams {
+  // Where the shadow lies relative to the content, in pixels.
+  float2 offset;
+  float2 pad;
+  // The shadow colour, premultiplied.
+  float4 color;
+};
+
+// The content over its own blurred, offset, tinted alpha.
+fragment float4 drop_shadow_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant DropShadowParams &params [[buffer(0)]],
+    texture2d<float> content [[texture(0)]],
+    texture2d<float> blurred [[texture(1)]]) {
+  constexpr sampler linear(mag_filter::linear, min_filter::linear, address::clamp_to_zero);
+  float4 base = content.read(uint2(input.position.xy));
+  float2 size = float2(blurred.get_width(), blurred.get_height());
+  float shadow_alpha = blurred.sample(linear, (input.position.xy - params.offset) / size).a;
+  return base + params.color * shadow_alpha * (1.0 - base.a);
+}
