@@ -783,6 +783,19 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Observe this element's own layout node every time it is painted, next to
+    /// its bounds. The `LayoutId` answers `Window::layout_content_size` and
+    /// `Window::layout_parent_content_size`, which `on_painted` cannot reach.
+    ///
+    /// Reports under the same conditions as `on_painted`, and runs after it.
+    fn on_painted_layout(
+        mut self,
+        listener: impl Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().paint_layout_listener = Some(Box::new(listener));
+        self
+    }
+
     /// Track the focus state of the given focus handle on this element.
     /// If the focus handle is focused by the application, this element will
     /// apply its focused styles.
@@ -2305,6 +2318,9 @@ pub struct Interactivity {
     pub(crate) tooltip_show_delay: Option<Duration>,
     pub(crate) window_control: Option<WindowControlArea>,
     pub(crate) paint_bounds_listener: Option<Box<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>>,
+    pub(crate) paint_layout_listener:
+        Option<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
+    pub(crate) layout_id: Option<LayoutId>,
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) capture_pointer: bool,
     pub(crate) always_hitbox: bool,
@@ -2415,6 +2431,7 @@ impl Interactivity {
 
                 let style = self.compute_style_internal(None, element_state.as_mut(), window, cx);
                 let layout_id = f(style, window, cx);
+                self.layout_id = Some(layout_id);
                 (layout_id, element_state)
             },
         )
@@ -2686,6 +2703,11 @@ impl Interactivity {
 
                 if let Some(listener) = self.paint_bounds_listener.take() {
                     listener(bounds, window, cx);
+                }
+                if let Some(listener) = self.paint_layout_listener.take()
+                    && let Some(layout_id) = self.layout_id
+                {
+                    listener(bounds, layout_id, window, cx);
                 }
 
                 let mut tab_group = None;
@@ -4971,6 +4993,53 @@ mod tests {
             recorded.borrow().is_empty(),
             "a hidden element paints nothing and must report no bounds"
         );
+    }
+
+    struct ContentSizeTestView {
+        recorded: Rc<RefCell<Vec<(Size<Pixels>, Option<Size<Pixels>>)>>>,
+    }
+
+    impl Render for ContentSizeTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let recorded = self.recorded.clone();
+            div().w(px(200.)).h(px(100.)).p(px(10.)).child(
+                div()
+                    .w_full()
+                    .h(px(0.))
+                    .pt(px(5.))
+                    .pb(px(7.))
+                    .border_t(px(2.))
+                    .child(div().h(px(40.)))
+                    .child(div().h(px(30.)))
+                    .on_painted_layout(move |_, layout_id, window, _| {
+                        recorded.borrow_mut().push((
+                            window.layout_content_size(layout_id),
+                            window.layout_parent_content_size(layout_id),
+                        ));
+                    }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn layout_content_size_ignores_the_clamped_height(cx: &mut TestAppContext) {
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let recorded = recorded.clone();
+            move |_, _| ContentSizeTestView { recorded }
+        });
+        let any_window = AnyWindowHandle::from(window);
+
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let (content, parent) = *recorded
+            .borrow()
+            .last()
+            .expect("the listener ran at least once");
+        // Padding and both children; the 2px top border is not part of it.
+        assert_eq!(content.height, px(5. + 40. + 30. + 7.));
+        assert_eq!(parent, Some(size(px(180.), px(80.))));
     }
 
     struct HoverProbeView {

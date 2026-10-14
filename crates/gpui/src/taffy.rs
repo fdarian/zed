@@ -416,6 +416,36 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.insert(id, bounds);
         bounds
     }
+
+    /// The extent of the node's content, measured from its padding-box origin.
+    ///
+    /// This is the scrollable-overflow extent: it covers children that overflow
+    /// the node and the node's padding, but not its border, and it does not
+    /// depend on how large the node was laid out to be. A node clamped to zero
+    /// height still reports the height its content wants. Add the border widths
+    /// for the height the node would have if it sized to its content.
+    pub fn layout_content_size(&mut self, id: LayoutId, scale_factor: f32) -> Size<Pixels> {
+        let content_size = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE).content_size;
+        Size {
+            width: Pixels(content_size.width / scale_factor),
+            height: Pixels(content_size.height / scale_factor),
+        }
+    }
+
+    /// The content box of the node's parent: the box a percentage length on the
+    /// node resolves against. `None` for a root.
+    pub fn layout_parent_content_size(
+        &mut self,
+        id: LayoutId,
+        scale_factor: f32,
+    ) -> Option<Size<Pixels>> {
+        let parent = self.taffy.parent(id.0)?;
+        let layout = self.taffy.layout(parent).expect(EXPECT_MESSAGE);
+        Some(Size {
+            width: Pixels(layout.content_box_width() / scale_factor),
+            height: Pixels(layout.content_box_height() / scale_factor),
+        })
+    }
 }
 
 /// A unique identifier for a layout node, generated when requesting a layout from Taffy

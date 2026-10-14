@@ -5224,6 +5224,38 @@ impl Window {
         Some(self.layout_bounds(parent))
     }
 
+    /// The extent of the content of the given layout node, in logical pixels,
+    /// measured from its padding-box origin, so it includes padding but not
+    /// border. It is the scrollable-overflow extent, so it is independent of how
+    /// large the node was laid out to be: a node clamped to zero height still
+    /// reports the height its content wants.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_content_size(&mut self, layout_id: LayoutId) -> Size<Pixels> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .layout_content_size(layout_id, scale_factor)
+    }
+
+    /// The content box of the given layout node's parent, in logical pixels:
+    /// the box a percentage length on the node resolves against. `None` for a
+    /// root node.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_parent_content_size(&mut self, layout_id: LayoutId) -> Option<Size<Pixels>> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .layout_parent_content_size(layout_id, scale_factor)
+    }
+
     /// This method should be called during `prepaint`. You can use
     /// the returned [Hitbox] during `paint` or in an event handler
     /// to determine whether the inserted hitbox was the topmost.
