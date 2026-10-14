@@ -91,6 +91,10 @@ impl Element for Svg {
         self.interactivity.write_a11y_info(node);
     }
 
+    fn a11y_relations(&self) -> &[(crate::A11yRelation, Vec<crate::SharedString>)] {
+        &self.interactivity.aria.relations
+    }
+
     fn request_layout(
         &mut self,
         global_id: Option<&GlobalElementId>,

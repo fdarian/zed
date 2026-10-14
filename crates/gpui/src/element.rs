@@ -32,9 +32,9 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId,
-    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
-    util::FluentBuilder, window::with_element_arena,
+    A11yRelation, A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context,
+    DispatchNodeId, ElementId, FocusHandle, InspectorElementId, LayoutId, Pixels, Point,
+    SharedString, Size, Style, Window, util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -118,6 +118,13 @@ pub trait Element: 'static + IntoElement {
     ///
     /// See the [accessibility guide](crate::_accessibility) for an overview.
     fn write_a11y_info(&self, _node: &mut accesskit::Node) {}
+
+    /// Relations of this element's node to other nodes, named by author id.
+    /// Resolved when the frame is finalized, so the targets may be anywhere in
+    /// the tree. Read only when `a11y_role()` returns `Some`.
+    fn a11y_relations(&self) -> &[(A11yRelation, Vec<SharedString>)] {
+        &[]
+    }
 
     /// Add synthetic child nodes to an [`Element`] that has an
     /// [`.id()`][Element::id] and a [`.role()`][Element::a11y_role].
@@ -378,6 +385,14 @@ impl<E: Element> Drawable<E> {
                             self.element.write_a11y_info(&mut node);
                             window.a11y.node_bounds.insert(node_id, bounds);
                             pushed_a11y_node = window.a11y.nodes.push(node_id, node);
+                            if pushed_a11y_node {
+                                for (relation, author_ids) in self.element.a11y_relations() {
+                                    window
+                                        .a11y
+                                        .nodes
+                                        .defer_relation(node_id, *relation, author_ids);
+                                }
+                            }
                             #[cfg(debug_assertions)]
                             if pushed_a11y_node {
                                 let view = window

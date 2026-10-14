@@ -1333,6 +1333,32 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Relate this element's accessibility node to the nodes whose
+    /// [`accessibility_id`][Self::accessibility_id] is in `author_ids`.
+    ///
+    /// The ids are resolved when the frame is complete, so the targets may be
+    /// anywhere in the tree, including after this element. Ids that match no
+    /// node are dropped.
+    fn a11y_relation(
+        mut self,
+        relation: crate::A11yRelation,
+        author_ids: impl IntoIterator<Item = SharedString>,
+    ) -> Self {
+        self.interactivity()
+            .aria
+            .relations
+            .push((relation, author_ids.into_iter().collect()));
+        self
+    }
+
+    /// Edit this element's accessibility node directly, after every other
+    /// `aria_*` setting has been written. For AccessKit properties that have
+    /// no dedicated builder method.
+    fn a11y_node(mut self, edit: impl Fn(&mut accesskit::Node) + 'static) -> Self {
+        self.interactivity().aria.node_hook = Some(std::rc::Rc::new(edit));
+        self
+    }
+
     /// Set the accessible label for this element.
     fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.interactivity().aria.label = Some(label.into());
@@ -1874,6 +1900,10 @@ impl Element for Div {
         self.interactivity.write_a11y_info(node);
     }
 
+    fn a11y_relations(&self) -> &[(crate::A11yRelation, Vec<crate::SharedString>)] {
+        &self.interactivity.aria.relations
+    }
+
     fn a11y_synthetic_children(
         &mut self,
         _prepaint: &mut Self::PrepaintState,
@@ -2085,6 +2115,8 @@ pub(crate) struct AriaProperties {
     pub(crate) column_index: Option<usize>,
     pub(crate) row_count: Option<usize>,
     pub(crate) column_count: Option<usize>,
+    pub(crate) relations: Vec<(crate::A11yRelation, Vec<SharedString>)>,
+    pub(crate) node_hook: Option<std::rc::Rc<dyn Fn(&mut accesskit::Node)>>,
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -3552,6 +3584,9 @@ impl Interactivity {
         if let Some(count) = self.aria.column_count {
             node.set_column_count(count);
         }
+        if let Some(hook) = &self.aria.node_hook {
+            hook(node);
+        }
         if !self.click_listeners.is_empty() {
             node.add_action(accesskit::Action::Click);
         }
@@ -4012,6 +4047,10 @@ where
 
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
         self.element.write_a11y_info(node);
+    }
+
+    fn a11y_relations(&self) -> &[(crate::A11yRelation, Vec<SharedString>)] {
+        self.element.a11y_relations()
     }
 
     fn a11y_synthetic_children(

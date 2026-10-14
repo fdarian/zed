@@ -304,6 +304,44 @@ impl A11y {
     }
 }
 
+/// A relation from one accessibility node to others, named by the author ids
+/// of the targets (see [`StatefulInteractiveElement::accessibility_id`]).
+///
+/// The targets of a relation are usually elsewhere in the tree and may be
+/// prepainted after the node that names them, so they are resolved once the
+/// frame is complete. Author ids that match no node are dropped, like a DOM
+/// `aria-labelledby` that names a missing element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum A11yRelation {
+    /// `aria-labelledby`
+    LabelledBy,
+    /// `aria-describedby`
+    DescribedBy,
+    /// `aria-controls`
+    Controls,
+    /// `aria-owns`
+    Owns,
+    /// `aria-details`
+    Details,
+    /// `aria-flowto`
+    FlowTo,
+    /// `aria-errormessage`. AccessKit holds one target; the first that
+    /// resolves wins.
+    ErrorMessage,
+    /// `aria-activedescendant`, set on the container. When the container is
+    /// the focused node, assistive technology is told that the target has
+    /// focus instead.
+    ActiveDescendant,
+}
+
+/// Unresolved targets of one relation, recorded in prepaint and resolved in
+/// [`A11yNodeBuilder::finalize`].
+struct PendingRelation {
+    node: NodeId,
+    relation: A11yRelation,
+    author_ids: Vec<SharedString>,
+}
+
 /// Builder API for synthetic children. See the docs for
 /// [`Element::a11y_synthetic_children`].
 pub struct A11ySubtreeBuilder<'a> {
@@ -388,6 +426,10 @@ pub(crate) struct A11yNodeBuilder {
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
     active_descendant: Option<NodeId>,
+    /// Author id to node, in push (document) order; the first node to claim an
+    /// id owns it, as with a DOM `id`.
+    author_ids: FxHashMap<String, NodeId>,
+    pending_relations: Vec<PendingRelation>,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
 }
@@ -401,6 +443,8 @@ impl A11yNodeBuilder {
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
+            author_ids: FxHashMap::default(),
+            pending_relations: Vec::new(),
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
         }
@@ -436,6 +480,7 @@ impl A11yNodeBuilder {
             return false;
         }
 
+        self.record_author_id(id, &node);
         if let Some(parent) = self.nodes_stack.last_mut() {
             parent.push_child(id);
         }
@@ -454,11 +499,36 @@ impl A11yNodeBuilder {
             return false;
         }
 
+        self.record_author_id(id, &node);
         if let Some(parent) = self.nodes_stack.last_mut() {
             parent.push_child(id);
         }
         self.all_nodes.push((id, node));
         true
+    }
+
+    fn record_author_id(&mut self, id: NodeId, node: &accesskit::Node) {
+        if let Some(author_id) = node.author_id() {
+            self.author_ids.entry(author_id.to_string()).or_insert(id);
+        }
+    }
+
+    /// Record relations of `node`, which must already be pushed this frame,
+    /// to be resolved when the frame is finalized.
+    pub(crate) fn defer_relation(
+        &mut self,
+        node: NodeId,
+        relation: A11yRelation,
+        author_ids: &[SharedString],
+    ) {
+        if author_ids.is_empty() {
+            return;
+        }
+        self.pending_relations.push(PendingRelation {
+            node,
+            relation,
+            author_ids: author_ids.to_vec(),
+        });
     }
 
     pub(crate) fn current_node_mut(&mut self) -> Option<&mut accesskit::Node> {
@@ -481,6 +551,8 @@ impl A11yNodeBuilder {
         self.ids_stack.clear();
         self.nodes_stack.clear();
         self.seen_ids.clear();
+        self.author_ids.clear();
+        self.pending_relations.clear();
         #[cfg(debug_assertions)]
         self.node_info.clear();
         let mut root_node = accesskit::Node::new(accesskit::Role::Window);
@@ -566,6 +638,8 @@ impl A11yNodeBuilder {
             }
         }
 
+        let relation_focus = self.resolve_relations();
+
         let focus = match self.active_descendant {
             Some(id) if self.has_node(id) => id,
             Some(id) => {
@@ -577,7 +651,7 @@ impl A11yNodeBuilder {
                 }
             }
 
-            _ => self.focus.unwrap_or(ROOT_NODE_ID),
+            _ => relation_focus.or(self.focus).unwrap_or(ROOT_NODE_ID),
         };
 
         let nodes = std::mem::take(&mut self.all_nodes);
@@ -589,6 +663,54 @@ impl A11yNodeBuilder {
         };
 
         Self::repair_tree_update(update)
+    }
+
+    /// Write the pending relations onto their nodes. Returns the node that
+    /// should take focus because the focused node names it as its
+    /// `ActiveDescendant`.
+    fn resolve_relations(&mut self) -> Option<NodeId> {
+        let pending = std::mem::take(&mut self.pending_relations);
+        if pending.is_empty() {
+            return None;
+        }
+        let positions: FxHashMap<NodeId, usize> = self
+            .all_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, (id, _))| (*id, index))
+            .collect();
+
+        let mut focus = None;
+        for relation in pending {
+            let Some(&position) = positions.get(&relation.node) else {
+                continue;
+            };
+            let targets: Vec<NodeId> = relation
+                .author_ids
+                .iter()
+                .filter_map(|author_id| self.author_ids.get(author_id.as_ref()).copied())
+                .collect();
+            let Some(&first) = targets.first() else {
+                continue;
+            };
+            let node = &mut self.all_nodes[position].1;
+            match relation.relation {
+                A11yRelation::LabelledBy => node.set_labelled_by(targets),
+                A11yRelation::DescribedBy => node.set_described_by(targets),
+                A11yRelation::Controls => node.set_controls(targets),
+                A11yRelation::Owns => node.set_owns(targets),
+                A11yRelation::Details => node.set_details(targets),
+                A11yRelation::FlowTo => node.set_flow_to(targets),
+                A11yRelation::ErrorMessage => node.set_error_message(first),
+                A11yRelation::ActiveDescendant => {
+                    node.set_active_descendant(first);
+                    if self.focus == Some(relation.node) {
+                        focus = Some(first);
+                    }
+                }
+            }
+        }
+        focus
     }
 
     /// Accesskit panics on invalid [`TreeUpdate`]s. This function defensively
@@ -642,7 +764,7 @@ impl A11yNodeBuilder {
 mod tests {
     // Import specific items rather than glob-importing `super`, which would pull
     // in gpui's own `test` attribute macro and shadow the standard one.
-    use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
+    use super::{A11y, A11yNodeBuilder, A11yRelation, ROOT_NODE_ID};
     use crate::FocusId;
     use accesskit::{NodeId, Role};
     use std::sync::{Arc, atomic::AtomicBool};
@@ -893,5 +1015,100 @@ mod tests {
 
         let update = a11y.end_frame(Default::default());
         assert_eq!(update.focus, a);
+    }
+    fn labelled_node(author_id: &str) -> accesskit::Node {
+        let mut node = test_node();
+        node.set_author_id(author_id);
+        node
+    }
+
+    fn node_in(update: &accesskit::TreeUpdate, id: NodeId) -> &accesskit::Node {
+        &update
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == id)
+            .expect("node is in the update")
+            .1
+    }
+
+    #[test]
+    fn relations_resolve_forward_references_by_author_id() {
+        let mut builder = new_builder();
+        let control = NodeId(1);
+        let label = NodeId(2);
+        let hint = NodeId(3);
+
+        assert!(builder.push(control, labelled_node("name")));
+        builder.defer_relation(
+            control,
+            A11yRelation::LabelledBy,
+            &["title".into(), "missing".into()],
+        );
+        builder.defer_relation(control, A11yRelation::DescribedBy, &["hint".into()]);
+        builder.pop();
+        assert!(builder.push(label, labelled_node("title")));
+        builder.pop();
+        assert!(builder.push(hint, labelled_node("hint")));
+        builder.pop();
+
+        let update = builder.finalize();
+        let control = node_in(&update, control);
+        assert_eq!(control.labelled_by(), &[label]);
+        assert_eq!(control.described_by(), &[hint]);
+    }
+
+    #[test]
+    fn relation_with_no_resolvable_target_is_not_written() {
+        let mut builder = new_builder();
+        let control = NodeId(1);
+
+        assert!(builder.push(control, test_node()));
+        builder.defer_relation(control, A11yRelation::Controls, &["missing".into()]);
+        builder.pop();
+
+        let update = builder.finalize();
+        assert!(node_in(&update, control).controls().is_empty());
+    }
+
+    #[test]
+    fn duplicate_author_ids_resolve_to_the_first_node_pushed() {
+        let mut builder = new_builder();
+        let control = NodeId(1);
+        let first = NodeId(2);
+        let second = NodeId(3);
+
+        assert!(builder.push(control, test_node()));
+        builder.defer_relation(control, A11yRelation::ErrorMessage, &["dup".into()]);
+        builder.pop();
+        assert!(builder.push(first, labelled_node("dup")));
+        builder.pop();
+        assert!(builder.push(second, labelled_node("dup")));
+        builder.pop();
+
+        let update = builder.finalize();
+        assert_eq!(node_in(&update, control).error_message(), Some(first));
+    }
+
+    #[test]
+    fn active_descendant_relation_moves_focus_only_when_container_is_focused() {
+        for focused in [true, false] {
+            let mut builder = new_builder();
+            let container = NodeId(1);
+            let item = NodeId(2);
+
+            assert!(builder.push(container, test_node()));
+            if focused {
+                builder.set_focus(container);
+            }
+            builder.defer_relation(container, A11yRelation::ActiveDescendant, &["row".into()]);
+            builder.pop();
+            assert!(builder.push(item, labelled_node("row")));
+            builder.pop();
+
+            let update = builder.finalize();
+            assert_eq!(node_in(&update, container).active_descendant(), Some(item));
+            let expected = if focused { item } else { ROOT_NODE_ID };
+            assert_eq!(update.focus, expected);
+        }
     }
 }

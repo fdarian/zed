@@ -312,6 +312,86 @@ fn node_to_json(
         aria.insert("column_count".into(), json!(v));
     }
 
+    // Flags and the remaining enum states.
+    let flags = [
+        ("hidden", node.is_hidden()),
+        ("disabled", node.is_disabled()),
+        ("required", node.is_required()),
+        ("read_only", node.is_read_only()),
+        ("multiselectable", node.is_multiselectable()),
+        ("busy", node.is_busy()),
+        ("live_atomic", node.is_live_atomic()),
+        ("modal", node.is_modal()),
+    ];
+    for (name, set) in flags {
+        if set {
+            aria.insert(name.into(), json!(true));
+        }
+    }
+    if let Some(v) = node.invalid() {
+        aria.insert("invalid".into(), json!(format!("{v:?}")));
+    }
+    if let Some(v) = node.live() {
+        aria.insert("live".into(), json!(format!("{v:?}")));
+    }
+    if let Some(v) = node.aria_current() {
+        aria.insert("aria_current".into(), json!(format!("{v:?}")));
+    }
+    if let Some(v) = node.has_popup() {
+        aria.insert("has_popup".into(), json!(format!("{v:?}")));
+    }
+    if let Some(v) = node.sort_direction() {
+        aria.insert("sort_direction".into(), json!(format!("{v:?}")));
+    }
+    if let Some(v) = node.auto_complete() {
+        aria.insert("auto_complete".into(), json!(format!("{v:?}")));
+    }
+    if let Some(v) = node.row_span() {
+        aria.insert("row_span".into(), json!(v));
+    }
+    if let Some(v) = node.column_span() {
+        aria.insert("column_span".into(), json!(v));
+    }
+    if let Some(v) = node.row_index_text() {
+        aria.insert("row_index_text".into(), json!(v));
+    }
+    if let Some(v) = node.column_index_text() {
+        aria.insert("column_index_text".into(), json!(v));
+    }
+    if let Some(v) = node.braille_label() {
+        aria.insert("braille_label".into(), json!(v));
+    }
+    if let Some(v) = node.braille_role_description() {
+        aria.insert("braille_role_description".into(), json!(v));
+    }
+
+    // Relations, as ephemeral ids of the target nodes.
+    let target = |target: &NodeId| {
+        ephemeral
+            .get(target)
+            .cloned()
+            .unwrap_or_else(|| target.0.to_string())
+    };
+    let relations = [
+        ("labelled_by", node.labelled_by()),
+        ("described_by", node.described_by()),
+        ("controls", node.controls()),
+        ("owns", node.owns()),
+        ("details", node.details()),
+        ("flow_to", node.flow_to()),
+    ];
+    for (name, targets) in relations {
+        if !targets.is_empty() {
+            aria.insert(name.into(), json!(targets.iter().map(target).collect::<Vec<_>>()));
+        }
+    }
+    if let Some(v) = node.error_message() {
+        aria.insert("error_message".into(), json!(target(&v)));
+    }
+    if let Some(v) = node.active_descendant() {
+        aria.insert("active_descendant".into(), json!(target(&v)));
+    }
+
     map.insert("aria".into(), serde_json::Value::Object(aria));
 
     serde_json::Value::Object(map)

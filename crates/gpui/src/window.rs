@@ -64,7 +64,7 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 
-pub use a11y::A11ySubtreeBuilder;
+pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
