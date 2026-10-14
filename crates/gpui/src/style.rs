@@ -238,6 +238,9 @@ pub struct Style {
     pub max_size: Size<Length>,
     /// Sets the preferred aspect ratio for the item. The ratio is calculated as width divided by height.
     pub aspect_ratio: Option<f32>,
+    /// Whether this is a replaced element such as an image. In block layout it is sized by its
+    /// own content instead of stretching to the container's width.
+    pub item_is_replaced: bool,
 
     // Spacing Properties
     /// How large should the margin be on each side?
@@ -833,6 +836,7 @@ impl Default for Style {
             min_size: Size::auto(),
             max_size: Size::auto(),
             aspect_ratio: None,
+            item_is_replaced: false,
             gap: Size::default(),
             // Alignment
             align_items: None,

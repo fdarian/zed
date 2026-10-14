@@ -1,9 +1,9 @@
 use crate::{
-    AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
+    AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
+    Interactivity, IntoElement, LayoutId, ObjectFit, Pixels, RenderImage, Resource,
     SharedString, SharedUri, StyleRefinement, Styled, Task, Window, decode_static_image,
-    decode_static_image_from_decoder, px,
+    decode_static_image_from_decoder, px, size,
 };
 use anyhow::Result;
 
@@ -318,6 +318,7 @@ impl Element for Img {
                 cx,
                 |mut style, window, cx| {
                     let mut replacement_id = None;
+                    let mut intrinsic = None;
 
                     match self.source.use_data(
                         self.image_cache
@@ -361,36 +362,18 @@ impl Element for Img {
 
                             let image_size = data.render_size(frame_index);
 
-                            if style.aspect_ratio.is_none() {
-                                style.aspect_ratio = Some(image_size.width / image_size.height);
-                            }
-
-                            if let Length::Auto = style.size.width {
-                                style.size.width = match style.size.height {
-                                    Length::Definite(DefiniteLength::Absolute(abs_length)) => {
-                                        let height_px = abs_length.to_pixels(window.rem_size());
-                                        Length::Definite(
-                                            px(image_size.width.0 * height_px.0
-                                                / image_size.height.0)
-                                            .into(),
-                                        )
-                                    }
-                                    _ => Length::Definite(image_size.width.into()),
-                                };
-                            }
-
-                            if let Length::Auto = style.size.height {
-                                style.size.height = match style.size.width {
-                                    Length::Definite(DefiniteLength::Absolute(abs_length)) => {
-                                        let width_px = abs_length.to_pixels(window.rem_size());
-                                        Length::Definite(
-                                            px(image_size.height.0 * width_px.0
-                                                / image_size.width.0)
-                                            .into(),
-                                        )
-                                    }
-                                    _ => Length::Definite(image_size.height.into()),
-                                };
+                            // Like a DOM `<img>`: an explicit `aspect_ratio` replaces the
+                            // intrinsic one, and a missing dimension is derived from the
+                            // other one by taffy, or from the intrinsic size when neither
+                            // is known. That is why neither size is filled in here: a
+                            // percentage width has no pixel value yet, and the box must
+                            // not take the bitmap's height next to it.
+                            if image_size.width.0 > 0.0 && image_size.height.0 > 0.0 {
+                                let ratio = *style
+                                    .aspect_ratio
+                                    .get_or_insert(image_size.width.0 / image_size.height.0);
+                                style.item_is_replaced = true;
+                                intrinsic = Some((image_size, ratio));
                             }
 
                             if global_id.is_some()
@@ -436,7 +419,22 @@ impl Element for Img {
                         }
                     }
 
-                    window.request_layout(style, replacement_id, cx)
+                    match intrinsic {
+                        Some((image_size, ratio)) => {
+                            window.request_measured_layout(style, move |known, _, _, _| {
+                                match (known.width, known.height) {
+                                    (Some(width), Some(height)) => size(width, height),
+                                    (Some(width), None) => size(width, width / ratio),
+                                    (None, Some(height)) => size(height * ratio, height),
+                                    // Height 0: taffy raises it to `width / aspect_ratio` after
+                                    // `max_width` and `min_width` clamped the width, so a clamped
+                                    // image keeps its proportions.
+                                    (None, None) => size(image_size.width, px(0.)),
+                                }
+                            })
+                        }
+                        None => window.request_layout(style, replacement_id, cx),
+                    }
                 },
             );
 

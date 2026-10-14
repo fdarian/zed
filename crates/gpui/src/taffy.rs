@@ -533,6 +533,7 @@ impl ToTaffy<taffy::style::Style> for Style {
             min_size: self.min_size.to_taffy(rem_size, scale_factor),
             max_size: self.max_size.to_taffy(rem_size, scale_factor),
             aspect_ratio: self.aspect_ratio,
+            item_is_replaced: self.item_is_replaced,
             margin: self.margin.to_taffy(rem_size, scale_factor),
             padding: self.padding.to_taffy(rem_size, scale_factor),
             border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor),
