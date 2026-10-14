@@ -7,9 +7,10 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
+    GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
+    Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi, point, px, quad,
+    rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -318,6 +319,30 @@ pub struct Style {
 
     /// The grid location of this element
     pub grid_location: Option<GridLocation>,
+
+    /// Full CSS `grid-template-columns`. Takes precedence over [`Style::grid_cols`].
+    pub grid_cols_template: Option<GridTemplateTracks>,
+
+    /// Full CSS `grid-template-rows`. Takes precedence over [`Style::grid_rows`].
+    pub grid_rows_template: Option<GridTemplateTracks>,
+
+    /// CSS `grid-auto-columns`: the size of implicitly created columns
+    pub grid_auto_cols: Option<Vec<GridTrack>>,
+
+    /// CSS `grid-auto-rows`: the size of implicitly created rows
+    pub grid_auto_rows: Option<Vec<GridTrack>>,
+
+    /// CSS `grid-auto-flow`
+    pub grid_auto_flow: Option<GridAutoFlow>,
+
+    /// CSS `grid-template-areas`
+    pub grid_template_areas: Option<GridTemplateAreas>,
+
+    /// CSS `justify-items`: how this container aligns its items along the inline axis
+    pub justify_items: Option<AlignItems>,
+
+    /// CSS `justify-self`: how this item aligns itself along the inline axis
+    pub justify_self: Option<AlignSelf>,
 
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
@@ -861,6 +886,14 @@ impl Default for Style {
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
+            grid_cols_template: None,
+            grid_rows_template: None,
+            grid_auto_cols: None,
+            grid_auto_rows: None,
+            grid_auto_flow: None,
+            grid_template_areas: None,
+            justify_items: None,
+            justify_self: None,
 
             #[cfg(debug_assertions)]
             debug: false,

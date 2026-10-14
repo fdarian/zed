@@ -466,6 +466,97 @@ fn border_widths_to_taffy(
     }
 }
 
+fn to_taffy_track_size_min(size: crate::GridTrackSize) -> taffy::style::MinTrackSizingFunction {
+    use crate::GridTrackSize::*;
+    use taffy::style::MinTrackSizingFunction as Min;
+    match size {
+        Length(value) => Min::length(value),
+        Percent(value) => Min::percent(value),
+        MinContent => Min::min_content(),
+        MaxContent => Min::max_content(),
+        // `auto`, and the maximum-only sizes, which a parser never puts in a minimum
+        Auto | Fr(_) | FitContentLength(_) | FitContentPercent(_) => Min::auto(),
+    }
+}
+
+fn to_taffy_track_size_max(size: crate::GridTrackSize) -> taffy::style::MaxTrackSizingFunction {
+    use crate::GridTrackSize::*;
+    use taffy::style::MaxTrackSizingFunction as Max;
+    match size {
+        Length(value) => Max::length(value),
+        Percent(value) => Max::percent(value),
+        Fr(value) => Max::fr(value),
+        Auto => Max::auto(),
+        MinContent => Max::min_content(),
+        MaxContent => Max::max_content(),
+        FitContentLength(value) => Max::fit_content_px(value),
+        FitContentPercent(value) => Max::fit_content_percent(value),
+    }
+}
+
+fn to_taffy_track(track: &crate::GridTrack) -> taffy::style::TrackSizingFunction {
+    taffy::style::TrackSizingFunction {
+        min: to_taffy_track_size_min(track.min),
+        max: to_taffy_track_size_max(track.max),
+    }
+}
+
+fn to_taffy_names(names: &[Vec<crate::SharedString>]) -> Vec<Vec<String>> {
+    names
+        .iter()
+        .map(|set| set.iter().map(|name| name.to_string()).collect())
+        .collect()
+}
+
+fn to_taffy_template(
+    template: &crate::GridTemplateTracks,
+) -> (
+    Vec<taffy::GridTemplateComponent<String>>,
+    Vec<Vec<String>>,
+) {
+    let components = template
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            crate::GridTemplateEntry::Track(track) => {
+                taffy::GridTemplateComponent::Single(to_taffy_track(track))
+            }
+            crate::GridTemplateEntry::Repeat {
+                repetition,
+                tracks,
+                line_names,
+            } => taffy::GridTemplateComponent::Repeat(taffy::GridTemplateRepetition {
+                count: match repetition {
+                    crate::GridRepetition::Count(count) => taffy::RepetitionCount::Count(*count),
+                    crate::GridRepetition::AutoFill => taffy::RepetitionCount::AutoFill,
+                    crate::GridRepetition::AutoFit => taffy::RepetitionCount::AutoFit,
+                },
+                tracks: tracks.iter().map(to_taffy_track).collect(),
+                line_names: to_taffy_names(line_names),
+            }),
+        })
+        .collect();
+    (components, to_taffy_names(&template.line_names))
+}
+
+fn to_taffy_areas(areas: &crate::GridTemplateAreas) -> taffy::GridTemplateAreas<String> {
+    taffy::GridTemplateAreas {
+        areas: areas
+            .areas
+            .iter()
+            .map(|area| taffy::GridTemplateArea {
+                name: area.name.to_string(),
+                row_start: area.row_start,
+                row_end: area.row_end,
+                column_start: area.column_start,
+                column_end: area.column_end,
+            })
+            .collect(),
+        row_count: areas.row_count,
+        column_count: areas.column_count,
+    }
+}
+
 trait ToTaffy<Output> {
     fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> Output;
 }
@@ -478,8 +569,8 @@ impl ToTaffy<taffy::style::Style> for Style {
             placement: &Range<crate::GridPlacement>,
         ) -> taffy::Line<taffy::GridPlacement> {
             taffy::Line {
-                start: placement.start.into(),
-                end: placement.end.into(),
+                start: placement.start.clone().into(),
+                end: placement.end.clone().into(),
             }
         }
 
@@ -514,6 +605,15 @@ impl ToTaffy<taffy::style::Style> for Style {
             .unwrap_or_default()
         }
 
+        let (grid_template_columns, grid_template_column_names) = match &self.grid_cols_template {
+            Some(template) => to_taffy_template(template),
+            None => (to_grid_repeat(&self.grid_cols), Vec::new()),
+        };
+        let (grid_template_rows, grid_template_row_names) = match &self.grid_rows_template {
+            Some(template) => to_taffy_template(template),
+            None => (to_grid_repeat(&self.grid_rows), Vec::new()),
+        };
+
         taffy::style::Style {
             display: self.display.into(),
             overflow: self.overflow.into(),
@@ -547,8 +647,26 @@ impl ToTaffy<taffy::style::Style> for Style {
             flex_basis: self.flex_basis.to_taffy(rem_size, scale_factor),
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
-            grid_template_rows: to_grid_repeat(&self.grid_rows),
-            grid_template_columns: to_grid_repeat(&self.grid_cols),
+            justify_items: self.justify_items.map(|x| x.into()),
+            justify_self: self.justify_self.map(|x| x.into()),
+            grid_template_rows,
+            grid_template_columns,
+            grid_template_row_names,
+            grid_template_column_names,
+            grid_auto_rows: self
+                .grid_auto_rows
+                .iter()
+                .flatten()
+                .map(to_taffy_track)
+                .collect(),
+            grid_auto_columns: self
+                .grid_auto_cols
+                .iter()
+                .flatten()
+                .map(to_taffy_track)
+                .collect(),
+            grid_auto_flow: self.grid_auto_flow.unwrap_or_default().into(),
+            grid_template_areas: self.grid_template_areas.as_ref().map(to_taffy_areas),
             grid_row: self
                 .grid_location
                 .as_ref()

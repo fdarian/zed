@@ -18,7 +18,7 @@ use std::{
 };
 use taffy::prelude::{TaffyGridLine, TaffyGridSpan};
 
-use crate::{App, DisplayId};
+use crate::{App, DisplayId, SharedString};
 
 /// Axis in a 2D cartesian space.
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -3798,12 +3798,17 @@ pub struct GridLocation {
 }
 
 /// The placement of an item within a grid layout's column or row.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize, JsonSchema, Default)]
 pub enum GridPlacement {
     /// The grid line index to place this item.
     Line(i16),
     /// The number of grid lines to span.
     Span(u16),
+    /// Place at the nth line with this name (`0` when no index was written), or at the
+    /// implicit `<name>-start` / `<name>-end` line of a `grid-template-areas` area.
+    NamedLine(SharedString, i16),
+    /// Span until the nth line with this name.
+    NamedSpan(SharedString, u16),
     /// Automatically determine the placement, equivalent to Span(1)
     #[default]
     Auto,
@@ -3814,6 +3819,12 @@ impl From<GridPlacement> for taffy::GridPlacement {
         match placement {
             GridPlacement::Line(index) => taffy::GridPlacement::from_line_index(index),
             GridPlacement::Span(span) => taffy::GridPlacement::from_span(span),
+            GridPlacement::NamedLine(name, index) => {
+                taffy::GridPlacement::NamedLine(name.to_string(), index)
+            }
+            GridPlacement::NamedSpan(name, span) => {
+                taffy::GridPlacement::NamedSpan(name.to_string(), span)
+            }
             GridPlacement::Auto => taffy::GridPlacement::Auto,
         }
     }
