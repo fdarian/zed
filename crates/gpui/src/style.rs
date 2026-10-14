@@ -1289,6 +1289,10 @@ pub enum Position {
     ///
     /// WARNING: to opt-out of layouting entirely, you must use [`Display::None`] instead on your [`Style`] object.
     Absolute,
+    /// Lays out like [`Position::Relative`] with the insets ignored. Once laid out, the element is
+    /// moved to stay inside the scrollport of its nearest scroll container, inset by `top`,
+    /// `right`, `bottom` and `left`, and never out of its parent's content box.
+    Sticky,
 }
 
 impl From<AlignItems> for taffy::style::AlignItems {
@@ -1367,7 +1371,7 @@ impl From<Overflow> for taffy::style::Overflow {
 impl From<Position> for taffy::style::Position {
     fn from(value: Position) -> Self {
         match value {
-            Position::Relative => Self::Relative,
+            Position::Relative | Position::Sticky => Self::Relative,
             Position::Absolute => Self::Absolute,
         }
     }

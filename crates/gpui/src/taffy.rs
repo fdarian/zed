@@ -485,7 +485,12 @@ impl ToTaffy<taffy::style::Style> for Style {
             overflow: self.overflow.into(),
             scrollbar_width: self.scrollbar_width.to_taffy(rem_size, scale_factor),
             position: self.position.into(),
-            inset: self.inset.to_taffy(rem_size, scale_factor),
+            // A sticky element is moved when it is prepainted, not by layout.
+            inset: if self.position == crate::Position::Sticky {
+                Edges::auto().to_taffy(rem_size, scale_factor)
+            } else {
+                self.inset.to_taffy(rem_size, scale_factor)
+            },
             size: self.size.to_taffy(rem_size, scale_factor),
             min_size: self.min_size.to_taffy(rem_size, scale_factor),
             max_size: self.max_size.to_taffy(rem_size, scale_factor),

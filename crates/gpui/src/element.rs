@@ -33,7 +33,7 @@
 
 use crate::{
     A11yRelation, A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context,
-    DispatchNodeId, ElementId, FocusHandle, InspectorElementId, LayoutId, Pixels, Point,
+    DispatchNodeId, ElementId, FocusHandle, InspectorElementId, IsZero, LayoutId, Pixels, Point,
     SharedString, Size, Style, Window, util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
@@ -89,6 +89,12 @@ pub trait Element: 'static + IntoElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState;
+
+    /// How far this element is moved from where layout put it, for `position: sticky`. Its
+    /// children and its own paint move with it. Called in prepaint with the laid-out bounds.
+    fn prepaint_offset(&self, _layout_bounds: Bounds<Pixels>, _window: &Window) -> Point<Pixels> {
+        Point::default()
+    }
 
     /// Once layout has been completed, this method will be called to paint the element to the screen.
     /// The state argument is the same state that was returned from [`Element::request_layout()`].
@@ -368,7 +374,13 @@ impl<E: Element> Drawable<E> {
                     debug_assert_eq!(&*global_id.as_ref().unwrap().0, &*window.element_id_stack);
                 }
 
-                let bounds = window.layout_bounds(layout_id);
+                let mut bounds = window.layout_bounds(layout_id);
+                let sticky_offset = self.element.prepaint_offset(bounds, window);
+                if !sticky_offset.is_zero() {
+                    let shifted = window.element_offset() + sticky_offset;
+                    window.element_offset_stack.push(shifted);
+                    bounds = window.layout_bounds(layout_id);
+                }
                 let mut pushed_a11y_node = false;
                 if window.a11y.is_active() {
                     if let Some(global_id) = global_id.as_ref() {
@@ -425,6 +437,9 @@ impl<E: Element> Drawable<E> {
                     cx,
                 );
                 window.next_frame.dispatch_tree.pop_node();
+                if !sticky_offset.is_zero() {
+                    window.element_offset_stack.pop();
+                }
 
                 if pushed_a11y_node {
                     if let Some(global_id) = global_id.as_ref() {

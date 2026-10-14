@@ -37,6 +37,7 @@ mod path_builder;
 mod platform;
 pub mod prelude;
 mod scroll_routing;
+mod sticky;
 /// Profiling utilities for task, frame, and thread performance tracking.
 pub mod profiler;
 #[cfg(any(
@@ -107,6 +108,7 @@ pub use executor::*;
 pub use geometry::*;
 pub use gestures::*;
 pub use scroll_routing::OverscrollBehavior;
+pub use sticky::StickyInsets;
 pub use global::*;
 pub use gpui_macros::{
     AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,

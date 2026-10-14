@@ -22,9 +22,10 @@ use crate::{
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, OverscrollBehavior,
-    ParentElement, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
+    ParentElement, Position, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     scroll_routing, size,
+    sticky::{self, StickyInsets},
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -1986,6 +1987,19 @@ impl Element for Div {
         (layout_id, DivFrameState { child_layout_ids })
     }
 
+    fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
+        let style = &self.interactivity.base_style;
+        if style.position != Some(Position::Sticky) {
+            return Point::default();
+        }
+        let insets = StickyInsets::resolve(&style.inset, window.viewport_size(), window);
+        if !insets.any() {
+            return Point::default();
+        }
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        sticky::offset(layout_bounds, insets, viewport)
+    }
+
     #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
     fn prepaint(
         &mut self,
@@ -2046,6 +2060,7 @@ impl Element for Div {
         }
 
         let overlay_prepainter = self.interactivity.overlay_prepainter.take();
+        let content_end = self.interactivity.content_end;
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2060,19 +2075,28 @@ impl Element for Div {
                 }
 
                 window.with_image_cache(image_cache, |window| {
+                    let (scrollport, containing_block) = sticky::frames(
+                        bounds,
+                        style,
+                        scroll_offset,
+                        content_end,
+                        window.rem_size(),
+                    );
                     window.with_element_offset(scroll_offset, |window| {
-                        if let Some(order_fn) = &self.prepaint_order_fn {
-                            let order = order_fn(window, cx);
-                            for idx in order {
-                                if let Some(child) = self.children.get_mut(idx) {
+                        sticky::within(scrollport, containing_block, || {
+                            if let Some(order_fn) = &self.prepaint_order_fn {
+                                let order = order_fn(window, cx);
+                                for idx in order {
+                                    if let Some(child) = self.children.get_mut(idx) {
+                                        child.prepaint(window, cx);
+                                    }
+                                }
+                            } else {
+                                for child in &mut self.children {
                                     child.prepaint(window, cx);
                                 }
                             }
-                        } else {
-                            for child in &mut self.children {
-                                child.prepaint(window, cx);
-                            }
-                        }
+                        })
                     });
 
                     if let Some(listener) = self.prepaint_listener.as_ref() {
@@ -4208,6 +4232,10 @@ where
         self.element.request_layout(id, inspector_id, window, cx)
     }
 
+    fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
+        self.element.prepaint_offset(layout_bounds, window)
+    }
+
     fn prepaint(
         &mut self,
         id: Option<&GlobalElementId>,
@@ -4216,7 +4244,7 @@ where
         state: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
-    ) -> E::PrepaintState {
+    ) -> Self::PrepaintState {
         self.element
             .prepaint(id, inspector_id, bounds, state, window, cx)
     }
