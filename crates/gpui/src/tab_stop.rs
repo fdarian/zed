@@ -106,6 +106,37 @@ impl TabStopMap {
         self.current_path.0.pop();
     }
 
+    /// Puts the tab stops recorded since `start` back in the order of `segments`, the ranges of
+    /// [`Self::insertion_history`] that each belonged to one child, listed in document order.
+    ///
+    /// Tab order is document order, but a parent that paints its children in another order
+    /// (CSS stacking) prepaints them in that order and so registers them in it.
+    pub fn restore_document_order(&mut self, start: usize, segments: &[std::ops::Range<usize>]) {
+        let in_order = segments.windows(2).all(|pair| pair[0].end <= pair[1].start);
+        let has_tab_stops = self.insertion_history[start..]
+            .iter()
+            .any(|operation| matches!(operation, TabStopOperation::Insert(_)));
+        if in_order || !has_tab_stops {
+            return;
+        }
+
+        let covered_end = segments.iter().map(|range| range.end).max().unwrap_or(start);
+        let mut operations = self.insertion_history[..start].to_vec();
+        for range in segments {
+            operations.extend_from_slice(&self.insertion_history[range.clone()]);
+        }
+        operations.extend_from_slice(&self.insertion_history[covered_end..]);
+
+        self.clear();
+        for operation in operations {
+            match operation {
+                TabStopOperation::Insert(focus_handle) => self.insert(&focus_handle),
+                TabStopOperation::Group(tab_index) => self.begin_group(tab_index),
+                TabStopOperation::GroupEnd => self.end_group(),
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         *self = Self::default();
         self.current_path.0.clear();

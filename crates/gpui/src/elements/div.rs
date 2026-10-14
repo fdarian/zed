@@ -1821,6 +1821,7 @@ pub fn div() -> Div {
         prepaint_listener: None,
         image_cache: None,
         prepaint_order_fn: None,
+        paint_ranks: None,
     }
 }
 
@@ -1831,9 +1832,27 @@ pub struct Div {
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
     prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
+    paint_ranks: Option<Vec<i32>>,
 }
 
 impl Div {
+    /// Paints and hit-tests children in ascending `ranks` order, ties in child order, while
+    /// layout keeps child order. `ranks[i]` belongs to the i-th child; missing entries are 0.
+    /// This is how CSS stacking works: positioned children paint over in-flow ones and `z-index`
+    /// orders them, without moving them in the layout.
+    pub fn paint_ranks(mut self, ranks: Vec<i32>) -> Self {
+        self.paint_ranks = Some(ranks);
+        self
+    }
+
+    fn child_paint_order(&self) -> SmallVec<[usize; 8]> {
+        let mut order: SmallVec<[usize; 8]> = (0..self.children.len()).collect();
+        if let Some(ranks) = &self.paint_ranks {
+            order.sort_by_key(|index| ranks.get(*index).copied().unwrap_or(0));
+        }
+        order
+    }
+
     /// Add a listener to be called when the children of this `Div` are prepainted.
     /// This allows you to store the [`Bounds`] of the children for later use.
     pub fn on_children_prepainted(
@@ -2065,6 +2084,7 @@ impl Element for Div {
 
         let overlay_prepainter = self.interactivity.overlay_prepainter.take();
         let content_end = self.interactivity.content_end;
+        let paint_order = self.paint_ranks.as_ref().map(|_| self.child_paint_order());
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2094,6 +2114,10 @@ impl Element for Div {
                                     if let Some(child) = self.children.get_mut(idx) {
                                         child.prepaint(window, cx);
                                     }
+                                }
+                            } else if let Some(order) = &paint_order {
+                                for &idx in order {
+                                    self.children[idx].prepaint(window, cx);
                                 }
                             } else {
                                 for child in &mut self.children {
@@ -2133,6 +2157,7 @@ impl Element for Div {
             .map(|provider| provider.provide(window, cx));
 
         let overlay_painter = self.interactivity.overlay_painter.take();
+        let paint_order = self.paint_ranks.as_ref().map(|_| self.child_paint_order());
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
@@ -2147,8 +2172,28 @@ impl Element for Div {
                         return;
                     }
 
-                    for child in &mut self.children {
-                        child.paint(window, cx);
+                    if let Some(order) = &paint_order {
+                        // Tab stops register while painting, so they follow the paint order and
+                        // are put back in document order afterwards.
+                        let tab_stops_start = window.next_frame.tab_stops.insertion_history.len();
+                        let mut segments = Vec::with_capacity(order.len());
+                        for &idx in order {
+                            let from = window.next_frame.tab_stops.insertion_history.len();
+                            self.children[idx].paint(window, cx);
+                            let to = window.next_frame.tab_stops.insertion_history.len();
+                            segments.push((idx, from..to));
+                        }
+                        segments.sort_by_key(|(idx, _)| *idx);
+                        let segments: Vec<_> =
+                            segments.into_iter().map(|(_, range)| range).collect();
+                        window
+                            .next_frame
+                            .tab_stops
+                            .restore_document_order(tab_stops_start, &segments);
+                    } else {
+                        for child in &mut self.children {
+                            child.paint(window, cx);
+                        }
                     }
                     if let Some(painter) = overlay_painter {
                         painter(bounds, window, cx);
@@ -4172,6 +4217,14 @@ where
 {
     fn style(&mut self) -> &mut StyleRefinement {
         self.element.style()
+    }
+}
+
+impl Stateful<Div> {
+    /// See [`Div::paint_ranks`].
+    pub fn paint_ranks(mut self, ranks: Vec<i32>) -> Self {
+        self.element = self.element.paint_ranks(ranks);
+        self
     }
 }
 
