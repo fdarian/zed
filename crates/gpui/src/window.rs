@@ -3085,6 +3085,24 @@ impl Window {
         self.capslock
     }
 
+    /// Draws now if the window has pending changes, so a caller that needs
+    /// current layout (a bounds query) does not read the previous frame.
+    ///
+    /// Does not present: `needs_present` is set and the platform's next frame
+    /// request presents what this drew, without drawing again. Returns false
+    /// without drawing when the window is clean or a draw is already running
+    /// on this thread.
+    pub fn draw_if_dirty(&mut self, cx: &mut App) -> bool {
+        if !self.invalidator.is_dirty() || draw_in_progress() {
+            return false;
+        }
+        self.draw(cx).clear(cx);
+        // The frame request that was waiting on the dirty flag may already have
+        // fired; wake the platform so something presents this frame.
+        self.invalidator.wake_platform();
+        true
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
