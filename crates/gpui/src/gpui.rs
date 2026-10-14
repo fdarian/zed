@@ -36,6 +36,7 @@ mod keymap;
 mod path_builder;
 mod platform;
 pub mod prelude;
+mod scroll_routing;
 /// Profiling utilities for task, frame, and thread performance tracking.
 pub mod profiler;
 #[cfg(any(
@@ -105,6 +106,7 @@ pub use elements::*;
 pub use executor::*;
 pub use geometry::*;
 pub use gestures::*;
+pub use scroll_routing::OverscrollBehavior;
 pub use global::*;
 pub use gpui_macros::{
     AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,

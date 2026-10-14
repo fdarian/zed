@@ -21,10 +21,10 @@ use crate::{
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
+    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, OverscrollBehavior,
+    ParentElement, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    scroll_routing, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -1593,6 +1593,13 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// What this element does with wheel delta it cannot scroll, per axis, like CSS
+    /// `overscroll-behavior`. The default hands it to the next scroll container up.
+    fn overscroll_behavior(mut self, x: OverscrollBehavior, y: OverscrollBehavior) -> Self {
+        self.interactivity().overscroll_behavior = point(x, y);
+        self
+    }
+
     /// Track the scroll state of this element with the given handle.
     fn anchor_scroll(mut self, scroll_anchor: Option<ScrollAnchor>) -> Self {
         self.interactivity().scroll_anchor = scroll_anchor;
@@ -2154,6 +2161,7 @@ pub struct Interactivity {
     /// Where the children end, measured from the border box origin. A `Div` sets it so
     /// that its scroll range follows CSS scrollable overflow, `content_size` otherwise.
     pub(crate) content_end: Option<Point<Pixels>>,
+    pub(crate) overscroll_behavior: Point<OverscrollBehavior>,
     pub(crate) overlay_painter:
         Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static>>,
     pub(crate) key_context: Option<KeyContext>,
@@ -2484,10 +2492,12 @@ impl Interactivity {
             // children's, plus the padding and border after them, which CSS adds to the
             // overflow so the last child can scroll clear of the edge.
             let far_edge = match self.content_end {
-                Some(content_end) => point(
-                    content_end.x + padding.right + border.right,
-                    content_end.y + padding.bottom + border.bottom,
-                ),
+                Some(content_end) => {
+                    point(
+                        content_end.x + padding.right + border.right,
+                        content_end.y + padding.bottom + border.bottom,
+                    )
+                }
                 None => {
                     let padding_size =
                         size(padding.left + padding.right, padding.top + padding.bottom);
@@ -3367,62 +3377,106 @@ impl Interactivity {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        if let Some(scroll_offset) = self.scroll_offset.clone() {
-            let ongoing_scroll = self.ongoing_scroll.clone();
-            let overflow = style.overflow;
-            let allow_concurrent_scroll = style.allow_concurrent_scroll;
-            let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
-            let line_height = window.line_height();
-            let hitbox = hitbox.clone();
-            let current_view = window.current_view();
+        let Some(scroll_offset) = self.scroll_offset.clone() else {
+            return;
+        };
+        let ongoing_scroll = self.ongoing_scroll.clone();
+        let overflow = style.overflow;
+        let allow_concurrent_scroll = style.allow_concurrent_scroll;
+        let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
+        let line_height = window.line_height();
+        let hitbox = hitbox.clone();
+        let current_view = window.current_view();
+
+        // A container that scrolls each axis by its own delta, and knows how far it can
+        // scroll, takes part in scroll chaining and latching (see `scroll_routing`).
+        // The other modes (one axis per gesture, a vertical wheel scrolling an x-only
+        // container) predate that and keep applying the whole delta.
+        if let Some(handle) = self.tracked_scroll_handle.clone()
+            && allow_concurrent_scroll
+            && !restrict_scroll_to_axis
+        {
+            let overscroll = self.overscroll_behavior;
+            let scroller = scroll_routing::scroller_id(&scroll_offset);
+
+            // Capture runs before any bubble listener, so by the time the first
+            // container claims the event the whole delta is waiting to be claimed.
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
-                    let mut scroll_offset = scroll_offset.borrow_mut();
-                    let old_scroll_offset = *scroll_offset;
-                    let mut delta = event.delta.pixel_delta(line_height);
-
-                    if restrict_scroll_to_axis
-                        && event.delta.precise()
-                        && let Some(ongoing_scroll) = &ongoing_scroll
-                    {
-                        ongoing_scroll
-                            .borrow_mut()
-                            .filter(&mut delta, event.touch_phase);
-                    }
-
-                    let mut delta_x = match overflow.x {
-                        Overflow::Scroll if !delta.x.is_zero() => delta.x,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
-                        {
-                            delta.y
-                        }
-                        _ => Pixels::ZERO,
-                    };
-                    let mut delta_y = match overflow.y {
-                        Overflow::Scroll if !delta.y.is_zero() => delta.y,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
-                        {
-                            delta.x
-                        }
-                        _ => Pixels::ZERO,
-                    };
-                    if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
-                        if delta_x.abs() > delta_y.abs() {
-                            delta_y = Pixels::ZERO;
-                        } else {
-                            delta_x = Pixels::ZERO;
-                        }
-                    }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
-                        cx.notify(current_view);
-                    }
+                if phase == DispatchPhase::Capture {
+                    scroll_routing::begin(window, cx, event, event.delta.pixel_delta(line_height));
                 }
             });
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let old_scroll_offset = *scroll_offset.borrow();
+                let claim = scroll_routing::Claim {
+                    scroller,
+                    under_pointer: scroll_routing::is_candidate(window, &hitbox),
+                    event: event.clone(),
+                    overflow,
+                    overscroll,
+                    offset: old_scroll_offset,
+                    max_offset: handle.max_offset(),
+                };
+                if let Some(new_scroll_offset) = scroll_routing::claim(window, cx, claim)
+                    && new_scroll_offset != old_scroll_offset
+                {
+                    *scroll_offset.borrow_mut() = new_scroll_offset;
+                    cx.notify(current_view);
+                }
+            });
+            return;
         }
+
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                let mut scroll_offset = scroll_offset.borrow_mut();
+                let old_scroll_offset = *scroll_offset;
+                let mut delta = event.delta.pixel_delta(line_height);
+
+                if restrict_scroll_to_axis
+                    && event.delta.precise()
+                    && let Some(ongoing_scroll) = &ongoing_scroll
+                {
+                    ongoing_scroll
+                        .borrow_mut()
+                        .filter(&mut delta, event.touch_phase);
+                }
+
+                let mut delta_x = match overflow.x {
+                    Overflow::Scroll if !delta.x.is_zero() => delta.x,
+                    Overflow::Scroll
+                        if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
+                    {
+                        delta.y
+                    }
+                    _ => Pixels::ZERO,
+                };
+                let mut delta_y = match overflow.y {
+                    Overflow::Scroll if !delta.y.is_zero() => delta.y,
+                    Overflow::Scroll
+                        if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
+                    {
+                        delta.x
+                    }
+                    _ => Pixels::ZERO,
+                };
+                if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
+                    if delta_x.abs() > delta_y.abs() {
+                        delta_y = Pixels::ZERO;
+                    } else {
+                        delta_x = Pixels::ZERO;
+                    }
+                }
+                scroll_offset.y += delta_y;
+                scroll_offset.x += delta_x;
+                if *scroll_offset != old_scroll_offset {
+                    cx.notify(current_view);
+                }
+            }
+        });
     }
 
     /// Compute the visual style for this element, based on the current bounds and the element's state.
