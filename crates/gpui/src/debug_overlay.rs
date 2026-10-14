@@ -250,7 +250,7 @@ fn solid_quad(
         bounds,
         content_mask: *content_mask,
         background: color.into(),
-        border_color: transparent_black(),
+        border_colors: Edges::all(transparent_black()),
         corner_radii: Corners::default(),
         border_widths: Edges::default(),
     }
