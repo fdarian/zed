@@ -726,6 +726,18 @@ impl Interactivity {
         self.hitbox_behavior = HitboxBehavior::BlockMouseExceptScroll;
     }
 
+    /// Make this element never the target of pointer hit testing, like CSS `pointer-events: none`.
+    /// The fluent API equivalent is [`InteractiveElement::pointer_events_none`].
+    pub fn pointer_events_none(&mut self) {
+        self.hitbox_behavior = HitboxBehavior::PassThrough;
+    }
+
+    /// Always insert a hitbox for this element in DOM hit testing mode.
+    /// The fluent API equivalent is [`InteractiveElement::always_hitbox`].
+    pub fn always_hitbox(&mut self) {
+        self.always_hitbox = true;
+    }
+
     fn has_pinch_listeners(&self) -> bool {
         !self.pinch_listeners.is_empty()
     }
@@ -1240,6 +1252,24 @@ pub trait InteractiveElement: Sized {
     /// See [`Hitbox::is_hovered`] for details.
     fn block_mouse_except_scroll(mut self) -> Self {
         self.interactivity().block_mouse_except_scroll();
+        self
+    }
+
+    /// Make this element never the target of pointer hit testing, like CSS `pointer-events: none`.
+    /// It stays in the hover chain when one of its descendants is hit, in DOM hit testing mode
+    /// (see [`Window::set_dom_hit_testing`]). Outside that mode it is skipped by hit testing.
+    /// The fluent API equivalent to [`Interactivity::pointer_events_none`].
+    fn pointer_events_none(mut self) -> Self {
+        self.interactivity().pointer_events_none();
+        self
+    }
+
+    /// Always insert a hitbox for this element in DOM hit testing mode, so it can be the target
+    /// (and part of the hover chain) even without listeners or hover styles. Has no effect
+    /// outside that mode (see [`Window::set_dom_hit_testing`]).
+    /// The fluent API equivalent to [`Interactivity::always_hitbox`].
+    fn always_hitbox(mut self) -> Self {
+        self.interactivity().always_hitbox();
         self
     }
 
@@ -2116,6 +2146,7 @@ pub struct Interactivity {
     pub(crate) paint_bounds_listener: Option<Box<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>>,
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) capture_pointer: bool,
+    pub(crate) always_hitbox: bool,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,
@@ -2320,7 +2351,12 @@ impl Interactivity {
 
                             let scroll_offset =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
-                            let result = f(&style, scroll_offset, hitbox, window, cx);
+                            let result = match hitbox.as_ref() {
+                                Some(parent) => window.with_hitbox_parent(parent, |window| {
+                                    f(&style, scroll_offset, hitbox.clone(), window, cx)
+                                }),
+                                None => f(&style, scroll_offset, hitbox, window, cx),
+                            };
                             (result, element_state)
                         },
                     )
@@ -2331,6 +2367,7 @@ impl Interactivity {
 
     fn should_insert_hitbox(&self, style: &Style, window: &Window, cx: &App) -> bool {
         self.hitbox_behavior != HitboxBehavior::Normal
+            || (self.always_hitbox && window.dom_hit_testing())
             || self.window_control.is_some()
             || style.mouse_cursor.is_some()
             || self.group.is_some()
@@ -4303,8 +4340,8 @@ impl ScrollHandle {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers, MouseMoveEvent,
-        TestAppContext, canvas, svg, util::FluentBuilder as _,
+        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers,
+        MouseMoveEvent, TestAppContext, canvas, svg, util::FluentBuilder as _,
     };
     use std::{
         cell::{Cell, RefCell},
@@ -5513,9 +5550,21 @@ mod tests {
                 events,
             }
         });
-        cx.simulate_mouse_down(point(px(10.), px(10.)), MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_move(point(px(200.), px(10.)), MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_up(point(px(200.), px(10.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_down(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(200.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(px(200.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
         assert_eq!(
             events.borrow().as_slice(),
             ["down", "handle-move", "handle-up"]
@@ -5532,17 +5581,402 @@ mod tests {
                 events,
             }
         });
-        cx.simulate_mouse_down(point(px(10.), px(10.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_down(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
         view.update(cx, |view, cx| {
             view.removed = true;
             cx.notify();
         });
         cx.run_until_parked();
-        cx.simulate_mouse_move(point(px(10.), px(10.)), MouseButton::Left, Modifiers::none());
-        cx.simulate_mouse_up(point(px(10.), px(10.)), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
         assert_eq!(
             events.borrow().as_slice(),
             ["down", "other-move", "other-up"]
         );
+    }
+
+    mod dom_hit_testing {
+        use super::*;
+        use crate::{
+            Entity, ScrollDelta, ScrollWheelEvent, StyleRefinement, TouchPhase, WindowHandle,
+            deferred, size,
+        };
+
+        struct SceneView {
+            build: Rc<dyn Fn() -> AnyElement>,
+        }
+
+        impl Render for SceneView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                (self.build)()
+            }
+        }
+
+        fn open_scene(
+            cx: &mut TestAppContext,
+            dom_hit_testing: bool,
+            build: impl Fn() -> AnyElement + 'static,
+        ) -> AnyWindowHandle {
+            let build: Rc<dyn Fn() -> AnyElement> = Rc::new(build);
+            let window = cx.open_window(size(px(800.), px(600.)), move |_, _| SceneView { build });
+            let window = AnyWindowHandle::from(window);
+            cx.update_window(window, |_, window, cx| {
+                window.set_dom_hit_testing(dom_hit_testing);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            window
+        }
+
+        fn root() -> Stateful<Div> {
+            div().id("root").size_full().always_hitbox()
+        }
+
+        fn node(name: &'static str, left: f32, top: f32, width: f32, height: f32) -> Stateful<Div> {
+            div()
+                .id(name)
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(width))
+                .h(px(height))
+                .always_hitbox()
+        }
+
+        fn move_to(window: &AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
+            cx.update_window(*window, |_, window, cx| {
+                window.simulate_mouse_move(point(px(x), px(y)), cx);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn chain(window: &AnyWindowHandle, cx: &mut TestAppContext) -> Vec<String> {
+            cx.update_window(*window, |_, window, _| {
+                window
+                    .hit_chain()
+                    .map(|(id, _)| id.last().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap()
+        }
+
+        fn chain_at(
+            window: &AnyWindowHandle,
+            cx: &mut TestAppContext,
+            x: f32,
+            y: f32,
+        ) -> Vec<String> {
+            move_to(window, cx, x, y);
+            chain(window, cx)
+        }
+
+        #[gpui::test]
+        fn nested_elements_form_a_chain_from_the_target_up(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(
+                        node("outer", 0., 0., 200., 200.).child(
+                            node("middle", 20., 20., 100., 100.)
+                                .child(node("inner", 10., 10., 50., 50.)),
+                        ),
+                    )
+                    .into_any_element()
+            });
+
+            assert_eq!(
+                chain_at(&window, cx, 50., 50.),
+                ["inner", "middle", "outer", "root"]
+            );
+            assert_eq!(
+                chain_at(&window, cx, 100., 100.),
+                ["middle", "outer", "root"]
+            );
+            assert_eq!(chain_at(&window, cx, 150., 150.), ["outer", "root"]);
+            assert_eq!(chain_at(&window, cx, 500., 500.), ["root"]);
+        }
+
+        #[gpui::test]
+        fn only_the_topmost_sibling_chain_is_hit(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("below", 0., 0., 100., 100.).child(node(
+                        "below-child",
+                        0.,
+                        0.,
+                        100.,
+                        100.,
+                    )))
+                    .child(node("above", 50., 50., 100., 100.))
+                    .into_any_element()
+            });
+
+            assert_eq!(chain_at(&window, cx, 75., 75.), ["above", "root"]);
+            assert_eq!(
+                chain_at(&window, cx, 25., 25.),
+                ["below-child", "below", "root"]
+            );
+        }
+
+        #[gpui::test]
+        fn a_pass_through_parent_is_chained_but_never_the_target(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(
+                        node("parent", 0., 0., 200., 200.)
+                            .pointer_events_none()
+                            .child(node("child", 20., 20., 50., 50.)),
+                    )
+                    .into_any_element()
+            });
+
+            assert_eq!(chain_at(&window, cx, 30., 30.), ["child", "parent", "root"]);
+            assert_eq!(chain_at(&window, cx, 150., 150.), ["root"]);
+        }
+
+        #[gpui::test]
+        fn a_pass_through_leaf_hits_the_element_below(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(
+                        node("parent", 0., 0., 200., 200.)
+                            .child(node("ghost-child", 20., 20., 50., 50.).pointer_events_none()),
+                    )
+                    .child(node("below", 300., 0., 100., 100.))
+                    .child(node("ghost-above", 300., 0., 100., 100.).pointer_events_none())
+                    .into_any_element()
+            });
+
+            assert_eq!(chain_at(&window, cx, 30., 30.), ["parent", "root"]);
+            assert_eq!(chain_at(&window, cx, 350., 50.), ["below", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_deferred_layer_is_parented_to_the_element_that_deferred_it(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("host", 0., 0., 100., 100.).child(deferred(
+                        node("popup", 300., 300., 100., 100.).child(node(
+                            "popup-child",
+                            10.,
+                            10.,
+                            20.,
+                            20.,
+                        )),
+                    )))
+                    .child(node("sibling", 300., 300., 100., 100.))
+                    .into_any_element()
+            });
+
+            // The sibling is later in the tree but the deferred layer paints over it, and the
+            // layer's chain goes through the host it was deferred from, not what is inserted
+            // before it or what is under it.
+            assert_eq!(
+                chain_at(&window, cx, 315., 315.),
+                ["popup-child", "popup", "host", "root"]
+            );
+            assert_eq!(chain_at(&window, cx, 380., 380.), ["popup", "host", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 50.), ["host", "root"]);
+        }
+
+        #[gpui::test]
+        fn content_masks_clip_the_target_but_not_its_ancestors(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("clip", 0., 0., 50., 50.).overflow_hidden().child(node(
+                        "overflowing",
+                        0.,
+                        0.,
+                        100.,
+                        100.,
+                    )))
+                    .into_any_element()
+            });
+
+            assert_eq!(
+                chain_at(&window, cx, 25., 25.),
+                ["overflowing", "clip", "root"]
+            );
+            assert_eq!(chain_at(&window, cx, 75., 75.), ["root"]);
+        }
+
+        #[gpui::test]
+        fn nothing_changes_while_dom_hit_testing_is_off(cx: &mut TestAppContext) {
+            let hovered = Rc::new(RefCell::new(Vec::new()));
+            let window = open_scene(cx, false, {
+                let hovered = hovered.clone();
+                move || {
+                    let record = |name: &'static str| {
+                        let hovered = hovered.clone();
+                        move |is_hovered: &bool, _: &mut Window, _: &mut App| {
+                            hovered.borrow_mut().push((name, *is_hovered));
+                        }
+                    };
+                    root()
+                        .child(node("below", 0., 0., 100., 100.).on_hover(record("below")))
+                        .child(node("above", 50., 50., 100., 100.).on_hover(record("above")))
+                        .child(node("quiet", 300., 300., 100., 100.))
+                        .into_any_element()
+                }
+            });
+
+            // Both overlapping siblings are hovered, as before the mode existed.
+            move_to(&window, cx, 75., 75.);
+            let mut entered = hovered.borrow().clone();
+            entered.sort();
+            assert_eq!(entered, [("above", true), ("below", true)]);
+            assert!(chain(&window, cx).is_empty());
+
+            // `always_hitbox` inserts nothing without the mode.
+            cx.update_window(window, |_, window, _| {
+                let quiet_hitboxes = window
+                    .rendered_frame
+                    .hitboxes
+                    .iter()
+                    .filter(|hitbox| hitbox.bounds.contains(&point(px(350.), px(350.))))
+                    .count();
+                assert_eq!(quiet_hitboxes, 0);
+            })
+            .unwrap();
+        }
+
+        #[gpui::test]
+        fn the_whole_chain_is_hovered_and_handles_scroll(cx: &mut TestAppContext) {
+            let hovered = Rc::new(RefCell::new(Vec::new()));
+            let scrolled = Rc::new(RefCell::new(Vec::new()));
+            let window = open_scene(cx, true, {
+                let hovered = hovered.clone();
+                let scrolled = scrolled.clone();
+                move || {
+                    let on_hover = |name: &'static str| {
+                        let hovered = hovered.clone();
+                        move |is_hovered: &bool, _: &mut Window, _: &mut App| {
+                            hovered.borrow_mut().push((name, *is_hovered));
+                        }
+                    };
+                    let on_scroll = |name: &'static str| {
+                        let scrolled = scrolled.clone();
+                        move |_: &ScrollWheelEvent, _: &mut Window, _: &mut App| {
+                            scrolled.borrow_mut().push(name);
+                        }
+                    };
+                    root()
+                        .child(
+                            node("outer", 0., 0., 200., 200.)
+                                .on_hover(on_hover("outer"))
+                                .on_scroll_wheel(on_scroll("outer"))
+                                .child(
+                                    node("inner", 10., 10., 50., 50.)
+                                        .on_hover(on_hover("inner"))
+                                        .on_scroll_wheel(on_scroll("inner")),
+                                ),
+                        )
+                        .child(
+                            node("other", 300., 0., 100., 100.)
+                                .occlude()
+                                .on_hover(on_hover("other"))
+                                .on_scroll_wheel(on_scroll("other")),
+                        )
+                        .into_any_element()
+                }
+            });
+
+            move_to(&window, cx, 30., 30.);
+            let mut entered = hovered.borrow().clone();
+            entered.sort();
+            assert_eq!(entered, [("inner", true), ("outer", true)]);
+
+            cx.update_window(window, |_, window, cx| {
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position: point(px(30.), px(30.)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-10.))),
+                        modifiers: Default::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+            let mut handled = scrolled.borrow().clone();
+            handled.sort();
+            assert_eq!(handled, ["inner", "outer"]);
+        }
+
+        struct CachedLayers;
+
+        impl Render for CachedLayers {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(node("leaf", 10., 10., 50., 50.))
+                    .child(deferred(node("layer", 300., 300., 100., 100.)))
+            }
+        }
+
+        struct CachedHost {
+            layers: Entity<CachedLayers>,
+        }
+
+        impl Render for CachedHost {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                root().child(
+                    node("host", 0., 0., 200., 200.).child(
+                        self.layers
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+                )
+            }
+        }
+
+        #[gpui::test]
+        fn reused_subtrees_attach_to_the_reprepainted_parent(cx: &mut TestAppContext) {
+            let host = cx.open_window(size(px(800.), px(600.)), |_, cx| CachedHost {
+                layers: cx.new(|_| CachedLayers),
+            });
+            let window = AnyWindowHandle::from(host);
+            cx.update_window(window, |_, window, cx| {
+                window.set_dom_hit_testing(true);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            assert_eq!(chain_at(&window, cx, 30., 30.), ["leaf", "host", "root"]);
+
+            // Re-rendering only the host re-inserts its hitboxes with new ids while the cached
+            // child, and the deferred layer inside it, are reused from the last frame. Twice,
+            // because the second reuse reads ranges recorded during a reused frame.
+            for _ in 0..2 {
+                host.update(cx, |_, _, cx| cx.notify()).unwrap();
+                cx.run_until_parked();
+                assert_eq!(chain_at(&window, cx, 30., 30.), ["leaf", "host", "root"]);
+                assert_eq!(chain_at(&window, cx, 350., 350.), ["layer", "host", "root"]);
+            }
+        }
     }
 }

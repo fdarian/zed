@@ -733,10 +733,26 @@ pub(crate) struct CursorStyleRequest {
     pub(crate) style: CursorStyle,
 }
 
-#[derive(Default, Eq, PartialEq)]
+#[derive(Default)]
 pub(crate) struct HitTest {
     pub(crate) ids: SmallVec<[HitboxId; 8]>,
     pub(crate) hover_hitbox_count: usize,
+    /// Parallel to `ids`, filled only in DOM hit testing mode.
+    chain: SmallVec<[HitChainLink; 8]>,
+}
+
+impl PartialEq for HitTest {
+    fn eq(&self, other: &Self) -> bool {
+        self.ids == other.ids && self.hover_hitbox_count == other.hover_hitbox_count
+    }
+}
+
+impl Eq for HitTest {}
+
+#[derive(Clone)]
+struct HitChainLink {
+    identity: Option<GlobalElementId>,
+    bounds: Bounds<Pixels>,
 }
 
 /// A type of window control area that corresponds to the platform window.
@@ -832,9 +848,17 @@ pub struct Hitbox {
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
     identity: Option<GlobalElementId>,
+    parent: Option<HitboxId>,
 }
 
 impl Hitbox {
+    /// The innermost hitbox that enclosed this one when it was inserted, see
+    /// [`Window::with_hitbox_parent`]. Deferred draws are enclosed by the hitbox that enclosed
+    /// the `defer_draw` call.
+    pub fn parent(&self) -> Option<HitboxId> {
+        self.parent
+    }
+
     /// Checks if the hitbox is currently hovered. Returns `false` during keyboard input modality
     /// so that keyboard navigation suppresses hover highlights. Except when handling
     /// `ScrollWheelEvent`, this is typically what you want when determining whether to handle mouse
@@ -923,6 +947,11 @@ pub enum HitboxBehavior {
     /// inconsistent UI where clicks and moves interact with elements that are not considered to
     /// be hovered.
     BlockMouseExceptScroll,
+
+    /// Never the target of hit testing, like CSS `pointer-events: none`. In DOM hit testing mode
+    /// (see [`Window::set_dom_hit_testing`]) the hitbox is still part of the hover chain when a
+    /// descendant is hit. Outside DOM mode the hitbox is skipped entirely.
+    PassThrough,
 }
 
 /// An identifier for a tooltip.
@@ -957,6 +986,7 @@ pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
     parent_node: DispatchNodeId,
+    parent_hitbox: Option<HitboxId>,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
@@ -999,6 +1029,8 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     line_layout_index: LineLayoutIndex,
+    /// The innermost enclosing hitbox when the snapshot was taken.
+    hitbox_parent: Option<HitboxId>,
 }
 
 #[derive(Clone, Default)]
@@ -1086,10 +1118,16 @@ impl Frame {
             .into_inner()
     }
 
-    pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
+    pub(crate) fn hit_test(&self, position: Point<Pixels>, dom_hit_testing: bool) -> HitTest {
+        if dom_hit_testing {
+            return self.dom_hit_test(position);
+        }
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
+            if hitbox.behavior == HitboxBehavior::PassThrough {
+                continue;
+            }
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
@@ -1107,6 +1145,37 @@ impl Frame {
         if !set_hover_hitbox_count {
             hit_test.hover_hitbox_count = hit_test.ids.len();
         }
+        hit_test
+    }
+
+    /// The topmost non-`PassThrough` hitbox containing the point, then its chain of parents.
+    /// Parents are included wherever the point is: an ancestor is hovered by a descendant that
+    /// overflows it, or that was deferred out of it.
+    fn dom_hit_test(&self, position: Point<Pixels>) -> HitTest {
+        let mut hit_test = HitTest::default();
+        let mut next = self.hitboxes.iter().rposition(|hitbox| {
+            hitbox.behavior != HitboxBehavior::PassThrough
+                && hitbox
+                    .bounds
+                    .intersect(&hitbox.content_mask.bounds)
+                    .contains(&position)
+        });
+        while let Some(index) = next {
+            let hitbox = &self.hitboxes[index];
+            hit_test.ids.push(hitbox.id);
+            hit_test.chain.push(HitChainLink {
+                identity: hitbox.identity.clone(),
+                bounds: hitbox.bounds,
+            });
+            // A parent is always inserted before its children.
+            next = hitbox.parent.map(|parent| {
+                self.hitboxes[..index]
+                    .iter()
+                    .rposition(|candidate| candidate.id == parent)
+                    .expect("hitbox parent is missing from the frame")
+            });
+        }
+        hit_test.hover_hitbox_count = hit_test.ids.len();
         hit_test
     }
 
@@ -1183,6 +1252,9 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    dom_hit_testing: bool,
+    /// Hitboxes whose element is currently being prepainted, innermost last.
+    hitbox_parent_stack: Vec<HitboxId>,
     /// The platform reported the pointer leaving the window and it has not moved
     /// back. `mouse_position` is then the last place it was inside, which would
     /// keep that element hovered, so nothing is hit while this is set.
@@ -1871,6 +1943,8 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            dom_hit_testing: false,
+            hitbox_parent_stack: Vec::new(),
             pointer_outside: false,
             modifiers,
             capslock,
@@ -2887,6 +2961,36 @@ impl Window {
             .and_then(|hitbox| hitbox.identity.clone());
     }
 
+    /// Switches hit testing to the DOM model, off by default. Every hitbox records the hitbox
+    /// that enclosed it (see [`Window::with_hitbox_parent`]), and the pointer hits the topmost
+    /// hitbox that is not [`HitboxBehavior::PassThrough`] together with its chain of parents.
+    /// That chain, and nothing else, is hovered and handles scroll; `BlockMouse` and
+    /// `BlockMouseExceptScroll` have no effect. Pointer capture is unchanged.
+    pub fn set_dom_hit_testing(&mut self, enabled: bool) {
+        if self.dom_hit_testing != enabled {
+            self.dom_hit_testing = enabled;
+            self.refresh();
+        }
+    }
+
+    /// Whether [`Window::set_dom_hit_testing`] is on.
+    pub fn dom_hit_testing(&self) -> bool {
+        self.dom_hit_testing
+    }
+
+    /// The hitboxes under the pointer in DOM hit testing mode, target first, each with the
+    /// element id it was inserted under and its bounds. It is the geometric hit and ignores pointer
+    /// capture. Empty when the mode is off or the pointer is outside the window.
+    ///
+    /// Hitboxes inserted outside any element id are left out, and an element without an id of its
+    /// own reports the id of its nearest ancestor that has one.
+    pub fn hit_chain(&self) -> impl Iterator<Item = (&GlobalElementId, Bounds<Pixels>)> {
+        self.mouse_hit_test
+            .chain
+            .iter()
+            .filter_map(|link| Some((link.identity.as_ref()?, link.bounds)))
+    }
+
     /// Releases any active pointer capture.
     pub fn release_pointer(&mut self) {
         self.captured_hitbox = None;
@@ -3236,7 +3340,8 @@ impl Window {
         self.mouse_hit_test = if self.pointer_outside {
             HitTest::default()
         } else {
-            self.next_frame.hit_test(self.mouse_position)
+            self.next_frame
+                .hit_test(self.mouse_position, self.dom_hit_testing)
         };
 
         // Now actually paint the elements.
@@ -3385,7 +3490,15 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    parent_hitbox,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    prepaint_range,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3394,6 +3507,7 @@ impl Window {
                     (
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
+                        deferred_draw.parent_hitbox,
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
@@ -3401,6 +3515,8 @@ impl Window {
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
+                self.hitbox_parent_stack.clear();
+                self.hitbox_parent_stack.extend(parent_hitbox);
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
@@ -3422,6 +3538,7 @@ impl Window {
 
             self.element_id_stack.clear();
             self.text_style_stack.clear();
+            self.hitbox_parent_stack.clear();
             round_start = round_end;
         }
     }
@@ -3480,14 +3597,26 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             line_layout_index: self.text_system.layout_index(),
+            hitbox_parent: self.hitbox_parent_stack.last().copied(),
         }
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        // Hitboxes keep their ids across frames but the enclosing hitbox is re-inserted, with a
+        // new id, every time its element prepaints. The reused hitboxes that hung off the old
+        // enclosing hitbox move to the current one.
+        let current_parent = self.hitbox_parent_stack.last().copied();
+        let stale_parent = range.start.hitbox_parent;
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
-                .cloned(),
+                .cloned()
+                .map(|mut hitbox| {
+                    if hitbox.parent == stale_parent {
+                        hitbox.parent = current_parent;
+                    }
+                    hitbox
+                }),
         );
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
@@ -3521,6 +3650,11 @@ impl Window {
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
+                    parent_hitbox: if deferred_draw.parent_hitbox == stale_parent {
+                        current_parent
+                    } else {
+                        deferred_draw.parent_hitbox
+                    },
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
@@ -4027,6 +4161,7 @@ impl Window {
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
             parent_node,
+            parent_hitbox: self.hitbox_parent_stack.last().copied(),
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             content_mask,
@@ -4940,9 +5075,23 @@ impl Window {
             content_mask,
             behavior,
             identity,
+            parent: self.hitbox_parent_stack.last().copied(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
+    }
+
+    /// Runs `f` with `parent` as the hitbox enclosing every hitbox it inserts. Elements that insert
+    /// a hitbox and then prepaint children must wrap the children in this. `Div` and the other
+    /// [`crate::Interactivity`] based elements already do.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn with_hitbox_parent<R>(&mut self, parent: &Hitbox, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_prepaint();
+        self.hitbox_parent_stack.push(parent.id);
+        let result = f(self);
+        self.hitbox_parent_stack.pop();
+        result
     }
 
     /// Set a hitbox which will act as a control area of the platform window.
@@ -5435,7 +5584,8 @@ impl Window {
         let hit_test = if self.pointer_outside {
             HitTest::default()
         } else {
-            self.rendered_frame.hit_test(self.mouse_position())
+            self.rendered_frame
+                .hit_test(self.mouse_position(), self.dom_hit_testing)
         };
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;

@@ -1643,7 +1643,7 @@ impl Element for List {
             state.measuring_behavior.reset();
         }
 
-        let layout =
+        let layout = window.with_hitbox_parent(&hitbox, |window| {
             match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
                 Err(autoscroll_request) => {
@@ -1652,7 +1652,8 @@ impl Element for List {
                         .prepaint_items(bounds, padding, false, &mut self.render_item, window, cx)
                         .unwrap()
                 }
-            };
+            }
+        });
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
