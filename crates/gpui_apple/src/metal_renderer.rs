@@ -146,6 +146,7 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
 }
 
 impl MetalRenderer {
@@ -766,6 +767,7 @@ impl MetalRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.bounds.intersect(&path.content_mask.bounds),
+                content_mask: path.content_mask,
             }));
         }
         let vertex_instance_bindings = writer.write(&vertices)?;
@@ -1138,6 +1140,11 @@ impl MetalRenderer {
             0,
         );
         command_encoder.set_vertex_buffer(
+            SurfaceInputIndex::Surfaces as u64,
+            Some(&instance_bindings.surfaces.buffer),
+            instance_bindings.surfaces.offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
             SurfaceInputIndex::Surfaces as u64,
             Some(&instance_bindings.surfaces.buffer),
             instance_bindings.surfaces.offset as u64,
@@ -1662,5 +1669,115 @@ fn log_presented_time(drawable: &metal::MetalDrawableRef) {
     let handler = handler.copy();
     unsafe {
         let _: () = msg_send![drawable, addPresentedHandler: &*handler];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MetalHeadlessRenderer;
+    use gpui::{
+        Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, PlatformHeadlessRenderer,
+        Quad, ScaledPixels, Scene, point, size,
+    };
+
+    const SIZE: f32 = 40.;
+
+    fn render(scene: &mut Scene) -> image::RgbaImage {
+        scene.finish();
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer
+            .render_scene_to_image(
+                scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
+            .expect("scene should render")
+    }
+
+    fn full_bounds() -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: size(ScaledPixels(SIZE), ScaledPixels(SIZE)),
+        }
+    }
+
+    fn quad(background: Hsla, border_colors: Edges<Hsla>, border_width: f32) -> Quad {
+        Quad {
+            bounds: full_bounds(),
+            content_mask: ContentMask {
+                bounds: full_bounds(),
+                corner_radii: Corners::default(),
+            },
+            background: Background::from(background),
+            border_colors,
+            border_widths: Edges::all(ScaledPixels(border_width)),
+            ..Quad::default()
+        }
+    }
+
+    /// The headless target is opaque and cleared to black, so "nothing was drawn" is black.
+    fn is_cleared(image: &image::RgbaImage, x: u32, y: u32) -> bool {
+        let [red, green, blue, _] = image.get_pixel(x, y).0;
+        red < 10 && green < 10 && blue < 10
+    }
+
+    fn dominant_channel(image: &image::RgbaImage, x: u32, y: u32) -> &'static str {
+        let [red, green, blue, _] = image.get_pixel(x, y).0;
+        if red > 200 && green > 200 && blue < 100 {
+            "yellow"
+        } else if red > 200 && green < 100 && blue < 100 {
+            "red"
+        } else if green > 100 && red < 100 && blue < 100 {
+            "green"
+        } else if blue > 200 && red < 100 && green < 100 {
+            "blue"
+        } else {
+            panic!("pixel ({x}, {y}) has an unexpected color {red} {green} {blue}")
+        }
+    }
+
+    #[test]
+    fn each_border_side_has_its_own_color_and_the_join_runs_corner_to_corner() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(
+            gpui::transparent_black(),
+            Edges {
+                top: gpui::red(),
+                right: gpui::green(),
+                bottom: gpui::blue(),
+                left: gpui::yellow(),
+            },
+            10.,
+        ));
+        let image = render(&mut scene);
+
+        assert_eq!(dominant_channel(&image, 20, 3), "red");
+        assert_eq!(dominant_channel(&image, 36, 20), "green");
+        assert_eq!(dominant_channel(&image, 20, 36), "blue");
+        assert_eq!(dominant_channel(&image, 3, 20), "yellow");
+        // Equal widths: the join is the diagonal, so the side nearer an edge wins.
+        assert_eq!(dominant_channel(&image, 6, 2), "red");
+        assert_eq!(dominant_channel(&image, 2, 6), "yellow");
+        assert_eq!(dominant_channel(&image, 37, 33), "green");
+        assert_eq!(dominant_channel(&image, 33, 37), "blue");
+        assert_eq!(dominant_channel(&image, 37, 6), "green");
+        assert_eq!(dominant_channel(&image, 33, 2), "red");
+        assert!(is_cleared(&image, 20, 20), "the interior stays empty");
+    }
+
+    #[test]
+    fn rounded_content_mask_clips_a_quad_to_its_corners() {
+        let mut scene = Scene::default();
+        let mut filled = quad(gpui::red(), Edges::all(gpui::transparent_black()), 0.);
+        filled.content_mask.corner_radii = Corners::all(ScaledPixels(16.));
+        scene.insert_primitive(filled);
+        let image = render(&mut scene);
+
+        assert!(is_cleared(&image, 0, 0), "the corner is clipped away");
+        assert!(is_cleared(&image, 2, 2));
+        assert!(is_cleared(&image, 39, 39));
+        assert!(is_cleared(&image, 37, 2));
+        assert_eq!(dominant_channel(&image, 20, 20), "red");
+        assert_eq!(dominant_channel(&image, 20, 1), "red", "straight edges are untouched");
+        assert_eq!(dominant_channel(&image, 8, 8), "red", "inside the arc");
     }
 }

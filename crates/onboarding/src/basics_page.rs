@@ -158,7 +158,7 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
                             *tab_index - 1
                         })
                         .focus(|mut style| {
-                            style.border_color = Some(colors.border_focused);
+                            style.set_border_color(colors.border_focused);
                             style
                         })
                         .on_click({

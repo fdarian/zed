@@ -585,7 +585,7 @@ impl Render for KeystrokeInput {
                     .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
                     .when(!self.search, |this| {
                         this.focus(|mut style| {
-                            style.border_color = Some(colors.border_focused);
+                            style.set_border_color(colors.border_focused);
                             style
                         })
                     })

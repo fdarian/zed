@@ -282,8 +282,9 @@ pub struct Style {
     /// The fill color of this element
     pub background: Option<Fill>,
 
-    /// The border color of this element
-    pub border_color: Option<Hsla>,
+    /// The border color of each side of this element. A transparent side draws nothing.
+    #[refineable]
+    pub border_colors: Edges<Hsla>,
 
     /// The border style of this element
     pub border_style: BorderStyle,
@@ -678,6 +679,11 @@ impl Style {
 
     /// Get the content mask for this element style, based on the given bounds.
     /// If the element does not hide its overflow, this will return `None`.
+    ///
+    /// Like CSS `overflow`, the mask is the padding box: the border box minus the borders, with
+    /// the corners rounded by the border radius minus the adjacent border width. The rounded
+    /// corners only apply when both axes clip; with one visible axis the mask is a plain
+    /// rectangle.
     pub fn overflow_mask(
         &self,
         bounds: Bounds<Pixels>,
@@ -689,40 +695,73 @@ impl Style {
                 y: Overflow::Visible,
             } => None,
             _ => {
-                let mut min = bounds.origin;
-                let mut max = bounds.bottom_right();
+                let border_widths = self.border_widths.to_pixels(rem_size);
+                let min = bounds.origin + point(border_widths.left, border_widths.top);
+                let max = bounds.bottom_right() - point(border_widths.right, border_widths.bottom);
 
-                if self
-                    .border_color
-                    .is_some_and(|color| !color.is_transparent())
-                {
-                    min.x += self.border_widths.left.to_pixels(rem_size);
-                    max.x -= self.border_widths.right.to_pixels(rem_size);
-                    min.y += self.border_widths.top.to_pixels(rem_size);
-                    max.y -= self.border_widths.bottom.to_pixels(rem_size);
-                }
-
-                let bounds = match (
+                let (bounds, corner_radii) = match (
                     self.overflow.x == Overflow::Visible,
                     self.overflow.y == Overflow::Visible,
                 ) {
                     // x and y both visible
                     (true, true) => return None,
                     // x visible, y hidden
-                    (true, false) => Bounds::from_corners(
-                        point(min.x, bounds.origin.y),
-                        point(max.x, bounds.bottom_right().y),
+                    (true, false) => (
+                        Bounds::from_corners(
+                            point(min.x, bounds.origin.y),
+                            point(max.x, bounds.bottom_right().y),
+                        ),
+                        Corners::default(),
                     ),
                     // x hidden, y visible
-                    (false, true) => Bounds::from_corners(
-                        point(bounds.origin.x, min.y),
-                        point(bounds.bottom_right().x, max.y),
+                    (false, true) => (
+                        Bounds::from_corners(
+                            point(bounds.origin.x, min.y),
+                            point(bounds.bottom_right().x, max.y),
+                        ),
+                        Corners::default(),
                     ),
                     // both hidden
-                    (false, false) => Bounds::from_corners(min, max),
+                    (false, false) => {
+                        let outer_radii = self
+                            .corner_radii
+                            .to_pixels(rem_size)
+                            .clamp_radii_for_quad_size(bounds.size);
+                        let inner_radius = |radius: Pixels, horizontal: Pixels, vertical: Pixels| {
+                            (radius - horizontal.max(vertical)).max(Pixels::ZERO)
+                        };
+                        (
+                            Bounds::from_corners(min, max),
+                            Corners {
+                                top_left: inner_radius(
+                                    outer_radii.top_left,
+                                    border_widths.left,
+                                    border_widths.top,
+                                ),
+                                top_right: inner_radius(
+                                    outer_radii.top_right,
+                                    border_widths.right,
+                                    border_widths.top,
+                                ),
+                                bottom_right: inner_radius(
+                                    outer_radii.bottom_right,
+                                    border_widths.right,
+                                    border_widths.bottom,
+                                ),
+                                bottom_left: inner_radius(
+                                    outer_radii.bottom_left,
+                                    border_widths.left,
+                                    border_widths.bottom,
+                                ),
+                            },
+                        )
+                    }
                 };
 
-                Some(ContentMask { bounds })
+                Some(ContentMask {
+                    bounds,
+                    corner_radii,
+                })
             }
         }
     }
@@ -786,16 +825,19 @@ impl Style {
 
         if self.is_border_visible() {
             let border_widths = self.border_widths.to_pixels(rem_size);
-            let mut background = self.border_color.unwrap_or_default();
+            let mut background = self.border_colors.top;
             background.a = 0.;
-            window.paint_quad(quad(
-                bounds,
-                corner_radii,
-                background,
-                border_widths,
-                self.border_color.unwrap_or_default(),
-                self.border_style,
-            ));
+            window.paint_quad(
+                quad(
+                    bounds,
+                    corner_radii,
+                    background,
+                    border_widths,
+                    self.border_colors.top,
+                    self.border_style,
+                )
+                .border_colors(self.border_colors),
+            );
         }
 
         if let Some(outline) = self.outline
@@ -834,9 +876,25 @@ impl Style {
     }
 
     fn is_border_visible(&self) -> bool {
-        self.border_color
-            .is_some_and(|color| !color.is_transparent())
-            && self.border_widths.any(|length| !length.is_zero())
+        self.border_widths.any(|length| !length.is_zero())
+            && [
+                self.border_colors.top,
+                self.border_colors.right,
+                self.border_colors.bottom,
+                self.border_colors.left,
+            ]
+            .iter()
+            .any(|color| !color.is_transparent())
+    }
+}
+
+impl StyleRefinement {
+    /// Sets the border color of all four sides.
+    pub fn set_border_color(&mut self, color: Hsla) {
+        self.border_colors.top = Some(color);
+        self.border_colors.right = Some(color);
+        self.border_colors.bottom = Some(color);
+        self.border_colors.left = Some(color);
     }
 }
 
@@ -875,7 +933,7 @@ impl Default for Style {
             flex_shrink: 1.0,
             flex_basis: Length::Auto,
             background: None,
-            border_color: None,
+            border_colors: Edges::default(),
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
@@ -1433,6 +1491,130 @@ mod tests {
     use super::*;
 
     use util_macros::perf;
+
+    fn rounded_mask(bounds: Bounds<Pixels>, radius: f32) -> ContentMask<Pixels> {
+        ContentMask {
+            bounds,
+            corner_radii: Corners::all(px(radius)),
+        }
+    }
+
+    #[test]
+    fn overflow_mask_rounds_the_padding_box() {
+        let mut style = Style::default();
+        style.overflow = Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        };
+        style.corner_radii = Corners {
+            top_left: AbsoluteLength::Pixels(px(10.)),
+            top_right: AbsoluteLength::Pixels(px(10.)),
+            bottom_right: AbsoluteLength::Pixels(px(10.)),
+            bottom_left: AbsoluteLength::Pixels(px(10.)),
+        };
+        style.border_widths = Edges {
+            top: AbsoluteLength::Pixels(px(2.)),
+            right: AbsoluteLength::Pixels(px(4.)),
+            bottom: AbsoluteLength::Pixels(px(0.)),
+            left: AbsoluteLength::Pixels(px(1.)),
+        };
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(50.)));
+
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+
+        assert_eq!(
+            mask.bounds,
+            Bounds::from_corners(point(px(11.), px(22.)), point(px(106.), px(70.)))
+        );
+        assert_eq!(
+            mask.corner_radii,
+            Corners {
+                top_left: px(8.),
+                top_right: px(6.),
+                bottom_right: px(6.),
+                bottom_left: px(9.),
+            }
+        );
+    }
+
+    #[test]
+    fn overflow_mask_is_square_when_one_axis_is_visible() {
+        let mut style = Style::default();
+        style.overflow = Point {
+            x: Overflow::Visible,
+            y: Overflow::Hidden,
+        };
+        style.corner_radii = Corners {
+            top_left: AbsoluteLength::Pixels(px(10.)),
+            top_right: AbsoluteLength::Pixels(px(10.)),
+            bottom_right: AbsoluteLength::Pixels(px(10.)),
+            bottom_left: AbsoluteLength::Pixels(px(10.)),
+        };
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(50.)));
+
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+
+        assert_eq!(mask.corner_radii, Corners::default());
+    }
+
+    #[test]
+    fn nested_content_masks_keep_the_radius_of_the_coinciding_corner() {
+        let outer = rounded_mask(
+            Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.))),
+            20.,
+        );
+        // Flush with the outer top-left corner only.
+        let inner = rounded_mask(
+            Bounds::new(point(px(0.), px(0.)), size(px(60.), px(60.))),
+            5.,
+        );
+
+        let mask = outer.intersect(&inner);
+
+        assert_eq!(mask.bounds, inner.bounds);
+        assert_eq!(mask.corner_radii.top_left, px(20.));
+        assert_eq!(mask.corner_radii.top_right, px(5.));
+        assert_eq!(mask.corner_radii.bottom_right, px(5.));
+        assert_eq!(mask.corner_radii.bottom_left, px(5.));
+    }
+
+    #[test]
+    fn content_mask_corners_cut_by_a_straight_edge_become_square() {
+        let outer = rounded_mask(
+            Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.))),
+            20.,
+        );
+        let clip = ContentMask::from_bounds(Bounds::new(
+            point(px(30.), px(30.)),
+            size(px(100.), px(100.)),
+        ));
+
+        let mask = outer.intersect(&clip);
+
+        assert_eq!(mask.bounds.origin, point(px(30.), px(30.)));
+        assert_eq!(
+            mask.corner_radii,
+            Corners {
+                top_left: px(0.),
+                top_right: px(0.),
+                bottom_right: px(20.),
+                bottom_left: px(0.),
+            }
+        );
+    }
+
+    #[test]
+    fn border_colors_builders_set_every_side() {
+        use crate::Styled as _;
+
+        let mut element = crate::div().border_color(red());
+        assert_eq!(element.style().border_colors.top, Some(red()));
+        assert_eq!(element.style().border_colors.left, Some(red()));
+
+        let mut element = element.border_top_color(blue());
+        assert_eq!(element.style().border_colors.top, Some(blue()));
+        assert_eq!(element.style().border_colors.bottom, Some(red()));
+    }
 
     #[perf]
     fn test_basic_highlight_style_combination() {

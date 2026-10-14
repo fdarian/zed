@@ -28,6 +28,10 @@ float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_rad
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
 float quad_sdf_impl(float2 center_to_point, float corner_radius);
+float content_mask_coverage(float2 position, ContentMask_ScaledPixels content_mask);
+float4 select_border_color(float2 center_to_point, float2 corner_to_point,
+                           float2 border, float4 top, float4 right,
+                           float4 bottom, float4 left);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
@@ -47,7 +51,10 @@ GradientColor prepare_fill_color(uint tag, uint color_space, Hsla solid, Hsla co
 struct QuadVertexOutput {
   uint quad_id [[flat]];
   float4 position [[position]];
-  float4 border_color [[flat]];
+  float4 border_color_top [[flat]];
+  float4 border_color_right [[flat]];
+  float4 border_color_bottom [[flat]];
+  float4 border_color_left [[flat]];
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
@@ -57,7 +64,10 @@ struct QuadVertexOutput {
 struct QuadFragmentInput {
   uint quad_id [[flat]];
   float4 position [[position]];
-  float4 border_color [[flat]];
+  float4 border_color_top [[flat]];
+  float4 border_color_right [[flat]];
+  float4 border_color_bottom [[flat]];
+  float4 border_color_left [[flat]];
   float4 background_solid [[flat]];
   float4 background_color0 [[flat]];
   float4 background_color1 [[flat]];
@@ -77,7 +87,6 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       to_device_position(unit_vertex, quad.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
                                                  quad.content_mask.bounds);
-  float4 border_color = hsla_to_rgba(quad.border_color);
 
   GradientColor gradient = prepare_fill_color(
     quad.background.tag,
@@ -90,7 +99,10 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
   return QuadVertexOutput{
       quad_id,
       device_position,
-      border_color,
+      hsla_to_rgba(quad.border_colors.top),
+      hsla_to_rgba(quad.border_colors.right),
+      hsla_to_rgba(quad.border_colors.bottom),
+      hsla_to_rgba(quad.border_colors.left),
       gradient.solid,
       gradient.color0,
       gradient.color1,
@@ -103,6 +115,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+  float mask_alpha = content_mask_coverage(input.position.xy, quad.content_mask);
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
     quad.corner_radii.bottom_left == 0.0 &&
@@ -115,7 +128,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
       unrounded) {
-    return background_color;
+    return background_color * float4(1.0, 1.0, 1.0, mask_alpha);
   }
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
@@ -175,7 +188,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Fast path for points that must be part of the background
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
-    return background_color;
+    return background_color * float4(1.0, 1.0, 1.0, mask_alpha);
   }
 
   // Signed distance of the point to the outside edge of the quad's border
@@ -210,7 +223,9 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   float4 color = background_color;
   if (border_sdf < antialias_threshold) {
-    float4 border_color = input.border_color;
+    float4 border_color = select_border_color(
+      center_to_point, corner_to_point, border, input.border_color_top,
+      input.border_color_right, input.border_color_bottom, input.border_color_left);
 
     // Dashed border logic when border_style == 1
     if (quad.border_style == 1) {
@@ -393,7 +408,62 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                 saturate(antialias_threshold - inner_sdf));
   }
 
-  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf) * mask_alpha);
+}
+
+// Picks the border color at a point. Two sides meet at each corner and, like
+// CSS, their colors are separated by the line from the outer corner of the
+// quad to the inner corner of its borders, antialiased across that line.
+//
+// `border` holds the widths of the nearest vertical (left or right) and
+// horizontal (top or bottom) sides.
+float4 select_border_color(float2 center_to_point, float2 corner_to_point,
+                           float2 border, float4 top, float4 right,
+                           float4 bottom, float4 left) {
+  float4 vertical_color = center_to_point.x < 0.0 ? left : right;
+  float4 horizontal_color = center_to_point.y < 0.0 ? top : bottom;
+
+  // A side without a border never owns the corner.
+  float vertical_weight;
+  if (border.x <= 0.0) {
+    vertical_weight = 0.0;
+  } else if (border.y <= 0.0) {
+    vertical_weight = 1.0;
+  } else {
+    // Signed distance to the join line, negative on the vertical side's half.
+    float2 distance_from_edges = -corner_to_point;
+    float to_join = (distance_from_edges.x * border.y - distance_from_edges.y * border.x) /
+                    length(border);
+    vertical_weight = saturate(0.5 - to_join);
+  }
+
+  if (vertical_weight >= 1.0) {
+    return vertical_color;
+  }
+  if (vertical_weight <= 0.0) {
+    return horizontal_color;
+  }
+  // Blend premultiplied so a transparent side doesn't darken the join.
+  float4 premultiplied = mix(
+    float4(horizontal_color.rgb * horizontal_color.a, horizontal_color.a),
+    float4(vertical_color.rgb * vertical_color.a, vertical_color.a),
+    vertical_weight);
+  if (premultiplied.a <= 0.0) {
+    return float4(0.0);
+  }
+  return float4(premultiplied.rgb / premultiplied.a, premultiplied.a);
+}
+
+// Coverage of the point by the content mask's rounded corners. The mask's
+// rectangle is already enforced by the clip distances, so this only matters
+// when a corner is rounded.
+float content_mask_coverage(float2 position, ContentMask_ScaledPixels content_mask) {
+  Corners_ScaledPixels radii = content_mask.corner_radii;
+  if (radii.top_left == 0.0 && radii.top_right == 0.0 &&
+      radii.bottom_right == 0.0 && radii.bottom_left == 0.0) {
+    return 1.0;
+  }
+  return saturate(0.5 - quad_sdf(position, content_mask.bounds, radii));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -551,6 +621,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha *= saturate(0.5 - element_distance);
   }
 
+  alpha *= content_mask_coverage(input.position.xy, shadow.content_mask);
   return input.color * float4(1., 1., 1., alpha);
 }
 
@@ -594,6 +665,7 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const float WAVE_HEIGHT_RATIO = 0.8;
 
   Underline underline = underlines[input.underline_id];
+  float mask_alpha = content_mask_coverage(input.position.xy, underline.content_mask);
   if (underline.wavy) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
@@ -612,15 +684,16 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return input.color * float4(1., 1., 1., alpha * mask_alpha);
   } else {
-    return input.color;
+    return input.color * float4(1., 1., 1., mask_alpha);
   }
 }
 
 struct MonochromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
+  uint sprite_id [[flat]];
   float4 color [[flat]];
   float4 clip_distance;
 };
@@ -628,6 +701,7 @@ struct MonochromeSpriteVertexOutput {
 struct MonochromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
+  uint sprite_id [[flat]];
   float4 color [[flat]];
   float4 clip_distance;
 };
@@ -651,6 +725,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
   return MonochromeSpriteVertexOutput{
       device_position,
       tile_position,
+      sprite_id,
       color,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
@@ -669,6 +744,7 @@ fragment float4 monochrome_sprite_fragment(
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float4 color = input.color;
   color.a *= sample.a;
+  color.a *= content_mask_coverage(input.position.xy, sprites[input.sprite_id].content_mask);
   return color;
 }
 
@@ -730,7 +806,8 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance);
+  color.a *= sprite.opacity * saturate(0.5 - distance) *
+             content_mask_coverage(input.position.xy, sprite.content_mask);
   return color;
 }
 
@@ -811,6 +888,7 @@ fragment float4 path_rasterization_fragment(
     gradient_color.color0,
     gradient_color.color1
   );
+  alpha *= content_mask_coverage(input.position.xy, v.content_mask);
   return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
 
@@ -853,12 +931,14 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  uint surface_id [[flat]];
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -881,10 +961,13 @@ vertex SurfaceVertexOutput surface_vertex(
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      surface_id,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                 constant SurfaceBounds *surfaces
+                                 [[buffer(SurfaceInputIndex_Surfaces)]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
@@ -899,7 +982,9 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  color.a = content_mask_coverage(input.position.xy, surfaces[input.surface_id].content_mask);
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

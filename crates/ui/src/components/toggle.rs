@@ -503,7 +503,7 @@ impl RenderOnce for Switch {
                 |this, tab_index| {
                     this.tab_index(tab_index)
                         .focus_visible(|mut style| {
-                            style.border_color = Some(cx.theme().colors().border_focused);
+                            style.set_border_color(cx.theme().colors().border_focused);
                             style
                         })
                         .when_some(self.on_click.clone(), |this, on_click| {

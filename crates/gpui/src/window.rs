@@ -2005,27 +2005,64 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
+/// rendered. The mask is a rectangle whose corners may be rounded, which is how `overflow: hidden`
+/// clips to a rounded padding box.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// The radii of the rounded corners of `bounds`. All zero for a plain rectangle.
+    pub corner_radii: Corners<P>,
 }
 
 impl ContentMask<Pixels> {
+    /// A rectangular mask with square corners.
+    pub fn from_bounds(bounds: Bounds<Pixels>) -> Self {
+        ContentMask {
+            bounds,
+            corner_radii: Corners::default(),
+        }
+    }
+
     /// Scale the content mask's pixel units by the given scaling factor.
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
         }
     }
 
     /// Intersect the content mask with the given content mask.
+    ///
+    /// The bounds are the rectangle intersection. A corner of the result keeps the radius of
+    /// whichever input has a corner at the same point (the larger one if both do), and is square
+    /// otherwise. That is exact when masks are nested, the usual case, where a child's rounded
+    /// corner lies inside its parent's. It is approximate when one mask's straight edge cuts
+    /// through the other's rounded corner: the cut corner comes out square instead of keeping the
+    /// arc's remaining part.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        let radius = |corner: fn(&Bounds<Pixels>) -> Point<Pixels>,
+                      radius: fn(&Corners<Pixels>) -> Pixels| {
+            let own = (corner(&self.bounds) == corner(&bounds)).then(|| radius(&self.corner_radii));
+            let theirs =
+                (corner(&other.bounds) == corner(&bounds)).then(|| radius(&other.corner_radii));
+            match (own, theirs) {
+                (Some(own), Some(theirs)) => own.max(theirs),
+                (Some(radius), None) | (None, Some(radius)) => radius,
+                (None, None) => Pixels::ZERO,
+            }
+        };
+        ContentMask {
+            bounds,
+            corner_radii: Corners {
+                top_left: radius(|bounds| bounds.origin, |radii| radii.top_left),
+                top_right: radius(|bounds| bounds.top_right(), |radii| radii.top_right),
+                bottom_right: radius(|bounds| bounds.bottom_right(), |radii| radii.bottom_right),
+                bottom_left: radius(|bounds| bounds.bottom_left(), |radii| radii.bottom_left),
+            },
+        }
     }
 }
 
@@ -2975,8 +3012,10 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+        let content_mask = self.content_mask();
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            bounds: self.cover_bounds(content_mask.bounds),
+            corner_radii: content_mask.corner_radii.scale(self.scale_factor()),
         }
     }
 
@@ -4022,11 +4061,11 @@ impl Window {
         self.content_mask_stack
             .last()
             .cloned()
-            .unwrap_or_else(|| ContentMask {
-                bounds: Bounds {
+            .unwrap_or_else(|| {
+                ContentMask::from_bounds(Bounds {
                     origin: Point::default(),
                     size: self.viewport_size,
-                },
+                })
             })
     }
 
@@ -4413,7 +4452,7 @@ impl Window {
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
-            border_color: quad.border_color.opacity(opacity),
+            border_colors: quad.border_colors.map(|color| color.opacity(opacity)),
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
@@ -4429,7 +4468,9 @@ impl Window {
         let outer_bounds = quad.bounds;
         let inner_bounds = Self::largest_border_interior(&quad);
 
-        if inner_bounds.is_empty() {
+        // A strip narrows the mask to a different rectangle, which would drop the mask's rounded
+        // corners, so a rounded mask paints the whole quad.
+        if inner_bounds.is_empty() || quad.content_mask.corner_radii != Corners::default() {
             self.next_frame.scene.insert_primitive(quad);
             return;
         }
@@ -4463,6 +4504,7 @@ impl Window {
                 self.next_frame.scene.insert_primitive(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
+                        corner_radii: Corners::default(),
                     },
                     ..quad
                 });
@@ -7356,8 +7398,8 @@ pub struct PaintQuad {
     pub background: Background,
     /// The widths of the quad's borders.
     pub border_widths: Edges<Pixels>,
-    /// The color of the quad's borders.
-    pub border_color: Hsla,
+    /// The color of each side's border.
+    pub border_colors: Edges<Hsla>,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
 }
@@ -7379,10 +7421,18 @@ impl PaintQuad {
         }
     }
 
-    /// Sets the border color of the quad.
+    /// Sets the border color of all four sides of the quad.
     pub fn border_color(self, border_color: impl Into<Hsla>) -> Self {
         PaintQuad {
-            border_color: border_color.into(),
+            border_colors: Edges::all(border_color.into()),
+            ..self
+        }
+    }
+
+    /// Sets the border color of each side of the quad separately.
+    pub fn border_colors(self, border_colors: Edges<Hsla>) -> Self {
+        PaintQuad {
+            border_colors,
             ..self
         }
     }
@@ -7410,7 +7460,7 @@ pub fn quad(
         corner_radii: corner_radii.into(),
         background: background.into(),
         border_widths: border_widths.into(),
-        border_color: border_color.into(),
+        border_colors: Edges::all(border_color.into()),
         border_style,
     }
 }
@@ -7422,7 +7472,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         corner_radii: (0.).into(),
         background: background.into(),
         border_widths: (0.).into(),
-        border_color: transparent_black(),
+        border_colors: Edges::all(transparent_black()),
         border_style: BorderStyle::default(),
     }
 }
@@ -7438,7 +7488,7 @@ pub fn outline(
         corner_radii: (0.).into(),
         background: transparent_black().into(),
         border_widths: (1.).into(),
-        border_color: border_color.into(),
+        border_colors: Edges::all(border_color.into()),
         border_style,
     }
 }

@@ -48,6 +48,19 @@ struct Hsla {
     float a;
 };
 
+// A rectangle whose corners may be rounded. Fragments outside it are not drawn.
+struct ContentMask {
+    Bounds bounds;
+    Corners corner_radii;
+};
+
+struct EdgesHsla {
+    Hsla top;
+    Hsla right;
+    Hsla bottom;
+    Hsla left;
+};
+
 struct LinearColorStop {
     Hsla color;
     float percentage;
@@ -314,6 +327,60 @@ float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
     return quad_sdf_impl(corner_center_to_point, corner_radius);
 }
 
+// Coverage of the position by the content mask's rounded corners. The mask's
+// rectangle is enforced by the clip distances, so this only matters when a
+// corner is rounded.
+float content_mask_coverage(float2 position, ContentMask content_mask) {
+    Corners radii = content_mask.corner_radii;
+    if (radii.top_left == 0.0 && radii.top_right == 0.0 &&
+        radii.bottom_right == 0.0 && radii.bottom_left == 0.0) {
+        return 1.0;
+    }
+    return saturate(0.5 - quad_sdf(position, content_mask.bounds, radii));
+}
+
+// Picks the border color at a point. Two sides meet at each corner and, like
+// CSS, their colors are separated by the line from the outer corner of the
+// quad to the inner corner of its borders, antialiased across that line.
+//
+// `border` holds the widths of the nearest vertical (left or right) and
+// horizontal (top or bottom) sides.
+float4 select_border_color(float2 center_to_point, float2 corner_to_point, float2 border,
+                           float4 top, float4 right, float4 bottom, float4 left) {
+    float4 vertical_color = center_to_point.x < 0.0 ? left : right;
+    float4 horizontal_color = center_to_point.y < 0.0 ? top : bottom;
+
+    // A side without a border never owns the corner.
+    float vertical_weight;
+    if (border.x <= 0.0) {
+        vertical_weight = 0.0;
+    } else if (border.y <= 0.0) {
+        vertical_weight = 1.0;
+    } else {
+        // Signed distance to the join line, negative on the vertical side's half.
+        float2 distance_from_edges = -corner_to_point;
+        float to_join = (distance_from_edges.x * border.y - distance_from_edges.y * border.x) /
+            length(border);
+        vertical_weight = saturate(0.5 - to_join);
+    }
+
+    if (vertical_weight >= 1.0) {
+        return vertical_color;
+    }
+    if (vertical_weight <= 0.0) {
+        return horizontal_color;
+    }
+    // Blend premultiplied so a transparent side doesn't darken the join.
+    float4 premultiplied = lerp(
+        float4(horizontal_color.rgb * horizontal_color.a, horizontal_color.a),
+        float4(vertical_color.rgb * vertical_color.a, vertical_color.a),
+        vertical_weight);
+    if (premultiplied.a <= 0.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    return float4(premultiplied.rgb / premultiplied.a, premultiplied.a);
+}
+
 GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[2]) {
     GradientColor output;
     if (tag == 0 || tag == 2 || tag == 3) {
@@ -502,9 +569,9 @@ struct Quad {
     uint order;
     uint border_style;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Background background;
-    Hsla border_color;
+    EdgesHsla border_colors;
     Corners corner_radii;
     Edges border_widths;
 };
@@ -512,20 +579,26 @@ struct Quad {
 struct QuadVertexOutput {
     nointerpolation uint quad_id: TEXCOORD0;
     float4 position: SV_Position;
-    nointerpolation float4 border_color: COLOR0;
+    nointerpolation float4 border_color_top: COLOR0;
     nointerpolation float4 background_solid: COLOR1;
     nointerpolation float4 background_color0: COLOR2;
     nointerpolation float4 background_color1: COLOR3;
+    nointerpolation float4 border_color_right: COLOR4;
+    nointerpolation float4 border_color_bottom: COLOR5;
+    nointerpolation float4 border_color_left: COLOR6;
     float4 clip_distance: SV_ClipDistance;
 };
 
 struct QuadFragmentInput {
     nointerpolation uint quad_id: TEXCOORD0;
     float4 position: SV_Position;
-    nointerpolation float4 border_color: COLOR0;
+    nointerpolation float4 border_color_top: COLOR0;
     nointerpolation float4 background_solid: COLOR1;
     nointerpolation float4 background_color0: COLOR2;
     nointerpolation float4 background_color1: COLOR3;
+    nointerpolation float4 border_color_right: COLOR4;
+    nointerpolation float4 border_color_bottom: COLOR5;
+    nointerpolation float4 border_color_left: COLOR6;
 };
 
 StructuredBuffer<Quad> quads: register(t1);
@@ -542,12 +615,14 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
         quad.background.solid,
         quad.background.colors
     );
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
-    float4 border_color = hsla_to_rgba(quad.border_color);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
 
     QuadVertexOutput output;
     output.position = device_position;
-    output.border_color = border_color;
+    output.border_color_top = hsla_to_rgba(quad.border_colors.top);
+    output.border_color_right = hsla_to_rgba(quad.border_colors.right);
+    output.border_color_bottom = hsla_to_rgba(quad.border_colors.bottom);
+    output.border_color_left = hsla_to_rgba(quad.border_colors.left);
     output.quad_id = quad_id;
     output.background_solid = gradient.solid;
     output.background_color0 = gradient.color0;
@@ -560,6 +635,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+    float mask_alpha = content_mask_coverage(input.position.xy, quad.content_mask);
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.top_right == 0.0 &&
@@ -572,7 +648,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         quad.border_widths.right == 0.0 &&
         quad.border_widths.bottom == 0.0 &&
         unrounded) {
-        return background_color;
+        return background_color * float4(1.0, 1.0, 1.0, mask_alpha);
     }
 
     float2 size = quad.bounds.size;
@@ -631,7 +707,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path for points that must be part of the background
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return background_color;
+        return background_color * float4(1.0, 1.0, 1.0, mask_alpha);
     }
 
     // Signed distance of the point to the outside edge of the quad's border
@@ -666,7 +742,10 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     float4 color = background_color;
     if (border_sdf < antialias_threshold) {
-        float4 border_color = input.border_color;
+        float4 border_color = select_border_color(
+            center_to_point, corner_to_point, border,
+            input.border_color_top, input.border_color_right,
+            input.border_color_bottom, input.border_color_left);
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {
             // Position along the perimeter in "dash space", where each dash
@@ -844,7 +923,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf) * mask_alpha);
 }
 
 /*
@@ -858,7 +937,7 @@ struct Shadow {
     float blur_radius;
     Bounds bounds;
     Corners corner_radii;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     Bounds element_bounds;
     Corners element_corner_radii;
@@ -898,7 +977,7 @@ ShadowVertexOutput shadow_vertex(uint vertex_id: SV_VertexID, uint instance_id: 
     }
 
     float4 device_position = to_device_position(unit_vertex, bounds);
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
     float4 color = hsla_to_rgba(shadow.color);
 
     ShadowVertexOutput output;
@@ -950,6 +1029,7 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         alpha *= saturate(0.5 - element_distance);
     }
 
+    alpha *= content_mask_coverage(input.position.xy, shadow.content_mask);
     return input.color * float4(1., 1., 1., alpha);
 }
 
@@ -964,6 +1044,7 @@ struct PathRasterizationSprite {
     float2 st_position;
     Background color;
     Bounds bounds;
+    ContentMask content_mask;
 };
 
 StructuredBuffer<PathRasterizationSprite> path_rasterization_sprites: register(t1);
@@ -1016,6 +1097,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
     float4 color = gradient_color(background, input.position.xy, bounds,
         gradient.solid, gradient.color0, gradient.color1);
+    alpha *= content_mask_coverage(input.position.xy, sprite.content_mask);
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
 
@@ -1066,7 +1148,7 @@ struct Underline {
     uint order;
     uint pad;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     float thickness;
     uint wavy;
@@ -1093,7 +1175,7 @@ UnderlineVertexOutput underline_vertex(uint vertex_id: SV_VertexID, uint instanc
     Underline underline = underlines[underline_id];
     float4 device_position = to_device_position(unit_vertex, underline.bounds);
     float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
-                                                    underline.content_mask);
+                                                    underline.content_mask.bounds);
     float4 color = hsla_to_rgba(underline.color);
 
     UnderlineVertexOutput output;
@@ -1109,6 +1191,7 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
     const float WAVE_HEIGHT_RATIO = 0.8;
 
     Underline underline = underlines[input.underline_id];
+    float mask_alpha = content_mask_coverage(input.position.xy, underline.content_mask);
     if (underline.wavy) {
         float half_thickness = underline.thickness * 0.5;
         float2 origin = underline.bounds.origin;
@@ -1125,9 +1208,9 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
         float distance_from_bottom_border = distance_in_pixels + half_thickness;
         float alpha = saturate(
             0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-        return input.color * float4(1., 1., 1., alpha);
+        return input.color * float4(1., 1., 1., alpha * mask_alpha);
     } else {
-        return input.color;
+        return input.color * float4(1., 1., 1., mask_alpha);
     }
 }
 
@@ -1141,7 +1224,7 @@ struct MonochromeSprite {
     uint order;
     uint pad;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Hsla color;
     AtlasTile tile;
     TransformationMatrix transformation;
@@ -1151,6 +1234,8 @@ struct MonochromeSpriteVertexOutput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float4 mask_bounds: TEXCOORD1;
+    nointerpolation float4 mask_corner_radii: TEXCOORD2;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1158,8 +1243,21 @@ struct MonochromeSpriteFragmentInput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float4 mask_bounds: TEXCOORD1;
+    nointerpolation float4 mask_corner_radii: TEXCOORD2;
     float4 clip_distance: SV_ClipDistance;
 };
+
+ContentMask mono_sprite_content_mask(MonochromeSpriteFragmentInput input) {
+    ContentMask content_mask;
+    content_mask.bounds.origin = input.mask_bounds.xy;
+    content_mask.bounds.size = input.mask_bounds.zw;
+    content_mask.corner_radii.top_left = input.mask_corner_radii.x;
+    content_mask.corner_radii.top_right = input.mask_corner_radii.y;
+    content_mask.corner_radii.bottom_right = input.mask_corner_radii.z;
+    content_mask.corner_radii.bottom_left = input.mask_corner_radii.w;
+    return content_mask;
+}
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
 
@@ -1169,7 +1267,7 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     MonochromeSprite sprite = mono_sprites[sprite_id];
     float4 device_position =
         to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
-    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
     float4 color = hsla_to_rgba(sprite.color);
 
@@ -1177,6 +1275,12 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     output.position = device_position;
     output.tile_position = tile_position;
     output.color = color;
+    output.mask_bounds = float4(sprite.content_mask.bounds.origin, sprite.content_mask.bounds.size);
+    output.mask_corner_radii = float4(
+        sprite.content_mask.corner_radii.top_left,
+        sprite.content_mask.corner_radii.top_right,
+        sprite.content_mask.corner_radii.bottom_right,
+        sprite.content_mask.corner_radii.bottom_left);
     output.clip_distance = clip_distance;
     return output;
 }
@@ -1184,7 +1288,8 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
-    return float4(input.color.rgb, input.color.a * alpha_corrected);
+    float mask_alpha = content_mask_coverage(input.position.xy, mono_sprite_content_mask(input));
+    return float4(input.color.rgb, input.color.a * alpha_corrected * mask_alpha);
 }
 
 MonochromeSpriteVertexOutput subpixel_sprite_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
@@ -1200,7 +1305,8 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
 
     SubpixelSpriteFragmentOutput output;
     output.foreground = float4(input.color.rgb, 1.0f);
-    output.alpha = float4(input.color.a * alpha_corrected, 1.0f);
+    float mask_alpha = content_mask_coverage(input.position.xy, mono_sprite_content_mask(input));
+    output.alpha = float4(input.color.a * alpha_corrected * mask_alpha, 1.0f);
     return output;
 }
 
@@ -1216,7 +1322,7 @@ struct PolychromeSprite {
     uint grayscale;
     float opacity;
     Bounds bounds;
-    Bounds content_mask;
+    ContentMask content_mask;
     Corners corner_radii;
     AtlasTile tile;
 };
@@ -1242,7 +1348,7 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
     PolychromeSprite sprite = poly_sprites[sprite_id];
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
     float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                    sprite.content_mask);
+                                                    sprite.content_mask.bounds);
     float2 tile_position = to_tile_position(unit_vertex, sprite.tile);
 
     PolychromeSpriteVertexOutput output;
@@ -1270,6 +1376,7 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }
-    color.a *= sprite.opacity * saturate(0.5 - distance);
+    color.a *= sprite.opacity * saturate(0.5 - distance) *
+        content_mask_coverage(input.position.xy, sprite.content_mask);
     return color;
 }
