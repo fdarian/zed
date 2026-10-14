@@ -849,6 +849,21 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
     fn is_hovered(&self) -> bool;
+    /// Hides the cursor and stops it from moving, so mouse input is reported only as relative
+    /// movement. Returns whether the lock is held afterwards. Platforms that cannot lock the
+    /// pointer return `false`. The platform releases the lock itself when the window deactivates
+    /// or closes.
+    fn set_pointer_lock(&self, _locked: bool) -> bool {
+        false
+    }
+    fn is_pointer_locked(&self) -> bool {
+        false
+    }
+    /// The `(deltaX, deltaY)` of the latest mouse move, in pixels. Zero on platforms that do not
+    /// report relative movement.
+    fn last_mouse_movement(&self) -> Point<Pixels> {
+        Point::default()
+    }
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);

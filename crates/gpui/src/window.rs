@@ -1265,6 +1265,8 @@ pub struct Window {
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
+    pointer_locked: bool,
+    pointer_lock_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
@@ -1952,6 +1954,8 @@ impl Window {
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
+            pointer_locked: false,
+            pointer_lock_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
             active,
             hovered,
@@ -2618,6 +2622,68 @@ impl Window {
     /// Always `false` on platforms other than macOS.
     pub fn is_simple_fullscreen(&self) -> bool {
         self.platform_window.is_simple_fullscreen()
+    }
+
+    /// Asks the platform to lock the pointer: the cursor is hidden and stops moving, and mouse
+    /// movement is reported through [`Window::last_mouse_movement`]. Returns whether the lock is
+    /// held. It fails on platforms without pointer lock and on windows that are not active.
+    ///
+    /// The lock is released by [`Window::exit_pointer_lock`], and by the platform when the window
+    /// deactivates or closes. Observers registered with [`Window::observe_pointer_lock`] are
+    /// notified of every change.
+    pub fn request_pointer_lock(&mut self, cx: &mut App) -> bool {
+        self.platform_window.set_pointer_lock(true);
+        self.sync_pointer_lock(cx);
+        self.pointer_locked
+    }
+
+    /// Releases the pointer lock taken by [`Window::request_pointer_lock`]. Does nothing when
+    /// the pointer is not locked.
+    pub fn exit_pointer_lock(&mut self, cx: &mut App) {
+        self.platform_window.set_pointer_lock(false);
+        self.sync_pointer_lock(cx);
+    }
+
+    /// Whether the pointer is locked to this window.
+    pub fn is_pointer_locked(&self) -> bool {
+        self.pointer_locked
+    }
+
+    /// The `(deltaX, deltaY)` of the latest mouse move, in pixels. Available whether or not the
+    /// pointer is locked; zero on platforms that do not report relative movement.
+    pub fn last_mouse_movement(&self) -> Point<Pixels> {
+        self.platform_window.last_mouse_movement()
+    }
+
+    /// Registers a callback invoked when the pointer lock is taken, released, or lost (for
+    /// example because the window deactivated). Read the new state with
+    /// [`Window::is_pointer_locked`].
+    pub fn observe_pointer_lock(
+        &self,
+        mut callback: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) = self.pointer_lock_observers.insert(
+            (),
+            Box::new(move |window, cx| {
+                callback(window, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Compares the platform's lock state with the last one observers saw, and notifies them on
+    /// a difference. The platform can drop the lock without being asked.
+    fn sync_pointer_lock(&mut self, cx: &mut App) {
+        let locked = self.platform_window.is_pointer_locked();
+        if locked == self.pointer_locked {
+            return;
+        }
+        self.pointer_locked = locked;
+        self.pointer_lock_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
     }
 
     pub(crate) fn appearance_changed(&mut self, cx: &mut App) {
@@ -6559,6 +6625,7 @@ impl Window {
             .clone()
             .retain(&(), |callback| callback(self, cx));
 
+        self.sync_pointer_lock(cx);
         self.bounds_changed(cx);
         self.refresh();
 
@@ -7499,6 +7566,63 @@ mod tests {
     /// must never strand them: either the frame runs them, or (when the
     /// inactive-window frame-rate throttle defers the frame) the waker fires
     /// so another request is delivered.
+    #[gpui::test]
+    fn test_pointer_lock_notifies_observers_and_survives_lost_lock(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        let notifications = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = window
+            .update(cx, |_, window, _| {
+                let notifications = notifications.clone();
+                window.observe_pointer_lock(move |window, _| {
+                    notifications.borrow_mut().push(window.is_pointer_locked());
+                })
+            })
+            .unwrap();
+
+        window
+            .update(cx, |_, window, cx| {
+                assert!(!window.is_pointer_locked());
+                assert!(window.request_pointer_lock(cx));
+                assert!(window.is_pointer_locked());
+                // A second request changes nothing, so observers stay quiet.
+                assert!(window.request_pointer_lock(cx));
+            })
+            .unwrap();
+        assert_eq!(*notifications.borrow(), [true]);
+
+        window
+            .update(cx, |_, window, cx| window.exit_pointer_lock(cx))
+            .unwrap();
+        assert_eq!(*notifications.borrow(), [true, false]);
+
+        window
+            .update(cx, |_, window, cx| {
+                window.request_pointer_lock(cx);
+                test_window.simulate_pointer_lock_lost();
+                assert!(
+                    window.is_pointer_locked(),
+                    "lost locks are only noticed on sync"
+                );
+                window.set_active_for_tests(false, cx);
+                assert!(!window.is_pointer_locked());
+            })
+            .unwrap();
+        assert_eq!(*notifications.borrow(), [true, false, true, false]);
+    }
+
+    #[gpui::test]
+    fn test_last_mouse_movement_reports_platform_delta(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_mouse_movement(point(px(3.), px(-2.)));
+        window
+            .update(cx, |_, window, _| {
+                assert_eq!(window.last_mouse_movement(), point(px(3.), px(-2.)));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn test_pending_next_frame_callbacks_are_not_stranded(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);

@@ -45,6 +45,8 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
+    pointer_locked: bool,
+    last_mouse_movement: Point<Pixels>,
 }
 
 #[derive(Clone)]
@@ -107,6 +109,8 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
+            pointer_locked: false,
+            last_mouse_movement: Point::default(),
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -196,6 +200,17 @@ impl TestWindow {
 
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
         self.0.lock().external_drag_files.clone()
+    }
+
+    /// Sets the value reported by `last_mouse_movement`, as a real platform does for each mouse move.
+    pub fn simulate_mouse_movement(&self, movement: Point<Pixels>) {
+        self.0.lock().last_mouse_movement = movement;
+    }
+
+    /// Drops the pointer lock the way a platform does on deactivation. The window only notices
+    /// on its next activation change, as with a real platform.
+    pub fn simulate_pointer_lock_lost(&self) {
+        self.0.lock().pointer_locked = false;
     }
 
     pub fn set_start_external_drag_result(&self, result: bool) {
@@ -289,6 +304,20 @@ impl PlatformWindow for TestWindow {
 
     fn is_hovered(&self) -> bool {
         false
+    }
+
+    fn set_pointer_lock(&self, locked: bool) -> bool {
+        let mut state = self.0.lock();
+        state.pointer_locked = locked;
+        locked
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        self.0.lock().pointer_locked
+    }
+
+    fn last_mouse_movement(&self) -> Point<Pixels> {
+        self.0.lock().last_mouse_movement
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {

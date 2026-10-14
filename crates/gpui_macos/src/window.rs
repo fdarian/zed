@@ -327,7 +327,57 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
 /// AppKit, so every call is gated on this flag to keep them balanced.
 static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 
-/// Hides or restores the cursor for `CursorStyle::None`. Idempotent.
+/// Whether the active cursor style is `CursorStyle::None`.
+static CURSOR_STYLE_HIDES: AtomicBool = AtomicBool::new(false);
+
+/// Whether a window holds the pointer lock. The cursor stays hidden for as long as it does,
+/// whatever the cursor style says.
+static POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" {
+    // CoreGraphics; `connected` is a `boolean_t`. Returns a `CGError`.
+    fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32;
+}
+
+/// Records whether the cursor style hides the cursor, and syncs AppKit.
+///
+/// # Safety
+///
+/// Must be called on the AppKit main thread.
+unsafe fn set_cursor_style_hides_cursor(hides: bool) {
+    CURSOR_STYLE_HIDES.store(hides, Ordering::Relaxed);
+    // SAFETY: The caller guarantees AppKit main-thread access.
+    unsafe { sync_cursor_hidden() };
+}
+
+/// Takes or releases the pointer lock: freezes the cursor in place and hides it.
+///
+/// # Safety
+///
+/// Must be called on the AppKit main thread.
+unsafe fn set_pointer_locked(locked: bool) {
+    if POINTER_LOCKED.swap(locked, Ordering::Relaxed) == locked {
+        return;
+    }
+    // SAFETY: The caller guarantees AppKit main-thread access.
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(!locked as u32);
+        sync_cursor_hidden();
+    }
+}
+
+/// # Safety
+///
+/// Must be called on the AppKit main thread.
+unsafe fn sync_cursor_hidden() {
+    let hidden =
+        CURSOR_STYLE_HIDES.load(Ordering::Relaxed) || POINTER_LOCKED.load(Ordering::Relaxed);
+    // SAFETY: The caller guarantees AppKit main-thread access.
+    unsafe { set_cursor_hidden(hidden) };
+}
+
+/// Hides or restores the cursor. Idempotent. Callers go through `sync_cursor_hidden` so the
+/// cursor style and the pointer lock agree.
 ///
 /// # Safety
 ///
@@ -369,7 +419,7 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
         };
 
         let Some(active_window) = active_window else {
-            set_cursor_hidden(false);
+            set_cursor_style_hides_cursor(false);
             return;
         };
 
@@ -382,7 +432,7 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
                 invalidateCursorRectsForView: window_state.native_view.as_ptr()
             ];
         }
-        set_cursor_hidden(style == CursorStyle::None);
+        set_cursor_style_hides_cursor(style == CursorStyle::None);
     }
 }
 
@@ -660,9 +710,19 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    pointer_locked: bool,
+    last_mouse_movement: Point<Pixels>,
 }
 
 impl MacWindowState {
+    /// Gives up the pointer lock if this window holds it, so the cursor is never left frozen.
+    fn release_pointer_lock(&mut self) {
+        if std::mem::take(&mut self.pointer_locked) {
+            // SAFETY: Window state is only touched from the AppKit main thread.
+            unsafe { set_pointer_locked(false) };
+        }
+    }
+
     fn move_traffic_light(&mut self) {
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() {
@@ -1088,6 +1148,8 @@ impl MacWindow {
                 toggle_tab_bar_callback: None,
                 activated_least_once: false,
                 closed: Arc::new(AtomicBool::new(false)),
+                pointer_locked: false,
+                last_mouse_movement: Point::default(),
                 accesskit_adapter: None,
                 sheet_parent: None,
             })));
@@ -1822,6 +1884,34 @@ impl PlatformWindow for MacWindow {
 
     fn is_simple_fullscreen(&self) -> bool {
         self.0.lock().simple_fullscreen_state.is_some()
+    }
+
+    fn set_pointer_lock(&self, locked: bool) -> bool {
+        let mut lock = self.0.lock();
+        if !locked {
+            lock.release_pointer_lock();
+            return false;
+        }
+        if lock.pointer_locked {
+            return true;
+        }
+        // A background window cannot freeze the cursor: the user is working in another app.
+        // SAFETY: The platform window is only used from the AppKit main thread.
+        if unsafe { lock.native_window.isKeyWindow() } != YES {
+            return false;
+        }
+        lock.pointer_locked = true;
+        // SAFETY: As above.
+        unsafe { set_pointer_locked(true) };
+        true
+    }
+
+    fn is_pointer_locked(&self) -> bool {
+        self.0.lock().pointer_locked
+    }
+
+    fn last_mouse_movement(&self) -> Point<Pixels> {
+        self.0.lock().last_mouse_movement
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -2590,6 +2680,21 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
         }
         _ => {}
     }
+    if matches!(
+        native_event_type,
+        NSEventType::NSMouseMoved
+            | NSEventType::NSLeftMouseDragged
+            | NSEventType::NSRightMouseDragged
+            | NSEventType::NSOtherMouseDragged
+    ) {
+        // Set before dispatch so handlers of this event read its own delta.
+        lock.last_mouse_movement = unsafe {
+            point(
+                px(native_event.deltaX() as f32),
+                px(native_event.deltaY() as f32),
+            )
+        };
+    }
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
@@ -2837,14 +2942,15 @@ extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
 
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
+    let mut lock = window_state.lock();
     let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
     if !is_active {
+        lock.release_pointer_lock();
         // SAFETY: AppKit delivers window delegate callbacks on the main thread.
-        unsafe { set_cursor_hidden(false) };
+        unsafe { set_cursor_style_hides_cursor(false) };
     }
 
     // When opening a pop-up while the application isn't active, Cocoa sends a spurious
@@ -2940,6 +3046,7 @@ extern "C" fn close_window(this: &Object, _: Sel) {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
             lock.closed.store(true, Ordering::Release);
+            lock.release_pointer_lock();
             (
                 lock.close_callback.take(),
                 lock.simple_fullscreen_state.take(),
@@ -2950,7 +3057,7 @@ extern "C" fn close_window(this: &Object, _: Sel) {
             pop_simple_fullscreen_presentation_options();
         }
 
-        set_cursor_hidden(false);
+        set_cursor_style_hides_cursor(false);
 
         if let Some(callback) = close_callback {
             callback();
