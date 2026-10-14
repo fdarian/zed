@@ -367,6 +367,8 @@ pub struct ResolvedPlacement {
     pub available_width: Pixels,
     /// Height the element can take without leaving the window
     pub available_height: Pixels,
+    /// Size of the reference box
+    pub anchor_size: Size<Pixels>,
 }
 
 fn place(
@@ -445,6 +447,7 @@ fn place(
             align: placement.align,
             available_width: px(available_width),
             available_height: px(available_height),
+            anchor_size: reference.size,
         },
     )
 }
