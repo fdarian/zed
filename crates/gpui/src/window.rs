@@ -6,7 +6,7 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -4451,7 +4451,11 @@ impl Window {
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
-            background: quad.background.opacity(opacity),
+            background: quad
+                .background
+                .opacity(opacity)
+                .scale_gradient(self.scale_factor()),
+            background_tile: quad.background_tile.scale(self.scale_factor()),
             border_colors: quad.border_colors.map(|color| color.opacity(opacity)),
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
@@ -7402,9 +7406,20 @@ pub struct PaintQuad {
     pub border_colors: Edges<Hsla>,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// Where a gradient background draws its image and how it repeats. The default has no tile
+    /// and the background spans the quad.
+    pub background_tile: BackgroundTile,
 }
 
 impl PaintQuad {
+    /// Places and repeats the background, as for a CSS background layer.
+    pub fn background_tile(self, background_tile: BackgroundTile) -> Self {
+        PaintQuad {
+            background_tile,
+            ..self
+        }
+    }
+
     /// Sets the corner radii of the quad.
     pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
         PaintQuad {
@@ -7462,6 +7477,7 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_colors: Edges::all(border_color.into()),
         border_style,
+        background_tile: BackgroundTile::default(),
     }
 }
 
@@ -7474,6 +7490,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_colors: Edges::all(transparent_black()),
         border_style: BorderStyle::default(),
+        background_tile: BackgroundTile::default(),
     }
 }
 
@@ -7490,6 +7507,7 @@ pub fn outline(
         border_widths: (1.).into(),
         border_colors: Edges::all(border_color.into()),
         border_style,
+        background_tile: BackgroundTile::default(),
     }
 }
 

@@ -74,6 +74,7 @@ mod macos_build {
         let gpui_src_paths = [
             gpui_dir.join("src/scene.rs"),
             gpui_dir.join("src/geometry.rs"),
+            gpui_dir.join("src/background_layer.rs"),
             gpui_dir.join("src/color.rs"),
             gpui_dir.join("src/window.rs"),
             gpui_dir.join("src/platform.rs"),

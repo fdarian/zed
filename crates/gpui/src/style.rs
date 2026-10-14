@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
+    AbsoluteLength, App, Background, BackgroundBoxes, BackgroundLayer, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
@@ -281,6 +281,10 @@ pub struct Style {
 
     /// The fill color of this element
     pub background: Option<Fill>,
+
+    /// Gradient layers painted above the background color, like CSS `background-image`. The first
+    /// layer is on top.
+    pub background_layers: Vec<BackgroundLayer>,
 
     /// The border color of each side of this element. A transparent side draws nothing.
     #[refineable]
@@ -800,7 +804,7 @@ impl Style {
                     | BackgroundTag::PatternSlash
                     | BackgroundTag::Checkerboard => color.solid,
 
-                    BackgroundTag::LinearGradient => color
+                    BackgroundTag::LinearGradient | BackgroundTag::Gradient => color
                         .colors
                         .first()
                         .map(|stop| stop.color)
@@ -818,6 +822,8 @@ impl Style {
                 self.border_style,
             ));
         }
+
+        self.paint_background_layers(bounds, corner_radii, window, rem_size);
 
         window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
 
@@ -872,6 +878,50 @@ impl Style {
         #[cfg(debug_assertions)]
         if self.debug_below {
             cx.remove_global::<DebugBelow>();
+        }
+    }
+
+    fn paint_background_layers(
+        &self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        window: &mut Window,
+        rem_size: Pixels,
+    ) {
+        if self.background_layers.is_empty() {
+            return;
+        }
+        let boxes = BackgroundBoxes::new(
+            bounds,
+            corner_radii,
+            self.border_widths.to_pixels(rem_size),
+            // Percentage padding is relative to the containing block, which isn't known here;
+            // the element's own size is the closest stand-in.
+            self.padding.to_pixels(
+                size(
+                    AbsoluteLength::Pixels(bounds.size.width),
+                    AbsoluteLength::Pixels(bounds.size.height),
+                ),
+                rem_size,
+            ),
+        );
+        for layer in self.background_layers.iter().rev() {
+            let Some(resolved) = layer.resolve(&boxes) else {
+                continue;
+            };
+            for chunk in resolved.chunks {
+                window.paint_quad(
+                    quad(
+                        resolved.bounds,
+                        resolved.corner_radii,
+                        chunk,
+                        Edges::default(),
+                        Hsla::default(),
+                        self.border_style,
+                    )
+                    .background_tile(resolved.tile),
+                );
+            }
         }
     }
 
@@ -933,6 +983,7 @@ impl Default for Style {
             flex_shrink: 1.0,
             flex_basis: Length::Auto,
             background: None,
+            background_layers: Vec::new(),
             border_colors: Edges::default(),
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),

@@ -15,6 +15,7 @@ mod arena;
 mod asset_cache;
 mod assets;
 mod bounds_tree;
+mod background_layer;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
@@ -99,6 +100,7 @@ pub use app::*;
 pub(crate) use arena::*;
 pub use asset_cache::*;
 pub use assets::*;
+pub use background_layer::*;
 pub use color::*;
 pub use ctor::ctor;
 #[cfg(feature = "profiler")]

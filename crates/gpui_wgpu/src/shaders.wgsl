@@ -143,11 +143,47 @@ struct LinearColorStop {
     percentage: f32,
 }
 
+struct GradientGeometry {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+}
+
+// One chunk, of at most four stops, of a CSS gradient. See `GradientParams` in color.rs.
+struct GradientParams {
+    // 0u is linear, 1u radial, 2u conic
+    kind: u32,
+    stop_count: u32,
+    repeating: u32,
+    pad: u32,
+    geometry: GradientGeometry,
+    t_min: f32,
+    t_max: f32,
+    repeat_start: f32,
+    repeat_length: f32,
+    // Stops 2 and 3; stops 0 and 1 are `Background.colors`.
+    extra_colors: array<LinearColorStop, 2>,
+}
+
+// Where a quad's background image is drawn and how it repeats. A zero width means no tile.
+struct BackgroundTile {
+    origin_x: f32,
+    origin_y: f32,
+    width: f32,
+    height: f32,
+    pitch_x: f32,
+    pitch_y: f32,
+    repeat_x: u32,
+    repeat_y: u32,
+}
+
 struct Background {
     // 0u is Solid
     // 1u is LinearGradient
     // 2u is PatternSlash
     // 3u is Checkerboard
+    // 4u is a CSS gradient, described by `gradient`
     tag: u32,
     // 0u is sRGB linear color
     // 1u is Oklab color
@@ -156,6 +192,7 @@ struct Background {
     gradient_angle_or_pattern_height: f32,
     colors: array<LinearColorStop, 2>,
     pad: u32,
+    gradient: GradientParams,
 }
 
 struct AtlasTextureId {
@@ -502,6 +539,81 @@ fn prepare_gradient_color(tag: u32, color_space: u32,
     return result;
 }
 
+// A stop's colour as it is interpolated: premultiplied, in the gradient's colour space.
+fn css_gradient_stop(stop: Hsla, color_space: u32) -> vec4<f32> {
+    var color = hsla_to_rgba(stop);
+    if (color_space == 1u) {
+        color = linear_srgb_to_oklab(color);
+    } else {
+        color = linear_to_srgba(color);
+    }
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+
+// CSS linear, radial and conic gradients, one chunk of at most four stops. `bounds` is the tile
+// the gradient's geometry is relative to.
+fn css_gradient_color(background: Background, position: vec2<f32>, bounds: Bounds) -> vec4<f32> {
+    let g = background.gradient;
+    let local = position - bounds.origin;
+
+    var t: f32;
+    if (g.kind == 0u) {
+        let start = vec2<f32>(g.geometry.a, g.geometry.b);
+        let line = vec2<f32>(g.geometry.c, g.geometry.d) - start;
+        t = dot(local - start, line) / dot(line, line);
+    } else if (g.kind == 1u) {
+        let radii = vec2<f32>(g.geometry.c, g.geometry.d);
+        t = length((local - vec2<f32>(g.geometry.a, g.geometry.b)) / radii);
+    } else {
+        let offset = local - vec2<f32>(g.geometry.a, g.geometry.b);
+        // Clockwise from the top, in turns.
+        t = fract(atan2(offset.x, -offset.y) / (2.0 * M_PI_F) - g.geometry.c);
+    }
+
+    if (g.repeating != 0u) {
+        t = g.repeat_start + (t - g.repeat_start) - g.repeat_length * floor((t - g.repeat_start) / g.repeat_length);
+    }
+    if (t < g.t_min || t >= g.t_max) {
+        return vec4<f32>(0.0);
+    }
+
+    var stop_positions = array<f32, 4>(
+        background.colors[0].percentage,
+        background.colors[1].percentage,
+        g.extra_colors[0].percentage,
+        g.extra_colors[1].percentage,
+    );
+    var stop_colors = array<vec4<f32>, 4>(
+        css_gradient_stop(background.colors[0].color, background.color_space),
+        css_gradient_stop(background.colors[1].color, background.color_space),
+        css_gradient_stop(g.extra_colors[0].color, background.color_space),
+        css_gradient_stop(g.extra_colors[1].color, background.color_space),
+    );
+
+    var color = stop_colors[0];
+    for (var i = 0u; i + 1u < g.stop_count; i += 1u) {
+        if (t >= stop_positions[i]) {
+            // Later segments override earlier ones, which makes a hard stop a jump.
+            if (t < stop_positions[i + 1u]) {
+                color = mix(stop_colors[i], stop_colors[i + 1u],
+                    (t - stop_positions[i]) / (stop_positions[i + 1u] - stop_positions[i]));
+            } else {
+                color = stop_colors[i + 1u];
+            }
+        }
+    }
+
+    if (color.a > 0.0) {
+        color = vec4<f32>(color.rgb / color.a, color.a);
+    } else {
+        color = vec4<f32>(0.0);
+    }
+    if (background.color_space == 1u) {
+        return oklab_to_linear_srgb(color);
+    }
+    return srgba_to_linear(color);
+}
+
 fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
     solid_color: vec4<f32>, color0: vec4<f32>, color1: vec4<f32>) -> vec4<f32> {
     var background_color = vec4<f32>(0.0);
@@ -571,6 +683,9 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
             background_color = solid_color;
             background_color.a *= saturate(0.5 - distance);
         }
+        case 4u: {
+            return css_gradient_color(background, position, bounds);
+        }
         case 3u: {
             // checkerboard
             let size = background.gradient_angle_or_pattern_height;
@@ -599,6 +714,7 @@ struct Quad {
     border_colors: EdgesHsla,
     corner_radii: Corners,
     border_widths: Edges,
+    background_tile: BackgroundTile,
 }
 
 struct QuadVarying {
@@ -650,8 +766,38 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     let quad = load_quad(input.quad_id);
 
-    let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+    var fill_position = input.position.xy;
+    var fill_bounds = quad.bounds;
+    var tile_alpha = 1.0;
+    if (quad.background_tile.width > 0.0) {
+        // The background is one tile, repeated or not, rather than the whole quad.
+        let tile = quad.background_tile;
+        let tile_origin = vec2<f32>(tile.origin_x, tile.origin_y);
+        let tile_size = vec2<f32>(tile.width, tile.height);
+        let pitch = vec2<f32>(tile.pitch_x, tile.pitch_y);
+        var local = fill_position - tile_origin;
+        if (tile.repeat_x != 0u) {
+            local.x -= pitch.x * floor(local.x / pitch.x);
+        }
+        if (tile.repeat_y != 0u) {
+            local.y -= pitch.y * floor(local.y / pitch.y);
+        }
+        // Repeating axes have hard edges, so tiles meet without a seam; a single tile is antialiased.
+        var coverage_x = saturate(min(local.x, tile_size.x - local.x) + 0.5);
+        if (tile.repeat_x != 0u) {
+            coverage_x = select(0.0, 1.0, local.x < tile_size.x);
+        }
+        var coverage_y = saturate(min(local.y, tile_size.y - local.y) + 0.5);
+        if (tile.repeat_y != 0u) {
+            coverage_y = select(0.0, 1.0, local.y < tile_size.y);
+        }
+        tile_alpha = coverage_x * coverage_y;
+        fill_position = tile_origin + local;
+        fill_bounds = Bounds(tile_origin, tile_size);
+    }
+    var background_color = gradient_color(quad.background, fill_position, fill_bounds,
         input.background_solid, input.background_color0, input.background_color1);
+    background_color.a *= tile_alpha;
     let mask_alpha = content_mask_coverage(input.position.xy, quad.content_mask);
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&

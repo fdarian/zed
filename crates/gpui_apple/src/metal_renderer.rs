@@ -1676,8 +1676,11 @@ fn log_presented_time(drawable: &metal::MetalDrawableRef) {
 mod tests {
     use super::MetalHeadlessRenderer;
     use gpui::{
-        Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla, PlatformHeadlessRenderer,
-        Quad, ScaledPixels, Scene, point, size,
+        Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundLayer,
+        BackgroundPosition, BackgroundRepeat, BackgroundSize, Bounds, ColorSpace, ContentMask,
+        Corners, DevicePixels, Edges, Gradient, GradientItem, GradientShape, GradientStop, Hsla,
+        LengthPercentage, LinearDirection, PlatformHeadlessRenderer, Quad, RadialShape,
+        RadialSize, RepeatStyle, ScaledPixels, Scene, StopPosition, point, px, size,
     };
 
     const SIZE: f32 = 40.;
@@ -1700,14 +1703,14 @@ mod tests {
         }
     }
 
-    fn quad(background: Hsla, border_colors: Edges<Hsla>, border_width: f32) -> Quad {
+    fn quad(background: impl Into<Background>, border_colors: Edges<Hsla>, border_width: f32) -> Quad {
         Quad {
             bounds: full_bounds(),
             content_mask: ContentMask {
                 bounds: full_bounds(),
                 corner_radii: Corners::default(),
             },
-            background: Background::from(background),
+            background: background.into(),
             border_colors,
             border_widths: Edges::all(ScaledPixels(border_width)),
             ..Quad::default()
@@ -1779,5 +1782,244 @@ mod tests {
         assert_eq!(dominant_channel(&image, 20, 20), "red");
         assert_eq!(dominant_channel(&image, 20, 1), "red", "straight edges are untouched");
         assert_eq!(dominant_channel(&image, 8, 8), "red", "inside the arc");
+    }
+
+    fn hex(value: u32) -> Hsla {
+        gpui::rgb(value).into()
+    }
+
+    fn stop(value: u32, position: Option<StopPosition>) -> GradientItem {
+        GradientItem::Stop(GradientStop {
+            color: hex(value),
+            position,
+        })
+    }
+
+    fn at(fraction: f32) -> Option<StopPosition> {
+        Some(StopPosition::Fraction(fraction))
+    }
+
+    fn layer(shape: GradientShape, items: Vec<GradientItem>, repeating: bool) -> BackgroundLayer {
+        BackgroundLayer::new(BackgroundImage::Gradient(Gradient {
+            shape,
+            items,
+            repeating,
+            color_space: ColorSpace::Srgb,
+        }))
+    }
+
+    /// Paints the layer into the whole 40x40 target, one quad per chunk.
+    fn render_layer(layer: &BackgroundLayer) -> image::RgbaImage {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
+        let boxes = BackgroundBoxes::new(bounds, Corners::default(), Edges::default(), Edges::default());
+        let resolved = layer.resolve(&boxes).expect("layer has something to paint");
+        let mut scene = Scene::default();
+        for chunk in resolved.chunks {
+            let mut quad = quad(chunk, Edges::all(gpui::transparent_black()), 0.);
+            quad.background_tile = resolved.tile;
+            scene.insert_primitive(quad);
+        }
+        render(&mut scene)
+    }
+
+    fn assert_color(image: &image::RgbaImage, x: u32, y: u32, expected: [u8; 3]) {
+        let [red, green, blue, _] = image.get_pixel(x, y).0;
+        let close = |actual: u8, expected: u8| actual.abs_diff(expected) <= 12;
+        assert!(
+            close(red, expected[0]) && close(green, expected[1]) && close(blue, expected[2]),
+            "pixel ({x}, {y}) is {red} {green} {blue}, expected about {expected:?}"
+        );
+    }
+
+    #[test]
+    fn a_linear_gradient_with_more_than_four_stops_has_no_seam_between_chunks() {
+        // Stops 0-3 form the first chunk and 3-4 the second; the boundary is at x = 30.
+        let image = render_layer(&layer(
+            GradientShape::Linear(LinearDirection::ToRight),
+            vec![
+                stop(0xff0000, at(0.)),
+                stop(0x00ff00, at(0.25)),
+                stop(0x0000ff, at(0.5)),
+                stop(0xffffff, at(0.75)),
+                stop(0x000000, at(1.)),
+            ],
+            false,
+        ));
+        assert_color(&image, 0, 20, [242, 13, 0]);
+        assert_color(&image, 10, 20, [0, 242, 13]);
+        assert_color(&image, 20, 20, [13, 13, 255]);
+        // Neighbouring pixels differ by a few levels at most, including across the boundary.
+        for x in 26..34 {
+            let [red, green, _, _] = image.get_pixel(x, 20).0;
+            let [next_red, next_green, _, _] = image.get_pixel(x + 1, 20).0;
+            assert!(
+                red.abs_diff(next_red) <= 30 && green.abs_diff(next_green) <= 30,
+                "seam at x = {x}: {red} {green} then {next_red} {next_green}"
+            );
+        }
+        assert_color(&image, 30, 20, [242, 242, 242]);
+        assert_color(&image, 39, 20, [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_hard_stop_is_a_jump() {
+        let image = render_layer(&layer(
+            GradientShape::Linear(LinearDirection::ToRight),
+            vec![
+                stop(0xff0000, at(0.)),
+                stop(0xff0000, at(0.5)),
+                stop(0x0000ff, at(0.5)),
+                stop(0x0000ff, at(1.)),
+            ],
+            false,
+        ));
+        assert_color(&image, 18, 20, [255, 0, 0]);
+        assert_color(&image, 21, 20, [0, 0, 255]);
+    }
+
+    #[test]
+    fn a_radial_gradient_grows_from_its_centre() {
+        let image = render_layer(&layer(
+            GradientShape::Radial {
+                shape: RadialShape::Circle,
+                size: RadialSize::ClosestSide,
+                position: BackgroundPosition::CENTER,
+            },
+            vec![stop(0xffffff, at(0.)), stop(0x000000, at(1.))],
+            false,
+        ));
+        assert_color(&image, 20, 20, [255, 255, 255]);
+        assert_color(&image, 39, 20, [0, 0, 0]);
+        assert_color(&image, 1, 1, [0, 0, 0]);
+        let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0];
+        assert!(brightness(20, 20) > brightness(26, 20));
+        assert!(brightness(26, 20) > brightness(33, 20));
+        assert!(brightness(33, 20) > brightness(38, 20) - 1);
+        // About a quarter of the way out: 5 of 20 pixels.
+        assert_color(&image, 25, 20, [191, 191, 191]);
+    }
+
+    #[test]
+    fn a_conic_gradient_sweeps_clockwise_from_the_top() {
+        let image = render_layer(&layer(
+            GradientShape::Conic {
+                from: 0.,
+                position: BackgroundPosition::CENTER,
+            },
+            vec![
+                stop(0xff0000, at(0.)),
+                stop(0xff0000, at(0.5)),
+                stop(0x0000ff, at(0.5)),
+                stop(0x0000ff, at(1.)),
+            ],
+            false,
+        ));
+        assert_color(&image, 30, 20, [255, 0, 0]);
+        assert_color(&image, 20, 35, [255, 0, 0]);
+        assert_color(&image, 10, 20, [0, 0, 255]);
+        assert_color(&image, 19, 5, [0, 0, 255]);
+    }
+
+    #[test]
+    fn a_repeating_gradient_restarts_at_its_period() {
+        let image = render_layer(&layer(
+            GradientShape::Linear(LinearDirection::ToRight),
+            vec![
+                GradientItem::Stop(GradientStop {
+                    color: hex(0xff0000),
+                    position: Some(StopPosition::Length(px(0.))),
+                }),
+                GradientItem::Stop(GradientStop {
+                    color: hex(0x0000ff),
+                    position: Some(StopPosition::Length(px(10.))),
+                }),
+            ],
+            true,
+        ));
+        for period in 0..4 {
+            assert_color(&image, period * 10, 20, [242, 0, 13]);
+            assert_color(&image, period * 10 + 9, 20, [13, 0, 242]);
+        }
+    }
+
+    #[test]
+    fn a_no_repeat_tile_paints_only_its_own_rectangle() {
+        let mut tiled = layer(
+            GradientShape::Linear(LinearDirection::ToBottom),
+            vec![stop(0xff0000, at(0.)), stop(0xff0000, at(1.))],
+            false,
+        );
+        tiled.origin = BackgroundBox::BorderBox;
+        tiled.size = BackgroundSize::Explicit {
+            width: Some(LengthPercentage::Length(px(10.))),
+            height: Some(LengthPercentage::Length(px(10.))),
+        };
+        tiled.position = BackgroundPosition::new(
+            LengthPercentage::Length(px(5.)),
+            LengthPercentage::Length(px(8.)),
+        );
+        tiled.repeat = BackgroundRepeat {
+            x: RepeatStyle::NoRepeat,
+            y: RepeatStyle::NoRepeat,
+        };
+        let image = render_layer(&tiled);
+        assert_color(&image, 5, 8, [255, 0, 0]);
+        assert_color(&image, 14, 17, [255, 0, 0]);
+        assert_color(&image, 4, 8, [0, 0, 0]);
+        assert_color(&image, 15, 12, [0, 0, 0]);
+        assert_color(&image, 8, 7, [0, 0, 0]);
+        assert_color(&image, 8, 18, [0, 0, 0]);
+        assert_color(&image, 30, 30, [0, 0, 0]);
+    }
+
+    #[test]
+    fn a_repeated_tile_restarts_its_gradient_in_every_cell() {
+        let mut tiled = layer(
+            GradientShape::Linear(LinearDirection::ToRight),
+            vec![stop(0xff0000, at(0.)), stop(0x0000ff, at(1.))],
+            false,
+        );
+        tiled.size = BackgroundSize::Explicit {
+            width: Some(LengthPercentage::Length(px(10.))),
+            height: Some(LengthPercentage::Length(px(40.))),
+        };
+        let image = render_layer(&tiled);
+        for cell in 0..4 {
+            assert_color(&image, cell * 10, 5, [242, 0, 13]);
+            assert_color(&image, cell * 10 + 9, 5, [13, 0, 242]);
+        }
+    }
+
+    #[test]
+    fn a_layer_clipped_to_rounded_corners_leaves_them_empty() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
+        let boxes = BackgroundBoxes::new(
+            bounds,
+            Corners {
+                top_left: px(16.),
+                top_right: px(16.),
+                bottom_right: px(16.),
+                bottom_left: px(16.),
+            },
+            Edges::default(),
+            Edges::default(),
+        );
+        let resolved = layer(
+            GradientShape::Linear(LinearDirection::ToBottom),
+            vec![stop(0xff0000, at(0.)), stop(0xff0000, at(1.))],
+            false,
+        )
+        .resolve(&boxes)
+        .unwrap();
+        let mut scene = Scene::default();
+        for chunk in resolved.chunks {
+            let mut quad = quad(chunk, Edges::all(gpui::transparent_black()), 0.);
+            quad.corner_radii = Corners::all(ScaledPixels(16.));
+            quad.background_tile = resolved.tile;
+            scene.insert_primitive(quad);
+        }
+        let image = render(&mut scene);
+        assert!(is_cleared(&image, 0, 0));
+        assert_color(&image, 20, 20, [255, 0, 0]);
     }
 }

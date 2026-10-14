@@ -66,10 +66,47 @@ struct LinearColorStop {
     float percentage;
 };
 
+struct GradientGeometry {
+    float a;
+    float b;
+    float c;
+    float d;
+};
+
+// One chunk, of at most four stops, of a CSS gradient. See `GradientParams` in color.rs.
+struct GradientParams {
+    // 0u is linear, 1u radial, 2u conic
+    uint kind;
+    uint stop_count;
+    uint repeating;
+    uint pad;
+    GradientGeometry geometry;
+    float t_min;
+    float t_max;
+    float repeat_start;
+    float repeat_length;
+    // Stops 2 and 3; stops 0 and 1 are `Background.colors`.
+    LinearColorStop extra_colors[2];
+};
+
+// Where a quad's background image is drawn and how it repeats. A zero width means no tile.
+struct BackgroundTile {
+    float origin_x;
+    float origin_y;
+    float width;
+    float height;
+    float pitch_x;
+    float pitch_y;
+    uint repeat_x;
+    uint repeat_y;
+};
+
 struct Background {
     // 0u is Solid
     // 1u is LinearGradient
     // 2u is PatternSlash
+    // 3u is Checkerboard
+    // 4u is a CSS gradient, described by `gradient`
     uint tag;
     // 0u is sRGB linear color
     // 1u is Oklab color
@@ -78,6 +115,7 @@ struct Background {
     float gradient_angle_or_pattern_height;
     LinearColorStop colors[2];
     uint pad;
+    GradientParams gradient;
 };
 
 struct GradientColor {
@@ -407,6 +445,79 @@ float2x2 rotate2d(float angle) {
     return float2x2(c, -s, s, c);
 }
 
+// A stop's colour as it is interpolated: premultiplied, in the gradient's colour space.
+float4 css_gradient_stop(Hsla stop, uint color_space) {
+    float4 color = hsla_to_rgba(stop);
+    if (color_space == 1) {
+        color = srgb_to_oklab(color);
+    }
+    return float4(color.rgb * color.a, color.a);
+}
+
+// CSS linear, radial and conic gradients, one chunk of at most four stops. `bounds` is the tile
+// the gradient's geometry is relative to.
+float4 css_gradient_color(Background background, float2 position, Bounds bounds) {
+    GradientParams g = background.gradient;
+    float2 local = position - bounds.origin;
+
+    float t;
+    if (g.kind == 0) {
+        float2 start = float2(g.geometry.a, g.geometry.b);
+        float2 line_vector = float2(g.geometry.c, g.geometry.d) - start;
+        t = dot(local - start, line_vector) / dot(line_vector, line_vector);
+    } else if (g.kind == 1) {
+        float2 radii = float2(g.geometry.c, g.geometry.d);
+        t = length((local - float2(g.geometry.a, g.geometry.b)) / radii);
+    } else {
+        float2 offset = local - float2(g.geometry.a, g.geometry.b);
+        // Clockwise from the top, in turns.
+        t = frac(atan2(offset.x, -offset.y) / (2.0 * M_PI_F) - g.geometry.c);
+    }
+
+    if (g.repeating != 0) {
+        t = g.repeat_start + (t - g.repeat_start) - g.repeat_length * floor((t - g.repeat_start) / g.repeat_length);
+    }
+    if (t < g.t_min || t >= g.t_max) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float stop_positions[4] = {
+        background.colors[0].percentage, background.colors[1].percentage,
+        g.extra_colors[0].percentage, g.extra_colors[1].percentage};
+    float4 stop_colors[4] = {
+        css_gradient_stop(background.colors[0].color, background.color_space),
+        css_gradient_stop(background.colors[1].color, background.color_space),
+        css_gradient_stop(g.extra_colors[0].color, background.color_space),
+        css_gradient_stop(g.extra_colors[1].color, background.color_space)};
+
+    float4 color = stop_colors[0];
+    for (uint i = 0; i + 1 < g.stop_count; i++) {
+        if (t >= stop_positions[i]) {
+            // Later segments override earlier ones, which makes a hard stop a jump.
+            if (t < stop_positions[i + 1]) {
+                color = lerp(stop_colors[i], stop_colors[i + 1],
+                    (t - stop_positions[i]) / (stop_positions[i + 1] - stop_positions[i]));
+            } else {
+                color = stop_colors[i + 1];
+            }
+        }
+    }
+
+    color = color.a > 0.0 ? float4(color.rgb / color.a, color.a) : float4(0.0, 0.0, 0.0, 0.0);
+    if (background.color_space == 1) {
+        color = oklab_to_srgb(color);
+    }
+
+    // Dither to reduce banding, as the linear gradient does.
+    float2 seed = position * 0.6180339887;
+    float r1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
+    float r2 = frac(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
+    float tri = r1 + r2 - 1.0;
+    color.rgb += tri * 2.0 / 255.0;
+    color.a += tri * 3.0 / 255.0;
+    return color;
+}
+
 float4 gradient_color(Background background,
                       float2 position,
                       Bounds bounds,
@@ -490,6 +601,9 @@ float4 gradient_color(Background background,
             color.a *= saturate(0.5 - distance);
             break;
         }
+        case 4:
+            color = css_gradient_color(background, position, bounds);
+            break;
         case 3: {
             // checkerboard
             float size = background.gradient_angle_or_pattern_height;
@@ -574,6 +688,7 @@ struct Quad {
     EdgesHsla border_colors;
     Corners corner_radii;
     Edges border_widths;
+    BackgroundTile background_tile;
 };
 
 struct QuadVertexOutput {
@@ -633,8 +748,37 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
 
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
-    float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+    float2 fill_position = input.position.xy;
+    Bounds fill_bounds = quad.bounds;
+    float tile_alpha = 1.0;
+    if (quad.background_tile.width > 0.0) {
+        // The background is one tile, repeated or not, rather than the whole quad.
+        BackgroundTile tile = quad.background_tile;
+        float2 tile_origin = float2(tile.origin_x, tile.origin_y);
+        float2 tile_size = float2(tile.width, tile.height);
+        float2 pitch = float2(tile.pitch_x, tile.pitch_y);
+        float2 local = fill_position - tile_origin;
+        if (tile.repeat_x != 0) {
+            local.x -= pitch.x * floor(local.x / pitch.x);
+        }
+        if (tile.repeat_y != 0) {
+            local.y -= pitch.y * floor(local.y / pitch.y);
+        }
+        // Repeating axes have hard edges, so tiles meet without a seam; a single tile is antialiased.
+        float coverage_x = tile.repeat_x != 0
+            ? (local.x < tile_size.x ? 1.0 : 0.0)
+            : saturate(min(local.x, tile_size.x - local.x) + 0.5);
+        float coverage_y = tile.repeat_y != 0
+            ? (local.y < tile_size.y ? 1.0 : 0.0)
+            : saturate(min(local.y, tile_size.y - local.y) + 0.5);
+        tile_alpha = coverage_x * coverage_y;
+        fill_position = tile_origin + local;
+        fill_bounds.origin = tile_origin;
+        fill_bounds.size = tile_size;
+    }
+    float4 background_color = gradient_color(quad.background, fill_position, fill_bounds,
     input.background_solid, input.background_color0, input.background_color1);
+    background_color.a *= tile_alpha;
     float mask_alpha = content_mask_coverage(input.position.xy, quad.content_mask);
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&

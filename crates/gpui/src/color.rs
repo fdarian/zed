@@ -747,6 +747,8 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    /// A CSS gradient (linear, radial or conic) described by [`GradientParams`].
+    Gradient = 4,
 }
 
 /// A color space for color interpolation.
@@ -773,7 +775,56 @@ impl Display for ColorSpace {
     }
 }
 
-/// A background color, which can be either a solid color or a linear gradient.
+/// The shape a [`BackgroundTag::Gradient`] background evaluates `t` from.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[repr(C)]
+pub(crate) enum GradientKind {
+    /// `t` is the distance along the line from `(geometry[0], geometry[1])` to
+    /// `(geometry[2], geometry[3])`, 0 at the start and 1 at the end.
+    #[default]
+    Linear = 0,
+    /// `t` is the distance from the centre `(geometry[0], geometry[1])` in units of the radii
+    /// `(geometry[2], geometry[3])`.
+    Radial = 1,
+    /// `t` is the clockwise turn from the top, starting at `geometry[2]` turns, around the centre
+    /// `(geometry[0], geometry[1])`.
+    Conic = 2,
+}
+
+/// What the GPU needs to evaluate one chunk of a CSS gradient. Positions are in the quad's own
+/// tile space (pixels from the tile's origin), so [`Window::paint_quad`] scales them.
+///
+/// A gradient with more than four stops is painted as several chunks that share the geometry.
+/// Each chunk keeps four stops at most, and only paints where `t` falls in `[t_min, t_max)`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[repr(C)]
+pub(crate) struct GradientParams {
+    pub(crate) kind: GradientKind,
+    /// The number of stops in this chunk, 2 to 4. Stops 0 and 1 live in `Background::colors`.
+    pub(crate) stop_count: u32,
+    /// Nonzero for a repeating gradient: `t` wraps into `[repeat_start, repeat_start + repeat_length)`.
+    pub(crate) repeating: u32,
+    pub(crate) pad: u32,
+    pub(crate) geometry: GradientGeometry,
+    pub(crate) t_min: f32,
+    pub(crate) t_max: f32,
+    pub(crate) repeat_start: f32,
+    pub(crate) repeat_length: f32,
+    /// Stops 2 and 3.
+    pub(crate) extra_colors: [LinearColorStop; 2],
+}
+
+/// Four numbers whose meaning depends on the [`GradientKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[repr(C)]
+pub(crate) struct GradientGeometry {
+    pub(crate) a: f32,
+    pub(crate) b: f32,
+    pub(crate) c: f32,
+    pub(crate) d: f32,
+}
+
+/// A background color, which can be either a solid color or a gradient.
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
 pub struct Background {
@@ -783,7 +834,9 @@ pub struct Background {
     pub(crate) gradient_angle_or_pattern_height: f32,
     pub(crate) colors: [LinearColorStop; 2],
     /// Padding for alignment for repr(C) layout.
-    pad: u32,
+    pub(crate) pad: u32,
+    /// Only read when `tag` is [`BackgroundTag::Gradient`].
+    pub(crate) gradient: GradientParams,
 }
 
 impl std::fmt::Debug for Background {
@@ -805,6 +858,7 @@ impl std::fmt::Debug for Background {
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
             ),
+            BackgroundTag::Gradient => write!(f, "Gradient({:?})", self.gradient),
         }
     }
 }
@@ -819,6 +873,7 @@ impl Default for Background {
             gradient_angle_or_pattern_height: 0.0,
             colors: [LinearColorStop::default(), LinearColorStop::default()],
             pad: 0,
+            gradient: GradientParams::default(),
         }
     }
 }
@@ -933,7 +988,33 @@ impl Background {
             self.colors[0].opacity(factor),
             self.colors[1].opacity(factor),
         ];
+        background.gradient.extra_colors = [
+            self.gradient.extra_colors[0].opacity(factor),
+            self.gradient.extra_colors[1].opacity(factor),
+        ];
         background
+    }
+
+    /// Scales the lengths of a gradient from logical to device pixels. Other backgrounds carry no
+    /// lengths that need scaling.
+    pub(crate) fn scale_gradient(mut self, factor: f32) -> Self {
+        if self.tag != BackgroundTag::Gradient {
+            return self;
+        }
+        let geometry = &mut self.gradient.geometry;
+        match self.gradient.kind {
+            GradientKind::Linear | GradientKind::Radial => {
+                geometry.a *= factor;
+                geometry.b *= factor;
+                geometry.c *= factor;
+                geometry.d *= factor;
+            }
+            GradientKind::Conic => {
+                geometry.a *= factor;
+                geometry.b *= factor;
+            }
+        }
+        self
     }
 
     /// Returns whether the background color is transparent.
@@ -943,6 +1024,12 @@ impl Background {
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
+            BackgroundTag::Gradient => {
+                let stops = &self.gradient.extra_colors;
+                self.colors.iter().all(|c| c.color.is_transparent())
+                    && (self.gradient.stop_count <= 2 || stops[0].color.is_transparent())
+                    && (self.gradient.stop_count <= 3 || stops[1].color.is_transparent())
+            }
         }
     }
 }
