@@ -1581,6 +1581,13 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Makes a scroll axis move only when code moves it: `overflow: hidden` in CSS is a scroll
+    /// container that the wheel and the keys leave alone. The axis still needs `Overflow::Scroll`.
+    fn programmatic_scroll_only(mut self, x: bool, y: bool) -> Self {
+        self.interactivity().programmatic_scroll_only = point(x, y);
+        self
+    }
+
     /// Paint something over this element's children, inside its content mask. `painter`
     /// gets the element's bounds, which a scroll offset does not move, and takes no part
     /// in layout, so unlike a child it cannot extend what the element scrolls. Only
@@ -2162,6 +2169,7 @@ pub struct Interactivity {
     /// that its scroll range follows CSS scrollable overflow, `content_size` otherwise.
     pub(crate) content_end: Option<Point<Pixels>>,
     pub(crate) overscroll_behavior: Point<OverscrollBehavior>,
+    pub(crate) programmatic_scroll_only: Point<bool>,
     pub(crate) overlay_painter:
         Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static>>,
     pub(crate) key_context: Option<KeyContext>,
@@ -2527,6 +2535,10 @@ impl Interactivity {
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
+                scroll_handle_state.user_scroll = point(
+                    style.overflow.x == Overflow::Scroll && !self.programmatic_scroll_only.x,
+                    style.overflow.y == Overflow::Scroll && !self.programmatic_scroll_only.y,
+                );
                 scroll_handle_state.padding_box = Bounds::new(
                     point(bounds.origin.x + border.left, bounds.origin.y + border.top),
                     size(
@@ -3381,7 +3393,17 @@ impl Interactivity {
             return;
         };
         let ongoing_scroll = self.ongoing_scroll.clone();
-        let overflow = style.overflow;
+        let programmatic = self.programmatic_scroll_only;
+        let user_scrolls = |overflow: Overflow, programmatic: bool| {
+            if programmatic { Overflow::Visible } else { overflow }
+        };
+        let overflow = point(
+            user_scrolls(style.overflow.x, programmatic.x),
+            user_scrolls(style.overflow.y, programmatic.y),
+        );
+        if overflow.x != Overflow::Scroll && overflow.y != Overflow::Scroll {
+            return;
+        }
         let allow_concurrent_scroll = style.allow_concurrent_scroll;
         let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
         let line_height = window.line_height();
@@ -4259,6 +4281,7 @@ struct ScrollHandleState {
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
     padding_box: Bounds<Pixels>,
+    user_scroll: Point<bool>,
     max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,
     scroll_to_bottom: bool,
@@ -4349,6 +4372,12 @@ impl ScrollHandle {
     /// what CSS calls the client area. Scrollbars are overlays and take nothing from it.
     pub fn padding_box(&self) -> Bounds<Pixels> {
         self.0.borrow().padding_box
+    }
+
+    /// Whether the wheel and the keys scroll each axis. A container whose `overflow` is hidden
+    /// scrolls only when code says so.
+    pub fn user_scrollable(&self) -> Point<bool> {
+        self.0.borrow().user_scroll
     }
 
     /// Return the bounds into which this child is painted
