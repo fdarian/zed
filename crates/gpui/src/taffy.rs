@@ -376,6 +376,11 @@ impl TaffyLayoutEngine {
     // snapped independently, but the raw content-box origin can carry a
     // 1dp residual into descendants.
 
+    /// The layout parent of a node, if it has one.
+    pub fn layout_parent(&self, id: LayoutId) -> Option<LayoutId> {
+        self.taffy.parent(id.0).map(LayoutId)
+    }
+
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
             return layout;

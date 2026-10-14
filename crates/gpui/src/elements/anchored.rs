@@ -1,4 +1,5 @@
 use smallvec::SmallVec;
+use std::rc::Rc;
 
 use crate::{
     Anchor, AnyElement, App, Axis, Bounds, Display, Edges, Element, GlobalElementId,
@@ -8,6 +9,7 @@ use crate::{
 
 /// The state that the anchored element element uses to track its children.
 pub struct AnchoredState {
+    layout_id: LayoutId,
     child_layout_ids: SmallVec<[LayoutId; 4]>,
 }
 
@@ -20,6 +22,8 @@ pub struct Anchored {
     anchor_position: Option<Point<Pixels>>,
     position_mode: AnchoredPositionMode,
     offset: Option<Point<Pixels>>,
+    placement: Option<AnchoredPlacement>,
+    on_placement: Option<Rc<dyn Fn(ResolvedPlacement, &mut Window, &mut App)>>,
 }
 
 /// anchored gives you an element that will avoid overflowing the window bounds.
@@ -32,6 +36,8 @@ pub fn anchored() -> Anchored {
         anchor_position: None,
         position_mode: AnchoredPositionMode::Window,
         offset: None,
+        placement: None,
+        on_placement: None,
     }
 }
 
@@ -61,6 +67,26 @@ impl Anchored {
     /// While Window will have it interpret the position as relative to the window.
     pub fn position_mode(mut self, mode: AnchoredPositionMode) -> Self {
         self.position_mode = mode;
+        self
+    }
+
+    /// Places the element on a side of its reference box, the way floating-ui does: on `side`
+    /// when it fits in the window, otherwise on the opposite side with the same gap (or the side
+    /// with more room if neither fits), then shifted along the cross axis to stay inside.
+    ///
+    /// The reference box is the layout parent's bounds, or the zero-size box at
+    /// [`Anchored::position`] when one is set. Replaces [`Anchored::anchor`] and the fit modes.
+    pub fn placement(mut self, placement: AnchoredPlacement) -> Self {
+        self.placement = Some(placement);
+        self
+    }
+
+    /// Called every prepaint with where [`Anchored::placement`] settled and how much room is left.
+    pub fn on_placement(
+        mut self,
+        listener: impl Fn(ResolvedPlacement, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_placement = Some(Rc::new(listener));
         self
     }
 
@@ -116,7 +142,13 @@ impl Element for Anchored {
 
         let layout_id = window.request_layout(anchored_style, child_layout_ids.iter().copied(), cx);
 
-        (layout_id, AnchoredState { child_layout_ids })
+        (
+            layout_id,
+            AnchoredState {
+                layout_id,
+                child_layout_ids,
+            },
+        )
     }
 
     fn prepaint(
@@ -138,6 +170,36 @@ impl Element for Anchored {
             .map(|id| window.layout_bounds(*id))
             .reduce(|acc, bounds| acc.union(&bounds))
             .unwrap();
+
+        if let Some(placement) = self.placement {
+            let reference = match self.anchor_position {
+                Some(position) => Bounds {
+                    origin: position,
+                    size: Size::default(),
+                },
+                None => window
+                    .layout_parent_bounds(request_layout.layout_id)
+                    .unwrap_or(bounds),
+            };
+            let (origin, resolved) = place(
+                &placement,
+                reference,
+                children_bounds.size,
+                window.viewport_size(),
+                window.client_inset.unwrap_or(px(0.)),
+            );
+            if let Some(on_placement) = self.on_placement.clone() {
+                on_placement(resolved, window, cx);
+            }
+            let offset = origin - bounds.origin;
+            let offset = point(offset.x.round(), offset.y.round());
+            window.with_element_offset(offset, |window| {
+                for child in &mut self.children {
+                    child.prepaint(window, cx);
+                }
+            });
+            return;
+        }
 
         let (origin, mut desired) = self.position_mode.get_position_and_bounds(
             self.anchor_position,
@@ -236,6 +298,155 @@ impl IntoElement for Anchored {
     fn into_element(self) -> Self::Element {
         self
     }
+}
+
+/// The side of a reference box an element opens on.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum PlacementSide {
+    /// Above the reference box
+    Top,
+    /// To the right of the reference box
+    Right,
+    /// Below the reference box
+    Bottom,
+    /// To the left of the reference box
+    Left,
+}
+
+impl PlacementSide {
+    fn opposite(self) -> Self {
+        match self {
+            Self::Top => Self::Bottom,
+            Self::Right => Self::Left,
+            Self::Bottom => Self::Top,
+            Self::Left => Self::Right,
+        }
+    }
+
+    fn is_vertical(self) -> bool {
+        matches!(self, Self::Top | Self::Bottom)
+    }
+}
+
+/// How an element lines up with the reference box along the other axis.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum PlacementAlign {
+    /// Leading edges meet
+    Start,
+    /// Centers meet
+    Center,
+    /// Trailing edges meet
+    End,
+}
+
+/// Where [`Anchored::placement`] puts an element.
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct AnchoredPlacement {
+    /// The preferred side
+    pub side: PlacementSide,
+    /// Alignment along the reference box
+    pub align: PlacementAlign,
+    /// Space between the reference box and the element, mirrored when the side flips
+    pub gap: Pixels,
+    /// Added to the final position, in window coordinates
+    pub offset: Point<Pixels>,
+    /// Open on the opposite side when the preferred one does not fit
+    pub flip: bool,
+    /// Distance kept to the window edges
+    pub margin: Pixels,
+}
+
+/// The outcome of [`Anchored::placement`].
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub struct ResolvedPlacement {
+    /// The side the element ended up on
+    pub side: PlacementSide,
+    /// The requested alignment
+    pub align: PlacementAlign,
+    /// Width the element can take without leaving the window
+    pub available_width: Pixels,
+    /// Height the element can take without leaving the window
+    pub available_height: Pixels,
+}
+
+fn place(
+    placement: &AnchoredPlacement,
+    reference: Bounds<Pixels>,
+    size: Size<Pixels>,
+    viewport: Size<Pixels>,
+    client_inset: Pixels,
+) -> (Point<Pixels>, ResolvedPlacement) {
+    let margin = (placement.margin + client_inset).0;
+    let (left, top) = (margin, margin);
+    let right = (viewport.width.0 - margin).max(left);
+    let bottom = (viewport.height.0 - margin).max(top);
+    let gap = placement.gap.0;
+    let (ref_left, ref_top) = (reference.left().0, reference.top().0);
+    let (ref_right, ref_bottom) = (reference.right().0, reference.bottom().0);
+
+    let room = |side: PlacementSide| match side {
+        PlacementSide::Top => ref_top - top - gap,
+        PlacementSide::Bottom => bottom - ref_bottom - gap,
+        PlacementSide::Left => ref_left - left - gap,
+        PlacementSide::Right => right - ref_right - gap,
+    };
+    let extent = |side: PlacementSide| {
+        if side.is_vertical() {
+            size.height.0
+        } else {
+            size.width.0
+        }
+    };
+
+    // floating-ui's flip with the bestFit fallback: leave the preferred side only when the
+    // element does not fit there, and then take whichever side has more room.
+    let mut side = placement.side;
+    if placement.flip && extent(side) > room(side) && room(side.opposite()) > room(side) {
+        side = side.opposite();
+    }
+
+    let (mut x, mut y) = match side {
+        PlacementSide::Top => (0.0, ref_top - gap - size.height.0),
+        PlacementSide::Bottom => (0.0, ref_bottom + gap),
+        PlacementSide::Left => (ref_left - gap - size.width.0, 0.0),
+        PlacementSide::Right => (ref_right + gap, 0.0),
+    };
+    if side.is_vertical() {
+        x = match placement.align {
+            PlacementAlign::Start => ref_left,
+            PlacementAlign::Center => (ref_left + ref_right - size.width.0) / 2.0,
+            PlacementAlign::End => ref_right - size.width.0,
+        };
+    } else {
+        y = match placement.align {
+            PlacementAlign::Start => ref_top,
+            PlacementAlign::Center => (ref_top + ref_bottom - size.height.0) / 2.0,
+            PlacementAlign::End => ref_bottom - size.height.0,
+        };
+    }
+    x += placement.offset.x.0;
+    y += placement.offset.y.0;
+
+    // Shift back inside the window; an element larger than the window lines up with its
+    // top-left corner.
+    x = x.min(right - size.width.0).max(left);
+    y = y.min(bottom - size.height.0).max(top);
+
+    let room_along_side = room(side).max(0.0);
+    let (available_width, available_height) = if side.is_vertical() {
+        (right - left, room_along_side)
+    } else {
+        (room_along_side, bottom - top)
+    };
+    (
+        point(px(x), px(y)),
+        ResolvedPlacement {
+            side,
+            align: placement.align,
+            available_width: px(available_width),
+            available_height: px(available_height),
+        },
+    )
 }
 
 /// Which algorithm to use when fitting the anchored element to be inside the window.
@@ -375,6 +586,94 @@ mod tests {
 
         assert_eq!(menu_bounds.origin, point(px(100.), px(100.)));
         assert_eq!(menu_bounds.size, size(px(200.), px(300.)));
+    }
+
+    fn placement(side: super::PlacementSide, align: super::PlacementAlign) -> super::AnchoredPlacement {
+        super::AnchoredPlacement {
+            side,
+            align,
+            gap: px(4.),
+            offset: point(px(0.), px(0.)),
+            flip: true,
+            margin: px(8.),
+        }
+    }
+
+    fn reference() -> crate::Bounds<Pixels> {
+        crate::Bounds::new(point(px(100.), px(200.)), size(px(60.), px(20.)))
+    }
+
+    fn low_reference() -> crate::Bounds<Pixels> {
+        crate::Bounds::new(point(px(100.), px(400.)), size(px(60.), px(20.)))
+    }
+
+    #[test]
+    fn placement_opens_on_the_preferred_side_when_it_fits() {
+        use super::{PlacementAlign::*, PlacementSide::*, place};
+        let (origin, resolved) = place(
+            &placement(Bottom, Start),
+            reference(),
+            size(px(80.), px(100.)),
+            size(px(800.), px(600.)),
+            px(0.),
+        );
+        assert_eq!(origin, point(px(100.), px(224.)));
+        assert_eq!(resolved.side, Bottom);
+        assert_eq!(resolved.available_height, px(600. - 8. - 220. - 4.));
+    }
+
+    #[test]
+    fn placement_centers_on_the_reference_once() {
+        use super::{PlacementAlign::*, PlacementSide::*, place};
+        let (origin, _) = place(
+            &placement(Bottom, Center),
+            reference(),
+            size(px(100.), px(40.)),
+            size(px(800.), px(600.)),
+            px(0.),
+        );
+        assert_eq!(origin.x, px(130. - 50.));
+    }
+
+    #[test]
+    fn placement_flips_to_the_opposite_side_with_the_same_gap() {
+        use super::{PlacementAlign::*, PlacementSide::*, place};
+        let (origin, resolved) = place(
+            &placement(Bottom, Start),
+            low_reference(),
+            size(px(80.), px(300.)),
+            size(px(800.), px(600.)),
+            px(0.),
+        );
+        assert_eq!(resolved.side, Top);
+        assert_eq!(origin.y, px(400. - 4. - 300.));
+    }
+
+    #[test]
+    fn placement_takes_the_side_with_more_room_when_neither_fits() {
+        use super::{PlacementAlign::*, PlacementSide::*, place};
+        // 388 above, 168 below: both too small for 500, above is larger.
+        let (_, resolved) = place(
+            &placement(Bottom, Start),
+            low_reference(),
+            size(px(80.), px(500.)),
+            size(px(800.), px(600.)),
+            px(0.),
+        );
+        assert_eq!(resolved.side, Top);
+    }
+
+    #[test]
+    fn placement_shifts_along_the_cross_axis() {
+        use super::{PlacementAlign::*, PlacementSide::*, place};
+        let (origin, _) = place(
+            &placement(Bottom, Start),
+            reference(),
+            size(px(760.), px(40.)),
+            size(px(800.), px(600.)),
+            px(0.),
+        );
+        assert_eq!(origin.x, px(800. - 8. - 760.));
     }
 
     #[gpui::test]

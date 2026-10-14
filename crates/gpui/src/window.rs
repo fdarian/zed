@@ -5125,6 +5125,14 @@ impl Window {
         bounds
     }
 
+    /// Bounds of the layout parent of `layout_id`, relative to the window, if it has a parent.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_parent_bounds(&mut self, layout_id: LayoutId) -> Option<Bounds<Pixels>> {
+        let parent = self.layout_engine.as_ref().unwrap().layout_parent(layout_id)?;
+        Some(self.layout_bounds(parent))
+    }
+
     /// This method should be called during `prepaint`. You can use
     /// the returned [Hitbox] during `paint` or in an event handler
     /// to determine whether the inserted hitbox was the topmost.
