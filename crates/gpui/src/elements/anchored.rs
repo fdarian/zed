@@ -676,6 +676,56 @@ mod tests {
         assert_eq!(origin.x, px(800. - 8. - 760.));
     }
 
+    struct PlacedView;
+
+    impl Render for PlacedView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .top(px(300.))
+                    .left(px(100.))
+                    .w(px(100.))
+                    .h(px(30.))
+                    .child(
+                        div().absolute().top_0().left_0().size_full().child(deferred(
+                            super::anchored()
+                                .placement(placement(
+                                    super::PlacementSide::Bottom,
+                                    super::PlacementAlign::Start,
+                                ))
+                                .child(
+                                    div()
+                                        .id("menu")
+                                        .debug_selector(|| "MENU".into())
+                                        .w(px(80.))
+                                        .h(px(200.)),
+                                ),
+                        )),
+                    ),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn placement_is_recomputed_when_the_window_is_resized(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| PlacedView);
+        cx.simulate_resize(size(px(800.), px(700.)));
+        cx.run_until_parked();
+        let below = cx.debug_bounds("MENU").expect("MENU debug bounds not found");
+        assert_eq!(below.origin.y, px(334.));
+
+        cx.simulate_resize(size(px(800.), px(400.)));
+        cx.run_until_parked();
+        let above = cx.debug_bounds("MENU").expect("MENU debug bounds not found");
+        assert_eq!(above.origin.y, px(300. - 4. - 200.));
+
+        cx.simulate_resize(size(px(800.), px(700.)));
+        cx.run_until_parked();
+        let below_again = cx.debug_bounds("MENU").expect("MENU debug bounds not found");
+        assert_eq!(below_again.origin.y, px(334.));
+    }
+
     #[gpui::test]
     fn test_anchored_snaps_to_window(cx: &mut TestAppContext) {
         let window = cx.open_window(size(px(800.), px(600.)), |_, _| AnchoredTestView {
