@@ -10,7 +10,7 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, IsZero, Overflow, OverscrollBehavior, Pixels, Point, ScrollDelta,
+    Interactivity, IntoElement, IsZero, Overflow, OverscrollBehavior, Pixels, Point,
     ScrollWheelEvent, Size, StatefulInteractiveElement, Style, StyleRefinement, Styled, Window,
     point, px, scroll_routing, size,
 };
