@@ -31,7 +31,28 @@ use gpui::{
     WindowButtonLayout, WindowParams,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
-use gpui::{Pixels, Point, px};
+use gpui::{PathPromptFilter, Pixels, Point, px};
+
+/// One portal filter holding every rule, so a file matches when it matches any
+/// of them. Separate filters would be alternatives the user picks between.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn portal_file_filter(
+    filters: &[PathPromptFilter],
+) -> Option<ashpd::desktop::file_chooser::FileFilter> {
+    if filters.is_empty() {
+        return None;
+    }
+    let portal_filter = filters.iter().fold(
+        ashpd::desktop::file_chooser::FileFilter::new("Accepted files"),
+        |portal_filter, filter| match filter {
+            PathPromptFilter::Extension(extension) => {
+                portal_filter.glob(&format!("*.{extension}"))
+            }
+            PathPromptFilter::MimeType(mime_type) => portal_filter.mimetype(mime_type),
+        },
+    );
+    Some(portal_filter)
+}
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) const SCROLL_LINES: f32 = 3.0;
@@ -423,6 +444,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                     .identifier(identifier.await)
                     .modal(true)
                     .title(title)
+                    .filters(portal_file_filter(&options.filters))
                     .accept_label(options.prompt.as_ref().map(gpui::SharedString::as_str))
                     .multiple(options.multiple)
                     .directory(options.directories)

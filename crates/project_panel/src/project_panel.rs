@@ -3651,6 +3651,7 @@ impl ProjectPanel {
             directories: true,
             multiple: false,
             prompt: Some("Download".into()),
+            filters: Vec::new(),
         });
 
         let fs = self.fs.clone();

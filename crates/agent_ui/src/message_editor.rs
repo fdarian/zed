@@ -1629,6 +1629,7 @@ impl MessageEditor {
             directories: false,
             multiple: true,
             prompt: Some("Select Images".into()),
+            filters: Vec::new(),
         });
 
         window

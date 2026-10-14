@@ -32,7 +32,8 @@ use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
+    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptFilter, PathPromptOptions,
+    Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
     WindowParams, popup::PopupNotSupportedError,
@@ -1013,6 +1014,10 @@ impl Platform for MacPlatform {
 
                     panel.setCanCreateDirectories(true.to_objc());
                     panel.setResolvesAliases_(false.to_objc());
+                    let content_types = allowed_content_types(&options.filters);
+                    if content_types != nil {
+                        let _: () = msg_send![panel, setAllowedContentTypes: content_types];
+                    }
                     let done_tx = Cell::new(Some(done_tx));
                     let block = ConcreteBlock::new(move |response: NSModalResponse| {
                         let result = if response == NSModalResponse::NSModalResponseOk {
@@ -1782,6 +1787,53 @@ unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {
     })))
 }
 
+// The `UTType` class lives in this framework, which nothing else in the crate links.
+#[link(name = "UniformTypeIdentifiers", kind = "framework")]
+unsafe extern "C" {}
+
+/// Maps the filters to an `NSArray<UTType>`, or `nil` when nothing was asked for.
+/// `nil` matters: an empty `allowedContentTypes` is not documented to mean "any".
+unsafe fn allowed_content_types(filters: &[PathPromptFilter]) -> id {
+    let types: Vec<id> = filters
+        .iter()
+        .filter_map(|filter| {
+            let content_type = unsafe { content_type_for_filter(filter) };
+            (content_type != nil).then_some(content_type)
+        })
+        .collect();
+    if types.is_empty() {
+        return nil;
+    }
+    unsafe { NSArray::arrayWithObjects(nil, &types) }
+}
+
+unsafe fn content_type_for_filter(filter: &PathPromptFilter) -> id {
+    let ut_type = class!(UTType);
+    match filter {
+        PathPromptFilter::Extension(extension) => unsafe {
+            msg_send![ut_type, typeWithFilenameExtension: ns_string(extension)]
+        },
+        PathPromptFilter::MimeType(mime_type) => {
+            // `image/*` is not a MIME type `UTType` can resolve; it is the type
+            // every image conforms to.
+            let wildcard_identifier = match mime_type.strip_suffix("/*") {
+                Some("image") => Some("public.image"),
+                Some("audio") => Some("public.audio"),
+                Some("video") => Some("public.movie"),
+                Some("text") => Some("public.text"),
+                Some("font") => Some("public.font"),
+                _ => None,
+            };
+            match wildcard_identifier {
+                Some(identifier) => unsafe {
+                    msg_send![ut_type, typeWithIdentifier: ns_string(identifier)]
+                },
+                None => unsafe { msg_send![ut_type, typeWithMIMEType: ns_string(mime_type)] },
+            }
+        }
+    }
+}
+
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     pub(super) fn TISCopyCurrentKeyboardLayoutInputSource() -> *mut Object;
@@ -1835,4 +1887,41 @@ mod security {
     pub const errSecSuccess: OSStatus = 0;
     pub const errSecUserCanceled: OSStatus = -128;
     pub const errSecItemNotFound: OSStatus = -25300;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identifier(filter: PathPromptFilter) -> Option<String> {
+        unsafe {
+            let content_type = content_type_for_filter(&filter);
+            if content_type == nil {
+                return None;
+            }
+            let identifier: id = msg_send![content_type, identifier];
+            Some(path_from_objc(identifier).to_string_lossy().into_owned())
+        }
+    }
+
+    #[test]
+    fn filters_resolve_to_content_types() {
+        assert_eq!(
+            identifier(PathPromptFilter::Extension("png".into())).as_deref(),
+            Some("public.png")
+        );
+        assert_eq!(
+            identifier(PathPromptFilter::MimeType("application/pdf".into())).as_deref(),
+            Some("com.adobe.pdf")
+        );
+        assert_eq!(
+            identifier(PathPromptFilter::MimeType("image/*".into())).as_deref(),
+            Some("public.image")
+        );
+    }
+
+    #[test]
+    fn no_filters_set_no_content_types() {
+        assert_eq!(unsafe { allowed_content_types(&[]) }, nil);
+    }
 }

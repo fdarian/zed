@@ -799,6 +799,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     directories: true,
                     multiple: true,
                     prompt: None,
+                    filters: Vec::new(),
                 },
                 action.create_new_window.unwrap_or_else(|| {
                     matches!(
@@ -819,6 +820,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     directories,
                     multiple: true,
                     prompt: None,
+                    filters: Vec::new(),
                 },
                 true,
                 cx,
@@ -3985,6 +3987,7 @@ impl Workspace {
                 directories: true,
                 multiple: true,
                 prompt: None,
+                filters: Vec::new(),
             },
             DirectoryLister::Project(self.project.clone()),
             window,

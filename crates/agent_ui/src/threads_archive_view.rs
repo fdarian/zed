@@ -1260,6 +1260,7 @@ impl ProjectPickerDelegate {
             directories: true,
             multiple: false,
             prompt: None,
+            filters: Vec::new(),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths_receiver.await else {

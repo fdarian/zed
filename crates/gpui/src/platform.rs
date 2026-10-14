@@ -2205,6 +2205,19 @@ pub struct PathPromptOptions {
     pub multiple: bool,
     /// The prompt to show to a user when selecting a path
     pub prompt: Option<SharedString>,
+    /// Restricts which files can be chosen, like the HTML `accept` attribute: a
+    /// file matches when it matches any entry. Empty means no restriction.
+    /// Directories are never filtered.
+    pub filters: Vec<PathPromptFilter>,
+}
+
+/// One entry of [`PathPromptOptions::filters`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathPromptFilter {
+    /// A file extension without the leading dot, such as `png`.
+    Extension(SharedString),
+    /// A MIME type such as `application/pdf`, or a wildcard such as `image/*`.
+    MimeType(SharedString),
 }
 
 /// What kind of prompt styling to show
