@@ -357,6 +357,11 @@ impl TestAppContext {
         self.test_platform.simulate_prompt_answer(button);
     }
 
+    /// The cursor style the window last asked the platform for.
+    pub fn active_cursor(&self) -> crate::CursorStyle {
+        self.test_platform.active_cursor()
+    }
+
     /// Returns true if there's an alert dialog open.
     pub fn has_pending_prompt(&self) -> bool {
         self.test_platform.has_pending_prompt()

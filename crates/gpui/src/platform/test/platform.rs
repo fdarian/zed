@@ -267,6 +267,10 @@ impl TestPlatform {
             .detach();
     }
 
+    pub(crate) fn active_cursor(&self) -> CursorStyle {
+        *self.active_cursor.lock()
+    }
+
     pub(crate) fn did_prompt_for_new_path(&self) -> bool {
         !self.prompts.borrow().new_path.is_empty()
     }

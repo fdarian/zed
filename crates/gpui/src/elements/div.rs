@@ -5992,8 +5992,8 @@ mod tests {
     mod dom_hit_testing {
         use super::*;
         use crate::{
-            Entity, ScrollDelta, ScrollWheelEvent, StyleRefinement, TouchPhase, WindowHandle,
-            deferred, size,
+            CursorStyle, Entity, MouseUpEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
+            TouchPhase, WindowHandle, deferred, size,
         };
         use std::cell::Cell;
 
@@ -6983,6 +6983,108 @@ mod tests {
             assert_eq!(elsewhere, Some(WindowControlArea::Drag));
             // Clipped out of the hit test, so it is not an area here.
             assert_eq!(area_at(&window, cx, 130., 230.), None);
+        }
+
+        /// The platform cursor is only set for the active window.
+        fn activate(window: &AnyWindowHandle, cx: &mut TestAppContext) {
+            cx.update_window(*window, |_, window, _| window.activate_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
+
+        fn send(window: &AnyWindowHandle, cx: &mut TestAppContext, event: impl InputEvent) {
+            cx.update_window(*window, |_, window, cx| {
+                window.dispatch_event(event.to_platform_input(), cx);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn press(window: &AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
+            send(
+                window,
+                cx,
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(x), px(y)),
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                },
+            );
+        }
+
+        fn drag_to(window: &AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
+            send(
+                window,
+                cx,
+                MouseMoveEvent {
+                    position: point(px(x), px(y)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::none(),
+                },
+            );
+        }
+
+        fn release(window: &AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
+            send(
+                window,
+                cx,
+                MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: point(px(x), px(y)),
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                },
+            );
+        }
+
+        #[gpui::test]
+        fn a_drag_area_shows_the_arrow_until_a_button_is_held(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(
+                        drag(node("bar", 0., 0., 400., 40.))
+                            .cursor_pointer()
+                            .child(node("button", 10., 5., 50., 30.).window_client_area()),
+                    )
+                    .child(node("outside", 0., 100., 100., 100.).cursor_pointer())
+                    .into_any_element()
+            });
+
+            activate(&window, cx);
+            move_to(&window, cx, 200., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+            // The client area is a hole in the drag area, so the page's cursor shows.
+            move_to(&window, cx, 20., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+            move_to(&window, cx, 200., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+
+            // With a button held the area no longer decides, so the element's cursor applies.
+            press(&window, cx, 200., 20.);
+            drag_to(&window, cx, 202., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+            release(&window, cx, 202., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+
+            move_to(&window, cx, 50., 150.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+        }
+
+        #[gpui::test]
+        fn without_dom_hit_testing_a_drag_area_keeps_the_cursor_of_its_element(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, false, || {
+                root()
+                    .child(drag(node("bar", 0., 0., 400., 40.)).cursor_pointer())
+                    .into_any_element()
+            });
+
+            activate(&window, cx);
+            move_to(&window, cx, 200., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
         }
     }
 }

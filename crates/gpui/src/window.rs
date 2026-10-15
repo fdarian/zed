@@ -1357,6 +1357,12 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// Buttons the platform reported down and not yet up. A move that reports no pressed button
+    /// clears it, so a mouse-up the window never saw cannot leave a button stuck.
+    pressed_mouse_buttons: SmallVec<[MouseButton; 3]>,
+    /// The last value of [`Window::drag_area_overrides_cursor`] that the platform cursor was
+    /// reset for.
+    cursor_arrow_over_drag_area: bool,
     dom_hit_testing: bool,
     /// Hitboxes whose element is currently being prepainted, innermost last.
     hitbox_parent_stack: Vec<HitboxId>,
@@ -2060,6 +2066,8 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            pressed_mouse_buttons: SmallVec::new(),
+            cursor_arrow_over_drag_area: false,
             dom_hit_testing: false,
             hitbox_parent_stack: Vec::new(),
             pointer_outside: false,
@@ -2920,8 +2928,11 @@ impl Window {
     /// Tells the compositor to take control of window movement (Wayland and X11)
     ///
     /// Events may not be received during a move operation.
-    pub fn start_window_move(&self) {
-        self.platform_window.start_window_move()
+    pub fn start_window_move(&mut self) {
+        self.platform_window.start_window_move();
+        // The platform grabs the pointer for the move and, on macOS, consumes the mouse-up.
+        self.pressed_mouse_buttons
+            .retain(|button| *button != MouseButton::Left);
     }
 
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
@@ -5802,12 +5813,24 @@ impl Window {
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
         if self.is_window_hovered() {
-            let style = self
-                .rendered_frame
-                .cursor_style(self)
-                .unwrap_or(CursorStyle::Arrow);
+            let style = if self.drag_area_overrides_cursor() {
+                CursorStyle::Arrow
+            } else {
+                self.rendered_frame
+                    .cursor_style(self)
+                    .unwrap_or(CursorStyle::Arrow)
+            };
             cx.platform.set_cursor_style(style);
         }
+    }
+
+    /// A window drag area shows the arrow whatever the page asks for, as in Electron, until a
+    /// button is pressed: then the cursor belongs to whatever the gesture is.
+    fn drag_area_overrides_cursor(&self) -> bool {
+        self.dom_hit_testing
+            && !self.pointer_outside
+            && self.pressed_mouse_buttons.is_empty()
+            && self.window_control_area_at(self.mouse_position) == Some(WindowControlArea::Drag)
     }
 
     /// Dispatch a given keystroke as though the user had typed it.
@@ -5994,6 +6017,26 @@ impl Window {
         };
 
         match &event {
+            PlatformInput::MouseDown(mouse_down) => {
+                if !self.pressed_mouse_buttons.contains(&mouse_down.button) {
+                    self.pressed_mouse_buttons.push(mouse_down.button);
+                }
+            }
+            PlatformInput::MouseUp(mouse_up) => self
+                .pressed_mouse_buttons
+                .retain(|button| *button != mouse_up.button),
+            PlatformInput::MouseMove(mouse_move) => match mouse_move.pressed_button {
+                Some(button) => {
+                    if !self.pressed_mouse_buttons.contains(&button) {
+                        self.pressed_mouse_buttons.push(button);
+                    }
+                }
+                None => self.pressed_mouse_buttons.clear(),
+            },
+            _ => {}
+        }
+
+        match &event {
             PlatformInput::MouseExited(_) => {
                 self.pointer_outside = true;
                 // Hover styles are read at paint, and nothing else repaints for an exit.
@@ -6069,8 +6112,12 @@ impl Window {
             self.rendered_frame
                 .hit_test(self.mouse_position(), self.dom_hit_testing)
         };
-        if hit_test != self.mouse_hit_test {
+        let arrow_over_drag_area = self.drag_area_overrides_cursor();
+        if hit_test != self.mouse_hit_test
+            || arrow_over_drag_area != self.cursor_arrow_over_drag_area
+        {
             self.mouse_hit_test = hit_test;
+            self.cursor_arrow_over_drag_area = arrow_over_drag_area;
             self.reset_cursor_style(cx);
         }
 
