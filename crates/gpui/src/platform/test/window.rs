@@ -469,9 +469,7 @@ impl PlatformWindow for TestWindow {
         unimplemented!()
     }
 
-    fn start_window_move(&self) {
-        unimplemented!()
-    }
+    fn start_window_move(&self) {}
 
     fn can_start_external_drag(&self) -> bool {
         true

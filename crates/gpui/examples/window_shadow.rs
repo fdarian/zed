@@ -80,13 +80,13 @@ impl Render for WindowShadow {
                     .when(!tiling.left, |div| div.pl(shadow_size))
                     .when(!tiling.right, |div| div.pr(shadow_size))
                     .on_mouse_move(|_e, window, _cx| window.refresh())
-                    .on_mouse_down(MouseButton::Left, move |e, window, _cx| {
+                    .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                         let size = window.window_bounds().get_bounds().size;
                         let pos = e.position;
 
                         match resize_edge(pos, shadow_size, size) {
                             Some(edge) => window.start_window_resize(edge),
-                            None => window.start_window_move(),
+                            None => window.start_window_move(cx),
                         };
                     }),
             })
@@ -167,8 +167,8 @@ impl Render for WindowShadow {
                                             Decorations::Client { .. } => div
                                                 .on_mouse_down(
                                                     MouseButton::Left,
-                                                    |_e, window, _| {
-                                                        window.start_window_move();
+                                                    |_e, window, cx| {
+                                                        window.start_window_move(cx);
                                                     },
                                                 )
                                                 .on_click(|e, window, _| {

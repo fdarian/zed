@@ -212,10 +212,10 @@ impl Render for PlatformTitleBar {
                         this.should_move = true;
                     }),
                 )
-                .on_mouse_move(cx.listener(move |this, _ev, window, _| {
+                .on_mouse_move(cx.listener(move |this, _ev, window, cx| {
                     if this.should_move {
                         this.should_move = false;
-                        window.start_window_move();
+                        window.start_window_move(cx);
                     }
                 }))
             })

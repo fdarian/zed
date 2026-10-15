@@ -1360,6 +1360,9 @@ pub struct Window {
     /// Buttons the platform reported down and not yet up. A move that reports no pressed button
     /// clears it, so a mouse-up the window never saw cannot leave a button stuck.
     pressed_mouse_buttons: SmallVec<[MouseButton; 3]>,
+    /// Whether the first button of the press now held went down over a window drag area (see
+    /// [`Window::window_control_area_at`]). The arrow then lasts until the last button is up.
+    press_began_in_drag_area: bool,
     /// The last value of [`Window::drag_area_overrides_cursor`] that the platform cursor was
     /// reset for.
     cursor_arrow_over_drag_area: bool,
@@ -2067,6 +2070,7 @@ impl Window {
             mouse_position,
             mouse_hit_test: HitTest::default(),
             pressed_mouse_buttons: SmallVec::new(),
+            press_began_in_drag_area: false,
             cursor_arrow_over_drag_area: false,
             dom_hit_testing: false,
             hitbox_parent_stack: Vec::new(),
@@ -2928,11 +2932,13 @@ impl Window {
     /// Tells the compositor to take control of window movement (Wayland and X11)
     ///
     /// Events may not be received during a move operation.
-    pub fn start_window_move(&mut self) {
+    pub fn start_window_move(&mut self, cx: &mut App) {
         self.platform_window.start_window_move();
         // The platform grabs the pointer for the move and, on macOS, consumes the mouse-up.
         self.pressed_mouse_buttons
             .retain(|button| *button != MouseButton::Left);
+        self.end_press_if_none_held();
+        self.reset_cursor_style(cx);
     }
 
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
@@ -5563,7 +5569,8 @@ impl Window {
     /// With [`Window::set_dom_hit_testing`] on this follows Electron's app-region model
     /// instead of hit testing: it is rect-based and the entry registered last (paint order)
     /// whose hitbox bounds contain `position` wins, a client entry (see
-    /// [`Window::insert_window_client_hitbox`]) yielding `None`. Content masks, pass-through
+    /// [`Window::insert_window_client_hitbox`]) yielding `None`, and a fullscreen window has no
+    /// areas at all, as Electron does not drag one. Content masks, pass-through
     /// behaviour and z-order do not take part, so an overlay without an area over a drag area
     /// still drags, and a drag area is not cut by its parent's overflow clipping.
     ///
@@ -5572,6 +5579,10 @@ impl Window {
     pub fn window_control_area_at(&self, position: Point<Pixels>) -> Option<WindowControlArea> {
         let entries = &self.rendered_frame.window_control_hitboxes;
         if self.dom_hit_testing {
+            // Electron does not drag a fullscreen window.
+            if self.is_fullscreen() {
+                return None;
+            }
             return entries
                 .iter()
                 .rev()
@@ -5824,13 +5835,24 @@ impl Window {
         }
     }
 
-    /// A window drag area shows the arrow whatever the page asks for, as in Electron, until a
-    /// button is pressed: then the cursor belongs to whatever the gesture is.
+    /// A window drag area shows the arrow whatever the page asks for, as in Electron. While a
+    /// button is held, the cursor stays the arrow if the press began in a drag area (the window
+    /// is about to move), and otherwise belongs to whatever the gesture is.
     fn drag_area_overrides_cursor(&self) -> bool {
-        self.dom_hit_testing
-            && !self.pointer_outside
-            && self.pressed_mouse_buttons.is_empty()
-            && self.window_control_area_at(self.mouse_position) == Some(WindowControlArea::Drag)
+        if !self.dom_hit_testing || self.pointer_outside {
+            return false;
+        }
+        if self.pressed_mouse_buttons.is_empty() {
+            self.window_control_area_at(self.mouse_position) == Some(WindowControlArea::Drag)
+        } else {
+            self.press_began_in_drag_area
+        }
+    }
+
+    fn end_press_if_none_held(&mut self) {
+        if self.pressed_mouse_buttons.is_empty() {
+            self.press_began_in_drag_area = false;
+        }
     }
 
     /// Dispatch a given keystroke as though the user had typed it.
@@ -6018,21 +6040,31 @@ impl Window {
 
         match &event {
             PlatformInput::MouseDown(mouse_down) => {
+                if self.pressed_mouse_buttons.is_empty() {
+                    self.press_began_in_drag_area = self.dom_hit_testing
+                        && self.window_control_area_at(mouse_down.position)
+                            == Some(WindowControlArea::Drag);
+                }
                 if !self.pressed_mouse_buttons.contains(&mouse_down.button) {
                     self.pressed_mouse_buttons.push(mouse_down.button);
                 }
             }
-            PlatformInput::MouseUp(mouse_up) => self
-                .pressed_mouse_buttons
-                .retain(|button| *button != mouse_up.button),
-            PlatformInput::MouseMove(mouse_move) => match mouse_move.pressed_button {
-                Some(button) => {
-                    if !self.pressed_mouse_buttons.contains(&button) {
-                        self.pressed_mouse_buttons.push(button);
+            PlatformInput::MouseUp(mouse_up) => {
+                self.pressed_mouse_buttons
+                    .retain(|button| *button != mouse_up.button);
+                self.end_press_if_none_held();
+            }
+            PlatformInput::MouseMove(mouse_move) => {
+                match mouse_move.pressed_button {
+                    Some(button) => {
+                        if !self.pressed_mouse_buttons.contains(&button) {
+                            self.pressed_mouse_buttons.push(button);
+                        }
                     }
+                    None => self.pressed_mouse_buttons.clear(),
                 }
-                None => self.pressed_mouse_buttons.clear(),
-            },
+                self.end_press_if_none_held();
+            }
             _ => {}
         }
 

@@ -7061,15 +7061,95 @@ mod tests {
             move_to(&window, cx, 200., 20.);
             assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
 
-            // With a button held the area no longer decides, so the element's cursor applies.
+            // A press that began in the area keeps the arrow, from the press itself on, even
+            // where the pointer leaves the bar.
             press(&window, cx, 200., 20.);
-            drag_to(&window, cx, 202., 20.);
-            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
-            release(&window, cx, 202., 20.);
             assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+            drag_to(&window, cx, 202., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+            drag_to(&window, cx, 50., 150.);
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+            release(&window, cx, 50., 150.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
 
             move_to(&window, cx, 50., 150.);
             assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+        }
+
+        #[gpui::test]
+        fn a_press_that_began_outside_a_drag_area_keeps_the_cursor_of_its_element(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(
+                        drag(node("bar", 0., 0., 400., 40.))
+                            .cursor_pointer()
+                            .child(node("button", 10., 5., 50., 30.).window_client_area()),
+                    )
+                    .child(node("outside", 0., 100., 100., 100.).cursor_pointer())
+                    .into_any_element()
+            });
+
+            activate(&window, cx);
+            // On the button, a hole in the bar: the gesture is the page's.
+            press(&window, cx, 20., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+            drag_to(&window, cx, 200., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+            release(&window, cx, 200., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+
+            press(&window, cx, 50., 150.);
+            drag_to(&window, cx, 200., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+            release(&window, cx, 200., 20.);
+        }
+
+        #[gpui::test]
+        fn starting_a_window_move_resets_the_cursor_of_the_press_it_ends(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(drag(node("bar", 0., 0., 400., 40.)).cursor_pointer())
+                    .into_any_element()
+            });
+
+            activate(&window, cx);
+            press(&window, cx, 200., 20.);
+            cx.update_window(window, |_, window, cx| window.start_window_move(cx))
+                .unwrap();
+            // The platform ate the release: the left button no longer counts as held, and the
+            // pointer is still over the bar.
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+            move_to(&window, cx, 210., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+        }
+
+        #[gpui::test]
+        fn a_fullscreen_window_has_no_drag_areas_and_keeps_the_cursor_of_its_element(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(drag(node("bar", 0., 0., 400., 40.)).cursor_pointer())
+                    .into_any_element()
+            });
+
+            activate(&window, cx);
+            assert_eq!(area_at(&window, cx, 200., 20.), Some(WindowControlArea::Drag));
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
+
+            cx.update_window(window, |_, window, _| window.toggle_fullscreen())
+                .unwrap();
+            assert_eq!(area_at(&window, cx, 200., 20.), None);
+            move_to(&window, cx, 201., 20.);
+            assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+
+            cx.update_window(window, |_, window, _| window.toggle_fullscreen())
+                .unwrap();
+            assert_eq!(area_at(&window, cx, 200., 20.), Some(WindowControlArea::Drag));
         }
 
         #[gpui::test]
