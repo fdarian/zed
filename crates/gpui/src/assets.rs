@@ -92,8 +92,10 @@ impl RenderImage {
             .unwrap_or_default()
     }
 
-    /// Get the size of this image, in pixels for display, adjusted for the scale factor.
-    pub(crate) fn render_size(&self, frame_index: usize) -> Size<Pixels> {
+    /// Get the size of this image, in pixels for display, adjusted for the scale factor: the
+    /// intrinsic size of the image, which for an SVG rasterised at [`crate::SMOOTH_SVG_SCALE_FACTOR`]
+    /// is half its bitmap.
+    pub fn render_size(&self, frame_index: usize) -> Size<Pixels> {
         self.size(frame_index)
             .map(|v| (v.0 as f32 / self.scale_factor).into())
     }

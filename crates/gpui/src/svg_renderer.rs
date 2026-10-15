@@ -378,6 +378,19 @@ mod tests {
     }
 
     #[test]
+    fn a_rasterised_svg_reports_its_intrinsic_size_as_render_size() -> Result<()> {
+        let renderer = SvgRenderer::new(Arc::new(()));
+        let image = renderer.render_single_frame(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6"></svg>"#,
+            1.0,
+        )?;
+
+        assert_eq!(image.size(0), Size::new(DevicePixels(20), DevicePixels(12)));
+        assert_eq!(image.render_size(0), Size::new(crate::px(10.), crate::px(6.)));
+        Ok(())
+    }
+
+    #[test]
     fn preserves_aspect_ratio_for_width_constrained_size() -> Result<()> {
         let renderer = SvgRenderer::new(Arc::new(()));
         let svg = renderer.parse_svg(
