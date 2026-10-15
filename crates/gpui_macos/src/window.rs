@@ -2112,17 +2112,25 @@ impl PlatformWindow for MacWindow {
     }
 
     fn start_window_move(&self) {
-        let this = self.0.lock();
-        if this.simple_fullscreen_state.is_some() {
-            return;
-        }
-        let window = this.native_window;
+        let window = {
+            let this = self.0.lock();
+            if this.simple_fullscreen_state.is_some() {
+                return;
+            }
+            this.native_window
+        };
 
+        // The state lock must not be held here: AppKit sends windowDidMove while it runs the
+        // drag, and `window_did_move` locks the same mutex.
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let event: id = msg_send![app, currentEvent];
             let _: () = msg_send![window, performWindowDragWithEvent: event];
         }
+
+        // AppKit tracks the drag until the button is released and consumes the mouse-up, so the
+        // view never sees it.
+        self.0.lock().last_left_mouse_down_event = None;
     }
 
     fn can_start_external_drag(&self) -> bool {
