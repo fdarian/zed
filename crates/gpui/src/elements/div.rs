@@ -6513,6 +6513,32 @@ mod tests {
             assert_eq!(chain_at(&window, cx, 130., 20.), ["under", "root"]);
         }
 
+        #[gpui::test]
+        fn a_rounded_overflow_clip_cuts_the_hit_area_of_its_children_at_the_corners(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(
+                        node("rounded", 0., 0., 100., 100.)
+                            .overflow_hidden()
+                            .rounded(px(40.))
+                            .child(node("fill", 0., 0., 100., 100.))
+                            .child(node("spill", 90., 90., 100., 100.)),
+                    )
+                    .into_any_element()
+            });
+            // The corner is rounded away: the press falls through to what is underneath.
+            assert_eq!(chain_at(&window, cx, 2., 2.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 98., 98.), ["under", "root"]);
+            // Inside the arc and along the straight edges the child is hit.
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["fill", "rounded", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 2.), ["fill", "rounded", "root"]);
+            // A child spilling past the clip is cut by it, as it is painted.
+            assert_eq!(chain_at(&window, cx, 150., 150.), ["under", "root"]);
+        }
+
         /// A chain of `depth` nested boxes under `top`, the deepest holding `leaves` leaves that
         /// all cover the same area.
         fn nested(top: Stateful<Div>, depth: usize, leaves: usize) -> Stateful<Div> {

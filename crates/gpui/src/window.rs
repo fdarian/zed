@@ -1166,8 +1166,8 @@ impl Frame {
             if hitbox.behavior == HitboxBehavior::PassThrough {
                 continue;
             }
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position)
+            if hitbox.bounds.intersect(&hitbox.content_mask.bounds).contains(&position)
+                && hitbox.content_mask.contains(&position)
                 && !clips.is_some_and(|clips| self.clipped_out(clips, ix, position))
             {
                 hit_test.ids.push(hitbox.id);
@@ -1237,6 +1237,7 @@ impl Frame {
                     .bounds
                     .intersect(&hitbox.content_mask.bounds)
                     .contains(&position)
+                && hitbox.content_mask.contains(&position)
                 && !clips.is_some_and(|clips| self.clipped_out(clips, ix, position))
         });
         while let Some(index) = next {
@@ -2139,6 +2140,24 @@ impl ContentMask<Pixels> {
             bounds: self.bounds.scale(factor),
             corner_radii: self.corner_radii.scale(factor),
         }
+    }
+
+    /// Whether the point is inside the mask, rounded corners included.
+    pub fn contains(&self, position: &Point<Pixels>) -> bool {
+        if !self.bounds.contains(position) {
+            return false;
+        }
+        if self.corner_radii == Corners::default() {
+            return true;
+        }
+        ResolvedClipPath::RoundedRect {
+            bounds: self.bounds.map(|pixels| ScaledPixels(pixels.0)),
+            corner_radii: self
+                .corner_radii
+                .clamp_radii_for_quad_size(self.bounds.size)
+                .map(|pixels| ScaledPixels(pixels.0)),
+        }
+        .contains(Point::new(position.x.0, position.y.0))
     }
 
     /// Intersect the content mask with the given content mask.
