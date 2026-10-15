@@ -1653,6 +1653,9 @@ struct BlurParams {
   int radius;
   // Nonzero to repeat the edge pixels instead of reading transparency past them.
   uint clamp_to_edge;
+  // The part of the source that holds the image, in uv units; the rest is padding. The edge pixels
+  // repeat at the end of this part, not of the texture.
+  float2 valid;
 };
 
 fragment float4 blur_fragment(
@@ -1661,13 +1664,18 @@ fragment float4 blur_fragment(
     texture2d<float> source [[texture(0)]]) {
   constexpr sampler zero(mag_filter::linear, min_filter::linear, address::clamp_to_zero);
   constexpr sampler edge(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
-  float2 uv = input.position.xy / float2(source.get_width(), source.get_height());
+  float2 texel = 1.0 / float2(source.get_width(), source.get_height());
+  float2 uv = input.position.xy * texel;
   float4 sum = float4(0.0);
   float total = 0.0;
   for (int i = -params.radius; i <= params.radius; i++) {
     float weight = exp(-(float)(i * i) / (2.0 * params.sigma * params.sigma));
     float2 at = uv + params.step * (float)i;
-    sum += weight * (params.clamp_to_edge != 0u ? source.sample(edge, at) : source.sample(zero, at));
+    if (params.clamp_to_edge != 0u) {
+      sum += weight * source.sample(edge, clamp(at, 0.5 * texel, params.valid - 0.5 * texel));
+    } else {
+      sum += weight * source.sample(zero, at);
+    }
     total += weight;
   }
   return sum / total;

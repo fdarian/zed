@@ -36,7 +36,8 @@ pub enum FilterFunction {
     DropShadow {
         /// How far the shadow is offset.
         offset: Point<Pixels>,
-        /// The standard deviation of the blur.
+        /// The standard deviation of the blur. Unlike `box-shadow`'s blur radius this is the
+        /// deviation itself, as in browsers and the SVG filter it is defined by.
         blur: Pixels,
         /// The shadow colour.
         color: Hsla,
@@ -87,6 +88,16 @@ impl ColorMatrix {
     }
 }
 
+/// The largest blur deviation, in device pixels, a filter keeps. A bigger one is capped: it already
+/// averages the whole element, and the texture it needs would grow with it.
+pub const MAX_BLUR_SIGMA: f32 = 128.;
+
+/// The most the filters of one group can reach beyond its content on any side, in device pixels.
+pub const MAX_FILTER_MARGIN: f32 = 1024.;
+
+/// The largest width or height of an offscreen group, which is what every Metal device supports.
+pub const MAX_GROUP_EXTENT: f32 = 16384.;
+
 /// A filter with its lengths in device pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ResolvedFilter {
@@ -112,7 +123,9 @@ impl FilterFunction {
     pub fn resolve(&self, scale_factor: f32) -> ResolvedFilter {
         let unit = |amount: f32| amount.clamp(0., 1.);
         match *self {
-            FilterFunction::Blur(sigma) => ResolvedFilter::Blur((sigma.0 * scale_factor).max(0.)),
+            FilterFunction::Blur(sigma) => {
+                ResolvedFilter::Blur((sigma.0 * scale_factor).clamp(0., MAX_BLUR_SIGMA))
+            }
             FilterFunction::Brightness(amount) => {
                 let amount = amount.max(0.);
                 ResolvedFilter::Color(ColorMatrix::rgb(
@@ -204,7 +217,7 @@ impl FilterFunction {
             } => ResolvedFilter::DropShadow {
                 dx: offset.x.0 * scale_factor,
                 dy: offset.y.0 * scale_factor,
-                sigma: (blur.0 * scale_factor).max(0.),
+                sigma: (blur.0 * scale_factor).clamp(0., MAX_BLUR_SIGMA),
                 color,
             },
         }
@@ -238,7 +251,12 @@ pub fn filter_margin(filters: &[ResolvedFilter]) -> Edges<f32> {
             ResolvedFilter::Color(_) => {}
         }
     }
-    margin
+    Edges {
+        top: margin.top.min(MAX_FILTER_MARGIN),
+        right: margin.right.min(MAX_FILTER_MARGIN),
+        bottom: margin.bottom.min(MAX_FILTER_MARGIN),
+        left: margin.left.min(MAX_FILTER_MARGIN),
+    }
 }
 
 /// The reach of a CSS shape function's radius.
@@ -314,6 +332,34 @@ pub struct ClipPath {
     pub shape: ClipShape,
     /// The reference box: border box unless given.
     pub reference: BackgroundBox,
+}
+
+/// The `clip-path` of a style. A style holds this rather than an `Option<ClipPath>` because a
+/// refinement of an optional field can only set it, never clear it, and CSS `clip-path: none` in a
+/// state style has to clear the base style's clip path.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum ClipPathValue {
+    /// `none`.
+    #[default]
+    None,
+    /// A basic shape.
+    Shape(ClipPath),
+}
+
+impl ClipPathValue {
+    /// The shape, unless the value is `none`.
+    pub fn shape(&self) -> Option<&ClipPath> {
+        match self {
+            ClipPathValue::None => None,
+            ClipPathValue::Shape(clip_path) => Some(clip_path),
+        }
+    }
+}
+
+impl From<Option<ClipPath>> for ClipPathValue {
+    fn from(clip_path: Option<ClipPath>) -> Self {
+        clip_path.map_or(ClipPathValue::None, ClipPathValue::Shape)
+    }
 }
 
 /// A clip path in device pixels.
@@ -694,6 +740,27 @@ mod tests {
         // Reach is 3: the shadow lies 10 right of the content and 5 above it.
         assert_eq!((margin.left, margin.right), (0., 13.));
         assert_eq!((margin.top, margin.bottom), (8., 0.));
+    }
+
+    #[test]
+    fn a_huge_blur_is_capped_and_so_is_its_margin() {
+        assert_eq!(
+            FilterFunction::Blur(px(1.0e9)).resolve(2.),
+            ResolvedFilter::Blur(MAX_BLUR_SIGMA)
+        );
+        let chain = vec![ResolvedFilter::Blur(MAX_BLUR_SIGMA); 40];
+        let margin = filter_margin(&chain);
+        assert_eq!(
+            (margin.left, margin.right, margin.top, margin.bottom),
+            (MAX_FILTER_MARGIN, MAX_FILTER_MARGIN, MAX_FILTER_MARGIN, MAX_FILTER_MARGIN)
+        );
+        let shadow = FilterFunction::DropShadow {
+            offset: Point::new(px(1.0e9), px(0.)),
+            blur: px(0.),
+            color: red(),
+        }
+        .resolve(1.);
+        assert_eq!(filter_margin(&[shadow]).right, MAX_FILTER_MARGIN);
     }
 
     #[test]

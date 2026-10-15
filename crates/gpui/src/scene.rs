@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, BackgroundTile, Bounds, ContentMask, Corners, Edges,
-    GroupEffect, Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
-    visual_bounds,
+    GroupEffect, Hsla, MAX_GROUP_EXTENT, Pixels, Point, Radians, ResolvedFilter, ScaledPixels, Size,
+    bounds_tree::BoundsTree, filter_margin, point, visual_bounds,
 };
 use std::{
     fmt::Debug,
@@ -295,7 +295,8 @@ impl Scene {
 
     /// The only primitive of a scene that holds exactly one and no groups.
     fn take_only_primitive(&mut self) -> Option<Primitive> {
-        if self.item_count() != 1 || !self.groups.is_empty() {
+        // A surface can't be faded in place: its pixels are the platform's to draw.
+        if self.item_count() != 1 || !self.groups.is_empty() || !self.surfaces.is_empty() {
             return None;
         }
         if let Some(shadow) = self.shadows.pop() {
@@ -319,7 +320,7 @@ impl Scene {
         if let Some(sprite) = self.polychrome_sprites.pop() {
             return Some(Primitive::PolychromeSprite(sprite));
         }
-        self.surfaces.pop().map(Primitive::Surface)
+        None
     }
 
     /// Moves everything in the scene, so a group's content can be drawn into a texture that
@@ -410,6 +411,10 @@ impl Scene {
             mut scene,
         } = builder;
 
+        // Nothing of a fully faded group shows, whatever it filters or sits over.
+        if effect.opacity <= 0. {
+            return;
+        }
         let has_backdrop = !effect.backdrop_filters.is_empty();
         if scene.item_count() == 0 && !has_backdrop {
             return;
@@ -426,10 +431,17 @@ impl Scene {
             .content_bounds()
             .map(|content| visual_bounds(content, &effect.filters));
         if has_backdrop || effect.text_mask {
-            let reference = visual_bounds(effect.reference, &[]);
-            visual = Some(visual.map_or(reference, |visual| visual.union(&reference)));
+            // Only the part of the element's box inside the content mask is ever composited, and
+            // the box can be arbitrarily large.
+            let reference = visual_bounds(effect.reference.intersect(&content_mask.bounds), &[]);
+            if !reference.is_empty() {
+                visual = Some(visual.map_or(reference, |visual| visual.union(&reference)));
+            }
         }
         let Some(visual) = visual else {
+            return;
+        };
+        let Some(visual) = limit_group_bounds(visual, &content_mask, &effect.filters) else {
             return;
         };
 
@@ -630,6 +642,29 @@ pub(crate) enum PaintOperation {
     EndGroup,
     StartTextClip,
     EndTextClip,
+}
+
+/// Keeps a group's bounds to what can show: what the content mask lets through, plus what the
+/// filters spread before it is cut, and never beyond what a texture can hold.
+fn limit_group_bounds(
+    bounds: Bounds<ScaledPixels>,
+    content_mask: &ContentMask<ScaledPixels>,
+    filters: &[ResolvedFilter],
+) -> Option<Bounds<ScaledPixels>> {
+    let margin = filter_margin(filters);
+    let reach = content_mask.bounds.extend(Edges {
+        top: ScaledPixels(margin.top),
+        right: ScaledPixels(margin.right),
+        bottom: ScaledPixels(margin.bottom),
+        left: ScaledPixels(margin.left),
+    });
+    let mut limited = bounds.intersect(&reach);
+    if limited.is_empty() {
+        return None;
+    }
+    limited.size.width = ScaledPixels(limited.size.width.0.min(MAX_GROUP_EXTENT));
+    limited.size.height = ScaledPixels(limited.size.height.0.min(MAX_GROUP_EXTENT));
+    Some(limited)
 }
 
 #[derive(Clone)]
@@ -1845,5 +1880,96 @@ mod tests {
         let quads = scene.quads_with_groups();
         assert_eq!(quads.len(), 1);
         assert_eq!(quads[0].bounds, bounds(100., 120., 20., 20.));
+    }
+
+    #[test]
+    fn a_huge_backdrop_box_is_cut_to_the_content_mask() {
+        let mut scene = scene();
+        let backdrop = GroupEffect {
+            backdrop_filters: vec![ResolvedFilter::Blur(crate::MAX_BLUR_SIGMA)],
+            reference: bounds(-1.0e7, -1.0e7, 2.0e7, 2.0e7),
+            ..GroupEffect::default()
+        };
+        scene.start_group(backdrop, mask(), None);
+        scene.end_group();
+        assert_eq!(scene.groups.len(), 1);
+        assert_eq!(scene.groups[0].bounds, bounds(0., 0., WINDOW, WINDOW));
+    }
+
+    #[test]
+    fn a_huge_blur_only_reaches_a_bounded_margin() {
+        let mut scene = scene();
+        let effect = GroupEffect {
+            filters: vec![crate::FilterFunction::Blur(crate::px(1.0e9)).resolve(1.)],
+            ..GroupEffect::default()
+        };
+        scene.start_group(effect, mask(), None);
+        scene.insert_primitive(quad(0., 0., WINDOW, WINDOW));
+        scene.end_group();
+        let bounds = scene.groups[0].bounds;
+        let reach = 3. * crate::MAX_BLUR_SIGMA;
+        assert_eq!(bounds.origin.x.0, -reach);
+        assert_eq!(bounds.size.width.0, WINDOW + 2. * reach);
+        assert!(bounds.size.height.0 <= crate::MAX_GROUP_EXTENT);
+    }
+
+    #[test]
+    fn a_group_never_exceeds_the_largest_texture() {
+        let mut scene = scene();
+        let wide = ContentMask {
+            bounds: bounds(0., 0., 1.0e6, 1.0e6),
+            corner_radii: Corners::default(),
+        };
+        let mut huge = quad(0., 0., 1.0e6, 1.0e6);
+        huge.content_mask = wide;
+        scene.start_group(blurred(), wide, None);
+        scene.insert_primitive(huge);
+        scene.end_group();
+        let bounds = scene.groups[0].bounds;
+        assert_eq!(bounds.size.width.0, crate::MAX_GROUP_EXTENT);
+        assert_eq!(bounds.size.height.0, crate::MAX_GROUP_EXTENT);
+    }
+
+    #[test]
+    fn a_fully_faded_group_paints_nothing_even_over_a_backdrop() {
+        let mut scene = scene();
+        let effect = GroupEffect {
+            opacity: 0.,
+            backdrop_filters: vec![ResolvedFilter::Blur(2.)],
+            reference: bounds(10., 10., 50., 50.),
+            ..GroupEffect::default()
+        };
+        scene.start_group(effect, mask(), None);
+        scene.insert_primitive(quad(10., 10., 20., 20.));
+        scene.insert_primitive(quad(15., 15., 20., 20.));
+        scene.end_group();
+        scene.finish();
+        assert!(scene.groups.is_empty());
+        assert!(scene.quads.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_fade_over_a_lone_surface_keeps_the_group() {
+        use core_video::pixel_buffer::CVPixelBuffer;
+        let image_buffer = CVPixelBuffer::new(
+            core_video::pixel_buffer::kCVPixelFormatType_32BGRA,
+            4,
+            4,
+            None,
+        )
+        .unwrap();
+        let mut scene = scene();
+        scene.start_group(fade(0.5), mask(), None);
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds: bounds(10., 10., 20., 20.),
+            content_mask: mask(),
+            image_buffer,
+        });
+        scene.end_group();
+        assert_eq!(scene.groups.len(), 1);
+        assert!(scene.surfaces.is_empty());
+        assert_eq!(scene.groups[0].scene.surfaces.len(), 1);
     }
 }

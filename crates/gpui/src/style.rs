@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundLayer, BackgroundTag,
-    BorderStyle, ClipPath, FilterFunction, GroupEffect, Bounds, ContentMask, Corners,
+    BorderStyle, ClipPathValue, FilterFunction, GroupEffect, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
@@ -297,7 +297,7 @@ pub struct Style {
     pub mask_layers: Vec<BackgroundLayer>,
 
     /// CSS `clip-path`.
-    pub clip_path: Option<ClipPath>,
+    pub clip_path: ClipPathValue,
 
     /// The border color of each side of this element. A transparent side draws nothing.
     #[refineable]
@@ -810,7 +810,7 @@ impl Style {
             && self.filter.is_empty()
             && self.backdrop_filter.is_empty()
             && self.mask_layers.is_empty()
-            && self.clip_path.is_none()
+            && self.clip_path == ClipPathValue::None
         {
             return None;
         }
@@ -859,7 +859,7 @@ impl Style {
             mask,
             clip_path: self
                 .clip_path
-                .as_ref()
+                .shape()
                 .map(|clip_path| clip_path.resolve(boxes.region(clip_path.reference), scale_factor)),
             reference: bounds.scale(scale_factor),
             reference_radii: corner_radii.scale(scale_factor),
@@ -1143,7 +1143,7 @@ impl Default for Style {
             filter: Vec::new(),
             backdrop_filter: Vec::new(),
             mask_layers: Vec::new(),
-            clip_path: None,
+            clip_path: ClipPathValue::None,
             border_colors: Edges::default(),
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
@@ -1708,6 +1708,36 @@ mod tests {
             bounds,
             corner_radii: Corners::all(px(radius)),
         }
+    }
+
+    #[test]
+    fn a_refinement_can_clear_the_clip_path() {
+        use crate::{ClipPath, ClipShape, InsetRadii, LengthPercentage};
+        let clip = ClipPath {
+            shape: ClipShape::Inset {
+                top: LengthPercentage::Percent(0.1),
+                right: LengthPercentage::Percent(0.1),
+                bottom: LengthPercentage::Percent(0.1),
+                left: LengthPercentage::Percent(0.1),
+                radii: InsetRadii::default(),
+            },
+            reference: BackgroundBox::BorderBox,
+        };
+        let mut style = Style::default();
+        style.refine(&StyleRefinement {
+            clip_path: Some(ClipPathValue::Shape(clip.clone())),
+            ..StyleRefinement::default()
+        });
+        assert_eq!(style.clip_path.shape(), Some(&clip));
+
+        style.refine(&StyleRefinement::default());
+        assert_eq!(style.clip_path.shape(), Some(&clip));
+
+        style.refine(&StyleRefinement {
+            clip_path: Some(ClipPathValue::None),
+            ..StyleRefinement::default()
+        });
+        assert_eq!(style.clip_path, ClipPathValue::None);
     }
 
     #[test]

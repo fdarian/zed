@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, PaintSurface, Path,
-    Point, PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, MAX_GROUP_EXTENT,
+    PaintSurface, Path, Point, PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
     filter_margin, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -1422,7 +1422,7 @@ impl MetalRenderer {
         target: &metal::TextureRef,
         vertical: bool,
         sigma: f32,
-        clamp_to_edge: bool,
+        edge: Option<[f32; 2]>,
     ) {
         let step = if vertical {
             [0., 1. / source.height() as f32]
@@ -1433,8 +1433,9 @@ impl MetalRenderer {
             step,
             sigma,
             radius: (sigma * 3.).ceil().max(1.) as i32,
-            clamp_to_edge: clamp_to_edge as u32,
+            clamp_to_edge: edge.is_some() as u32,
             pad: 0,
+            valid: edge.unwrap_or([1., 1.]),
         };
         self.run_pass(command_buffer, target, &self.effect_pipelines.blur, |encoder| {
             encoder.set_fragment_bytes(
@@ -1447,12 +1448,14 @@ impl MetalRenderer {
     }
 
     /// A Gaussian blur of the texture in a new texture of the same size. Large blurs run on a
-    /// reduced copy, which is how they stay affordable.
+    /// reduced copy, which is how they stay affordable. With `edge`, the pixels at the end of the
+    /// image repeat instead of reading transparency past them; it is the part of the texture that
+    /// holds the image, in uv units.
     fn blur_texture(
         &mut self,
         input: &metal::Texture,
         sigma: f32,
-        clamp_to_edge: bool,
+        edge: Option<[f32; 2]>,
         command_buffer: &metal::CommandBufferRef,
     ) -> metal::Texture {
         const MAX_SIGMA_IN_PASS: f32 = 6.;
@@ -1482,13 +1485,13 @@ impl MetalRenderer {
             &horizontal,
             false,
             sigma,
-            clamp_to_edge,
+            edge,
         );
         if let Some(previous) = working.take() {
             self.release_texture(previous);
         }
         let mut result = self.acquire_texture(width, height);
-        self.blur_pass(command_buffer, &horizontal, &result, true, sigma, clamp_to_edge);
+        self.blur_pass(command_buffer, &horizontal, &result, true, sigma, edge);
         self.release_texture(horizontal);
 
         for &(width, height) in sizes[..sizes.len() - 1].iter().rev() {
@@ -1504,7 +1507,7 @@ impl MetalRenderer {
         &mut self,
         mut texture: metal::Texture,
         filters: &[ResolvedFilter],
-        clamp_to_edge: bool,
+        edge: Option<[f32; 2]>,
         command_buffer: &metal::CommandBufferRef,
     ) -> metal::Texture {
         let mut index = 0;
@@ -1525,7 +1528,7 @@ impl MetalRenderer {
                     index += 1;
                     if sigma > 0. {
                         let blurred =
-                            self.blur_texture(&texture, sigma, clamp_to_edge, command_buffer);
+                            self.blur_texture(&texture, sigma, edge, command_buffer);
                         self.release_texture(mem::replace(&mut texture, blurred));
                     }
                 }
@@ -1537,7 +1540,7 @@ impl MetalRenderer {
                 } => {
                     index += 1;
                     let blurred = (sigma > 0.)
-                        .then(|| self.blur_texture(&texture, sigma, clamp_to_edge, command_buffer));
+                        .then(|| self.blur_texture(&texture, sigma, edge, command_buffer));
                     let rgba = gpui::Rgba::from(color);
                     let params = DropShadowParams {
                         offset: [dx, dy],
@@ -1703,8 +1706,8 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<()> {
         let effect = &group.effect;
-        let width = group.bounds.size.width.0.ceil().max(1.) as u32;
-        let height = group.bounds.size.height.0.ceil().max(1.) as u32;
+        let width = group.bounds.size.width.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
+        let height = group.bounds.size.height.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
         let texture_width = texture_size_class(width);
         let texture_height = texture_size_class(height);
         let texture_size = size(
@@ -1726,7 +1729,7 @@ impl MetalRenderer {
             path_intermediate,
             true,
         )?;
-        let content = self.apply_filters(content, &effect.filters, false, command_buffer);
+        let content = self.apply_filters(content, &effect.filters, None, command_buffer);
 
         let mask_a = match &effect.mask {
             Some(quads) => {
@@ -1860,7 +1863,20 @@ impl MetalRenderer {
             return Ok(());
         }
 
-        let backdrop = self.acquire_texture(copy_width, copy_height);
+        // The copy lives in a texture of a size class so that a resizing backdrop reuses pooled
+        // textures; what the copy doesn't cover is cleared, and the blur stops at the copy's edge.
+        let texture_width = texture_size_class(copy_width);
+        let texture_height = texture_size_class(copy_height);
+        let backdrop = self.acquire_texture(texture_width, texture_height);
+        if (texture_width, texture_height) != (copy_width, copy_height) {
+            new_command_encoder_for_texture(
+                command_buffer,
+                &backdrop,
+                size(DevicePixels(texture_width as i32), DevicePixels(texture_height as i32)),
+                Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+            )
+            .end_encoding();
+        }
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
             target,
@@ -1882,13 +1898,18 @@ impl MetalRenderer {
             metal::MTLOrigin { x: 0, y: 0, z: 0 },
         );
         blit.end_encoding();
-        let filtered = self.apply_filters(backdrop, &effect.backdrop_filters, true, command_buffer);
+        let valid = [
+            copy_width as f32 / texture_width as f32,
+            copy_height as f32 / texture_height as f32,
+        ];
+        let filtered =
+            self.apply_filters(backdrop, &effect.backdrop_filters, Some(valid), command_buffer);
 
         let (params, polygon) = Self::composite_params(
             group,
             &region,
             [left, top],
-            [copy_width as f32, copy_height as f32],
+            [texture_width as f32, texture_height as f32],
             mask_a_size,
             mask_b_size,
             Some((reference, effect.reference_radii)),
@@ -2110,6 +2131,7 @@ struct BlurParams {
     radius: i32,
     clamp_to_edge: u32,
     pad: u32,
+    valid: [f32; 2],
 }
 
 /// Mirrors `DropShadowParams` in the shaders.
@@ -3386,6 +3408,60 @@ mod tests {
         assert!(is_cleared(&image, 1, 1));
         assert_color(&image, 20, 1, [255, 0, 0]);
         assert_color(&image, 20, 20, [255, 0, 0]);
+    }
+
+    #[test]
+    fn a_huge_element_with_a_huge_blur_renders_without_exceeding_the_texture_limit() {
+        let mut scene = groups_scene();
+        stripes(&mut scene);
+        let huge = Bounds::new(
+            point(ScaledPixels(-1.0e7), ScaledPixels(-1.0e7)),
+            size(ScaledPixels(2.0e7), ScaledPixels(2.0e7)),
+        );
+        let blur = gpui::FilterFunction::Blur(px(1.0e9)).resolve(1.);
+        let mut content = solid(0., 0., 1.0e7, 1.0e7, 0xff0000);
+        content.bounds = huge;
+        scene.start_group(
+            GroupEffect {
+                filters: vec![blur],
+                backdrop_filters: vec![blur],
+                reference: huge,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.insert_primitive(content);
+        scene.end_group();
+        let image = render(&mut scene);
+        // The backdrop is the stripes averaged over the window, under a faint red.
+        let pixel = image.get_pixel(20, 20).0;
+        assert!(pixel[0] > 100 && pixel[1] > 80 && pixel[1] < 160, "{pixel:?}");
+    }
+
+    #[test]
+    fn a_backdrop_blur_repeats_the_edge_of_a_copy_that_does_not_fill_its_texture() {
+        // 28 by 28 is padded to a 32 by 32 texture, which must not leak into the blur.
+        let mut scene = groups_scene();
+        scene.insert_primitive(solid(0., 0., SIZE, SIZE, 0xffffff));
+        let region = Bounds::new(
+            point(ScaledPixels(6.), ScaledPixels(6.)),
+            size(ScaledPixels(28.), ScaledPixels(28.)),
+        );
+        scene.start_group(
+            GroupEffect {
+                backdrop_filters: vec![gpui::FilterFunction::Blur(px(6.)).resolve(1.)],
+                reference: region,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.end_group();
+        let image = render(&mut scene);
+        for (x, y) in [(6, 6), (33, 33), (20, 6), (6, 33), (20, 20)] {
+            assert_color(&image, x, y, [255, 255, 255]);
+        }
     }
 
     #[test]
