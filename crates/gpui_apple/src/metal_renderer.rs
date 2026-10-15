@@ -3255,6 +3255,36 @@ mod tests {
     }
 
     #[test]
+    fn an_oklab_gradient_decodes_with_the_exact_srgb_curve() {
+        let mut oklab = layer(
+            GradientShape::Linear(LinearDirection::ToRight),
+            vec![stop(0x000000, at(0.)), stop(0x404080, at(1.))],
+            false,
+        );
+        let BackgroundImage::Gradient(gradient) = &mut oklab.image else {
+            unreachable!()
+        };
+        gradient.color_space = ColorSpace::Oklab;
+        let image = render_layer(&oklab);
+        // Two columns around a quarter of the way along, averaged to wash out the dither. The
+        // exact curve gives (2.6, 2.6, 11.0); a 2.2 power curve gives (9.6, 9.6, 19.3).
+        let mean = |channel: usize| {
+            (0..SIZE as u32)
+                .flat_map(|y| [9, 10].map(|x| (x, y)))
+                .map(|(x, y)| image.get_pixel(x, y).0[channel] as f32)
+                .sum::<f32>()
+                / (SIZE * 2.)
+        };
+        for (channel, expected) in [(0, 2.6), (1, 2.6), (2, 11.0)] {
+            let actual = mean(channel);
+            assert!(
+                (actual - expected).abs() < 2.5,
+                "channel {channel} is {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn dithering_a_gradient_does_not_make_it_translucent() {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
         let boxes = BackgroundBoxes::new(bounds, Corners::default(), Edges::default(), Edges::default());

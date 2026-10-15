@@ -1068,12 +1068,20 @@ float4 hsla_to_rgba(Hsla hsla) {
   return rgba;
 }
 
+// The sRGB transfer function of IEC 61966-2-1, the one CSS Color 4 uses. Out-of-gamut components keep
+// their sign, so an Oklab mix that leaves the gamut does not turn into NaN.
 float3 srgb_to_linear(float3 color) {
-  return pow(color, float3(2.2));
+  float3 magnitude = abs(color);
+  float3 linear_part = magnitude / 12.92;
+  float3 power_part = pow((magnitude + 0.055) / 1.055, float3(2.4));
+  return sign(color) * select(power_part, linear_part, magnitude <= 0.04045);
 }
 
 float3 linear_to_srgb(float3 color) {
-  return pow(color, float3(1.0 / 2.2));
+  float3 magnitude = abs(color);
+  float3 linear_part = magnitude * 12.92;
+  float3 power_part = 1.055 * pow(magnitude, float3(1.0 / 2.4)) - 0.055;
+  return sign(color) * select(power_part, linear_part, magnitude <= 0.0031308);
 }
 
 // Converts a sRGB color to the Oklab color space.
