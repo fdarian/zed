@@ -2538,6 +2538,11 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// The value being dragged, if a drag of type `T` is active (e.g. `ExternalPaths` during a file drag).
+    pub fn active_drag_value<T: 'static>(&self) -> Option<&T> {
+        self.active_drag.as_ref()?.value.downcast_ref::<T>()
+    }
+
     /// Gets the cursor style of the currently active drag operation.
     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
@@ -3148,6 +3153,32 @@ mod test {
         cx.to_async().refresh();
 
         assert_eq!(render_count.get(), render_count_before_refresh + 1);
+    }
+
+    #[gpui::test]
+    fn active_drag_value_downcasts_to_dragged_type(cx: &mut TestAppContext) {
+        use super::AnyDrag;
+        use crate::{point, px};
+        use std::sync::Arc;
+
+        #[derive(Debug, PartialEq)]
+        struct Payload(u32);
+
+        cx.update(|cx| {
+            assert!(cx.active_drag_value::<Payload>().is_none());
+
+            let view = cx.new(|_| RenderCounter(Rc::new(Cell::new(0))));
+            cx.active_drag = Some(AnyDrag {
+                view: view.into(),
+                value: Arc::new(Payload(7)),
+                cursor_offset: point(px(0.), px(0.)),
+                cursor_style: None,
+                external_payload_source: None,
+            });
+
+            assert_eq!(cx.active_drag_value::<Payload>(), Some(&Payload(7)));
+            assert!(cx.active_drag_value::<u32>().is_none());
+        });
     }
 
     #[test]
