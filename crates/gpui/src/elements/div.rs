@@ -7120,7 +7120,7 @@ mod tests {
             press(&window, cx, 200., 20.);
             cx.update_window(window, |_, window, cx| window.start_window_move(cx))
                 .unwrap();
-            // The platform ate the release: the left button no longer counts as held, and the
+            // The release may never arrive: the left button no longer counts as held, and the
             // pointer is still over the bar.
             assert_eq!(cx.active_cursor(), CursorStyle::Arrow);
             move_to(&window, cx, 210., 20.);

@@ -961,9 +961,20 @@ impl WindowsWindowInner {
             return None;
         }
 
+        let mut cursor_point = POINT {
+            x: lparam.signed_loword().into(),
+            y: lparam.signed_hiword().into(),
+        };
+        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
+
         let callback = self.state.callbacks.hit_test_window_control.take();
         let drag_area = if let Some(mut callback) = callback {
-            let area = callback();
+            let scale_factor = self.state.scale_factor.get();
+            let area = callback(logical_point(
+                cursor_point.x as f32,
+                cursor_point.y as f32,
+                scale_factor,
+            ));
             self.state
                 .callbacks
                 .hit_test_window_control
@@ -993,12 +1004,6 @@ impl WindowsWindowInner {
         // We need to calculate the frame thickness ourselves and do the hit test manually.
         let frame_y = get_frame_thicknessx(dpi);
         let frame_x = get_frame_thicknessy(dpi);
-        let mut cursor_point = POINT {
-            x: lparam.signed_loword().into(),
-            y: lparam.signed_hiword().into(),
-        };
-
-        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         if self.is_resizable
             && !self.state.is_maximized()
             && 0 <= cursor_point.y

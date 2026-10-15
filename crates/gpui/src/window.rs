@@ -1963,7 +1963,7 @@ impl Window {
         });
         platform_window.on_hit_test_window_control({
             let mut cx = cx.to_async();
-            Box::new(move || {
+            Box::new(move |position| {
                 handle
                     .update(&mut cx, |_, window, _cx| {
                         // Only the rect-based DOM lookup needs this: hit testing already finds
@@ -1971,7 +1971,7 @@ impl Window {
                         if window.dom_hit_testing && window.pointer_outside {
                             return None;
                         }
-                        window.window_control_area_at(window.mouse_position)
+                        window.window_control_area_at(position)
                     })
                     .log_err()
                     .unwrap_or(None)
@@ -2933,10 +2933,12 @@ impl Window {
     /// Handle window movement for Linux and macOS.
     /// Tells the compositor to take control of window movement (Wayland and X11)
     ///
-    /// Events may not be received during a move operation.
+    /// Events may not be received during a move operation. On macOS the call hands the move to
+    /// the WindowServer and returns right away, and the mouse-up that ends it may not be sent.
     pub fn start_window_move(&mut self, cx: &mut App) {
         self.platform_window.start_window_move();
-        // The platform grabs the pointer for the move and, on macOS, consumes the mouse-up.
+        // The platform takes the pointer for the move, and the release may never reach the
+        // window, so the left press is over as far as GPUI is concerned.
         self.pressed_mouse_buttons
             .retain(|button| *button != MouseButton::Left);
         self.end_press_if_none_held();

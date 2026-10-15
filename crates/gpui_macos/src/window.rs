@@ -1959,7 +1959,10 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().close_callback = Some(callback);
     }
 
-    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        _callback: Box<dyn FnMut(Point<Pixels>) -> Option<WindowControlArea>>,
+    ) {
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
@@ -2120,16 +2123,17 @@ impl PlatformWindow for MacWindow {
             this.native_window
         };
 
-        // The state lock must not be held here: AppKit sends windowDidMove while it runs the
-        // drag, and `window_did_move` locks the same mutex.
+        // The state lock must not be held here: the call hands the drag to the WindowServer and
+        // returns right away, but a windowDidMove could still reach `window_did_move`, which
+        // locks the same mutex.
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let event: id = msg_send![app, currentEvent];
             let _: () = msg_send![window, performWindowDragWithEvent: event];
         }
 
-        // AppKit tracks the drag until the button is released and consumes the mouse-up, so the
-        // view never sees it.
+        // The call returns before the drag ends and Apple documents that a mouse-up may not be
+        // sent, so the view may never see this press's release: forget the press now.
         self.0.lock().last_left_mouse_down_event = None;
     }
 
