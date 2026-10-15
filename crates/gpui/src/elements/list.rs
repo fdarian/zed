@@ -970,22 +970,23 @@ impl StateInner {
             .max(px(0.))
             .min(scroll_max);
 
+        let (start, ..) =
+            self.items
+                .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
+        let new_offset = ListOffset {
+            item_ix: start.count,
+            offset_in_item: new_scroll_top - start.height,
+        };
+
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.pending_scroll = None;
             self.logical_scroll_top = None;
         } else {
-            let (start, ..) =
-                self.items
-                    .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
-            let scroll_top = ListOffset {
-                item_ix: start.count,
-                offset_in_item: new_scroll_top - start.height,
-            };
             // The user's scroll supersedes the position stashed by a
             // remeasure; re-anchor the pending adjustment so it doesn't revert
             // this scroll on the next layout.
-            self.rebase_pending_scroll(scroll_top);
-            self.logical_scroll_top = Some(scroll_top);
+            self.rebase_pending_scroll(new_offset);
+            self.logical_scroll_top = Some(new_offset);
         }
 
         if delta.y > px(0.) {
@@ -993,7 +994,7 @@ impl StateInner {
         }
 
         if let Some(handler) = self.scroll_handler.as_mut() {
-            let visible_range = Self::visible_range(&self.items, height, scroll_top);
+            let visible_range = Self::visible_range(&self.items, height, &new_offset);
             handler(
                 &ListScrollEvent {
                     visible_range,
@@ -1858,7 +1859,7 @@ impl sum_tree::SeekTarget<'_, ListItemSummary, ListItemSummary> for Height {
 mod test {
 
     use gpui::{ScrollDelta, ScrollWheelEvent};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use crate::{
@@ -2006,6 +2007,60 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 0);
         assert_eq!(offset.offset_in_item, px(0.));
+    }
+
+    fn scroll_to_end_in_one_wheel_move(alignment: crate::ListAlignment, cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(10, alignment, px(10.)).measure_all();
+        let reported = Rc::new(RefCell::new(Vec::new()));
+        state.set_scroll_handler({
+            let reported = reported.clone();
+            move |event, _, _| reported.borrow_mut().push(event.visible_range.clone())
+        });
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(20.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| TestView(state.clone())).into_any_element()
+        });
+
+        let wheel = |dy: f32| ScrollWheelEvent {
+            position: point(px(50.), px(50.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            ..Default::default()
+        };
+        if alignment == crate::ListAlignment::Bottom {
+            cx.simulate_event(wheel(500.));
+            reported.borrow_mut().clear();
+        }
+        cx.simulate_event(wheel(-500.));
+
+        let reported = reported.borrow();
+        let last = reported.last().expect("the wheel move reports a range");
+        assert!(
+            last.contains(&9),
+            "the range reported after scrolling to the end ({last:?}) must include the last item"
+        );
+    }
+
+    #[gpui::test]
+    fn test_scroll_to_end_reports_last_item_top_aligned(cx: &mut TestAppContext) {
+        scroll_to_end_in_one_wheel_move(crate::ListAlignment::Top, cx);
+    }
+
+    #[gpui::test]
+    fn test_scroll_to_end_reports_last_item_bottom_aligned(cx: &mut TestAppContext) {
+        scroll_to_end_in_one_wheel_move(crate::ListAlignment::Bottom, cx);
     }
 
     #[gpui::test]
@@ -2657,8 +2712,9 @@ mod test {
     fn test_follow_tail_disengages_on_user_scroll(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
-        // 10 items × 50px = 500px total, 200px viewport.
-        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        // 10 items × 50px = 500px total, 200px viewport. The overdraw measures two items
+        // above the tail, so there is something to scroll up through.
+        let state = ListState::new(10, crate::ListAlignment::Top, px(100.));
 
         struct TestView(ListState);
         impl Render for TestView {
@@ -2908,8 +2964,9 @@ mod test {
     fn test_follow_tail_reengages_when_scrolled_back_to_bottom(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
-        // 10 items × 50px = 500px total, 200px viewport.
-        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        // 10 items × 50px = 500px total, 200px viewport. The overdraw measures two items
+        // above the tail, so there is something to scroll up through.
+        let state = ListState::new(10, crate::ListAlignment::Top, px(100.));
 
         struct TestView(ListState);
         impl Render for TestView {
