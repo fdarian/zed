@@ -34,10 +34,7 @@ use std::{
     mem::MaybeUninit,
     ops::Range,
     ptr, slice,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 // Exported to metal
@@ -142,7 +139,9 @@ pub struct MetalRenderer {
     /// not zero.
     group_depth: Cell<usize>,
     /// Textures for effect groups and their filters, free to be used again.
-    texture_pool: Vec<metal::Texture>,
+    texture_pool: TexturePool<metal::Texture>,
+    /// How many bytes of group textures are drawn ahead of the pass that composites them.
+    group_texture_budget: u64,
     /// Path rasterization targets for groups, by texture size.
     group_path_intermediates: HashMap<(u32, u32), PathIntermediate>,
     unit_vertices: metal::Buffer,
@@ -310,7 +309,8 @@ impl MetalRenderer {
             group_pipelines,
             effect_pipelines,
             group_depth: Cell::new(0),
-            texture_pool: Vec::new(),
+            group_texture_budget: GROUP_TEXTURE_BUDGET,
+            texture_pool: TexturePool::default(),
             group_path_intermediates: HashMap::new(),
             unit_vertices,
             instance_buffer_pool,
@@ -426,6 +426,7 @@ impl MetalRenderer {
             return;
         };
 
+        let stats = render_stats_enabled().then(|| (encoders_opened(), std::time::Instant::now()));
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
@@ -433,6 +434,14 @@ impl MetalRenderer {
                 return;
             }
         };
+        if let Some((encoders_before, started)) = stats {
+            eprintln!(
+                "[gpuix-render] encoders={} encode_ms={:.3} pool_mb={:.1}",
+                encoders_opened() - encoders_before,
+                started.elapsed().as_secs_f64() * 1e3,
+                self.texture_pool.bytes() as f64 / 1e6,
+            );
+        }
 
         log_presented_time(&drawable);
         if self.presents_with_transaction {
@@ -461,7 +470,9 @@ impl MetalRenderer {
             &mut writer,
             texture,
             viewport_size,
-        )?;
+        );
+        self.texture_pool.end_frame();
+        let command_buffer = command_buffer?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -704,6 +715,11 @@ impl MetalRenderer {
             )
         })?;
 
+        // Group textures are drawn before the target's encoder opens, so that compositing a group
+        // does not end the encoder: a new one would Load and Store the whole target again.
+        let mut groups = GroupQueue::new(scene.groups.len());
+        self.prepare_groups(scene, &mut groups, command_buffer, writer)?;
+
         let mut command_encoder =
             new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color);
 
@@ -786,16 +802,55 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::EffectGroups(range) => {
-                    command_encoder.end_encoding();
-                    for group in &scene.groups[range] {
-                        self.composite_group(group, command_buffer, writer, texture, viewport_size)?;
+                    for index in range {
+                        if groups.is_waiting(index) {
+                            command_encoder.end_encoding();
+                            self.prepare_groups(scene, &mut groups, command_buffer, writer)?;
+                            command_encoder = new_command_encoder_for_texture(
+                                command_buffer,
+                                texture,
+                                viewport_size,
+                                None,
+                            );
+                        }
+                        let group = &scene.groups[index];
+                        let prepared = groups.take(index);
+                        // A backdrop filter copies what the target holds so far, which needs the
+                        // draws before it to have ended.
+                        if !group.effect.backdrop_filters.is_empty() {
+                            command_encoder.end_encoding();
+                            let result = self.draw_backdrop(
+                                group,
+                                &prepared,
+                                command_buffer,
+                                writer,
+                                texture,
+                                viewport_size,
+                            );
+                            command_encoder = new_command_encoder_for_texture(
+                                command_buffer,
+                                texture,
+                                viewport_size,
+                                None,
+                            );
+                            if let Err(error) = result {
+                                command_encoder.end_encoding();
+                                return Err(error);
+                            }
+                        }
+                        let result = self.composite_group(
+                            group,
+                            &prepared,
+                            writer,
+                            viewport_size,
+                            command_encoder,
+                        );
+                        self.release_prepared(prepared);
+                        if let Err(error) = result {
+                            command_encoder.end_encoding();
+                            return Err(error);
+                        }
                     }
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        texture,
-                        viewport_size,
-                        None,
-                    );
                 }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
@@ -1294,12 +1349,8 @@ impl MetalRenderer {
     }
 
     fn acquire_texture(&mut self, width: u32, height: u32) -> metal::Texture {
-        if let Some(index) = self
-            .texture_pool
-            .iter()
-            .position(|texture| texture.width() == width as u64 && texture.height() == height as u64)
-        {
-            return self.texture_pool.swap_remove(index);
+        if let Some(texture) = self.texture_pool.take(width, height) {
+            return texture;
         }
         let descriptor = metal::TextureDescriptor::new();
         descriptor.set_width(width as u64);
@@ -1311,17 +1362,9 @@ impl MetalRenderer {
         self.device.new_texture(&descriptor)
     }
 
-    #[cfg(test)]
-    fn texture_pool_bytes(&self) -> u64 {
-        self.texture_pool.iter().map(|texture| texture.width() * texture.height() * 4).sum()
-    }
-
     fn release_texture(&mut self, texture: metal::Texture) {
-        const MAX_POOLED_TEXTURES: usize = 32;
-        if self.texture_pool.len() >= MAX_POOLED_TEXTURES {
-            self.texture_pool.remove(0);
-        }
-        self.texture_pool.push(texture);
+        let (width, height) = (texture.width() as u32, texture.height() as u32);
+        self.texture_pool.put(texture, width, height);
     }
 
     fn group_path_intermediate(&mut self, width: u32, height: u32) -> PathIntermediate {
@@ -1672,11 +1715,11 @@ impl MetalRenderer {
         (params, polygon)
     }
 
+    /// Draws `source` over the part of the target that `encoder` is drawing into.
     #[allow(clippy::too_many_arguments)]
-    fn draw_composite(
+    fn encode_composite(
         &self,
-        command_buffer: &metal::CommandBufferRef,
-        target: &metal::TextureRef,
+        encoder: &metal::RenderCommandEncoderRef,
         viewport_size: Size<DevicePixels>,
         params: &CompositeParams,
         polygon: Option<&InstanceBinding>,
@@ -1684,7 +1727,6 @@ impl MetalRenderer {
         mask_a: Option<&metal::TextureRef>,
         mask_b: Option<&metal::TextureRef>,
     ) {
-        let encoder = new_command_encoder_for_texture(command_buffer, target, viewport_size, None);
         encoder.set_render_pipeline_state(&self.effect_pipelines.composite);
         encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
         let params_size = mem::size_of::<CompositeParams>() as u64;
@@ -1706,24 +1748,59 @@ impl MetalRenderer {
         encoder.set_fragment_texture(1, Some(mask_a.unwrap_or(source)));
         encoder.set_fragment_texture(2, Some(mask_b.unwrap_or(source)));
         encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_composite(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        target: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        params: &CompositeParams,
+        polygon: Option<&InstanceBinding>,
+        source: &metal::TextureRef,
+        mask_a: Option<&metal::TextureRef>,
+        mask_b: Option<&metal::TextureRef>,
+    ) {
+        let encoder = new_command_encoder_for_texture(command_buffer, target, viewport_size, None);
+        self.encode_composite(encoder, viewport_size, params, polygon, source, mask_a, mask_b);
         encoder.end_encoding();
     }
 
-    /// Draws a group into the target: its content through its filters, behind it the filtered
-    /// backdrop, and over everything the group's opacity, masks and clip path.
-    fn composite_group(
+    /// Draws the textures of the groups from `groups.next` on that fit in
+    /// `group_texture_budget` together (at least one): their content through their filters, and
+    /// their masks. A group texture depends on nothing but its own scene, so it can be drawn ahead
+    /// of the pass that composites it.
+    fn prepare_groups(
+        &mut self,
+        scene: &Scene,
+        groups: &mut GroupQueue,
+        command_buffer: &metal::CommandBufferRef,
+        writer: &mut InstanceBufferWriter,
+    ) -> Result<()> {
+        let first = groups.next;
+        let mut bytes = 0;
+        while groups.next < scene.groups.len() {
+            let group = &scene.groups[groups.next];
+            bytes += group_texture_bytes(group);
+            if bytes > self.group_texture_budget && groups.next > first {
+                break;
+            }
+            let prepared = self.prepare_group(group, command_buffer, writer)?;
+            groups.prepared[groups.next] = Some(prepared);
+            groups.next += 1;
+        }
+        Ok(())
+    }
+
+    fn prepare_group(
         &mut self,
         group: &EffectGroup,
         command_buffer: &metal::CommandBufferRef,
         writer: &mut InstanceBufferWriter,
-        target: &metal::TextureRef,
-        viewport_size: Size<DevicePixels>,
-    ) -> Result<()> {
+    ) -> Result<PreparedGroup> {
         let effect = &group.effect;
-        let width = group.bounds.size.width.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
-        let height = group.bounds.size.height.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
-        let texture_width = texture_size_class(width);
-        let texture_height = texture_size_class(height);
+        let (texture_width, texture_height) = group_texture_extent(group);
         let texture_size = size(
             DevicePixels(texture_width as i32),
             DevicePixels(texture_height as i32),
@@ -1768,55 +1845,60 @@ impl MetalRenderer {
             }
             None => None,
         };
-        let mask_extent = [texture_width as f32, texture_height as f32];
+        Ok(PreparedGroup {
+            content,
+            mask_a,
+            mask_b,
+            extent: [texture_width as f32, texture_height as f32],
+        })
+    }
 
-        if !effect.backdrop_filters.is_empty() {
-            self.draw_backdrop(
-                group,
-                mask_a.as_ref().map(|_| mask_extent),
-                mask_b.as_ref().map(|_| mask_extent),
-                [mask_a.as_ref(), mask_b.as_ref()],
-                command_buffer,
-                writer,
-                target,
-                viewport_size,
-            )?;
+    fn release_prepared(&mut self, prepared: PreparedGroup) {
+        self.release_texture(prepared.content);
+        if let Some(texture) = prepared.mask_a {
+            self.release_texture(texture);
         }
+        if let Some(texture) = prepared.mask_b {
+            self.release_texture(texture);
+        }
+    }
 
+    /// Draws a prepared group into the target that `encoder` is drawing into: its content with
+    /// the group's opacity, masks and clip path.
+    fn composite_group(
+        &self,
+        group: &EffectGroup,
+        prepared: &PreparedGroup,
+        writer: &mut InstanceBufferWriter,
+        viewport_size: Size<DevicePixels>,
+        encoder: &metal::RenderCommandEncoderRef,
+    ) -> Result<()> {
         let dest = group.bounds.intersect(&group.content_mask.bounds);
-        if !dest.is_empty() {
-            let (params, polygon) = Self::composite_params(
-                group,
-                &dest,
-                [group.bounds.origin.x.0, group.bounds.origin.y.0],
-                mask_extent,
-                mask_a.as_ref().map(|_| mask_extent),
-                mask_b.as_ref().map(|_| mask_extent),
-                None,
-            );
-            let polygon = match polygon {
-                Some(points) if !points.is_empty() => Some(writer.write(&points)?),
-                _ => None,
-            };
-            self.draw_composite(
-                command_buffer,
-                target,
-                viewport_size,
-                &params,
-                polygon.as_ref(),
-                &content,
-                mask_a.as_deref(),
-                mask_b.as_deref(),
-            );
+        if dest.is_empty() {
+            return Ok(());
         }
-
-        self.release_texture(content);
-        if let Some(texture) = mask_a {
-            self.release_texture(texture);
-        }
-        if let Some(texture) = mask_b {
-            self.release_texture(texture);
-        }
+        let (params, polygon) = Self::composite_params(
+            group,
+            &dest,
+            [group.bounds.origin.x.0, group.bounds.origin.y.0],
+            prepared.extent,
+            prepared.mask_a.as_ref().map(|_| prepared.extent),
+            prepared.mask_b.as_ref().map(|_| prepared.extent),
+            None,
+        );
+        let polygon = match polygon {
+            Some(points) if !points.is_empty() => Some(writer.write(&points)?),
+            _ => None,
+        };
+        self.encode_composite(
+            encoder,
+            viewport_size,
+            &params,
+            polygon.as_ref(),
+            &prepared.content,
+            prepared.mask_a.as_deref(),
+            prepared.mask_b.as_deref(),
+        );
         Ok(())
     }
 
@@ -1827,9 +1909,7 @@ impl MetalRenderer {
     fn draw_backdrop(
         &mut self,
         group: &EffectGroup,
-        mask_a_size: Option<[f32; 2]>,
-        mask_b_size: Option<[f32; 2]>,
-        masks: [Option<&metal::Texture>; 2],
+        prepared: &PreparedGroup,
         command_buffer: &metal::CommandBufferRef,
         writer: &mut InstanceBufferWriter,
         target: &metal::TextureRef,
@@ -1891,7 +1971,7 @@ impl MetalRenderer {
             )
             .end_encoding();
         }
-        ENCODERS_OPENED.fetch_add(1, Ordering::Relaxed);
+        count_encoder();
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
             target,
@@ -1925,8 +2005,8 @@ impl MetalRenderer {
             &region,
             [left, top],
             [texture_width as f32, texture_height as f32],
-            mask_a_size,
-            mask_b_size,
+            prepared.mask_a.as_ref().map(|_| prepared.extent),
+            prepared.mask_b.as_ref().map(|_| prepared.extent),
             Some((reference, effect.reference_radii)),
         );
         let polygon = match polygon {
@@ -1940,11 +2020,134 @@ impl MetalRenderer {
             &params,
             polygon.as_ref(),
             &filtered,
-            masks[0].map(|texture| &**texture),
-            masks[1].map(|texture| &**texture),
+            prepared.mask_a.as_deref(),
+            prepared.mask_b.as_deref(),
         );
         self.release_texture(filtered);
         Ok(())
+    }
+}
+
+/// Idle textures that effect groups and their filters draw into again instead of making new ones.
+/// A texture is dropped once it has not been used for `max_idle_frames` frames, and the pool never
+/// holds more than `byte_budget`, oldest first, so a group that resizes through many sizes does
+/// not pile up a texture per size.
+struct TexturePool<T> {
+    entries: Vec<PooledTexture<T>>,
+    frame: u64,
+    max_idle_frames: u64,
+    byte_budget: u64,
+}
+
+struct PooledTexture<T> {
+    texture: T,
+    width: u32,
+    height: u32,
+    last_used: u64,
+}
+
+impl<T> PooledTexture<T> {
+    fn bytes(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.height) * TEXTURE_BYTES_PER_PIXEL
+    }
+}
+
+const TEXTURE_BYTES_PER_PIXEL: u64 = 4;
+
+impl<T> Default for TexturePool<T> {
+    fn default() -> Self {
+        Self::new(POOL_MAX_IDLE_FRAMES, POOL_BYTE_BUDGET)
+    }
+}
+
+impl<T> TexturePool<T> {
+    fn new(max_idle_frames: u64, byte_budget: u64) -> Self {
+        Self {
+            entries: Vec::new(),
+            frame: 0,
+            max_idle_frames,
+            byte_budget,
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.entries.iter().map(PooledTexture::bytes).sum()
+    }
+
+    /// A pooled texture of exactly this size, the one used most recently.
+    fn take(&mut self, width: u32, height: u32) -> Option<T> {
+        let index = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.width == width && entry.height == height)
+            .max_by_key(|(_, entry)| entry.last_used)?
+            .0;
+        Some(self.entries.swap_remove(index).texture)
+    }
+
+    fn put(&mut self, texture: T, width: u32, height: u32) {
+        self.entries.push(PooledTexture {
+            texture,
+            width,
+            height,
+            last_used: self.frame,
+        });
+    }
+
+    /// Ends a frame: drops what has sat idle too long, then the least recently used until the
+    /// pool fits its budget.
+    fn end_frame(&mut self) {
+        let frame = self.frame;
+        let max_idle_frames = self.max_idle_frames;
+        self.entries
+            .retain(|entry| frame - entry.last_used <= max_idle_frames);
+        let mut bytes = self.bytes();
+        if bytes > self.byte_budget {
+            self.entries
+                .sort_by_key(|entry| std::cmp::Reverse(entry.last_used));
+            while bytes > self.byte_budget {
+                let evicted = self.entries.pop().expect("over budget means not empty");
+                bytes -= evicted.bytes();
+            }
+        }
+        self.frame += 1;
+    }
+}
+
+/// A group whose textures are drawn and wait to be composited.
+struct PreparedGroup {
+    content: metal::Texture,
+    mask_a: Option<metal::Texture>,
+    mask_b: Option<metal::Texture>,
+    /// The size of the textures, which a composite samples a part of.
+    extent: [f32; 2],
+}
+
+/// The groups of a scene in paint order, from the ones prepared and not yet composited to the ones
+/// not prepared yet.
+struct GroupQueue {
+    prepared: Vec<Option<PreparedGroup>>,
+    /// The first group that is not prepared.
+    next: usize,
+}
+
+impl GroupQueue {
+    fn new(len: usize) -> Self {
+        Self {
+            prepared: (0..len).map(|_| None).collect(),
+            next: 0,
+        }
+    }
+
+    fn is_waiting(&self, index: usize) -> bool {
+        index >= self.next
+    }
+
+    fn take(&mut self, index: usize) -> PreparedGroup {
+        self.prepared[index]
+            .take()
+            .expect("a group is prepared before it is composited, and composited once")
     }
 }
 
@@ -2160,11 +2363,41 @@ struct DropShadowParams {
 /// How many colour matrices one filter pass applies; longer runs take several passes.
 const MAX_MATRICES_PER_PASS: usize = 8;
 
-/// Textures are sized in steps so that groups of nearly the same size share them.
+/// The smallest step textures are sized in.
 const TEXTURE_SIZE_STEP: u32 = 32;
 
+/// A pooled texture goes after this many frames unused.
+const POOL_MAX_IDLE_FRAMES: u64 = 30;
+
+/// The most the pool holds between frames.
+const POOL_BYTE_BUDGET: u64 = 128 << 20;
+
+/// How many of a group's textures are drawn ahead of compositing them, in bytes. Past it the
+/// target's encoder ends once more, to draw the next ones.
+const GROUP_TEXTURE_BUDGET: u64 = 256 << 20;
+
+/// Textures are sized in steps so that groups of nearly the same size share them, and a group that
+/// resizes through many sizes does not leave a texture behind for each. The step is 1/16 of the
+/// power of two above the extent, so a texture is at most 1/8 larger than what it holds, and never
+/// below `TEXTURE_SIZE_STEP`.
 fn texture_size_class(extent: u32) -> u32 {
-    extent.max(1).next_multiple_of(TEXTURE_SIZE_STEP)
+    let extent = extent.max(1);
+    let step = (extent.next_power_of_two() / 16).max(TEXTURE_SIZE_STEP);
+    extent.next_multiple_of(step)
+}
+
+fn group_texture_extent(group: &EffectGroup) -> (u32, u32) {
+    let width = group.bounds.size.width.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
+    let height = group.bounds.size.height.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
+    (texture_size_class(width), texture_size_class(height))
+}
+
+/// What the textures a group holds while it waits to be composited take: its content, and a mask
+/// for each of its masks.
+fn group_texture_bytes(group: &EffectGroup) -> u64 {
+    let (width, height) = group_texture_extent(group);
+    let textures = 1 + u64::from(group.effect.mask.is_some()) + u64::from(group.text_mask.is_some());
+    u64::from(width) * u64::from(height) * 4 * textures
 }
 
 fn rect_array(bounds: &Bounds<ScaledPixels>) -> [f32; 4] {
@@ -2185,12 +2418,18 @@ fn radii_array(radii: &gpui::Corners<ScaledPixels>) -> [f32; 4] {
     ]
 }
 
-/// Render and blit encoders opened since the process started, for measuring how a scene is
-/// split into passes. Read it before and after a frame.
-static ENCODERS_OPENED: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static ENCODERS_OPENED: Cell<u64> = const { Cell::new(0) };
+}
 
+fn count_encoder() {
+    ENCODERS_OPENED.with(|count| count.set(count.get() + 1));
+}
+
+/// Render and blit encoders this thread has opened, for measuring how a scene is split into
+/// passes. Read it before and after a frame.
 pub fn encoders_opened() -> u64 {
-    ENCODERS_OPENED.load(Ordering::Relaxed)
+    ENCODERS_OPENED.with(Cell::get)
 }
 
 fn new_command_encoder_for_texture<'a>(
@@ -2199,7 +2438,7 @@ fn new_command_encoder_for_texture<'a>(
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
-    ENCODERS_OPENED.fetch_add(1, Ordering::Relaxed);
+    count_encoder();
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
     let color_attachment = render_pass_descriptor
         .color_attachments()
@@ -2619,6 +2858,13 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
     fn supports_effect_groups(&self) -> bool {
         true
     }
+}
+
+/// Debug only: with `GPUIX_RENDER_STATS` set, `draw` prints the encoders it opened, the time it
+/// took to encode the frame and the bytes the texture pool holds, one line per frame.
+fn render_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GPUIX_RENDER_STATS").is_some())
 }
 
 /// Debug only: when `GPUIX_PRESENT_LOG` names a file, appends the
@@ -3683,8 +3929,220 @@ mod tests {
                 encoders / FRAMES as u64,
                 cpu / FRAMES as f64,
                 gpu / FRAMES as f64,
-                renderer.texture_pool_bytes() as f64 / 1e6
+                renderer.texture_pool.bytes() as f64 / 1e6
             );
         }
+    }
+
+    /// Overlapping translucent groups with plain quads between them, over a plain quad.
+    fn interleaved_scene() -> Scene {
+        let mut scene = groups_scene();
+        scene.insert_primitive(solid(0., 0., 30., 30., 0x0000ff));
+        group(
+            &mut scene,
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            &[
+                solid(10., 10., 20., 20., 0xff0000),
+                solid(12., 12., 4., 4., 0xff0000),
+            ],
+        );
+        scene.insert_primitive(solid(15., 15., 10., 10., 0x00ff00));
+        group(
+            &mut scene,
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            &[
+                solid(20., 20., 15., 15., 0xffffff),
+                solid(21., 21., 3., 3., 0xffffff),
+            ],
+        );
+        scene.insert_primitive(solid(28., 28., 8., 8., 0xffff00));
+        scene
+    }
+
+    fn assert_interleaved_order(image: &image::RgbaImage) {
+        // The first group over the plain quad under it.
+        assert_color(image, 12, 26, [128, 0, 128]);
+        // The plain quad after the first group covers it outright.
+        assert_color(image, 17, 17, [0, 255, 0]);
+        // The second group over that plain quad, and over the plain quad under it, and over
+        // both groups' overlap.
+        assert_color(image, 22, 22, [128, 255, 128]);
+        assert_color(image, 26, 26, [192, 128, 192]);
+        // The second group over nothing, and the plain quad after it over the group.
+        assert_color(image, 33, 22, [128, 128, 128]);
+        assert_color(image, 32, 32, [255, 255, 0]);
+    }
+
+    #[test]
+    fn groups_and_plain_quads_land_in_paint_order() {
+        let image = render(&mut interleaved_scene());
+        assert_interleaved_order(&image);
+    }
+
+    #[test]
+    fn paint_order_holds_when_group_textures_are_drawn_a_few_at_a_time() {
+        // A budget below one group draws one group's textures per pass over the target, so
+        // every group ends the target's encoder and the next pass loads what is drawn so far.
+        let mut scene = interleaved_scene();
+        scene.finish();
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer.renderer.group_texture_budget = 1;
+        let image = renderer
+            .render_scene_to_image(
+                &scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
+            .expect("scene should render");
+        assert_interleaved_order(&image);
+    }
+
+    #[test]
+    fn a_batch_of_groups_composites_in_one_pass_over_the_target() {
+        use super::encoders_opened;
+        let mut scene = groups_scene();
+        for column in 0..8 {
+            group(
+                &mut scene,
+                GroupEffect {
+                    opacity: 0.5,
+                    ..GroupEffect::default()
+                },
+                &[
+                    solid(column as f32 * 5., 0., 4., 30., 0xff0000),
+                    solid(column as f32 * 5., 10., 4., 4., 0x0000ff),
+                ],
+            );
+        }
+        scene.finish();
+        let mut renderer = MetalHeadlessRenderer::new();
+        let before = encoders_opened();
+        renderer
+            .render_scene_to_image(
+                &scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
+            .expect("scene should render");
+        // One pass per group's texture and one over the target for all of them. Ending the
+        // target's pass for each group would take two passes per group.
+        assert_eq!(encoders_opened() - before, 8 + 1);
+    }
+
+    #[test]
+    fn a_pool_drops_the_oldest_textures_over_its_byte_budget() {
+        let mut pool = super::TexturePool::new(1000, 4 * 100 * 100 * 3);
+        for texture in 0..5 {
+            pool.put(texture, 100, 100);
+            pool.end_frame();
+        }
+        assert_eq!(pool.bytes(), 4 * 100 * 100 * 3);
+        // The newest are kept.
+        let mut kept: Vec<_> = (0..3).filter_map(|_| pool.take(100, 100)).collect();
+        kept.sort();
+        assert_eq!(kept, [2, 3, 4]);
+    }
+
+    #[test]
+    fn a_pool_drops_textures_that_sit_idle() {
+        let mut pool = super::TexturePool::new(3, u64::MAX);
+        pool.put("stale", 64, 64);
+        for _ in 0..3 {
+            pool.end_frame();
+        }
+        assert_eq!(pool.take(64, 64), Some("stale"));
+        pool.put("stale", 64, 64);
+        for _ in 0..5 {
+            pool.end_frame();
+        }
+        assert_eq!(pool.bytes(), 0);
+        assert_eq!(pool.take(64, 64), None);
+    }
+
+    #[test]
+    fn a_pool_hands_out_only_the_size_asked_for_and_the_newest_of_it() {
+        let mut pool = super::TexturePool::new(30, u64::MAX);
+        pool.put("old", 64, 64);
+        pool.end_frame();
+        pool.put("other size", 96, 64);
+        pool.put("new", 64, 64);
+        assert_eq!(pool.take(64, 64), Some("new"));
+        assert_eq!(pool.take(64, 64), Some("old"));
+        assert_eq!(pool.take(64, 64), None);
+    }
+
+    #[test]
+    fn a_resizing_element_goes_through_few_texture_sizes() {
+        use super::texture_size_class;
+        let classes: std::collections::BTreeSet<_> =
+            (100..=1500).map(texture_size_class).collect();
+        assert!(classes.len() <= 56, "{} classes", classes.len());
+        for extent in 1..=16384u32 {
+            let class = texture_size_class(extent);
+            assert!(class >= extent && class <= 16384);
+            // Never more than an eighth bigger than what it holds, past the smallest step.
+            assert!(class - extent < (extent / 8).max(32), "{extent} -> {class}");
+        }
+    }
+
+    /// Pool size after a filtered element resizes through 60 frames.
+    #[test]
+    #[ignore]
+    fn pool_bytes_after_a_filtered_element_resizes() {
+        use super::MetalRenderer;
+        const WIDTH: i32 = 2880;
+        const HEIGHT: i32 = 1800;
+        let mut renderer = MetalRenderer::new_headless(Default::default());
+        let target_size = size(DevicePixels(WIDTH), DevicePixels(HEIGHT));
+        renderer.update_path_intermediate_textures(target_size);
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(WIDTH as u64);
+        descriptor.set_height(HEIGHT as u64);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(
+            metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+        );
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        let target = renderer.device.new_texture(&descriptor);
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(WIDTH as f32), ScaledPixels(HEIGHT as f32)),
+            ),
+            corner_radii: Corners::default(),
+        };
+        let mut peak = 0;
+        for frame in 0..60 {
+            // From a small box to nearly the whole window, a few pixels per frame in each axis.
+            let width = 200. + frame as f32 * 44.;
+            let height = 150. + frame as f32 * 27.;
+            let mut scene = groups_scene();
+            scene.start_group(
+                filtered(vec![gpui::FilterFunction::Blur(px(6.))]),
+                mask,
+                None,
+            );
+            scene.insert_primitive(Quad {
+                content_mask: mask,
+                ..solid(0., 0., width, height, 0x3355aa)
+            });
+            scene.end_group();
+            scene.finish();
+            let command_buffer = renderer
+                .render_frame(&scene, &target, target_size)
+                .expect("scene renders");
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            peak = peak.max(renderer.texture_pool.bytes());
+        }
+        println!(
+            "pool after 60 frames {:.1} MB, peak {:.1} MB",
+            renderer.texture_pool.bytes() as f64 / 1e6,
+            peak as f64 / 1e6
+        );
     }
 }
