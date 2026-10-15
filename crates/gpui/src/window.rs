@@ -1966,7 +1966,9 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, window, _cx| {
-                        if window.pointer_outside {
+                        // Only the rect-based DOM lookup needs this: hit testing already finds
+                        // nothing for a pointer outside.
+                        if window.dom_hit_testing && window.pointer_outside {
                             return None;
                         }
                         window.window_control_area_at(window.mouse_position)
