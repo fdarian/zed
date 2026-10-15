@@ -1402,14 +1402,14 @@ float4 fill_color(Background background,
   return color;
 }
 
-// Triangular-distributed noise that breaks up 8-bit quantization steps in gradients.
+// Triangular-distributed noise that breaks up 8-bit quantization steps in gradients. It leaves alpha
+// alone: noise there would let the backdrop show through an opaque gradient.
 float4 dither(float4 color, float2 position) {
   float2 seed = position * 0.6180339887; // golden ratio spread
   float r1 = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
   float r2 = fract(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
   float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
   color.rgb += tri * 2.0 / 255.0;
-  color.a   += tri * 3.0 / 255.0;
   return color;
 }
 

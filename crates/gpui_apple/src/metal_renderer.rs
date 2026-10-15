@@ -3254,6 +3254,30 @@ mod tests {
         assert_color(&image, 20, 20, [255, 0, 0]);
     }
 
+    #[test]
+    fn dithering_a_gradient_does_not_make_it_translucent() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
+        let boxes = BackgroundBoxes::new(bounds, Corners::default(), Edges::default(), Edges::default());
+        let resolved = layer(
+            GradientShape::Linear(LinearDirection::ToRight),
+            vec![stop(0x000000, at(0.)), stop(0x000000, at(1.))],
+            false,
+        )
+        .resolve(&boxes)
+        .unwrap();
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(gpui::white(), Edges::all(gpui::transparent_black()), 0.));
+        for chunk in resolved.chunks {
+            let mut quad = quad(chunk, Edges::all(gpui::transparent_black()), 0.);
+            quad.background_tile = resolved.tile;
+            scene.insert_primitive(quad);
+        }
+        let image = render(&mut scene);
+        // Opaque black over white: anything the white shows through is alpha noise.
+        let brightest = image.pixels().map(|pixel| pixel.0[0]).max().unwrap();
+        assert!(brightest <= 2, "white shows through an opaque gradient: {brightest}/255");
+    }
+
     fn groups_scene() -> Scene {
         let mut scene = Scene::default();
         scene.set_effect_groups_enabled(true);
