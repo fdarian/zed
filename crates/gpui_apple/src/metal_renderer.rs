@@ -27,8 +27,17 @@ use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
 use std::{
-    cell::Cell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice,
-    sync::Arc,
+    cell::Cell,
+    collections::HashMap,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 // Exported to metal
@@ -1302,6 +1311,11 @@ impl MetalRenderer {
         self.device.new_texture(&descriptor)
     }
 
+    #[cfg(test)]
+    fn texture_pool_bytes(&self) -> u64 {
+        self.texture_pool.iter().map(|texture| texture.width() * texture.height() * 4).sum()
+    }
+
     fn release_texture(&mut self, texture: metal::Texture) {
         const MAX_POOLED_TEXTURES: usize = 32;
         if self.texture_pool.len() >= MAX_POOLED_TEXTURES {
@@ -1877,6 +1891,7 @@ impl MetalRenderer {
             )
             .end_encoding();
         }
+        ENCODERS_OPENED.fetch_add(1, Ordering::Relaxed);
         let blit = command_buffer.new_blit_command_encoder();
         blit.copy_from_texture(
             target,
@@ -2170,12 +2185,21 @@ fn radii_array(radii: &gpui::Corners<ScaledPixels>) -> [f32; 4] {
     ]
 }
 
+/// Render and blit encoders opened since the process started, for measuring how a scene is
+/// split into passes. Read it before and after a frame.
+static ENCODERS_OPENED: AtomicU64 = AtomicU64::new(0);
+
+pub fn encoders_opened() -> u64 {
+    ENCODERS_OPENED.load(Ordering::Relaxed)
+}
+
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
     viewport_size: Size<DevicePixels>,
     clear_color: Option<metal::MTLClearColor>,
 ) -> &'a metal::RenderCommandEncoderRef {
+    ENCODERS_OPENED.fetch_add(1, Ordering::Relaxed);
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
     let color_attachment = render_pass_descriptor
         .color_attachments()
@@ -3570,5 +3594,97 @@ mod tests {
         assert_color(&image, 10, 26, [128, 0, 0]);
         assert_color(&image, 31, 19, [0, 0, 128]);
         assert!(is_cleared(&image, 28, 8));
+    }
+
+    /// Run with `cargo test -p gpui_apple --release --features test-support -- --ignored --nocapture
+    /// frame_cost`. Prints encoders, CPU encode time and GPU time per frame for a window full of
+    /// rows that are effect groups.
+    #[test]
+    #[ignore]
+    fn frame_cost_of_many_effect_groups() {
+        use super::{MetalRenderer, encoders_opened};
+        use objc::{msg_send, sel, sel_impl};
+        use std::time::Instant;
+
+        const WIDTH: i32 = 2880;
+        const HEIGHT: i32 = 1800;
+        let rows_scene = |effect: &dyn Fn() -> GroupEffect| {
+            let mut scene = groups_scene();
+            let mask = ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size(ScaledPixels(WIDTH as f32), ScaledPixels(HEIGHT as f32)),
+                ),
+                corner_radii: Corners::default(),
+            };
+            let solid = |x, y, width, height, color| Quad {
+                content_mask: mask,
+                ..solid(x, y, width, height, color)
+            };
+            for row in 0..50 {
+                let y = row as f32 * 36.;
+                scene.insert_primitive(solid(0., y, 2880., 2., 0x202020));
+                scene.start_group(effect(), mask, None);
+                scene.insert_primitive(solid(20., y + 4., 2800., 28., 0x3355aa));
+                scene.insert_primitive(solid(40., y + 8., 400., 20., 0xffffff));
+                scene.end_group();
+            }
+            scene.finish();
+            scene
+        };
+        let cases: [(&str, Box<dyn Fn() -> GroupEffect>); 2] = [
+            (
+                "50 rows opacity .8",
+                Box::new(|| GroupEffect {
+                    opacity: 0.8,
+                    ..GroupEffect::default()
+                }),
+            ),
+            (
+                "50 rows blur 4",
+                Box::new(|| filtered(vec![gpui::FilterFunction::Blur(px(4.))])),
+            ),
+        ];
+        for (name, effect) in &cases {
+            let scene = rows_scene(effect.as_ref());
+            let mut renderer = MetalRenderer::new_headless(Default::default());
+            let target_size = size(DevicePixels(WIDTH), DevicePixels(HEIGHT));
+            renderer.update_path_intermediate_textures(target_size);
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(WIDTH as u64);
+            descriptor.set_height(HEIGHT as u64);
+            descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            let target = renderer.device.new_texture(&descriptor);
+            let (mut cpu, mut gpu, mut encoders) = (0., 0., 0);
+            const FRAMES: usize = 30;
+            for frame in 0..FRAMES + 3 {
+                let before = encoders_opened();
+                let started = Instant::now();
+                let command_buffer = renderer
+                    .render_frame(&scene, &target, target_size)
+                    .expect("scene renders");
+                command_buffer.commit();
+                let encode = started.elapsed().as_secs_f64() * 1e3;
+                command_buffer.wait_until_completed();
+                if frame >= 3 {
+                    let start: f64 = unsafe { msg_send![&*command_buffer, GPUStartTime] };
+                    let end: f64 = unsafe { msg_send![&*command_buffer, GPUEndTime] };
+                    cpu += encode;
+                    gpu += (end - start) * 1e3;
+                    encoders += encoders_opened() - before;
+                }
+            }
+            println!(
+                "{name}: encoders/frame {}, cpu {:.2} ms, gpu {:.2} ms, pool {:.1} MB",
+                encoders / FRAMES as u64,
+                cpu / FRAMES as f64,
+                gpu / FRAMES as f64,
+                renderer.texture_pool_bytes() as f64 / 1e6
+            );
+        }
     }
 }
