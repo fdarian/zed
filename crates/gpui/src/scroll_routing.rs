@@ -18,8 +18,8 @@ use collections::HashMap;
 use web_time::Instant;
 
 use crate::{
-    App, Global, Hitbox, IsZero, Overflow, Pixels, Point, ScrollWheelEvent, TouchPhase, Window,
-    WindowId, point,
+    App, Global, Hitbox, HitboxBehavior, IsZero, Overflow, Pixels, Point, ScrollWheelEvent,
+    TouchPhase, Window, WindowId, point,
 };
 
 /// How long a latched container keeps the wheel once events stop. Momentum events
@@ -79,8 +79,16 @@ impl Global for WheelRouting {}
 /// reaches. The listeners of those run innermost first (bubble order), and each takes its share
 /// in turn, so this is the only place that decides who is in the chain: the rest of this module
 /// only chains, clamps, latches and applies overscroll behavior.
+///
+/// A [`HitboxBehavior::PassThrough`] container is never one of them, even when a descendant that is
+/// not pass-through is under the pointer: like in the DOM, the wheel goes to what is under the
+/// pointer and scrolls the ancestors that can be hit.
 pub(crate) fn is_candidate(window: &Window, hitbox: &Hitbox) -> bool {
-    hitbox.should_handle_scroll(window)
+    !passes_through(hitbox) && hitbox.should_handle_scroll(window)
+}
+
+pub(crate) fn passes_through(hitbox: &Hitbox) -> bool {
+    hitbox.behavior == HitboxBehavior::PassThrough
 }
 
 /// Starts routing one wheel event. Every container calls it from its capture-phase
@@ -113,6 +121,9 @@ pub(crate) struct Claim {
     pub scroller: ScrollerId,
     /// The pointer is over the container. A latched container does not need this.
     pub under_pointer: bool,
+    /// The container's hitbox is [`HitboxBehavior::PassThrough`]. It takes no wheel, and a latch
+    /// on it from an earlier gesture ends.
+    pub pass_through: bool,
     pub event: ScrollWheelEvent,
     /// What a line of a mouse wheel is worth, in pixels, to this container.
     pub line_height: Pixels,
@@ -131,6 +142,17 @@ pub(crate) fn claim(window: &Window, cx: &mut App, claim: Claim) -> Option<Point
         .0
         .entry(window.window_handle().window_id())
         .or_default();
+
+    if claim.pass_through {
+        if routing
+            .latch
+            .as_ref()
+            .is_some_and(|latch| latch.scroller == claim.scroller)
+        {
+            routing.latch = None;
+        }
+        return None;
+    }
 
     let latched = match &routing.latch {
         Some(latch) if !routing.latched_this_event => {

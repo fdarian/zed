@@ -3506,7 +3506,11 @@ impl Interactivity {
         let ongoing_scroll = self.ongoing_scroll.clone();
         let programmatic = self.programmatic_scroll_only;
         let user_scrolls = |overflow: Overflow, programmatic: bool| {
-            if programmatic { Overflow::Visible } else { overflow }
+            if programmatic {
+                Overflow::Visible
+            } else {
+                overflow
+            }
         };
         let overflow = point(
             user_scrolls(style.overflow.x, programmatic.x),
@@ -3547,6 +3551,7 @@ impl Interactivity {
                 let claim = scroll_routing::Claim {
                     scroller,
                     under_pointer: scroll_routing::is_candidate(window, &hitbox),
+                    pass_through: scroll_routing::passes_through(&hitbox),
                     event: event.clone(),
                     line_height,
                     overflow,
@@ -3565,7 +3570,7 @@ impl Interactivity {
         }
 
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+            if phase == DispatchPhase::Bubble && scroll_routing::is_candidate(window, &hitbox) {
                 let mut scroll_offset = scroll_offset.borrow_mut();
                 let old_scroll_offset = *scroll_offset;
                 let mut delta = event.delta.pixel_delta(line_height);
@@ -5957,6 +5962,7 @@ mod tests {
             Entity, ScrollDelta, ScrollWheelEvent, StyleRefinement, TouchPhase, WindowHandle,
             deferred, size,
         };
+        use std::cell::Cell;
 
         struct SceneView {
             build: Rc<dyn Fn() -> AnyElement>,
@@ -6290,6 +6296,112 @@ mod tests {
             let mut handled = scrolled.borrow().clone();
             handled.sort();
             assert_eq!(handled, ["inner", "outer"]);
+        }
+
+        struct NestedScrollers {
+            outer: ScrollHandle,
+            inner: ScrollHandle,
+            inner_passes_through: Rc<Cell<bool>>,
+        }
+
+        fn nested_scrollers(cx: &mut TestAppContext) -> (AnyWindowHandle, NestedScrollers) {
+            let scrollers = NestedScrollers {
+                outer: ScrollHandle::new(),
+                inner: ScrollHandle::new(),
+                inner_passes_through: Rc::new(Cell::new(false)),
+            };
+            let window = open_scene(cx, true, {
+                let outer = scrollers.outer.clone();
+                let inner = scrollers.inner.clone();
+                let inner_passes_through = scrollers.inner_passes_through.clone();
+                move || {
+                    let mut inner_scroller = div()
+                        .id("inner")
+                        .always_hitbox()
+                        .w(px(100.))
+                        .h(px(100.))
+                        .overflow_y_scroll()
+                        .track_scroll(&inner)
+                        .when(inner_passes_through.get(), |this| {
+                            this.pointer_events_none()
+                        })
+                        .child(div().id("inner-content").always_hitbox().h(px(500.)));
+                    inner_scroller.style().allow_concurrent_scroll = Some(true);
+                    let mut outer_scroller = node("outer", 0., 0., 200., 200.)
+                        .overflow_y_scroll()
+                        .track_scroll(&outer)
+                        .child(inner_scroller)
+                        .child(div().id("outer-content").h(px(1000.)));
+                    outer_scroller.style().allow_concurrent_scroll = Some(true);
+                    root().child(outer_scroller).into_any_element()
+                }
+            });
+            (window, scrollers)
+        }
+
+        fn wheel_at(window: &AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
+            cx.update_window(*window, |_, window, cx| {
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position: point(px(x), px(y)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-10.))),
+                        modifiers: Default::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        #[gpui::test]
+        fn a_scroller_takes_the_wheel_over_its_content(cx: &mut TestAppContext) {
+            let (window, scrollers) = nested_scrollers(cx);
+            move_to(&window, cx, 50., 50.);
+            wheel_at(&window, cx, 50., 50.);
+            assert_eq!(scrollers.inner.offset().y, px(-10.));
+            assert_eq!(scrollers.outer.offset().y, px(0.));
+        }
+
+        #[gpui::test]
+        fn a_pass_through_scroller_never_takes_the_wheel(cx: &mut TestAppContext) {
+            let (window, scrollers) = nested_scrollers(cx);
+            scrollers.inner_passes_through.set(true);
+            cx.update_window(window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            // The content inside the pass-through scroller is hit, so the scroller is in the
+            // chain as its ancestor, and still does not scroll.
+            assert_eq!(
+                chain_at(&window, cx, 50., 50.),
+                ["inner-content", "inner", "outer", "root"]
+            );
+            wheel_at(&window, cx, 50., 50.);
+            assert_eq!(scrollers.inner.offset().y, px(0.));
+            assert_eq!(scrollers.outer.offset().y, px(-10.));
+        }
+
+        #[gpui::test]
+        fn a_latched_gesture_leaves_a_scroller_that_became_pass_through(cx: &mut TestAppContext) {
+            let (window, scrollers) = nested_scrollers(cx);
+            move_to(&window, cx, 50., 50.);
+            wheel_at(&window, cx, 50., 50.);
+            assert_eq!(scrollers.inner.offset().y, px(-10.));
+            assert_eq!(scrollers.outer.offset().y, px(0.));
+
+            scrollers.inner_passes_through.set(true);
+            cx.update_window(window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            wheel_at(&window, cx, 50., 50.);
+            assert_eq!(scrollers.inner.offset().y, px(-10.));
+            assert_eq!(scrollers.outer.offset().y, px(-10.));
         }
 
         struct CachedLayers;

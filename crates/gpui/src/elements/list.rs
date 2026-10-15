@@ -1715,6 +1715,7 @@ impl Element for List {
             let claim = scroll_routing::Claim {
                 scroller,
                 under_pointer: scroll_routing::is_candidate(window, &hitbox),
+                pass_through: scroll_routing::passes_through(&hitbox),
                 event: event.clone(),
                 // Lists have always read a line of a mouse wheel as 20 pixels.
                 line_height: px(20.),
