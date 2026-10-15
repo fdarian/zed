@@ -3594,6 +3594,35 @@ mod tests {
         assert!((100..155).contains(&(image.get_pixel(24, 24).0[0] as i32)));
     }
 
+    /// Filter Effects 2: "any opacity applied to element B will be applied to the filtered backdrop
+    /// image as well", so a half-opaque backdrop-filtered element shows half of the blurred
+    /// backdrop over half of the sharp one.
+    #[test]
+    fn the_opacity_of_a_backdrop_filtered_element_fades_its_filtered_backdrop() {
+        let mut scene = groups_scene();
+        stripes(&mut scene);
+        let region = Bounds::new(
+            point(ScaledPixels(10.), ScaledPixels(10.)),
+            size(ScaledPixels(20.), ScaledPixels(20.)),
+        );
+        scene.start_group(
+            GroupEffect {
+                opacity: 0.5,
+                backdrop_filters: vec![gpui::FilterFunction::Blur(px(4.)).resolve(1.)],
+                reference: region,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.end_group();
+        let image = render(&mut scene);
+        let white = image.get_pixel(20, 20).0[0] as i32;
+        let black = image.get_pixel(22, 20).0[0] as i32;
+        assert!((170..215).contains(&white), "a white stripe is {white}");
+        assert!((40..85).contains(&black), "a black stripe is {black}");
+    }
+
     fn fade_mask(width: f32) -> Vec<Quad> {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(width), px(SIZE)));
         let boxes = BackgroundBoxes::new(bounds, Corners::default(), Edges::default(), Edges::default());
