@@ -45,7 +45,7 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     cmp,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
@@ -1007,6 +1007,9 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    /// Derived from `hitboxes`: every code path that changes `hitboxes` must call
+    /// `Frame::hitboxes_changed`.
+    clip_index: OnceCell<Option<ClipIndex>>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1045,6 +1048,38 @@ pub(crate) struct PaintIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+/// For each hitbox of a frame, the nearest hitbox enclosing it that has a `clip-path`. Built from
+/// the parent links the frame ends up with rather than recorded at insert time, because
+/// `Window::reuse_prepaint` re-parents the hitboxes of a cached prepaint under the current parent.
+struct ClipIndex {
+    enclosing_clip: Vec<Option<u32>>,
+}
+
+impl ClipIndex {
+    fn new(hitboxes: &[Hitbox]) -> Option<Self> {
+        if !hitboxes.iter().any(|hitbox| hitbox.clip.is_some()) {
+            return None;
+        }
+        let mut positions = FxHashMap::with_capacity_and_hasher(hitboxes.len(), Default::default());
+        let mut enclosing_clip: Vec<Option<u32>> = Vec::with_capacity(hitboxes.len());
+        for (ix, hitbox) in hitboxes.iter().enumerate() {
+            // A parent is always inserted before its children.
+            let parent = hitbox
+                .parent
+                .and_then(|parent| positions.get(&parent).copied());
+            enclosing_clip.push(parent.and_then(|parent: usize| {
+                if hitboxes[parent].clip.is_some() {
+                    Some(parent as u32)
+                } else {
+                    enclosing_clip[parent]
+                }
+            }));
+            positions.insert(hitbox.id, ix);
+        }
+        Some(Self { enclosing_clip })
+    }
+}
+
 impl Frame {
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
         Frame {
@@ -1057,6 +1092,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            clip_index: OnceCell::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1086,6 +1122,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.hitboxes_changed();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1122,15 +1159,17 @@ impl Frame {
         if dom_hit_testing {
             return self.dom_hit_test(position);
         }
-        let has_clips = self.has_clips();
+        let clips = self.clip_index();
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
+        for (ix, hitbox) in self.hitboxes.iter().enumerate().rev() {
             if hitbox.behavior == HitboxBehavior::PassThrough {
                 continue;
             }
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) && !(has_clips && self.clipped_out(hitbox, position)) {
+            if bounds.contains(&position)
+                && !clips.is_some_and(|clips| self.clipped_out(clips, ix, position))
+            {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -1149,31 +1188,39 @@ impl Frame {
         hit_test
     }
 
-    fn has_clips(&self) -> bool {
-        self.hitboxes.iter().any(|hitbox| hitbox.clip.is_some())
+    fn hitboxes_changed(&mut self) {
+        self.clip_index.take();
     }
 
-    /// Whether `position` is outside the `clip-path` of the hitbox or of one of the hitboxes that
-    /// enclose it, when the frame has any clip (see `has_clips`). A clip path cuts away the hit area of its whole subtree, as in CSS. Looked up
-    /// by id through the parents rather than stored down the tree, so that reusing a cached
-    /// prepaint under another parent needs no fix-up.
-    fn clipped_out(&self, hitbox: &Hitbox, position: Point<Pixels>) -> bool {
+    /// `None` when no hitbox of the frame has a clip, which is the common case: hit testing then
+    /// pays one scan per frame and nothing per candidate.
+    fn clip_index(&self) -> Option<&ClipIndex> {
+        self.clip_index
+            .get_or_init(|| ClipIndex::new(&self.hitboxes))
+            .as_ref()
+    }
+
+    /// Whether `position` is outside the `clip-path` of the hitbox at `ix` or of one of the
+    /// hitboxes that enclose it. A clip path cuts away the hit area of its whole subtree, as in
+    /// CSS.
+    fn clipped_out(&self, clips: &ClipIndex, ix: usize, position: Point<Pixels>) -> bool {
+        debug_assert_eq!(clips.enclosing_clip.len(), self.hitboxes.len());
         let position = Point::new(position.x.0, position.y.0);
-        let mut current = Some(hitbox);
-        while let Some(hitbox) = current {
-            if hitbox
+        let clipped = |ix: usize| {
+            self.hitboxes[ix]
                 .clip
                 .as_ref()
                 .is_some_and(|clip| !clip.contains(position))
-            {
+        };
+        if clipped(ix) {
+            return true;
+        }
+        let mut current = clips.enclosing_clip[ix];
+        while let Some(clipping) = current {
+            if clipped(clipping as usize) {
                 return true;
             }
-            current = hitbox.parent.and_then(|parent| {
-                self.hitboxes
-                    .iter()
-                    .rev()
-                    .find(|candidate| candidate.id == parent)
-            });
+            current = clips.enclosing_clip[clipping as usize];
         }
         false
     }
@@ -1182,15 +1229,15 @@ impl Frame {
     /// Parents are included wherever the point is: an ancestor is hovered by a descendant that
     /// overflows it, or that was deferred out of it.
     fn dom_hit_test(&self, position: Point<Pixels>) -> HitTest {
-        let has_clips = self.has_clips();
+        let clips = self.clip_index();
         let mut hit_test = HitTest::default();
-        let mut next = self.hitboxes.iter().rposition(|hitbox| {
+        let mut next = self.hitboxes.iter().enumerate().rposition(|(ix, hitbox)| {
             hitbox.behavior != HitboxBehavior::PassThrough
                 && hitbox
                     .bounds
                     .intersect(&hitbox.content_mask.bounds)
                     .contains(&position)
-                && !(has_clips && self.clipped_out(hitbox, position))
+                && !clips.is_some_and(|clips| self.clipped_out(clips, ix, position))
         });
         while let Some(index) = next {
             let hitbox = &self.hitboxes[index];
@@ -3757,6 +3804,7 @@ impl Window {
         // enclosing hitbox move to the current one.
         let current_parent = self.hitbox_parent_stack.last().copied();
         let stale_parent = range.start.hitbox_parent;
+        self.next_frame.hitboxes_changed();
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -4040,6 +4088,7 @@ impl Window {
         let result = f(self);
         if result.is_err() {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
+            self.next_frame.hitboxes_changed();
             self.next_frame
                 .tooltip_requests
                 .truncate(index.tooltips_index);
@@ -5330,6 +5379,7 @@ impl Window {
             clip: clip.map(Rc::new),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
+        self.next_frame.hitboxes_changed();
         hitbox
     }
 

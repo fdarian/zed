@@ -6513,6 +6513,99 @@ mod tests {
             assert_eq!(chain_at(&window, cx, 130., 20.), ["under", "root"]);
         }
 
+        /// A chain of `depth` nested boxes under `top`, the deepest holding `leaves` leaves that
+        /// all cover the same area.
+        fn nested(top: Stateful<Div>, depth: usize, leaves: usize) -> Stateful<Div> {
+            fn name(prefix: &str, ix: usize) -> SharedString {
+                format!("{prefix}-{ix}").into()
+            }
+            let mut inner = div().id("deepest").absolute().size_full().always_hitbox();
+            for ix in 0..leaves {
+                inner = inner.child(
+                    div()
+                        .id(name("leaf", ix))
+                        .absolute()
+                        .size_full()
+                        .always_hitbox(),
+                );
+            }
+            for ix in (0..depth).rev() {
+                inner = div()
+                    .id(name("level", ix))
+                    .absolute()
+                    .size_full()
+                    .always_hitbox()
+                    .child(inner);
+            }
+            top.child(inner)
+        }
+
+        #[gpui::test]
+        fn a_clip_path_cuts_a_deep_subtree_and_clips_nest(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(nested(
+                        clipped_from(node("outer", 0., 0., 200., 200.), 50.),
+                        30,
+                        0,
+                    ))
+                    .into_any_element()
+            });
+            let deep = chain_at(&window, cx, 70., 20.);
+            assert_eq!(deep.len(), 1 + 30 + 1 + 1);
+            assert_eq!(deep[..2], ["deepest", "level-29"]);
+            assert_eq!(deep[31..], ["outer", "root"]);
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["under", "root"]);
+
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(
+                        clipped_from(node("outer", 0., 0., 200., 200.), 50.).child(nested(
+                            clipped_from(node("inner", 0., 0., 200., 200.), 100.),
+                            5,
+                            0,
+                        )),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["root"]);
+            assert_eq!(chain_at(&window, cx, 70., 20.), ["outer", "root"]);
+            assert_eq!(chain_at(&window, cx, 120., 20.)[0], "deepest");
+        }
+
+        #[gpui::test]
+        fn a_clip_path_over_thousands_of_deep_hitboxes_is_hit_tested_in_linear_time(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(nested(
+                        clipped_from(node("outer", 0., 0., 200., 200.), 50.),
+                        30,
+                        5000,
+                    ))
+                    .into_any_element()
+            });
+            cx.update_window(window, |_, window, _| {
+                let started = std::time::Instant::now();
+                for _ in 0..20 {
+                    // Every one of the 5000 leaves contains the point and is cut by the clip.
+                    let cut = window
+                        .rendered_frame
+                        .hit_test(point(px(20.), px(20.)), true);
+                    assert_eq!(cut.ids.len(), 1);
+                }
+                // Looking each ancestor up by id took seconds per call in a debug build.
+                assert!(started.elapsed() < std::time::Duration::from_secs(2));
+                let kept = window
+                    .rendered_frame
+                    .hit_test(point(px(70.), px(20.)), true);
+                assert_eq!(kept.ids.len(), 1 + 1 + 30 + 1 + 1);
+            })
+            .unwrap();
+        }
+
         #[gpui::test]
         fn a_clip_path_follows_the_element_when_it_moves(cx: &mut TestAppContext) {
             let left = Rc::new(Cell::new(0.));
@@ -6602,6 +6695,50 @@ mod tests {
                 cx.run_until_parked();
                 assert_eq!(chain_at(&window, cx, 30., 30.), ["leaf", "host", "root"]);
                 assert_eq!(chain_at(&window, cx, 350., 350.), ["layer"]);
+            }
+        }
+
+        struct CachedClippedHost {
+            layers: Entity<CachedLayers>,
+        }
+
+        impl Render for CachedClippedHost {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                root().child(
+                    clipped_from(node("host", 0., 0., 200., 200.), 50.).child(
+                        self.layers
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+                )
+            }
+        }
+
+        #[gpui::test]
+        fn a_clip_path_cuts_reused_subtrees_under_the_reprepainted_parent(
+            cx: &mut TestAppContext,
+        ) {
+            let host = cx.open_window(size(px(800.), px(600.)), |_, cx| CachedClippedHost {
+                layers: cx.new(|_| CachedLayers),
+            });
+            let window = AnyWindowHandle::from(host);
+            cx.update_window(window, |_, window, cx| {
+                window.set_dom_hit_testing(true);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            for _ in 0..3 {
+                // The leaf spans 10..60: the clip of the host keeps only its last 10px, and
+                // follows the host through the re-parenting of the reused leaf.
+                assert_eq!(chain_at(&window, cx, 30., 30.), ["root"]);
+                assert_eq!(chain_at(&window, cx, 55., 30.), ["leaf", "host", "root"]);
+                assert_eq!(chain_at(&window, cx, 350., 350.), ["layer"]);
+                host.update(cx, |_, _, cx| cx.notify()).unwrap();
+                cx.run_until_parked();
             }
         }
     }
