@@ -853,8 +853,8 @@ pub struct Hitbox {
 
 impl Hitbox {
     /// The innermost hitbox that enclosed this one when it was inserted, see
-    /// [`Window::with_hitbox_parent`]. Deferred draws are enclosed by the hitbox that enclosed
-    /// the `defer_draw` call.
+    /// [`Window::with_hitbox_parent`]. A deferred draw starts a new hitbox root, so the outermost
+    /// hitboxes of a deferred layer have no parent, like content portaled to `body` in the DOM.
     pub fn parent(&self) -> Option<HitboxId> {
         self.parent
     }
@@ -986,7 +986,6 @@ pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
     parent_node: DispatchNodeId,
-    parent_hitbox: Option<HitboxId>,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
@@ -3529,6 +3528,7 @@ impl Window {
 
     fn prepaint_deferred_draws(&mut self, cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
+        debug_assert!(self.hitbox_parent_stack.is_empty());
 
         // Process deferred draws in multiple rounds to support nesting.
         // Each round processes all current deferred draws, which may push new ones.
@@ -3556,15 +3556,7 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (
-                    element,
-                    parent_node,
-                    parent_hitbox,
-                    current_view,
-                    rem_size,
-                    absolute_offset,
-                    prepaint_range,
-                ) = {
+                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3573,7 +3565,6 @@ impl Window {
                     (
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
-                        deferred_draw.parent_hitbox,
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
@@ -3581,8 +3572,6 @@ impl Window {
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
-                self.hitbox_parent_stack.clear();
-                self.hitbox_parent_stack.extend(parent_hitbox);
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
@@ -3604,7 +3593,6 @@ impl Window {
 
             self.element_id_stack.clear();
             self.text_style_stack.clear();
-            self.hitbox_parent_stack.clear();
             round_start = round_end;
         }
     }
@@ -3716,11 +3704,6 @@ impl Window {
                 .map(|deferred_draw| DeferredDraw {
                     current_view: deferred_draw.current_view,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
-                    parent_hitbox: if deferred_draw.parent_hitbox == stale_parent {
-                        current_parent
-                    } else {
-                        deferred_draw.parent_hitbox
-                    },
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     content_mask: deferred_draw.content_mask,
@@ -4214,6 +4197,10 @@ impl Window {
     /// When `content_mask` is provided, the deferred element will be clipped to that region during
     /// both prepaint and paint. When `None`, no additional clipping is applied.
     ///
+    /// The deferred element starts a new hitbox root: its outermost hitboxes have no
+    /// [`Hitbox::parent`], so under [`Window::set_dom_hit_testing`] the chain of a hit inside it
+    /// does not include the hitboxes around this call.
+    ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn defer_draw(
         &mut self,
@@ -4227,7 +4214,6 @@ impl Window {
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
             parent_node,
-            parent_hitbox: self.hitbox_parent_stack.last().copied(),
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             content_mask,

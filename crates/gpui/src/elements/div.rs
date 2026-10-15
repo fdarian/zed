@@ -5768,31 +5768,59 @@ mod tests {
         }
 
         #[gpui::test]
-        fn a_deferred_layer_is_parented_to_the_element_that_deferred_it(cx: &mut TestAppContext) {
-            let window = open_scene(cx, true, || {
-                root()
-                    .child(node("host", 0., 0., 100., 100.).child(deferred(
-                        node("popup", 300., 300., 100., 100.).child(node(
-                            "popup-child",
-                            10.,
-                            10.,
-                            20.,
-                            20.,
-                        )),
-                    )))
-                    .child(node("sibling", 300., 300., 100., 100.))
-                    .into_any_element()
+        fn a_deferred_layer_is_a_hitbox_root_outside_the_element_that_deferred_it(
+            cx: &mut TestAppContext,
+        ) {
+            let scrolled = Rc::new(RefCell::new(Vec::new()));
+            let window = open_scene(cx, true, {
+                let scrolled = scrolled.clone();
+                move || {
+                    let scrolled = scrolled.clone();
+                    root()
+                        .child(
+                            node("host", 0., 0., 100., 100.)
+                                .on_scroll_wheel(move |_: &ScrollWheelEvent, _, _| {
+                                    scrolled.borrow_mut().push("host");
+                                })
+                                .child(deferred(node("popup", 50., 50., 100., 100.).child(node(
+                                    "popup-child",
+                                    10.,
+                                    10.,
+                                    20.,
+                                    20.,
+                                )))),
+                        )
+                        .child(node("sibling", 300., 300., 100., 100.))
+                        .into_any_element()
+                }
             });
 
-            // The sibling is later in the tree but the deferred layer paints over it, and the
-            // layer's chain goes through the host it was deferred from, not what is inserted
-            // before it or what is under it.
-            assert_eq!(
-                chain_at(&window, cx, 315., 315.),
-                ["popup-child", "popup", "host", "root"]
-            );
-            assert_eq!(chain_at(&window, cx, 380., 380.), ["popup", "host", "root"]);
-            assert_eq!(chain_at(&window, cx, 50., 50.), ["host", "root"]);
+            // The chain of a hit inside the layer ends at the layer's outermost hitbox: it does
+            // not continue to the host the layer was deferred from.
+            assert_eq!(chain_at(&window, cx, 65., 65.), ["popup-child", "popup"]);
+            assert_eq!(chain_at(&window, cx, 140., 140.), ["popup"]);
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["host", "root"]);
+
+            let scroll_at = |cx: &mut TestAppContext, x: f32, y: f32| {
+                cx.update_window(window, |_, window, cx| {
+                    window.dispatch_event(
+                        ScrollWheelEvent {
+                            position: point(px(x), px(y)),
+                            delta: ScrollDelta::Pixels(point(px(0.), px(-10.))),
+                            modifiers: Default::default(),
+                            touch_phase: TouchPhase::Moved,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                })
+                .unwrap();
+            };
+
+            scroll_at(cx, 65., 65.);
+            assert_eq!(scrolled.borrow().as_slice(), [] as [&str; 0]);
+            scroll_at(cx, 20., 20.);
+            assert_eq!(scrolled.borrow().as_slice(), ["host"]);
         }
 
         #[gpui::test]
@@ -5969,13 +5997,14 @@ mod tests {
             assert_eq!(chain_at(&window, cx, 30., 30.), ["leaf", "host", "root"]);
 
             // Re-rendering only the host re-inserts its hitboxes with new ids while the cached
-            // child, and the deferred layer inside it, are reused from the last frame. Twice,
-            // because the second reuse reads ranges recorded during a reused frame.
+            // child, and the deferred layer inside it, are reused from the last frame. The leaf
+            // follows the re-inserted host while the layer stays a root. Twice, because the
+            // second reuse reads ranges recorded during a reused frame.
             for _ in 0..2 {
                 host.update(cx, |_, _, cx| cx.notify()).unwrap();
                 cx.run_until_parked();
                 assert_eq!(chain_at(&window, cx, 30., 30.), ["leaf", "host", "root"]);
-                assert_eq!(chain_at(&window, cx, 350., 350.), ["layer", "host", "root"]);
+                assert_eq!(chain_at(&window, cx, 350., 350.), ["layer"]);
             }
         }
     }
