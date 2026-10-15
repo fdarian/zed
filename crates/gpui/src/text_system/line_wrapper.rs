@@ -1263,6 +1263,39 @@ mod tests {
         });
     }
 
+    // CSS has no hanging indent: a line that starts with spaces wraps back to the left edge.
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_text_wraps_continuation_lines_to_the_left_edge(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let text: SharedString = "        aaa bbb ccc ddd eee".into();
+            let run = TextRun {
+                len: text.len(),
+                font: font("Helvetica"),
+                color: Default::default(),
+                underline: Default::default(),
+                ..Default::default()
+            };
+            let lines = text_system
+                .shape_text(text.clone(), px(16.), &[run], Some(px(100.)), None)
+                .unwrap();
+            let layout = &lines[0].layout;
+            let rows = layout.wrap_boundaries().len() + 1;
+            assert!(rows >= 3, "the text should wrap onto several lines, got {rows}");
+            for boundary in layout.wrap_boundaries() {
+                let index = layout.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                // The index of a boundary is the end of the row above, so look one glyph in.
+                let position = layout.position_for_index(index + 1, px(20.)).unwrap();
+                assert!(
+                    position.x < px(12.),
+                    "a continuation line starts at the left edge, but its second glyph is at {}",
+                    position.x
+                );
+            }
+        });
+    }
+
     #[test]
     fn test_multiline_truncation_fits_within_wrapped_lines() {
         let mut wrapper = build_wrapper();
