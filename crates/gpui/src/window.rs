@@ -733,7 +733,7 @@ pub(crate) struct CursorStyleRequest {
     pub(crate) style: CursorStyle,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct HitTest {
     pub(crate) ids: SmallVec<[HitboxId; 8]>,
     pub(crate) hover_hitbox_count: usize,
@@ -1289,6 +1289,22 @@ enum InputModality {
 /// mouse jitters by a few pixels and should not hide focus-visible styles.
 const KEYBOARD_MODALITY_MOUSE_SLOP: Pixels = px(8.);
 
+/// Raises [`Window::dispatch_depth`] for as long as it lives, which includes unwinding.
+struct DispatchScope(Rc<Cell<usize>>);
+
+impl DispatchScope {
+    fn enter(depth: &Rc<Cell<usize>>) -> Self {
+        depth.set(depth.get() + 1);
+        Self(depth.clone())
+    }
+}
+
+impl Drop for DispatchScope {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1358,6 +1374,15 @@ pub struct Window {
     last_input_modality: InputModality,
     keyboard_modality_mouse_origin: Point<Pixels>,
     pub(crate) refreshing: bool,
+    /// Counts the input events being dispatched, which is more than one only when a handler
+    /// causes another. While it is not zero, [`Window::draw_if_dirty`] measures instead of
+    /// drawing: see [`Window::measure`].
+    dispatch_depth: Rc<Cell<usize>>,
+    /// The invalidator's update count after the last measure pass, so that a window nothing
+    /// invalidated since is not measured again. Reset by every draw.
+    measured_at: Option<usize>,
+    /// A measure pass is running, so a view must not read or write the frame caches.
+    pub(crate) measuring: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2045,6 +2070,9 @@ impl Window {
             last_input_modality: InputModality::Mouse,
             keyboard_modality_mouse_origin: mouse_position,
             refreshing: false,
+            dispatch_depth: Rc::new(Cell::new(0)),
+            measured_at: None,
+            measuring: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -3211,14 +3239,81 @@ impl Window {
     /// request presents what this drew, without drawing again. Returns false
     /// without drawing when the window is clean or a draw is already running
     /// on this thread.
+    ///
+    /// While an input event is being dispatched this lays out and paints the
+    /// current tree without swapping frames (see [`Window::measure`]): the
+    /// dispatch is reading the rendered frame, and a swap would pull it out
+    /// from under the handlers. Bounds and scroll metrics are still current
+    /// afterwards, and the window stays dirty for the next real draw. Returns
+    /// false there too when nothing was invalidated since the last measure.
     pub fn draw_if_dirty(&mut self, cx: &mut App) -> bool {
         if !self.invalidator.is_dirty() || draw_in_progress() {
             return false;
+        }
+        if self.dispatch_depth.get() > 0 {
+            return self.measure(cx);
         }
         self.draw(cx).clear(cx);
         // The frame request that was waiting on the dirty flag may already have
         // fired; wake the platform so something presents this frame.
         self.invalidator.wake_platform();
+        true
+    }
+
+    /// Lays out, prepaints and paints the current tree into `next_frame` and throws the frame
+    /// away, so that what layout and paint publish outside the frame (painted bounds, scroll
+    /// handle metrics, element states) is current while `rendered_frame` stays exactly as the
+    /// input being dispatched found it: its dispatch tree, listeners, hitboxes, cursor styles
+    /// and input handlers, and the hit test, pointer capture and tooltip that were taken from
+    /// it.
+    ///
+    /// What the pass leaves undone is what only a presented frame needs, and the next draw
+    /// does it: the window stays dirty, and views stay marked dirty and are not recorded as
+    /// observers. Nothing is cached across the pass: views render in full instead of reusing
+    /// their last prepaint and paint, which would move listeners out of `rendered_frame`, and
+    /// the element states a view cache keeps point into the frame they were made for. Neither
+    /// the focus path nor the input handler is touched, and no accessibility tree is built.
+    fn measure(&mut self, cx: &mut App) -> bool {
+        if cx.mode.skip_drawing() {
+            return false;
+        }
+        let invalidations = self.invalidator.update_count();
+        if self.measured_at == Some(invalidations) {
+            return false;
+        }
+
+        let arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        cx.entities.clear_accessed();
+        debug_assert!(self.rendered_entity_stack.is_empty());
+        self.requested_autoscroll = None;
+
+        let mouse_hit_test = self.mouse_hit_test.clone();
+        let captured_hitbox = self.captured_hitbox;
+        let captured_identity = self.captured_identity.clone();
+        let tooltip_bounds = self.tooltip_bounds.take();
+        let a11y_was_active = self.a11y.suspend();
+        self.measuring = true;
+
+        self.build_next_frame(cx);
+
+        self.measuring = false;
+        self.a11y.resume(a11y_was_active);
+        self.tooltip_bounds = tooltip_bounds;
+        self.captured_identity = captured_identity;
+        self.captured_hitbox = captured_hitbox;
+        self.mouse_hit_test = mouse_hit_test;
+
+        self.layout_engine.as_mut().unwrap().clear();
+        // An element's state was moved out of `rendered_frame` when the pass reached it. Hand
+        // it back, updated, or the next draw would find it gone and start the element over.
+        for (key, state) in self.next_frame.element_states.drain() {
+            self.rendered_frame.element_states.insert(key, state);
+        }
+        self.next_frame.clear();
+        self.invalidator.set_phase(DrawPhase::None);
+        self.measured_at = Some(self.invalidator.update_count());
+
+        arena_scope.exit(&cx.element_arena).clear(cx);
         true
     }
 
@@ -3241,6 +3336,7 @@ impl Window {
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
+        self.measured_at = None;
         self.requested_autoscroll = None;
 
         // Restore the previously-used input handler.
@@ -3261,25 +3357,7 @@ impl Window {
             }
         }
         if !cx.mode.skip_drawing() {
-            self.captured_hitbox = None;
-            let effect_groups = self.platform_window.supports_effect_groups();
-            self.next_frame
-                .scene
-                .set_effect_groups_enabled(effect_groups);
-            self.draw_roots(cx);
-            if self.captured_identity.is_some() && self.captured_hitbox.is_none() {
-                self.captured_identity = None;
-            }
-            #[cfg(feature = "profiler")]
-            {
-                let viewport_size = self.viewport_size;
-                let scale_factor = self.scale_factor();
-                self.debug_frame_overlay.paint(
-                    &mut self.next_frame.scene,
-                    viewport_size,
-                    scale_factor,
-                );
-            }
+            self.build_next_frame(cx);
         }
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
@@ -3370,6 +3448,27 @@ impl Window {
         // Exit the scope to obtain the arena-clear token this draw owes; the
         // scope's teardown itself happens in `ElementArenaScope::drop`.
         arena_scope.exit(&cx.element_arena)
+    }
+
+    /// Fills `next_frame` from the root view: [`Window::draw`] and [`Window::measure`] differ in
+    /// what they do with it afterwards.
+    fn build_next_frame(&mut self, cx: &mut App) {
+        self.captured_hitbox = None;
+        let effect_groups = self.platform_window.supports_effect_groups();
+        self.next_frame
+            .scene
+            .set_effect_groups_enabled(effect_groups);
+        self.draw_roots(cx);
+        if self.captured_identity.is_some() && self.captured_hitbox.is_none() {
+            self.captured_identity = None;
+        }
+        #[cfg(feature = "profiler")]
+        {
+            let viewport_size = self.viewport_size;
+            let scale_factor = self.scale_factor();
+            self.debug_frame_overlay
+                .paint(&mut self.next_frame.scene, viewport_size, scale_factor);
+        }
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
@@ -5681,6 +5780,7 @@ impl Window {
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let _dispatching = DispatchScope::enter(&self.dispatch_depth);
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -7695,11 +7795,12 @@ mod tests {
         rc::Rc,
     };
 
+    use crate::util::FluentBuilder as _;
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
+        AnyWindowHandle, App, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-        MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
+        HitboxBehavior, InputEvent as _, InteractiveElement as _, IntoElement, MouseButton,
+        MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
         StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
         WindowOptions, canvas, div, point, px, size,
     };
@@ -8489,5 +8590,237 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    struct DialogAndNeighbour {
+        dialog_open: bool,
+        dialog_focus: FocusHandle,
+        dialog_key_downs: Rc<Cell<usize>>,
+        neighbour_bounds: Rc<Cell<Bounds<Pixels>>>,
+    }
+
+    impl Render for DialogAndNeighbour {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let neighbour_bounds = self.neighbour_bounds.clone();
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .when(self.dialog_open, |root| {
+                    root.child(
+                        div()
+                            .id("dialog")
+                            .track_focus(&self.dialog_focus)
+                            .w(px(100.))
+                            .h(px(50.))
+                            .on_key_down(cx.listener(|this, _, _, _| {
+                                this.dialog_key_downs.set(this.dialog_key_downs.get() + 1);
+                            })),
+                    )
+                })
+                .child(
+                    canvas(
+                        move |bounds, _, _| neighbour_bounds.set(bounds),
+                        |_, _, _, _| {},
+                    )
+                    .w(px(100.))
+                    .h(px(10.)),
+                )
+        }
+    }
+
+    /// A keystroke interceptor that closes a dialog and then reads where its neighbour went
+    /// draws mid-dispatch. The key must still reach the dialog it was dispatched to, through the
+    /// path the frame it started on gave it, and the read must see the neighbour's new place.
+    #[gpui::test]
+    fn test_key_dispatch_survives_a_draw_requested_by_an_interceptor(cx: &mut TestAppContext) {
+        let key_downs = Rc::new(Cell::new(0));
+        let neighbour_bounds = Rc::new(Cell::new(Bounds::default()));
+        let (view, cx) = cx.add_window_view({
+            let key_downs = key_downs.clone();
+            let neighbour_bounds = neighbour_bounds.clone();
+            move |_, cx| DialogAndNeighbour {
+                dialog_open: true,
+                dialog_focus: cx.focus_handle(),
+                dialog_key_downs: key_downs,
+                neighbour_bounds,
+            }
+        });
+        cx.update(|window, cx| {
+            let focus = view.read(cx).dialog_focus.clone();
+            window.focus(&focus, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(neighbour_bounds.get().origin.y, px(50.));
+
+        let seen_by_interceptor = Rc::new(Cell::new(None));
+        cx.update(|_, cx| {
+            let view = view.clone();
+            let seen_by_interceptor = seen_by_interceptor.clone();
+            let neighbour_bounds = neighbour_bounds.clone();
+            cx.intercept_keystrokes(move |_, window, cx| {
+                view.update(cx, |this, cx| {
+                    this.dialog_open = false;
+                    cx.notify();
+                });
+                window.draw_if_dirty(cx);
+                seen_by_interceptor.set(Some(neighbour_bounds.get().origin.y));
+            })
+            .detach();
+        });
+
+        cx.simulate_keystrokes("a");
+
+        assert_eq!(seen_by_interceptor.get(), Some(px(0.)));
+        assert_eq!(
+            key_downs.get(),
+            1,
+            "the key goes to the dialog it was dispatched to"
+        );
+        assert_eq!(neighbour_bounds.get().origin.y, px(0.));
+        cx.update(|window, _| assert_eq!(window.dispatch_depth.get(), 0));
+    }
+
+    struct HoverProbe {
+        paints: Rc<Cell<usize>>,
+        on_capture: Rc<dyn Fn(&mut Window, &mut App)>,
+        bubbled_hovered: Rc<RefCell<Vec<bool>>>,
+    }
+
+    impl Render for HoverProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            let on_capture = self.on_capture.clone();
+            let bubbled_hovered = self.bubbled_hovered.clone();
+            div().size_full().child(
+                canvas(
+                    |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    move |_, hitbox, window, _| {
+                        paints.set(paints.get() + 1);
+                        let on_capture = on_capture.clone();
+                        let bubbled_hovered = bubbled_hovered.clone();
+                        window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
+                            if phase.capture() {
+                                on_capture(window, cx);
+                            } else {
+                                bubbled_hovered.borrow_mut().push(hitbox.is_hovered(window));
+                            }
+                        });
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    fn hover_probe<'a>(
+        cx: &'a mut TestAppContext,
+        paints: &Rc<Cell<usize>>,
+        on_capture: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> (Rc<RefCell<Vec<bool>>>, &'a mut crate::VisualTestContext) {
+        let bubbled_hovered = Rc::new(RefCell::new(Vec::new()));
+        let (_view, cx) = cx.add_window_view({
+            let paints = paints.clone();
+            let bubbled_hovered = bubbled_hovered.clone();
+            move |_, _| HoverProbe {
+                paints,
+                on_capture: Rc::new(on_capture),
+                bubbled_hovered,
+            }
+        });
+        (bubbled_hovered, cx)
+    }
+
+    /// A capture-phase listener that draws mid-dispatch must leave the bubble phase what the
+    /// frame the event started on gave it: the hover it hit, and the listeners themselves,
+    /// which dispatch holds out of the frame and writes back when it is done.
+    #[gpui::test]
+    fn test_mouse_dispatch_survives_a_draw_requested_by_a_capture_listener(
+        cx: &mut TestAppContext,
+    ) {
+        let draws = Rc::new(Cell::new(true));
+        let paints = Rc::new(Cell::new(0));
+        let (bubbled_hovered, cx) = hover_probe(cx, &paints, {
+            let draws = draws.clone();
+            move |window, cx| {
+                if draws.get() {
+                    window.refresh();
+                    window.draw_if_dirty(cx);
+                }
+            }
+        });
+        let position = point(px(10.), px(10.));
+        cx.simulate_mouse_move(position, None, crate::Modifiers::default());
+        let listeners_before = cx.update(|window, _| window.rendered_frame.mouse_listeners.len());
+        let paints_before = paints.get();
+
+        cx.simulate_mouse_down(position, MouseButton::Left, crate::Modifiers::default());
+
+        assert_eq!(*bubbled_hovered.borrow(), vec![true]);
+        assert!(
+            paints.get() > paints_before,
+            "the capture listener's draw painted"
+        );
+        cx.update(|window, _| {
+            assert_eq!(
+                window.rendered_frame.mouse_listeners.len(),
+                listeners_before
+            );
+            assert!(
+                window
+                    .rendered_frame
+                    .mouse_listeners
+                    .iter()
+                    .all(|listener| listener.is_some())
+            );
+            assert_eq!(window.dispatch_depth.get(), 0);
+        });
+
+        // The listeners the first press left in place take the next one.
+        draws.set(false);
+        cx.simulate_mouse_down(position, MouseButton::Left, crate::Modifiers::default());
+        assert_eq!(*bubbled_hovered.borrow(), vec![true, true]);
+    }
+
+    /// Reads that follow one another with nothing invalidated in between share one measure, and
+    /// the window stays due for a real draw that swaps the frames.
+    #[gpui::test]
+    fn test_draws_requested_during_dispatch_measure_once_per_invalidation(cx: &mut TestAppContext) {
+        let paints = Rc::new(Cell::new(0));
+        let observed = Rc::new(RefCell::new(None));
+        let (_, cx) = hover_probe(cx, &paints, {
+            let paints = paints.clone();
+            let observed = observed.clone();
+            move |window, cx| {
+                let before = paints.get();
+                window.refresh();
+                let reads = [(); 3].map(|_| window.draw_if_dirty(cx));
+                let paints_after_reads = paints.get() - before;
+                window.refresh();
+                let read_after_invalidation = window.draw_if_dirty(cx);
+                *observed.borrow_mut() = Some((
+                    reads,
+                    paints_after_reads,
+                    read_after_invalidation,
+                    paints.get() - before,
+                    window.invalidator.is_dirty(),
+                ));
+            }
+        });
+        let position = point(px(10.), px(10.));
+        cx.simulate_mouse_move(position, None, crate::Modifiers::default());
+        let paints_before_press = paints.get();
+
+        cx.simulate_mouse_down(position, MouseButton::Left, crate::Modifiers::default());
+
+        assert_eq!(
+            *observed.borrow(),
+            Some(([true, false, false], 1, true, 2, true)),
+            "one measure per invalidation, and the window is still dirty"
+        );
+        // The test app draws a dirty window when the press's update ends: the measures left
+        // it dirty, and that draw is the real one.
+        assert_eq!(paints.get() - paints_before_press, 3);
+        assert!(!cx.update(|window, _| window.invalidator.is_dirty()));
     }
 }

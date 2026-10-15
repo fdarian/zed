@@ -145,6 +145,10 @@ pub(crate) struct A11y {
     /// At the end of the frame, we re-call [`Self::sync_active_flag`] to
     /// determine whether we should actually send the finished [`TreeUpdate`].
     active_this_frame: bool,
+    /// Set while a measure pass runs ([`Window::measure`]): that pass paints a frame that is
+    /// never sent, so it must not build a tree or replace the action listeners of the frame
+    /// that was.
+    suspended: bool,
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
@@ -173,6 +177,7 @@ impl A11y {
             force_disabled,
             active_flag,
             active_this_frame: false,
+            suspended: false,
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
@@ -210,7 +215,19 @@ impl A11y {
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
     pub(crate) fn sync_active_flag(&mut self) {
-        self.active_this_frame = !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
+        self.active_this_frame =
+            !self.suspended && !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
+    }
+
+    /// Makes [`Self::is_active`] false until [`Self::resume`], returning what to resume with.
+    pub(crate) fn suspend(&mut self) -> bool {
+        self.suspended = true;
+        std::mem::replace(&mut self.active_this_frame, false)
+    }
+
+    pub(crate) fn resume(&mut self, was_active: bool) {
+        self.suspended = false;
+        self.active_this_frame = was_active;
     }
 
     /// Pretend a screen reader is connected. Tests need this because AccessKit
