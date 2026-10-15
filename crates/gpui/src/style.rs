@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundLayer, BackgroundTag,
-    BorderStyle, ClipPathValue, FilterFunction, GroupEffect, Bounds, ContentMask, Corners,
+    BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
@@ -865,6 +865,18 @@ impl Style {
             reference_radii: corner_radii.scale(scale_factor),
             text_mask: false,
         })
+    }
+
+    /// The `clip-path` as the pointer sees it, in logical pixels.
+    pub(crate) fn hit_clip_path(
+        &self,
+        bounds: Bounds<Pixels>,
+        rem_size: Pixels,
+    ) -> Option<ResolvedClipPath> {
+        let clip_path = self.clip_path.shape()?;
+        let corner_radii = self.border_box_radii(bounds, rem_size);
+        let boxes = self.background_boxes(bounds, corner_radii, rem_size);
+        Some(clip_path.resolve(boxes.region(clip_path.reference), 1.))
     }
 
     fn border_box_radii(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> Corners<Pixels> {

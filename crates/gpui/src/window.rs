@@ -15,7 +15,7 @@ use crate::{
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedClipPath, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -849,6 +849,7 @@ pub struct Hitbox {
     pub behavior: HitboxBehavior,
     identity: Option<GlobalElementId>,
     parent: Option<HitboxId>,
+    clip: Option<Rc<ResolvedClipPath>>,
 }
 
 impl Hitbox {
@@ -1121,6 +1122,7 @@ impl Frame {
         if dom_hit_testing {
             return self.dom_hit_test(position);
         }
+        let has_clips = self.has_clips();
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
@@ -1128,7 +1130,7 @@ impl Frame {
                 continue;
             }
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            if bounds.contains(&position) && !(has_clips && self.clipped_out(hitbox, position)) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -1147,10 +1149,40 @@ impl Frame {
         hit_test
     }
 
+    fn has_clips(&self) -> bool {
+        self.hitboxes.iter().any(|hitbox| hitbox.clip.is_some())
+    }
+
+    /// Whether `position` is outside the `clip-path` of the hitbox or of one of the hitboxes that
+    /// enclose it, when the frame has any clip (see `has_clips`). A clip path cuts away the hit area of its whole subtree, as in CSS. Looked up
+    /// by id through the parents rather than stored down the tree, so that reusing a cached
+    /// prepaint under another parent needs no fix-up.
+    fn clipped_out(&self, hitbox: &Hitbox, position: Point<Pixels>) -> bool {
+        let position = Point::new(position.x.0, position.y.0);
+        let mut current = Some(hitbox);
+        while let Some(hitbox) = current {
+            if hitbox
+                .clip
+                .as_ref()
+                .is_some_and(|clip| !clip.contains(position))
+            {
+                return true;
+            }
+            current = hitbox.parent.and_then(|parent| {
+                self.hitboxes
+                    .iter()
+                    .rev()
+                    .find(|candidate| candidate.id == parent)
+            });
+        }
+        false
+    }
+
     /// The topmost non-`PassThrough` hitbox containing the point, then its chain of parents.
     /// Parents are included wherever the point is: an ancestor is hovered by a descendant that
     /// overflows it, or that was deferred out of it.
     fn dom_hit_test(&self, position: Point<Pixels>) -> HitTest {
+        let has_clips = self.has_clips();
         let mut hit_test = HitTest::default();
         let mut next = self.hitboxes.iter().rposition(|hitbox| {
             hitbox.behavior != HitboxBehavior::PassThrough
@@ -1158,6 +1190,7 @@ impl Frame {
                     .bounds
                     .intersect(&hitbox.content_mask.bounds)
                     .contains(&position)
+                && !(has_clips && self.clipped_out(hitbox, position))
         });
         while let Some(index) = next {
             let hitbox = &self.hitboxes[index];
@@ -5262,6 +5295,21 @@ impl Window {
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
+        self.insert_hitbox_clipped(bounds, behavior, None)
+    }
+
+    /// Like [`Window::insert_hitbox`], for an element with a `clip-path`: the pointer only hits
+    /// this hitbox, and every hitbox inserted inside it (see [`Window::with_hitbox_parent`]),
+    /// where `clip` contains it. `clip` is in the same logical pixels as `bounds`, so resolve it
+    /// with a scale factor of 1.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn insert_hitbox_clipped(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        behavior: HitboxBehavior,
+        clip: Option<ResolvedClipPath>,
+    ) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
@@ -5279,6 +5327,7 @@ impl Window {
             behavior,
             identity,
             parent: self.hitbox_parent_stack.last().copied(),
+            clip: clip.map(Rc::new),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox

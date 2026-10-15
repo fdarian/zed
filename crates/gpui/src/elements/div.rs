@@ -16,7 +16,7 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, ClipPathValue, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
@@ -2522,7 +2522,11 @@ impl Interactivity {
                         style.overflow_mask(bounds, window.rem_size()),
                         |window| {
                             let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox(bounds, self.hitbox_behavior))
+                                Some(window.insert_hitbox_clipped(
+                                    bounds,
+                                    self.hitbox_behavior,
+                                    style.hit_clip_path(bounds, window.rem_size()),
+                                ))
                             } else {
                                 None
                             };
@@ -2547,6 +2551,9 @@ impl Interactivity {
         self.hitbox_behavior != HitboxBehavior::Normal
             || (self.always_hitbox && window.dom_hit_testing())
             || self.window_control.is_some()
+            // The clip cuts the hit area of the element and of its descendants, which
+            // `with_hitbox_parent` carries down.
+            || style.clip_path != ClipPathValue::None
             || style.mouse_cursor.is_some()
             || self.group.is_some()
             || self.scroll_offset.is_some()
@@ -6454,6 +6461,103 @@ mod tests {
                     .child(node("leaf", 10., 10., 50., 50.))
                     .child(deferred(node("layer", 300., 300., 100., 100.)))
             }
+        }
+
+        use crate::{BackgroundBox, ClipPath, ClipShape, InsetRadii, LengthPercentage};
+
+        /// Clips `element` to its right half, from `left` in.
+        fn clipped_from(mut element: Stateful<Div>, left: f32) -> Stateful<Div> {
+            let none = LengthPercentage::Length(px(0.));
+            element.style().clip_path = Some(ClipPathValue::Shape(ClipPath {
+                shape: ClipShape::Inset {
+                    top: none,
+                    right: none,
+                    bottom: none,
+                    left: LengthPercentage::Length(px(left)),
+                    radii: InsetRadii::default(),
+                },
+                reference: BackgroundBox::BorderBox,
+            }));
+            element
+        }
+
+        #[gpui::test]
+        fn a_clip_path_lets_the_pointer_through_to_what_is_underneath(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 200., 200.))
+                    .child(clipped_from(node("clipped", 0., 0., 100., 100.), 50.))
+                    .into_any_element()
+            });
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 70., 20.), ["clipped", "root"]);
+            assert_eq!(chain_at(&window, cx, 150., 20.), ["under", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_clip_path_cuts_the_hit_area_of_the_whole_subtree(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(
+                        clipped_from(node("clipped", 0., 0., 100., 100.), 50.)
+                            .child(node("cut", 10., 10., 30., 30.))
+                            .child(node("kept", 60., 10., 30., 30.))
+                            // Overflows the clipped box, as the paint would be clipped too.
+                            .child(node("overflow", 120., 10., 30., 30.)),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 70., 20.), ["kept", "clipped", "root"]);
+            assert_eq!(chain_at(&window, cx, 130., 20.), ["under", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_clip_path_follows_the_element_when_it_moves(cx: &mut TestAppContext) {
+            let left = Rc::new(Cell::new(0.));
+            let window = open_scene(cx, true, {
+                let left = left.clone();
+                move || {
+                    root()
+                        .child(clipped_from(node("clipped", left.get(), 0., 100., 100.), 50.))
+                        .into_any_element()
+                }
+            });
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["root"]);
+            assert_eq!(chain_at(&window, cx, 70., 20.), ["clipped", "root"]);
+            left.set(200.);
+            cx.update_window(window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            assert_eq!(chain_at(&window, cx, 70., 20.), ["root"]);
+            assert_eq!(chain_at(&window, cx, 220., 20.), ["root"]);
+            assert_eq!(chain_at(&window, cx, 270., 20.), ["clipped", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_clip_path_also_cuts_hover_outside_dom_hit_testing(cx: &mut TestAppContext) {
+            let hovered = Rc::new(Cell::new(false));
+            let window = open_scene(cx, false, {
+                let hovered = hovered.clone();
+                move || {
+                    let hovered = hovered.clone();
+                    root()
+                        .child(
+                            clipped_from(node("clipped", 0., 0., 100., 100.), 50.)
+                                .on_hover(move |state, _, _| hovered.set(*state)),
+                        )
+                        .into_any_element()
+                }
+            });
+            move_to(&window, cx, 20., 20.);
+            assert!(!hovered.get());
+            move_to(&window, cx, 70., 20.);
+            assert!(hovered.get());
+            move_to(&window, cx, 20., 20.);
+            assert!(!hovered.get());
         }
 
         struct CachedHost {
