@@ -768,6 +768,14 @@ pub enum WindowControlArea {
     Min,
 }
 
+/// What a hitbox registered with the window stands for: a platform control area, or a hole in
+/// the control areas below it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowRegion {
+    Control(WindowControlArea),
+    Client,
+}
+
 /// An identifier for a [Hitbox] which also includes [HitboxBehavior].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct HitboxId(u64);
@@ -1010,7 +1018,8 @@ pub(crate) struct Frame {
     /// Derived from `hitboxes`: every code path that changes `hitboxes` must call
     /// `Frame::hitboxes_changed`.
     clip_index: OnceCell<Option<ClipIndex>>,
-    pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
+    /// In paint order.
+    pub(crate) window_control_hitboxes: Vec<(WindowRegion, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
@@ -1948,12 +1957,10 @@ impl Window {
             Box::new(move || {
                 handle
                     .update(&mut cx, |_, window, _cx| {
-                        for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
-                                return Some(*area);
-                            }
+                        if window.pointer_outside {
+                            return None;
                         }
-                        None
+                        window.window_control_area_at(window.mouse_position)
                     })
                     .log_err()
                     .unwrap_or(None)
@@ -5523,7 +5530,52 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn insert_window_control_hitbox(&mut self, area: WindowControlArea, hitbox: Hitbox) {
         self.invalidator.debug_assert_paint();
-        self.next_frame.window_control_hitboxes.push((area, hitbox));
+        self.next_frame
+            .window_control_hitboxes
+            .push((WindowRegion::Control(area), hitbox));
+    }
+
+    /// Set a hitbox which is client area of the platform window: it carves a hole in the
+    /// control areas registered before it, see [`Window::window_control_area_at`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn insert_window_client_hitbox(&mut self, hitbox: Hitbox) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .window_control_hitboxes
+            .push((WindowRegion::Client, hitbox));
+    }
+
+    /// The control area of the platform window at `position`, which is what the platform asks
+    /// for when the pointer is over the window (for example to start a window drag).
+    ///
+    /// With [`Window::set_dom_hit_testing`] on this follows Electron's app-region model
+    /// instead of hit testing: it is rect-based and the entry registered last (paint order)
+    /// whose hitbox bounds contain `position` wins, a client entry (see
+    /// [`Window::insert_window_client_hitbox`]) yielding `None`. Content masks, pass-through
+    /// behaviour and z-order do not take part, so an overlay without an area over a drag area
+    /// still drags, and a drag area is not cut by its parent's overflow clipping.
+    ///
+    /// With the mode off, it is the first control area whose hitbox is under the mouse
+    /// according to hit testing, client entries are ignored and `position` is not used.
+    pub fn window_control_area_at(&self, position: Point<Pixels>) -> Option<WindowControlArea> {
+        let entries = &self.rendered_frame.window_control_hitboxes;
+        if self.dom_hit_testing {
+            return entries
+                .iter()
+                .rev()
+                .find(|(_, hitbox)| hitbox.bounds.contains(&position))
+                .and_then(|(region, _)| match region {
+                    WindowRegion::Control(area) => Some(*area),
+                    WindowRegion::Client => None,
+                });
+        }
+        entries.iter().find_map(|(region, hitbox)| match region {
+            WindowRegion::Control(area) if self.mouse_hit_test.ids.contains(&hitbox.id) => {
+                Some(*area)
+            }
+            _ => None,
+        })
     }
 
     /// Sets the key context for the current element. This context will be used to translate

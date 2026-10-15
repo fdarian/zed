@@ -26,6 +26,7 @@ use crate::{
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     scroll_routing, size,
     sticky::{self, StickyInsets},
+    window::WindowRegion,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -716,7 +717,14 @@ impl Interactivity {
     /// Set the bounds of this element as a window control area for the platform window.
     /// The imperative API equivalent to [`InteractiveElement::window_control_area`]
     pub fn window_control_area(&mut self, area: WindowControlArea) {
-        self.window_control = Some(area);
+        self.window_control = Some(WindowRegion::Control(area));
+    }
+
+    /// Set the bounds of this element as client area of the platform window: a hole in the
+    /// window control areas painted before it (see [`Window::window_control_area_at`]).
+    /// The imperative API equivalent to [`InteractiveElement::window_client_area`]
+    pub fn window_client_area(&mut self) {
+        self.window_control = Some(WindowRegion::Client);
     }
 
     /// Block non-scroll mouse interactions with elements behind this element's hitbox.
@@ -1257,6 +1265,14 @@ pub trait InteractiveElement: Sized {
     /// The fluent API equivalent to [`Interactivity::window_control_area`].
     fn window_control_area(mut self, area: WindowControlArea) -> Self {
         self.interactivity().window_control_area(area);
+        self
+    }
+
+    /// Set the bounds of this element as client area of the platform window: a hole in the
+    /// window control areas painted before it (see [`Window::window_control_area_at`]).
+    /// The fluent API equivalent to [`Interactivity::window_client_area`].
+    fn window_client_area(mut self) -> Self {
+        self.interactivity().window_client_area();
         self
     }
 
@@ -2316,7 +2332,7 @@ pub struct Interactivity {
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
-    pub(crate) window_control: Option<WindowControlArea>,
+    pub(crate) window_control: Option<WindowRegion>,
     pub(crate) paint_bounds_listener: Option<Box<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>>,
     pub(crate) paint_layout_listener:
         Option<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
@@ -2760,11 +2776,18 @@ impl Interactivity {
                                                 GroupHitboxes::push(group, hitbox.id, cx);
                                             }
 
-                                            if let Some(area) = self.window_control {
-                                                window.insert_window_control_hitbox(
-                                                    area,
-                                                    hitbox.clone(),
-                                                );
+                                            match self.window_control {
+                                                Some(WindowRegion::Control(area)) => window
+                                                    .insert_window_control_hitbox(
+                                                        area,
+                                                        hitbox.clone(),
+                                                    ),
+                                                Some(WindowRegion::Client) => {
+                                                    window.insert_window_client_hitbox(
+                                                        hitbox.clone(),
+                                                    )
+                                                }
+                                                None => {}
                                             }
 
                                             self.paint_mouse_listeners(
@@ -6788,6 +6811,178 @@ mod tests {
                 host.update(cx, |_, _, cx| cx.notify()).unwrap();
                 cx.run_until_parked();
             }
+        }
+
+        fn area_at(
+            window: &AnyWindowHandle,
+            cx: &mut TestAppContext,
+            x: f32,
+            y: f32,
+        ) -> Option<WindowControlArea> {
+            move_to(window, cx, x, y);
+            cx.update_window(*window, |_, window, _| {
+                window.window_control_area_at(point(px(x), px(y)))
+            })
+            .unwrap()
+        }
+
+        fn drag(element: Stateful<Div>) -> Stateful<Div> {
+            element.window_control_area(WindowControlArea::Drag)
+        }
+
+        #[gpui::test]
+        fn a_client_area_cuts_a_hole_in_a_drag_area_and_a_drag_area_inside_it_drags(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(
+                        drag(node("bar", 0., 0., 400., 40.)).child(
+                            node("button", 10., 5., 50., 30.)
+                                .window_client_area()
+                                .child(drag(node("handle", 20., 10., 10., 10.))),
+                        ),
+                    )
+                    .into_any_element()
+            });
+
+            assert_eq!(area_at(&window, cx, 5., 5.), Some(WindowControlArea::Drag));
+            assert_eq!(area_at(&window, cx, 15., 10.), None);
+            assert_eq!(
+                area_at(&window, cx, 35., 20.),
+                Some(WindowControlArea::Drag)
+            );
+            assert_eq!(
+                area_at(&window, cx, 100., 20.),
+                Some(WindowControlArea::Drag)
+            );
+            assert_eq!(area_at(&window, cx, 500., 300.), None);
+        }
+
+        #[gpui::test]
+        fn the_later_sibling_wins_where_areas_overlap(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(drag(node("bar", 0., 0., 400., 40.)))
+                    .child(node("client", 0., 0., 100., 40.).window_client_area())
+                    .child(drag(node("later", 50., 0., 100., 40.)))
+                    .into_any_element()
+            });
+
+            assert_eq!(area_at(&window, cx, 25., 10.), None);
+            assert_eq!(
+                area_at(&window, cx, 75., 10.),
+                Some(WindowControlArea::Drag)
+            );
+            assert_eq!(
+                area_at(&window, cx, 125., 10.),
+                Some(WindowControlArea::Drag)
+            );
+            assert_eq!(
+                area_at(&window, cx, 300., 10.),
+                Some(WindowControlArea::Drag)
+            );
+        }
+
+        #[gpui::test]
+        fn an_overlay_without_an_area_over_a_drag_area_still_drags(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(drag(node("bar", 0., 0., 400., 40.)))
+                    .child(node("overlay", 0., 0., 200., 40.).occlude())
+                    .into_any_element()
+            });
+
+            assert_eq!(chain_at(&window, cx, 100., 10.), ["overlay", "root"]);
+            assert_eq!(
+                area_at(&window, cx, 100., 10.),
+                Some(WindowControlArea::Drag)
+            );
+        }
+
+        #[gpui::test]
+        fn areas_use_unclipped_bounds_and_ignore_pass_through(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(
+                        node("clip", 0., 0., 100., 100.)
+                            .overflow_hidden()
+                            .child(drag(node("overflowing", 50., 50., 100., 100.)))
+                            .child(
+                                node("ghost-client", 0., 0., 20., 20.)
+                                    .window_client_area()
+                                    .pointer_events_none(),
+                            ),
+                    )
+                    .into_any_element()
+            });
+
+            assert_eq!(chain_at(&window, cx, 130., 130.), ["root"]);
+            assert_eq!(
+                area_at(&window, cx, 130., 130.),
+                Some(WindowControlArea::Drag)
+            );
+            assert_eq!(area_at(&window, cx, 10., 10.), None);
+            assert_eq!(area_at(&window, cx, 160., 160.), None);
+        }
+
+        #[gpui::test]
+        fn other_control_areas_follow_the_same_rule(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(drag(node("bar", 0., 0., 400., 40.)))
+                    .child(
+                        node("close", 0., 0., 40., 40.)
+                            .window_control_area(WindowControlArea::Close),
+                    )
+                    .into_any_element()
+            });
+
+            assert_eq!(
+                area_at(&window, cx, 10., 10.),
+                Some(WindowControlArea::Close)
+            );
+            assert_eq!(
+                area_at(&window, cx, 100., 10.),
+                Some(WindowControlArea::Drag)
+            );
+        }
+
+        #[gpui::test]
+        fn without_dom_hit_testing_an_area_is_the_one_under_the_mouse(cx: &mut TestAppContext) {
+            let window = open_scene(cx, false, || {
+                root()
+                    .child(
+                        drag(node("bar", 0., 0., 400., 40.))
+                            .child(node("client", 10., 5., 50., 30.).window_client_area()),
+                    )
+                    .child(node("overlay", 200., 0., 100., 40.).occlude())
+                    .child(
+                        node("clip", 0., 100., 100., 100.)
+                            .overflow_hidden()
+                            .child(drag(node("overflowing", 50., 50., 100., 100.))),
+                    )
+                    .into_any_element()
+            });
+
+            assert_eq!(area_at(&window, cx, 5., 5.), Some(WindowControlArea::Drag));
+            // Client entries are ignored: the bar is still under the mouse.
+            assert_eq!(
+                area_at(&window, cx, 30., 20.),
+                Some(WindowControlArea::Drag)
+            );
+            // The blocking overlay hides the bar.
+            assert_eq!(area_at(&window, cx, 250., 20.), None);
+            // The mouse position is what counts, not the argument.
+            move_to(&window, cx, 5., 5.);
+            let elsewhere = cx
+                .update_window(window, |_, window, _| {
+                    window.window_control_area_at(point(px(700.), px(500.)))
+                })
+                .unwrap();
+            assert_eq!(elsewhere, Some(WindowControlArea::Drag));
+            // Clipped out of the hit test, so it is not an area here.
+            assert_eq!(area_at(&window, cx, 130., 230.), None);
         }
     }
 }
