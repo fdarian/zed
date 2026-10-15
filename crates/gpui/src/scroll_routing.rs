@@ -136,7 +136,14 @@ pub(crate) struct Claim {
 
 /// Takes this container's share of the event. Returns the offset to scroll to, or
 /// `None` if the event is not this container's.
+///
+/// An event whose default a capture-phase listener prevented is nobody's: that is the DOM's
+/// `preventDefault()` on a `wheel` event, which cancels the scroll it would have caused. The
+/// event still reaches every listener, and the latch is left as it was.
 pub(crate) fn claim(window: &Window, cx: &mut App, claim: Claim) -> Option<Point<Pixels>> {
+    if window.default_prevented() {
+        return None;
+    }
     let routing = cx
         .default_global::<WheelRouting>()
         .0

@@ -3570,7 +3570,10 @@ impl Interactivity {
         }
 
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && scroll_routing::is_candidate(window, &hitbox) {
+            if phase == DispatchPhase::Bubble
+                && !window.default_prevented()
+                && scroll_routing::is_candidate(window, &hitbox)
+            {
                 let mut scroll_offset = scroll_offset.borrow_mut();
                 let old_scroll_offset = *scroll_offset;
                 let mut delta = event.delta.pixel_delta(line_height);
@@ -6302,6 +6305,7 @@ mod tests {
             outer: ScrollHandle,
             inner: ScrollHandle,
             inner_passes_through: Rc<Cell<bool>>,
+            prevent_wheel: Rc<Cell<bool>>,
         }
 
         fn nested_scrollers(cx: &mut TestAppContext) -> (AnyWindowHandle, NestedScrollers) {
@@ -6309,11 +6313,13 @@ mod tests {
                 outer: ScrollHandle::new(),
                 inner: ScrollHandle::new(),
                 inner_passes_through: Rc::new(Cell::new(false)),
+                prevent_wheel: Rc::new(Cell::new(false)),
             };
             let window = open_scene(cx, true, {
                 let outer = scrollers.outer.clone();
                 let inner = scrollers.inner.clone();
                 let inner_passes_through = scrollers.inner_passes_through.clone();
+                let prevent_wheel = scrollers.prevent_wheel.clone();
                 move || {
                     let mut inner_scroller = div()
                         .id("inner")
@@ -6333,7 +6339,23 @@ mod tests {
                         .child(inner_scroller)
                         .child(div().id("outer-content").h(px(1000.)));
                     outer_scroller.style().allow_concurrent_scroll = Some(true);
-                    root().child(outer_scroller).into_any_element()
+                    // Registered first, so it runs before the scrollers, as a capture-phase
+                    // listener at the top of the tree does.
+                    let prevent_wheel = prevent_wheel.clone();
+                    let preventer = canvas(
+                        |_, _, _| (),
+                        move |_, _, window, _| {
+                            let prevent_wheel = prevent_wheel.clone();
+                            window.on_mouse_event(
+                                move |_: &ScrollWheelEvent, phase, window, _| {
+                                    if phase == DispatchPhase::Capture && prevent_wheel.get() {
+                                        window.prevent_default();
+                                    }
+                                },
+                            );
+                        },
+                    );
+                    root().child(preventer).child(outer_scroller).into_any_element()
                 }
             });
             (window, scrollers)
@@ -6383,6 +6405,21 @@ mod tests {
             wheel_at(&window, cx, 50., 50.);
             assert_eq!(scrollers.inner.offset().y, px(0.));
             assert_eq!(scrollers.outer.offset().y, px(-10.));
+        }
+
+        #[gpui::test]
+        fn a_prevented_wheel_scrolls_nothing_and_the_next_one_does(cx: &mut TestAppContext) {
+            let (window, scrollers) = nested_scrollers(cx);
+            move_to(&window, cx, 50., 50.);
+            scrollers.prevent_wheel.set(true);
+            wheel_at(&window, cx, 50., 50.);
+            assert_eq!(scrollers.inner.offset().y, px(0.));
+            assert_eq!(scrollers.outer.offset().y, px(0.));
+
+            scrollers.prevent_wheel.set(false);
+            wheel_at(&window, cx, 50., 50.);
+            assert_eq!(scrollers.inner.offset().y, px(-10.));
+            assert_eq!(scrollers.outer.offset().y, px(0.));
         }
 
         #[gpui::test]
