@@ -1703,7 +1703,7 @@ impl Element for List {
         let mut moved = Pixels::ZERO;
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Capture {
-                scroll_routing::begin(window, cx, event);
+                scroll_routing::begin(window, cx, event, scroller);
             }
         });
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {

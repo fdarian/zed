@@ -1379,6 +1379,9 @@ pub struct Window {
     /// causes another. While it is not zero, [`Window::draw_if_dirty`] measures instead of
     /// drawing: see [`Window::measure`].
     dispatch_depth: Rc<Cell<usize>>,
+    /// Counts the events dispatched, so that a listener registered by many elements can tell one
+    /// event from the next.
+    dispatch_serial: u64,
     /// The invalidator's update count after the last measure pass, so that a window nothing
     /// invalidated since is not measured again. Reset by every draw.
     measured_at: Option<usize>,
@@ -2072,6 +2075,7 @@ impl Window {
             keyboard_modality_mouse_origin: mouse_position,
             refreshing: false,
             dispatch_depth: Rc::new(Cell::new(0)),
+            dispatch_serial: 0,
             measured_at: None,
             measuring: false,
             activation_observers: SubscriberSet::new(),
@@ -5796,10 +5800,15 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
+    pub(crate) fn dispatch_serial(&self) -> u64 {
+        self.dispatch_serial
+    }
+
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
         let _dispatching = DispatchScope::enter(&self.dispatch_depth);
+        self.dispatch_serial += 1;
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();

@@ -3547,7 +3547,7 @@ impl Interactivity {
             // container claims the event the whole delta is waiting to be claimed.
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture {
-                    scroll_routing::begin(window, cx, event);
+                    scroll_routing::begin(window, cx, event, scroller);
                 }
             });
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
@@ -6312,6 +6312,7 @@ mod tests {
             outer: ScrollHandle,
             inner: ScrollHandle,
             inner_passes_through: Rc<Cell<bool>>,
+            inner_removed: Rc<Cell<bool>>,
             prevent_wheel: Rc<Cell<bool>>,
         }
 
@@ -6320,12 +6321,14 @@ mod tests {
                 outer: ScrollHandle::new(),
                 inner: ScrollHandle::new(),
                 inner_passes_through: Rc::new(Cell::new(false)),
+                inner_removed: Rc::new(Cell::new(false)),
                 prevent_wheel: Rc::new(Cell::new(false)),
             };
             let window = open_scene(cx, true, {
                 let outer = scrollers.outer.clone();
                 let inner = scrollers.inner.clone();
                 let inner_passes_through = scrollers.inner_passes_through.clone();
+                let inner_removed = scrollers.inner_removed.clone();
                 let prevent_wheel = scrollers.prevent_wheel.clone();
                 move || {
                     let mut inner_scroller = div()
@@ -6343,7 +6346,7 @@ mod tests {
                     let mut outer_scroller = node("outer", 0., 0., 200., 200.)
                         .overflow_y_scroll()
                         .track_scroll(&outer)
-                        .child(inner_scroller)
+                        .when(!inner_removed.get(), |this| this.child(inner_scroller))
                         .child(div().id("outer-content").h(px(1000.)));
                     outer_scroller.style().allow_concurrent_scroll = Some(true);
                     // Registered first, so it runs before the scrollers, as a capture-phase
@@ -6445,6 +6448,25 @@ mod tests {
             .unwrap();
             wheel_at(&window, cx, 50., 50.);
             assert_eq!(scrollers.inner.offset().y, px(-10.));
+            assert_eq!(scrollers.outer.offset().y, px(-10.));
+        }
+
+        #[gpui::test]
+        fn a_latch_on_a_scroller_that_was_removed_does_not_swallow_the_wheel(
+            cx: &mut TestAppContext,
+        ) {
+            let (window, scrollers) = nested_scrollers(cx);
+            move_to(&window, cx, 50., 50.);
+            wheel_at(&window, cx, 50., 50.);
+            assert_eq!(scrollers.inner.offset().y, px(-10.));
+
+            scrollers.inner_removed.set(true);
+            cx.update_window(window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            wheel_at(&window, cx, 50., 50.);
             assert_eq!(scrollers.outer.offset().y, px(-10.));
         }
 

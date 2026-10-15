@@ -9,8 +9,9 @@
 //! A gesture is latched to the container that took its first delta. A trackpad gesture
 //! and its momentum keep scrolling that container even after it reaches its limit, so
 //! the momentum never hops to the parent. A latch ends on a new gesture
-//! ([`TouchPhase::Started`]) or after [`LATCH_TIMEOUT`] without wheel events. A mouse
-//! wheel has no phases, and its latch also ends when the pointer moves.
+//! ([`TouchPhase::Started`]), after [`LATCH_TIMEOUT`] without wheel events, or when its container
+//! is no longer in the frame. A mouse wheel has no phases, and its latch also ends when the
+//! pointer moves.
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -23,7 +24,9 @@ use crate::{
 };
 
 /// How long a latched container keeps the wheel once events stop. Momentum events
-/// arrive every frame, so a gap this long is the end of the gesture.
+/// arrive every frame, so a gap this long is the end of the gesture. It is Chromium's wheel
+/// latching transaction (`MouseWheelPhaseHandler`), which times a wheel without phases out the same
+/// way.
 const LATCH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// What a container does with scroll delta it cannot use, like CSS
@@ -63,6 +66,10 @@ struct WindowRouting {
     /// take their share of the remainder.
     latched_this_event: bool,
     last_event: Option<Instant>,
+    /// The containers that took part in the event being dispatched, which are the ones in the
+    /// frame. A latch on one that is not here was left behind by an unmounted container.
+    present: Vec<ScrollerId>,
+    present_for: u64,
 }
 
 struct Latch {
@@ -93,7 +100,12 @@ pub(crate) fn passes_through(hitbox: &Hitbox) -> bool {
 
 /// Starts routing one wheel event. Every container calls it from its capture-phase
 /// listener, which runs before any bubble-phase listener, so repeating it is harmless.
-pub(crate) fn begin(window: &Window, cx: &mut App, event: &ScrollWheelEvent) {
+pub(crate) fn begin(
+    window: &Window,
+    cx: &mut App,
+    event: &ScrollWheelEvent,
+    scroller: ScrollerId,
+) {
     let routing = cx
         .default_global::<WheelRouting>()
         .0
@@ -114,6 +126,11 @@ pub(crate) fn begin(window: &Window, cx: &mut App, event: &ScrollWheelEvent) {
     routing.last_event = Some(now);
     routing.latched_this_event = false;
     routing.remaining = point(1.0, 1.0);
+    if routing.present_for != window.dispatch_serial() {
+        routing.present_for = window.dispatch_serial();
+        routing.present.clear();
+    }
+    routing.present.push(scroller);
 }
 
 /// One container's claim on the wheel event being dispatched.
@@ -159,6 +176,14 @@ pub(crate) fn claim(window: &Window, cx: &mut App, claim: Claim) -> Option<Point
             routing.latch = None;
         }
         return None;
+    }
+
+    if routing
+        .latch
+        .as_ref()
+        .is_some_and(|latch| !routing.present.contains(&latch.scroller))
+    {
+        routing.latch = None;
     }
 
     let latched = match &routing.latch {
