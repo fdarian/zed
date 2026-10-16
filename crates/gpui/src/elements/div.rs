@@ -1860,7 +1860,6 @@ pub fn div() -> Div {
         prepaint_order_fn: None,
         paint_ranks: None,
         stacking_context: false,
-        z_index: None,
         lifted: Vec::new(),
         lifted_children: SmallVec::new(),
         children_lifting: false,
@@ -1876,7 +1875,6 @@ pub struct Div {
     prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
     paint_ranks: Option<Vec<i32>>,
     stacking_context: bool,
-    z_index: Option<i32>,
     /// The positioned descendants this stacking context was handed, in paint order. Set by
     /// prepaint, painted and emptied by paint.
     lifted: Vec<LiftedElement>,
@@ -1910,7 +1908,7 @@ impl Div {
     /// The `z-index` of this element in its stacking context. It takes effect on a positioned
     /// element, one whose `position` is set and not [`Position::Static`], and no index is 0.
     pub fn z_index(mut self, z_index: i32) -> Self {
-        self.z_index = Some(z_index);
+        self.interactivity.base_style.z_index = Some(z_index);
         self
     }
 
@@ -2137,10 +2135,7 @@ impl Element for Div {
     }
 
     fn lift_z(&self) -> Option<i32> {
-        match self.interactivity.base_style.position {
-            None | Some(Position::Static) => None,
-            Some(_) => Some(self.z_index.unwrap_or(0)),
-        }
+        self.interactivity.base_style.lift_z()
     }
 
     fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
@@ -8309,6 +8304,45 @@ mod tests {
 
                 // Without a context every parent orders only its own children.
                 let window = open_scene(cx, true, scene(false));
+                assert_eq!(painted(&window, cx), ["root", "a", "b", "c"]);
+                assert_eq!(chain_at(&window, cx, 120., 120.), ["c", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_positioned_element_that_is_not_a_div_is_lifted_too(cx: &mut TestAppContext) {
+                // "b" is a canvas: without lift_z it would stay in tree order below "c".
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(boxed("a", 0., 0., 200.).child({
+                            let mut surface = canvas(
+                                |_, _, _| (),
+                                |bounds, _, window, _| {
+                                    window.paint_quad(crate::fill(bounds, tint("b")));
+                                },
+                            )
+                            .absolute()
+                            .left(px(50.))
+                            .top(px(50.))
+                            .w(px(100.))
+                            .h(px(100.));
+                            surface.style().z_index = Some(5);
+                            surface
+                        }))
+                        .child(boxed("c", 100., 100., 200.))
+                        .into_any_element()
+                });
+                assert_eq!(painted(&window, cx), ["root", "a", "c", "b"]);
+            }
+
+            #[gpui::test]
+            fn an_unlifted_positioned_element_keeps_its_place_in_the_tree(cx: &mut TestAppContext) {
+                // "b" is positioned for layout only: it stays under "c" like a static box.
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(boxed("a", 0., 0., 200.).child(boxed("b", 50., 50., 100.).unlifted()))
+                        .child(boxed("c", 100., 100., 200.))
+                        .into_any_element()
+                });
                 assert_eq!(painted(&window, cx), ["root", "a", "b", "c"]);
                 assert_eq!(chain_at(&window, cx, 120., 120.), ["c", "root"]);
             }

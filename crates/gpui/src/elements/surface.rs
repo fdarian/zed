@@ -106,6 +106,10 @@ impl Element for Surface {
         self.style.escape()
     }
 
+    fn lift_z(&self) -> Option<i32> {
+        self.style.lift_z()
+    }
+
     fn request_layout(
         &mut self,
         _global_id: Option<&GlobalElementId>,

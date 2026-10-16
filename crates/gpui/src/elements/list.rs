@@ -1530,6 +1530,10 @@ impl Element for List {
         self.style.escape()
     }
 
+    fn lift_z(&self) -> Option<i32> {
+        self.style.lift_z()
+    }
+
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.interactivity
             .override_role

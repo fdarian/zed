@@ -85,6 +85,10 @@ impl Element for Svg {
         self.interactivity.base_style.escape()
     }
 
+    fn lift_z(&self) -> Option<i32> {
+        self.interactivity.base_style.lift_z()
+    }
+
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.interactivity
             .override_role

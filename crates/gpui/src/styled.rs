@@ -587,6 +587,15 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Keeps a positioned element in its place in the tree instead of lifting it into the nearest
+    /// stacking context (see [`crate::Div::stacking_context`]). For elements that are positioned
+    /// for layout only, such as the containing block of an absolute child, which must not rise
+    /// above their later siblings. Its positioned descendants are lifted on their own.
+    fn unlifted(mut self) -> Self {
+        self.style().lifts = Some(false);
+        self
+    }
+
     /// Sets the aspect ratio of the element.
     /// [Docs](https://tailwindcss.com/docs/aspect-ratio)
     fn aspect_ratio(mut self, ratio: f32) -> Self {

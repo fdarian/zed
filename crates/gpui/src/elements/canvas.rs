@@ -50,6 +50,10 @@ impl<T: 'static> Element for Canvas<T> {
         self.style.escape()
     }
 
+    fn lift_z(&self) -> Option<i32> {
+        self.style.lift_z()
+    }
+
     fn request_layout(
         &mut self,
         _id: Option<&GlobalElementId>,

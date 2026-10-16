@@ -276,6 +276,10 @@ impl Element for UniformList {
         self.interactivity.base_style.escape()
     }
 
+    fn lift_z(&self) -> Option<i32> {
+        self.interactivity.base_style.lift_z()
+    }
+
     fn request_layout(
         &mut self,
         global_id: Option<&GlobalElementId>,

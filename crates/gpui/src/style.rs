@@ -261,6 +261,14 @@ pub struct Style {
     // Position properties
     /// What should the `position` value of this struct use as a base offset?
     pub position: Position,
+    /// The `z-index` of this element in its stacking context. It takes effect on a positioned
+    /// element, one whose `position` is not [`Position::Static`], and 0 is `auto`. See
+    /// [`crate::Div::stacking_context`].
+    pub z_index: i32,
+    /// Whether a positioned element is handed to the stacking context around it. An element that
+    /// is positioned only for layout (the containing block of an absolute child, say) turns this
+    /// off to keep its place in the tree. See [`crate::Styled::unlifted`].
+    pub lifts: bool,
     /// How should the position of this element be tweaked relative to the layout defined?
     #[refineable]
     pub inset: Edges<Length>,
@@ -435,6 +443,18 @@ impl StyleRefinement {
             Some(Position::AbsoluteInAncestor) => Some(Escape::ContainingBlock),
             Some(Position::Fixed) => Some(Escape::Viewport),
             _ => None,
+        }
+    }
+
+    /// The `z-index` of an element with this style for `Element::lift_z`: a positioned element
+    /// (`position` set and not [`Position::Static`]) has one, an in-flow element has none.
+    pub fn lift_z(&self) -> Option<i32> {
+        if self.lifts == Some(false) {
+            return None;
+        }
+        match self.position {
+            None | Some(Position::Static) => None,
+            Some(_) => Some(self.z_index.unwrap_or(0)),
         }
     }
 }
@@ -1186,6 +1206,8 @@ impl Default for Style {
             restrict_scroll_to_axis: false,
             scrollbar_width: AbsoluteLength::default(),
             position: Position::Relative,
+            z_index: 0,
+            lifts: true,
             inset: Edges::auto(),
             margin: Edges::<Length>::zero(),
             padding: Edges::<DefiniteLength>::zero(),
