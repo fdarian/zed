@@ -5839,7 +5839,7 @@ impl Window {
             .scale(self.scale_factor());
         let opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_primitive(PolychromeSprite {
+        self.next_frame.scene.insert_image(PolychromeSprite {
             order: 0,
             nearest_neighbor: nearest_neighbor.into(),
             grayscale: grayscale.into(),

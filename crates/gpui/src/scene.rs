@@ -172,10 +172,19 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+        self.insert(primitive.into(), true);
+    }
+
+    /// Inserts an image. Unlike the sprite of an emoji, which is a glyph, it is not part of
+    /// what a text clip masks by.
+    pub fn insert_image(&mut self, sprite: PolychromeSprite) {
+        self.insert(sprite.into(), false);
+    }
+
+    fn insert(&mut self, primitive: Primitive, glyph: bool) {
         if self.hidden {
             return;
         }
-        let primitive = primitive.into();
         if primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds)
@@ -183,7 +192,12 @@ impl Scene {
         {
             return;
         }
-        self.record(PaintOperation::Primitive(primitive.clone()));
+        match (&primitive, glyph) {
+            (Primitive::PolychromeSprite(sprite), false) => {
+                self.record(PaintOperation::Image(*sprite))
+            }
+            _ => self.record(PaintOperation::Primitive(primitive.clone())),
+        }
 
         let mut primitive = primitive;
         if !self.effect_groups_enabled {
@@ -192,7 +206,7 @@ impl Scene {
                 primitive.apply_opacity(opacity);
             }
         }
-        if let Some(glyph) = primitive.as_glyph_mask() {
+        if glyph && let Some(glyph) = primitive.as_glyph_mask() {
             for clip in &mut self.text_clips {
                 clip.scene.insert_primitive_local(glyph.clone());
             }
@@ -617,6 +631,7 @@ impl Scene {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Image(sprite) => self.insert_image(*sprite),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartGroup {
@@ -702,6 +717,7 @@ pub(crate) enum PrimitiveKind {
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    Image(PolychromeSprite),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
     StartGroup {
@@ -2014,6 +2030,40 @@ mod tests {
         assert_eq!(mask_scene.monochrome_sprites.len(), 2);
         // Opaque, whatever colour the text has.
         assert_eq!(mask_scene.monochrome_sprites[0].color.a, 1.);
+    }
+
+    #[test]
+    fn a_text_clip_masks_by_an_emoji_but_not_by_an_image() {
+        let mut scene = scene();
+        let region = bounds(0., 0., 100., 50.);
+        scene.start_text_clip();
+        let effect = GroupEffect {
+            text_mask: true,
+            reference: region,
+            ..GroupEffect::default()
+        };
+        scene.start_group(effect, mask(), Some(region));
+        scene.insert_primitive(quad(0., 0., 100., 50.));
+        scene.end_group();
+        let sprite = PolychromeSprite {
+            order: 0,
+            nearest_neighbor: false.into(),
+            grayscale: false.into(),
+            opacity: 1.,
+            bounds: bounds(10., 10., 8., 8.),
+            content_mask: mask(),
+            corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
+            tile: glyph(0., 0.).tile,
+        };
+        scene.insert_primitive(sprite);
+        scene.insert_image(sprite);
+        scene.end_text_clip();
+        scene.finish();
+
+        assert_eq!(scene.polychrome_sprites.len(), 2, "both paint");
+        let mask_scene = scene.groups[0].text_mask.as_ref().expect("the group has a text mask");
+        assert_eq!(mask_scene.polychrome_sprites.len(), 1);
     }
 
     #[test]
