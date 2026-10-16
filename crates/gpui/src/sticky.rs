@@ -68,6 +68,7 @@ pub(crate) fn frames(
     style: &Style,
     scroll_offset: Point<Pixels>,
     content_end: Option<Point<Pixels>>,
+    scrollbar_size: Size<Pixels>,
     rem_size: Pixels,
 ) -> (Option<Bounds<Pixels>>, Bounds<Pixels>) {
     let border = style.border_widths.to_pixels(rem_size);
@@ -76,8 +77,8 @@ pub(crate) fn frames(
     let padding_box = Bounds::new(
         point(bounds.origin.x + border.left, bounds.origin.y + border.top),
         Size {
-            width: bounds.size.width - border.left - border.right,
-            height: bounds.size.height - border.top - border.bottom,
+            width: bounds.size.width - border.left - border.right - scrollbar_size.width,
+            height: bounds.size.height - border.top - border.bottom - scrollbar_size.height,
         },
     );
     let origin = point(
@@ -191,6 +192,28 @@ mod tests {
             constraint.map(|(start, end)| (px(start), px(end))),
         )
         .into()
+    }
+
+    #[test]
+    fn the_scrollport_stops_where_the_scrollbar_starts() {
+        let mut style = Style::default();
+        style.overflow = Point {
+            x: Overflow::Scroll,
+            y: Overflow::Scroll,
+        };
+        let bounds = Bounds::new(point(px(10.), px(20.)), Size { width: px(100.), height: px(80.) });
+        let scrollbar = Size { width: px(15.), height: px(11.) };
+
+        let (scrollport, _) =
+            frames(bounds, &style, Point::default(), None, scrollbar, px(16.));
+
+        assert_eq!(
+            scrollport,
+            Some(Bounds::new(
+                point(px(10.), px(20.)),
+                Size { width: px(85.), height: px(69.) }
+            ))
+        );
     }
 
     #[test]

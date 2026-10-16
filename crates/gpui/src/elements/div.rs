@@ -1618,6 +1618,14 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Reserves no room for a scrollbar on an axis that scrolls, whatever the `scrollbar_width`.
+    /// An axis that only code scrolls (see [`Self::programmatic_scroll_only`]) reserves none
+    /// either.
+    fn without_scrollbar(mut self, x: bool, y: bool) -> Self {
+        self.interactivity().no_scrollbar = point(x, y);
+        self
+    }
+
     /// Runs when this element has prepainted its children, with its bounds, so an overlay can
     /// insert hitboxes that sit above them (see [`Self::paint_overlay`]). Only [`Div`] runs it.
     fn prepaint_overlay(
@@ -2018,13 +2026,25 @@ impl Element for Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
+        let no_scrollbar = point(
+            self.interactivity.no_scrollbar.x || self.interactivity.programmatic_scroll_only.x,
+            self.interactivity.no_scrollbar.y || self.interactivity.programmatic_scroll_only.y,
+        );
         let layout_id = window.with_image_cache(image_cache, |window| {
             self.interactivity.request_layout(
                 global_id,
                 inspector_id,
                 window,
                 cx,
-                |style, window, cx| {
+                |mut style, window, cx| {
+                    // Layout reserves room for a scrollbar on every axis that scrolls, so an axis
+                    // without one is laid out as hidden.
+                    if no_scrollbar.x && style.overflow.x == Overflow::Scroll {
+                        style.overflow.x = Overflow::Hidden;
+                    }
+                    if no_scrollbar.y && style.overflow.y == Overflow::Scroll {
+                        style.overflow.y = Overflow::Hidden;
+                    }
                     window.with_text_style(style.text_style().cloned(), |window| {
                         child_layout_ids = self
                             .children
@@ -2121,6 +2141,8 @@ impl Element for Div {
             child_max = window
                 .layout_scrollable_overflow_end(request_layout.layout_id)
                 .map_or(bounds.origin, |end| end.max(&bounds.origin));
+            self.interactivity.scrollbar_size =
+                window.layout_scrollbar_size(request_layout.layout_id);
         }
         self.interactivity.content_end = Some(child_max - bounds.origin);
 
@@ -2130,6 +2152,7 @@ impl Element for Div {
 
         let overlay_prepainter = self.interactivity.overlay_prepainter.take();
         let content_end = self.interactivity.content_end;
+        let scrollbar_size = self.interactivity.scrollbar_size;
         let paint_order = self.paint_ranks.as_ref().map(|_| self.child_paint_order());
         self.interactivity.prepaint(
             global_id,
@@ -2150,6 +2173,7 @@ impl Element for Div {
                         style,
                         scroll_offset,
                         content_end,
+                        scrollbar_size,
                         window.rem_size(),
                     );
                     window.with_element_offset(scroll_offset, |window| {
@@ -2303,8 +2327,12 @@ pub struct Interactivity {
     /// sets it, so that its scroll range follows CSS scrollable overflow. Without it the range is
     /// `content_size` plus the padding.
     pub(crate) content_end: Option<Point<Pixels>>,
+    /// The space a scroll container reserved for its scrollbars (see
+    /// [`Window::layout_scrollbar_size`]). It is not part of the scrollport.
+    pub(crate) scrollbar_size: Size<Pixels>,
     pub(crate) overscroll_behavior: Point<OverscrollBehavior>,
     pub(crate) programmatic_scroll_only: Point<bool>,
+    pub(crate) no_scrollbar: Point<bool>,
     pub(crate) overlay_painter:
         Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static>>,
     pub(crate) overlay_prepainter:
@@ -2675,7 +2703,7 @@ impl Interactivity {
             // 0.00000x pixels. As we generally don't benefit from a precision that
             // high for the maximum scroll, we round the scroll max to 2 decimal
             // places here.
-            let scroll_max = (far_edge - Point::from(bounds.size))
+            let scroll_max = (far_edge - Point::from(bounds.size - self.scrollbar_size))
                 .map(round_to_two_decimals)
                 .max(&Default::default());
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
@@ -2696,11 +2724,15 @@ impl Interactivity {
                     style.overflow.x == Overflow::Scroll && !self.programmatic_scroll_only.x,
                     style.overflow.y == Overflow::Scroll && !self.programmatic_scroll_only.y,
                 );
+                scroll_handle_state.scrollbar_size = self.scrollbar_size;
                 scroll_handle_state.padding_box = Bounds::new(
                     point(bounds.origin.x + border.left, bounds.origin.y + border.top),
                     size(
-                        bounds.size.width - border.left - border.right,
-                        bounds.size.height - border.top - border.bottom,
+                        bounds.size.width - border.left - border.right - self.scrollbar_size.width,
+                        bounds.size.height
+                            - border.top
+                            - border.bottom
+                            - self.scrollbar_size.height,
                     ),
                 );
             }
@@ -4484,6 +4516,7 @@ struct ScrollHandleState {
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
     padding_box: Bounds<Pixels>,
+    scrollbar_size: Size<Pixels>,
     user_scroll: Point<bool>,
     max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,
@@ -4571,10 +4604,16 @@ impl ScrollHandle {
         }
     }
 
-    /// The scrollport as of the last layout: the border box without its borders, which is
-    /// what CSS calls the client area. Scrollbars are overlays and take nothing from it.
+    /// The scrollport as of the last layout: the border box without its borders and the space
+    /// reserved for scrollbars, which is what CSS calls the client area.
     pub fn padding_box(&self) -> Bounds<Pixels> {
         self.0.borrow().padding_box
+    }
+
+    /// The space reserved for scrollbars as of the last layout: its width on the right of the
+    /// scrollport, and its height below it. Zero unless the element has a `scrollbar_width`.
+    pub fn scrollbar_size(&self) -> Size<Pixels> {
+        self.0.borrow().scrollbar_size
     }
 
     /// Whether the wheel and the keys scroll each axis. A container whose `overflow` is hidden
@@ -6738,6 +6777,113 @@ mod tests {
                     .into_any_element()
             });
             assert_eq!(range, point(px(0.), px(300.)));
+        }
+
+        /// A 100 by 100 scroller with a 15px `scrollbar_width` holding a 300 by 300 child, and the
+        /// width the 100%-wide `fill` child laid out to.
+        fn reserved_scroller(
+            cx: &mut TestAppContext,
+            style: impl Fn(Stateful<Div>) -> Stateful<Div> + 'static,
+        ) -> (ScrollHandle, Pixels) {
+            let handle = ScrollHandle::new();
+            let fill_width = Rc::new(Cell::new(px(0.)));
+            let _window = open_scene(cx, true, {
+                let (handle, fill_width) = (handle.clone(), fill_width.clone());
+                move || {
+                    let fill_width = fill_width.clone();
+                    root()
+                        .child(
+                            style(
+                                div()
+                                    .id("scroller")
+                                    .w(px(100.))
+                                    .h(px(100.))
+                                    .scrollbar_width(px(15.)),
+                            )
+                            .track_scroll(&handle)
+                            .child(
+                                div()
+                                    .id("fill")
+                                    .w_full()
+                                    .h(px(300.))
+                                    .on_painted_layout(move |bounds, _, _, _| {
+                                        fill_width.set(bounds.size.width)
+                                    }),
+                            )
+                            .child(div().id("wide").w(px(300.)).h(px(10.))),
+                        )
+                        .into_any_element()
+                }
+            });
+            (handle, fill_width.get())
+        }
+
+        #[gpui::test]
+        fn a_vertical_scrollbar_takes_its_width_from_the_scrollport(cx: &mut TestAppContext) {
+            let (handle, fill_width) = reserved_scroller(cx, |scroller| scroller.overflow_y_scroll());
+            assert_eq!(handle.scrollbar_size(), size(px(15.), px(0.)));
+            assert_eq!(handle.padding_box().size, size(px(85.), px(100.)));
+            assert_eq!(fill_width, px(85.));
+        }
+
+        #[gpui::test]
+        fn two_scrollbars_take_a_corner_and_the_range_ends_at_the_scrollport(
+            cx: &mut TestAppContext,
+        ) {
+            let (handle, _) = reserved_scroller(cx, |scroller| scroller.overflow_scroll());
+            assert_eq!(handle.scrollbar_size(), size(px(15.), px(15.)));
+            assert_eq!(handle.padding_box().size, size(px(85.), px(85.)));
+            // The 300 wide child and the 310 tall content, against an 85 by 85 scrollport.
+            assert_eq!(handle.max_offset(), point(px(215.), px(225.)));
+        }
+
+        #[gpui::test]
+        fn a_scroller_without_a_scrollbar_width_reserves_nothing(cx: &mut TestAppContext) {
+            let handle = ScrollHandle::new();
+            let _window = open_scene(cx, true, {
+                let handle = handle.clone();
+                move || {
+                    root()
+                        .child(
+                            div()
+                                .id("scroller")
+                                .w(px(100.))
+                                .h(px(100.))
+                                .overflow_scroll()
+                                .track_scroll(&handle)
+                                .child(div().w(px(300.)).h(px(300.))),
+                        )
+                        .into_any_element()
+                }
+            });
+            assert_eq!(handle.scrollbar_size(), size(px(0.), px(0.)));
+            assert_eq!(handle.padding_box().size, size(px(100.), px(100.)));
+            assert_eq!(handle.max_offset(), point(px(200.), px(200.)));
+        }
+
+        #[gpui::test]
+        fn an_axis_only_code_scrolls_reserves_no_scrollbar(cx: &mut TestAppContext) {
+            let (handle, _) = reserved_scroller(cx, |scroller| {
+                scroller.overflow_scroll().programmatic_scroll_only(true, false)
+            });
+            assert_eq!(handle.scrollbar_size(), size(px(15.), px(0.)));
+            assert_eq!(handle.padding_box().size, size(px(85.), px(100.)));
+            let (handle, _) = reserved_scroller(cx, |scroller| {
+                scroller.overflow_scroll().programmatic_scroll_only(true, true)
+            });
+            assert_eq!(handle.scrollbar_size(), size(px(0.), px(0.)));
+        }
+
+        #[gpui::test]
+        fn an_axis_declared_without_a_scrollbar_reserves_none(cx: &mut TestAppContext) {
+            let (handle, _) = reserved_scroller(cx, |scroller| {
+                scroller.overflow_scroll().without_scrollbar(false, true)
+            });
+            // No vertical bar, so no width taken; the horizontal bar still takes its height.
+            assert_eq!(handle.scrollbar_size(), size(px(0.), px(15.)));
+            // The axis still scrolls: only the room for its bar is gone.
+            assert_eq!(handle.max_offset(), point(px(200.), px(225.)));
+            assert_eq!(handle.user_scrollable(), point(true, true));
         }
 
         #[gpui::test]

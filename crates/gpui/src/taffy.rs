@@ -532,6 +532,17 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// The space the node reserved for scrollbars, taken from the right of its padding box for
+    /// a vertical bar and from the bottom for a horizontal one. It is nonzero only on an
+    /// axis whose `overflow` is `Scroll` and whose `scrollbar_width` is not zero.
+    pub fn layout_scrollbar_size(&mut self, id: LayoutId, scale_factor: f32) -> Size<Pixels> {
+        let scrollbar_size = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE).scrollbar_size;
+        Size {
+            width: Pixels(scrollbar_size.width / scale_factor),
+            height: Pixels(scrollbar_size.height / scale_factor),
+        }
+    }
+
     /// The content box of the node's parent: the box a percentage length on the
     /// node resolves against. `None` for a root.
     pub fn layout_parent_content_size(

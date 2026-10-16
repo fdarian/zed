@@ -5560,6 +5560,21 @@ impl Window {
             .layout_insets(layout_id, scale_factor)
     }
 
+    /// The space the given layout node reserved for scrollbars, in logical pixels: its
+    /// `scrollbar_width` on an axis whose `overflow` is `Scroll`, taken from the right and
+    /// bottom of its padding box.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_scrollbar_size(&mut self, layout_id: LayoutId) -> Size<Pixels> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .layout_scrollbar_size(layout_id, scale_factor)
+    }
+
     /// The content box of the given layout node's parent, in logical pixels:
     /// the box a percentage length on the node resolves against. `None` for a
     /// root node.
