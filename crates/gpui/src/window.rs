@@ -865,6 +865,23 @@ pub struct Hitbox {
     identity: Option<GlobalElementId>,
     parent: Option<HitboxId>,
     clip: Option<Rc<ResolvedClipPath>>,
+    exact_clips: Option<Rc<ExactClips>>,
+}
+
+/// The `overflow` clips around a hitbox that `content_mask` is only an approximation of, as a
+/// list of masks the pointer has to be inside every one of. A hitbox gets them when a nested clip
+/// is not exactly the intersection of its two masks, see [`Window::with_exact_hit_mask`].
+#[derive(Debug)]
+struct ExactClips {
+    mask: ContentMask<Pixels>,
+    outer: Option<Rc<ExactClips>>,
+}
+
+impl ExactClips {
+    fn contains(&self, position: Point<Pixels>) -> bool {
+        self.mask.contains(&position)
+            && self.outer.as_ref().is_none_or(|outer| outer.contains(position))
+    }
 }
 
 /// Whether `point` is inside `bounds` with its corners rounded by `radii`, each corner a quarter
@@ -910,7 +927,10 @@ impl Hitbox {
         self.bounds
             .intersect(&self.content_mask.bounds)
             .contains(&position)
-            && self.content_mask.contains(&position)
+            && match &self.exact_clips {
+                Some(clips) => clips.contains(position),
+                None => self.content_mask.contains(&position),
+            }
             && point_in_rounded_rect(position, self.bounds, self.corner_radii)
     }
 
@@ -1477,6 +1497,7 @@ pub struct Window {
     /// How many boxes were prepainted so far that sit outside the clip they were prepainted in,
     /// see [`Window::note_escape`].
     escapes_prepainted: u32,
+    exact_clips: Option<Rc<ExactClips>>,
     /// What the children of each positioned element see, innermost last. Only prepaint reads it.
     pub(crate) positioned_frames: Vec<PositionedFrame>,
     #[cfg(any(test, feature = "test-support"))]
@@ -2204,6 +2225,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             escapes_prepainted: 0,
+            exact_clips: None,
             positioned_frames: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             effect_groups_forced: false,
@@ -4621,6 +4643,43 @@ impl Window {
         self.with_effect_group(effect, None, |window| window.with_replaced_content_mask(mask, f))
     }
 
+    /// Like [`Window::with_content_mask`] for the prepaint of a clip, but a hitbox inserted
+    /// inside is clipped by `mask` and the current mask each, not by their approximate
+    /// intersection, when [`ContentMask::intersection_is_exact`] says that would differ. The
+    /// pointer then misses exactly where the clip cuts, which costs nothing unless a nested clip
+    /// cuts the corner of another.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn with_exact_hit_mask<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+        let Some(mask) = mask else {
+            return f(self);
+        };
+        let current = self.content_mask();
+        // Inside an inexact clip the approximate mask of a hitbox is not consulted for its
+        // corners, so every clip that rounds one has to be in the list from there on.
+        let exact = self.exact_clips.is_none() && mask.intersection_is_exact(&current);
+        if exact {
+            return self.with_content_mask(Some(mask), f);
+        }
+        let previous = self.exact_clips.take();
+        let outer = match previous.clone() {
+            Some(clips) => Some(clips),
+            None => Some(Rc::new(ExactClips {
+                mask: current,
+                outer: None,
+            })),
+        };
+        self.exact_clips = Some(Rc::new(ExactClips { mask, outer }));
+        let result = self.with_content_mask(Some(mask), f);
+        self.exact_clips = previous;
+        result
+    }
+
     /// [`Window::with_exact_content_mask`] unless `escape_inside`, otherwise
     /// [`Window::with_content_mask`]: the paint of an element's `overflow` clip, `escape_inside`
     /// being whether prepaint found a box inside it that escapes the clip.
@@ -6448,6 +6507,7 @@ impl Window {
             identity,
             parent: self.hitbox_parent_stack.last().copied(),
             clip: clip.map(Rc::new),
+            exact_clips: self.exact_clips.clone(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         self.next_frame.hitboxes_changed();
@@ -10149,6 +10209,7 @@ mod tests {
                         radii: size(50., 50.),
                     })
                 }),
+                exact_clips: None,
             });
         }
         frame

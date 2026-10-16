@@ -2746,7 +2746,7 @@ impl Interactivity {
                 };
                 window.with_visibility(visibility, |window| {
                     window.with_text_style(style.text_style().cloned(), |window| {
-                        window.with_content_mask(
+                        window.with_exact_hit_mask(
                             style.overflow_mask(bounds, window.rem_size()),
                             |window| {
                                 let escapes_before = window.escapes_prepainted();
@@ -8674,6 +8674,61 @@ mod tests {
                     let masks = red_masks(&window, cx);
                     assert_eq!(masks.len(), 1);
                     assert_eq!(masks[0].corner_radii, Corners::all(px(16.)));
+                }
+
+                #[gpui::test]
+                fn the_pointer_misses_where_a_child_clip_is_cut_by_the_parents_corner(
+                    cx: &mut TestAppContext,
+                ) {
+                    let window = open_scene(cx, true, || {
+                        let target = div().id("target").always_hitbox().flex_none().w(px(400.)).h(px(400.));
+                        root()
+                            .child(
+                                clip("parent", 100., 120., 16.)
+                                    .child(clip("child", 4., 112., 0.).child(target)),
+                            )
+                            .into_any_element()
+                    });
+
+                    // In the child, in the corner the parent rounds away.
+                    assert_eq!(chain_at(&window, cx, 104.2, 104.2), ["root"]);
+                    assert_eq!(chain_at(&window, cx, 215.8, 215.8), ["root"]);
+                    // Beside the arc, and in the middle.
+                    assert_eq!(
+                        chain_at(&window, cx, 110., 110.),
+                        ["target", "child", "parent", "root"]
+                    );
+                    assert_eq!(
+                        chain_at(&window, cx, 160., 160.),
+                        ["target", "child", "parent", "root"]
+                    );
+                    // Outside the child's square, inside the parent.
+                    assert_eq!(chain_at(&window, cx, 102., 160.), ["parent", "root"]);
+                }
+
+                #[gpui::test]
+                fn the_pointer_misses_the_mixed_elliptical_corner_the_way_the_clip_does(
+                    cx: &mut TestAppContext,
+                ) {
+                    let window = open_scene(cx, true, || {
+                        let target = div().id("target").always_hitbox().flex_none().w(px(400.)).h(px(400.));
+                        let mut parent = static_box("parent", 100., 120.).overflow_hidden();
+                        let mut child = static_box("child", 0., 120.).overflow_hidden();
+                        for (element, x, y) in [(&mut parent, 40., 10.), (&mut child, 10., 40.)] {
+                            let radii = &mut element.style().corner_radii;
+                            radii.top_left = Some(CornerRadius { x: px(x).into(), y: px(y).into() });
+                        }
+                        root().child(parent.child(child.child(target))).into_any_element()
+                    });
+
+                    // 5 by 2 from the corner is outside the first ellipse (40 by 10).
+                    assert_eq!(chain_at(&window, cx, 105., 102.), ["root"]);
+                    // 7.5 by 7.5 is inside both ellipses, and outside the one with the larger
+                    // radius per axis (40 by 40) that `intersect` would have kept.
+                    assert_eq!(
+                        chain_at(&window, cx, 107.5, 107.5),
+                        ["target", "child", "parent", "root"]
+                    );
                 }
 
                 #[gpui::test]
