@@ -300,6 +300,21 @@ pub enum ClipShape {
         /// The `round` radii, circular. Percentages refer to the smaller side of the box.
         radii: InsetRadii,
     },
+    /// `rect()` and `xywh()`: the same box as an inset, but every edge is a distance from the
+    /// top left of the reference box. An inset cannot hold `rect(0 80px 50% 0)`, whose right edge
+    /// is `80px` from the left in a box of any width.
+    Rect {
+        /// Distance down from the top edge to the top edge of the shape.
+        top: LengthPercentage,
+        /// Distance right from the left edge to the right edge of the shape.
+        right: LengthPercentage,
+        /// Distance down from the top edge to the bottom edge of the shape.
+        bottom: LengthPercentage,
+        /// Distance right from the left edge to the left edge of the shape.
+        left: LengthPercentage,
+        /// The `round` radii, circular. Percentages refer to the smaller side of the box.
+        radii: InsetRadii,
+    },
     /// `circle(radius at position)`.
     Circle {
         /// The radius.
@@ -394,6 +409,21 @@ impl ClipPath {
         let bounds = reference.bounds;
         let (width, height) = (bounds.size.width, bounds.size.height);
         let to_device = |value: f32| value * scale_factor;
+        let smaller_side = width.min(height);
+        let rounded_rect = |shape: Bounds<Pixels>, radii: &InsetRadii| {
+            let radius = |radius: &LengthPercentage| radius.resolve(smaller_side);
+            let corner_radii = Corners {
+                top_left: radius(&radii.top_left),
+                top_right: radius(&radii.top_right),
+                bottom_right: radius(&radii.bottom_right),
+                bottom_left: radius(&radii.bottom_left),
+            }
+            .clamp_radii_for_quad_size(shape.size);
+            ResolvedClipPath::RoundedRect {
+                bounds: shape.scale(scale_factor),
+                corner_radii: corner_radii.scale(scale_factor),
+            }
+        };
         match &self.shape {
             ClipShape::Inset {
                 top,
@@ -401,8 +431,8 @@ impl ClipPath {
                 bottom,
                 left,
                 radii,
-            } => {
-                let inset = Bounds::from_corners(
+            } => rounded_rect(
+                Bounds::from_corners(
                     point(
                         bounds.origin.x + left.resolve(width),
                         bounds.origin.y + top.resolve(height),
@@ -411,20 +441,35 @@ impl ClipPath {
                         bounds.bottom_right().x - right.resolve(width),
                         bounds.bottom_right().y - bottom.resolve(height),
                     ),
+                ),
+                radii,
+            ),
+            ClipShape::Rect {
+                top,
+                right,
+                bottom,
+                left,
+                radii,
+            } => {
+                let origin = point(
+                    bounds.origin.x + left.resolve(width),
+                    bounds.origin.y + top.resolve(height),
                 );
-                let smaller_side = width.min(height);
-                let radius = |radius: &LengthPercentage| radius.resolve(smaller_side);
-                let corner_radii = Corners {
-                    top_left: radius(&radii.top_left),
-                    top_right: radius(&radii.top_right),
-                    bottom_right: radius(&radii.bottom_right),
-                    bottom_left: radius(&radii.bottom_left),
-                }
-                .clamp_radii_for_quad_size(inset.size);
-                ResolvedClipPath::RoundedRect {
-                    bounds: inset.scale(scale_factor),
-                    corner_radii: corner_radii.scale(scale_factor),
-                }
+                let far = point(
+                    bounds.origin.x + right.resolve(width),
+                    bounds.origin.y + bottom.resolve(height),
+                );
+                // An edge before its opposite one makes the shape empty, not a flipped box.
+                rounded_rect(
+                    Bounds::new(
+                        origin,
+                        size(
+                            (far.x - origin.x).max(Pixels::ZERO),
+                            (far.y - origin.y).max(Pixels::ZERO),
+                        ),
+                    ),
+                    radii,
+                )
             }
             ClipShape::Circle { radius, center } => {
                 let center_point = Point::new(
@@ -812,6 +857,56 @@ mod tests {
         assert_eq!(bounds.origin, point(ScaledPixels(40.), ScaledPixels(50.)));
         assert_eq!(bounds.size, size(ScaledPixels(160.), ScaledPixels(100.)));
         assert_eq!(corner_radii.top_left, ScaledPixels(16.));
+    }
+
+    fn rect_clip(
+        top: LengthPercentage,
+        right: LengthPercentage,
+        bottom: LengthPercentage,
+        left: LengthPercentage,
+    ) -> ClipPath {
+        ClipPath {
+            shape: ClipShape::Rect {
+                top,
+                right,
+                bottom,
+                left,
+                radii: InsetRadii::default(),
+            },
+            reference: BackgroundBox::BorderBox,
+        }
+    }
+
+    #[test]
+    fn rect_edges_are_measured_from_the_top_left() {
+        // In the 100x60 box at (10, 20): the right edge is 80px from the left whatever the width,
+        // and the bottom edge is halfway down.
+        let clip = rect_clip(
+            LengthPercentage::Length(px(5.)),
+            LengthPercentage::Length(px(80.)),
+            percent(0.5),
+            percent(0.1),
+        );
+        let ResolvedClipPath::RoundedRect { bounds, .. } = clip.resolve(region(), 2.) else {
+            panic!("rect is a rounded rect");
+        };
+        assert_eq!(bounds.origin, point(ScaledPixels(40.), ScaledPixels(50.)));
+        assert_eq!(bounds.size, size(ScaledPixels(140.), ScaledPixels(50.)));
+    }
+
+    #[test]
+    fn rect_with_an_edge_before_its_opposite_one_is_empty() {
+        let clip = rect_clip(
+            LengthPercentage::Length(px(0.)),
+            LengthPercentage::Length(px(10.)),
+            percent(1.),
+            LengthPercentage::Length(px(30.)),
+        );
+        let ResolvedClipPath::RoundedRect { bounds, .. } = clip.resolve(region(), 1.) else {
+            panic!("rect is a rounded rect");
+        };
+        assert_eq!(bounds.size.width, ScaledPixels(0.));
+        assert_eq!(bounds.size.height, ScaledPixels(60.));
     }
 
     #[test]
