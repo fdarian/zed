@@ -159,20 +159,45 @@ impl WindowTextSystem {
 }
 
 /// Makes `runs` fit the text after `range` of it is replaced by `replacement_len`
-/// bytes. The replacement has the style of the run that `range` starts in.
+/// bytes. The replacement has the style of the run that `range` starts in, except
+/// that it is the size of the line: it was measured as such, as the ellipsis of a
+/// block is in CSS.
 fn replace_in_runs(runs: &mut Vec<TextRun>, range: Range<usize>, replacement_len: usize) {
     let mut start = 0;
     let mut replaced = false;
-    runs.retain_mut(|run| {
+    let mut out = Vec::with_capacity(runs.len() + 2);
+    for run in runs.drain(..) {
         let end = start + run.len;
         let before = range.start.clamp(start, end) - start;
         let after = end - range.end.clamp(start, end);
         let owns_replacement = !replaced && (start..end).contains(&range.start);
         replaced |= owns_replacement;
-        run.len = before + after + if owns_replacement { replacement_len } else { 0 };
         start = end;
-        run.len > 0
-    });
+        let sized = run.font_size.is_some() || run.line_height.is_some();
+        if owns_replacement && sized {
+            let mut push = |len: usize, run: TextRun| {
+                if len > 0 {
+                    out.push(TextRun { len, ..run });
+                }
+            };
+            push(before, run.clone());
+            push(
+                replacement_len,
+                TextRun {
+                    font_size: None,
+                    line_height: None,
+                    ..run.clone()
+                },
+            );
+            push(after, run);
+        } else {
+            let len = before + after + if owns_replacement { replacement_len } else { 0 };
+            if len > 0 {
+                out.push(TextRun { len, ..run });
+            }
+        }
+    }
+    *runs = out;
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -572,6 +597,49 @@ mod tests {
             let (text, runs) = fixture.truncate_with_runs(&scenario, &[4, 6, 3]);
             assert_eq!(text, "abcde\u{2026}\nxy");
             assert_eq!(runs, [4, 4, 3]);
+        });
+    }
+
+    #[crate::test]
+    fn the_affix_is_the_size_of_the_line_whatever_the_run_it_replaces(cx: &mut TestAppContext) {
+        with_fixture(cx, |fixture| {
+            let text: SharedString = "aaaaBBBBBBBB".into();
+            let run = |len, font_size| TextRun {
+                font_size,
+                ..fixture.run(len)
+            };
+            let runs = [run(4, None), run(8, Some(px(32.)))];
+            // The B's are two spaces wide each. The affix measured at the size of the
+            // line is a space, and in the size of the B's it would be two.
+            let line_width = fixture.space * 9.5;
+            let truncation = EndTruncation {
+                font_size: px(16.),
+                line_width,
+                wraps: false,
+                max_lines: None,
+                affix: AFFIX,
+                affix_width: fixture.space,
+                options: TextLayoutOptions::default(),
+                insets: &[],
+            };
+            let (cut, cut_runs) = fixture
+                .text_system
+                .truncate_end(&text, &runs, &truncation)
+                .unwrap();
+            assert_eq!(cut, "aaaaBB\u{2026}");
+            assert_eq!(cut_runs.iter().map(|run| run.len).sum::<usize>(), cut.len());
+            let lines = fixture
+                .text_system
+                .shape_text(cut.clone(), px(16.), &cut_runs, None, None)
+                .unwrap();
+            assert!(
+                lines[0].layout.width() <= line_width,
+                "{cut:?} is {:?} wide in {line_width:?}",
+                lines[0].layout.width()
+            );
+            let affix = cut_runs.last().unwrap();
+            assert_eq!(affix.len, AFFIX.len());
+            assert_eq!(affix.font_size, None);
         });
     }
 
