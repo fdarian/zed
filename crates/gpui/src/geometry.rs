@@ -2575,6 +2575,273 @@ impl From<Pixels> for Corners<Pixels> {
     }
 }
 
+/// The horizontal and vertical radius of one rounded corner as a style states them, the two
+/// values of CSS `border-radius: x / y`. A fraction is of the box's width for `x` and of its height
+/// for `y`.
+///
+/// A `y` of zero means "the same as `x`", so a corner built from a length is circular. A corner
+/// where either radius is meant to be zero is square: set `x` to zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CornerRadius {
+    /// The horizontal radius.
+    pub x: DefiniteLength,
+    /// The vertical radius; zero for the same as `x`.
+    pub y: DefiniteLength,
+}
+
+impl CornerRadius {
+    /// This radius on all four corners.
+    pub fn on_all_corners(self) -> Corners<CornerRadius> {
+        Corners {
+            top_left: self,
+            top_right: self,
+            bottom_right: self,
+            bottom_left: self,
+        }
+    }
+
+    /// The two radii in pixels for a box of `size`, each at least zero.
+    pub fn to_pixels(self, size: Size<Pixels>, rem_size: Pixels) -> Size<Pixels> {
+        Size {
+            width: self
+                .x
+                .to_pixels(AbsoluteLength::Pixels(size.width), rem_size)
+                .max(Pixels::ZERO),
+            height: self
+                .y
+                .to_pixels(AbsoluteLength::Pixels(size.height), rem_size)
+                .max(Pixels::ZERO),
+        }
+    }
+}
+
+/// A single value, as in `border-radius: 8px` and `border-radius: 50%`: a length is circular and a
+/// fraction is that fraction of each side.
+impl From<DefiniteLength> for CornerRadius {
+    fn from(length: DefiniteLength) -> Self {
+        let y = match length {
+            DefiniteLength::Absolute(_) => DefiniteLength::default(),
+            DefiniteLength::Fraction(_) | DefiniteLength::Calc { .. } => length,
+        };
+        CornerRadius { x: length, y }
+    }
+}
+
+impl From<AbsoluteLength> for CornerRadius {
+    fn from(length: AbsoluteLength) -> Self {
+        DefiniteLength::from(length).into()
+    }
+}
+
+impl From<Pixels> for CornerRadius {
+    fn from(pixels: Pixels) -> Self {
+        DefiniteLength::from(pixels).into()
+    }
+}
+
+impl From<Rems> for CornerRadius {
+    fn from(rems: Rems) -> Self {
+        DefiniteLength::from(rems).into()
+    }
+}
+
+/// The radii of a box's rounded corners: the horizontal and the vertical semi-axis of each
+/// corner's quarter ellipse.
+///
+/// Once built by [`CornerRadii::new`] a corner is either square, with both radii zero, or has
+/// both positive. Primitives that carry the two axes in separate `Corners` fields read a zero
+/// `y` as equal to `x`, so code that only knows circular corners fills `x` and leaves `y` default.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CornerRadii<T: Clone + Debug + Default + PartialEq> {
+    /// The horizontal radius of each corner.
+    pub x: Corners<T>,
+    /// The vertical radius of each corner; zero for the same as `x`.
+    pub y: Corners<T>,
+}
+
+impl<T: Clone + Debug + Default + PartialEq> From<Corners<T>> for CornerRadii<T> {
+    /// Circular corners.
+    fn from(x: Corners<T>) -> Self {
+        CornerRadii {
+            x,
+            y: Corners::default(),
+        }
+    }
+}
+
+impl<T: Copy + Clone + Debug + Default + PartialEq> CornerRadii<T> {
+    /// The vertical radius of each corner, where a zero stands for the horizontal one.
+    #[must_use]
+    pub fn explicit_y(&self) -> Corners<T> {
+        let vertical = |x: T, y: T| if y == T::default() { x } else { y };
+        Corners {
+            top_left: vertical(self.x.top_left, self.y.top_left),
+            top_right: vertical(self.x.top_right, self.y.top_right),
+            bottom_right: vertical(self.x.bottom_right, self.y.bottom_right),
+            bottom_left: vertical(self.x.bottom_left, self.y.bottom_left),
+        }
+    }
+}
+
+impl From<f32> for CornerRadii<Pixels> {
+    fn from(radius: f32) -> Self {
+        Corners::from(radius).into()
+    }
+}
+
+impl From<Pixels> for CornerRadii<Pixels> {
+    fn from(radius: Pixels) -> Self {
+        Corners::from(radius).into()
+    }
+}
+
+impl CornerRadii<Pixels> {
+    /// Circular corners of the same radius.
+    pub fn all(radius: Pixels) -> Self {
+        Corners::all(radius).into()
+    }
+
+    /// Radii that fit a box of `size`, as CSS Backgrounds 3 section 5.5 has them. `y` is the
+    /// vertical radius of each corner, zero for the same as `x`.
+    ///
+    /// A corner with a zero horizontal radius is square, and a zero vertical one stands for the
+    /// horizontal radius. When two radii of a side add up to more
+    /// than the side, every radius on both axes is multiplied by the same factor, the smallest
+    /// `side / sum` over the four sides, so the shape keeps its proportions.
+    #[must_use]
+    pub fn new(x: Corners<Pixels>, y: Corners<Pixels>, size: Size<Pixels>) -> Self {
+        let pair = |x: Pixels, y: Pixels| {
+            if x.0 <= 0. {
+                (0., 0.)
+            } else if y.0 <= 0. {
+                (x.0, x.0)
+            } else {
+                (x.0, y.0)
+            }
+        };
+        let top_left = pair(x.top_left, y.top_left);
+        let top_right = pair(x.top_right, y.top_right);
+        let bottom_right = pair(x.bottom_right, y.bottom_right);
+        let bottom_left = pair(x.bottom_left, y.bottom_left);
+
+        // `(side, sum of the two radii on it)` for the side that needs the most shrinking. The factor
+        // is applied as `radius * side / sum` instead of `radius * (side / sum)`, which stays exact
+        // when a circle's two radii are equal.
+        let mut binding: Option<(f32, f32)> = None;
+        for (side, sum) in [
+            (size.width.0, top_left.0 + top_right.0),
+            (size.width.0, bottom_left.0 + bottom_right.0),
+            (size.height.0, top_left.1 + bottom_left.1),
+            (size.height.0, top_right.1 + bottom_right.1),
+        ] {
+            let side = side.max(0.);
+            if sum > side && binding.is_none_or(|(s, t)| side * t < s * sum) {
+                binding = Some((side, sum));
+            }
+        }
+        let fit = |radius: f32| match binding {
+            Some((side, sum)) => Pixels(radius * side / sum),
+            None => Pixels(radius),
+        };
+        CornerRadii {
+            x: Corners {
+                top_left: fit(top_left.0),
+                top_right: fit(top_right.0),
+                bottom_right: fit(bottom_right.0),
+                bottom_left: fit(bottom_left.0),
+            },
+            y: Corners {
+                top_left: fit(top_left.1),
+                top_right: fit(top_right.1),
+                bottom_right: fit(bottom_right.1),
+                bottom_left: fit(bottom_left.1),
+            },
+        }
+    }
+
+    /// Whether every corner is square.
+    pub fn is_square(&self) -> bool {
+        self.x == Corners::default()
+    }
+
+    /// The radii of a box that is `amount` smaller on every side: [`CornerRadii::inset`] by the same
+    /// width everywhere.
+    #[must_use]
+    pub fn shrink(&self, amount: Pixels) -> Self {
+        self.inset(Edges::all(amount))
+    }
+
+    /// The radii of the box inside these by `edges` on each side, the corners of a padding box
+    /// inside a border box. The horizontal radius of a corner shrinks by the width of the left or
+    /// right edge it touches and the vertical one by the top or bottom edge. A corner whose radius
+    /// reaches zero on either axis becomes square, as does one that already was; negative edges
+    /// grow the radii instead.
+    #[must_use]
+    pub fn inset(&self, edges: Edges<Pixels>) -> Self {
+        let vertical = self.explicit_y();
+        let corner = |x: Pixels, y: Pixels, horizontal_edge: Pixels, vertical_edge: Pixels| {
+            let (inner_x, inner_y) = (x - horizontal_edge, y - vertical_edge);
+            if x <= Pixels::ZERO || inner_x <= Pixels::ZERO || inner_y <= Pixels::ZERO {
+                (Pixels::ZERO, Pixels::ZERO)
+            } else {
+                (inner_x, inner_y)
+            }
+        };
+        let top_left = corner(self.x.top_left, vertical.top_left, edges.left, edges.top);
+        let top_right = corner(self.x.top_right, vertical.top_right, edges.right, edges.top);
+        let bottom_right = corner(
+            self.x.bottom_right,
+            vertical.bottom_right,
+            edges.right,
+            edges.bottom,
+        );
+        let bottom_left = corner(
+            self.x.bottom_left,
+            vertical.bottom_left,
+            edges.left,
+            edges.bottom,
+        );
+        CornerRadii {
+            x: Corners {
+                top_left: top_left.0,
+                top_right: top_right.0,
+                bottom_right: bottom_right.0,
+                bottom_left: bottom_left.0,
+            },
+            y: Corners {
+                top_left: top_left.1,
+                top_right: top_right.1,
+                bottom_right: bottom_right.1,
+                bottom_left: bottom_left.1,
+            },
+        }
+    }
+
+    /// The radii for a size scaled by `factor`.
+    #[must_use]
+    pub fn scale(&self, factor: f32) -> CornerRadii<ScaledPixels> {
+        CornerRadii {
+            x: self.x.scale(factor),
+            y: self.y.scale(factor),
+        }
+    }
+}
+
+/// The signed distance from a point to the quarter ellipse of a box's rounded corner, positive
+/// outside and negative inside. `from_centre` is measured from the ellipse's centre towards the
+/// box's corner and both its components are positive; `radii` are the ellipse's semi-axes.
+///
+/// This is the function the shaders paint with (`ellipse_corner_sdf`), so hit testing and clipping
+/// agree with what is drawn. The unit circle distance is scaled by the gradient of the ellipse's
+/// implicit function: exact on a circle, and within a few hundredths of a pixel of the true
+/// distance on an eccentric ellipse near the edge. The sign is always exact.
+pub(crate) fn ellipse_corner_sdf(from_centre: Point<f32>, radii: Size<f32>) -> f32 {
+    let k0 = (from_centre.x / radii.width).hypot(from_centre.y / radii.height);
+    let k1 = (from_centre.x / (radii.width * radii.width))
+        .hypot(from_centre.y / (radii.height * radii.height));
+    k0 * (k0 - 1.) / k1
+}
+
 /// Represents an angle in Radians
 #[derive(
     Clone,
@@ -4111,5 +4378,311 @@ mod tests {
         );
         assert!(DefiniteLength::try_from("calc(10px * 50%)").is_err());
         assert!(DefiniteLength::try_from("calc(10px + 50)").is_err());
+    }
+
+    fn corners(top_left: f32, top_right: f32, bottom_right: f32, bottom_left: f32) -> Corners<Pixels> {
+        Corners {
+            top_left: px(top_left),
+            top_right: px(top_right),
+            bottom_right: px(bottom_right),
+            bottom_left: px(bottom_left),
+        }
+    }
+
+    fn assert_close(actual: Pixels, expected: f32) {
+        assert!(
+            (actual.0 - expected).abs() < 1e-4,
+            "{} is not {expected}",
+            actual.0
+        );
+    }
+
+    #[test]
+    fn a_corner_with_a_zero_horizontal_radius_is_square() {
+        let radii = CornerRadii::new(
+            corners(0., 10., 0., 10.),
+            corners(12., 4., 12., 4.),
+            size(px(100.), px(100.)),
+        );
+        assert_eq!(radii.x, corners(0., 10., 0., 10.));
+        assert_eq!(radii.y, corners(0., 4., 0., 4.));
+    }
+
+    #[test]
+    fn a_zero_vertical_radius_makes_the_corner_circular() {
+        let radii = CornerRadii::new(
+            corners(8., 0., 6., 3.),
+            corners(0., 0., 2., 0.),
+            size(px(100.), px(100.)),
+        );
+        assert_eq!(radii.x, corners(8., 0., 6., 3.));
+        assert_eq!(radii.y, corners(8., 0., 2., 3.));
+    }
+
+    #[test]
+    fn radii_that_fit_are_left_alone() {
+        let radii = CornerRadii::new(
+            corners(30., 20., 10., 40.),
+            corners(5., 25., 10., 15.),
+            size(px(100.), px(60.)),
+        );
+        assert_eq!(radii.x, corners(30., 20., 10., 40.));
+        assert_eq!(radii.y, corners(5., 25., 10., 15.));
+    }
+
+    #[test]
+    fn radii_that_overflow_a_side_all_shrink_by_the_same_factor() {
+        // The top side holds 80 + 60 in 100, so every radius on both axes scales by 100 / 140,
+        // including the bottom right corner that is nowhere near the top.
+        let radii = CornerRadii::new(
+            corners(80., 60., 10., 0.),
+            corners(10., 10., 10., 0.),
+            size(px(100.), px(50.)),
+        );
+        let factor = 100. / 140.;
+        assert_close(radii.x.top_left, 80. * factor);
+        assert_close(radii.x.top_right, 60. * factor);
+        assert_close(radii.x.bottom_right, 10. * factor);
+        assert_close(radii.y.top_left, 10. * factor);
+        assert_close(radii.y.top_right, 10. * factor);
+        assert_close(radii.y.bottom_right, 10. * factor);
+        assert_eq!(radii.x.bottom_left, px(0.));
+        assert_eq!(radii.y.bottom_left, px(0.));
+    }
+
+    #[test]
+    fn the_side_that_overflows_the_most_sets_the_factor() {
+        // Horizontally 20 + 20 fits 100, vertically 40 + 40 needs 50 / 80.
+        let radii = CornerRadii::new(
+            corners(20., 20., 20., 20.),
+            corners(40., 40., 40., 40.),
+            size(px(100.), px(50.)),
+        );
+        assert_close(radii.x.top_left, 12.5);
+        assert_close(radii.y.top_left, 25.);
+        // Both overflow, the horizontal one by more: 100 / 300 beats 50 / 120.
+        let radii = CornerRadii::new(
+            corners(150., 150., 150., 150.),
+            corners(60., 60., 60., 60.),
+            size(px(100.), px(50.)),
+        );
+        assert_close(radii.x.top_left, 50.);
+        assert_close(radii.y.top_left, 20.);
+    }
+
+    #[test]
+    fn circular_radii_fit_exactly() {
+        // A circle: the two radii of each side add up to the side.
+        let radii = CornerRadii::new(
+            Corners::all(px(20.)),
+            Corners::default(),
+            size(px(40.), px(40.)),
+        );
+        assert_eq!(radii.x, Corners::all(px(20.)));
+        assert_eq!(radii.y, Corners::all(px(20.)));
+        // A pill: a huge radius shrinks to half the short side, to the bit.
+        let radii = CornerRadii::new(
+            Corners::all(px(500.)),
+            Corners::default(),
+            size(px(100.), px(20.)),
+        );
+        assert_eq!(radii.x, Corners::all(px(10.)));
+        assert_eq!(radii.y, Corners::all(px(10.)));
+    }
+
+    #[test]
+    fn a_box_without_room_has_square_corners() {
+        let radii = CornerRadii::new(
+            Corners::all(px(10.)),
+            Corners::all(px(10.)),
+            size(px(0.), px(30.)),
+        );
+        assert_eq!(radii.x, Corners::default());
+        assert_eq!(radii.y, Corners::default());
+    }
+
+    #[test]
+    fn percentage_radii_resolve_against_each_side() {
+        let rem = px(16.);
+        let radii = |corner: CornerRadius, size: Size<Pixels>| {
+            let resolved = corner.to_pixels(size, rem);
+            CornerRadii::new(
+                Corners::all(resolved.width),
+                Corners::all(resolved.height),
+                size,
+            )
+        };
+        // `border-radius: 50%` on a 200 x 100 box is an ellipse that fills it.
+        let ellipse = radii(
+            CornerRadius::from(DefiniteLength::Fraction(0.5)),
+            size(px(200.), px(100.)),
+        );
+        assert_eq!(ellipse.x, Corners::all(px(100.)));
+        assert_eq!(ellipse.y, Corners::all(px(50.)));
+        // `20% / 10px`.
+        let mixed = radii(
+            CornerRadius {
+                x: DefiniteLength::Fraction(0.2),
+                y: px(10.).into(),
+            },
+            size(px(200.), px(100.)),
+        );
+        assert_eq!(mixed.x, Corners::all(px(40.)));
+        assert_eq!(mixed.y, Corners::all(px(10.)));
+        // A length alone is circular and rems follow the rem size.
+        let circular = radii(CornerRadius::from(rems(0.5)), size(px(200.), px(100.)));
+        assert_eq!(circular.x, Corners::all(px(8.)));
+        assert_eq!(circular.y, Corners::all(px(8.)));
+        // Negative radii are not radii.
+        let negative = CornerRadius::from(px(-4.)).to_pixels(size(px(10.), px(10.)), rem);
+        assert_eq!(negative, size(px(0.), px(0.)));
+    }
+
+    #[test]
+    fn inset_shrinks_each_axis_by_the_edge_it_meets() {
+        let radii = CornerRadii {
+            x: Corners::all(px(10.)),
+            y: Corners::all(px(6.)),
+        };
+        let inner = radii.inset(Edges {
+            top: px(1.),
+            right: px(3.),
+            bottom: px(2.),
+            left: px(4.),
+        });
+        assert_eq!(inner.x, corners(6., 7., 7., 6.));
+        assert_eq!(inner.y, corners(5., 5., 4., 4.));
+    }
+
+    #[test]
+    fn inset_takes_a_circular_corner_as_an_equal_vertical_radius() {
+        let radii = CornerRadii::from(Corners::all(px(10.)));
+        let inner = radii.inset(Edges {
+            top: px(4.),
+            right: px(0.),
+            bottom: px(0.),
+            left: px(2.),
+        });
+        assert_eq!(inner.x.top_left, px(8.));
+        assert_eq!(inner.y.top_left, px(6.));
+        assert_eq!(inner.x.bottom_right, px(10.));
+        assert_eq!(inner.y.bottom_right, px(10.));
+    }
+
+    #[test]
+    fn an_inset_corner_is_square_once_either_axis_reaches_zero() {
+        let radii = CornerRadii {
+            x: Corners::all(px(10.)),
+            y: Corners::all(px(6.)),
+        };
+        // The vertical radius is used up by the top edge, the horizontal one is not.
+        let inner = radii.inset(Edges {
+            top: px(6.),
+            right: px(0.),
+            bottom: px(0.),
+            left: px(0.),
+        });
+        assert_eq!(inner.x.top_left, px(0.));
+        assert_eq!(inner.y.top_left, px(0.));
+        assert_eq!(inner.x.top_right, px(0.));
+        assert_eq!(inner.y.top_right, px(0.));
+        assert_eq!(inner.x.bottom_left, px(10.));
+        assert_eq!(inner.y.bottom_left, px(6.));
+        // And the other way round.
+        let inner = radii.inset(Edges {
+            top: px(0.),
+            right: px(12.),
+            bottom: px(0.),
+            left: px(0.),
+        });
+        assert_eq!(inner.x.top_right, px(0.));
+        assert_eq!(inner.y.top_right, px(0.));
+        assert_eq!(inner.x.top_left, px(10.));
+    }
+
+    #[test]
+    fn a_square_corner_stays_square_when_the_edges_grow() {
+        let radii = CornerRadii {
+            x: corners(0., 10., 0., 10.),
+            y: corners(0., 6., 0., 6.),
+        };
+        let outer = radii.inset(Edges::all(px(-2.)));
+        assert_eq!(outer.x, corners(0., 12., 0., 12.));
+        assert_eq!(outer.y, corners(0., 8., 0., 8.));
+    }
+
+    #[test]
+    fn shrinking_is_insetting_every_edge_by_the_same_amount() {
+        let radii = CornerRadii {
+            x: Corners::all(px(10.)),
+            y: Corners::all(px(6.)),
+        };
+        assert_eq!(radii.shrink(px(2.)), radii.inset(Edges::all(px(2.))));
+        assert_eq!(radii.shrink(px(2.)).x, Corners::all(px(8.)));
+        assert_eq!(radii.shrink(px(2.)).y, Corners::all(px(4.)));
+        assert!(radii.shrink(px(6.)).is_square());
+    }
+
+    /// The distance from `point` to the quarter ellipse `x = radius_x cos t, y = radius_y sin t`,
+    /// negative inside, found by trying a fine sampling of the arc.
+    fn nearest_point_distance(point: (f64, f64), radii: (f64, f64)) -> f64 {
+        const STEPS: u32 = 20_000;
+        let nearest = (0..=STEPS)
+            .map(|step| {
+                let angle = std::f64::consts::FRAC_PI_2 * f64::from(step) / f64::from(STEPS);
+                (point.0 - radii.0 * angle.cos()).hypot(point.1 - radii.1 * angle.sin())
+            })
+            .fold(f64::INFINITY, f64::min);
+        if (point.0 / radii.0).hypot(point.1 / radii.1) < 1. {
+            -nearest
+        } else {
+            nearest
+        }
+    }
+
+    #[test]
+    fn the_ellipse_distance_agrees_with_the_nearest_point_on_the_arc() {
+        for radii in [
+            (20., 20.),
+            (20., 10.),
+            (10., 20.),
+            (30., 15.),
+            (40., 8.),
+            (8., 40.),
+        ] {
+            for step in 1..16 {
+                let angle = std::f64::consts::FRAC_PI_2 * f64::from(step) / 16.;
+                let (arc_x, arc_y) = (radii.0 * angle.cos(), radii.1 * angle.sin());
+                let normal = (angle.cos() / radii.0, angle.sin() / radii.1);
+                let length = normal.0.hypot(normal.1);
+                for offset in [-0.75, -0.3, 0., 0.3, 0.75] {
+                    let point = (
+                        arc_x + normal.0 / length * offset,
+                        arc_y + normal.1 / length * offset,
+                    );
+                    let approximate = ellipse_corner_sdf(
+                        Point::new(point.0 as f32, point.1 as f32),
+                        Size::new(radii.0 as f32, radii.1 as f32),
+                    );
+                    let exact = nearest_point_distance(point, radii);
+                    assert!(
+                        (f64::from(approximate) - exact).abs() < 0.1,
+                        "radii {radii:?}, point {point:?}: {approximate} is not {exact}"
+                    );
+                    // The edge is where the shader draws it, whatever the scale of the distance.
+                    if offset != 0. {
+                        assert_eq!(approximate > 0., offset > 0., "radii {radii:?}, point {point:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_ellipse_distance_of_a_circle_is_the_circle_distance() {
+        for (x, y) in [(3., 4.), (10., 0.5), (14., 14.), (0.2, 18.)] {
+            let distance = ellipse_corner_sdf(Point::new(x, y), Size::new(12., 12.));
+            assert!((distance - (f32::hypot(x, y) - 12.)).abs() < 1e-4);
+        }
     }
 }
