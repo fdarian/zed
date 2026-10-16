@@ -2,12 +2,14 @@ mod font_fallbacks;
 mod font_features;
 mod line;
 mod line_layout;
+mod line_truncation;
 mod line_wrapper;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
 pub use line_layout::*;
+pub(crate) use line_truncation::EndTruncation;
 pub use line_wrapper::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

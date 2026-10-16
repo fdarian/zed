@@ -1,8 +1,8 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
+    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, EndTruncation,
+    GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
+    LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
+    TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
     WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
@@ -648,6 +648,10 @@ impl TextLayout {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {
+                let width = known_dimensions.width.or(match available_space.width {
+                    crate::AvailableSpace::Definite(x) => Some(x),
+                    _ => None,
+                });
                 let wrap_width = if text_style.white_space == WhiteSpace::Normal {
                     known_dimensions.width.or(match available_space.width {
                         crate::AvailableSpace::Definite(x) => Some(x),
@@ -662,25 +666,8 @@ impl TextLayout {
                 } else {
                     None
                 };
-
-                let (truncate_width, truncation_affix, truncate_from) =
-                    if let Some(text_overflow) = text_style.text_overflow.clone() {
-                        let width = known_dimensions.width.or(match available_space.width {
-                            crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
-                                Some(max_lines) => Some(x * max_lines),
-                                None => Some(x),
-                            },
-                            _ => None,
-                        });
-
-                        match text_overflow {
-                            TextOverflow::Truncate(s) => (width, s, TruncateFrom::End),
-                            TextOverflow::TruncateStart(s) => (width, s, TruncateFrom::Start),
-                            TextOverflow::TruncateMiddle(s) => (width, s, TruncateFrom::Middle),
-                        }
-                    } else {
-                        (None, "".into(), TruncateFrom::End)
-                    };
+                let truncation = text_style.text_overflow.as_ref().zip(width);
+                let truncate_width = truncation.map(|(_, width)| width);
 
                 // Only use cached layout if:
                 // 1. We have a cached size
@@ -700,67 +687,90 @@ impl TextLayout {
                     return size;
                 }
 
-                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
-                let (text, runs) = if let Some(truncate_width) = truncate_width {
-                    if let Some(max_lines) = text_style.line_clamp
-                        && let Some(wrap_width) = wrap_width
-                    {
-                        line_wrapper.truncate_wrapped_line(
-                            text.clone(),
-                            wrap_width,
-                            max_lines,
-                            &truncation_affix,
-                            &runs,
-                            truncate_from,
-                        )
-                    } else if let Some(unclipped) = window
+                let truncated = (|| -> anyhow::Result<_> {
+                    let Some((text_overflow, width)) = truncation else {
+                        return Ok((text.clone(), Cow::Borrowed(&*runs)));
+                    };
+                    let mut line_wrapper =
+                        cx.text_system().line_wrapper(text_style.font(), font_size);
+                    match text_overflow {
+                        TextOverflow::Truncate(affix) => {
+                            // Cut where the lines break when the text is laid out, not
+                            // where a sum of character advances says they would.
+                            window.text_system().truncate_end(
+                                &text,
+                                &runs,
+                                &EndTruncation {
+                                    font_size,
+                                    line_width: width,
+                                    wraps: wrap_width.is_some(),
+                                    max_lines: text_style.line_clamp,
+                                    affix,
+                                    affix_width: line_wrapper.width_of(affix),
+                                    options: text_style.layout_options(),
+                                },
+                            )
+                        }
+                        TextOverflow::TruncateStart(affix)
+                        | TextOverflow::TruncateMiddle(affix) => {
+                            let (truncate_from, flat_width) = match (text_overflow, wrap_width) {
+                                (TextOverflow::TruncateStart(_), Some(_)) => (
+                                    TruncateFrom::Start,
+                                    width * text_style.line_clamp.unwrap_or(1),
+                                ),
+                                (TextOverflow::TruncateStart(_), None) => {
+                                    (TruncateFrom::Start, width)
+                                }
+                                _ => (TruncateFrom::Middle, width),
+                            };
+                            let unclipped = window.text_system().shape_text_with_options(
+                                text.clone(),
+                                font_size,
+                                &runs,
+                                None,
+                                None,
+                                text_style.layout_options(),
+                            )?;
+                            if unclipped
+                                .iter()
+                                .all(|line| line.size(line_height).width <= flat_width)
+                            {
+                                // The truncation below sums per-character advances,
+                                // which overestimates the shaped width (no kerning), cutting
+                                // text that fits exactly in its measured width. Skip it
+                                // whenever the honestly-shaped text fits; the shaping comes
+                                // from the line layout cache when the same text was already
+                                // measured untruncated this frame.
+                                Ok((text.clone(), Cow::Borrowed(&*runs)))
+                            } else {
+                                Ok(line_wrapper.truncate_line(
+                                    text.clone(),
+                                    flat_width,
+                                    affix,
+                                    &runs,
+                                    truncate_from,
+                                ))
+                            }
+                        }
+                    }
+                })()
+                .log_err();
+                let lines = truncated.and_then(|(text, runs)| {
+                    let len = text.len();
+                    window
                         .text_system()
                         .shape_text_with_options(
-                            text.clone(),
+                            text,
                             font_size,
                             &runs,
-                            None,
-                            None,
+                            wrap_width,            // Wrap if we know the width.
+                            text_style.line_clamp, // Limit the number of lines if line_clamp is set.
                             text_style.layout_options(),
                         )
                         .log_err()
-                        && unclipped
-                            .iter()
-                            .all(|line| line.size(line_height).width <= truncate_width)
-                    {
-                        // The truncation decision below sums per-character advances,
-                        // which overestimates the shaped width (no kerning), truncating
-                        // text that fits exactly in its measured width. Skip truncation
-                        // whenever the honestly-shaped text fits; the shaping result
-                        // comes from the line layout cache when the same text was
-                        // already measured untruncated this frame.
-                        (text.clone(), Cow::Borrowed(&*runs))
-                    } else {
-                        line_wrapper.truncate_line(
-                            text.clone(),
-                            truncate_width,
-                            &truncation_affix,
-                            &runs,
-                            truncate_from,
-                        )
-                    }
-                } else {
-                    (text.clone(), Cow::Borrowed(&*runs))
-                };
-                let len = text.len();
-
-                let Some(lines) = window
-                    .text_system()
-                    .shape_text_with_options(
-                        text,
-                        font_size,
-                        &runs,
-                        wrap_width,            // Wrap if we know the width.
-                        text_style.line_clamp, // Limit the number of lines if line_clamp is set.
-                        text_style.layout_options(),
-                    )
-                    .log_err()
-                else {
+                        .map(|lines| (len, lines))
+                });
+                let Some((len, lines)) = lines else {
                     element_state.0.borrow_mut().replace(TextLayoutInner {
                         lines: Default::default(),
                         len: 0,
@@ -1305,6 +1315,85 @@ mod tests {
         let _ = div().child("String".to_string());
         let _ = div().child(Cow::Borrowed("Cow"));
         let _ = div().child(SharedString::from("SharedString"));
+    }
+
+    #[cfg(target_os = "macos")]
+    mod truncation {
+        use super::*;
+        use crate::{
+            AppContext as _, Context, ParentElement as _, Render, Styled as _, TabSize,
+            TestAppContext, WhiteSpace, div, font, px,
+        };
+
+        struct TruncatedText {
+            text: &'static str,
+            width: Pixels,
+            nowrap: bool,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for TruncatedText {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let text = StyledText::new(self.text);
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let mut container = div()
+                    .w(self.width)
+                    .font_family(font("Menlo").family)
+                    .text_size(px(16.))
+                    .text_ellipsis();
+                container.text_style().tab_size = Some(TabSize::Spaces(4.));
+                container.text_style().hang_trailing_spaces = Some(true);
+                if self.nowrap {
+                    container.text_style().white_space = Some(WhiteSpace::Nowrap);
+                } else {
+                    container = container.line_clamp(2);
+                }
+                container.child(text)
+            }
+        }
+
+        fn laid_out(
+            cx: &mut TestAppContext,
+            text: &'static str,
+            columns: f32,
+            nowrap: bool,
+        ) -> TextLayout {
+            let space = cx.update(|cx| {
+                let text_system = cx.text_system();
+                text_system
+                    .advance(text_system.resolve_font(&font("Menlo")), px(16.), ' ')
+                    .unwrap()
+                    .width
+            });
+            let layout = Rc::new(RefCell::new(None));
+            let window = cx.add_window({
+                let layout = layout.clone();
+                move |_, _| TruncatedText {
+                    text,
+                    width: space * (columns + 0.25),
+                    nowrap,
+                    layout,
+                }
+            });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            let layout = layout.borrow().clone().unwrap();
+            layout
+        }
+
+        #[crate::test]
+        fn a_clamped_paragraph_with_tabs_is_cut_where_it_wraps(cx: &mut TestAppContext) {
+            // The tabs end the first line at column 10, so dd starts the second one.
+            let layout = laid_out(cx, "aa\tbb\tcc dd ee ff gg hh ii jj", 12., false);
+            assert_eq!(layout.text(), "aa\tbb\tcc dd ee ff gg\u{2026}");
+            assert_eq!(layout.wrapped_text(), "aa\tbb\tcc \ndd ee ff gg\u{2026}");
+        }
+
+        #[crate::test]
+        fn a_line_with_tabs_that_does_not_wrap_is_cut_at_its_stop(cx: &mut TestAppContext) {
+            let layout = laid_out(cx, "a\tb\tc\td\te", 10., true);
+            assert_eq!(layout.text(), "a\tb\tc\u{2026}");
+        }
     }
 
     #[test]
