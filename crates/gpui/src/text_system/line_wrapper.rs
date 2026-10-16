@@ -721,7 +721,8 @@ mod tests {
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
     use crate::{
-        TabSize, TextLayoutOptions, TextRun, WindowTextSystem, WrapBoundary, WrappedLine, point,
+        OverflowWrap, TabSize, TextLayoutOptions, TextRun, WindowTextSystem, WrapBoundary,
+        WrappedLine, point,
     };
 
     fn build_wrapper() -> LineWrapper {
@@ -1960,6 +1961,7 @@ mod tests {
         tab_size: None,
         hang_trailing_spaces: true,
         break_spaces: false,
+        overflow_wrap: OverflowWrap::BreakWord,
     };
 
     #[cfg(target_os = "macos")]
@@ -1967,6 +1969,7 @@ mod tests {
         tab_size: None,
         hang_trailing_spaces: false,
         break_spaces: true,
+        overflow_wrap: OverflowWrap::BreakWord,
     };
 
     #[cfg(target_os = "macos")]
@@ -2057,6 +2060,7 @@ mod tests {
             tab_size: Some(TabSize::Spaces(8.)),
             hang_trailing_spaces: true,
             break_spaces: false,
+            ..Default::default()
         };
         let text = TabbedText::shape_with(cx, "aaaa\tbb", Some(width), options);
         assert_eq!(text.line.layout.wrap_boundaries().len(), 1);
@@ -2204,6 +2208,112 @@ mod tests {
             assert!(Arc::ptr_eq(
                 &shape("abc de", BREAKING).layout,
                 &shape("abc de", both).layout
+            ));
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn overflowing(overflow_wrap: OverflowWrap) -> TextLayoutOptions {
+        TextLayoutOptions {
+            overflow_wrap,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_text_breaks_a_word_that_does_not_fit_by_default(cx: &mut TestAppContext) {
+        let width = spaces_wide(cx, 3.5);
+        let text = TabbedText::shape_with(cx, "aaaaaaaa bbbb", Some(width), Default::default());
+        // Three letters to a line: "aaa" "aaa" "aa " "bbb" "b".
+        assert_eq!(text.line.layout.wrap_boundaries().len(), 4);
+        assert_columns(&text, &[(4, 1., 1), (7, 1., 2), (10, 1., 3)]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_normal_overflow_wrap_keeps_a_word_whole(cx: &mut TestAppContext) {
+        let width = spaces_wide(cx, 3.5);
+        let options = overflowing(OverflowWrap::Normal);
+        let text = TabbedText::shape_with(cx, "aaaaaaaa bbbb", Some(width), options);
+        assert_eq!(
+            text.line.layout.wrap_boundaries(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 9
+            }]
+        );
+        assert_columns(&text, &[(7, 7., 0), (10, 1., 1)]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_break_word_and_anywhere_break_only_without_an_earlier_break(cx: &mut TestAppContext) {
+        let width = spaces_wide(cx, 5.5);
+        for overflow_wrap in [OverflowWrap::BreakWord, OverflowWrap::Anywhere] {
+            let text =
+                TabbedText::shape_with(cx, "aa bbbbbbbb", Some(width), overflowing(overflow_wrap));
+            // "aa " then "bbbbb" and "bbb": the word goes down whole before it is cut.
+            assert_eq!(text.line.layout.wrap_boundaries().len(), 2);
+            assert_columns(&text, &[(4, 1., 1), (9, 1., 2)]);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_overflowing_word_when_spaces_break_leaves_no_line_of_a_space(
+        cx: &mut TestAppContext,
+    ) {
+        let width = spaces_wide(cx, 4.5);
+        let options = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            ..BREAKING
+        };
+        let text = TabbedText::shape_with(cx, "aaaa bbbb", Some(width), options);
+        // "aaaa " overflows by its space, which stays at the end of its line.
+        assert_eq!(text.line.layout.wrap_boundaries().len(), 1);
+        assert_columns(&text, &[(4, 4., 0), (6, 1., 1)]);
+        let broken = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::BreakWord,
+            ..BREAKING
+        };
+        let text = TabbedText::shape_with(cx, "aaaa bbbb", Some(width), broken);
+        assert_eq!(text.line.layout.wrap_boundaries().len(), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_text_has_a_layout_for_each_overflow_wrap(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let shape = |wrap_width, options| {
+                let run = TextRun {
+                    len: 9,
+                    font: font("Menlo"),
+                    ..Default::default()
+                };
+                text_system
+                    .shape_text_with_options(
+                        "aaaa bbbb".into(),
+                        px(16.),
+                        &[run],
+                        wrap_width,
+                        None,
+                        options,
+                    )
+                    .unwrap()
+                    .remove(0)
+            };
+            let wrap_width = Some(px(40.));
+            let default = shape(wrap_width, Default::default());
+            assert!(!Arc::ptr_eq(
+                &default.layout,
+                &shape(wrap_width, overflowing(OverflowWrap::Normal)).layout
+            ));
+            // Without a wrap width there is nothing to break.
+            assert!(Arc::ptr_eq(
+                &shape(None, Default::default()).layout,
+                &shape(None, overflowing(OverflowWrap::Normal)).layout
             ));
         });
     }

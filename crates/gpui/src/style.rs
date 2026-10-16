@@ -11,7 +11,7 @@ use crate::{
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextLayoutOptions, TextRun, Window,
-    black, phi, point, px, quad, rems, size,
+    OverflowWrap, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -630,6 +630,11 @@ pub struct TextStyle {
     /// Whether a line may break after every space and tab, and spaces never hang,
     /// as in CSS `white-space: break-spaces`. Overrides `hang_trailing_spaces`.
     pub break_spaces: bool,
+
+    /// Whether a word that does not fit and has no earlier place to break on its
+    /// line breaks anyway, as in CSS `overflow-wrap`. Defaults to `BreakWord`, which
+    /// is not CSS's initial value: it is how text has always wrapped here.
+    pub overflow_wrap: OverflowWrap,
 }
 
 impl Default for TextStyle {
@@ -654,6 +659,7 @@ impl Default for TextStyle {
             tab_size: None,
             hang_trailing_spaces: false,
             break_spaces: false,
+            overflow_wrap: OverflowWrap::default(),
         }
     }
 }
@@ -698,6 +704,7 @@ impl TextStyle {
             tab_size: self.tab_size,
             hang_trailing_spaces: self.hang_trailing_spaces,
             break_spaces: self.break_spaces,
+            overflow_wrap: self.overflow_wrap,
         }
     }
 

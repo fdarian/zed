@@ -44,6 +44,22 @@ impl Hash for TabSize {
     }
 }
 
+/// Whether a word with no place to break on its line breaks anyway, as in CSS
+/// `overflow-wrap`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum OverflowWrap {
+    /// A word that does not fit overflows the line. This is CSS's initial value,
+    /// but not this type's default.
+    Normal,
+    /// A word that does not fit and has no earlier place to break on its line
+    /// breaks at the character that overflows. This is what text has always done
+    /// here, so it is the default.
+    #[default]
+    BreakWord,
+    /// Lays the text out as `BreakWord` does.
+    Anywhere,
+}
+
 /// What a line of text is laid out with, beyond its fonts and its wrap width.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextLayoutOptions {
@@ -61,6 +77,8 @@ pub struct TextLayoutOptions {
     /// of a line is measured and aligned like any other character. This
     /// overrides `hang_trailing_spaces`.
     pub break_spaces: bool,
+    /// Whether a word that does not fit breaks anyway.
+    pub overflow_wrap: OverflowWrap,
 }
 
 impl TextLayoutOptions {
@@ -287,6 +305,7 @@ impl LineLayout {
         tab_stop: Option<TabStopFor<'_>>,
     ) -> WrapComputation {
         let hang = options.spaces_hang();
+        let breaks_words = options.overflow_wrap != OverflowWrap::Normal;
         let mut boundaries = SmallVec::new();
         // The glyph each line starts at.
         let mut line_starts: SmallVec<[usize; 2]> = SmallVec::new();
@@ -330,9 +349,12 @@ impl LineLayout {
             let hanging = hang && positions.glyphs[ix].hangs;
             let width = positions.x(ix + 1) - last_boundary_x;
 
+            // Without a place to break, a word that does not fit is left to overflow
+            // when `overflow_wrap` is normal, and goes on until one turns up.
             if !hanging
                 && wrap_width.is_some_and(|wrap_width| width > wrap_width)
                 && boundary > last_boundary
+                && (last_candidate_ix.is_some() || breaks_words)
             {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
@@ -876,12 +898,18 @@ impl LineLayoutCache {
     {
         // Text without a tab or a space is laid out the same whatever its tab size
         // or what happens to its spaces, so it must not take a cache entry of its
-        // own. Hanging that break_spaces overrides is dropped for the same reason.
+        // own. Hanging that break_spaces overrides is dropped for the same reason,
+        // and so is overflow_wrap when it has no wrap width.
         let has_spaces = text.as_ref().contains(hangs);
         let options = TextLayoutOptions {
             tab_size: options.tab_size.filter(|_| text.as_ref().contains('\t')),
             hang_trailing_spaces: options.spaces_hang() && has_spaces,
             break_spaces: options.break_spaces && has_spaces,
+            overflow_wrap: if wrap_width.is_some() {
+                options.overflow_wrap
+            } else {
+                OverflowWrap::default()
+            },
         };
         let key = &CacheKeyRef {
             text: text.as_ref(),
@@ -2013,5 +2041,113 @@ mod tests {
             }
             .spaces_hang()
         );
+    }
+
+    fn overflow_line(
+        text: &str,
+        wrap_width: f32,
+        overflow_wrap: OverflowWrap,
+    ) -> WrappedLineLayout {
+        let options = TextLayoutOptions {
+            overflow_wrap,
+            ..Default::default()
+        };
+        line_with_options(text, Some(wrap_width), options)
+    }
+
+    /// The character, not byte, index each wrap boundary is at.
+    fn boundary_chars(layout: &WrappedLineLayout, text: &str) -> Vec<usize> {
+        boundary_indices(layout)
+            .into_iter()
+            .map(|byte| text[..byte].chars().count())
+            .collect()
+    }
+
+    #[test]
+    fn test_the_default_options_break_a_word_that_does_not_fit() {
+        assert_eq!(OverflowWrap::default(), OverflowWrap::BreakWord);
+        // What this layout did before there was a choice: a word with no earlier
+        // place to break is cut where it overflows, and one after a space is not.
+        let layout = line_with_options("aaaaaaaa bbbb", Some(35.), TextLayoutOptions::default());
+        assert_eq!(boundary_indices(&layout), vec![3, 6, 9, 12]);
+        let layout = line_with_options("aa bbbbbbbb", Some(55.), TextLayoutOptions::default());
+        assert_eq!(boundary_indices(&layout), vec![3, 8]);
+        let layout = line_with_options("中中中中 中中", Some(35.), TextLayoutOptions::default());
+        assert_eq!(boundary_chars(&layout, "中中中中 中中"), vec![3, 6]);
+    }
+
+    #[test]
+    fn test_normal_overflow_wrap_keeps_a_long_word_whole() {
+        let text = "aaaaaaaa bbbb";
+        let layout = overflow_line(text, 35., OverflowWrap::Normal);
+        // "aaaaaaaa " overflows its line, and "bbbb" its own.
+        assert_eq!(boundary_indices(&layout), vec![9]);
+        let columns = columns(&layout, text);
+        assert_eq!(columns[7], (70., 0));
+        assert_eq!(columns[10], (10., 1));
+        // A word alone on the line overflows it, however long.
+        let layout = overflow_line("aaaaaaaaaaaa", 35., OverflowWrap::Normal);
+        assert!(layout.wrap_boundaries.is_empty());
+        assert_eq!(layout.unwrapped_layout.width, px(120.));
+    }
+
+    #[test]
+    fn test_normal_overflow_wrap_still_breaks_where_a_word_can_start() {
+        let layout = overflow_line("aa bb cc dd", 45., OverflowWrap::Normal);
+        assert_eq!(boundary_indices(&layout), vec![3, 6, 9]);
+        // After overflowing, the line breaks at the next place there is one.
+        let layout = overflow_line("aaaaaaaa bb cc", 35., OverflowWrap::Normal);
+        assert_eq!(boundary_indices(&layout), vec![9, 12]);
+    }
+
+    #[test]
+    fn test_break_word_and_anywhere_break_a_word_only_without_an_earlier_break() {
+        for overflow_wrap in [OverflowWrap::BreakWord, OverflowWrap::Anywhere] {
+            // "bbbbbbbb" fits after the space on a line of its own, so it breaks
+            // there and not inside "aa bbb".
+            let layout = overflow_line("aa bbbbbbbb", 55., overflow_wrap);
+            assert_eq!(boundary_indices(&layout), vec![3, 8], "{overflow_wrap:?}");
+            // With no earlier place the word breaks where it overflows.
+            let layout = overflow_line("aaaaaaaa", 35., overflow_wrap);
+            assert_eq!(boundary_indices(&layout), vec![3, 6], "{overflow_wrap:?}");
+        }
+    }
+
+    #[test]
+    fn test_overflowing_words_when_spaces_break_leave_no_line_of_one_space() {
+        // "aaaa " does not fit in 45, and the space, which is the only place to
+        // break, does not start a line of its own.
+        let options = TextLayoutOptions {
+            break_spaces: true,
+            overflow_wrap: OverflowWrap::Normal,
+            ..Default::default()
+        };
+        let layout = line_with_options("aaaa bbbb", Some(45.), options);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        let layout = line_with_options("aaaa bbbb", Some(35.), options);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        // A run of spaces still breaks between any two of them.
+        let layout = line_with_options("aaaa    bbbb", Some(65.), options);
+        assert_eq!(boundary_indices(&layout), vec![6]);
+        // A word that is broken inside puts the space on its own line.
+        let broken = TextLayoutOptions {
+            break_spaces: true,
+            ..Default::default()
+        };
+        let layout = line_with_options("aaaa bbbb", Some(45.), broken);
+        assert_eq!(boundary_indices(&layout), vec![4, 5]);
+    }
+
+    #[test]
+    fn test_overflow_wrap_normal_with_a_line_clamp_stops_at_the_last_line() {
+        let text = "aa bbbbbbbbbbbb cc dd";
+        let shaped = monospace_layout(text, 10.);
+        let options = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            ..Default::default()
+        };
+        let computation =
+            shaped.compute_wrap_boundaries(text, Some(px(35.)), Some(2), options, None);
+        assert_eq!(computation.boundaries.len(), 1);
     }
 }
