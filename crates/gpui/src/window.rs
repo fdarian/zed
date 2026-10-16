@@ -5764,13 +5764,45 @@ impl Window {
         nearest_neighbor: bool,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+        let sprite = self.image_sprite(
+            bounds,
+            image_bounds,
+            corner_radii,
+            data,
+            frame_index,
+            grayscale,
+            nearest_neighbor,
+            self.element_opacity(),
+            self.snapped_content_mask(),
+        )?;
+        if let Some(sprite) = sprite {
+            self.next_frame.scene.insert_image(sprite);
+        }
+        Ok(())
+    }
 
+    /// The sprite that draws `image_bounds` of an image cropped to `bounds`, with the image in
+    /// the atlas. `None` when nothing of it is visible. It is the caller's job to place it:
+    /// `paint_image` inserts it into the scene, and a mask keeps it with the group effect.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn image_sprite(
+        &self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: impl Into<CornerRadii<Pixels>>,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        nearest_neighbor: bool,
+        opacity: f32,
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> Result<Option<PolychromeSprite>> {
         let visible_bounds = bounds.intersect(&image_bounds);
         if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
-            return Ok(());
+            return Ok(None);
         }
         if image_bounds.size.width <= Pixels::ZERO || image_bounds.size.height <= Pixels::ZERO {
-            return Ok(());
+            return Ok(None);
         }
 
         let params = RenderImageParams {
@@ -5833,13 +5865,11 @@ impl Window {
             }
         };
 
-        let content_mask = self.snapped_content_mask();
         let corner_radii = corner_radii.into();
         let corner_radii = CornerRadii::new(corner_radii.x, corner_radii.y, visible_bounds.size)
             .scale(self.scale_factor());
-        let opacity = self.element_opacity();
 
-        self.next_frame.scene.insert_image(PolychromeSprite {
+        Ok(Some(PolychromeSprite {
             order: 0,
             nearest_neighbor: nearest_neighbor.into(),
             grayscale: grayscale.into(),
@@ -5849,8 +5879,7 @@ impl Window {
             corner_radii_y: corner_radii.y,
             tile: sub_tile,
             opacity,
-        });
-        Ok(())
+        }))
     }
 
     /// Paint a surface into the scene for the next frame at the current z-index.
