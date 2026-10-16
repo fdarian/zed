@@ -833,6 +833,11 @@ impl Hash for HighlightStyle {
     }
 }
 
+/// How far a clip reaches along its visible axis. Finite, because an infinite origin plus an
+/// infinite size is NaN in the intersection of two masks, and far beyond any window or scroll
+/// extent, so the window's own mask is what ends up cutting.
+const UNBOUNDED_CLIP: Pixels = Pixels(1.0e6);
+
 impl Style {
     /// Returns true if the style is visible and the background is opaque.
     pub fn has_opaque_background(&self) -> bool {
@@ -854,59 +859,48 @@ impl Style {
     /// If the element does not hide its overflow, this will return `None`.
     ///
     /// Like CSS `overflow`, the mask is the padding box: the border box minus the borders, with
-    /// the corners rounded by the border radius minus the adjacent border width. The rounded
-    /// corners only apply when both axes clip; with one visible axis the mask is a plain
-    /// rectangle. That is what browsers do: the CSSWG resolved (csswg-drafts#7434, now the
-    /// "corner clipping" rule of CSS Overflow 3) that `border-radius` does not round the clip when
-    /// `clip` is mixed with `visible`, and Chromium implements it (WPT
-    /// `css-overflow/rounded-overflow-clip-visible.html`).
+    /// the corners rounded by the border radius minus the adjacent border width.
+    ///
+    /// An axis beside `Visible` follows CSS Overflow 3. `Hidden` and `Scroll` make the visible
+    /// axis compute to `auto`, so both axes clip. `Clip` leaves it visible: the mask is a plain
+    /// rectangle, unbounded along the visible axis, because the CSSWG resolved
+    /// (csswg-drafts#7434, now the "corner clipping" rule of CSS Overflow 3) that `border-radius`
+    /// does not round the clip when `clip` is mixed with `visible`, and Chromium implements it
+    /// (WPT `css-overflow/rounded-overflow-clip-visible.html`).
     pub fn overflow_mask(
         &self,
         bounds: Bounds<Pixels>,
         rem_size: Pixels,
     ) -> Option<ContentMask<Pixels>> {
-        match self.overflow {
-            Point {
-                x: Overflow::Visible,
-                y: Overflow::Visible,
-            } => None,
-            _ => {
-                let border_widths = self.border_widths.to_pixels(rem_size);
-                let min = bounds.origin + point(border_widths.left, border_widths.top);
-                let max = bounds.bottom_right() - point(border_widths.right, border_widths.bottom);
+        let visible_beside_clip = |own: Overflow, other: Overflow| {
+            own == Overflow::Visible && other == Overflow::Clip
+        };
+        let border_widths = self.border_widths.to_pixels(rem_size);
+        let min = bounds.origin + point(border_widths.left, border_widths.top);
+        let max = bounds.bottom_right() - point(border_widths.right, border_widths.bottom);
 
-                let (bounds, corner_radii) = match (
-                    self.overflow.x == Overflow::Visible,
-                    self.overflow.y == Overflow::Visible,
-                ) {
-                    // x and y both visible
-                    (true, true) => return None,
-                    // x visible, y hidden
-                    (true, false) => (
-                        Bounds::from_corners(
-                            point(min.x, bounds.origin.y),
-                            point(max.x, bounds.bottom_right().y),
-                        ),
-                        CornerRadii::default(),
-                    ),
-                    // x hidden, y visible
-                    (false, true) => (
-                        Bounds::from_corners(
-                            point(bounds.origin.x, min.y),
-                            point(bounds.bottom_right().x, max.y),
-                        ),
-                        CornerRadii::default(),
-                    ),
-                    // both hidden
-                    (false, false) => (
-                        Bounds::from_corners(min, max),
-                        self.border_box_radii(bounds, rem_size).inset(border_widths),
-                    ),
-                };
-
-                Some(ContentMask::rounded(bounds, corner_radii))
+        let (mask_bounds, corner_radii) = match (
+            visible_beside_clip(self.overflow.x, self.overflow.y),
+            visible_beside_clip(self.overflow.y, self.overflow.x),
+        ) {
+            (true, _) => (
+                Bounds::from_corners(point(-UNBOUNDED_CLIP, min.y), point(UNBOUNDED_CLIP, max.y)),
+                CornerRadii::default(),
+            ),
+            (_, true) => (
+                Bounds::from_corners(point(min.x, -UNBOUNDED_CLIP), point(max.x, UNBOUNDED_CLIP)),
+                CornerRadii::default(),
+            ),
+            _ if self.overflow.x == Overflow::Visible && self.overflow.y == Overflow::Visible => {
+                return None;
             }
-        }
+            _ => (
+                Bounds::from_corners(min, max),
+                self.border_box_radii(bounds, rem_size).inset(border_widths),
+            ),
+        };
+
+        Some(ContentMask::rounded(mask_bounds, corner_radii))
     }
 
     /// Paints the element like [`Style::paint`], as one offscreen group when it has an effect
@@ -2173,18 +2167,80 @@ mod tests {
     }
 
     #[test]
-    fn overflow_mask_is_square_when_one_axis_is_visible() {
+    fn overflow_mask_clips_only_the_clipping_axis_and_is_square() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(50.)));
+        let mut style = Style::default();
+        style.corner_radii = CornerRadius::from(px(10.)).on_all_corners();
+        style.border_widths = Edges {
+            top: px(2.).into(),
+            right: px(4.).into(),
+            bottom: px(2.).into(),
+            left: px(4.).into(),
+        };
+
+        style.overflow = Point {
+            x: Overflow::Visible,
+            y: Overflow::Clip,
+        };
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+        assert_eq!(mask.corner_radii, Corners::default());
+        assert_eq!(mask.corner_radii_y, Corners::default());
+        // The padding box vertically, and as far as the window goes horizontally.
+        assert_eq!(mask.bounds.top(), px(22.));
+        assert_eq!(mask.bounds.bottom(), px(68.));
+        assert!(mask.bounds.left() <= px(-100_000.));
+        assert!(mask.bounds.right() >= px(100_000.));
+
+        style.overflow = Point {
+            x: Overflow::Clip,
+            y: Overflow::Visible,
+        };
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+        assert_eq!(mask.corner_radii, Corners::default());
+        assert_eq!(mask.bounds.left(), px(14.));
+        assert_eq!(mask.bounds.right(), px(106.));
+        assert!(mask.bounds.top() <= px(-100_000.));
+        assert!(mask.bounds.bottom() >= px(100_000.));
+    }
+
+    #[test]
+    fn hidden_and_scroll_beside_visible_clip_both_axes_and_round_them() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(50.)));
+        for clipping in [Overflow::Hidden, Overflow::Scroll] {
+            for overflow in [
+                Point { x: clipping, y: Overflow::Visible },
+                Point { x: Overflow::Visible, y: clipping },
+            ] {
+                let mut style = Style::default();
+                style.overflow = overflow;
+                style.corner_radii = CornerRadius::from(px(10.)).on_all_corners();
+                let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+                assert_eq!(mask.bounds, bounds);
+                assert_eq!(mask.corner_radii.top_left, px(10.));
+            }
+        }
+    }
+
+    #[test]
+    fn an_unbounded_overflow_mask_intersects_without_going_not_a_number() {
         let mut style = Style::default();
         style.overflow = Point {
             x: Overflow::Visible,
-            y: Overflow::Hidden,
+            y: Overflow::Clip,
         };
-        style.corner_radii = CornerRadius::from(px(10.)).on_all_corners();
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(50.)));
-
         let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+        let window = ContentMask::from_bounds(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(800.), px(600.)),
+        ));
 
-        assert_eq!(mask.corner_radii, Corners::default());
+        assert_eq!(
+            mask.intersect(&window).bounds,
+            Bounds::from_corners(point(px(0.), px(0.)), point(px(800.), px(50.)))
+        );
+        assert!(mask.intersection_is_exact(&window));
+        assert!(mask.intersection_is_exact(&mask));
     }
 
     #[test]

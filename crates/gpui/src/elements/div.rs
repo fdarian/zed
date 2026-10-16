@@ -7339,6 +7339,62 @@ mod tests {
             assert_eq!(chain_at(&window, cx, 150., 150.), ["under", "root"]);
         }
 
+        fn red_area_the_clip_lets_through(window: &AnyWindowHandle, cx: &mut TestAppContext) -> f32 {
+            cx.update_window(*window, |_, window, _| {
+                let scale = window.scale_factor();
+                window
+                    .painted_quads()
+                    .iter()
+                    .filter(|quad| quad.background.as_solid() == Some(crate::hsla(0., 1., 0.5, 1.)))
+                    .map(|quad| {
+                        let visible = quad.bounds.intersect(&quad.content_mask.bounds);
+                        visible.size.width.0 * visible.size.height.0 / (scale * scale)
+                    })
+                    .sum()
+            })
+            .unwrap()
+        }
+
+        /// A 100x100 clip at the origin holding a red 200x200 box that starts 10px inside it.
+        fn clip_with_spill(clip: Stateful<Div>) -> AnyElement {
+            root()
+                .child(node("under", 0., 0., 400., 400.))
+                .child(clip.child(node("spill", 10., 10., 200., 200.).bg(crate::hsla(0., 1., 0.5, 1.))))
+                .into_any_element()
+        }
+
+        #[gpui::test]
+        fn an_x_clip_with_y_visible_cuts_paint_and_hits_only_at_the_sides(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                clip_with_spill(node("clip", 0., 0., 100., 100.).overflow_x_clip().rounded(px(40.)))
+            });
+
+            // 90 wide up to the clip's right edge, all 200 tall.
+            assert_eq!(red_area_the_clip_lets_through(&window, cx), 90. * 200.);
+            assert_eq!(chain_at(&window, cx, 50., 150.), ["spill", "clip", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 205.), ["spill", "clip", "root"]);
+            assert_eq!(chain_at(&window, cx, 150., 50.), ["under", "root"]);
+            // The clip's rounded corners do not apply to a mixed clip.
+            assert_eq!(chain_at(&window, cx, 12., 12.), ["spill", "clip", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_y_clip_with_x_visible_cuts_paint_and_hits_only_above_and_below(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                clip_with_spill(node("clip", 0., 0., 100., 100.).overflow_y_clip().rounded(px(40.)))
+            });
+
+            assert_eq!(red_area_the_clip_lets_through(&window, cx), 200. * 90.);
+            assert_eq!(chain_at(&window, cx, 150., 50.), ["spill", "clip", "root"]);
+            assert_eq!(chain_at(&window, cx, 205., 50.), ["spill", "clip", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 150.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 12., 12.), ["spill", "clip", "root"]);
+        }
+
         #[gpui::test]
         fn a_rounded_box_without_overflow_clipping_misses_the_pointer_at_its_corners(
             cx: &mut TestAppContext,

@@ -151,6 +151,25 @@ pub fn overflow_style_methods(input: TokenStream) -> TokenStream {
             self.style().overflow.y = Some(gpui::Overflow::Hidden);
             self
         }
+
+        /// Sets the overflow on both axes to `clip`: cut off, and not a scroll container.
+        #visibility fn overflow_clip(mut self) -> Self {
+            self.style().overflow.x = Some(gpui::Overflow::Clip);
+            self.style().overflow.y = Some(gpui::Overflow::Clip);
+            self
+        }
+
+        /// Sets the overflow on the X axis to `clip`. Beside a visible Y axis, only X is cut.
+        #visibility fn overflow_x_clip(mut self) -> Self {
+            self.style().overflow.x = Some(gpui::Overflow::Clip);
+            self
+        }
+
+        /// Sets the overflow on the Y axis to `clip`. Beside a visible X axis, only Y is cut.
+        #visibility fn overflow_y_clip(mut self) -> Self {
+            self.style().overflow.y = Some(gpui::Overflow::Clip);
+            self
+        }
     };
 
     output.into()
