@@ -713,6 +713,32 @@ impl TextStyle {
         self
     }
 
+    /// Applies the refinement of a descendant. As in CSS, a decoration line the
+    /// descendant declares is drawn besides the one of the same kind it inherits
+    /// rather than in its place.
+    pub(crate) fn refine_nested(&mut self, refinement: &TextStyleRefinement) {
+        let outer_underline = self.underline;
+        let outer_strikethrough = self.strikethrough;
+        let outer_overline = self.overline;
+        self.refine(refinement);
+        if let Some(outer) = outer_underline
+            && self.underline != Some(outer)
+        {
+            self.extra_decorations.push(ExtraDecoration::Underline(outer));
+        }
+        if let Some(outer) = outer_strikethrough
+            && self.strikethrough != Some(outer)
+        {
+            self.extra_decorations
+                .push(ExtraDecoration::Strikethrough(outer));
+        }
+        if let Some(outer) = outer_overline
+            && self.overline != Some(outer)
+        {
+            self.extra_decorations.push(ExtraDecoration::Overline(outer));
+        }
+    }
+
     /// What the text of this style is laid out with, beyond its font and wrap width.
     pub fn layout_options(&self) -> TextLayoutOptions {
         TextLayoutOptions {

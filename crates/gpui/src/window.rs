@@ -2612,7 +2612,7 @@ impl Window {
     pub fn text_style(&self) -> TextStyle {
         let mut style = TextStyle::default();
         for refinement in &self.text_style_stack {
-            style.refine(refinement);
+            style.refine_nested(refinement);
         }
         style
     }
@@ -10093,6 +10093,41 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].color, blue());
         assert!(lines[0].bounds.origin.x.0 > 0.);
+    }
+
+    #[gpui::test]
+    fn a_nested_box_adds_its_decoration_to_the_inherited_one(cx: &mut TestAppContext) {
+        use crate::text_decoration::{SHAPE_DOTTED, SHAPE_SOLID};
+        use crate::{blue, red};
+        let cx = cx.add_empty_window();
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(40.)), |_, _| {
+            div()
+                .text_size(px(16.))
+                .underline()
+                .text_decoration_color(red())
+                .child(
+                    div()
+                        .underline()
+                        .text_decoration_dotted()
+                        .text_decoration_2()
+                        .text_decoration_color(blue())
+                        .child("inner"),
+                )
+        });
+        let lines = cx.update(|window, _| window.painted_underlines());
+
+        assert_eq!(lines.len(), 2);
+        let outer = lines
+            .iter()
+            .find(|line| line.color == red())
+            .expect("the outer underline");
+        let inner = lines
+            .iter()
+            .find(|line| line.color == blue())
+            .expect("the inner underline");
+        assert_eq!((outer.style, inner.style), (SHAPE_SOLID, SHAPE_DOTTED));
+        assert_eq!(inner.thickness.0, outer.thickness.0 * 2.);
+        assert_eq!(outer.bounds.origin.y, inner.bounds.origin.y);
     }
 
     #[gpui::test]
