@@ -3,7 +3,7 @@ use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use std::{
     borrow::Borrow,
     cell::RefCell,
@@ -265,8 +265,89 @@ pub struct ShapedGlyph {
     pub is_emoji: bool,
 }
 
+/// The height of a wrapped row and where its baseline is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowMetrics {
+    /// The height of the row.
+    pub height: Pixels,
+    /// The distance from the top of the row to its baseline.
+    pub baseline: Pixels,
+}
+
 impl LineLayout {
     /// The index for the character at the given x coordinate
+    fn is_styled(&self, run: &ShapedRun) -> bool {
+        run.font_size != self.font_size || run.line_height.is_some()
+    }
+
+    fn has_styled_runs(&self) -> bool {
+        self.runs.iter().any(|run| self.is_styled(run))
+    }
+
+    /// The metrics of each row this line makes when wrapped at `wrap_boundaries`, as
+    /// CSS lays out a line box: the line's own ascent and descent with `line_height`
+    /// form a strut, and every run with a font size or line height of its own that has
+    /// a glyph in the row grows the row around the shared baseline.
+    pub fn rows(
+        &self,
+        wrap_boundaries: &[WrapBoundary],
+        line_height: Pixels,
+    ) -> SmallVec<[RowMetrics; 1]> {
+        let row_count = wrap_boundaries.len() + 1;
+        let half_leading = (line_height - self.ascent - self.descent) / 2.;
+        let strut = RowMetrics {
+            height: line_height,
+            baseline: half_leading + self.ascent,
+        };
+        if !self.has_styled_runs() {
+            return smallvec![strut; row_count];
+        }
+
+        let strut_above = half_leading + self.ascent;
+        let strut_below = half_leading + self.descent;
+        let mut grown: SmallVec<[Option<(Pixels, Pixels)>; 1]> = smallvec![None; row_count];
+        let mut row_ix = 0;
+        let mut next_boundary = 0;
+        for (run_ix, run) in self.runs.iter().enumerate() {
+            if !self.is_styled(run) {
+                while wrap_boundaries
+                    .get(next_boundary)
+                    .is_some_and(|boundary| boundary.run_ix == run_ix)
+                {
+                    row_ix += 1;
+                    next_boundary += 1;
+                }
+                continue;
+            }
+
+            let run_line_height = run.line_height.unwrap_or(line_height);
+            let run_above = run.ascent + (run_line_height - run.ascent - run.descent) / 2.;
+            let run_below = run_line_height - run_above;
+            for glyph_ix in 0..run.glyphs.len() {
+                while wrap_boundaries.get(next_boundary) == Some(&WrapBoundary { run_ix, glyph_ix })
+                {
+                    row_ix += 1;
+                    next_boundary += 1;
+                }
+                let (above, below) = grown[row_ix].unwrap_or((strut_above, strut_below));
+                grown[row_ix] = Some((above.max(run_above), below.max(run_below)));
+            }
+        }
+
+        grown
+            .into_iter()
+            .map(|grown| match grown {
+                Some((above, below)) if above != strut_above || below != strut_below => {
+                    RowMetrics {
+                        height: above + below,
+                        baseline: above,
+                    }
+                }
+                _ => strut,
+            })
+            .collect()
+    }
+
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
         if x >= self.width {
             None
@@ -837,12 +918,37 @@ impl WrappedLineLayout {
         })
     }
 
+    /// The metrics of each wrapped row of this line, for the given line height.
+    pub fn rows(&self, line_height: Pixels) -> SmallVec<[RowMetrics; 1]> {
+        self.unwrapped_layout
+            .rows(&self.wrap_boundaries, line_height)
+    }
+
+    /// The largest ascent and descent among the runs that have a glyph in `bytes`,
+    /// or `None` when no glyph is. This is the content area of an inline box that
+    /// spans those bytes.
+    pub fn run_extent(&self, bytes: Range<usize>) -> Option<(Pixels, Pixels)> {
+        self.unwrapped_layout
+            .runs
+            .iter()
+            .filter(|run| run.glyphs.iter().any(|glyph| bytes.contains(&glyph.index)))
+            .map(|run| (run.ascent, run.descent))
+            .reduce(|first, second| (first.0.max(second.0), first.1.max(second.1)))
+    }
+
     /// The size of the whole wrapped text, for the given line_height.
     /// can span multiple lines if there are multiple wrap boundaries.
     pub fn size(&self, line_height: Pixels) -> Size<Pixels> {
+        let height = if self.unwrapped_layout.has_styled_runs() {
+            self.rows(line_height)
+                .iter()
+                .fold(Pixels::ZERO, |height, row| height + row.height)
+        } else {
+            line_height * (self.wrap_boundaries.len() + 1)
+        };
         Size {
             width: self.width(),
-            height: line_height * (self.wrap_boundaries.len() + 1),
+            height,
         }
     }
 
@@ -901,7 +1007,22 @@ impl WrappedLineLayout {
         line_height: Pixels,
         closest: bool,
     ) -> Result<usize, usize> {
-        let wrapped_line_ix = (position.y / line_height) as usize;
+        let rows = self
+            .unwrapped_layout
+            .has_styled_runs()
+            .then(|| self.rows(line_height));
+        let wrapped_line_ix = match &rows {
+            None => (position.y / line_height) as usize,
+            Some(rows) => {
+                let mut bottom = Pixels::ZERO;
+                rows.iter()
+                    .position(|row| {
+                        bottom += row.height;
+                        position.y < bottom
+                    })
+                    .unwrap_or(rows.len())
+            }
+        };
 
         let wrapped_line_start_index;
         let wrapped_line_start_x;
@@ -954,6 +1075,10 @@ impl WrappedLineLayout {
 
     /// Returns the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
+        let rows = self
+            .unwrapped_layout
+            .has_styled_runs()
+            .then(|| self.rows(line_height));
         let mut line_start_ix = 0;
         let mut line_end_indices = self
             .wrap_boundaries
@@ -966,7 +1091,7 @@ impl WrappedLineLayout {
             .chain([self.len()])
             .enumerate();
         for (ix, line_end_ix) in line_end_indices {
-            let line_y = ix as f32 * line_height;
+            let line_y = row_top(rows.as_deref(), ix, line_height);
             if index < line_start_ix {
                 break;
             } else if index > line_end_ix {
@@ -980,6 +1105,17 @@ impl WrappedLineLayout {
         }
 
         None
+    }
+}
+
+/// The top of row `row_ix` relative to the top of its line, given the rows of a
+/// line with styled runs, or `None` for a line whose rows are all `line_height`.
+fn row_top(rows: Option<&[RowMetrics]>, row_ix: usize, line_height: Pixels) -> Pixels {
+    match rows {
+        None => row_ix as f32 * line_height,
+        Some(rows) => rows[..row_ix]
+            .iter()
+            .fold(Pixels::ZERO, |top, row| top + row.height),
     }
 }
 
@@ -2907,5 +3043,270 @@ mod tests {
         assert_eq!(position(3), point(px(38.), px(0.)));
         assert_eq!(position(4), point(px(10.), line_height));
         assert_eq!(position(5), point(px(26.), line_height));
+    }
+
+    mod rows {
+        use super::{Pixels, RowMetrics, ShapedRun, WrappedLineLayout};
+        use crate as gpui;
+        use crate::{TestAppContext, TextRun, WindowTextSystem, font, point, px};
+        use std::sync::Arc;
+
+        const LINE_HEIGHT: f32 = 30.;
+
+        fn run(len: usize, font_size: Option<f32>, line_height: Option<f32>) -> TextRun {
+            TextRun {
+                len,
+                font: font("Menlo"),
+                font_size: font_size.map(px),
+                line_height: line_height.map(px),
+                ..Default::default()
+            }
+        }
+
+        fn shape(
+            cx: &mut TestAppContext,
+            text: &str,
+            runs: &[TextRun],
+            wrap_width: f32,
+        ) -> Arc<WrappedLineLayout> {
+            cx.update(|cx| {
+                let text_system = WindowTextSystem::new(cx.text_system().clone());
+                let lines = text_system
+                    .shape_text(
+                        text.to_string().into(),
+                        px(10.),
+                        runs,
+                        Some(px(wrap_width)),
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(lines.len(), 1);
+                lines[0].layout.clone()
+            })
+        }
+
+        fn assert_px(actual: Pixels, expected: Pixels) {
+            assert!(
+                (f32::from(actual) - f32::from(expected)).abs() < 1e-3,
+                "{actual:?} != {expected:?}"
+            );
+        }
+
+        fn assert_row(row: RowMetrics, height: Pixels, baseline: Pixels) {
+            assert_px(row.height, height);
+            assert_px(row.baseline, baseline);
+        }
+
+        fn strut(layout: &WrappedLineLayout) -> RowMetrics {
+            let line_height = px(LINE_HEIGHT);
+            let half_leading = (line_height - layout.ascent() - layout.descent()) / 2.;
+            RowMetrics {
+                height: line_height,
+                baseline: half_leading + layout.ascent(),
+            }
+        }
+
+        fn above(run: &ShapedRun, line_height: Pixels) -> Pixels {
+            run.ascent + (line_height - run.ascent - run.descent) / 2.
+        }
+
+        /// "aaaa " plain, "bbbb " big, "cc dd": plain "cc " and big "dd", which wraps into
+        /// a row of only plain text, a row of only big text, and a row of both.
+        fn mixed(cx: &mut TestAppContext, big_line_height: Option<f32>) -> Arc<WrappedLineLayout> {
+            let layout = shape(
+                cx,
+                "aaaa bbbb cc dd",
+                &[
+                    run(5, None, None),
+                    run(5, Some(20.), big_line_height),
+                    run(3, None, None),
+                    run(2, Some(20.), big_line_height),
+                ],
+                60.,
+            );
+            assert_eq!(layout.runs().len(), 4);
+            let starts = layout
+                .wrap_boundaries()
+                .iter()
+                .map(|boundary| layout.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+                .collect::<Vec<_>>();
+            assert_eq!(starts, vec![5, 10]);
+            layout
+        }
+
+        #[crate::test]
+        fn a_row_is_as_tall_as_its_tallest_run_around_one_baseline(cx: &mut TestAppContext) {
+            let layout = mixed(cx, Some(60.));
+            let big = &layout.runs()[1];
+            let big_above = above(big, px(60.));
+            let rows = layout.rows(px(LINE_HEIGHT));
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0], strut(&layout));
+            assert_row(rows[1], px(60.), big_above);
+            assert_row(rows[2], px(60.), big_above);
+            assert_eq!(
+                layout
+                    .unwrapped_layout
+                    .rows(layout.wrap_boundaries(), px(LINE_HEIGHT)),
+                rows
+            );
+            assert_px(layout.size(px(LINE_HEIGHT)).height, px(150.));
+        }
+
+        #[crate::test]
+        fn a_big_run_without_a_line_height_of_its_own_uses_the_line_height(
+            cx: &mut TestAppContext,
+        ) {
+            let layout = mixed(cx, None);
+            let big = &layout.runs()[1];
+            let big_above = above(big, px(LINE_HEIGHT));
+            let big_below = px(LINE_HEIGHT) - big_above;
+            let strut = strut(&layout);
+            let half_leading = px(LINE_HEIGHT) - strut.baseline;
+            let rows = layout.rows(px(LINE_HEIGHT));
+            assert_eq!(rows[0], strut);
+            let expected_above = big_above.max(strut.baseline);
+            let expected_below = big_below.max(half_leading);
+            for row in &rows[1..] {
+                assert_row(*row, expected_above + expected_below, expected_above);
+            }
+            assert!(rows[1].height > px(LINE_HEIGHT));
+        }
+
+        #[crate::test]
+        fn a_run_with_only_a_line_height_grows_its_row(cx: &mut TestAppContext) {
+            let layout = shape(
+                cx,
+                "aaaa bbbb cccc",
+                &[
+                    run(5, None, None),
+                    run(5, None, Some(50.)),
+                    run(4, None, None),
+                ],
+                30.,
+            );
+            assert_eq!(layout.wrap_boundaries().len(), 2);
+            let tall = above(&layout.runs()[1], px(50.));
+            let rows = layout.rows(px(LINE_HEIGHT));
+            assert_eq!(rows[0], strut(&layout));
+            assert_row(rows[1], px(50.), tall);
+            assert_eq!(rows[2], strut(&layout));
+            assert_px(layout.size(px(LINE_HEIGHT)).height, px(110.));
+        }
+
+        #[crate::test]
+        fn a_smaller_run_with_a_small_line_height_leaves_the_row_the_strut(
+            cx: &mut TestAppContext,
+        ) {
+            let layout = shape(
+                cx,
+                "aaaa bbbb cccc",
+                &[
+                    run(5, None, None),
+                    run(5, Some(5.), Some(6.)),
+                    run(4, None, None),
+                ],
+                30.,
+            );
+            assert_eq!(layout.wrap_boundaries().len(), 2);
+            assert_eq!(
+                layout.rows(px(LINE_HEIGHT)).as_slice(),
+                [strut(&layout); 3].as_slice()
+            );
+            assert_eq!(layout.size(px(LINE_HEIGHT)).height, px(LINE_HEIGHT * 3.));
+        }
+
+        #[crate::test]
+        fn without_styled_runs_every_row_is_the_line_height(cx: &mut TestAppContext) {
+            let layout = shape(cx, "aaaa bbbb cccc", &[run(14, None, None)], 30.);
+            let rows = layout.rows(px(LINE_HEIGHT));
+            assert_eq!(rows.len(), 3);
+            let expected = strut(&layout);
+            assert!(rows.iter().all(|row| *row == expected));
+            assert_eq!(layout.size(px(LINE_HEIGHT)).height, px(LINE_HEIGHT) * 3);
+            assert_eq!(layout.size(px(LINE_HEIGHT)).width, layout.width());
+            // An index on a wrap boundary is still on the row that ends there.
+            for (index, row) in [(0, 0), (5, 0), (6, 1), (11, 2)] {
+                assert_eq!(
+                    layout.position_for_index(index, px(LINE_HEIGHT)).unwrap().y,
+                    px(LINE_HEIGHT) * row
+                );
+            }
+            assert_eq!(
+                layout.index_for_position(point(px(1.), px(65.)), px(LINE_HEIGHT)),
+                Ok(10)
+            );
+            assert_eq!(
+                layout.index_for_position(point(px(1.), px(90.)), px(LINE_HEIGHT)),
+                Err(0)
+            );
+            assert_eq!(
+                layout.index_for_position(point(px(1.), px(-5.)), px(LINE_HEIGHT)),
+                Ok(0)
+            );
+        }
+
+        #[crate::test]
+        fn positions_and_indices_follow_the_row_heights(cx: &mut TestAppContext) {
+            let layout = mixed(cx, Some(60.));
+            let line_height = px(LINE_HEIGHT);
+            let tops = [0., 30., 90.];
+            // An index on a wrap boundary is still on the row that ends there.
+            for (index, top) in [
+                (0, tops[0]),
+                (5, tops[0]),
+                (6, tops[1]),
+                (7, tops[1]),
+                (10, tops[1]),
+                (11, tops[2]),
+                (13, tops[2]),
+            ] {
+                assert_px(
+                    layout.position_for_index(index, line_height).unwrap().y,
+                    px(top),
+                );
+            }
+            // A big glyph is 12px wide, a plain one 6px.
+            assert_px(
+                layout.position_for_index(7, line_height).unwrap().x,
+                px(24.),
+            );
+
+            let at = |x: f32, y: f32| layout.index_for_position(point(px(x), px(y)), line_height);
+            assert_eq!(at(7., -5.), Ok(1));
+            assert_eq!(at(7., 29.), Ok(1));
+            assert_eq!(at(1., 30.), Ok(5));
+            assert_eq!(at(13., 80.), Ok(6));
+            assert_eq!(at(1., 89.), Ok(5));
+            assert_eq!(at(1., 90.), Ok(10));
+            assert_eq!(at(1., 100.), Ok(10));
+            assert_eq!(at(1., 149.), Ok(10));
+            assert_eq!(at(1., 150.), Err(0));
+            assert_eq!(at(1., 1000.), Err(0));
+
+            assert_eq!(
+                layout.closest_index_for_position(point(px(11.), px(40.)), line_height),
+                Ok(6)
+            );
+            assert_eq!(
+                layout.closest_index_for_position(point(px(1.), px(150.)), line_height),
+                Err(0)
+            );
+        }
+
+        #[crate::test]
+        fn the_extent_of_a_range_is_the_largest_of_the_runs_it_touches(cx: &mut TestAppContext) {
+            let layout = mixed(cx, None);
+            let plain = (layout.runs()[0].ascent, layout.runs()[0].descent);
+            let big = (layout.runs()[1].ascent, layout.runs()[1].descent);
+            assert_eq!(layout.run_extent(0..5), Some(plain));
+            assert_eq!(layout.run_extent(5..10), Some(big));
+            assert_eq!(
+                layout.run_extent(3..7),
+                Some((plain.0.max(big.0), plain.1.max(big.1)))
+            );
+            assert_eq!(layout.run_extent(20..30), None);
+            assert_eq!(layout.run_extent(5..5), None);
+        }
     }
 }

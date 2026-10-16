@@ -272,7 +272,13 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, Rc::new(no_insets), window, cx);
+        let layout_id = state.layout(
+            SharedString::from(*self),
+            None,
+            Rc::new(no_insets),
+            window,
+            cx,
+        );
         (layout_id, state)
     }
 
@@ -641,6 +647,17 @@ impl IntoElement for StyledText {
     }
 }
 
+/// A wrapped row of a laid-out text, in window coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextRow {
+    /// The y coordinate of the top of the row.
+    pub top: Pixels,
+    /// The height of the row.
+    pub height: Pixels,
+    /// The y coordinate of the baseline of the row.
+    pub baseline: Pixels,
+}
+
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
@@ -980,6 +997,73 @@ impl TextLayout {
         }
 
         None
+    }
+
+    /// The wrapped row that contains the window y coordinate `y`, or `None` when `y`
+    /// is above or below the text.
+    pub fn row_at_y(&self, y: Pixels) -> Option<TextRow> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+        let line_height = element_state.line_height;
+
+        let mut line_top = bounds.origin.y;
+        for line in &element_state.lines {
+            let line_bottom = line_top + line.size(line_height).height;
+            if y >= line_bottom {
+                line_top = line_bottom;
+                continue;
+            }
+            let mut top = line_top;
+            for row in line.rows(line_height) {
+                if y >= top && y < top + row.height {
+                    return Some(TextRow {
+                        top,
+                        height: row.height,
+                        baseline: top + row.baseline,
+                    });
+                }
+                top += row.height;
+            }
+            return None;
+        }
+
+        None
+    }
+
+    /// The largest ascent and descent among the runs that have a glyph in the byte
+    /// range `range` of the text, or `None` when no glyph is.
+    pub fn run_extent(&self, range: Range<usize>) -> Option<(Pixels, Pixels)> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+
+        let mut line_start_ix = 0;
+        let mut extent: Option<(Pixels, Pixels)> = None;
+        for line in &element_state.lines {
+            let line_end_ix = line_start_ix + line.len();
+            if range.end <= line_start_ix {
+                break;
+            }
+            if range.start <= line_end_ix {
+                let within_line =
+                    range.start.saturating_sub(line_start_ix)..range.end - line_start_ix;
+                if let Some(line_extent) = line.run_extent(within_line) {
+                    extent = Some(match extent {
+                        Some(extent) => (extent.0.max(line_extent.0), extent.1.max(line_extent.1)),
+                        None => line_extent,
+                    });
+                }
+            }
+            line_start_ix = line_end_ix + 1;
+        }
+
+        extent
     }
 
     /// Retrieve the layout for the line containing the given byte index.
@@ -1426,6 +1510,112 @@ mod tests {
         let _ = div().child("String".to_string());
         let _ = div().child(Cow::Borrowed("Cow"));
         let _ = div().child(SharedString::from("SharedString"));
+    }
+
+    mod rows {
+        use super::*;
+        use crate as gpui;
+        use crate::{TestAppContext, WindowTextSystem, font, point, px, size};
+
+        fn run(len: usize, font_size: Option<f32>, line_height: Option<f32>) -> TextRun {
+            TextRun {
+                len,
+                font: font("Menlo"),
+                font_size: font_size.map(px),
+                line_height: line_height.map(px),
+                ..Default::default()
+            }
+        }
+
+        /// Two hard lines at (10, 100): "aa" plain, and "bb" at twice the size with a
+        /// line height of 60.
+        fn two_lines(cx: &mut TestAppContext) -> TextLayout {
+            cx.update(|cx| {
+                let text_system = WindowTextSystem::new(cx.text_system().clone());
+                let lines = text_system
+                    .shape_text(
+                        "aa\nbb".into(),
+                        px(10.),
+                        &[run(3, None, None), run(2, Some(20.), Some(60.))],
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(lines.len(), 2);
+                let layout = TextLayout::default();
+                layout.0.replace(Some(TextLayoutInner {
+                    len: 5,
+                    lines,
+                    line_height: px(30.),
+                    wrap_width: None,
+                    truncate_width: None,
+                    inset_width: None,
+                    size: None,
+                    bounds: Some(Bounds::new(
+                        point(px(10.), px(100.)),
+                        size(px(100.), px(90.)),
+                    )),
+                }));
+                layout
+            })
+        }
+
+        #[crate::test]
+        fn the_row_at_a_y_is_found_across_hard_lines(cx: &mut TestAppContext) {
+            let layout = two_lines(cx);
+            let lines = layout.line_layouts();
+            let strut = lines[0].rows(px(30.))[0];
+            let tall = lines[1].rows(px(30.))[0];
+            assert_eq!(strut.height, px(30.));
+            assert_eq!(tall.height, px(60.));
+
+            assert_eq!(layout.row_at_y(px(99.)), None);
+            assert_eq!(
+                layout.row_at_y(px(100.)),
+                Some(TextRow {
+                    top: px(100.),
+                    height: px(30.),
+                    baseline: px(100.) + strut.baseline
+                })
+            );
+            assert_eq!(layout.row_at_y(px(129.)).unwrap().top, px(100.));
+            assert_eq!(
+                layout.row_at_y(px(130.)),
+                Some(TextRow {
+                    top: px(130.),
+                    height: px(60.),
+                    baseline: px(130.) + tall.baseline
+                })
+            );
+            assert_eq!(layout.row_at_y(px(189.)).unwrap().top, px(130.));
+            assert_eq!(layout.row_at_y(px(190.)), None);
+        }
+
+        #[crate::test]
+        fn stacked_lines_use_the_height_of_their_rows(cx: &mut TestAppContext) {
+            let layout = two_lines(cx);
+            let second = layout.position_for_index(3).unwrap();
+            assert_eq!(second.y, px(130.));
+            assert_eq!(layout.index_for_position(point(px(11.), px(170.))), Ok(3));
+            assert_eq!(layout.index_for_position(point(px(11.), px(110.))), Ok(0));
+        }
+
+        #[crate::test]
+        fn the_extent_of_a_range_spans_lines_and_skips_newlines(cx: &mut TestAppContext) {
+            let layout = two_lines(cx);
+            let lines = layout.line_layouts();
+            let plain = lines[0].run_extent(0..2).unwrap();
+            let big = lines[1].run_extent(0..2).unwrap();
+            assert_ne!(plain, big);
+            assert_eq!(layout.run_extent(0..2), Some(plain));
+            assert_eq!(layout.run_extent(3..5), Some(big));
+            assert_eq!(
+                layout.run_extent(1..4),
+                Some((plain.0.max(big.0), plain.1.max(big.1)))
+            );
+            assert_eq!(layout.run_extent(2..3), None);
+            assert_eq!(layout.run_extent(5..9), None);
+        }
     }
 
     #[cfg(target_os = "macos")]
