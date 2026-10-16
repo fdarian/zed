@@ -3,7 +3,7 @@ use crate::{
     Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
     Pixels, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle, WeakEntity,
 };
-use crate::{Empty, Window};
+use crate::{Empty, Visibility, Window};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
@@ -293,6 +293,7 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    visibility: Visibility,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -382,11 +383,13 @@ impl<V: View> Element for ViewElement<V> {
                     |element_state, window| {
                         let content_mask = window.content_mask();
                         let text_style = window.text_style();
+                        let visibility = window.visibility();
 
                         if let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
+                            && element_state.cache_key.visibility == visibility
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
                         {
@@ -427,6 +430,7 @@ impl<V: View> Element for ViewElement<V> {
                                     bounds,
                                     content_mask,
                                     text_style,
+                                    visibility,
                                 },
                             },
                         )

@@ -183,8 +183,8 @@ pub struct Style {
     /// What layout strategy should be used?
     pub display: Display,
 
-    /// Should the element be painted on screen?
-    pub visibility: Visibility,
+    /// Should the element be painted on screen? `None` inherits the parent's, as in CSS.
+    pub visibility: Option<Visibility>,
 
     // Overflow properties
     /// How children overflowing their container should affect layout
@@ -390,7 +390,9 @@ pub enum Visibility {
     /// The element should be drawn as normal.
     #[default]
     Visible,
-    /// The element should not be drawn, but should still take up space in the layout.
+    /// The element should not be drawn, but should still take up space in the layout. Its
+    /// descendants are hidden as well unless they are `Visible` themselves. A hidden element
+    /// is not a hit target, is left out of the tab order and registers no listeners.
     Hidden,
 }
 
@@ -1120,7 +1122,7 @@ impl Default for Style {
     fn default() -> Self {
         Style {
             display: Display::Block,
-            visibility: Visibility::Visible,
+            visibility: None,
             overflow: Point {
                 x: Overflow::Visible,
                 y: Overflow::Visible,

@@ -34,7 +34,7 @@
 use crate::{
     A11yRelation, A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context,
     DispatchNodeId, ElementId, FocusHandle, InspectorElementId, IsZero, LayoutId, Pixels, Point,
-    SharedString, Size, Style, Window, util::FluentBuilder, window::with_element_arena,
+    SharedString, Size, Style, Visibility, Window, util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -116,6 +116,12 @@ pub trait Element: 'static + IntoElement {
     ///
     /// See the [accessibility guide](crate::_accessibility) for an overview.
     fn a11y_role(&self) -> Option<accesskit::Role> {
+        None
+    }
+
+    /// The `visibility` this element declares in its own style. While the visibility it ends up
+    /// with is [`Visibility::Hidden`], the element is left out of the accessibility tree.
+    fn declared_visibility(&self) -> Option<Visibility> {
         None
     }
 
@@ -382,7 +388,9 @@ impl<E: Element> Drawable<E> {
                     bounds = window.layout_bounds(layout_id);
                 }
                 let mut pushed_a11y_node = false;
-                if window.a11y.is_active() {
+                let hidden = self.element.declared_visibility().unwrap_or(window.visibility())
+                    == Visibility::Hidden;
+                if window.a11y.is_active() && !hidden {
                     if let Some(global_id) = global_id.as_ref() {
                         if let Some(role) = self.element.a11y_role() {
                             let node_id = global_id.accesskit_node_id();

@@ -781,8 +781,8 @@ pub trait InteractiveElement: Sized {
     /// speculative: `List::prepaint` prepaints a range of rows, and can then roll
     /// the window back through `Window::transact` and prepaint a different range.
     /// A listener that ran in prepaint would keep the bounds of a row that is not
-    /// on screen. It does not fire for an element whose style is
-    /// `Visibility::Hidden`, which paints nothing.
+    /// on screen. It fires for a hidden element too, which paints nothing but keeps its box;
+    /// [`Window::visibility`] tells the listener which it is.
     fn on_painted(
         mut self,
         listener: impl Fn(Bounds<Pixels>, &mut Window, &mut App) + 'static,
@@ -1982,6 +1982,10 @@ impl Element for Div {
             .filter(|role| *role != accesskit::Role::GenericContainer)
     }
 
+    fn declared_visibility(&self) -> Option<Visibility> {
+        self.interactivity.base_style.visibility
+    }
+
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
         self.interactivity.write_a11y_info(node);
     }
@@ -2548,31 +2552,40 @@ impl Interactivity {
                     }
                 }
 
-                window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
-                        style.overflow_mask(bounds, window.rem_size()),
-                        |window| {
-                            let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                Some(window.insert_hitbox_clipped(
-                                    bounds,
-                                    self.hitbox_behavior,
-                                    style.hit_clip_path(bounds, window.rem_size()),
-                                ))
-                            } else {
-                                None
-                            };
+                let visibility = style.visibility.unwrap_or(window.visibility());
+                // A hidden element is never the target of the pointer. It stays in the chain of
+                // a visible descendant, as an ancestor with `pointer-events: none` does.
+                let hitbox_behavior = match visibility {
+                    Visibility::Hidden => HitboxBehavior::PassThrough,
+                    Visibility::Visible => self.hitbox_behavior,
+                };
+                window.with_visibility(visibility, |window| {
+                    window.with_text_style(style.text_style().cloned(), |window| {
+                        window.with_content_mask(
+                            style.overflow_mask(bounds, window.rem_size()),
+                            |window| {
+                                let hitbox = if self.should_insert_hitbox(&style, window, cx) {
+                                    Some(window.insert_hitbox_clipped(
+                                        bounds,
+                                        hitbox_behavior,
+                                        style.hit_clip_path(bounds, window.rem_size()),
+                                    ))
+                                } else {
+                                    None
+                                };
 
-                            let scroll_offset =
-                                self.clamp_scroll_position(bounds, &style, window, cx);
-                            let result = match hitbox.as_ref() {
-                                Some(parent) => window.with_hitbox_parent(parent, |window| {
-                                    f(&style, scroll_offset, hitbox.clone(), window, cx)
-                                }),
-                                None => f(&style, scroll_offset, hitbox, window, cx),
-                            };
-                            (result, element_state)
-                        },
-                    )
+                                let scroll_offset =
+                                    self.clamp_scroll_position(bounds, &style, window, cx);
+                                let result = match hitbox.as_ref() {
+                                    Some(parent) => window.with_hitbox_parent(parent, |window| {
+                                        f(&style, scroll_offset, hitbox.clone(), window, cx)
+                                    }),
+                                    None => f(&style, scroll_offset, hitbox, window, cx),
+                                };
+                                (result, element_state)
+                            },
+                        )
+                    })
                 })
             },
         )
@@ -2723,7 +2736,8 @@ impl Interactivity {
                 let mut element_state =
                     element_state.map(|element_state| element_state.unwrap_or_default());
 
-                let style = self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
+                let mut style =
+                    self.compute_style_internal(hitbox, element_state.as_mut(), window, cx);
 
                 #[cfg(any(feature = "test-support", test))]
                 if let Some(debug_selector) = &self.debug_selector {
@@ -2735,17 +2749,11 @@ impl Interactivity {
 
                 self.paint_hover_group_handler(window, cx);
 
-                if style.visibility == Visibility::Hidden {
-                    return ((), element_state);
-                }
-
-                if let Some(listener) = self.paint_bounds_listener.take() {
-                    listener(bounds, window, cx);
-                }
-                if let Some(listener) = self.paint_layout_listener.take()
-                    && let Some(layout_id) = self.layout_id
-                {
-                    listener(bounds, layout_id, window, cx);
+                let visibility = style.visibility.unwrap_or(window.visibility());
+                let hidden = visibility == Visibility::Hidden;
+                if hidden {
+                    // The backdrop is part of the box that is not painted.
+                    style.backdrop_filter.clear();
                 }
 
                 let mut tab_group = None;
@@ -2753,7 +2761,18 @@ impl Interactivity {
                     tab_group = self.tab_index;
                 }
 
-                {
+                window.with_visibility(visibility, |window| {
+                    // The listeners see the element's own visibility, and run for a hidden
+                    // element: it has no paint, but it has its box.
+                    if let Some(listener) = self.paint_bounds_listener.take() {
+                        listener(bounds, window, cx);
+                    }
+                    if let Some(listener) = self.paint_layout_listener.take()
+                        && let Some(layout_id) = self.layout_id
+                    {
+                        listener(bounds, layout_id, window, cx);
+                    }
+
                     style.paint_with_effects(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(
@@ -2768,10 +2787,14 @@ impl Interactivity {
                                         // sibling groups every container would then sort ahead of
                                         // every item, and `focus_next` from a container would jump
                                         // to the first item in the whole window instead of its own.
-                                        if let Some(focus_handle) = &self.tracked_focus_handle {
+                                        if !hidden
+                                            && let Some(focus_handle) = &self.tracked_focus_handle
+                                        {
                                             window.next_frame.tab_stops.insert(focus_handle);
                                         }
-                                        if let Some(hitbox) = hitbox {
+                                        // A hidden element takes no part in the pointer's world,
+                                        // while the listeners of its visible descendants do.
+                                        if let Some(hitbox) = hitbox.filter(|_| !hidden) {
                                             #[cfg(debug_assertions)]
                                             self.paint_debug_info(
                                                 global_id, hitbox, &style, window, cx,
@@ -2816,7 +2839,7 @@ impl Interactivity {
 
                                         self.paint_keyboard_listeners(window, cx);
 
-                                        if window.a11y.is_active() {
+                                        if !hidden && window.a11y.is_active() {
                                             if let Some(global_id) = global_id {
                                                 if !self.a11y_action_listeners.is_empty() {
                                                     let node_id = global_id.accesskit_node_id();
@@ -2833,7 +2856,7 @@ impl Interactivity {
 
                                         f(&style, window, cx);
 
-                                        if let Some(_hitbox) = hitbox {
+                                        if let Some(_hitbox) = hitbox.filter(|_| !hidden) {
                                             #[cfg(any(feature = "inspector", debug_assertions))]
                                             window.insert_inspector_hitbox(
                                                 _hitbox.id,
@@ -2850,7 +2873,7 @@ impl Interactivity {
                             );
                         });
                     });
-                }
+                });
 
                 ((), element_state)
             },
@@ -4338,6 +4361,10 @@ where
         self.element.a11y_role()
     }
 
+    fn declared_visibility(&self) -> Option<Visibility> {
+        self.element.declared_visibility()
+    }
+
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
         self.element.write_a11y_info(node);
     }
@@ -4724,8 +4751,10 @@ mod tests {
                             .group_hover("hover-group", |style| style.visible())
                             .child(canvas(
                                 |_, _, _| {},
-                                move |_, _, _, _| {
-                                    anonymous_paint_count.set(anonymous_paint_count.get() + 1)
+                                move |_, _, window, _| {
+                                    if window.visibility() == Visibility::Visible {
+                                        anonymous_paint_count.set(anonymous_paint_count.get() + 1)
+                                    }
                                 },
                             )),
                     )
@@ -4991,7 +5020,7 @@ mod tests {
 
     struct PaintedBoundsTestView {
         hidden: bool,
-        recorded: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+        recorded: Rc<RefCell<Vec<(Bounds<Pixels>, Visibility)>>>,
     }
 
     impl Render for PaintedBoundsTestView {
@@ -5004,7 +5033,9 @@ mod tests {
                     .left(px(8.))
                     .size(px(16.))
                     .when(self.hidden, |this| this.invisible())
-                    .on_painted(move |bounds, _, _| recorded.borrow_mut().push(bounds)),
+                    .on_painted(move |bounds, window, _| {
+                        recorded.borrow_mut().push((bounds, window.visibility()))
+                    }),
             )
         }
     }
@@ -5030,8 +5061,9 @@ mod tests {
             .borrow()
             .last()
             .expect("the listener ran at least once");
-        assert_eq!(last.origin, point(px(8.), px(4.)));
-        assert_eq!(last.size, size(px(16.), px(16.)));
+        assert_eq!(last.0.origin, point(px(8.), px(4.)));
+        assert_eq!(last.0.size, size(px(16.), px(16.)));
+        assert_eq!(last.1, Visibility::Visible);
 
         window
             .update(cx, |view, _, cx| {
@@ -5042,10 +5074,13 @@ mod tests {
         recorded.borrow_mut().clear();
         cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
-        assert!(
-            recorded.borrow().is_empty(),
-            "a hidden element paints nothing and must report no bounds"
-        );
+        let hidden = *recorded
+            .borrow()
+            .last()
+            .expect("a hidden element paints nothing but still has its box");
+        assert_eq!(hidden.0.origin, point(px(8.), px(4.)));
+        assert_eq!(hidden.0.size, size(px(16.), px(16.)));
+        assert_eq!(hidden.1, Visibility::Hidden);
     }
 
     struct ContentSizeTestView {
@@ -6108,6 +6143,32 @@ mod tests {
             );
             assert_eq!(chain_at(&window, cx, 150., 150.), ["outer", "root"]);
             assert_eq!(chain_at(&window, cx, 500., 500.), ["root"]);
+        }
+
+        #[gpui::test]
+        fn a_hidden_element_is_never_the_target_but_stays_in_a_visible_descendants_chain(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("below", 0., 0., 200., 200.))
+                    .child(
+                        node("hidden", 0., 0., 200., 200.)
+                            .invisible()
+                            .child(node("shown", 20., 20., 50., 50.).visible())
+                            .child(node("inherited", 100., 100., 50., 50.)),
+                    )
+                    .into_any_element()
+            });
+
+            // The pointer goes through the hidden box to what lies under it.
+            assert_eq!(chain_at(&window, cx, 180., 30.), ["below", "root"]);
+            assert_eq!(chain_at(&window, cx, 120., 120.), ["below", "root"]);
+            // A `visible` descendant is a target, and the hidden box is an ancestor in its chain.
+            assert_eq!(
+                chain_at(&window, cx, 30., 30.),
+                ["shown", "hidden", "root"]
+            );
         }
 
         #[gpui::test]
@@ -7393,6 +7454,199 @@ mod tests {
             activate(&window, cx);
             move_to(&window, cx, 200., 20.);
             assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+        }
+    }
+
+    mod visibility {
+        use super::*;
+        use crate::{deferred, red, size};
+
+        struct SceneView {
+            build: Rc<dyn Fn() -> AnyElement>,
+        }
+
+        impl Render for SceneView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                (self.build)()
+            }
+        }
+
+        fn open_scene(
+            cx: &mut TestAppContext,
+            build: impl Fn() -> AnyElement + 'static,
+        ) -> AnyWindowHandle {
+            let build: Rc<dyn Fn() -> AnyElement> = Rc::new(build);
+            let window = cx.open_window(size(px(800.), px(600.)), move |_, _| SceneView { build });
+            let window = AnyWindowHandle::from(window);
+            cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            window
+        }
+
+        /// A box whose width names it in `painted_widths`.
+        fn boxed(width: f32) -> Div {
+            div().w(px(width)).h(px(20.)).bg(red())
+        }
+
+        fn painted_widths(window: &AnyWindowHandle, cx: &mut TestAppContext) -> Vec<i32> {
+            cx.update_window(*window, |_, window, _| {
+                let mut widths: Vec<i32> = window
+                    .painted_quads()
+                    .iter()
+                    .map(|quad| (quad.bounds.size.width.0 / window.scale_factor()).round() as i32)
+                    .collect();
+                widths.sort();
+                widths
+            })
+            .unwrap()
+        }
+
+        #[gpui::test]
+        fn a_hidden_element_paints_nothing_and_its_descendants_follow(cx: &mut TestAppContext) {
+            let window = open_scene(cx, || {
+                div()
+                    .child(boxed(10.))
+                    .child(boxed(20.).invisible().child(boxed(30.)).child("text"))
+                    .child(boxed(40.))
+                    .into_any_element()
+            });
+
+            assert_eq!(painted_widths(&window, cx), [10, 40]);
+        }
+
+        #[gpui::test]
+        fn a_visible_descendant_of_a_hidden_element_paints(cx: &mut TestAppContext) {
+            let window = open_scene(cx, || {
+                div()
+                    .child(
+                        boxed(20.)
+                            .invisible()
+                            .child(boxed(30.))
+                            .child(boxed(40.).visible().child(boxed(50.)))
+                            .child(boxed(60.)),
+                    )
+                    .into_any_element()
+            });
+
+            // The 50 inherits `visible` from the 40, and the 60 still inherits `hidden`.
+            assert_eq!(painted_widths(&window, cx), [40, 50]);
+        }
+
+        #[gpui::test]
+        fn a_hidden_element_keeps_its_box(cx: &mut TestAppContext) {
+            let painted = Rc::new(RefCell::new(Vec::new()));
+            let window = open_scene(cx, {
+                let painted = painted.clone();
+                move || {
+                    let record = |name: &'static str| {
+                        let painted = painted.clone();
+                        move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                            painted.borrow_mut().push((name, bounds));
+                        }
+                    };
+                    div()
+                        .child(div().w(px(10.)).h(px(10.)))
+                        .child(
+                            boxed(60.)
+                                .invisible()
+                                .on_painted(record("hidden"))
+                                .child(boxed(30.).on_painted(record("inherited"))),
+                        )
+                        .child(boxed(70.).on_painted(record("after")))
+                        .into_any_element()
+                }
+            });
+            let _ = window;
+
+            let painted = painted.borrow();
+            let find = |name| painted.iter().find(|(painted, _)| *painted == name).unwrap().1;
+            assert_eq!(find("hidden").size, size(px(60.), px(20.)));
+            assert_eq!(find("inherited").size, size(px(30.), px(20.)));
+            // The hidden element still takes its space in the layout.
+            assert_eq!(find("hidden").origin.y, px(10.));
+            assert_eq!(find("after").origin.y, px(30.));
+        }
+
+        #[gpui::test]
+        fn showing_an_element_again_paints_it(cx: &mut TestAppContext) {
+            let hidden = Rc::new(Cell::new(true));
+            let window = open_scene(cx, {
+                let hidden = hidden.clone();
+                move || {
+                    let target = boxed(20.).child(boxed(30.));
+                    div()
+                        .child(if hidden.get() { target.invisible() } else { target })
+                        .into_any_element()
+                }
+            });
+            assert_eq!(painted_widths(&window, cx), Vec::<i32>::new());
+
+            hidden.set(false);
+            cx.update_window(window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            assert_eq!(painted_widths(&window, cx), [20, 30]);
+        }
+
+        #[gpui::test]
+        fn a_deferred_child_of_a_hidden_element_stays_hidden(cx: &mut TestAppContext) {
+            let window = open_scene(cx, || {
+                div()
+                    .child(
+                        boxed(20.)
+                            .invisible()
+                            .child(deferred(boxed(30.)))
+                            .child(deferred(boxed(40.).visible())),
+                    )
+                    .into_any_element()
+            });
+
+            assert_eq!(painted_widths(&window, cx), [40]);
+        }
+
+        #[gpui::test]
+        fn a_hidden_element_leaves_the_tab_order(cx: &mut TestAppContext) {
+            struct Tabs {
+                handles: [FocusHandle; 3],
+                hidden: usize,
+            }
+
+            impl Render for Tabs {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    div().children(self.handles.iter().enumerate().map(|(index, handle)| {
+                        let item = div()
+                            .id(("tab", index))
+                            .track_focus(&handle.clone().tab_stop(true))
+                            .size(px(10.));
+                        if index == self.hidden { item.invisible() } else { item }
+                    }))
+                }
+            }
+
+            let handles = cx.update(|cx| [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()]);
+            let window: AnyWindowHandle = cx
+                .add_window({
+                    let handles = handles.clone();
+                    move |_, _| Tabs { handles, hidden: 1 }
+                })
+                .into();
+            cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+
+            let order = cx
+                .update_window(window, |_, window, cx| {
+                    window.focus(&handles[0], cx);
+                    window.focus_next(cx);
+                    window.focused(cx).map(|handle| handle.id)
+                })
+                .unwrap();
+            assert_eq!(order, Some(handles[2].id));
         }
     }
 }

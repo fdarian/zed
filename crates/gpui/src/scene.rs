@@ -12,6 +12,7 @@ use crate::{
 use std::{
     fmt::Debug,
     iter::Peekable,
+    mem,
     ops::{Add, Range, Sub},
     slice,
 };
@@ -61,6 +62,7 @@ pub struct Scene {
     flat_opacities: Vec<f32>,
     text_clips: Vec<TextClip>,
     next_group_id: u64,
+    hidden: bool,
 }
 
 /// A group under construction: its content goes to its own scene until the group ends.
@@ -163,7 +165,16 @@ impl Scene {
         self.current_mut().layer_stack.pop();
     }
 
+    /// While hidden, primitives are dropped (`visibility: hidden`): the element keeps its box in
+    /// the layout, and effect groups and layers still open and close around nothing.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
+    }
+
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+        if self.hidden {
+            return;
+        }
         let primitive = primitive.into();
         if primitive
             .bounds()
@@ -546,6 +557,8 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        // The recorded operations already left out whatever was hidden when they were recorded.
+        let hidden = mem::take(&mut self.hidden);
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
@@ -561,6 +574,7 @@ impl Scene {
                 PaintOperation::EndTextClip => self.end_text_clip(),
             }
         }
+        self.hidden = hidden;
     }
 
     pub fn finish(&mut self) {
@@ -1880,6 +1894,24 @@ mod tests {
         let quads = scene.quads_with_groups();
         assert_eq!(quads.len(), 1);
         assert_eq!(quads[0].bounds, bounds(100., 120., 20., 20.));
+    }
+
+    #[test]
+    fn a_hidden_scene_drops_primitives_and_replays_what_was_recorded() {
+        let mut recorded = scene();
+        recorded.insert_primitive(quad(0., 0., 10., 10.));
+        recorded.set_hidden(true);
+        recorded.insert_primitive(quad(20., 0., 10., 10.));
+        recorded.set_hidden(false);
+        recorded.insert_primitive(quad(40., 0., 10., 10.));
+        assert_eq!(recorded.quads.len(), 2);
+
+        let mut replayed = scene();
+        replayed.set_hidden(true);
+        replayed.replay(0..recorded.len(), &recorded);
+        assert!(replayed.hidden, "replay leaves the flag as it found it");
+        replayed.set_hidden(false);
+        assert_eq!(replayed.quads.len(), 2);
     }
 
     #[test]
