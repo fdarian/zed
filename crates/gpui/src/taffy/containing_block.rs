@@ -8,7 +8,7 @@
 //! percentage margins become pixels measured from the containing block's padding
 //! box, and auto insets stay auto so taffy keeps the static position.
 
-use super::{EXPECT_MESSAGE, LayoutId, TaffyLayoutEngine};
+use super::{CalcArena, EXPECT_MESSAGE, LayoutId, TaffyLayoutEngine};
 use crate::{App, AvailableSpace, Position, Size, Window};
 use taffy::{
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -182,63 +182,93 @@ impl TaffyLayoutEngine {
             bottom: (from.origin.y + from.size.height) - (to.origin.y + to.size.height),
         };
         let basis = to.size;
+        let calcs = &self.calcs;
 
         style.inset = TaffyRect {
-            left: inset(style.inset.left, basis.width, shift.left),
-            right: inset(style.inset.right, basis.width, shift.right),
-            top: inset(style.inset.top, basis.height, shift.top),
-            bottom: inset(style.inset.bottom, basis.height, shift.bottom),
+            left: inset(calcs, style.inset.left, basis.width, shift.left),
+            right: inset(calcs, style.inset.right, basis.width, shift.right),
+            top: inset(calcs, style.inset.top, basis.height, shift.top),
+            bottom: inset(calcs, style.inset.bottom, basis.height, shift.bottom),
         };
-        style.size = dimensions(style.size, basis);
-        style.min_size = dimensions(style.min_size, basis);
-        style.max_size = dimensions(style.max_size, basis);
+        style.size = dimensions(calcs, style.size, basis);
+        style.min_size = dimensions(calcs, style.min_size, basis);
+        style.max_size = dimensions(calcs, style.max_size, basis);
         // CSS resolves every percentage margin and padding against the width.
         style.margin = style
             .margin
-            .map(|margin| length_percentage_auto(margin, basis.width));
+            .map(|margin| length_percentage_auto(calcs, margin, basis.width));
         style.padding = style
             .padding
-            .map(|padding| length_percentage(padding, basis.width));
+            .map(|padding| length_percentage(calcs, padding, basis.width));
     }
 }
 
-fn inset(value: LengthPercentageAuto, basis: f32, shift: f32) -> LengthPercentageAuto {
+/// `length + fraction * basis` for a calc, so it can be measured from the containing block.
+fn resolve_calc(calcs: &CalcArena, raw: CompactLength, basis: f32) -> Option<f32> {
+    calcs
+        .get(raw)
+        .map(|calc| calc.length + calc.percent * basis)
+}
+
+fn inset(
+    calcs: &CalcArena,
+    value: LengthPercentageAuto,
+    basis: f32,
+    shift: f32,
+) -> LengthPercentageAuto {
     let raw = value.into_raw();
     match raw.tag() {
         CompactLength::LENGTH_TAG => LengthPercentageAuto::length(raw.value() + shift),
         CompactLength::PERCENT_TAG => LengthPercentageAuto::length(raw.value() * basis + shift),
-        _ => value,
+        _ => match resolve_calc(calcs, raw, basis) {
+            Some(resolved) => LengthPercentageAuto::length(resolved + shift),
+            None => value,
+        },
     }
 }
 
-fn dimension(value: Dimension, basis: f32) -> Dimension {
+fn dimension(calcs: &CalcArena, value: Dimension, basis: f32) -> Dimension {
     if value.tag() == CompactLength::PERCENT_TAG {
         Dimension::length(value.value() * basis)
+    } else if let Some(resolved) = resolve_calc(calcs, value.into_raw(), basis) {
+        Dimension::length(resolved)
     } else {
         value
     }
 }
 
-fn dimensions(value: TaffySize<Dimension>, basis: TaffySize<f32>) -> TaffySize<Dimension> {
+fn dimensions(
+    calcs: &CalcArena,
+    value: TaffySize<Dimension>,
+    basis: TaffySize<f32>,
+) -> TaffySize<Dimension> {
     TaffySize {
-        width: dimension(value.width, basis.width),
-        height: dimension(value.height, basis.height),
+        width: dimension(calcs, value.width, basis.width),
+        height: dimension(calcs, value.height, basis.height),
     }
 }
 
-fn length_percentage_auto(value: LengthPercentageAuto, basis: f32) -> LengthPercentageAuto {
+fn length_percentage_auto(
+    calcs: &CalcArena,
+    value: LengthPercentageAuto,
+    basis: f32,
+) -> LengthPercentageAuto {
     let raw = value.into_raw();
     if raw.tag() == CompactLength::PERCENT_TAG {
         LengthPercentageAuto::length(raw.value() * basis)
+    } else if let Some(resolved) = resolve_calc(calcs, raw, basis) {
+        LengthPercentageAuto::length(resolved)
     } else {
         value
     }
 }
 
-fn length_percentage(value: LengthPercentage, basis: f32) -> LengthPercentage {
+fn length_percentage(calcs: &CalcArena, value: LengthPercentage, basis: f32) -> LengthPercentage {
     let raw = value.into_raw();
     if raw.tag() == CompactLength::PERCENT_TAG {
         LengthPercentage::length(raw.value() * basis)
+    } else if let Some(resolved) = resolve_calc(calcs, raw, basis) {
+        LengthPercentage::length(resolved)
     } else {
         value
     }

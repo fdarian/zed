@@ -51,6 +51,14 @@ pub struct LinearCalc {
     pub percent: f32,
 }
 
+// fdarian fork patch: upstream returns 0.0.
+#[allow(unsafe_code)]
+fn resolve_linear_calc(val: *const (), basis: f32) -> f32 {
+    // SAFETY: calc pointers handed to this tree point to a live, 8-aligned `LinearCalc`; see its docs.
+    let calc = unsafe { *(val as *const LinearCalc) };
+    calc.length + calc.percent * basis
+}
+
 /// The error Taffy generates on invalid operations
 pub type TaffyResult<T> = Result<T, TaffyError>;
 
@@ -344,7 +352,7 @@ where
                     let measure_function = |known_dimensions, available_space| {
                         (tree.measure_function)(known_dimensions, available_space, node_id, node_context, style)
                     };
-                    compute_leaf_layout(inputs, style, |_, _| 0.0, measure_function)
+                    compute_leaf_layout(inputs, style, resolve_linear_calc, measure_function)
                 }
             }
         })
@@ -409,12 +417,8 @@ where
     }
 
     #[inline(always)]
-    #[allow(unsafe_code)]
     fn resolve_calc_value(&self, val: *const (), basis: f32) -> f32 {
-        // fdarian fork patch: upstream returns 0.0.
-        // SAFETY: calc pointers handed to this tree point to a live, 8-aligned `LinearCalc`; see its docs.
-        let calc = unsafe { *(val as *const LinearCalc) };
-        calc.length + calc.percent * basis
+        resolve_linear_calc(val, basis)
     }
 
     #[inline(always)]
@@ -1436,6 +1440,30 @@ mod tests {
 
         fn ptr(calc: &LinearCalc) -> *const () {
             calc as *const LinearCalc as *const ()
+        }
+
+        #[test]
+        fn a_leaf_resolves_its_max_size_calc() {
+            let max_width = LinearCalc { length: 10.0, percent: 0.5 };
+
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let leaf = taffy
+                .new_leaf(Style {
+                    size: Size { width: length(300.0), height: length(10.0) },
+                    max_size: Size { width: Dimension::calc(ptr(&max_width)), height: Dimension::auto() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let root = taffy
+                .new_with_children(
+                    Style { size: Size { width: length(200.0), height: length(100.0) }, ..Default::default() },
+                    &[leaf],
+                )
+                .unwrap();
+
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+
+            assert_eq!(taffy.layout(leaf).unwrap().size.width, 110.0);
         }
 
         #[test]

@@ -152,7 +152,9 @@ impl RedistributableColumnsState {
                 .map_ref(|length| Self::get_fraction(length, self.cached_container_width, rem_size))
         } else {
             self.preview_widths.map_ref(|length| match length {
-                DefiniteLength::Fraction(fraction) => *fraction,
+                DefiniteLength::Fraction(fraction) | DefiniteLength::Calc { fraction, .. } => {
+                    *fraction
+                }
                 DefiniteLength::Absolute(_) => 0.0,
             })
         }
@@ -161,10 +163,12 @@ impl RedistributableColumnsState {
     pub fn preview_column_width(&self, column_index: usize, window: &Window) -> Option<Pixels> {
         let width = self.preview_widths().as_slice().get(column_index)?;
         match width {
-            DefiniteLength::Fraction(fraction) if self.cached_container_width > px(0.) => {
-                Some(self.cached_container_width * *fraction)
+            DefiniteLength::Fraction(_) | DefiniteLength::Calc { .. }
+                if self.cached_container_width > px(0.) =>
+            {
+                Some(width.to_pixels(self.cached_container_width.into(), window.rem_size()))
             }
-            DefiniteLength::Fraction(_) => None,
+            DefiniteLength::Fraction(_) | DefiniteLength::Calc { .. } => None,
             DefiniteLength::Absolute(AbsoluteLength::Pixels(pixels)) => Some(*pixels),
             DefiniteLength::Absolute(AbsoluteLength::Rems(rems_width)) => {
                 Some(rems_width.to_pixels(window.rem_size()))
@@ -211,6 +215,9 @@ impl RedistributableColumnsState {
                 rems_width.to_pixels(rem_size) / bounds_width
             }
             DefiniteLength::Fraction(fraction) => *fraction,
+            DefiniteLength::Calc { .. } => {
+                length.to_pixels(bounds_width.into(), rem_size) / bounds_width
+            }
         }
     }
 

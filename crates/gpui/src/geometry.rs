@@ -3462,13 +3462,30 @@ pub enum DefiniteLength {
     Absolute(AbsoluteLength),
     /// A relative length specified as a fraction of the parent's size, between 0 and 1.
     Fraction(f32),
+    /// The sum of a fixed length and a fraction of the parent's size, like CSS `calc(10px + 50%)`.
+    /// The fraction may be negative.
+    Calc {
+        /// The fixed part.
+        length: AbsoluteLength,
+        /// The part proportional to the parent's size.
+        fraction: f32,
+    },
 }
 
 impl DefiniteLength {
+    /// A length of `length + fraction * basis`, like CSS `calc(10px + 50%)`.
+    pub fn calc(length: impl Into<AbsoluteLength>, fraction: f32) -> Self {
+        Self::Calc {
+            length: length.into(),
+            fraction,
+        }
+    }
+
     /// Converts the `DefiniteLength` to `Pixels` based on a given `base_size` and `rem_size`.
     ///
     /// If the `DefiniteLength` is an absolute length, it will be directly converted to `Pixels`.
     /// If it is a fraction, the fraction will be multiplied by the `base_size` to get the length in pixels.
+    /// A calc is the sum of both.
     ///
     /// # Arguments
     ///
@@ -3492,14 +3509,21 @@ impl DefiniteLength {
     /// assert_eq!(length_in_pixels.to_pixels(base_size, rem_size), Pixels::from(42.0));
     /// assert_eq!(length_in_rems.to_pixels(base_size, rem_size), Pixels::from(32.0));
     /// assert_eq!(length_as_fraction.to_pixels(base_size, rem_size), Pixels::from(50.0));
+    ///
+    /// let length_as_calc = DefiniteLength::calc(px(10.0), 0.5);
+    /// assert_eq!(length_as_calc.to_pixels(base_size, rem_size), Pixels::from(60.0));
     /// ```
     pub fn to_pixels(self, base_size: AbsoluteLength, rem_size: Pixels) -> Pixels {
+        let fraction_of_base = |fraction: f32| match base_size {
+            AbsoluteLength::Pixels(px) => px * fraction,
+            AbsoluteLength::Rems(rems) => rems * rem_size * fraction,
+        };
         match self {
             DefiniteLength::Absolute(size) => size.to_pixels(rem_size),
-            DefiniteLength::Fraction(fraction) => match base_size {
-                AbsoluteLength::Pixels(px) => px * fraction,
-                AbsoluteLength::Rems(rems) => rems * rem_size * fraction,
-            },
+            DefiniteLength::Fraction(fraction) => fraction_of_base(fraction),
+            DefiniteLength::Calc { length, fraction } => {
+                length.to_pixels(rem_size) + fraction_of_base(fraction)
+            }
         }
     }
 }
@@ -3515,17 +3539,40 @@ impl Display for DefiniteLength {
         match self {
             DefiniteLength::Absolute(length) => write!(f, "{length}"),
             DefiniteLength::Fraction(fraction) => write!(f, "{}%", (fraction * 100.0) as i32),
+            DefiniteLength::Calc { length, fraction } => {
+                let sign = if *fraction < 0.0 { '-' } else { '+' };
+                write!(f, "calc({length} {sign} {}%)", fraction.abs() * 100.0)
+            }
         }
     }
 }
 
-const EXPECTED_DEFINITE_LENGTH: &str = "expected number with 'px', 'rem', or '%' suffix";
+const EXPECTED_DEFINITE_LENGTH: &str =
+    "expected number with 'px', 'rem', or '%' suffix, or 'calc(<length> + <percentage>)'";
 
 impl TryFrom<&'_ str> for DefiniteLength {
     type Error = anyhow::Error;
 
     fn try_from(value: &'_ str) -> Result<Self, Self::Error> {
-        if let Some(percentage) = value.strip_suffix('%') {
+        let invalid =
+            || anyhow!("invalid DefiniteLength '{value}', expected {EXPECTED_DEFINITE_LENGTH}");
+        if let Some(body) = value
+            .strip_prefix("calc(")
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            let (length, sign, percentage) =
+                if let Some((length, percentage)) = body.split_once(" + ") {
+                    (length, 1.0, percentage)
+                } else if let Some((length, percentage)) = body.split_once(" - ") {
+                    (length, -1.0, percentage)
+                } else {
+                    return Err(invalid());
+                };
+            let percentage = percentage.strip_suffix('%').ok_or_else(invalid)?;
+            let percentage: f32 = percentage.parse().map_err(|_| invalid())?;
+            let length = AbsoluteLength::try_from(length).map_err(|_| invalid())?;
+            Ok(DefiniteLength::calc(length, sign * percentage / 100.0))
+        } else if let Some(percentage) = value.strip_suffix('%') {
             let fraction: f32 = percentage.parse::<f32>().with_context(|| {
                 format!("invalid DefiniteLength '{value}', expected {EXPECTED_DEFINITE_LENGTH}")
             })?;
@@ -3548,7 +3595,7 @@ impl JsonSchema for DefiniteLength {
     fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         json_schema!({
             "type": "string",
-            "pattern": r"^-?\d+(\.\d+)?(px|rem|%)$"
+            "pattern": r"^(-?\d+(\.\d+)?(px|rem|%)|calc\(-?\d+(\.\d+)?(px|rem) [+-] \d+(\.\d+)?%\))$"
         })
     }
 }
@@ -3933,6 +3980,7 @@ impl IsZero for DefiniteLength {
         match self {
             DefiniteLength::Absolute(length) => length.is_zero(),
             DefiniteLength::Fraction(fraction) => *fraction == 0.,
+            DefiniteLength::Calc { length, fraction } => length.is_zero() && *fraction == 0.,
         }
     }
 }
@@ -4015,5 +4063,53 @@ mod tests {
 
         // Test Case 3: Bounds intersecting with themselves
         assert!(bounds1.intersects(&bounds1));
+    }
+
+    #[test]
+    fn calc_definite_length_is_the_length_plus_a_fraction_of_the_base() {
+        let base = AbsoluteLength::Pixels(px(200.));
+        let rem_size = px(16.);
+        assert_eq!(
+            DefiniteLength::calc(px(-20.), 1.).to_pixels(base, rem_size),
+            px(180.)
+        );
+        assert_eq!(
+            DefiniteLength::calc(rems(2.), -0.25).to_pixels(base, rem_size),
+            px(32. - 50.)
+        );
+        assert_eq!(
+            DefiniteLength::calc(px(10.), 0.5).to_pixels(AbsoluteLength::Rems(rems(10.)), rem_size),
+            px(10. + 80.)
+        );
+    }
+
+    #[test]
+    fn calc_definite_length_negates_both_parts() {
+        let negated = -DefiniteLength::calc(px(10.), 0.5);
+        assert_eq!(negated, DefiniteLength::calc(px(-10.), -0.5));
+    }
+
+    #[test]
+    fn calc_definite_length_is_zero_only_when_both_parts_are() {
+        assert!(DefiniteLength::calc(px(0.), 0.).is_zero());
+        assert!(!DefiniteLength::calc(px(1.), 0.).is_zero());
+        assert!(!DefiniteLength::calc(px(0.), 0.1).is_zero());
+    }
+
+    #[test]
+    fn calc_definite_length_round_trips_through_its_text_form() {
+        for length in [
+            DefiniteLength::calc(px(10.), 0.5),
+            DefiniteLength::calc(rems(2.), -0.25),
+        ] {
+            let text = length.to_string();
+            assert_eq!(DefiniteLength::try_from(text.as_str()).unwrap(), length);
+        }
+        assert_eq!(
+            DefiniteLength::calc(px(10.), 0.5).to_string(),
+            "calc(10px + 50%)"
+        );
+        assert!(DefiniteLength::try_from("calc(10px * 50%)").is_err());
+        assert!(DefiniteLength::try_from("calc(10px + 50)").is_err());
     }
 }
