@@ -1546,6 +1546,23 @@ mod tests {
         let _ = div().child(SharedString::from("SharedString"));
     }
 
+    #[test]
+    fn highlights_never_give_a_run_a_size() {
+        let highlight = HighlightStyle {
+            color: Some(crate::red()),
+            font_weight: Some(crate::FontWeight::BOLD),
+            underline: Some(crate::UnderlineStyle::default()),
+            ..Default::default()
+        };
+        let runs =
+            StyledText::compute_runs("abcdef", &TextStyle::default(), [(1..4, highlight)]);
+        assert_eq!(runs.iter().map(|run| run.len).collect::<Vec<_>>(), [1, 3, 2]);
+        for run in runs {
+            assert_eq!(run.font_size, None);
+            assert_eq!(run.line_height, None);
+        }
+    }
+
     mod rows {
         use super::*;
         use crate as gpui;
