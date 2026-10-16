@@ -10020,6 +10020,82 @@ mod tests {
     }
 
     #[gpui::test]
+    fn extra_decorations_paint_beside_the_first_line_of_their_kind(cx: &mut TestAppContext) {
+        use crate::text_decoration::{SHAPE_DOTTED, SHAPE_SOLID};
+        use crate::{ExtraDecoration, OverlineStyle, UnderlineStyle, blue, red};
+        let cx = cx.add_empty_window();
+
+        let lines = painted_decorations(cx, |mut el| {
+            el.text_style().underline = Some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(red()),
+                ..Default::default()
+            });
+            el.text_style().extra_decorations = Some(vec![
+                ExtraDecoration::Underline(UnderlineStyle {
+                    thickness: px(3.),
+                    color: Some(blue()),
+                    style: crate::TextDecorationStyle::Dotted,
+                    ..Default::default()
+                }),
+                ExtraDecoration::Overline(OverlineStyle {
+                    thickness: px(2.),
+                    ..Default::default()
+                }),
+            ]);
+            el
+        });
+
+        assert_eq!(lines.len(), 3);
+        let solid = lines
+            .iter()
+            .find(|line| line.style == SHAPE_SOLID && line.color == red());
+        let dotted = lines
+            .iter()
+            .find(|line| line.style == SHAPE_DOTTED)
+            .expect("the extra underline");
+        let solid = solid.expect("the first underline");
+        assert_eq!(dotted.color, blue());
+        assert_eq!(dotted.thickness.0, solid.thickness.0 * 3.);
+        assert_eq!(
+            dotted.bounds.origin.y, solid.bounds.origin.y,
+            "both sit at the underline's place"
+        );
+        assert_eq!(dotted.bounds.size.width, solid.bounds.size.width);
+        let overline = lines
+            .iter()
+            .find(|line| line.thickness.0 == solid.thickness.0 * 2.)
+            .expect("the extra overline");
+        assert!(overline.bounds.origin.y < solid.bounds.origin.y);
+    }
+
+    #[gpui::test]
+    fn extra_decorations_of_one_run_cover_that_run_only(cx: &mut TestAppContext) {
+        use crate::{ExtraDecoration, StyledText, TextRun, UnderlineStyle, blue};
+        let cx = cx.add_empty_window();
+        let extra = vec![ExtraDecoration::Underline(UnderlineStyle {
+            thickness: px(2.),
+            color: Some(blue()),
+            ..Default::default()
+        })];
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(40.)), |_, _| {
+            let style = crate::TextStyle::default();
+            let plain = style.to_run(2);
+            let decorated = TextRun {
+                extra_decorations: extra.clone(),
+                ..style.to_run(2)
+            };
+            div()
+                .text_size(px(16.))
+                .child(StyledText::new("abcd").with_runs(vec![plain, decorated]))
+        });
+        let lines = cx.update(|window, _| window.painted_underlines());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].color, blue());
+        assert!(lines[0].bounds.origin.x.0 > 0.);
+    }
+
+    #[gpui::test]
     fn a_zero_thickness_decoration_paints_nothing(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         let none = painted_decorations(cx, |el| el.underline().text_decoration_0());

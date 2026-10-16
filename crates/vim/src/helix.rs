@@ -1307,6 +1307,7 @@ impl Vim {
                 font_size: None,
                 line_height: None,
                 overline: None,
+                extra_decorations: Vec::new(),
             };
 
             text_system.layout_line(text, font_size, &[run], None).width

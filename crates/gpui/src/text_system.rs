@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Bounds, DevicePixels, Hsla, OverlineStyle, Pixels, PlatformTextSystem, Point, Result,
+    Bounds, DevicePixels, ExtraDecoration, Hsla, OverlineStyle, Pixels, PlatformTextSystem, Point, Result,
     SharedString, Size, StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
 };
 use anyhow::{Context as _, anyhow};
@@ -444,6 +444,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
+                && last_run.extra_decorations == run.extra_decorations
                 && last_run.background_color == run.background_color
             {
                 last_run.len += run.len as u32;
@@ -456,6 +457,7 @@ impl WindowTextSystem {
                 underline: run.underline,
                 strikethrough: run.strikethrough,
                 overline: run.overline,
+                extra_decorations: run.extra_decorations.clone(),
             });
         }
 
@@ -494,6 +496,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
+                && last_run.extra_decorations == run.extra_decorations
                 && last_run.background_color == run.background_color
             {
                 last_run.len += run.len as u32;
@@ -506,6 +509,7 @@ impl WindowTextSystem {
                 underline: run.underline,
                 strikethrough: run.strikethrough,
                 overline: run.overline,
+                extra_decorations: run.extra_decorations.clone(),
             });
         }
 
@@ -609,6 +613,7 @@ impl WindowTextSystem {
                     && last_run.underline == run.underline
                     && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
+                && last_run.extra_decorations == run.extra_decorations
                     && last_run.background_color == run.background_color
                 {
                     last_run.len += run_len_within_line as u32;
@@ -621,6 +626,7 @@ impl WindowTextSystem {
                         underline: run.underline,
                         strikethrough: run.strikethrough,
                         overline: run.overline,
+                        extra_decorations: run.extra_decorations.clone(),
                     });
                     true
                 };
@@ -771,6 +777,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
+                && last_run.extra_decorations == run.extra_decorations
             // we do not consider differing background color relevant, as it does not affect glyphs
             // && last_run.background_color == run.background_color
             {
@@ -860,6 +867,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
+                && last_run.extra_decorations == run.extra_decorations
             // we do not consider differing background color relevant, as it does not affect glyphs
             // && last_run.background_color == run.background_color
             {
@@ -927,6 +935,7 @@ impl WindowTextSystem {
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
+                && last_run.extra_decorations == run.extra_decorations
             // we do not consider differing background color relevant, as it does not affect glyphs
             // && last_run.background_color == run.background_color
             {
@@ -1189,6 +1198,8 @@ pub struct TextRun {
     pub line_height: Option<Pixels>,
     /// The overline style (if any)
     pub overline: Option<OverlineStyle>,
+    /// The lines drawn besides `underline`, `strikethrough` and `overline`.
+    pub extra_decorations: Vec<ExtraDecoration>,
 }
 
 #[cfg(all(target_os = "macos", test))]

@@ -1,8 +1,8 @@
 use crate::{
-    App, Bounds, DevicePixels, FontId, GlyphInset, Half, Hsla, LineLayout, OverlineStyle, Pixels,
-    Point, RenderGlyphParams, Result, ShapedRun, SharedString, StrikethroughStyle, TextAlign,
-    TextSystem,
-    UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
+    App, Bounds, DevicePixels, ExtraDecoration, FontId, GlyphInset, Half, Hsla, LineLayout,
+    OverlineStyle, Pixels, Point, RenderGlyphParams, Result, ShapedRun, SharedString,
+    StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
+    WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -40,6 +40,9 @@ pub struct DecorationRun {
 
     /// The overline style for this run
     pub overline: Option<OverlineStyle>,
+
+    /// The lines drawn besides the underline, strikethrough and overline
+    pub extra_decorations: Vec<ExtraDecoration>,
 }
 
 /// A line of text that has been shaped and decorated.
@@ -171,6 +174,7 @@ impl ShapedLine {
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
                     overline: decoration.overline,
+                    extra_decorations: decoration.extra_decorations.clone(),
                 });
                 right_decorations.push(DecorationRun {
                     len: right_len,
@@ -179,6 +183,7 @@ impl ShapedLine {
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
                     overline: decoration.overline,
+                    extra_decorations: decoration.extra_decorations.clone(),
                 });
             }
 
@@ -407,6 +412,8 @@ fn paint_line(
         let mut current_underline: Option<OpenDecoration<UnderlineStyle>> = None;
         let mut current_strikethrough: Option<OpenDecoration<StrikethroughStyle>> = None;
         let mut current_overline: Option<OpenDecoration<OverlineStyle>> = None;
+        let mut current_extras: Vec<OpenDecoration<ExtraDecoration>> = Vec::new();
+        let mut extras_source: &[ExtraDecoration] = &[];
         let text_system = cx.text_system().clone();
         let mut glyph_origin = point(
             aligned_origin_x(
@@ -488,6 +495,20 @@ fn paint_line(
                             current_overline = None;
                         }
                     }
+                    for extra in &mut current_extras {
+                        paint_extra(
+                            window,
+                            extra,
+                            glyph_origin.x - previous_trailing,
+                            row_baseline,
+                            max_glyph_size.width.half(),
+                        );
+                        extra.x = origin.x;
+                    }
+                    if glyph.index >= run_end {
+                        current_extras.clear();
+                        extras_source = &[];
+                    }
 
                     glyph_origin.y += rows[line_ix].height;
                     line_ix += 1;
@@ -507,6 +528,7 @@ fn paint_line(
                 let mut finished_underline: Option<OpenDecoration<UnderlineStyle>> = None;
                 let mut finished_strikethrough: Option<OpenDecoration<StrikethroughStyle>> = None;
                 let mut finished_overline: Option<OpenDecoration<OverlineStyle>> = None;
+                let mut finished_extras = Vec::new();
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
@@ -587,10 +609,31 @@ fn paint_line(
                             });
                         }
 
+                        if style_run.extra_decorations.as_slice() != extras_source {
+                            finished_extras = std::mem::take(&mut current_extras);
+                            extras_source = &style_run.extra_decorations;
+                            current_extras = extras_source
+                                .iter()
+                                .map(|extra| {
+                                    open_extra(
+                                        extra,
+                                        glyph_origin.x + leading,
+                                        style_run.color,
+                                        layout,
+                                        run,
+                                        line_height,
+                                        &text_system,
+                                    )
+                                })
+                                .collect();
+                        }
+
                         run_end += style_run.len as usize;
                         color = style_run.color;
                     } else {
                         run_end = layout.len;
+                        finished_extras = std::mem::take(&mut current_extras);
+                        extras_source = &[];
                         finished_underline = current_underline.take();
                         finished_strikethrough = current_strikethrough.take();
                         finished_overline = current_overline.take();
@@ -627,6 +670,16 @@ fn paint_line(
                         overline.origin(row_baseline),
                         glyph_origin.x - previous_trailing - overline.x,
                         &overline.style,
+                    );
+                }
+
+                for mut extra in finished_extras {
+                    paint_extra(
+                        window,
+                        &mut extra,
+                        glyph_origin.x - previous_trailing,
+                        row_baseline,
+                        max_glyph_size.width.half(),
                     );
                 }
 
@@ -699,6 +752,16 @@ fn paint_line(
                 overline.origin(last_row_baseline),
                 last_line_end_x - overline.x,
                 &overline.style,
+            );
+        }
+
+        for mut extra in current_extras {
+            paint_extra(
+                window,
+                &mut extra,
+                last_line_end_x,
+                last_row_baseline,
+                max_glyph_size.width.half(),
             );
         }
 
@@ -873,6 +936,77 @@ struct OpenDecoration<Style> {
 impl<Style> OpenDecoration<Style> {
     fn origin(&self, row_baseline: Pixels) -> Point<Pixels> {
         point(self.x, row_baseline + self.baseline_offset)
+    }
+}
+
+fn open_extra(
+    extra: &ExtraDecoration,
+    x: Pixels,
+    run_color: Hsla,
+    layout: &LineLayout,
+    run: &ShapedRun,
+    line_height: Pixels,
+    text_system: &TextSystem,
+) -> OpenDecoration<ExtraDecoration> {
+    let thickness = |thickness, from_font| {
+        decoration_thickness(
+            thickness,
+            from_font,
+            text_system,
+            run.font_id,
+            layout.font_size,
+        )
+    };
+    let (baseline_offset, style) = match extra {
+        ExtraDecoration::Underline(underline) => (
+            underline_offset(layout, run),
+            ExtraDecoration::Underline(UnderlineStyle {
+                color: Some(underline.color.unwrap_or(run_color)),
+                thickness: thickness(underline.thickness, underline.thickness_from_font),
+                ..*underline
+            }),
+        ),
+        ExtraDecoration::Strikethrough(strikethrough) => (
+            strikethrough_offset(layout, run, line_height),
+            ExtraDecoration::Strikethrough(StrikethroughStyle {
+                color: Some(strikethrough.color.unwrap_or(run_color)),
+                thickness: thickness(strikethrough.thickness, strikethrough.thickness_from_font),
+                ..*strikethrough
+            }),
+        ),
+        ExtraDecoration::Overline(overline) => (
+            overline_offset(layout, run),
+            ExtraDecoration::Overline(OverlineStyle {
+                color: Some(overline.color.unwrap_or(run_color)),
+                thickness: thickness(overline.thickness, overline.thickness_from_font),
+                ..*overline
+            }),
+        ),
+    };
+    OpenDecoration {
+        x,
+        baseline_offset,
+        style,
+    }
+}
+
+/// Paints `extra` from where it started to `end_x`.
+fn paint_extra(
+    window: &mut Window,
+    extra: &mut OpenDecoration<ExtraDecoration>,
+    end_x: Pixels,
+    row_baseline: Pixels,
+    half_glyph_width: Pixels,
+) {
+    if extra.x == end_x {
+        extra.x -= half_glyph_width;
+    }
+    let origin = extra.origin(row_baseline);
+    let width = end_x - extra.x;
+    match &extra.style {
+        ExtraDecoration::Underline(style) => window.paint_underline(origin, width, style),
+        ExtraDecoration::Strikethrough(style) => window.paint_strikethrough(origin, width, style),
+        ExtraDecoration::Overline(style) => window.paint_overline(origin, width, style),
     }
 }
 
@@ -1188,6 +1322,7 @@ mod tests {
                     underline: None,
                     strikethrough: None,
                     overline: None,
+                    extra_decorations: Vec::new(),
                 },
                 DecorationRun {
                     len: 3,
@@ -1196,6 +1331,7 @@ mod tests {
                     underline: None,
                     strikethrough: None,
                     overline: None,
+                    extra_decorations: Vec::new(),
                 },
                 DecorationRun {
                     len: 1,
@@ -1204,6 +1340,7 @@ mod tests {
                     underline: None,
                     strikethrough: None,
                     overline: None,
+                    extra_decorations: Vec::new(),
                 },
             ],
         );

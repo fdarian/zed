@@ -7215,6 +7215,7 @@ impl LineWithInvisibles {
                             font_size: None,
                             line_height: None,
                             overline: text_style.overline,
+                            extra_decorations: text_style.extra_decorations.clone(),
                         };
                         let line_layout = window
                             .text_system()
@@ -7295,6 +7296,7 @@ impl LineWithInvisibles {
                             font_size: None,
                             line_height: None,
                             overline: text_style.overline,
+                            extra_decorations: text_style.extra_decorations.clone(),
                         });
 
                         if editor_mode.is_full() && !highlighted_chunk.is_inlay {
@@ -7381,6 +7383,7 @@ impl LineWithInvisibles {
                         font_size: None,
                         line_height: None,
                         overline: text_run.overline,
+                        extra_decorations: text_run.extra_decorations.clone(),
                     });
                     cursor_col = segment_start_col;
                 }
@@ -7398,6 +7401,7 @@ impl LineWithInvisibles {
                         font_size: None,
                         line_height: None,
                         overline: text_run.overline,
+                        extra_decorations: text_run.extra_decorations.clone(),
                     });
                     cursor_col = segment_slice_end_col;
                 }
@@ -7417,6 +7421,7 @@ impl LineWithInvisibles {
                     font_size: None,
                     line_height: None,
                     overline: text_run.overline,
+                    extra_decorations: text_run.extra_decorations.clone(),
                 });
             }
             line_col = run_end_col;

@@ -613,6 +613,9 @@ pub struct TextStyle {
     /// The overline style of the text
     pub overline: Option<OverlineStyle>,
 
+    /// The lines drawn besides `underline`, `strikethrough` and `overline`.
+    pub extra_decorations: Vec<ExtraDecoration>,
+
     /// How to handle whitespace in the text
     pub white_space: WhiteSpace,
 
@@ -662,6 +665,7 @@ impl Default for TextStyle {
             underline: None,
             strikethrough: None,
             overline: None,
+            extra_decorations: Vec::new(),
             white_space: WhiteSpace::Normal,
             text_overflow: None,
             text_align: TextAlign::default(),
@@ -754,6 +758,7 @@ impl TextStyle {
             font_size: None,
             line_height: None,
             overline: self.overline,
+            extra_decorations: self.extra_decorations.clone(),
         }
     }
 }
@@ -1353,6 +1358,19 @@ pub struct OverlineStyle {
 
     /// How the overline is drawn.
     pub style: TextDecorationStyle,
+}
+
+/// A decoration line beyond the first of its kind on a run. CSS decorations of
+/// nested boxes accumulate, each with its own style, colour and thickness, while
+/// `underline`, `strikethrough` and `overline` hold one line each.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum ExtraDecoration {
+    /// A second or later underline.
+    Underline(UnderlineStyle),
+    /// A second or later strikethrough.
+    Strikethrough(StrikethroughStyle),
+    /// A second or later overline.
+    Overline(OverlineStyle),
 }
 
 /// The kinds of fill that can be applied to a shape.

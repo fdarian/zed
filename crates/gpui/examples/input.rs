@@ -472,6 +472,7 @@ impl Element for TextElement {
             font_size: None,
             line_height: None,
             overline: None,
+            extra_decorations: Vec::new(),
         };
         let runs = if let Some(marked_range) = input.marked_range.as_ref() {
             vec![

@@ -420,6 +420,7 @@ impl Element for EditorText {
                 font_size: None,
                 line_height: None,
                 overline: None,
+                extra_decorations: Vec::new(),
             };
             vec![
                 window
@@ -441,6 +442,7 @@ impl Element for EditorText {
                         font_size: None,
                         line_height: None,
                         overline: None,
+                        extra_decorations: Vec::new(),
                     };
                     window
                         .text_system()
