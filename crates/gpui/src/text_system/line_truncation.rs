@@ -229,6 +229,8 @@ mod tests {
             TextRun {
                 len,
                 font: font("Menlo"),
+                font_size: None,
+                line_height: None,
                 ..Default::default()
             }
         }

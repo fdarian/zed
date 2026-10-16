@@ -237,6 +237,14 @@ pub struct LineLayout {
 pub struct ShapedRun {
     /// The font id for this run
     pub font_id: FontId,
+    /// The size this run was shaped at
+    pub font_size: Pixels,
+    /// The ascent of the font of this run, at the size of this run
+    pub ascent: Pixels,
+    /// The descent of the font of this run, at the size of this run
+    pub descent: Pixels,
+    /// The line height of this run, if it has one of its own
+    pub line_height: Option<Pixels>,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
 }
@@ -335,7 +343,7 @@ impl LineLayout {
     ///   Its width equals the x-advance up to the split point.
     /// - `suffix` contains glyphs for bytes `[byte_index, len)` with positions
     ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
-    /// - `font_size`, `ascent`, and `descent` are copied to both halves.
+    /// - `font_size`, `ascent`, and `descent` of the line and of each run are copied to both halves.
     pub fn split_at(&self, byte_index: usize) -> (LineLayout, LineLayout) {
         let x_offset = self.x_for_index(byte_index);
 
@@ -349,6 +357,10 @@ impl LineLayout {
             if split_pos > 0 {
                 left_runs.push(ShapedRun {
                     font_id: run.font_id,
+                    font_size: run.font_size,
+                    ascent: run.ascent,
+                    descent: run.descent,
+                    line_height: run.line_height,
                     glyphs: run.glyphs[..split_pos].to_vec(),
                 });
             }
@@ -365,6 +377,10 @@ impl LineLayout {
                     .collect();
                 right_runs.push(ShapedRun {
                     font_id: run.font_id,
+                    font_size: run.font_size,
+                    ascent: run.ascent,
+                    descent: run.descent,
+                    line_height: run.line_height,
                     glyphs: right_glyphs,
                 });
             }
@@ -520,6 +536,10 @@ impl LineLayout {
             .iter()
             .map(|run| ShapedRun {
                 font_id: run.font_id,
+                font_size: run.font_size,
+                ascent: run.ascent,
+                descent: run.descent,
+                line_height: run.line_height,
                 glyphs: run
                     .glyphs
                     .iter()
@@ -1492,6 +1512,25 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
+    /// The size to shape this run at, `None` for the size of the line. Only the
+    /// macOS shaper honours it, the others shape every run at the size of the line.
+    pub font_size: Option<Pixels>,
+    /// The line height of the run, carried through to [`ShapedRun::line_height`].
+    pub line_height: Option<Pixels>,
+}
+
+impl FontRun {
+    /// The line height of the run that the byte at `ix` falls in.
+    pub fn line_height_at(runs: &[FontRun], ix: usize) -> Option<Pixels> {
+        let mut end = 0;
+        for run in runs {
+            end += run.len;
+            if ix < end {
+                return run.line_height;
+            }
+        }
+        panic!("byte {ix} is past the {end} bytes of the font runs");
+    }
 }
 
 trait AsCacheKeyRef {
@@ -1667,6 +1706,10 @@ mod tests {
             descent: px(4.),
             runs: vec![ShapedRun {
                 font_id: FontId(0),
+                font_size: px(16.),
+                ascent: px(12.),
+                descent: px(4.),
+                line_height: None,
                 glyphs,
             }],
             len: 0,

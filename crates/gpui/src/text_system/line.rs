@@ -406,7 +406,7 @@ fn paint_line(
         // current glyph's position is after.
         let mut previous_trailing = Pixels::ZERO;
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            max_glyph_size = text_system.bounding_box(run.font_id, run.font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -567,14 +567,14 @@ fn paint_line(
                             painted_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run.font_size,
                         )?;
                     } else {
                         window.paint_glyph(
                             painted_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run.font_size,
                             color,
                         )?;
                     }
@@ -657,7 +657,7 @@ fn paint_line_background(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            max_glyph_size = text_system.bounding_box(run.font_id, run.font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -831,6 +831,10 @@ mod tests {
                 descent: px(4.0),
                 runs: vec![ShapedRun {
                     font_id: FontId(0),
+                    font_size: px(16.0),
+                    ascent: px(12.0),
+                    descent: px(4.0),
+                    line_height: None,
                     glyphs: shaped_glyphs,
                 }],
                 len: text.len(),
@@ -906,6 +910,10 @@ mod tests {
                 runs: vec![
                     ShapedRun {
                         font_id: FontId(0),
+                        font_size: px(16.0),
+                        ascent: px(12.0),
+                        descent: px(4.0),
+                        line_height: None,
                         glyphs: vec![
                             ShapedGlyph {
                                 id: GlyphId(0),
@@ -929,6 +937,10 @@ mod tests {
                     },
                     ShapedRun {
                         font_id: FontId(1),
+                        font_size: px(16.0),
+                        ascent: px(12.0),
+                        descent: px(4.0),
+                        line_height: None,
                         glyphs: vec![
                             ShapedGlyph {
                                 id: GlyphId(0),

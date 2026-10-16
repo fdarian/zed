@@ -1705,6 +1705,8 @@ mod tests {
                         thickness: px(1.),
                         ..Default::default()
                     }),
+                    font_size: None,
+                    line_height: None,
                     ..Default::default()
                 };
                 let text = StyledText::new(TEXT)

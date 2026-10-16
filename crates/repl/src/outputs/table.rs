@@ -101,6 +101,8 @@ impl TableView {
             len: 0,
             font: text_font,
             color: text_style.color,
+            font_size: None,
+            line_height: None,
             ..Default::default()
         }];
 

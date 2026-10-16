@@ -1115,6 +1115,8 @@ impl EditorElement {
                                     len,
                                     font,
                                     color,
+                                    font_size: None,
+                                    line_height: None,
                                     ..Default::default()
                                 }],
                                 None,
@@ -3105,6 +3107,8 @@ impl EditorElement {
                         len: line.len(),
                         font: style.text.font(),
                         color: placeholder_color,
+                        font_size: None,
+                        line_height: None,
                         ..Default::default()
                     };
                     let line = window.text_system().shape_line(
@@ -6596,6 +6600,8 @@ impl EditorElement {
             len: text.len(),
             font: self.style.text.font(),
             color,
+            font_size: None,
+            line_height: None,
             ..Default::default()
         };
         window.text_system().shape_line(
@@ -7205,6 +7211,8 @@ impl LineWithInvisibles {
                             background_color: text_style.background_color,
                             underline: text_style.underline,
                             strikethrough: text_style.strikethrough,
+                            font_size: None,
+                            line_height: None,
                         };
                         let line_layout = window
                             .text_system()
@@ -7282,6 +7290,8 @@ impl LineWithInvisibles {
                             background_color: text_style.background_color,
                             underline: text_style.underline,
                             strikethrough: text_style.strikethrough,
+                            font_size: None,
+                            line_height: None,
                         });
 
                         if editor_mode.is_full() && !highlighted_chunk.is_inlay {
@@ -7365,6 +7375,8 @@ impl LineWithInvisibles {
                         background_color: text_run.background_color,
                         underline: text_run.underline,
                         strikethrough: text_run.strikethrough,
+                        font_size: None,
+                        line_height: None,
                     });
                     cursor_col = segment_start_col;
                 }
@@ -7379,6 +7391,8 @@ impl LineWithInvisibles {
                         background_color: text_run.background_color,
                         underline: text_run.underline,
                         strikethrough: text_run.strikethrough,
+                        font_size: None,
+                        line_height: None,
                     });
                     cursor_col = segment_slice_end_col;
                 }
@@ -7395,6 +7409,8 @@ impl LineWithInvisibles {
                     background_color: text_run.background_color,
                     underline: text_run.underline,
                     strikethrough: text_run.strikethrough,
+                    font_size: None,
+                    line_height: None,
                 });
             }
             line_col = run_end_col;
@@ -9315,6 +9331,8 @@ impl Element for EditorElement {
                             len: tab_len,
                             font: self.style.text.font(),
                             color: cx.theme().colors().editor_invisible,
+                            font_size: None,
+                            line_height: None,
                             ..Default::default()
                         }],
                         None,
@@ -9329,6 +9347,8 @@ impl Element for EditorElement {
                             len: space_len,
                             font: self.style.text.font(),
                             color: cx.theme().colors().editor_invisible,
+                            font_size: None,
+                            line_height: None,
                             ..Default::default()
                         }],
                         None,
@@ -12327,6 +12347,8 @@ mod tests {
         TextRun {
             len,
             color,
+            font_size: None,
+            line_height: None,
             ..Default::default()
         }
     }

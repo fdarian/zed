@@ -1239,19 +1239,42 @@ impl PlatformTextSystem for NoopTextSystem {
         Ok((raster_bounds.size, Vec::new()))
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, _runs: &[FontRun]) -> LineLayout {
+    fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         let mut position = px(0.);
         let metrics = self.font_metrics(FontId(0));
-        let em_width = font_size
-            * self
-                .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
-                .unwrap()
-                .width
-            / metrics.units_per_em as f32;
-        let mut glyphs = Vec::new();
+        let units_per_em = metrics.units_per_em as f32;
+        let m_advance = self
+            .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
+            .unwrap()
+            .width;
+        let mut runs = Vec::<ShapedRun>::new();
+        let mut run_end = 0;
+        let mut font_runs = font_runs.iter();
+        let mut font_run = None;
         for (ix, c) in text.char_indices() {
+            while ix >= run_end {
+                let next = font_runs.next().expect("the font runs cover the text");
+                run_end += next.len;
+                font_run = Some(next);
+            }
+            let font_run = font_run.expect("the loop above sets a font run");
+            let run_size = font_run.font_size.unwrap_or(font_size);
+            let em_width = run_size * m_advance / units_per_em;
             if let Some(glyph) = self.glyph_for_char(FontId(0), c) {
-                glyphs.push(ShapedGlyph {
+                let new_run = runs.last().is_none_or(|last| {
+                    last.font_size != run_size || last.line_height != font_run.line_height
+                });
+                if new_run {
+                    runs.push(ShapedRun {
+                        font_id: FontId(0),
+                        font_size: run_size,
+                        ascent: run_size * (metrics.ascent / units_per_em),
+                        descent: run_size * (metrics.descent / units_per_em),
+                        line_height: font_run.line_height,
+                        glyphs: Vec::new(),
+                    });
+                }
+                runs.last_mut().unwrap().glyphs.push(ShapedGlyph {
                     id: glyph,
                     position: point(position, px(0.)),
                     index: ix,
@@ -1266,21 +1289,15 @@ impl PlatformTextSystem for NoopTextSystem {
                 position += em_width
             }
         }
-        let mut runs = Vec::default();
-        if !glyphs.is_empty() {
-            runs.push(ShapedRun {
-                font_id: FontId(0),
-                glyphs,
-            });
-        } else {
+        if runs.is_empty() {
             position = px(0.);
         }
 
         LineLayout {
             font_size,
             width: position,
-            ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
-            descent: font_size * (metrics.descent / metrics.units_per_em as f32),
+            ascent: font_size * (metrics.ascent / units_per_em),
+            descent: font_size * (metrics.descent / units_per_em),
             runs,
             len: text.len(),
         }

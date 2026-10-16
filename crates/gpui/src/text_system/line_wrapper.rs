@@ -549,8 +549,8 @@ mod tests {
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
     use crate::{
-        OverflowWrap, TabSize, TextInset, TextLayoutOptions, TextRun, WindowTextSystem,
-        WordBreak, WrapBoundary, WrappedLine, point,
+        OverflowWrap, TabSize, TextInset, TextLayoutOptions, TextRun, WindowTextSystem, WordBreak,
+        WrapBoundary, WrappedLine, point,
     };
 
     fn build_wrapper() -> LineWrapper {
@@ -572,6 +572,8 @@ mod tests {
                     weight: FontWeight::default(),
                     style: FontStyle::Normal,
                 },
+                font_size: None,
+                line_height: None,
                 ..Default::default()
             })
             .collect()
@@ -1080,11 +1082,15 @@ mod tests {
                 font: font("Helvetica"),
                 color: Default::default(),
                 underline: Default::default(),
+                font_size: None,
+                line_height: None,
                 ..Default::default()
             };
             let bold = TextRun {
                 len: 0,
                 font: font("Helvetica").bold(),
+                font_size: None,
+                line_height: None,
                 ..Default::default()
             };
 
@@ -1137,6 +1143,8 @@ mod tests {
                 font: font("Helvetica"),
                 color: Default::default(),
                 underline: Default::default(),
+                font_size: None,
+                line_height: None,
                 ..Default::default()
             };
             let lines = text_system
@@ -1144,9 +1152,13 @@ mod tests {
                 .unwrap();
             let layout = &lines[0].layout;
             let rows = layout.wrap_boundaries().len() + 1;
-            assert!(rows >= 3, "the text should wrap onto several lines, got {rows}");
+            assert!(
+                rows >= 3,
+                "the text should wrap onto several lines, got {rows}"
+            );
             for boundary in layout.wrap_boundaries() {
-                let index = layout.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                let index =
+                    layout.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
                 // The index of a boundary is the end of the row above, so look one glyph in.
                 let position = layout.position_for_index(index + 1, px(20.)).unwrap();
                 assert!(
@@ -1282,6 +1294,8 @@ mod tests {
                     font: menlo,
                     color: Default::default(),
                     underline: Default::default(),
+                    font_size: None,
+                    line_height: None,
                     ..Default::default()
                 };
                 let mut lines = text_system
@@ -1450,6 +1464,8 @@ mod tests {
             let run = TextRun {
                 len: 4,
                 font: font("Menlo"),
+                font_size: None,
+                line_height: None,
                 ..Default::default()
             };
             let shaped = text_system.layout_line("ab\tc", px(16.), &[run], None);
@@ -1481,6 +1497,8 @@ mod tests {
                 let run = TextRun {
                     len: 6,
                     font: font("Menlo"),
+                    font_size: None,
+                    line_height: None,
                     ..Default::default()
                 };
                 text_system
@@ -1628,6 +1646,8 @@ mod tests {
                 let run = TextRun {
                     len: text.len(),
                     font: font("Menlo"),
+                    font_size: None,
+                    line_height: None,
                     ..Default::default()
                 };
                 text_system
@@ -1728,6 +1748,8 @@ mod tests {
                 let run = TextRun {
                     len: text.len(),
                     font: font("Menlo"),
+                    font_size: None,
+                    line_height: None,
                     ..Default::default()
                 };
                 text_system
@@ -1840,6 +1862,8 @@ mod tests {
                 let run = TextRun {
                     len: 9,
                     font: font("Menlo"),
+                    font_size: None,
+                    line_height: None,
                     ..Default::default()
                 };
                 text_system
@@ -1923,6 +1947,8 @@ mod tests {
                 let run = TextRun {
                     len: 9,
                     font: font("Menlo"),
+                    font_size: None,
+                    line_height: None,
                     ..Default::default()
                 };
                 text_system
@@ -1964,6 +1990,8 @@ mod tests {
                 let run = TextRun {
                     len: 17,
                     font: font("Menlo"),
+                    font_size: None,
+                    line_height: None,
                     ..Default::default()
                 };
                 text_system
@@ -2000,6 +2028,8 @@ mod tests {
             let run = TextRun {
                 len: text.len(),
                 font: font("Menlo"),
+                font_size: None,
+                line_height: None,
                 ..Default::default()
             };
             text_system
@@ -2112,7 +2142,13 @@ mod tests {
         // break-word breaks a word only when it does not fit, so it does not shrink
         // the min-content width: only anywhere does.
         assert_min_content(cx, "aa bbbbbbbb", wrapping(OverflowWrap::Normal), &[], 8.);
-        assert_min_content(cx, "aa bbbbbbbb", wrapping(OverflowWrap::BreakWord), &[], 8.);
+        assert_min_content(
+            cx,
+            "aa bbbbbbbb",
+            wrapping(OverflowWrap::BreakWord),
+            &[],
+            8.,
+        );
         assert_min_content(cx, "aa bbbbbbbb", wrapping(OverflowWrap::Anywhere), &[], 1.);
     }
 

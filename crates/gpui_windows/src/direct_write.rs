@@ -612,6 +612,10 @@ impl DirectWriteState {
                 text_system: self,
                 components,
                 index_converter: StringIndexConverter::new(text),
+                font_runs,
+                font_size,
+                ascent,
+                descent,
                 runs: &mut runs,
                 width: 0.0,
             };
@@ -1393,6 +1397,10 @@ struct RendererContext<'t, 'a, 'b> {
     text_system: &'t mut DirectWriteState,
     components: &'a DirectWriteComponents,
     index_converter: StringIndexConverter<'a>,
+    font_runs: &'a [FontRun],
+    font_size: Pixels,
+    ascent: Pixels,
+    descent: Pixels,
     runs: &'b mut Vec<ShapedRun>,
     width: f32,
 }
@@ -1582,6 +1590,9 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         let mut utf16_idx = desc.textPosition as usize;
         let mut glyph_idx = 0;
         let mut glyphs = Vec::with_capacity(glyph_count);
+        context.index_converter.advance_to_utf16_ix(utf16_idx);
+        let line_height =
+            FontRun::line_height_at(context.font_runs, context.index_converter.utf8_ix);
         for (cluster_utf16_len, cluster_glyph_count) in cluster_analyzer {
             context.index_converter.advance_to_utf16_ix(utf16_idx);
             utf16_idx += cluster_utf16_len;
@@ -1607,7 +1618,14 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             }
             glyph_idx += cluster_glyph_count;
         }
-        context.runs.push(ShapedRun { font_id, glyphs });
+        context.runs.push(ShapedRun {
+            font_id,
+            font_size: context.font_size,
+            ascent: context.ascent,
+            descent: context.descent,
+            line_height,
+            glyphs,
+        });
         Ok(())
     }
 

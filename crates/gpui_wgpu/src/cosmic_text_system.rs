@@ -600,7 +600,7 @@ impl CosmicTextSystemState {
             if let Some(same_run) = layout
                 .runs
                 .last_mut()
-                .filter(|last| last.font_id == run.font_id)
+                .filter(|last| last.font_id == run.font_id && last.line_height == run.line_height)
             {
                 same_run.glyphs.append(&mut run.glyphs);
             } else {
@@ -732,14 +732,18 @@ impl CosmicTextSystemState {
                 is_emoji,
             };
 
-            if let Some(last_run) = runs
-                .last_mut()
-                .filter(|last_run| last_run.font_id == font_id)
-            {
+            let line_height = FontRun::line_height_at(font_runs, glyph.start);
+            if let Some(last_run) = runs.last_mut().filter(|last_run| {
+                last_run.font_id == font_id && last_run.line_height == line_height
+            }) {
                 last_run.glyphs.push(shaped_glyph);
             } else {
                 runs.push(ShapedRun {
                     font_id,
+                    font_size,
+                    ascent: layout.max_ascent.into(),
+                    descent: layout.max_descent.into(),
+                    line_height,
                     glyphs: vec![shaped_glyph],
                 });
             }
@@ -790,6 +794,8 @@ fn clip_font_runs(font_runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontR
             clipped.push(FontRun {
                 len: end - start,
                 font_id: run.font_id,
+                font_size: run.font_size,
+                line_height: run.line_height,
             });
         }
     }
@@ -1080,6 +1086,8 @@ mod tests {
         let runs = [FontRun {
             len: text.len(),
             font_id,
+            font_size: None,
+            line_height: None,
         }];
         Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
     }
@@ -1096,6 +1104,8 @@ mod tests {
         let runs = [gpui::TextRun {
             len: text.len(),
             font: gpui::font("IBM Plex Sans"),
+            font_size: None,
+            line_height: None,
             ..Default::default()
         }];
 
@@ -1189,10 +1199,14 @@ mod tests {
             FontRun {
                 len: "ab\u{001c}\u{05d0}".len(),
                 font_id,
+                font_size: None,
+                line_height: None,
             },
             FontRun {
                 len: "\u{05d1}".len(),
                 font_id,
+                font_size: None,
+                line_height: None,
             },
         ];
         let layout = text_system.layout_line(text, gpui::px(14.0), &runs);
@@ -1246,10 +1260,14 @@ mod tests {
             FontRun {
                 len: 3,
                 font_id: fid(1),
+                font_size: None,
+                line_height: None,
             },
             FontRun {
                 len: 4,
                 font_id: fid(2),
+                font_size: None,
+                line_height: None,
             },
         ];
 
@@ -1259,11 +1277,15 @@ mod tests {
             &[
                 FontRun {
                     len: 1,
-                    font_id: fid(1)
+                    font_id: fid(1),
+                    font_size: None,
+                    line_height: None,
                 },
                 FontRun {
                     len: 2,
-                    font_id: fid(2)
+                    font_id: fid(2),
+                    font_size: None,
+                    line_height: None,
                 },
             ]
         );
@@ -1271,7 +1293,9 @@ mod tests {
             clip_font_runs(&runs, 3..7).as_slice(),
             &[FontRun {
                 len: 4,
-                font_id: fid(2)
+                font_id: fid(2),
+                font_size: None,
+                line_height: None,
             }]
         );
         assert!(clip_font_runs(&runs, 5..5).is_empty());

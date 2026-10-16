@@ -239,6 +239,8 @@ impl TextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    font_size: None,
+                    line_height: None,
                 }],
             )
             .width
@@ -615,6 +617,8 @@ impl WindowTextSystem {
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
+                    && run.font_size == font_run.font_size
+                    && run.line_height == font_run.line_height
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -622,6 +626,8 @@ impl WindowTextSystem {
                     font_runs.push(FontRun {
                         len: run_len_within_line,
                         font_id,
+                        font_size: run.font_size,
+                        line_height: run.line_height,
                     });
                 }
 
@@ -765,6 +771,8 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.font_size == font_run.font_size
+                && run.line_height == font_run.line_height
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -772,6 +780,8 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    font_size: run.font_size,
+                    line_height: run.line_height,
                 });
             }
         }
@@ -799,6 +809,8 @@ impl WindowTextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    font_size: None,
+                    line_height: None,
                 }],
                 None,
             )
@@ -847,6 +859,8 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.font_size == font_run.font_size
+                && run.line_height == font_run.line_height
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -854,6 +868,8 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    font_size: run.font_size,
+                    line_height: run.line_height,
                 });
             }
         }
@@ -909,6 +925,8 @@ impl WindowTextSystem {
             let font_id = self.resolve_font(&run.font);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run.font_size == font_run.font_size
+                && run.line_height == font_run.line_height
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -916,6 +934,8 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    font_size: run.font_size,
+                    line_height: run.line_height,
                 });
             }
         }
@@ -981,6 +1001,8 @@ fn split_font_run_at(font_runs: &mut Vec<FontRun>, at: usize) {
                 FontRun {
                     len: run_start + run.len - at,
                     font_id: run.font_id,
+                    font_size: run.font_size,
+                    line_height: run.line_height,
                 },
             );
             return;
@@ -1146,6 +1168,11 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+    /// The font size of this run. `None` is the size the line is shaped at.
+    pub font_size: Option<Pixels>,
+    /// How much this run contributes to the height of its line box.
+    /// `None` is the line height the line is painted with.
+    pub line_height: Option<Pixels>,
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -1395,6 +1422,8 @@ mod tests {
             .map(|len| FontRun {
                 len: *len,
                 font_id: FontId(0),
+                font_size: None,
+                line_height: None,
             })
             .collect()
     }
@@ -1416,6 +1445,22 @@ mod tests {
         }
         assert_eq!(lens(&runs), vec![2, 2, 3, 3]);
     }
+
+    #[test]
+    fn test_a_split_font_run_keeps_its_font_size_and_line_height() {
+        let mut runs = vec![FontRun {
+            len: 4,
+            font_id: FontId(0),
+            font_size: Some(px(32.)),
+            line_height: Some(px(40.)),
+        }];
+        split_font_run_at(&mut runs, 1);
+        assert_eq!(runs.len(), 2);
+        for run in &runs {
+            assert_eq!(run.font_size, Some(px(32.)));
+            assert_eq!(run.line_height, Some(px(40.)));
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1427,6 +1472,8 @@ mod insets_tests {
         TextRun {
             len,
             font: font("Menlo"),
+            font_size: None,
+            line_height: None,
             ..Default::default()
         }
     }
@@ -1493,6 +1540,90 @@ mod insets_tests {
                 assert!(!Arc::ptr_eq(&a[0].layout, &other[0].layout));
             }
             assert_eq!(wider[0].layout.width(), a[0].layout.width() + px(2.));
+        });
+    }
+
+    fn sized_run(len: usize, font_size: Option<Pixels>, line_height: Option<Pixels>) -> TextRun {
+        TextRun {
+            font_size,
+            line_height,
+            ..run(len)
+        }
+    }
+
+    #[crate::test]
+    fn test_the_size_and_line_height_of_a_text_run_reach_the_shaped_runs(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let lines = text_system
+                .shape_text(
+                    "aabbcc".into(),
+                    px(16.),
+                    &[
+                        sized_run(2, None, None),
+                        sized_run(2, Some(px(32.)), Some(px(40.))),
+                        sized_run(2, Some(px(32.)), Some(px(40.))),
+                    ],
+                    None,
+                    None,
+                )
+                .unwrap();
+            let runs = &lines[0].layout.unwrapped_layout.runs;
+            assert_eq!(runs.len(), 2);
+            assert_eq!(runs[0].font_size, px(16.));
+            assert_eq!(runs[0].line_height, None);
+            assert_eq!(runs[1].font_size, px(32.));
+            assert_eq!(runs[1].line_height, Some(px(40.)));
+            assert_eq!(runs[1].glyphs.len(), 4);
+        });
+    }
+
+    #[crate::test]
+    fn test_runs_of_one_font_and_different_sizes_are_not_merged(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let layout = |runs: &[TextRun]| text_system.layout_line("abcd", px(16.), runs, None);
+            let same = layout(&[sized_run(2, None, None), sized_run(2, None, None)]);
+            let sized = layout(&[sized_run(2, None, None), sized_run(2, Some(px(32.)), None)]);
+            let tall = layout(&[
+                sized_run(2, None, Some(px(20.))),
+                sized_run(2, None, Some(px(30.))),
+            ]);
+            assert_eq!(same.runs.len(), 1);
+            assert_eq!(sized.runs.len(), 2);
+            assert_eq!(tall.runs.len(), 2);
+        });
+    }
+
+    #[crate::test]
+    fn test_the_size_of_a_run_is_part_of_what_a_layout_is_cached_by(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let layout = |size: Option<Pixels>| {
+                text_system.layout_line("abcd", px(16.), &[sized_run(4, size, None)], None)
+            };
+            let line_size = layout(None);
+            let again = layout(None);
+            let doubled = layout(Some(px(32.)));
+            assert!(Arc::ptr_eq(&line_size, &again));
+            assert!(!Arc::ptr_eq(&line_size, &doubled));
+            assert!((f32::from(doubled.width) - 2. * f32::from(line_size.width)).abs() < 0.01);
+
+            let by_hash = |size: Option<Pixels>| {
+                text_system.layout_line_by_hash(
+                    7,
+                    4,
+                    px(16.),
+                    &[sized_run(4, size, None)],
+                    None,
+                    || "abcd".into(),
+                )
+            };
+            assert!(
+                (f32::from(by_hash(Some(px(32.))).width) - 2. * f32::from(by_hash(None).width))
+                    .abs()
+                    < 0.01
+            );
         });
     }
 

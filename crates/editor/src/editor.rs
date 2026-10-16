@@ -11908,6 +11908,8 @@ pub fn column_pixels(style: &EditorStyle, column: usize, window: &Window) -> Pix
             len: column,
             font: style.text.font(),
             color: Hsla::default(),
+            font_size: None,
+            line_height: None,
             ..Default::default()
         }],
         None,

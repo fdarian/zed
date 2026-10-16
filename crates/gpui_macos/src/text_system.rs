@@ -4,7 +4,7 @@ use collections::{HashMap, HashSet};
 use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,
-    base::{CFRange, CFType, TCFType},
+    base::{CFIndex, CFRange, CFType, TCFType},
     number::CFNumber,
     string::CFString,
 };
@@ -534,6 +534,7 @@ impl MacTextSystemState {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
+        let mut input_runs = Vec::<InputRun>::with_capacity(font_runs.len());
 
         {
             let mut text = text;
@@ -556,16 +557,26 @@ impl MacTextSystemState {
                 max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
                 max_descent = max_descent.max(-font_metrics.descent * font_scale);
 
-                let font_size = if break_ligature {
-                    px(f32::from(font_size).next_up())
+                let run_font_size = run.font_size.unwrap_or(font_size);
+                let run_scale = f32::from(run_font_size) / font_metrics.units_per_em as f32;
+                input_runs.push(InputRun {
+                    utf16_start,
+                    font_size: run_font_size,
+                    ascent: px(font_metrics.ascent * run_scale),
+                    descent: px(-font_metrics.descent * run_scale),
+                    line_height: run.line_height,
+                });
+
+                let ct_font_size = if break_ligature {
+                    px(f32::from(run_font_size).next_up())
                 } else {
-                    font_size
+                    run_font_size
                 };
                 unsafe {
                     string.set_attribute(
                         cf_range,
                         kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
+                        &font.native_font().clone_with_font_size(ct_font_size.into()),
                     );
                 }
                 break_ligature = !break_ligature;
@@ -586,11 +597,30 @@ impl MacTextSystemState {
             };
             let font_id = self.id_for_native_font(font);
 
+            // The CTFont's point size is perturbed by the ligature hack and its font can be
+            // a fallback, so the run's size comes from the input run it was shaped from.
+            // The hack also keeps a CTRun inside one input run.
+            let Some(first_utf16_ix) = run.string_indices().first().copied() else {
+                continue;
+            };
+            let input_run = &input_runs
+                [input_runs.partition_point(|input| input.utf16_start <= first_utf16_ix) - 1];
+
             let glyphs = match runs.last_mut() {
-                Some(run) if run.font_id == font_id => &mut run.glyphs,
+                Some(run)
+                    if run.font_id == font_id
+                        && run.font_size == input_run.font_size
+                        && run.line_height == input_run.line_height =>
+                {
+                    &mut run.glyphs
+                }
                 _ => {
                     runs.push(ShapedRun {
                         font_id,
+                        font_size: input_run.font_size,
+                        ascent: input_run.ascent,
+                        descent: input_run.descent,
+                        line_height: input_run.line_height,
                         glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
                     });
                     &mut runs.last_mut().unwrap().glyphs
@@ -626,6 +656,15 @@ impl MacTextSystemState {
             len: text.len(),
         }
     }
+}
+
+/// What the shaper needs to know about an input `FontRun` once the glyphs come back.
+struct InputRun {
+    utf16_start: CFIndex,
+    font_size: Pixels,
+    ascent: Pixels,
+    descent: Pixels,
+    line_height: Option<Pixels>,
 }
 
 #[derive(Debug, Clone)]
@@ -777,6 +816,8 @@ mod tests {
         let mut style = FontRun {
             font_id,
             len: line.len(),
+            font_size: None,
+            line_height: None,
         };
 
         let layout = fonts.layout_line(line, px(16.), &[style]);
@@ -798,10 +839,14 @@ mod tests {
             FontRun {
                 len: "\u{feff}".len(),
                 font_id,
+                font_size: None,
+                line_height: None,
             },
             FontRun {
                 len: "ab".len(),
                 font_id,
+                font_size: None,
+                line_height: None,
             },
         ];
         let layout = fonts.layout_line(line, px(16.), font_runs);
@@ -820,8 +865,18 @@ mod tests {
 
         let text = "hello world";
         let font_runs = &[
-            FontRun { font_id, len: 5 }, // "hello"
-            FontRun { font_id, len: 6 }, // " world"
+            FontRun {
+                font_id,
+                len: 5,
+                font_size: None,
+                line_height: None,
+            }, // "hello"
+            FontRun {
+                font_id,
+                len: 6,
+                font_size: None,
+                line_height: None,
+            }, // " world"
         ];
 
         let layout = fonts.layout_line(text, px(16.), font_runs);
@@ -841,11 +896,18 @@ mod tests {
         // Test with different font runs - should not insert ZWNJ
         let font_id2 = fonts.font_id(&font("Times")).unwrap_or(font_id);
         let font_runs_different = &[
-            FontRun { font_id, len: 5 }, // "hello"
+            FontRun {
+                font_id,
+                len: 5,
+                font_size: None,
+                line_height: None,
+            }, // "hello"
             // " world"
             FontRun {
                 font_id: font_id2,
                 len: 6,
+                font_size: None,
+                line_height: None,
             },
         ];
 
@@ -870,15 +932,35 @@ mod tests {
         let font_id = fonts.font_id(&font("Helvetica")).unwrap();
 
         let text = "hello";
-        let font_runs = &[FontRun { font_id, len: 5 }];
+        let font_runs = &[FontRun {
+            font_id,
+            len: 5,
+            font_size: None,
+            line_height: None,
+        }];
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, text.len());
 
         let text = "abc";
         let font_runs = &[
-            FontRun { font_id, len: 1 }, // "a"
-            FontRun { font_id, len: 1 }, // "b"
-            FontRun { font_id, len: 1 }, // "c"
+            FontRun {
+                font_id,
+                len: 1,
+                font_size: None,
+                line_height: None,
+            }, // "a"
+            FontRun {
+                font_id,
+                len: 1,
+                font_size: None,
+                line_height: None,
+            }, // "b"
+            FontRun {
+                font_id,
+                len: 1,
+                font_size: None,
+                line_height: None,
+            }, // "c"
         ];
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, text.len());
@@ -900,5 +982,99 @@ mod tests {
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
+    }
+
+    fn menlo_run(
+        fonts: &MacTextSystem,
+        len: usize,
+        font_size: Option<gpui::Pixels>,
+        line_height: Option<gpui::Pixels>,
+    ) -> FontRun {
+        FontRun {
+            font_id: fonts.font_id(&font("Menlo")).unwrap(),
+            len,
+            font_size,
+            line_height,
+        }
+    }
+
+    #[test]
+    fn test_a_run_is_shaped_at_its_own_font_size() {
+        let fonts = MacTextSystem::new();
+        let runs = [
+            menlo_run(&fonts, 2, None, None),
+            menlo_run(&fonts, 2, Some(px(32.)), None),
+        ];
+
+        let layout = fonts.layout_line("aaaa", px(16.), &runs);
+
+        assert_eq!(layout.runs.len(), 2);
+        assert_eq!(layout.runs[0].font_size, px(16.));
+        assert_eq!(layout.runs[1].font_size, px(32.));
+
+        let first_advance =
+            layout.runs[0].glyphs[1].position.x - layout.runs[0].glyphs[0].position.x;
+        let second_advance =
+            layout.runs[1].glyphs[1].position.x - layout.runs[1].glyphs[0].position.x;
+        assert!((f32::from(second_advance) - 2. * f32::from(first_advance)).abs() < 0.01);
+
+        assert!(
+            (f32::from(layout.runs[1].ascent) - 2. * f32::from(layout.runs[0].ascent)).abs() < 0.01
+        );
+        assert!(
+            (f32::from(layout.runs[1].descent) - 2. * f32::from(layout.runs[0].descent)).abs()
+                < 0.01
+        );
+        assert_eq!(layout.ascent, layout.runs[0].ascent);
+        assert_eq!(layout.descent, layout.runs[0].descent);
+        assert_eq!(layout.font_size, px(16.));
+    }
+
+    #[test]
+    fn test_a_run_of_the_line_size_is_the_same_as_one_without_a_size() {
+        let fonts = MacTextSystem::new();
+        let implicit = fonts.layout_line("aaaa", px(16.), &[menlo_run(&fonts, 4, None, None)]);
+        let explicit = fonts.layout_line(
+            "aaaa",
+            px(16.),
+            &[
+                menlo_run(&fonts, 2, Some(px(16.)), None),
+                menlo_run(&fonts, 2, Some(px(16.)), None),
+            ],
+        );
+
+        assert_eq!(explicit.runs.len(), 1);
+        assert_eq!(explicit.runs[0].font_size, px(16.));
+        assert_eq!(explicit.width, implicit.width);
+    }
+
+    #[test]
+    fn test_runs_of_the_same_font_merge_only_with_the_same_line_height() {
+        let fonts = MacTextSystem::new();
+
+        let same = fonts.layout_line(
+            "aaaa",
+            px(16.),
+            &[
+                menlo_run(&fonts, 2, None, Some(px(20.))),
+                menlo_run(&fonts, 2, None, Some(px(20.))),
+            ],
+        );
+        assert_eq!(same.runs.len(), 1);
+        assert_eq!(same.runs[0].line_height, Some(px(20.)));
+
+        let different = fonts.layout_line(
+            "aaaa",
+            px(16.),
+            &[
+                menlo_run(&fonts, 2, None, Some(px(20.))),
+                menlo_run(&fonts, 2, None, Some(px(40.))),
+            ],
+        );
+        assert_eq!(different.runs.len(), 2);
+        assert_eq!(different.runs[0].line_height, Some(px(20.)));
+        assert_eq!(different.runs[1].line_height, Some(px(40.)));
+        assert_eq!(different.runs[0].glyphs.len(), 2);
+        assert_eq!(different.runs[1].glyphs.len(), 2);
     }
 }

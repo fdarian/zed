@@ -923,6 +923,8 @@ impl TerminalElement {
             },
             underline,
             strikethrough,
+            font_size: None,
+            line_height: None,
         };
 
         if let Some((style, range)) = hyperlink
@@ -1499,6 +1501,8 @@ impl Element for TerminalElement {
                             len,
                             font: text_style.font(),
                             color: theme.colors().terminal_ansi_background,
+                            font_size: None,
+                            line_height: None,
                             ..Default::default()
                         }],
                         None,
@@ -1729,6 +1733,8 @@ impl Element for TerminalElement {
                                 font: ime_style.font(),
                                 color: ime_style.color,
                                 underline: ime_style.underline,
+                                font_size: None,
+                                line_height: None,
                                 ..Default::default()
                             }],
                             None,
@@ -2561,6 +2567,8 @@ mod tests {
             len: 1,
             font: font("Helvetica"),
             color: Hsla::red(),
+            font_size: None,
+            line_height: None,
             ..Default::default()
         };
 
@@ -2568,6 +2576,8 @@ mod tests {
             len: 1,
             font: font("Helvetica"),
             color: Hsla::red(),
+            font_size: None,
+            line_height: None,
             ..Default::default()
         };
 
@@ -2575,6 +2585,8 @@ mod tests {
             len: 1,
             font: font("Helvetica"),
             color: Hsla::blue(), // Different color
+            font_size: None,
+            line_height: None,
             ..Default::default()
         };
 
@@ -2594,6 +2606,8 @@ mod tests {
             len: 1,
             font: font("Helvetica"),
             color: Hsla::red(),
+            font_size: None,
+            line_height: None,
             ..Default::default()
         };
 
@@ -2624,6 +2638,8 @@ mod tests {
             len: 1,
             font: font("Helvetica"),
             color: Hsla::red(),
+            font_size: None,
+            line_height: None,
             ..Default::default()
         };
 
@@ -2655,6 +2671,8 @@ mod tests {
             len: 1,
             font: font("Helvetica"),
             color: Hsla::red(),
+            font_size: None,
+            line_height: None,
             ..Default::default()
         };
 
