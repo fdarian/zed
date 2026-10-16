@@ -1673,6 +1673,7 @@ impl MetalRenderer {
             ],
             content_mask: rect_array(&group.content_mask.bounds),
             content_radii: radii_array(&group.content_mask.corner_radii),
+            content_radii_y: radii_array(&group.content_mask.corner_radii_y),
             group: [origin.x.0, origin.y.0, 0., 0.],
             misc: [
                 effect.opacity,
@@ -1691,6 +1692,7 @@ impl MetalRenderer {
         if let Some((bounds, radii)) = reference {
             params.reference = rect_array(&bounds);
             params.reference_radii = radii_array(&radii.x);
+            params.reference_radii_y = radii_array(&radii.y);
         }
 
         let mut polygon = None;
@@ -1703,6 +1705,7 @@ impl MetalRenderer {
                 params.group[2] = 1.;
                 params.clip_a = rect_array(bounds);
                 params.clip_radii = radii_array(&corner_radii.x);
+                params.clip_radii_y = radii_array(&corner_radii.y);
             }
             Some(ResolvedClipPath::Ellipse { center, radii }) => {
                 params.group[2] = 2.;
@@ -2343,12 +2346,15 @@ struct CompositeParams {
     mask_b: [f32; 4],
     content_mask: [f32; 4],
     content_radii: [f32; 4],
+    content_radii_y: [f32; 4],
     clip_a: [f32; 4],
     clip_radii: [f32; 4],
+    clip_radii_y: [f32; 4],
     group: [f32; 4],
     misc: [f32; 4],
     reference: [f32; 4],
     reference_radii: [f32; 4],
+    reference_radii_y: [f32; 4],
 }
 
 /// Mirrors `BlurParams` in the shaders.
@@ -3024,6 +3030,129 @@ mod tests {
         assert_eq!(dominant_channel(&image, 20, 20), "red");
         assert_eq!(dominant_channel(&image, 20, 1), "red", "straight edges are untouched");
         assert_eq!(dominant_channel(&image, 8, 8), "red", "inside the arc");
+    }
+
+    fn elliptical_radii() -> CornerRadii<ScaledPixels> {
+        CornerRadii {
+            x: Corners {
+                top_left: ScaledPixels(16.),
+                top_right: ScaledPixels(10.),
+                bottom_right: ScaledPixels(16.),
+                bottom_left: ScaledPixels(0.),
+            },
+            y: Corners {
+                top_left: ScaledPixels(8.),
+                top_right: ScaledPixels(20.),
+                bottom_right: ScaledPixels(6.),
+                bottom_left: ScaledPixels(0.),
+            },
+        }
+    }
+
+    /// Whether the pixel and its eight neighbours are all on the same side of the shape the hit
+    /// test uses, and if so which: the pixels the shader has to agree about, not the antialiased
+    /// edge.
+    fn clearly_inside(x: u32, y: u32, radii: CornerRadii<ScaledPixels>) -> Option<bool> {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
+        let radii = CornerRadii {
+            x: Corners {
+                top_left: px(radii.x.top_left.0),
+                top_right: px(radii.x.top_right.0),
+                bottom_right: px(radii.x.bottom_right.0),
+                bottom_left: px(radii.x.bottom_left.0),
+            },
+            y: Corners {
+                top_left: px(radii.y.top_left.0),
+                top_right: px(radii.y.top_right.0),
+                bottom_right: px(radii.y.bottom_right.0),
+                bottom_left: px(radii.y.bottom_left.0),
+            },
+        };
+        let mut sides = (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy))).map(|(dx, dy)| {
+            let at = point(
+                px((x as f32 + 0.5 + dx as f32).clamp(0., SIZE - 0.01)),
+                px((y as f32 + 0.5 + dy as f32).clamp(0., SIZE - 0.01)),
+            );
+            gpui::point_in_rounded_rect(at, bounds, radii)
+        });
+        let first = sides.next().unwrap();
+        sides.all(|side| side == first).then_some(first)
+    }
+
+    fn assert_the_shader_draws_the_hit_test_shape(image: &image::RgbaImage, radii: CornerRadii<ScaledPixels>) {
+        let mut checked_inside = 0;
+        let mut checked_outside = 0;
+        for y in 0..SIZE as u32 {
+            for x in 0..SIZE as u32 {
+                match clearly_inside(x, y, radii) {
+                    Some(true) => {
+                        checked_inside += 1;
+                        assert_eq!(dominant_channel(image, x, y), "red", "pixel ({x}, {y}) is inside");
+                    }
+                    Some(false) => {
+                        checked_outside += 1;
+                        assert!(is_cleared(image, x, y), "pixel ({x}, {y}) is outside");
+                    }
+                    None => {}
+                }
+            }
+        }
+        assert!(checked_inside > 1000 && checked_outside > 20);
+    }
+
+    #[test]
+    fn a_quad_with_elliptical_corners_is_drawn_where_the_hit_test_puts_them() {
+        let mut scene = Scene::default();
+        let radii = elliptical_radii();
+        let mut filled = quad(gpui::red(), Edges::all(gpui::transparent_black()), 0.);
+        filled.corner_radii = radii.x;
+        filled.corner_radii_y = radii.y;
+        scene.insert_primitive(filled);
+        let image = render(&mut scene);
+
+        assert_the_shader_draws_the_hit_test_shape(&image, radii);
+        // (6, 2) is inside the 16 x 8 corner and outside the circle of radius 16 about (16, 16).
+        assert_eq!(dominant_channel(&image, 6, 2), "red");
+        assert!(is_cleared(&image, 0, 0));
+    }
+
+    #[test]
+    fn a_content_mask_with_elliptical_corners_clips_where_the_hit_test_does() {
+        let mut scene = Scene::default();
+        let radii = elliptical_radii();
+        let mut filled = quad(gpui::red(), Edges::all(gpui::transparent_black()), 0.);
+        filled.content_mask.corner_radii = radii.x;
+        filled.content_mask.corner_radii_y = radii.y;
+        scene.insert_primitive(filled);
+        let image = render(&mut scene);
+
+        assert_the_shader_draws_the_hit_test_shape(&image, radii);
+    }
+
+    #[test]
+    fn the_inner_edge_of_a_border_on_an_elliptical_corner_is_an_ellipse() {
+        let mut scene = Scene::default();
+        let mut ring = quad(
+            gpui::transparent_black(),
+            Edges::all(gpui::red()),
+            4.,
+        );
+        ring.corner_radii = Corners::all(ScaledPixels(16.));
+        ring.corner_radii_y = Corners::all(ScaledPixels(8.));
+        scene.insert_primitive(ring);
+        let image = render(&mut scene);
+
+        // The outer ellipse is 16 x 8 about (16, 8) and the inner one 12 x 4.
+        assert!(is_cleared(&image, 2, 2), "outside the outer ellipse");
+        assert_eq!(dominant_channel(&image, 5, 3), "red", "in the border");
+        assert_eq!(dominant_channel(&image, 6, 4), "red", "in the border");
+        assert!(is_cleared(&image, 10, 7), "inside the inner ellipse");
+        assert!(is_cleared(&image, 8, 6), "inside the inner ellipse");
+        // On the straight sides the border is 4 wide.
+        assert_eq!(dominant_channel(&image, 20, 2), "red");
+        assert!(is_cleared(&image, 20, 5));
+        assert_eq!(dominant_channel(&image, 2, 20), "red");
+        assert!(is_cleared(&image, 5, 20));
     }
 
     fn hex(value: u32) -> Hsla {
@@ -3799,6 +3928,68 @@ mod tests {
         assert!(is_cleared(&image, 1, 1));
         assert_color(&image, 20, 1, [255, 0, 0]);
         assert_color(&image, 20, 20, [255, 0, 0]);
+    }
+
+    #[test]
+    fn an_elliptical_clip_path_clips_the_group_where_the_hit_test_does() {
+        let mut scene = groups_scene();
+        let radii = elliptical_radii();
+        group(
+            &mut scene,
+            GroupEffect {
+                clip_path: Some(gpui::ResolvedClipPath::RoundedRect {
+                    bounds: full_bounds(),
+                    corner_radii: radii,
+                }),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        let image = render(&mut scene);
+        assert_the_shader_draws_the_hit_test_shape(&image, radii);
+    }
+
+    fn shadow(blur_radius: f32, radii: CornerRadii<ScaledPixels>) -> gpui::Shadow {
+        gpui::Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(blur_radius),
+            bounds: full_bounds(),
+            corner_radii: radii.x,
+            corner_radii_y: radii.y,
+            content_mask: window_mask(),
+            color: gpui::red(),
+            element_bounds: Bounds::default(),
+            element_corner_radii: Corners::default(),
+            element_corner_radii_y: Corners::default(),
+            inset: 0,
+            pad: 0,
+        }
+    }
+
+    #[test]
+    fn a_hard_shadow_with_elliptical_corners_has_the_shape_of_the_hit_test() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(shadow(0., elliptical_radii()));
+        let image = render(&mut scene);
+        assert_the_shader_draws_the_hit_test_shape(&image, elliptical_radii());
+    }
+
+    #[test]
+    fn a_blurred_shadow_follows_an_elliptical_corner() {
+        // In the corner, the 16 x 8 ellipse covers more than the circle of radius 16 and less than
+        // the square.
+        let red_at_corner = |radii| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(shadow(2., radii));
+            render(&mut scene).get_pixel(4, 4).0[0]
+        };
+        let square = red_at_corner(CornerRadii::default());
+        let circle = red_at_corner(CornerRadii::from(Corners::all(ScaledPixels(16.))));
+        let ellipse = red_at_corner(CornerRadii {
+            x: Corners::all(ScaledPixels(16.)),
+            y: Corners::all(ScaledPixels(8.)),
+        });
+        assert!(circle + 8 < ellipse && ellipse + 8 < square, "{circle} < {ellipse} < {square}");
     }
 
     #[test]
