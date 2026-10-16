@@ -1,5 +1,6 @@
 use crate::{
-    Pixels, Result, SharedString, TextLayoutOptions, TextRun, WindowTextSystem, WrappedLine, px,
+    Pixels, Result, SharedString, TextInset, TextLayoutOptions, TextRun, WindowTextSystem,
+    WrappedLine, px,
 };
 use std::{borrow::Cow, iter, ops::Range};
 
@@ -15,6 +16,7 @@ pub(crate) struct EndTruncation<'a> {
     pub affix: &'a str,
     pub affix_width: Pixels,
     pub options: TextLayoutOptions,
+    pub insets: &'a [TextInset],
 }
 
 /// One line of a laid out paragraph, as byte indices into the paragraph and the x
@@ -99,13 +101,14 @@ impl WindowTextSystem {
         truncation: &EndTruncation,
     ) -> Result<(SharedString, Cow<'a, [TextRun]>)> {
         let wrap_width = truncation.wraps.then_some(truncation.line_width);
-        let lines = self.shape_text_with_options(
+        let lines = self.shape_text_with_insets(
             text.clone(),
             truncation.font_size,
             runs,
             wrap_width,
             None,
             truncation.options,
+            truncation.insets,
         )?;
 
         let mut cuts: Vec<Range<usize>> = Vec::new();
@@ -299,6 +302,7 @@ mod tests {
                 affix: AFFIX,
                 affix_width: self.space,
                 options: scenario.options,
+                insets: &[],
             };
             let (text, runs) = self
                 .text_system

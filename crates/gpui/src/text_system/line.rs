@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
-    WrappedLineLayout, black, fill, point, px, size,
+    App, Bounds, DevicePixels, GlyphInset, Half, Hsla, LineLayout, Pixels, Point,
+    RenderGlyphParams, Result, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
+    WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -96,6 +96,7 @@ impl ShapedLine {
             align,
             align_width,
             &self.decoration_runs,
+            &[],
             &[],
             &[],
             window,
@@ -231,6 +232,7 @@ impl LineLayout {
             decoration_runs,
             &[],
             &[],
+            &[],
             window,
             cx,
         )
@@ -308,6 +310,7 @@ impl WrappedLine {
             &self.decoration_runs,
             &self.wrap_boundaries,
             &self.hanging_widths,
+            &self.layout.insets,
             window,
             cx,
         )?;
@@ -347,6 +350,10 @@ impl WrappedLine {
     }
 }
 
+/// Paints `layout`. A glyph with an inset is painted after its leading inset, and
+/// a decoration starts there when it begins on that glyph and ends before the
+/// trailing inset of the glyph it ends after: the decoration of a CSS inline box
+/// covers its text, not its padding.
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -356,6 +363,7 @@ fn paint_line(
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
     hanging_widths: &[Pixels],
+    insets: &[GlyphInset],
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -392,6 +400,11 @@ fn paint_line(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
+        let mut glyph_insets = insets.iter().peekable();
+        let mut glyph_count = 0;
+        // The trailing inset of the glyph before the current one, which the
+        // current glyph's position is after.
+        let mut previous_trailing = Pixels::ZERO;
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
@@ -400,6 +413,9 @@ fn paint_line(
                 if glyph_ix == 0 && run_ix == 0 {
                     first_glyph_x = glyph_origin.x;
                 }
+                let inset = glyph_insets.next_if(|inset| inset.glyph_ix == glyph_count);
+                glyph_count += 1;
+                let leading = inset.map_or(Pixels::ZERO, |inset| inset.leading);
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
@@ -409,7 +425,7 @@ fn paint_line(
                         };
                         window.paint_underline(
                             *underline_origin,
-                            glyph_origin.x - underline_origin.x,
+                            glyph_origin.x - previous_trailing - underline_origin.x,
                             underline_style,
                         );
                         if glyph.index < run_end {
@@ -427,7 +443,7 @@ fn paint_line(
                         };
                         window.paint_strikethrough(
                             *strikethrough_origin,
-                            glyph_origin.x - strikethrough_origin.x,
+                            glyph_origin.x - previous_trailing - strikethrough_origin.x,
                             strikethrough_style,
                         );
                         if glyph.index < run_end {
@@ -475,7 +491,7 @@ fn paint_line(
                         if let Some(run_underline) = style_run.underline.as_ref() {
                             current_underline.get_or_insert((
                                 point(
-                                    glyph_origin.x,
+                                    glyph_origin.x + leading,
                                     glyph_origin.y + baseline_offset.y + (layout.descent * 0.618),
                                 ),
                                 UnderlineStyle {
@@ -493,7 +509,7 @@ fn paint_line(
                         if let Some(run_strikethrough) = style_run.strikethrough.as_ref() {
                             current_strikethrough.get_or_insert((
                                 point(
-                                    glyph_origin.x,
+                                    glyph_origin.x + leading,
                                     glyph_origin.y
                                         + (((layout.ascent * 0.5) + baseline_offset.y) * 0.5),
                                 ),
@@ -519,7 +535,7 @@ fn paint_line(
                     };
                     window.paint_underline(
                         underline_origin,
-                        glyph_origin.x - underline_origin.x,
+                        glyph_origin.x - previous_trailing - underline_origin.x,
                         &underline_style,
                     );
                 }
@@ -532,13 +548,14 @@ fn paint_line(
                     };
                     window.paint_strikethrough(
                         strikethrough_origin,
-                        glyph_origin.x - strikethrough_origin.x,
+                        glyph_origin.x - previous_trailing - strikethrough_origin.x,
                         &strikethrough_style,
                     );
                 }
 
+                let painted_origin = point(glyph_origin.x + leading, glyph_origin.y);
                 let max_glyph_bounds = Bounds {
-                    origin: glyph_origin,
+                    origin: painted_origin,
                     size: max_glyph_size,
                 };
 
@@ -547,14 +564,14 @@ fn paint_line(
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji(
-                            glyph_origin + baseline_offset + vertical_offset,
+                            painted_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
                         )?;
                     } else {
                         window.paint_glyph(
-                            glyph_origin + baseline_offset + vertical_offset,
+                            painted_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
@@ -562,10 +579,11 @@ fn paint_line(
                         )?;
                     }
                 }
+                previous_trailing = inset.map_or(Pixels::ZERO, |inset| inset.trailing);
             }
         }
 
-        let mut last_line_end_x = first_glyph_x + layout.width;
+        let mut last_line_end_x = first_glyph_x + layout.width - previous_trailing;
         if let Some(boundary) = wrap_boundaries.last() {
             let run = &layout.runs[boundary.run_ix];
             let glyph = &run.glyphs[boundary.glyph_ix];

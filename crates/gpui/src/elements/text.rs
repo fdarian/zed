@@ -1,9 +1,10 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, EndTruncation,
-    GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
-    TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    GlobalElementId, GlyphInset, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId,
+    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    SharedString, Size, TextInset, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom,
+    WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
+    set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -271,7 +272,7 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, window, cx);
+        let layout_id = state.layout(SharedString::from(*self), None, Vec::new(), window, cx);
         (layout_id, state)
     }
 
@@ -345,7 +346,7 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, window, cx);
+        let layout_id = state.layout(self.clone(), None, Vec::new(), window, cx);
         (layout_id, state)
     }
 
@@ -393,6 +394,7 @@ pub struct StyledText {
     runs: Option<Vec<TextRun>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
+    insets: Vec<TextInset>,
     layout: TextLayout,
 }
 
@@ -404,6 +406,7 @@ impl StyledText {
             runs: None,
             delayed_highlights: None,
             delayed_font_family_overrides: None,
+            insets: Vec::new(),
             layout: TextLayout::default(),
         }
     }
@@ -537,6 +540,13 @@ impl StyledText {
         self.runs = Some(runs);
         self
     }
+
+    /// Adds the advance of `insets` around ranges of the text, as the padding,
+    /// border and margin of an inline box would. See [`TextInset`].
+    pub fn with_insets(mut self, insets: Vec<TextInset>) -> Self {
+        self.insets = insets;
+        self
+    }
 }
 
 impl Element for StyledText {
@@ -571,7 +581,10 @@ impl Element for StyledText {
             Self::apply_font_family_overrides(runs, overrides);
         }
 
-        let layout_id = self.layout.layout(self.text.clone(), runs, window, cx);
+        let insets = mem::take(&mut self.insets);
+        let layout_id = self
+            .layout
+            .layout(self.text.clone(), runs, insets, window, cx);
         (layout_id, ())
     }
 
@@ -628,6 +641,7 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
+        insets: Vec<TextInset>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -708,6 +722,7 @@ impl TextLayout {
                                     affix,
                                     affix_width: line_wrapper.width_of(affix),
                                     options: text_style.layout_options(),
+                                    insets: &insets,
                                 },
                             )
                         }
@@ -723,13 +738,14 @@ impl TextLayout {
                                 }
                                 _ => (TruncateFrom::Middle, width),
                             };
-                            let unclipped = window.text_system().shape_text_with_options(
+                            let unclipped = window.text_system().shape_text_with_insets(
                                 text.clone(),
                                 font_size,
                                 &runs,
                                 None,
                                 None,
                                 text_style.layout_options(),
+                                &insets,
                             )?;
                             if unclipped
                                 .iter()
@@ -755,17 +771,26 @@ impl TextLayout {
                     }
                 })()
                 .log_err();
-                let lines = truncated.and_then(|(text, runs)| {
-                    let len = text.len();
+                let lines = truncated.and_then(|(truncated_text, runs)| {
+                    let len = truncated_text.len();
+                    // The insets are byte ranges of the text as it was given, which cut
+                    // text no longer matches, so a cut drops them. The measuring above
+                    // that decided on the cut counted them.
+                    let insets: &[TextInset] = if insets.is_empty() || truncated_text == text {
+                        &insets
+                    } else {
+                        &[]
+                    };
                     window
                         .text_system()
-                        .shape_text_with_options(
-                            text,
+                        .shape_text_with_insets(
+                            truncated_text,
                             font_size,
                             &runs,
                             wrap_width,            // Wrap if we know the width.
                             text_style.line_clamp, // Limit the number of lines if line_clamp is set.
                             text_style.layout_options(),
+                            insets,
                         )
                         .log_err()
                         .map(|lines| (len, lines))
@@ -934,6 +959,41 @@ impl TextLayout {
             } else {
                 return Some(line.layout.clone());
             }
+        }
+
+        None
+    }
+
+    /// The insets of the glyph that starts at the byte `index` of the text, summed
+    /// over every inset that starts or ends on it, or `None` when it has none.
+    /// The returned `index` is the one asked for, and `glyph_ix` counts glyphs
+    /// within the line the index is on.
+    pub fn insets_at(&self, index: usize) -> Option<GlyphInset> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let mut line_start_ix = 0;
+
+        for line in &element_state.lines {
+            let line_end_ix = line_start_ix + line.len();
+            if index > line_end_ix {
+                line_start_ix = line_end_ix + 1;
+                continue;
+            }
+            let index_within_line = index.checked_sub(line_start_ix)?;
+            return line
+                .layout
+                .insets
+                .iter()
+                .filter(|inset| inset.index == index_within_line)
+                .copied()
+                .reduce(|first, second| GlyphInset {
+                    leading: first.leading + second.leading,
+                    trailing: first.trailing + second.trailing,
+                    ..first
+                })
+                .map(|inset| GlyphInset { index, ..inset });
         }
 
         None
@@ -1393,6 +1453,219 @@ mod tests {
         fn a_line_with_tabs_that_does_not_wrap_is_cut_at_its_stop(cx: &mut TestAppContext) {
             let layout = laid_out(cx, "a\tb\tc\td\te", 10., true);
             assert_eq!(layout.text(), "a\tb\tc\u{2026}");
+        }
+    }
+
+    mod insets {
+        use super::*;
+        use crate::{
+            Context, DevicePixels, Font, FontId, FontMetrics, FontRun, GlyphId, LineLayout,
+            NoopTextSystem, ParentElement as _, PlatformTextSystem, Render, RenderGlyphParams,
+            Styled as _, TestApp, UnderlineStyle, div, px,
+        };
+
+        const TEXT: &str = "abcd";
+
+        /// The text system of the tests, with glyphs that rasterize to something, so
+        /// that painting a glyph leaves a sprite in the scene.
+        struct Rasterizing(NoopTextSystem);
+
+        impl PlatformTextSystem for Rasterizing {
+            fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> anyhow::Result<()> {
+                self.0.add_fonts(fonts)
+            }
+
+            fn all_font_names(&self) -> Vec<String> {
+                self.0.all_font_names()
+            }
+
+            fn font_id(&self, descriptor: &Font) -> anyhow::Result<FontId> {
+                self.0.font_id(descriptor)
+            }
+
+            fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+                self.0.font_metrics(font_id)
+            }
+
+            fn typographic_bounds(
+                &self,
+                font_id: FontId,
+                glyph_id: GlyphId,
+            ) -> anyhow::Result<Bounds<f32>> {
+                self.0.typographic_bounds(font_id, glyph_id)
+            }
+
+            fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> anyhow::Result<Size<f32>> {
+                self.0.advance(font_id, glyph_id)
+            }
+
+            fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+                self.0.glyph_for_char(font_id, ch)
+            }
+
+            fn glyph_raster_bounds(
+                &self,
+                _: &RenderGlyphParams,
+            ) -> anyhow::Result<Bounds<DevicePixels>> {
+                Ok(Bounds {
+                    origin: Default::default(),
+                    size: crate::size(DevicePixels(1), DevicePixels(1)),
+                })
+            }
+
+            fn rasterize_glyph(
+                &self,
+                _: &RenderGlyphParams,
+                raster_bounds: Bounds<DevicePixels>,
+            ) -> anyhow::Result<(Size<DevicePixels>, Vec<u8>)> {
+                Ok((raster_bounds.size, vec![0; 1]))
+            }
+
+            fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+                self.0.layout_line(text, font_size, runs)
+            }
+
+            fn recommended_rendering_mode(
+                &self,
+                font_id: FontId,
+                font_size: Pixels,
+            ) -> crate::TextRenderingMode {
+                self.0.recommended_rendering_mode(font_id, font_size)
+            }
+        }
+
+        struct InsetText {
+            insets: Vec<TextInset>,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for InsetText {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let run = |len, underlined: bool| TextRun {
+                    len,
+                    color: crate::black(),
+                    underline: underlined.then(|| UnderlineStyle {
+                        thickness: px(1.),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let text = StyledText::new(TEXT)
+                    .with_runs(vec![run(1, false), run(2, true), run(1, false)])
+                    .with_insets(self.insets.clone());
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                div().text_size(px(16.)).child(text)
+            }
+        }
+
+        struct Painted {
+            layout: TextLayout,
+            /// The x of each glyph, in logical pixels.
+            glyphs: Vec<f32>,
+            /// The x and the width of each underline, in logical pixels.
+            underlines: Vec<(f32, f32)>,
+        }
+
+        fn painted(insets: Vec<TextInset>) -> Painted {
+            let mut app = TestApp::with_text_system(Arc::new(Rasterizing(NoopTextSystem::new())));
+            let layout = Rc::new(RefCell::new(None));
+            let mut window = app.open_window({
+                let layout = layout.clone();
+                move |_, _| InsetText { insets, layout }
+            });
+            window.draw();
+            let (glyphs, underlines) = window.update(|_, window, _| {
+                let scale = window.scale_factor();
+                let scene = &window.rendered_frame.scene;
+                (
+                    scene
+                        .monochrome_sprites
+                        .iter()
+                        .map(|sprite| sprite.bounds.origin.x.0 / scale)
+                        .collect::<Vec<_>>(),
+                    scene
+                        .underlines
+                        .iter()
+                        .map(|underline| {
+                            (
+                                underline.bounds.origin.x.0 / scale,
+                                underline.bounds.size.width.0 / scale,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            });
+            let layout = layout.borrow().clone().unwrap();
+            Painted {
+                layout,
+                glyphs,
+                underlines,
+            }
+        }
+
+        fn inset(range: Range<usize>, leading: f32, trailing: f32) -> TextInset {
+            TextInset {
+                range,
+                leading: px(leading),
+                trailing: px(trailing),
+            }
+        }
+
+        fn assert_close(actual: f32, expected: f32, context: &str) {
+            // Positions snap to a device pixel.
+            assert!(
+                (actual - expected).abs() <= 1.,
+                "{context}: {actual} != {expected}"
+            );
+        }
+
+        #[test]
+        fn glyphs_and_decorations_are_painted_after_the_leading_inset() {
+            let plain = painted(Vec::new());
+            // "bc" has 6 before it and 4 after it, and is underlined.
+            let inset = painted(vec![inset(1..3, 6., 4.)]);
+
+            assert_eq!(plain.glyphs.len(), 4);
+            assert_eq!(inset.glyphs.len(), 4);
+            for (ix, shift) in [0., 6., 6., 10.].into_iter().enumerate() {
+                assert_close(
+                    inset.glyphs[ix] - plain.glyphs[ix],
+                    shift,
+                    &format!("glyph {ix}"),
+                );
+            }
+
+            // The underline starts at b and ends at c: the insets are not under it.
+            assert_eq!(plain.underlines.len(), 1);
+            assert_eq!(inset.underlines.len(), 1);
+            assert_close(
+                inset.underlines[0].0 - plain.underlines[0].0,
+                6.,
+                "underline x",
+            );
+            assert_close(
+                inset.underlines[0].1,
+                plain.underlines[0].1,
+                "underline width",
+            );
+
+            // And the layout measures what was painted.
+            let end_shift = inset.layout.position_for_index(3).unwrap().x
+                - plain.layout.position_for_index(3).unwrap().x;
+            assert!((f32::from(end_shift) - 10.).abs() < 0.01);
+        }
+
+        #[test]
+        fn the_layout_reports_the_insets_of_a_glyph() {
+            let plain = painted(Vec::new());
+            let inset = painted(vec![inset(1..3, 6., 4.), inset(1..2, 1., 0.)]);
+            assert_eq!(plain.layout.insets_at(1), None);
+            assert_eq!(inset.layout.insets_at(0), None);
+            let b = inset.layout.insets_at(1).unwrap();
+            assert_eq!((b.index, b.leading, b.trailing), (1, px(7.), px(0.)));
+            let c = inset.layout.insets_at(2).unwrap();
+            assert_eq!((c.index, c.leading, c.trailing), (2, px(0.), px(4.)));
+            assert_eq!(inset.layout.insets_at(3), None);
         }
     }
 
