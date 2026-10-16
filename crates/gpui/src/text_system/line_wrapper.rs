@@ -2406,4 +2406,36 @@ mod tests {
             ));
         });
     }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_text_has_a_layout_for_each_line_clamp(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let wrapped_lines = |line_clamp| {
+                let run = TextRun {
+                    len: 17,
+                    font: font("Menlo"),
+                    ..Default::default()
+                };
+                text_system
+                    .shape_text_with_options(
+                        "aa bb cc dd ee ff".into(),
+                        px(16.),
+                        &[run],
+                        Some(px(48.)),
+                        line_clamp,
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .remove(0)
+                    .layout
+                    .wrap_boundaries()
+                    .len()
+                    + 1
+            };
+            assert_eq!(wrapped_lines(Some(2)), 2);
+            assert!(wrapped_lines(None) > 2);
+        });
+    }
 }

@@ -975,11 +975,13 @@ impl LineLayoutCache {
                 OverflowWrap::default()
             },
         };
+        let max_lines = max_lines.filter(|_| wrap_width.is_some());
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
             runs,
             wrap_width,
+            max_lines,
             force_width: None,
             options,
         } as &dyn AsCacheKeyRef;
@@ -1037,6 +1039,7 @@ impl LineLayoutCache {
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width,
+                max_lines,
                 force_width: None,
                 options,
             });
@@ -1109,6 +1112,7 @@ impl LineLayoutCache {
             font_size,
             runs,
             wrap_width: None,
+            max_lines: None,
             force_width,
             options: TextLayoutOptions::default(),
         } as &dyn AsCacheKeyRef;
@@ -1138,6 +1142,7 @@ impl LineLayoutCache {
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
+                max_lines: None,
                 force_width,
                 options: TextLayoutOptions::default(),
             });
@@ -1348,6 +1353,8 @@ struct CacheKey {
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
+    /// How many wrapped lines the layout stops at, which changes where it ends.
+    max_lines: Option<usize>,
     force_width: Option<Pixels>,
     options: TextLayoutOptions,
 }
@@ -1358,6 +1365,8 @@ struct CacheKeyRef<'a> {
     font_size: Pixels,
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
+    /// How many wrapped lines the layout stops at, which changes where it ends.
+    max_lines: Option<usize>,
     force_width: Option<Pixels>,
     options: TextLayoutOptions,
 }
@@ -1451,6 +1460,7 @@ impl AsCacheKeyRef for CacheKey {
             font_size: self.font_size,
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
+            max_lines: self.max_lines,
             force_width: self.force_width,
             options: self.options,
         }
