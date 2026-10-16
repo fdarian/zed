@@ -2538,6 +2538,9 @@ pub struct Interactivity {
     pub(crate) paint_layout_listener:
         Option<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
     pub(crate) layout_id: Option<LayoutId>,
+    /// Whether a box inside escaped the clip of this element at the last prepaint, which keeps
+    /// the clip from being painted exactly (see [`Window::with_exact_content_mask`]).
+    pub(crate) escape_inside: bool,
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) capture_pointer: bool,
     pub(crate) always_hitbox: bool,
@@ -2746,6 +2749,7 @@ impl Interactivity {
                         window.with_content_mask(
                             style.overflow_mask(bounds, window.rem_size()),
                             |window| {
+                                let escapes_before = window.escapes_prepainted();
                                 let hitbox = if self.should_insert_hitbox(&style, window, cx) {
                                     Some(window.insert_hitbox_shaped(
                                         bounds,
@@ -2765,6 +2769,7 @@ impl Interactivity {
                                     }),
                                     None => f(&style, scroll_offset, hitbox, window, cx),
                                 };
+                                self.escape_inside = window.escapes_prepainted() != escapes_before;
                                 (result, element_state)
                             },
                         )
@@ -2962,8 +2967,9 @@ impl Interactivity {
 
                     style.paint_with_effects(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
-                            window.with_content_mask(
+                            window.with_overflow_clip(
                                 style.overflow_mask(bounds, window.rem_size()),
+                                self.escape_inside,
                                 |window| {
                                     window.with_tab_group(tab_group, |window| {
                                         // Register the container's own focus handle *inside* its
@@ -8531,6 +8537,210 @@ mod tests {
                 assert_eq!(visible_area(&window, cx), 190. * 50.);
                 assert_eq!(chain_at(&window, cx, 200., 140.), ["box", "layer"]);
                 assert_eq!(chain_at(&window, cx, 350., 140.), ["root"]);
+            }
+
+            /// A clip inside a clip is the exact intersection of the two even where a single
+            /// rounded rectangle could not be.
+            mod nested_clips {
+                use super::*;
+                use crate::{ContentMask, CornerRadius, Corners};
+
+                /// A square `size` box `offset` from its parent, clipping to a circle-cornered
+                /// outline of `radius`.
+                fn clip(name: &'static str, offset: f32, size: f32, radius: f32) -> Stateful<Div> {
+                    let mut element = static_box(name, offset, size).overflow_hidden();
+                    let radius = Some(CornerRadius::from(px(radius)));
+                    let radii = &mut element.style().corner_radii;
+                    radii.top_left = radius;
+                    radii.top_right = radius;
+                    radii.bottom_right = radius;
+                    radii.bottom_left = radius;
+                    element
+                }
+
+                /// A red box far larger than any clip around it.
+                fn fill() -> Div {
+                    div().flex_none().w(px(400.)).h(px(400.)).bg(red())
+                }
+
+                /// The content masks of the red quads, in logical pixels.
+                fn red_masks(
+                    window: &AnyWindowHandle,
+                    cx: &mut TestAppContext,
+                ) -> Vec<ContentMask<Pixels>> {
+                    cx.update_window(*window, |_, window, _| {
+                        let scale = window.scale_factor();
+                        window
+                            .painted_quads()
+                            .iter()
+                            .filter(|quad| quad.background.as_solid() == Some(hsla(0., 1., 0.5, 1.)))
+                            .map(|quad| ContentMask {
+                                bounds: Bounds::new(
+                                    point(
+                                        px(quad.content_mask.bounds.origin.x.0 / scale),
+                                        px(quad.content_mask.bounds.origin.y.0 / scale),
+                                    ),
+                                    size(
+                                        px(quad.content_mask.bounds.size.width.0 / scale),
+                                        px(quad.content_mask.bounds.size.height.0 / scale),
+                                    ),
+                                ),
+                                corner_radii: quad.content_mask.corner_radii.map(|r| px(r.0 / scale)),
+                                corner_radii_y: quad
+                                    .content_mask
+                                    .corner_radii_y
+                                    .map(|r| px(r.0 / scale)),
+                            })
+                            .collect()
+                    })
+                    .unwrap()
+                }
+
+                fn group_radii(window: &AnyWindowHandle, cx: &mut TestAppContext) -> Vec<f32> {
+                    cx.update_window(*window, |_, window, _| {
+                        let scale = window.scale_factor();
+                        window
+                            .painted_group_masks()
+                            .iter()
+                            .map(|mask| mask.corner_radii.top_left.0 / scale)
+                            .collect()
+                    })
+                    .unwrap()
+                }
+
+                #[gpui::test]
+                fn a_child_cutting_the_parents_corner_is_a_group_under_the_parents_mask(
+                    cx: &mut TestAppContext,
+                ) {
+                    let window = open_with_groups(cx, || {
+                        root()
+                            .child(
+                                clip("parent", 100., 120., 16.)
+                                    .child(clip("child", 4., 112., 0.).child(fill())),
+                            )
+                            .into_any_element()
+                    });
+
+                    // The group is cut by the parent's rounded padding box, however many
+                    // primitives it holds, and the one primitive is cut by the child's own box.
+                    assert_eq!(
+                        group_masks(&window, cx),
+                        [Bounds::new(point(px(100.), px(100.)), size(px(120.), px(120.)))]
+                    );
+                    assert_eq!(group_radii(&window, cx), [16.]);
+                    let masks = red_masks(&window, cx);
+                    assert_eq!(masks.len(), 1);
+                    assert_eq!(
+                        masks[0].bounds,
+                        Bounds::new(point(px(104.), px(104.)), size(px(112.), px(112.)))
+                    );
+                    assert_eq!(masks[0].corner_radii, Corners::default());
+                }
+
+                #[gpui::test]
+                fn a_child_inside_the_parents_arc_makes_no_group(cx: &mut TestAppContext) {
+                    let window = open_with_groups(cx, || {
+                        root()
+                            .child(
+                                clip("parent", 100., 120., 16.)
+                                    .child(clip("child", 10., 100., 0.).child(fill())),
+                            )
+                            .into_any_element()
+                    });
+
+                    assert!(group_masks(&window, cx).is_empty());
+                    let masks = red_masks(&window, cx);
+                    assert_eq!(masks.len(), 1);
+                    assert_eq!(
+                        masks[0].bounds,
+                        Bounds::new(point(px(110.), px(110.)), size(px(100.), px(100.)))
+                    );
+                }
+
+                #[gpui::test]
+                fn a_child_flush_with_the_parent_makes_no_group_and_keeps_the_parents_arc(
+                    cx: &mut TestAppContext,
+                ) {
+                    let window = open_with_groups(cx, || {
+                        root()
+                            .child(
+                                clip("parent", 100., 120., 16.)
+                                    .child(clip("child", 0., 120., 6.).child(fill())),
+                            )
+                            .into_any_element()
+                    });
+
+                    assert!(group_masks(&window, cx).is_empty());
+                    let masks = red_masks(&window, cx);
+                    assert_eq!(masks.len(), 1);
+                    assert_eq!(masks[0].corner_radii, Corners::all(px(16.)));
+                }
+
+                #[gpui::test]
+                fn without_group_support_the_clip_stays_the_approximate_intersection(
+                    cx: &mut TestAppContext,
+                ) {
+                    let window = open_scene(cx, true, || {
+                        root()
+                            .child(
+                                clip("parent", 100., 120., 16.)
+                                    .child(clip("child", 4., 112., 0.).child(fill())),
+                            )
+                            .into_any_element()
+                    });
+
+                    assert!(group_masks(&window, cx).is_empty());
+                    let masks = red_masks(&window, cx);
+                    assert_eq!(masks.len(), 1);
+                    assert_eq!(
+                        masks[0].bounds,
+                        Bounds::new(point(px(104.), px(104.)), size(px(112.), px(112.)))
+                    );
+                    assert_eq!(masks[0].corner_radii, Corners::default());
+                }
+
+                #[gpui::test]
+                fn a_box_escaping_both_clips_is_still_painted_outside_them(
+                    cx: &mut TestAppContext,
+                ) {
+                    let window = open_with_groups(cx, || {
+                        root()
+                            .child(
+                                clip("parent", 100., 120., 16.).child(
+                                    clip("child", 4., 112., 0.).child(escaping("box", 10., 10., 50.)),
+                                ),
+                            )
+                            .into_any_element()
+                    });
+
+                    // The box sits at the top left of the window, outside both clips.
+                    assert_eq!(bounds_of(&window, cx, "box").origin, point(px(10.), px(10.)));
+                    assert_eq!(visible_area(&window, cx), 50. * 50.);
+                    // The clip with a box escaping it stays the approximate intersection: a
+                    // group under the parent's mask would cut the box.
+                    assert!(group_masks(&window, cx).is_empty());
+                }
+
+                #[gpui::test]
+                fn a_box_that_stays_inside_the_clips_does_not_stop_them_being_exact(
+                    cx: &mut TestAppContext,
+                ) {
+                    let window = open_with_groups(cx, || {
+                        let mut child = clip("child", 4., 112., 0.).child(fill());
+                        child.style().position = Some(Position::Relative);
+                        root()
+                            .child(
+                                clip("parent", 100., 120., 16.)
+                                    .child(child.child(escaping("box", 10., 10., 50.))),
+                            )
+                            .into_any_element()
+                    });
+
+                    // The positioned child is the box's containing block, so the box is clipped by
+                    // it and by the parent, and nothing escapes.
+                    assert_eq!(group_masks(&window, cx).len(), 1);
+                    assert_eq!(bounds_of(&window, cx, "box").origin, point(px(114.), px(114.)));
+                }
             }
         }
 

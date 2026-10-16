@@ -741,6 +741,12 @@ pub struct GroupEffect {
     pub reference_radii: CornerRadii<ScaledPixels>,
     /// Multiply the group by the alpha of the glyphs painted after it, as `background-clip: text`.
     pub text_mask: bool,
+    /// The group exists only for the content mask it composites under, which clips the whole group
+    /// exactly where the masks of its primitives could not: see [`Window::with_exact_content_mask`].
+    /// It is kept even when it holds a single primitive.
+    ///
+    /// [`Window::with_exact_content_mask`]: crate::Window::with_exact_content_mask
+    pub exact_clip: bool,
 }
 
 impl Default for GroupEffect {
@@ -754,6 +760,7 @@ impl Default for GroupEffect {
             reference: Bounds::default(),
             reference_radii: CornerRadii::default(),
             text_mask: false,
+            exact_clip: false,
         }
     }
 }
@@ -761,14 +768,15 @@ impl Default for GroupEffect {
 impl GroupEffect {
     /// Whether the effect does nothing but fade, which can sometimes be done without a group.
     pub fn is_opacity_only(&self) -> bool {
-        self.filters.is_empty()
+        !self.exact_clip
+            && self.filters.is_empty()
             && self.backdrop_filters.is_empty()
             && self.mask.is_none()
             && self.clip_path.is_none()
             && !self.text_mask
     }
 
-    /// Whether the effect changes nothing at all.
+    /// Whether the effect changes nothing at all, so a group of it could be left out.
     pub fn is_noop(&self) -> bool {
         self.is_opacity_only() && self.opacity >= 1.
     }
@@ -1195,5 +1203,12 @@ mod tests {
         effect.filters.push(ResolvedFilter::Blur(1.));
         assert!(!effect.is_opacity_only());
         assert!(GroupEffect::default().is_noop());
+        // A group kept for its content mask does more than fade, and is not left out.
+        let clip = GroupEffect {
+            exact_clip: true,
+            ..GroupEffect::default()
+        };
+        assert!(!clip.is_opacity_only());
+        assert!(!clip.is_noop());
     }
 }

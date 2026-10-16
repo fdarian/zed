@@ -1824,6 +1824,29 @@ mod tests {
     }
 
     #[test]
+    fn a_group_kept_for_its_clip_stays_a_group_around_a_single_primitive() {
+        let mut scene = scene();
+        let clip = GroupEffect {
+            exact_clip: true,
+            ..GroupEffect::default()
+        };
+        let mut inner = quad(10., 10., 20., 20.);
+        inner.content_mask.bounds = bounds(0., 0., 300., 300.);
+        scene.start_group(clip, narrow(), None);
+        scene.insert_primitive(inner);
+        scene.end_group();
+
+        assert!(scene.quads.is_empty());
+        assert_eq!(scene.groups.len(), 1);
+        // The group composites under the mask it started with, the primitive keeps its own.
+        assert_eq!(scene.groups[0].content_mask, narrow());
+        assert_eq!(
+            scene.groups[0].scene.quads[0].content_mask.bounds,
+            bounds(-10., -10., 300., 300.)
+        );
+    }
+
+    #[test]
     fn two_overlapping_primitives_make_a_real_group() {
         let mut scene = scene();
         scene.start_group(fade(0.5), mask(), None);

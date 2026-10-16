@@ -464,6 +464,7 @@ impl<E: Element> Drawable<E> {
                     .escapes_to()
                     .map(|escape| window.escape_frame(escape));
                 if let Some((mask, offset)) = escaped {
+                    window.note_escape(&mask);
                     window.content_mask_stack.push(mask);
                     window.element_offset_stack.push(offset);
                 }

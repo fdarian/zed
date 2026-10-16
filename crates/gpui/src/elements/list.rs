@@ -248,6 +248,8 @@ pub struct ListPrepaintState {
     hitbox: Hitbox,
     style: Style,
     layout: LayoutItemsResponse,
+    /// Whether a row escapes the list's clip, which keeps the clip from being painted exactly.
+    escape_inside: bool,
 }
 
 #[derive(Clone)]
@@ -1673,6 +1675,7 @@ impl Element for List {
             state.measuring_behavior.reset();
         }
 
+        let escapes_before = window.escapes_prepainted();
         let layout = window.with_hitbox_parent(&hitbox, |window| {
             match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
@@ -1696,6 +1699,7 @@ impl Element for List {
             hitbox,
             style,
             layout,
+            escape_inside: window.escapes_prepainted() != escapes_before,
         }
     }
 
@@ -1768,18 +1772,23 @@ impl Element for List {
         });
 
         let overlay_painter = self.interactivity.overlay_painter.take();
+        let escape_inside = prepaint.escape_inside;
         let layout = &mut prepaint.layout;
         prepaint
             .style
             .paint_with_effects(bounds, window, cx, |window, cx| {
-                window.with_content_mask(Some(ContentMask::from_bounds(bounds)), |window| {
-                    for item in &mut layout.item_layouts {
-                        item.element.paint(window, cx);
-                    }
-                    if let Some(painter) = overlay_painter {
-                        painter(bounds, window, cx);
-                    }
-                });
+                window.with_overflow_clip(
+                    Some(ContentMask::from_bounds(bounds)),
+                    escape_inside,
+                    |window| {
+                        for item in &mut layout.item_layouts {
+                            item.element.paint(window, cx);
+                        }
+                        if let Some(painter) = overlay_painter {
+                            painter(bounds, window, cx);
+                        }
+                    },
+                );
             });
     }
 }

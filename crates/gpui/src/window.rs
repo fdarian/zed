@@ -1474,6 +1474,9 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    /// How many boxes were prepainted so far that sit outside the clip they were prepainted in,
+    /// see [`Window::note_escape`].
+    escapes_prepainted: u32,
     /// What the children of each positioned element see, innermost last. Only prepaint reads it.
     pub(crate) positioned_frames: Vec<PositionedFrame>,
     #[cfg(any(test, feature = "test-support"))]
@@ -2200,6 +2203,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            escapes_prepainted: 0,
             positioned_frames: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             effect_groups_forced: false,
@@ -4578,6 +4582,75 @@ impl Window {
         } else {
             f(self)
         }
+    }
+
+    /// Like [`Window::with_content_mask`], but the clip is exactly the intersection of the two
+    /// masks, which a single rounded rectangle cannot always be: where one mask's straight edge
+    /// cuts through the other's rounded corner, or their corner radii differ in shape, the
+    /// intersection is not a rounded rectangle (see [`ContentMask::intersection_is_exact`]).
+    ///
+    /// When it is not one, `f` is painted as an offscreen group under the current mask, with
+    /// `mask` in place of it on every primitive, so the primitives are cut by `mask`'s shape and
+    /// the group's composite is cut by the current mask's. That costs one offscreen pass, paid
+    /// only then. Without renderer support for groups, the clip stays the approximate
+    /// intersection.
+    ///
+    /// Boxes inside `f` that escape the clip (see [`Window::with_escaped_content_mask`]) would
+    /// widen the group past the current mask and lose it for the rest of `f`, so a caller that
+    /// knows of one inside uses [`Window::with_content_mask`] instead.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_exact_content_mask<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let Some(mask) = mask else {
+            return f(self);
+        };
+        if !self.next_frame.scene.effect_groups_enabled()
+            || mask.intersection_is_exact(&self.content_mask())
+        {
+            return self.with_content_mask(Some(mask), f);
+        }
+        let effect = GroupEffect {
+            exact_clip: true,
+            ..GroupEffect::default()
+        };
+        self.with_effect_group(effect, None, |window| window.with_replaced_content_mask(mask, f))
+    }
+
+    /// [`Window::with_exact_content_mask`] unless `escape_inside`, otherwise
+    /// [`Window::with_content_mask`]: the paint of an element's `overflow` clip, `escape_inside`
+    /// being whether prepaint found a box inside it that escapes the clip.
+    pub(crate) fn with_overflow_clip<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        escape_inside: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if escape_inside {
+            self.with_content_mask(mask, f)
+        } else {
+            self.with_exact_content_mask(mask, f)
+        }
+    }
+
+    /// Notes during prepaint that a box is placed outside the clip around it. It is what
+    /// [`Window::escapes_prepainted`] counts.
+    pub(crate) fn note_escape(&mut self, escaped: &ContentMask<Pixels>) {
+        let clip = self.content_mask().bounds;
+        if clip.union(&escaped.bounds) != clip {
+            self.escapes_prepainted = self.escapes_prepainted.wrapping_add(1);
+        }
+    }
+
+    /// A number that changes whenever a box prepainted after the last reading escaped the clip it
+    /// is in, so a clip that reads it before and after prepainting its children knows whether one
+    /// of them did.
+    pub(crate) fn escapes_prepainted(&self) -> u32 {
+        self.escapes_prepainted
     }
 
     /// Invoke the given function with the given content mask in place of the current one, not
