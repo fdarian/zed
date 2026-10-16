@@ -7,6 +7,7 @@
 use crate::{
     Background, BackgroundTag, Bounds, ColorSpace, Corners, Edges, GradientGeometry, GradientKind,
     GradientParams, Hsla, LinearColorStop, Pixels, Point, Rgba, Size, point, px, size,
+    solid_background,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -641,6 +642,10 @@ struct Geometry {
 impl Gradient {
     /// The gradient's geometry in a box of the given size, and its stops with positions filled in
     /// as CSS specifies, split into chunks of at most four stops.
+    ///
+    /// A repeating gradient whose cycle has no length, which depends on the box when the first and
+    /// last stop are in different units, has no gradient to draw. CSS paints the average colour of
+    /// its stops, and so does this: one solid background.
     pub fn resolve(&self, tile: Size<Pixels>) -> Vec<Background> {
         let geometry = self.geometry(tile);
         let stops = self.resolve_stops(&geometry);
@@ -651,7 +656,11 @@ impl Gradient {
         let first = stops[0].position;
         let last = stops[stops.len() - 1].position;
         let repeat_length = last - first;
-        let (repeating, repeat_start, repeat_length) = if self.repeating && repeat_length > 1e-6 {
+        if self.repeating && repeat_length <= 1e-6 {
+            // Every hint's span is also at most the epsilon, so no stop here came from one.
+            return vec![solid_background(average_color(&stops))];
+        }
+        let (repeating, repeat_start, repeat_length) = if self.repeating {
             (1, first, repeat_length)
         } else {
             (0, 0., 0.)
@@ -990,6 +999,31 @@ impl Gradient {
     }
 }
 
+/// The colour of stops spread evenly, which is how a cycle of no length is painted: an end stop
+/// counts for half of a middle one, and colours average premultiplied.
+fn average_color(stops: &[ResolvedStop]) -> Hsla {
+    let spans = (stops.len() - 1) as f32;
+    let (mut red, mut green, mut blue, mut alpha) = (0., 0., 0., 0.);
+    for (index, stop) in stops.iter().enumerate() {
+        let is_end = index == 0 || index + 1 == stops.len();
+        let weight = if is_end { 0.5 } else { 1. } / spans;
+        let color = Rgba::from(stop.color);
+        alpha += color.a * weight;
+        red += color.r * color.a * weight;
+        green += color.g * color.a * weight;
+        blue += color.b * color.a * weight;
+    }
+    if alpha <= 0. {
+        return Hsla::transparent_black();
+    }
+    Hsla::from(Rgba {
+        r: red / alpha,
+        g: green / alpha,
+        b: blue / alpha,
+        a: alpha,
+    })
+}
+
 fn mix_premultiplied(from: Hsla, to: Hsla, amount: f32) -> Hsla {
     let from = Rgba::from(from);
     let to = Rgba::from(to);
@@ -1013,7 +1047,7 @@ fn mix_premultiplied(from: Hsla, to: Hsla, amount: f32) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{blue, green, red, yellow};
+    use crate::{blue, green, red, white, yellow};
 
     fn gradient(shape: GradientShape, items: Vec<GradientItem>) -> Gradient {
         Gradient {
@@ -1326,6 +1360,202 @@ mod tests {
         assert_eq!(chunk.gradient.repeating, 1);
         assert_close(chunk.gradient.repeat_start, 0.2);
         assert_close(chunk.gradient.repeat_length, 0.2);
+    }
+
+    fn repeating(shape: GradientShape, items: Vec<GradientItem>) -> Gradient {
+        let mut repeating = gradient(shape, items);
+        repeating.repeating = true;
+        repeating
+    }
+
+    fn to_right() -> GradientShape {
+        GradientShape::Linear(LinearDirection::ToRight)
+    }
+
+    fn length(pixels: f32) -> Option<StopPosition> {
+        Some(StopPosition::Length(px(pixels)))
+    }
+
+    fn rgba(color: Hsla) -> Rgba {
+        Rgba::from(color)
+    }
+
+    /// The single solid colour `gradient` resolves to in `tile`.
+    fn solid_colour(gradient: &Gradient, tile: Size<Pixels>) -> Rgba {
+        let resolved = gradient.resolve(tile);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].tag, BackgroundTag::Solid);
+        rgba(resolved[0].solid)
+    }
+
+    fn assert_rgba(color: Rgba, expected: [f32; 4]) {
+        for (actual, expected) in [color.r, color.g, color.b, color.a].into_iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "{color:?} vs {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeating_cycle_of_no_length_is_the_average_colour() {
+        let tile = size(px(200.), px(40.));
+        // The CSS Images example: rgb(75%, 50%, 75%). The middle stop counts twice an end.
+        let middle = repeating(
+            to_right(),
+            vec![
+                stop(red(), length(0.)),
+                stop(white(), length(0.)),
+                stop(blue(), length(0.)),
+            ],
+        );
+        assert_rgba(solid_colour(&middle, tile), [0.75, 0.5, 0.75, 1.]);
+
+        let same_unit = repeating(
+            to_right(),
+            vec![stop(red(), length(10.)), stop(blue(), length(10.))],
+        );
+        assert_rgba(solid_colour(&same_unit, tile), [0.5, 0., 0.5, 1.]);
+
+        // Positions raised to the one before them: the last two stops sit on the first.
+        let raised = repeating(
+            to_right(),
+            vec![
+                stop(red(), length(20.)),
+                stop(blue(), length(5.)),
+                stop(blue(), length(20.)),
+            ],
+        );
+        assert_rgba(solid_colour(&raised, tile), [0.25, 0., 0.75, 1.]);
+
+        // The last stop defaults to 100%, where the first one is.
+        let defaulted = repeating(
+            to_right(),
+            vec![stop(red(), at(1.)), stop(blue(), None)],
+        );
+        assert_rgba(solid_colour(&defaulted, tile), [0.5, 0., 0.5, 1.]);
+
+        // A hint takes no part in the average.
+        let hinted = repeating(
+            to_right(),
+            vec![
+                stop(red(), length(0.)),
+                GradientItem::Hint(StopPosition::Length(px(0.))),
+                stop(blue(), length(0.)),
+            ],
+        );
+        assert_rgba(solid_colour(&hinted, tile), [0.5, 0., 0.5, 1.]);
+    }
+
+    #[test]
+    fn a_stop_averages_by_its_alpha() {
+        let faded = repeating(
+            to_right(),
+            vec![
+                stop(red(), length(0.)),
+                stop(Hsla::transparent_black(), length(0.)),
+            ],
+        );
+        assert_rgba(
+            solid_colour(&faded, size(px(100.), px(10.))),
+            [1., 0., 0., 0.5],
+        );
+
+        let invisible = repeating(
+            to_right(),
+            vec![
+                stop(Hsla::transparent_black(), length(0.)),
+                stop(Hsla::transparent_black(), length(0.)),
+            ],
+        );
+        assert_rgba(
+            solid_colour(&invisible, size(px(100.), px(10.))),
+            [0., 0., 0., 0.],
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_empty_only_when_the_units_agree_in_the_box() {
+        // 10px is 5% of a 200px line and not of a 400px one.
+        let mixed = repeating(
+            to_right(),
+            vec![stop(red(), length(10.)), stop(blue(), at(0.05))],
+        );
+        assert_rgba(
+            solid_colour(&mixed, size(px(200.), px(40.))),
+            [0.5, 0., 0.5, 1.],
+        );
+
+        // 5% of 400px is 20px: the cycle is 10px long.
+        let chunks = mixed.resolve(size(px(400.), px(40.)));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].tag, BackgroundTag::Gradient);
+        assert_eq!(chunks[0].gradient.repeating, 1);
+        assert_close(chunks[0].gradient.repeat_start, 0.025);
+        assert_close(chunks[0].gradient.repeat_length, 0.025);
+
+        // A stop below the first one is raised to it, so a smaller last stop is also empty.
+        let backwards = repeating(
+            to_right(),
+            vec![stop(red(), length(40.)), stop(blue(), at(0.05))],
+        );
+        assert_rgba(
+            solid_colour(&backwards, size(px(200.), px(40.))),
+            [0.5, 0., 0.5, 1.],
+        );
+    }
+
+    #[test]
+    fn radial_and_conic_cycles_of_no_length_are_the_average_colour() {
+        let radial = repeating(
+            GradientShape::Radial {
+                shape: RadialShape::Circle,
+                size: RadialSize::Explicit {
+                    x: LengthPercentage::Length(px(100.)),
+                    y: LengthPercentage::Length(px(100.)),
+                },
+                position: BackgroundPosition::CENTER,
+            },
+            vec![stop(red(), length(100.)), stop(blue(), at(1.))],
+        );
+        assert_rgba(
+            solid_colour(&radial, size(px(300.), px(300.))),
+            [0.5, 0., 0.5, 1.],
+        );
+
+        let conic = |last: StopPosition| {
+            repeating(
+                GradientShape::Conic {
+                    from: 0.,
+                    position: BackgroundPosition::CENTER,
+                },
+                vec![
+                    stop(red(), Some(StopPosition::Angle(90.))),
+                    stop(white(), Some(last)),
+                    stop(blue(), Some(last)),
+                ],
+            )
+        };
+        let tile = size(px(100.), px(100.));
+        assert_rgba(
+            solid_colour(&conic(StopPosition::Fraction(0.25)), tile),
+            [0.75, 0.5, 0.75, 1.],
+        );
+        let chunks = conic(StopPosition::Angle(180.)).resolve(tile);
+        assert_eq!(chunks[0].gradient.repeating, 1);
+        assert_close(chunks[0].gradient.repeat_start, 0.25);
+        assert_close(chunks[0].gradient.repeat_length, 0.25);
+    }
+
+    #[test]
+    fn a_gradient_that_does_not_repeat_keeps_coincident_stops() {
+        let hard = gradient(
+            to_right(),
+            vec![stop(red(), length(10.)), stop(blue(), length(10.))],
+        );
+        let chunks = hard.resolve(size(px(200.), px(40.)));
+        assert_eq!(chunks[0].tag, BackgroundTag::Gradient);
+        assert_eq!(chunks[0].gradient.repeating, 0);
     }
 
     fn boxes(width: f32, height: f32) -> BackgroundBoxes {
