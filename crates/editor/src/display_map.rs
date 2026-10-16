@@ -1456,7 +1456,7 @@ impl<'a> HighlightedChunk<'a> {
                     underline: Some(UnderlineStyle {
                         color: Some(editor_style.status.hint),
                         thickness: px(1.),
-                        wavy: false,
+                        ..Default::default()
                     }),
                     ..Default::default()
                 };
@@ -1912,7 +1912,8 @@ impl DisplaySnapshot {
                                     UnderlineStyle {
                                         color: Some(diagnostic_color),
                                         thickness: 1.0.into(),
-                                        wavy: true,
+                                        style: gpui::TextDecorationStyle::Wavy,
+                                        ..Default::default()
                                     }
                                 }),
                             ..Default::default()

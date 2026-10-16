@@ -492,6 +492,7 @@ fn apply_html_highlight_style(refinement: &mut TextStyleRefinement, style: &Html
         refinement.strikethrough = Some(StrikethroughStyle {
             thickness: px(1.),
             color: None,
+            ..Default::default()
         });
     }
 }

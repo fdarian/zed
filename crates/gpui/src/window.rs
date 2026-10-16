@@ -12,19 +12,20 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
     Keystroke, KeystrokeEvent, LayoutId, LayoutInsets, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, Path, Pixels,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, OverlineStyle, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedClipPath, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle, Visibility,
+    TextDecorationStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle, Visibility,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
     transparent_black,
 };
 
+use crate::text_decoration::{DecorationKind, decoration_geometry};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
@@ -2914,6 +2915,13 @@ impl Window {
         self.rendered_frame.scene.quads_with_groups()
     }
 
+    /// The text decoration lines, as underline primitives, in the most recently rendered
+    /// frame's scene. Bounds are in scaled pixels and are not clipped.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_underlines(&self) -> Vec<Underline> {
+        self.rendered_frame.scene.underlines_with_groups()
+    }
+
     /// Surfaces in the most recently rendered frame. Used by tests to assert a
     /// texture was composited without rasterizing.
     #[cfg(any(test, feature = "test-support"))]
@@ -5228,30 +5236,14 @@ impl Window {
         width: Pixels,
         style: &UnderlineStyle,
     ) {
-        self.invalidator.debug_assert_paint();
-
-        let scale_factor = self.scale_factor();
-        let thickness = self.snap_stroke(style.thickness);
-        let height = if style.wavy {
-            ScaledPixels(thickness.0 * 3.)
-        } else {
-            thickness
-        };
-        let bounds = Bounds {
-            origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
-            size: size(self.snap_stroke(width), height),
-        };
-        let element_opacity = self.element_opacity();
-
-        self.next_frame.scene.insert_primitive(Underline {
-            order: 0,
-            pad: 0,
-            bounds,
-            content_mask: self.snapped_content_mask(),
-            color: style.color.unwrap_or_default().opacity(element_opacity),
-            thickness,
-            wavy: style.wavy.into(),
-        });
+        self.paint_decoration(
+            DecorationKind::Underline,
+            origin,
+            width,
+            style.thickness,
+            style.color,
+            style.style,
+        );
     }
 
     /// Paint a strikethrough into the scene for the next frame at the current z-index.
@@ -5263,25 +5255,69 @@ impl Window {
         width: Pixels,
         style: &StrikethroughStyle,
     ) {
+        self.paint_decoration(
+            DecorationKind::Strikethrough,
+            origin,
+            width,
+            style.thickness,
+            style.color,
+            style.style,
+        );
+    }
+
+    /// Paint an overline into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_overline(&mut self, origin: Point<Pixels>, width: Pixels, style: &OverlineStyle) {
+        self.paint_decoration(
+            DecorationKind::Overline,
+            origin,
+            width,
+            style.thickness,
+            style.color,
+            style.style,
+        );
+    }
+
+    /// `origin` is the top left of the straight line of `thickness`, whatever the style.
+    fn paint_decoration(
+        &mut self,
+        kind: DecorationKind,
+        origin: Point<Pixels>,
+        width: Pixels,
+        thickness: Pixels,
+        color: Option<Hsla>,
+        style: TextDecorationStyle,
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let height = style.thickness;
-        let bounds = Bounds {
-            origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
-            size: size(self.snap_stroke(width), self.snap_stroke(height)),
-        };
-        let opacity = self.element_opacity();
+        let thickness = self.snap_stroke(thickness);
+        if thickness.0 == 0. {
+            return;
+        }
+        let geometry = decoration_geometry(kind, style, thickness.0);
+        let origin = origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor)));
+        let width = self.snap_stroke(width);
+        let color = color.unwrap_or_default().opacity(self.element_opacity());
+        let content_mask = self.snapped_content_mask();
 
-        self.next_frame.scene.insert_primitive(Underline {
-            order: 0,
-            pad: 0,
-            bounds,
-            content_mask: self.snapped_content_mask(),
-            thickness: self.snap_stroke(style.thickness),
-            color: style.color.unwrap_or_default().opacity(opacity),
-            wavy: false.into(),
-        });
+        for band in geometry.bands() {
+            self.next_frame.scene.insert_primitive(Underline {
+                order: 0,
+                pad: 0,
+                bounds: Bounds {
+                    origin: point(origin.x, origin.y + ScaledPixels(band.offset)),
+                    size: size(width, ScaledPixels(band.height)),
+                },
+                content_mask: content_mask.clone(),
+                color,
+                thickness,
+                style: geometry.shape,
+                mark_length: ScaledPixels(geometry.mark_length),
+                mark_period: ScaledPixels(geometry.mark_period),
+            });
+        }
     }
 
     /// Paints a monochrome (non-emoji) glyph into the scene for the next frame at the current z-index.
@@ -9756,5 +9792,68 @@ mod tests {
                 "dom: {dom}"
             );
         }
+    }
+
+    fn painted_decorations(
+        cx: &mut crate::VisualTestContext,
+        decorate: impl FnOnce(crate::Div) -> crate::Div,
+    ) -> Vec<crate::Underline> {
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(40.)), |_, _| {
+            decorate(div().text_size(px(16.))).child("decorated")
+        });
+        cx.update(|window, _| window.painted_underlines())
+    }
+
+    #[gpui::test]
+    fn text_decoration_styles_reach_the_scene(cx: &mut TestAppContext) {
+        use crate::text_decoration::{SHAPE_DASHED, SHAPE_DOTTED, SHAPE_SOLID, SHAPE_WAVY};
+        let cx = cx.add_empty_window();
+
+        let solid = painted_decorations(cx, |el| el.underline());
+        assert_eq!(solid.len(), 1);
+        assert_eq!(solid[0].style, SHAPE_SOLID);
+        assert_eq!(solid[0].bounds.size.height, solid[0].thickness);
+
+        let dotted = painted_decorations(cx, |el| el.underline().text_decoration_dotted());
+        assert_eq!(dotted.len(), 1);
+        assert_eq!(dotted[0].style, SHAPE_DOTTED);
+        assert_eq!(dotted[0].mark_length, dotted[0].thickness);
+        assert_eq!(dotted[0].mark_period.0, dotted[0].thickness.0 * 2.);
+
+        let dashed = painted_decorations(cx, |el| el.underline().text_decoration_dashed());
+        assert_eq!(dashed[0].style, SHAPE_DASHED);
+        assert!(dashed[0].mark_period > dashed[0].mark_length);
+
+        let wavy = painted_decorations(cx, |el| el.underline().text_decoration_wavy());
+        assert_eq!(wavy[0].style, SHAPE_WAVY);
+        assert_eq!(wavy[0].bounds.size.height.0, wavy[0].thickness.0 * 3.);
+
+        let double = painted_decorations(cx, |el| el.underline().text_decoration_double());
+        assert_eq!(double.len(), 2);
+        assert_eq!(double[0].style, SHAPE_SOLID);
+        assert_eq!(double[0].bounds.size.width, double[1].bounds.size.width);
+        assert_eq!(
+            double[1].bounds.origin.y.0 - double[0].bounds.origin.y.0,
+            double[0].thickness.0 * 2.,
+            "the second line starts one thickness below the first one's bottom"
+        );
+    }
+
+    #[gpui::test]
+    fn an_overline_sits_above_an_underline(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let over = painted_decorations(cx, |el| el.overline());
+        let under = painted_decorations(cx, |el| el.underline());
+        assert_eq!((over.len(), under.len()), (1, 1));
+        assert!(over[0].bounds.origin.y < under[0].bounds.origin.y);
+        assert!(over[0].bounds.origin.y.0 >= 0.);
+        assert_eq!(over[0].bounds.size.width, under[0].bounds.size.width);
+    }
+
+    #[gpui::test]
+    fn a_zero_thickness_decoration_paints_nothing(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let none = painted_decorations(cx, |el| el.underline().text_decoration_0());
+        assert!(none.is_empty());
     }
 }

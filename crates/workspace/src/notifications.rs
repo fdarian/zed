@@ -456,7 +456,7 @@ pub fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             underline: Some(UnderlineStyle {
                 thickness: px(1.),
                 color: Some(cx.theme().colors().text_accent),
-                wavy: false,
+                ..Default::default()
             }),
             ..Default::default()
         },

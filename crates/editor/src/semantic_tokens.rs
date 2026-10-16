@@ -499,6 +499,7 @@ fn convert_token(
                     SemanticTokenColorOverride::InheritForeground(false) => None,
                     SemanticTokenColorOverride::Replace(c) => Some(c.into()),
                 },
+                ..StrikethroughStyle::default()
             },
         );
     }

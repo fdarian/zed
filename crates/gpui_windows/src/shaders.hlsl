@@ -1295,7 +1295,9 @@ struct Underline {
     ContentMask content_mask;
     Hsla color;
     float thickness;
-    uint wavy;
+    uint style;
+    float mark_length;
+    float mark_period;
 };
 
 struct UnderlineVertexOutput {
@@ -1336,7 +1338,20 @@ float4 underline_fragment(UnderlineFragmentInput input): SV_Target {
 
     Underline underline = underlines[input.underline_id];
     float mask_alpha = content_mask_coverage(input.position.xy, underline.content_mask);
-    if (underline.wavy) {
+    // The numbers of `SHAPE_*` in gpui's text_decoration.rs.
+    if (underline.style == 1u) {
+        float radius = underline.mark_length * 0.5;
+        float2 local = input.position.xy - underline.bounds.origin;
+        float nearest = floor((local.x - radius) / underline.mark_period + 0.5);
+        float2 center = float2(nearest * underline.mark_period + radius, radius);
+        float dot_alpha = saturate(0.5 - (length(local - center) - radius));
+        return input.color * float4(1., 1., 1., dot_alpha * mask_alpha);
+    } else if (underline.style == 2u) {
+        float x = input.position.x - underline.bounds.origin.x;
+        float along = x - floor(x / underline.mark_period) * underline.mark_period;
+        float dash_alpha = saturate(along + 0.5) * saturate(underline.mark_length - along + 0.5);
+        return input.color * float4(1., 1., 1., dash_alpha * mask_alpha);
+    } else if (underline.style == 3u) {
         float half_thickness = underline.thickness * 0.5;
         float2 origin = underline.bounds.origin;
 

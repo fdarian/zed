@@ -20510,7 +20510,7 @@ impl EntityInputHandler for Editor {
                         underline: Some(UnderlineStyle {
                             thickness: px(1.),
                             color: None,
-                            wavy: false,
+                            ..Default::default()
                         }),
                         ..Default::default()
                     },

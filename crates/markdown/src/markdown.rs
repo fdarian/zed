@@ -2823,6 +2823,7 @@ impl Element for MarkdownElement {
                                 strikethrough: Some(StrikethroughStyle {
                                     thickness: px(1.),
                                     color: None,
+                                    ..Default::default()
                                 }),
                                 ..Default::default()
                             })

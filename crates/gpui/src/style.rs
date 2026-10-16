@@ -10,8 +10,8 @@ use crate::{
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
-    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextLayoutOptions, TextRun, Window,
-    OverflowWrap, WordBreak, black, phi, point, px, quad, rems, size,
+    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextDecorationStyle, TextLayoutOptions,
+    TextRun, Window, OverflowWrap, WordBreak, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -607,6 +607,9 @@ pub struct TextStyle {
     /// The strikethrough style of the text
     pub strikethrough: Option<StrikethroughStyle>,
 
+    /// The overline style of the text
+    pub overline: Option<OverlineStyle>,
+
     /// How to handle whitespace in the text
     pub white_space: WhiteSpace,
 
@@ -655,6 +658,7 @@ impl Default for TextStyle {
             background_color: None,
             underline: None,
             strikethrough: None,
+            overline: None,
             white_space: WhiteSpace::Normal,
             text_overflow: None,
             text_align: TextAlign::default(),
@@ -746,6 +750,7 @@ impl TextStyle {
             strikethrough: self.strikethrough,
             font_size: None,
             line_height: None,
+            overline: self.overline,
         }
     }
 }
@@ -1308,14 +1313,18 @@ impl Default for Style {
     Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub struct UnderlineStyle {
-    /// The thickness of the underline.
+    /// The thickness of the underline. With `thickness_from_font` this is the fallback
+    /// for a font that has no underline thickness.
     pub thickness: Pixels,
+
+    /// Use the underline thickness the font reports (CSS `text-decoration-thickness: from-font`).
+    pub thickness_from_font: bool,
 
     /// The color of the underline.
     pub color: Option<Hsla>,
 
-    /// Whether the underline should be wavy, like in a spell checker.
-    pub wavy: bool,
+    /// How the underline is drawn, e.g. wavy like in a spell checker.
+    pub style: TextDecorationStyle,
 }
 
 /// The properties that can be applied to a strikethrough.
@@ -1323,11 +1332,37 @@ pub struct UnderlineStyle {
     Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub struct StrikethroughStyle {
-    /// The thickness of the strikethrough.
+    /// The thickness of the strikethrough. With `thickness_from_font` this is the fallback
+    /// for a font that has no underline thickness.
     pub thickness: Pixels,
+
+    /// Use the underline thickness the font reports (CSS `text-decoration-thickness: from-font`).
+    pub thickness_from_font: bool,
 
     /// The color of the strikethrough.
     pub color: Option<Hsla>,
+
+    /// How the strikethrough is drawn.
+    pub style: TextDecorationStyle,
+}
+
+/// The properties that can be applied to an overline.
+#[derive(
+    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub struct OverlineStyle {
+    /// The thickness of the overline. With `thickness_from_font` this is the fallback
+    /// for a font that has no underline thickness.
+    pub thickness: Pixels,
+
+    /// Use the underline thickness the font reports (CSS `text-decoration-thickness: from-font`).
+    pub thickness_from_font: bool,
+
+    /// The color of the overline.
+    pub color: Option<Hsla>,
+
+    /// How the overline is drawn.
+    pub style: TextDecorationStyle,
 }
 
 /// The kinds of fill that can be applied to a shape.
@@ -2004,6 +2039,7 @@ mod tests {
             strikethrough: Some(StrikethroughStyle {
                 thickness: px(2.),
                 color: Some(blue()),
+                ..Default::default()
             }),
             fade_out: Some(0.),
             font_style: Some(FontStyle::Italic),
@@ -2012,7 +2048,8 @@ mod tests {
             underline: Some(UnderlineStyle {
                 thickness: px(2.),
                 color: Some(red()),
-                wavy: true,
+                style: TextDecorationStyle::Wavy,
+                ..Default::default()
             }),
         };
         let expected_style = style_b;
@@ -2036,6 +2073,7 @@ mod tests {
             strikethrough: Some(StrikethroughStyle {
                 thickness: px(4.),
                 color: Some(crate::red()),
+                ..Default::default()
             }),
             fade_out: Some(0.),
             font_style: Some(FontStyle::Oblique),
@@ -2044,7 +2082,7 @@ mod tests {
             underline: Some(UnderlineStyle {
                 thickness: px(4.),
                 color: None,
-                wavy: false,
+                ..Default::default()
             }),
         };
 
@@ -2053,6 +2091,7 @@ mod tests {
             strikethrough: Some(StrikethroughStyle {
                 thickness: px(4.),
                 color: Some(red()),
+                ..Default::default()
             }),
             // TODO this does not seem right
             fade_out: Some(0.),
@@ -2062,7 +2101,7 @@ mod tests {
             underline: Some(UnderlineStyle {
                 thickness: px(4.),
                 color: None,
-                wavy: false,
+                ..Default::default()
             }),
         };
 

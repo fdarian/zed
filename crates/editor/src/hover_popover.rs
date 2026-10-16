@@ -931,7 +931,7 @@ pub fn hover_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             underline: Some(gpui::UnderlineStyle {
                 thickness: px(1.),
                 color: Some(cx.theme().colors().editor_foreground),
-                wavy: false,
+                ..Default::default()
             }),
             ..Default::default()
         },
@@ -985,7 +985,7 @@ pub fn diagnostics_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             underline: Some(gpui::UnderlineStyle {
                 thickness: px(1.),
                 color: Some(cx.theme().colors().editor_foreground),
-                wavy: false,
+                ..Default::default()
             }),
             ..Default::default()
         },

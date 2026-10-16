@@ -1,6 +1,7 @@
 use crate::{
-    App, Bounds, DevicePixels, GlyphInset, Half, Hsla, LineLayout, Pixels, Point,
-    RenderGlyphParams, Result, ShapedRun, SharedString, StrikethroughStyle, TextAlign,
+    App, Bounds, DevicePixels, FontId, GlyphInset, Half, Hsla, LineLayout, OverlineStyle, Pixels,
+    Point, RenderGlyphParams, Result, ShapedRun, SharedString, StrikethroughStyle, TextAlign,
+    TextSystem,
     UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
@@ -36,6 +37,9 @@ pub struct DecorationRun {
 
     /// The strikethrough style for this run
     pub strikethrough: Option<StrikethroughStyle>,
+
+    /// The overline style for this run
+    pub overline: Option<OverlineStyle>,
 }
 
 /// A line of text that has been shaped and decorated.
@@ -166,6 +170,7 @@ impl ShapedLine {
                     background_color: decoration.background_color,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
+                    overline: decoration.overline,
                 });
                 right_decorations.push(DecorationRun {
                     len: right_len,
@@ -173,6 +178,7 @@ impl ShapedLine {
                     background_color: decoration.background_color,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
+                    overline: decoration.overline,
                 });
             }
 
@@ -350,6 +356,26 @@ impl WrappedLine {
     }
 }
 
+/// `thickness` unless the style asks for the font's own underline thickness and the
+/// font has one, as CSS `text-decoration-thickness: from-font` falls back to `auto`.
+fn decoration_thickness(
+    thickness: Pixels,
+    from_font: bool,
+    text_system: &TextSystem,
+    font_id: FontId,
+    font_size: Pixels,
+) -> Pixels {
+    if !from_font {
+        return thickness;
+    }
+    let font_thickness = text_system.underline_thickness(font_id, font_size);
+    if font_thickness > px(0.) {
+        font_thickness
+    } else {
+        thickness
+    }
+}
+
 /// Paints `layout`. A glyph with an inset is painted after its leading inset, and
 /// a decoration starts there when it begins on that glyph and ends before the
 /// trailing inset of the glyph it ends after: the decoration of a CSS inline box
@@ -380,6 +406,7 @@ fn paint_line(
         let mut color = black();
         let mut current_underline: Option<OpenDecoration<UnderlineStyle>> = None;
         let mut current_strikethrough: Option<OpenDecoration<StrikethroughStyle>> = None;
+        let mut current_overline: Option<OpenDecoration<OverlineStyle>> = None;
         let text_system = cx.text_system().clone();
         let mut glyph_origin = point(
             aligned_origin_x(
@@ -446,6 +473,21 @@ fn paint_line(
                             current_strikethrough = None;
                         }
                     }
+                    if let Some(overline) = current_overline.as_mut() {
+                        if glyph_origin.x == overline.x {
+                            overline.x -= max_glyph_size.width.half();
+                        };
+                        window.paint_overline(
+                            overline.origin(row_baseline),
+                            glyph_origin.x - previous_trailing - overline.x,
+                            &overline.style,
+                        );
+                        if glyph.index < run_end {
+                            overline.x = origin.x;
+                        } else {
+                            current_overline = None;
+                        }
+                    }
 
                     glyph_origin.y += rows[line_ix].height;
                     line_ix += 1;
@@ -464,6 +506,7 @@ fn paint_line(
 
                 let mut finished_underline: Option<OpenDecoration<UnderlineStyle>> = None;
                 let mut finished_strikethrough: Option<OpenDecoration<StrikethroughStyle>> = None;
+                let mut finished_overline: Option<OpenDecoration<OverlineStyle>> = None;
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
@@ -488,8 +531,14 @@ fn paint_line(
                                 baseline_offset: underline_offset(layout, run),
                                 style: UnderlineStyle {
                                     color: Some(run_underline.color.unwrap_or(style_run.color)),
-                                    thickness: run_underline.thickness,
-                                    wavy: run_underline.wavy,
+                                    thickness: decoration_thickness(
+                                        run_underline.thickness,
+                                        run_underline.thickness_from_font,
+                                        &text_system,
+                                        run.font_id,
+                                        layout.font_size,
+                                    ),
+                                    ..*run_underline
                                 },
                             });
                         }
@@ -504,7 +553,36 @@ fn paint_line(
                                 baseline_offset: strikethrough_offset(layout, run, line_height),
                                 style: StrikethroughStyle {
                                     color: Some(run_strikethrough.color.unwrap_or(style_run.color)),
-                                    thickness: run_strikethrough.thickness,
+                                    thickness: decoration_thickness(
+                                        run_strikethrough.thickness,
+                                        run_strikethrough.thickness_from_font,
+                                        &text_system,
+                                        run.font_id,
+                                        layout.font_size,
+                                    ),
+                                    ..*run_strikethrough
+                                },
+                            });
+                        }
+                        if let Some(overline) = &current_overline
+                            && style_run.overline.as_ref() != Some(&overline.style)
+                        {
+                            finished_overline = current_overline.take();
+                        }
+                        if let Some(run_overline) = style_run.overline.as_ref() {
+                            current_overline.get_or_insert(OpenDecoration {
+                                x: glyph_origin.x + leading,
+                                baseline_offset: overline_offset(layout, run),
+                                style: OverlineStyle {
+                                    color: Some(run_overline.color.unwrap_or(style_run.color)),
+                                    thickness: decoration_thickness(
+                                        run_overline.thickness,
+                                        run_overline.thickness_from_font,
+                                        &text_system,
+                                        run.font_id,
+                                        layout.font_size,
+                                    ),
+                                    ..*run_overline
                                 },
                             });
                         }
@@ -515,6 +593,7 @@ fn paint_line(
                         run_end = layout.len;
                         finished_underline = current_underline.take();
                         finished_strikethrough = current_strikethrough.take();
+                        finished_overline = current_overline.take();
                     }
                 }
 
@@ -537,6 +616,17 @@ fn paint_line(
                         strikethrough.origin(row_baseline),
                         glyph_origin.x - previous_trailing - strikethrough.x,
                         &strikethrough.style,
+                    );
+                }
+
+                if let Some(mut overline) = finished_overline {
+                    if overline.x == glyph_origin.x {
+                        overline.x -= max_glyph_size.width.half();
+                    };
+                    window.paint_overline(
+                        overline.origin(row_baseline),
+                        glyph_origin.x - previous_trailing - overline.x,
+                        &overline.style,
                     );
                 }
 
@@ -598,6 +688,17 @@ fn paint_line(
                 strikethrough.origin(last_row_baseline),
                 last_line_end_x - strikethrough.x,
                 &strikethrough.style,
+            );
+        }
+
+        if let Some(mut overline) = current_overline.take() {
+            if last_line_end_x == overline.x {
+                overline.x -= max_glyph_size.width.half()
+            };
+            window.paint_overline(
+                overline.origin(last_row_baseline),
+                last_line_end_x - overline.x,
+                &overline.style,
             );
         }
 
@@ -760,7 +861,7 @@ fn paint_line_background(
     })
 }
 
-/// An underline or strikethrough that has started and has not been painted yet.
+/// An underline, strikethrough or overline that has started and has not been painted yet.
 struct OpenDecoration<Style> {
     x: Pixels,
     /// Below the baseline of the row it is on, so that it keeps its place when it
@@ -784,6 +885,17 @@ fn underline_offset(layout: &LineLayout, run: &ShapedRun) -> Pixels {
         layout.descent
     };
     descent * 0.618
+}
+
+/// Where an overline on `run` sits relative to the baseline: the top of the run's
+/// ascent, whatever row it is on.
+fn overline_offset(layout: &LineLayout, run: &ShapedRun) -> Pixels {
+    let ascent = if layout.is_styled(run) {
+        run.ascent
+    } else {
+        layout.ascent
+    };
+    -ascent
 }
 
 /// Where a strikethrough on `run` sits relative to the baseline, from the run's own
@@ -1075,6 +1187,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    overline: None,
                 },
                 DecorationRun {
                     len: 3,
@@ -1082,6 +1195,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    overline: None,
                 },
                 DecorationRun {
                     len: 1,
@@ -1089,6 +1203,7 @@ mod tests {
                     background_color: None,
                     underline: None,
                     strikethrough: None,
+                    overline: None,
                 },
             ],
         );

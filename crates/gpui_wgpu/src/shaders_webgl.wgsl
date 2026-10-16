@@ -233,7 +233,7 @@ fn load_path_sprite(instance_id: u32) -> PathSprite {
 }
 
 fn load_underline(instance_id: u32) -> Underline {
-    var cursor = instance_cursor(instance_id * 20u);
+    var cursor = instance_cursor(instance_id * 22u);
     return Underline(
         read_word(&cursor),
         read_word(&cursor),
@@ -242,6 +242,8 @@ fn load_underline(instance_id: u32) -> Underline {
         read_hsla(&cursor),
         read_f32(&cursor),
         read_word(&cursor),
+        read_f32(&cursor),
+        read_f32(&cursor),
     );
 }
 

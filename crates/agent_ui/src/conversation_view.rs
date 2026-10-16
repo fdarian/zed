@@ -3677,6 +3677,7 @@ fn plan_label_markdown_style(
                 Some(gpui::StrikethroughStyle {
                     thickness: px(1.),
                     color: Some(cx.theme().colors().text_muted.opacity(0.8)),
+                    ..Default::default()
                 })
             } else {
                 None

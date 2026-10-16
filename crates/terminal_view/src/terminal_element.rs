@@ -892,12 +892,18 @@ impl TerminalElement {
             (cell.has_underline() || cell.hyperlink().is_some()).then(|| UnderlineStyle {
                 color: Some(fg),
                 thickness: Pixels::from(1.0),
-                wavy: cell.has_undercurl(),
+                style: if cell.has_undercurl() {
+                    gpui::TextDecorationStyle::Wavy
+                } else {
+                    gpui::TextDecorationStyle::Solid
+                },
+                ..Default::default()
             });
 
         let strikethrough = cell.has_strikeout().then(|| StrikethroughStyle {
             color: Some(fg),
             thickness: Pixels::from(1.0),
+            ..Default::default()
         });
 
         let weight = if cell.is_bold() {
@@ -1256,7 +1262,7 @@ impl Element for TerminalElement {
                     underline: Some(UnderlineStyle {
                         thickness: px(1.0),
                         color: Some(theme.colors().link_text_hover),
-                        wavy: false,
+                        ..Default::default()
                     }),
                     strikethrough: None,
                     fade_out: None,
@@ -1722,7 +1728,7 @@ impl Element for TerminalElement {
                         ime_style.underline = Some(UnderlineStyle {
                             color: Some(ime_style.color),
                             thickness: px(1.0),
-                            wavy: false,
+                            ..Default::default()
                         });
 
                         let shaped_line = window.text_system().shape_line(

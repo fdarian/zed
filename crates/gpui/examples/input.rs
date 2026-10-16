@@ -471,6 +471,7 @@ impl Element for TextElement {
             strikethrough: None,
             font_size: None,
             line_height: None,
+            overline: None,
         };
         let runs = if let Some(marked_range) = input.marked_range.as_ref() {
             vec![
@@ -485,7 +486,7 @@ impl Element for TextElement {
                     underline: Some(UnderlineStyle {
                         color: Some(run.color),
                         thickness: px(1.0),
-                        wavy: false,
+                        ..Default::default()
                     }),
                     font_size: None,
                     line_height: None,

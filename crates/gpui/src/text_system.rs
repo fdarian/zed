@@ -15,8 +15,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
-    StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
+    Bounds, DevicePixels, Hsla, OverlineStyle, Pixels, PlatformTextSystem, Point, Result,
+    SharedString, Size, StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
 };
 use anyhow::{Context as _, anyhow};
 use collections::FxHashMap;
@@ -315,6 +315,11 @@ impl TextSystem {
         padding_top + ascent
     }
 
+    /// The underline thickness the font reports for `font_size`, zero when it has none.
+    pub fn underline_thickness(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.underline_thickness(font_size))
+    }
+
     fn read_metrics<T>(&self, font_id: FontId, read: impl FnOnce(&FontMetrics) -> T) -> T {
         let lock = self.font_metrics.upgradable_read();
 
@@ -438,6 +443,7 @@ impl WindowTextSystem {
                 && last_run.color == run.color
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
+                && last_run.overline == run.overline
                 && last_run.background_color == run.background_color
             {
                 last_run.len += run.len as u32;
@@ -449,6 +455,7 @@ impl WindowTextSystem {
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
+                overline: run.overline,
             });
         }
 
@@ -486,6 +493,7 @@ impl WindowTextSystem {
                 && last_run.color == run.color
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
+                && last_run.overline == run.overline
                 && last_run.background_color == run.background_color
             {
                 last_run.len += run.len as u32;
@@ -497,6 +505,7 @@ impl WindowTextSystem {
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
+                overline: run.overline,
             });
         }
 
@@ -599,6 +608,7 @@ impl WindowTextSystem {
                     && last_run.color == run.color
                     && last_run.underline == run.underline
                     && last_run.strikethrough == run.strikethrough
+                && last_run.overline == run.overline
                     && last_run.background_color == run.background_color
                 {
                     last_run.len += run_len_within_line as u32;
@@ -610,6 +620,7 @@ impl WindowTextSystem {
                         background_color: run.background_color,
                         underline: run.underline,
                         strikethrough: run.strikethrough,
+                        overline: run.overline,
                     });
                     true
                 };
@@ -759,6 +770,7 @@ impl WindowTextSystem {
                 && last_run.color == run.color
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
+                && last_run.overline == run.overline
             // we do not consider differing background color relevant, as it does not affect glyphs
             // && last_run.background_color == run.background_color
             {
@@ -847,6 +859,7 @@ impl WindowTextSystem {
                 && last_run.color == run.color
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
+                && last_run.overline == run.overline
             // we do not consider differing background color relevant, as it does not affect glyphs
             // && last_run.background_color == run.background_color
             {
@@ -913,6 +926,7 @@ impl WindowTextSystem {
                 && last_run.color == run.color
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
+                && last_run.overline == run.overline
             // we do not consider differing background color relevant, as it does not affect glyphs
             // && last_run.background_color == run.background_color
             {
@@ -1173,6 +1187,8 @@ pub struct TextRun {
     /// How much this run contributes to the height of its line box.
     /// `None` is the line height the line is painted with.
     pub line_height: Option<Pixels>,
+    /// The overline style (if any)
+    pub overline: Option<OverlineStyle>,
 }
 
 #[cfg(all(target_os = "macos", test))]

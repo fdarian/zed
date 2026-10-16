@@ -419,6 +419,7 @@ impl Element for EditorText {
                 strikethrough: None,
                 font_size: None,
                 line_height: None,
+                overline: None,
             };
             vec![
                 window
@@ -439,6 +440,7 @@ impl Element for EditorText {
                         strikethrough: None,
                         font_size: None,
                         line_height: None,
+                        overline: None,
                     };
                     window
                         .text_system()

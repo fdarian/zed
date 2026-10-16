@@ -1386,7 +1386,9 @@ struct Underline {
     content_mask: ContentMask,
     color: Hsla,
     thickness: f32,
-    wavy: u32,
+    style: u32,
+    mark_length: f32,
+    mark_period: f32,
 }
 
 
@@ -1423,7 +1425,22 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
     let underline = load_underline(input.underline_id);
     let mask_alpha = content_mask_coverage(input.position.xy, underline.content_mask);
-    if (underline.wavy == 0u)
+    // The numbers of `SHAPE_*` in gpui's text_decoration.rs.
+    if (underline.style == 1u) {
+        let radius = underline.mark_length * 0.5;
+        let local = input.position.xy - underline.bounds.origin;
+        let nearest = floor((local.x - radius) / underline.mark_period + 0.5);
+        let center = vec2<f32>(nearest * underline.mark_period + radius, radius);
+        let dot_alpha = saturate(0.5 - (length(local - center) - radius));
+        return blend_color(input.color, dot_alpha * input.color.a * mask_alpha);
+    }
+    if (underline.style == 2u) {
+        let x = input.position.x - underline.bounds.origin.x;
+        let along = x - floor(x / underline.mark_period) * underline.mark_period;
+        let dash_alpha = saturate(along + 0.5) * saturate(underline.mark_length - along + 0.5);
+        return blend_color(input.color, dash_alpha * input.color.a * mask_alpha);
+    }
+    if (underline.style != 3u)
     {
         return blend_color(input.color, input.color.a * mask_alpha);
     }

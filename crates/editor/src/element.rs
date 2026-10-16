@@ -7213,6 +7213,7 @@ impl LineWithInvisibles {
                             strikethrough: text_style.strikethrough,
                             font_size: None,
                             line_height: None,
+                            overline: text_style.overline,
                         };
                         let line_layout = window
                             .text_system()
@@ -7292,6 +7293,7 @@ impl LineWithInvisibles {
                             strikethrough: text_style.strikethrough,
                             font_size: None,
                             line_height: None,
+                            overline: text_style.overline,
                         });
 
                         if editor_mode.is_full() && !highlighted_chunk.is_inlay {
@@ -7377,6 +7379,7 @@ impl LineWithInvisibles {
                         strikethrough: text_run.strikethrough,
                         font_size: None,
                         line_height: None,
+                        overline: text_run.overline,
                     });
                     cursor_col = segment_start_col;
                 }
@@ -7393,6 +7396,7 @@ impl LineWithInvisibles {
                         strikethrough: text_run.strikethrough,
                         font_size: None,
                         line_height: None,
+                        overline: text_run.overline,
                     });
                     cursor_col = segment_slice_end_col;
                 }
@@ -7411,6 +7415,7 @@ impl LineWithInvisibles {
                     strikethrough: text_run.strikethrough,
                     font_size: None,
                     line_height: None,
+                    overline: text_run.overline,
                 });
             }
             line_col = run_end_col;

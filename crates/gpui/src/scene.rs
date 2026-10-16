@@ -556,6 +556,18 @@ impl Scene {
         quads
     }
 
+    /// The underlines of this scene and of the groups inside it, in this scene's coordinates.
+    pub fn underlines_with_groups(&self) -> Vec<Underline> {
+        let mut underlines = self.underlines.clone();
+        for group in &self.groups {
+            for mut underline in group.scene.underlines_with_groups() {
+                underline.translate(group.bounds.origin);
+                underlines.push(underline);
+            }
+        }
+        underlines
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
@@ -1172,7 +1184,12 @@ pub struct Underline {
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub thickness: ScaledPixels,
-    pub wavy: PaddedBool32,
+    /// A `SHAPE_*` code of `text_decoration.rs`.
+    pub style: u32,
+    /// For the dotted and dashed shapes: the length of a mark and the distance between
+    /// the starts of two marks.
+    pub mark_length: ScaledPixels,
+    pub mark_period: ScaledPixels,
 }
 
 impl From<Underline> for Primitive {

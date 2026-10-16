@@ -253,7 +253,7 @@ impl RenderOnce for LabelLike {
                 this.text_style().underline = Some(UnderlineStyle {
                     thickness: px(1.),
                     color: Some(cx.theme().colors().text_muted.opacity(0.4)),
-                    wavy: false,
+                    ..Default::default()
                 });
                 this
             })

@@ -697,9 +697,27 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const float WAVE_FREQUENCY = 2.0;
   const float WAVE_HEIGHT_RATIO = 0.8;
 
+  // The numbers of `SHAPE_*` in gpui's text_decoration.rs.
+  const uint SHAPE_DOTTED = 1u;
+  const uint SHAPE_DASHED = 2u;
+  const uint SHAPE_WAVY = 3u;
+
   Underline underline = underlines[input.underline_id];
   float mask_alpha = content_mask_coverage(input.position.xy, underline.content_mask);
-  if (underline.wavy) {
+  if (underline.style == SHAPE_DOTTED) {
+    // Round dots, laid out from the left edge; the nearest dot decides the coverage.
+    float radius = underline.mark_length * 0.5;
+    float2 local = input.position.xy - float2(underline.bounds.origin.x, underline.bounds.origin.y);
+    float nearest = floor((local.x - radius) / underline.mark_period + 0.5);
+    float2 center = float2(nearest * underline.mark_period + radius, radius);
+    float alpha = saturate(0.5 - (length(local - center) - radius));
+    return input.color * float4(1., 1., 1., alpha * mask_alpha);
+  } else if (underline.style == SHAPE_DASHED) {
+    float x = input.position.x - underline.bounds.origin.x;
+    float along = x - floor(x / underline.mark_period) * underline.mark_period;
+    float alpha = saturate(along + 0.5) * saturate(underline.mark_length - along + 0.5);
+    return input.color * float4(1., 1., 1., alpha * mask_alpha);
+  } else if (underline.style == SHAPE_WAVY) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
         float2(underline.bounds.origin.x, underline.bounds.origin.y);

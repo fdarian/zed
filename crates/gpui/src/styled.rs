@@ -2,8 +2,9 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
-    JustifyContent, Length, SharedString, StrikethroughStyle, StyleRefinement, TextAlign,
-    TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    JustifyContent, Length, OverlineStyle, SharedString, StrikethroughStyle, StyleRefinement,
+    TextAlign, TextDecorationStyle, TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace,
+    px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -749,6 +750,16 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the decoration of the text to have a line over it.
+    fn overline(mut self) -> Self {
+        let style = self.text_style();
+        style.overline = Some(OverlineStyle {
+            thickness: px(1.),
+            ..Default::default()
+        });
+        self
+    }
+
     /// Removes the text decoration on this element.
     ///
     /// This value cascades to its child elements.
@@ -770,7 +781,34 @@ pub trait Styled: Sized {
     fn text_decoration_solid(mut self) -> Self {
         let style = self.text_style();
         let underline = style.underline.get_or_insert_with(Default::default);
-        underline.wavy = false;
+        underline.style = TextDecorationStyle::Solid;
+        self
+    }
+
+    /// Sets the text decoration style to a double line.
+    /// [Docs](https://tailwindcss.com/docs/text-decoration-style)
+    fn text_decoration_double(mut self) -> Self {
+        let style = self.text_style();
+        let underline = style.underline.get_or_insert_with(Default::default);
+        underline.style = TextDecorationStyle::Double;
+        self
+    }
+
+    /// Sets the text decoration style to a dotted line.
+    /// [Docs](https://tailwindcss.com/docs/text-decoration-style)
+    fn text_decoration_dotted(mut self) -> Self {
+        let style = self.text_style();
+        let underline = style.underline.get_or_insert_with(Default::default);
+        underline.style = TextDecorationStyle::Dotted;
+        self
+    }
+
+    /// Sets the text decoration style to a dashed line.
+    /// [Docs](https://tailwindcss.com/docs/text-decoration-style)
+    fn text_decoration_dashed(mut self) -> Self {
+        let style = self.text_style();
+        let underline = style.underline.get_or_insert_with(Default::default);
+        underline.style = TextDecorationStyle::Dashed;
         self
     }
 
@@ -779,7 +817,7 @@ pub trait Styled: Sized {
     fn text_decoration_wavy(mut self) -> Self {
         let style = self.text_style();
         let underline = style.underline.get_or_insert_with(Default::default);
-        underline.wavy = true;
+        underline.style = TextDecorationStyle::Wavy;
         self
     }
 

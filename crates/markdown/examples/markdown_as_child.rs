@@ -83,7 +83,7 @@ impl Render for HelloWorld {
                 underline: Some(gpui::UnderlineStyle {
                     thickness: px(1.),
                     color: Some(Color::Accent.color(cx)),
-                    wavy: false,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
