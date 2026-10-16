@@ -5182,6 +5182,7 @@ mod tests {
                     .h(px(40.))
                     .pl(relative(0.1))
                     .pt(px(5.))
+                    .pr(crate::DefiniteLength::calc(px(4.), 0.1))
                     .border_l(px(3.))
                     .border_b(px(2.))
                     .on_painted_layout(move |_, layout_id, window, _| {
@@ -5210,7 +5211,8 @@ mod tests {
         // 10% of the 180px content box of the parent.
         assert_eq!(insets.padding.left, px(18.));
         assert_eq!(insets.padding.top, px(5.));
-        assert_eq!(insets.padding.right, px(0.));
+        // 4px plus 10% of the same 180px.
+        assert_eq!(insets.padding.right, px(22.));
         assert_eq!(insets.border.left, px(3.));
         assert_eq!(insets.border.bottom, px(2.));
         assert_eq!(insets.border.top, px(0.));
