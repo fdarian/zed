@@ -176,6 +176,36 @@ pub struct GridTemplate {
     pub min_size: GridTemplateMinSize,
 }
 
+/// A CSS intrinsic size keyword for a width, which depends on the element's content.
+#[derive(Copy, Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
+pub enum IntrinsicSize {
+    /// `min-content`: the narrowest width the content can take without overflowing.
+    MinContent,
+    /// `max-content`: the width of the content with no line broken.
+    MaxContent,
+    /// `fit-content`: `min(max-content, max(min-content, available width))`.
+    FitContent,
+    /// `fit-content(<limit>)`: `min(max-content, max(min-content, limit))`.
+    FitContentLimit(DefiniteLength),
+}
+
+/// The widths that are an [`IntrinsicSize`] keyword. They exist next to `Style::size`,
+/// `min_size` and `max_size` because taffy has no intrinsic size keywords, so those fields
+/// hold `auto` for the width that carries one and layout fills in the measured value.
+///
+/// A keyword wins over a length set for the same width. In the block axis the keywords behave
+/// as `auto`, so there are no height fields.
+#[derive(Clone, Copy, Default, PartialEq, Debug, Refineable)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct IntrinsicWidths {
+    /// The keyword for `width`.
+    pub width: Option<IntrinsicSize>,
+    /// The keyword for `min-width`. `fit-content` is `min-content` here.
+    pub min_width: Option<IntrinsicSize>,
+    /// The keyword for `max-width`. `fit-content` is `max-content` here.
+    pub max_width: Option<IntrinsicSize>,
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -238,6 +268,9 @@ pub struct Style {
     /// Controls the maximum size of the item
     #[refineable]
     pub max_size: Size<Length>,
+    /// The widths of `size`, `min_size` and `max_size` that are an intrinsic size keyword.
+    #[refineable]
+    pub intrinsic_widths: IntrinsicWidths,
     /// Sets the preferred aspect ratio for the item. The ratio is calculated as width divided by height.
     pub aspect_ratio: Option<f32>,
     /// Whether this is a replaced element such as an image. In block layout it is sized by its
@@ -1138,6 +1171,7 @@ impl Default for Style {
             size: Size::auto(),
             min_size: Size::auto(),
             max_size: Size::auto(),
+            intrinsic_widths: IntrinsicWidths::default(),
             aspect_ratio: None,
             item_is_replaced: false,
             gap: Size::default(),

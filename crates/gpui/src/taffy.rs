@@ -11,6 +11,7 @@ use std::{fmt::Debug, ops::Range};
 
 mod calc;
 mod containing_block;
+mod intrinsic;
 use calc::CalcArena;
 use taffy::{
     TaffyTree, TraversePartialTree as _,
@@ -51,6 +52,9 @@ pub struct TaffyLayoutEngine {
     /// Nodes whose subtree belongs to another layer (deferred and anchored elements), so it is
     /// not part of the scrollable overflow of the scrollers it sits in.
     detached: FxHashSet<LayoutId>,
+    /// Nodes with a width keyword (`min-content`, `max-content`, `fit-content`) that
+    /// `compute_layout` has not measured yet, in the order they were requested.
+    intrinsic_nodes: Vec<intrinsic::IntrinsicNode>,
     /// Owns what the `calc()` lengths in the taffy styles point to, so it is cleared with them.
     calcs: CalcArena,
 }
@@ -71,6 +75,7 @@ impl TaffyLayoutEngine {
             escapable_absolutes: Vec::new(),
             escapable_kinds: FxHashMap::default(),
             detached: FxHashSet::default(),
+            intrinsic_nodes: Vec::new(),
             calcs: CalcArena::default(),
         }
     }
@@ -85,6 +90,7 @@ impl TaffyLayoutEngine {
         self.escapable_absolutes.clear();
         self.escapable_kinds.clear();
         self.detached.clear();
+        self.intrinsic_nodes.clear();
     }
 
     pub fn mark_detached(&mut self, id: LayoutId) {
@@ -115,6 +121,7 @@ impl TaffyLayoutEngine {
                 .into()
         };
         self.track_position(id, style.position, escapable);
+        self.track_intrinsic_widths(id, &style, rem_size, scale_factor);
         id
     }
 
@@ -144,6 +151,7 @@ impl TaffyLayoutEngine {
             .expect(EXPECT_MESSAGE)
             .into();
         self.track_position(id, style.position, escapable);
+        self.track_intrinsic_widths(id, &style, rem_size, scale_factor);
         id
     }
 
@@ -273,6 +281,7 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        self.resolve_intrinsic_widths(window, cx);
         self.run_taffy(id, available_space, scale_factor, window, cx);
         self.settle_containing_blocks(id, available_space, scale_factor, window, cx);
     }
@@ -1453,6 +1462,437 @@ mod tests {
                 calc(10., 0.5).to_taffy(Pixels(16.0), 2.0, &mut arena);
             let value = arena.get(length.into_raw()).expect("a calc");
             assert_eq!((value.length, value.percent), (20.0, 0.5));
+        }
+    }
+    mod intrinsic_widths {
+        use crate::{
+            AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, GlobalElementId,
+            InspectorElementId, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+            Position, Render, Size, Style, StyleRefinement, Styled, TestAppContext, Window, div,
+            px, relative, size,
+        };
+        use refineable::Refineable as _;
+        use std::{cell::Cell, rc::Rc};
+
+        const CHAR: f32 = 10.;
+
+        /// Text where every character is `CHAR` wide and a line is `CHAR` high, wrapping at spaces.
+        /// Its min-content is the longest word and its max-content the text on one line.
+        struct Words {
+            text: &'static str,
+            style: StyleRefinement,
+            bounds: Option<Rc<Cell<Option<Bounds<Pixels>>>>>,
+        }
+
+        fn words(text: &'static str) -> Words {
+            Words {
+                text,
+                style: StyleRefinement::default(),
+                bounds: None,
+            }
+        }
+
+        fn measure_words(text: &str, wrap_width: Option<f32>) -> Size<Pixels> {
+            let mut lines = vec![0usize];
+            for word in text.split(' ') {
+                let current = lines.last_mut().expect("there is always a line");
+                let joined = if *current == 0 {
+                    word.len()
+                } else {
+                    *current + 1 + word.len()
+                };
+                match wrap_width {
+                    Some(wrap) if *current > 0 && joined as f32 * CHAR > wrap => {
+                        lines.push(word.len())
+                    }
+                    _ => *current = joined,
+                }
+            }
+            let widest = lines.iter().copied().max().expect("there is a line");
+            size(px(widest as f32 * CHAR), px(lines.len() as f32 * CHAR))
+        }
+
+        impl Styled for Words {
+            fn style(&mut self) -> &mut StyleRefinement {
+                &mut self.style
+            }
+        }
+
+        impl IntoElement for Words {
+            type Element = Self;
+
+            fn into_element(self) -> Self {
+                self
+            }
+        }
+
+        impl Element for Words {
+            type RequestLayoutState = ();
+            type PrepaintState = ();
+
+            fn id(&self) -> Option<ElementId> {
+                None
+            }
+
+            fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+                None
+            }
+
+            fn request_layout(
+                &mut self,
+                _id: Option<&GlobalElementId>,
+                _inspector_id: Option<&InspectorElementId>,
+                window: &mut Window,
+                _cx: &mut App,
+            ) -> (crate::LayoutId, ()) {
+                let mut style = Style::default();
+                style.refine(&self.style);
+                let text = self.text;
+                let layout_id =
+                    window.request_measured_layout(style, move |known, available, _window, _cx| {
+                        let wrap = known.width.map(|width| width.0).or(match available.width {
+                            AvailableSpace::Definite(width) => Some(width.0),
+                            AvailableSpace::MinContent => Some(0.),
+                            AvailableSpace::MaxContent => None,
+                        });
+                        measure_words(text, wrap)
+                    });
+                (layout_id, ())
+            }
+
+            fn prepaint(
+                &mut self,
+                _id: Option<&GlobalElementId>,
+                _inspector_id: Option<&InspectorElementId>,
+                _bounds: Bounds<Pixels>,
+                _request_layout: &mut (),
+                _window: &mut Window,
+                _cx: &mut App,
+            ) {
+            }
+
+            fn paint(
+                &mut self,
+                _id: Option<&GlobalElementId>,
+                _inspector_id: Option<&InspectorElementId>,
+                bounds: Bounds<Pixels>,
+                _request_layout: &mut (),
+                _prepaint: &mut (),
+                _window: &mut Window,
+                _cx: &mut App,
+            ) {
+                if let Some(recorded) = &self.bounds {
+                    recorded.set(Some(bounds));
+                }
+            }
+        }
+
+        struct Probe {
+            text: &'static str,
+            build: Rc<dyn Fn(&'static str) -> AnyElement>,
+        }
+
+        impl Render for Probe {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().size_full().child((self.build)(self.text))
+            }
+        }
+
+        fn probe<'a>(
+            cx: &'a mut TestAppContext,
+            text: &'static str,
+            build: impl Fn(&'static str) -> AnyElement + 'static,
+        ) -> (crate::Entity<Probe>, &'a mut crate::VisualTestContext) {
+            let (view, cx) = cx.add_window_view(|_, _| Probe {
+                text,
+                build: Rc::new(build),
+            });
+            cx.simulate_resize(size(px(400.), px(300.)));
+            cx.run_until_parked();
+            (view, cx)
+        }
+
+        fn bounds(cx: &mut crate::VisualTestContext, selector: &'static str) -> Bounds<Pixels> {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("no element with debug selector {selector}"))
+        }
+
+        /// The width of `style(div())` holding `text`, in a block parent `parent_width` wide.
+        fn width_in(
+            cx: &mut TestAppContext,
+            parent_width: f32,
+            text: &'static str,
+            style: impl Fn(crate::Div) -> crate::Div + 'static,
+        ) -> Pixels {
+            let (_, cx) = probe(cx, text, move |text| {
+                div()
+                    .w(px(parent_width))
+                    .child(style(div().debug_selector(|| "box".into())).child(words(text)))
+                    .into_any_element()
+            });
+            bounds(cx, "box").size.width
+        }
+
+        const SHORT: &str = "hello world";
+        const LONG: &str = "hello wonderful world";
+
+        #[gpui::test]
+        fn max_content_is_the_text_on_one_line(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, SHORT, |text| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(400.))
+                    .child(
+                        div()
+                            .debug_selector(|| "box".into())
+                            .w_max_content()
+                            .child(words(text)),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(110.));
+        }
+
+        #[gpui::test]
+        fn a_measured_leaf_takes_the_keyword_itself(cx: &mut TestAppContext) {
+            let recorded = Rc::new(Cell::new(None));
+            let leaf_bounds = recorded.clone();
+            let (_, _cx) = probe(cx, LONG, move |text| {
+                let mut leaf = words(text).w_min_content();
+                leaf.bounds = Some(leaf_bounds.clone());
+                div().w(px(400.)).child(leaf).into_any_element()
+            });
+            assert_eq!(
+                recorded.get().expect("painted").size,
+                size(px(90.), px(30.))
+            );
+        }
+
+        #[gpui::test]
+        fn min_content_is_the_widest_unbreakable_run(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 400., LONG, |box_| box_.w_min_content()),
+                px(90.)
+            );
+        }
+
+        #[gpui::test]
+        fn min_content_of_a_box_of_fixed_children_is_the_widest_child(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, SHORT, |_| {
+                div()
+                    .w(px(400.))
+                    .child(
+                        div()
+                            .debug_selector(|| "box".into())
+                            .w_min_content()
+                            .child(div().w(px(30.)).h(px(5.)))
+                            .child(div().w(px(70.)).h(px(5.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(70.));
+        }
+
+        #[gpui::test]
+        fn fit_content_is_max_content_when_the_text_fits(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 400., SHORT, |box_| box_.w_fit_content()),
+                px(110.)
+            );
+        }
+
+        #[gpui::test]
+        fn fit_content_is_the_available_width_when_the_text_does_not_fit(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 100., LONG, |box_| box_.w_fit_content()),
+                px(100.)
+            );
+        }
+
+        #[gpui::test]
+        fn fit_content_does_not_go_under_min_content(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 50., LONG, |box_| box_.w_fit_content()),
+                px(90.)
+            );
+        }
+
+        #[gpui::test]
+        fn fit_content_of_a_limit_is_the_limit_between_min_and_max_content(
+            cx: &mut TestAppContext,
+        ) {
+            let limited = |limit: f32| move |box_: crate::Div| box_.w_fit_content_to(px(limit));
+            assert_eq!(width_in(cx, 400., LONG, limited(100.)), px(100.));
+            assert_eq!(width_in(cx, 400., LONG, limited(500.)), px(210.));
+            assert_eq!(width_in(cx, 400., LONG, limited(20.)), px(90.));
+        }
+
+        #[gpui::test]
+        fn a_fit_content_limit_can_be_a_percentage(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 200., LONG, |box_| box_.w_fit_content_to(relative(0.5))),
+                px(100.)
+            );
+        }
+
+        #[gpui::test]
+        fn fit_content_in_a_percentage_width_parent_uses_that_width(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, LONG, |text| {
+                div()
+                    .w(relative(0.5))
+                    .child(
+                        div()
+                            .debug_selector(|| "box".into())
+                            .w_fit_content()
+                            .child(words(text)),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(200.));
+        }
+
+        #[gpui::test]
+        fn max_content_inside_max_content_adds_up(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, SHORT, |_| {
+                div()
+                    .flex()
+                    .w_max_content()
+                    .debug_selector(|| "outer".into())
+                    .child(div().w_max_content().child(words("ab")))
+                    .child(div().w_max_content().child(words("abcd")))
+                    .child(div().w(px(30.)).h(px(5.)))
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "outer").size.width, px(90.));
+        }
+
+        #[gpui::test]
+        fn min_content_sees_the_max_content_width_of_a_nested_keyword(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, "aa bb", |text| {
+                div()
+                    .debug_selector(|| "outer".into())
+                    .w_min_content()
+                    .child(div().w_max_content().child(words(text)))
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "outer").size.width, px(50.));
+        }
+
+        #[gpui::test]
+        fn max_width_max_content_caps_a_stretching_box(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 400., SHORT, |box_| box_.max_w_max_content()),
+                px(110.)
+            );
+            assert_eq!(
+                width_in(cx, 60., LONG, |box_| box_.max_w_max_content()),
+                px(60.)
+            );
+        }
+
+        #[gpui::test]
+        fn min_width_min_content_keeps_a_narrow_box_from_squeezing_its_content(
+            cx: &mut TestAppContext,
+        ) {
+            assert_eq!(
+                width_in(cx, 400., LONG, |box_| box_.w(px(20.)).min_w_min_content()),
+                px(90.)
+            );
+        }
+
+        #[gpui::test]
+        fn min_and_max_width_limits_are_clamped_between_the_content_sizes(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 50., LONG, |box_| box_.min_w_fit_content_to(px(10.))),
+                px(90.)
+            );
+            assert_eq!(
+                width_in(cx, 400., LONG, |box_| box_.max_w_fit_content_to(px(1000.))),
+                px(210.)
+            );
+        }
+
+        #[gpui::test]
+        fn a_keyword_still_obeys_the_authors_max_width(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 400., LONG, |box_| box_.w_max_content().max_w(px(150.))),
+                px(150.)
+            );
+            assert_eq!(
+                width_in(cx, 400., LONG, |box_| box_.w_fit_content().max_w(px(150.))),
+                px(150.)
+            );
+        }
+
+        #[gpui::test]
+        fn an_absolute_box_is_sized_by_its_content(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, LONG, |text| {
+                div()
+                    .relative()
+                    .w(px(300.))
+                    .h(px(100.))
+                    .child(
+                        div()
+                            .debug_selector(|| "box".into())
+                            .absolute()
+                            .w_min_content()
+                            .child(words(text)),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(90.));
+        }
+
+        #[gpui::test]
+        fn an_absolute_box_escaping_a_static_parent_keeps_its_width(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, LONG, |text| {
+                let mut parent = div().w(px(300.)).h(px(100.));
+                parent.style().position = Some(Position::Static);
+                let mut child = div()
+                    .debug_selector(|| "box".into())
+                    .w_min_content()
+                    .top(px(5.))
+                    .child(words(text));
+                child.style().position = Some(Position::AbsoluteInAncestor);
+                div()
+                    .relative()
+                    .w(px(350.))
+                    .child(parent.child(child))
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(90.));
+        }
+
+        #[gpui::test]
+        fn a_second_frame_measures_the_new_content(cx: &mut TestAppContext) {
+            let (view, cx) = probe(cx, SHORT, |text| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(400.))
+                    .child(
+                        div()
+                            .debug_selector(|| "box".into())
+                            .w_fit_content()
+                            .child(words(text)),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(110.));
+
+            for (text, width) in [("hi", 20.), (LONG, 210.), (SHORT, 110.)] {
+                view.update(cx, |view, cx| {
+                    view.text = text;
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                assert_eq!(bounds(cx, "box").size.width, px(width), "text {text:?}");
+            }
         }
     }
 }

@@ -1,9 +1,9 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
+    JustifyContent, Length, SharedString, StrikethroughStyle, StyleRefinement, TextAlign,
+    TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -476,6 +476,80 @@ pub trait Styled: Sized {
     /// [Docs](https://tailwindcss.com/docs/align-content#stretch)
     fn content_stretch(mut self) -> Self {
         self.style().align_content = Some(AlignContent::Stretch);
+        self
+    }
+
+    /// Sets the width of the element to `min-content`.
+    fn w_min_content(mut self) -> Self {
+        self.style().intrinsic_widths.width = Some(IntrinsicSize::MinContent);
+        self
+    }
+
+    /// Sets the width of the element to `max-content`.
+    fn w_max_content(mut self) -> Self {
+        self.style().intrinsic_widths.width = Some(IntrinsicSize::MaxContent);
+        self
+    }
+
+    /// Sets the width of the element to `fit-content`.
+    fn w_fit_content(mut self) -> Self {
+        self.style().intrinsic_widths.width = Some(IntrinsicSize::FitContent);
+        self
+    }
+
+    /// Sets the width of the element to `fit-content(<limit>)`.
+    fn w_fit_content_to(mut self, limit: impl Into<DefiniteLength>) -> Self {
+        self.style().intrinsic_widths.width = Some(IntrinsicSize::FitContentLimit(limit.into()));
+        self
+    }
+
+    /// Sets the minimum width of the element to `min-content`.
+    fn min_w_min_content(mut self) -> Self {
+        self.style().intrinsic_widths.min_width = Some(IntrinsicSize::MinContent);
+        self
+    }
+
+    /// Sets the minimum width of the element to `max-content`.
+    fn min_w_max_content(mut self) -> Self {
+        self.style().intrinsic_widths.min_width = Some(IntrinsicSize::MaxContent);
+        self
+    }
+
+    /// Sets the minimum width of the element to `fit-content`.
+    fn min_w_fit_content(mut self) -> Self {
+        self.style().intrinsic_widths.min_width = Some(IntrinsicSize::FitContent);
+        self
+    }
+
+    /// Sets the minimum width of the element to `fit-content(<limit>)`.
+    fn min_w_fit_content_to(mut self, limit: impl Into<DefiniteLength>) -> Self {
+        self.style().intrinsic_widths.min_width =
+            Some(IntrinsicSize::FitContentLimit(limit.into()));
+        self
+    }
+
+    /// Sets the maximum width of the element to `min-content`.
+    fn max_w_min_content(mut self) -> Self {
+        self.style().intrinsic_widths.max_width = Some(IntrinsicSize::MinContent);
+        self
+    }
+
+    /// Sets the maximum width of the element to `max-content`.
+    fn max_w_max_content(mut self) -> Self {
+        self.style().intrinsic_widths.max_width = Some(IntrinsicSize::MaxContent);
+        self
+    }
+
+    /// Sets the maximum width of the element to `fit-content`.
+    fn max_w_fit_content(mut self) -> Self {
+        self.style().intrinsic_widths.max_width = Some(IntrinsicSize::FitContent);
+        self
+    }
+
+    /// Sets the maximum width of the element to `fit-content(<limit>)`.
+    fn max_w_fit_content_to(mut self, limit: impl Into<DefiniteLength>) -> Self {
+        self.style().intrinsic_widths.max_width =
+            Some(IntrinsicSize::FitContentLimit(limit.into()));
         self
     }
 
