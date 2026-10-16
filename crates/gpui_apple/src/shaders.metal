@@ -1623,14 +1623,24 @@ float ellipse_sdf(float2 position, float2 center, float2 radii) {
   return k1 > 0.0 ? k0 * (k0 - 1.0) / k1 : -min(radii.x, radii.y);
 }
 
+// A point whose x is above this separates two contours, each closed on its own. An edge between
+// them would be a seam of half coverage inside the shape.
+constant float CONTOUR_BREAK = 1e37;
+
 // Signed distance to a polygon: negative inside.
 float polygon_sdf(float2 position, constant float2 *points, uint count, bool even_odd) {
   float min_distance_squared = 1e20;
   int winding = 0;
   uint crossings = 0;
+  uint contour_start = 0;
   for (uint i = 0; i < count; i++) {
     float2 start = points[i];
-    float2 end = points[(i + 1) % count];
+    if (start.x > CONTOUR_BREAK) {
+      contour_start = i + 1;
+      continue;
+    }
+    bool last_of_contour = i + 1 == count || points[i + 1].x > CONTOUR_BREAK;
+    float2 end = last_of_contour ? points[contour_start] : points[i + 1];
     float2 edge = end - start;
     float2 to_point = position - start;
     float along = clamp(dot(to_point, edge) / max(dot(edge, edge), 1e-12), 0.0, 1.0);

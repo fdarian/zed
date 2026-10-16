@@ -331,12 +331,13 @@ pub enum ClipShape {
         /// The centre.
         center: BackgroundPosition,
     },
-    /// `polygon(fill-rule, points)`.
+    /// `polygon(fill-rule, points)`, and `path()`, whose subpaths are contours.
     Polygon {
         /// `evenodd` instead of the default `nonzero`.
         even_odd: bool,
-        /// The vertices, relative to the reference box.
-        points: Vec<(LengthPercentage, LengthPercentage)>,
+        /// The closed outlines, each a list of vertices relative to the reference box. The fill rule
+        /// applies to all of them together, so a contour inside another is a hole or not by it.
+        contours: Vec<Vec<(LengthPercentage, LengthPercentage)>>,
     },
 }
 
@@ -394,10 +395,10 @@ pub enum ResolvedClipPath {
         /// The radii.
         radii: Size<f32>,
     },
-    /// A polygon.
+    /// A polygon of one or more closed contours.
     Polygon {
-        /// The vertices.
-        points: Vec<Point<f32>>,
+        /// The vertices of each contour.
+        contours: Vec<Vec<Point<f32>>>,
         /// Whether the interior is by the even-odd rule instead of nonzero winding.
         even_odd: bool,
     },
@@ -506,14 +507,19 @@ impl ClipPath {
                     radii: size(to_device(rx.0), to_device(ry.0)),
                 }
             }
-            ClipShape::Polygon { even_odd, points } => ResolvedClipPath::Polygon {
-                points: points
+            ClipShape::Polygon { even_odd, contours } => ResolvedClipPath::Polygon {
+                contours: contours
                     .iter()
-                    .map(|(x, y)| {
-                        Point::new(
-                            to_device((bounds.origin.x + x.resolve(width)).0),
-                            to_device((bounds.origin.y + y.resolve(height)).0),
-                        )
+                    .map(|points| {
+                        points
+                            .iter()
+                            .map(|(x, y)| {
+                                Point::new(
+                                    to_device((bounds.origin.x + x.resolve(width)).0),
+                                    to_device((bounds.origin.y + y.resolve(height)).0),
+                                )
+                            })
+                            .collect()
                     })
                     .collect(),
                 even_odd: *even_odd,
@@ -562,8 +568,8 @@ impl ResolvedClipPath {
                 center.x += delta.x;
                 center.y += delta.y;
             }
-            ResolvedClipPath::Polygon { points, .. } => {
-                for vertex in points {
+            ResolvedClipPath::Polygon { contours, .. } => {
+                for vertex in contours.iter_mut().flatten() {
                     vertex.x += delta.x;
                     vertex.y += delta.y;
                 }
@@ -608,29 +614,32 @@ impl ResolvedClipPath {
                 let y = (position.y - center.y) / radii.height;
                 x * x + y * y <= 1.
             }
-            ResolvedClipPath::Polygon { points, even_odd } => {
-                polygon_contains(points, position, *even_odd)
+            ResolvedClipPath::Polygon { contours, even_odd } => {
+                polygon_contains(contours, position, *even_odd)
             }
         }
     }
 }
 
-/// The winding number of the polygon around a position, which is how `nonzero` fills.
-fn polygon_contains(points: &[Point<f32>], position: Point<f32>, even_odd: bool) -> bool {
+/// Whether the contours fill a position: by their summed winding number for `nonzero`, or by the
+/// parity of the edges a ray crosses for `evenodd`. Each contour is closed on its own.
+fn polygon_contains(contours: &[Vec<Point<f32>>], position: Point<f32>, even_odd: bool) -> bool {
     let mut winding = 0i32;
     let mut crossings = 0u32;
-    for (index, start) in points.iter().enumerate() {
-        let end = points[(index + 1) % points.len()];
-        let side = (end.x - start.x) * (position.y - start.y)
-            - (position.x - start.x) * (end.y - start.y);
-        if start.y <= position.y {
-            if end.y > position.y {
-                crossings += (side > 0.) as u32;
-                winding += (side > 0.) as i32;
+    for points in contours {
+        for (index, start) in points.iter().enumerate() {
+            let end = points[(index + 1) % points.len()];
+            let side = (end.x - start.x) * (position.y - start.y)
+                - (position.x - start.x) * (end.y - start.y);
+            if start.y <= position.y {
+                if end.y > position.y {
+                    crossings += (side > 0.) as u32;
+                    winding += (side > 0.) as i32;
+                }
+            } else if end.y <= position.y {
+                crossings += (side < 0.) as u32;
+                winding -= (side < 0.) as i32;
             }
-        } else if end.y <= position.y {
-            crossings += (side < 0.) as u32;
-            winding -= (side < 0.) as i32;
         }
     }
     if even_odd {
@@ -947,6 +956,7 @@ mod tests {
                 Point::new(50. + 50. * angle.cos(), 50. + 50. * angle.sin())
             })
             .collect();
+        let star = [star];
         let centre = Point::new(50., 50.);
         assert!(polygon_contains(&star, centre, false));
         assert!(!polygon_contains(&star, centre, true));
@@ -955,6 +965,39 @@ mod tests {
         assert!(polygon_contains(&star, arm, false));
         assert!(polygon_contains(&star, arm, true));
         assert!(!polygon_contains(&star, Point::new(2., 2.), false));
+    }
+
+    #[test]
+    fn contours_fill_together_under_the_fill_rule() {
+        let square = |left: f32, right: f32, clockwise: bool| {
+            let mut corners = vec![
+                Point::new(left, left),
+                Point::new(right, left),
+                Point::new(right, right),
+                Point::new(left, right),
+            ];
+            if !clockwise {
+                corners.reverse();
+            }
+            corners
+        };
+        let middle = Point::new(50., 50.);
+        let ring = Point::new(10., 50.);
+        // A square inside another is a hole by even-odd, and by nonzero only if it winds the other way.
+        let same_way = [square(0., 100., true), square(25., 75., true)];
+        assert!(polygon_contains(&same_way, middle, false));
+        assert!(!polygon_contains(&same_way, middle, true));
+        assert!(polygon_contains(&same_way, ring, false));
+        assert!(polygon_contains(&same_way, ring, true));
+        let opposite = [square(0., 100., true), square(25., 75., false)];
+        assert!(!polygon_contains(&opposite, middle, false));
+        assert!(!polygon_contains(&opposite, middle, true));
+        assert!(polygon_contains(&opposite, ring, false));
+        // A contour elsewhere closes on itself: nothing joins it to the first.
+        let apart = [square(0., 40., true), square(60., 100., true)];
+        assert!(polygon_contains(&apart, Point::new(80., 80.), false));
+        assert!(!polygon_contains(&apart, Point::new(50., 50.), false));
+        assert!(!polygon_contains(&apart, Point::new(50., 50.), true));
     }
 
     #[test]

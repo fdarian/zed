@@ -50,6 +50,9 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+/// Between the contours of a clip path polygon, so that `polygon_sdf` closes each on its own
+/// instead of drawing an edge from one to the next. Any x above the shader's `CONTOUR_BREAK`.
+const POLYGON_CONTOUR_BREAK: [f32; 2] = [f32::MAX, f32::MAX];
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -1705,11 +1708,18 @@ impl MetalRenderer {
                 params.group[2] = 2.;
                 params.clip_a = [center.x, center.y, radii.width.max(1e-3), radii.height.max(1e-3)];
             }
-            Some(ResolvedClipPath::Polygon { points, even_odd }) => {
+            Some(ResolvedClipPath::Polygon { contours, even_odd }) => {
+                let mut points: Vec<[f32; 2]> = Vec::new();
+                for contour in contours {
+                    if !points.is_empty() {
+                        points.push(POLYGON_CONTOUR_BREAK);
+                    }
+                    points.extend(contour.iter().map(|point| [point.x, point.y]));
+                }
                 params.group[2] = 3.;
                 params.group[3] = points.len() as f32;
                 params.misc[1] = *even_odd as u32 as f32;
-                polygon = Some(points.iter().map(|point| [point.x, point.y]).collect());
+                polygon = Some(points);
             }
         }
         (params, polygon)
@@ -3719,11 +3729,11 @@ mod tests {
     #[test]
     fn a_polygon_clip_path_follows_its_edges() {
         let triangle = gpui::ResolvedClipPath::Polygon {
-            points: vec![
+            contours: vec![vec![
                 gpui::Point::new(20., 4.),
                 gpui::Point::new(36., 36.),
                 gpui::Point::new(4., 36.),
-            ],
+            ]],
             even_odd: false,
         };
         let mut scene = groups_scene();
@@ -3741,6 +3751,37 @@ mod tests {
         assert!(is_cleared(&image, 6, 10));
         assert!(is_cleared(&image, 34, 10));
         assert!(is_cleared(&image, 20, 2));
+    }
+
+    #[test]
+    fn a_polygon_of_two_contours_has_a_hole_and_no_seam() {
+        let square = |from: f32, to: f32| {
+            vec![
+                gpui::Point::new(from, from),
+                gpui::Point::new(to, from),
+                gpui::Point::new(to, to),
+                gpui::Point::new(from, to),
+            ]
+        };
+        let ring = gpui::ResolvedClipPath::Polygon {
+            contours: vec![square(4., 36.), square(14., 26.)],
+            even_odd: true,
+        };
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                clip_path: Some(ring),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        let image = render(&mut scene);
+        assert_color(&image, 8, 20, [255, 0, 0]);
+        assert!(is_cleared(&image, 20, 20));
+        // Between the corners of the two squares: an edge joining them would halve the coverage here.
+        assert_color(&image, 9, 9, [255, 0, 0]);
+        assert_color(&image, 30, 30, [255, 0, 0]);
     }
 
     #[test]
