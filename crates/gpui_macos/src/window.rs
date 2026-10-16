@@ -2,6 +2,7 @@ use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
+    cursor_hide::{self, CursorHide},
     ns_string, renderer,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -95,6 +96,8 @@ const NSPopUpWindowLevel: NSInteger = 101;
 const NSTrackingMouseEnteredAndExited: NSUInteger = 0x01;
 #[allow(non_upper_case_globals)]
 const NSTrackingMouseMoved: NSUInteger = 0x02;
+#[allow(non_upper_case_globals)]
+const NSTrackingActiveInKeyWindow: NSUInteger = 0x20;
 #[allow(non_upper_case_globals)]
 const NSTrackingActiveAlways: NSUInteger = 0x80;
 #[allow(non_upper_case_globals)]
@@ -323,77 +326,9 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
     )
 }
 
-/// Whether we currently owe AppKit an `[NSCursor unhide]`. `hide` and `unhide` are counted by
-/// AppKit, so every call is gated on this flag to keep them balanced.
-static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
-
-/// Whether the active cursor style is `CursorStyle::None`.
-static CURSOR_STYLE_HIDES: AtomicBool = AtomicBool::new(false);
-
-/// Whether a window holds the pointer lock. The cursor stays hidden for as long as it does,
-/// whatever the cursor style says.
-static POINTER_LOCKED: AtomicBool = AtomicBool::new(false);
-
 unsafe extern "C" {
     // CoreGraphics; `connected` is a `boolean_t`. Returns a `CGError`.
     fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32;
-}
-
-/// Records whether the cursor style hides the cursor, and syncs AppKit.
-///
-/// # Safety
-///
-/// Must be called on the AppKit main thread.
-unsafe fn set_cursor_style_hides_cursor(hides: bool) {
-    CURSOR_STYLE_HIDES.store(hides, Ordering::Relaxed);
-    // SAFETY: The caller guarantees AppKit main-thread access.
-    unsafe { sync_cursor_hidden() };
-}
-
-/// Takes or releases the pointer lock: freezes the cursor in place and hides it.
-///
-/// # Safety
-///
-/// Must be called on the AppKit main thread.
-unsafe fn set_pointer_locked(locked: bool) {
-    if POINTER_LOCKED.swap(locked, Ordering::Relaxed) == locked {
-        return;
-    }
-    // SAFETY: The caller guarantees AppKit main-thread access.
-    unsafe {
-        CGAssociateMouseAndMouseCursorPosition(!locked as u32);
-        sync_cursor_hidden();
-    }
-}
-
-/// # Safety
-///
-/// Must be called on the AppKit main thread.
-unsafe fn sync_cursor_hidden() {
-    let hidden =
-        CURSOR_STYLE_HIDES.load(Ordering::Relaxed) || POINTER_LOCKED.load(Ordering::Relaxed);
-    // SAFETY: The caller guarantees AppKit main-thread access.
-    unsafe { set_cursor_hidden(hidden) };
-}
-
-/// Hides or restores the cursor. Idempotent. Callers go through `sync_cursor_hidden` so the
-/// cursor style and the pointer lock agree.
-///
-/// # Safety
-///
-/// Must be called on the AppKit main thread.
-unsafe fn set_cursor_hidden(hidden: bool) {
-    if CURSOR_HIDDEN.swap(hidden, Ordering::Relaxed) == hidden {
-        return;
-    }
-    // SAFETY: The caller guarantees AppKit main-thread access.
-    unsafe {
-        if hidden {
-            let _: () = msg_send![class!(NSCursor), hide];
-        } else {
-            let _: () = msg_send![class!(NSCursor), unhide];
-        }
-    }
 }
 
 /// Stores the cursor style on the active GPUI window and invalidates its cursor rects.
@@ -419,7 +354,6 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
         };
 
         let Some(active_window) = active_window else {
-            set_cursor_style_hides_cursor(false);
             return;
         };
 
@@ -432,7 +366,11 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
                 invalidateCursorRectsForView: window_state.native_view.as_ptr()
             ];
         }
-        set_cursor_style_hides_cursor(style == CursorStyle::None);
+        cursor_hide::apply(
+            window_state
+                .cursor_hide
+                .set_style_hides(style == CursorStyle::None),
+        );
     }
 }
 
@@ -669,6 +607,7 @@ struct MacWindowState {
     blurred_view: Option<id>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
+    cursor_hide: CursorHide,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
@@ -719,8 +658,18 @@ impl MacWindowState {
     fn release_pointer_lock(&mut self) {
         if std::mem::take(&mut self.pointer_locked) {
             // SAFETY: Window state is only touched from the AppKit main thread.
-            unsafe { set_pointer_locked(false) };
+            unsafe {
+                CGAssociateMouseAndMouseCursorPosition(true as u32);
+                cursor_hide::apply(self.cursor_hide.set_pointer_locked(false));
+            }
         }
+    }
+
+    /// Lets go of everything this window did to the cursor: the pointer lock and its hide.
+    fn release_cursor(&mut self) {
+        self.release_pointer_lock();
+        // SAFETY: Window state is only touched from the AppKit main thread.
+        unsafe { cursor_hide::apply(self.cursor_hide.release()) };
     }
 
     fn move_traffic_light(&mut self) {
@@ -1105,6 +1054,7 @@ impl MacWindow {
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
+                cursor_hide: CursorHide::new(),
                 cursor_visible,
                 frame_source: None,
                 renderer: renderer::new_renderer(
@@ -1215,6 +1165,19 @@ impl MacWindow {
                         native_window.setLevel_(NSNormalWindowLevel);
                     }
                     native_window.setAcceptsMouseMovedEvents_(YES);
+
+                    // Only the exit matters: it tells the window the pointer left, which
+                    // releases the cursor hide of `cursor: none`.
+                    let tracking_area: id = msg_send![class!(NSTrackingArea), alloc];
+                    let _: () = msg_send![
+                        tracking_area,
+                        initWithRect: NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.))
+                        options: NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
+                        owner: native_view
+                        userInfo: nil
+                    ];
+                    let _: () =
+                        msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
 
                     if let Some(tabbing_identifier) = tabbing_identifier {
                         let tabbing_id = ns_string(tabbing_identifier.as_str());
@@ -1906,7 +1869,10 @@ impl PlatformWindow for MacWindow {
         }
         lock.pointer_locked = true;
         // SAFETY: As above.
-        unsafe { set_pointer_locked(true) };
+        unsafe {
+            CGAssociateMouseAndMouseCursorPosition(false as u32);
+            cursor_hide::apply(lock.cursor_hide.set_pointer_locked(true));
+        }
         true
     }
 
@@ -2452,7 +2418,7 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
-            // Hidden through `set_cursor_hidden`; the rect still needs a valid cursor.
+            // Hidden through `CursorHide`; the rect still needs a valid cursor.
             CursorStyle::None => msg_send![class!(NSCursor), arrowCursor],
         };
 
@@ -2743,6 +2709,12 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
             lock.cursor_visible.store(true, Ordering::Relaxed);
         }
 
+        // The pointer is in this window for every event but an exit. A hide that the exit
+        // released is taken again by the next event, as the pointer is back.
+        let pointer_inside = !matches!(event, PlatformInput::MouseExited(_));
+        // SAFETY: AppKit delivers view events on the main thread.
+        unsafe { cursor_hide::apply(lock.cursor_hide.set_pointer_inside(pointer_inside)) };
+
         match &mut event {
             PlatformInput::MouseDown(
                 event @ MouseDownEvent {
@@ -2979,9 +2951,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
     if !is_active {
-        lock.release_pointer_lock();
-        // SAFETY: AppKit delivers window delegate callbacks on the main thread.
-        unsafe { set_cursor_style_hides_cursor(false) };
+        lock.release_cursor();
     }
 
     // When opening a pop-up while the application isn't active, Cocoa sends a spurious
@@ -3077,7 +3047,7 @@ extern "C" fn close_window(this: &Object, _: Sel) {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
             lock.closed.store(true, Ordering::Release);
-            lock.release_pointer_lock();
+            lock.release_cursor();
             (
                 lock.close_callback.take(),
                 lock.simple_fullscreen_state.take(),
@@ -3087,8 +3057,6 @@ extern "C" fn close_window(this: &Object, _: Sel) {
         if simple_fullscreen_state.is_some() {
             pop_simple_fullscreen_presentation_options();
         }
-
-        set_cursor_style_hides_cursor(false);
 
         if let Some(callback) = close_callback {
             callback();
