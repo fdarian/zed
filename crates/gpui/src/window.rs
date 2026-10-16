@@ -8,7 +8,7 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Escape, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragOperation, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
     Keystroke, KeystrokeEvent, LayoutId, LayoutInsets, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
@@ -1448,6 +1448,7 @@ pub struct Window {
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
+    drag_operation: Option<DragOperation>,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
     /// Buttons the platform reported down and not yet up. A move that reports no pressed button
@@ -2166,6 +2167,7 @@ impl Window {
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
+            drag_operation: None,
             mouse_position,
             mouse_hit_test: HitTest::default(),
             pressed_mouse_buttons: SmallVec::new(),
@@ -2233,6 +2235,9 @@ impl Window {
 pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
+    /// What the window picked for the files being dragged over it, if a handler picked one.
+    /// A platform that can tell the drag source answers with it.
+    pub drag_operation: Option<DragOperation>,
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -3301,6 +3306,13 @@ impl Window {
     /// parent elements from becoming focused on mouse down.
     pub fn prevent_default(&mut self) {
         self.default_prevented = true;
+    }
+
+    /// Picks what dropping the files being dragged over the window would do, for the event
+    /// currently being dispatched. The platform reports it to the drag source (the cursor
+    /// badge on macOS). Without a pick the platform keeps its own default.
+    pub fn set_drag_operation(&mut self, operation: DragOperation) {
+        self.drag_operation = Some(operation);
     }
 
     /// Obtain whether default has been prevented for the event currently being dispatched.
@@ -6492,6 +6504,7 @@ impl Window {
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
+        self.drag_operation = None;
 
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
@@ -6659,6 +6672,7 @@ impl Window {
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
+            drag_operation: self.drag_operation,
         }
     }
 
@@ -8515,7 +8529,7 @@ mod tests {
     use crate::util::FluentBuilder as _;
     use crate::{
         ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, ContentMask, Context,
-        DispatchTree, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
+        DispatchTree, DragMoveEvent, DragOperation, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
         FileDropEvent, FocusHandle, HitboxBehavior, InputEvent as _, InteractiveElement as _,
         IntoElement, Keymap, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, NativeKey, ParentElement, Pixels,
         Point, Render, RequestFrameOptions, ResolvedClipPath, StatefulInteractiveElement as _,
@@ -9268,6 +9282,70 @@ mod tests {
     /// When a focus listener moves focus again (e.g. a dock forwarding focus to its
     /// active panel), the resulting focus events must be dispatched without waiting
     /// for an unrelated redraw of the window.
+    struct DragOperationView {
+        operation: Rc<Cell<Option<DragOperation>>>,
+    }
+
+    impl Render for DragOperationView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let operation = self.operation.clone();
+            canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let operation = operation.clone();
+                    window.on_mouse_event(move |_: &MouseMoveEvent, _, window, _| {
+                        if let Some(operation) = operation.get() {
+                            window.set_drag_operation(operation);
+                        }
+                    });
+                },
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn a_file_drag_event_returns_the_operation_its_handler_picked(cx: &mut TestAppContext) {
+        let operation = Rc::new(Cell::new(None));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let operation = operation.clone();
+                move |_, _| DragOperationView { operation }
+            })
+            .into();
+        let position = point(px(10.), px(10.));
+        let paths = || ExternalPaths(["/tmp/a".into()].into_iter().collect());
+
+        let mut dispatch = |event: FileDropEvent| {
+            cx.update_window(window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.dispatch_event(event.to_platform_input(), cx)
+            })
+            .unwrap()
+        };
+
+        let entered = dispatch(FileDropEvent::Entered {
+            position,
+            paths: paths(),
+        });
+        assert_eq!(entered.drag_operation, None);
+
+        operation.set(Some(DragOperation::Move));
+        let pending = dispatch(FileDropEvent::Pending { position });
+        assert_eq!(pending.drag_operation, Some(DragOperation::Move));
+
+        operation.set(Some(DragOperation::None));
+        let refused = dispatch(FileDropEvent::Pending { position });
+        assert_eq!(refused.drag_operation, Some(DragOperation::None));
+
+        operation.set(None);
+        let unpicked = dispatch(FileDropEvent::Pending { position });
+        assert_eq!(
+            unpicked.drag_operation, None,
+            "a pick does not outlive its event"
+        );
+    }
+
     #[gpui::test]
     fn test_focus_moved_by_focus_listener_is_dispatched(cx: &mut TestAppContext) {
         let b_focus_count = Rc::new(Cell::new(0));

@@ -789,6 +789,20 @@ impl InputEvent for FileDropEvent {
 }
 impl MouseEvent for FileDropEvent {}
 
+/// What dropping files on a window would do, as the window tells the platform while files are
+/// dragged over it. See [`Window::set_drag_operation`](crate::Window::set_drag_operation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragOperation {
+    /// The drop is refused.
+    None,
+    /// The files are copied.
+    Copy,
+    /// The files are moved.
+    Move,
+    /// The files are linked.
+    Link,
+}
+
 /// An enum corresponding to all kinds of platform input events.
 #[derive(Clone, Debug)]
 pub enum PlatformInput {

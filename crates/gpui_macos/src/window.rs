@@ -26,7 +26,7 @@ use cocoa::{
 use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
+    ExternalPaths, DragOperation, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NativeKey,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
@@ -114,6 +114,8 @@ const NSDragOperationNone: NSDragOperation = 0;
 const NSDragOperationCopy: NSDragOperation = 1;
 #[allow(non_upper_case_globals)]
 const NSDragOperationMove: NSDragOperation = 16;
+#[allow(non_upper_case_globals)]
+const NSDragOperationLink: NSDragOperation = 2;
 const NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION: NSInteger = 0;
 const NSDRAGGING_CONTEXT_WITHIN_APPLICATION: NSInteger = 1;
 #[derive(PartialEq)]
@@ -3383,18 +3385,47 @@ fn is_drag_from_this_window(this: &Object, dragging_info: id) -> bool {
     std::ptr::eq(source as *const Object, this as *const Object)
 }
 
+/// The operation answered to the drag source. A window that picked one with
+/// `Window::set_drag_operation` decides, within what the source allows; otherwise the drag
+/// is copied, or moved when it started in this window.
+fn drag_operation_reply(
+    picked: Option<DragOperation>,
+    is_source_window: bool,
+    source_mask: NSDragOperation,
+) -> NSDragOperation {
+    let Some(picked) = picked else {
+        return if is_source_window {
+            NSDragOperationMove
+        } else {
+            NSDragOperationCopy
+        };
+    };
+    let wanted = match picked {
+        DragOperation::None => NSDragOperationNone,
+        DragOperation::Copy => NSDragOperationCopy,
+        DragOperation::Move => NSDragOperationMove,
+        DragOperation::Link => NSDragOperationLink,
+    };
+    wanted & source_mask
+}
+
+fn dragging_source_mask(dragging_info: id) -> NSDragOperation {
+    unsafe { msg_send![dragging_info, draggingSourceOperationMask] }
+}
+
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
     let is_source_window = is_drag_from_this_window(this, dragging_info);
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
     let paths = external_paths_from_event(dragging_info);
     if let Some(event) = paths.map(|paths| FileDropEvent::Entered { position, paths })
-        && send_file_drop_event(window_state, event)
+        && let Some(result) = send_file_drop_event(window_state, event)
     {
-        if is_source_window {
-            return NSDragOperationMove;
-        }
-        return NSDragOperationCopy;
+        return drag_operation_reply(
+            result.drag_operation,
+            is_source_window,
+            dragging_source_mask(dragging_info),
+        );
     }
     NSDragOperationNone
 }
@@ -3403,14 +3434,13 @@ extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDr
     let is_source_window = is_drag_from_this_window(this, dragging_info);
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
-    if send_file_drop_event(window_state, FileDropEvent::Pending { position }) {
-        if is_source_window {
-            NSDragOperationMove
-        } else {
-            NSDragOperationCopy
-        }
-    } else {
-        NSDragOperationNone
+    match send_file_drop_event(window_state, FileDropEvent::Pending { position }) {
+        Some(result) => drag_operation_reply(
+            result.drag_operation,
+            is_source_window,
+            dragging_source_mask(dragging_info),
+        ),
+        None => NSDragOperationNone,
     }
 }
 
@@ -3422,7 +3452,7 @@ extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {
 extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
-    send_file_drop_event(window_state, FileDropEvent::Submit { position }).to_objc()
+    send_file_drop_event(window_state, FileDropEvent::Submit { position }).is_some().to_objc()
 }
 
 fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths> {
@@ -3513,7 +3543,7 @@ async fn synthetic_drag(
 fn send_file_drop_event(
     window_state: Arc<Mutex<MacWindowState>>,
     file_drop_event: FileDropEvent,
-) -> bool {
+) -> Option<gpui::DispatchEventResult> {
     let external_files_dragged = match file_drop_event {
         FileDropEvent::Entered { .. } => Some(true),
         FileDropEvent::Exited | FileDropEvent::Ended => Some(false),
@@ -3523,15 +3553,15 @@ fn send_file_drop_event(
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.event_callback.take() {
         drop(lock);
-        callback(PlatformInput::FileDrop(file_drop_event));
+        let result = callback(PlatformInput::FileDrop(file_drop_event));
         let mut lock = window_state.lock();
         lock.event_callback = Some(callback);
         if let Some(external_files_dragged) = external_files_dragged {
             lock.external_files_dragged = external_files_dragged;
         }
-        true
+        Some(result)
     } else {
-        false
+        None
     }
 }
 
@@ -3726,5 +3756,43 @@ mod tests {
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(nil), None);
+    }
+
+    const EVERY_OPERATION: NSDragOperation =
+        NSDragOperationCopy | NSDragOperationLink | NSDragOperationMove;
+
+    #[test]
+    fn a_drag_nobody_picked_an_operation_for_is_copied_or_moved_within_the_window() {
+        assert_eq!(
+            drag_operation_reply(None, false, EVERY_OPERATION),
+            NSDragOperationCopy
+        );
+        assert_eq!(
+            drag_operation_reply(None, true, EVERY_OPERATION),
+            NSDragOperationMove
+        );
+        // The old answer did not depend on what the source allows.
+        assert_eq!(drag_operation_reply(None, false, 0), NSDragOperationCopy);
+    }
+
+    #[test]
+    fn a_picked_operation_is_answered_as_the_matching_ns_operation() {
+        let reply = |picked| drag_operation_reply(Some(picked), false, EVERY_OPERATION);
+        assert_eq!(reply(DragOperation::None), NSDragOperationNone);
+        assert_eq!(reply(DragOperation::Copy), NSDragOperationCopy);
+        assert_eq!(reply(DragOperation::Move), NSDragOperationMove);
+        assert_eq!(reply(DragOperation::Link), NSDragOperationLink);
+    }
+
+    #[test]
+    fn a_picked_operation_the_source_does_not_allow_refuses_the_drop() {
+        assert_eq!(
+            drag_operation_reply(Some(DragOperation::Move), false, NSDragOperationCopy),
+            NSDragOperationNone
+        );
+        assert_eq!(
+            drag_operation_reply(Some(DragOperation::Copy), true, NSDragOperationCopy),
+            NSDragOperationCopy
+        );
     }
 }
