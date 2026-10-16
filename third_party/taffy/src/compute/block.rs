@@ -549,9 +549,7 @@ fn compute_inner(
         known_dimensions.height.or(size.height.maybe_max(min_size.height)).or(min_size.height);
 
     // 3. Perform final item layout and return content height
-    let resolved_padding = raw_padding.resolve_or_zero(Some(container_outer_width), |val, basis| tree.calc(val, basis));
-    let resolved_border = raw_border.resolve_or_zero(Some(container_outer_width), |val, basis| tree.calc(val, basis));
-    let resolved_content_box_inset = resolved_padding + resolved_border + scrollbar_gutter;
+    let resolved_content_box_inset = padding + border + scrollbar_gutter;
     #[cfg_attr(not(feature = "content_size"), allow(unused_mut))]
     let (
         mut inflow_content_size,
@@ -567,7 +565,7 @@ fn compute_inner(
         container_percentage_resolution_height,
         content_box_inset,
         resolved_content_box_inset,
-        resolved_border,
+        border,
         text_align,
         direction,
         own_margins_collapse_with_children,
@@ -618,13 +616,13 @@ fn compute_inner(
                             Point {
                                 x: container_outer_width
                                     - (layout.location.x + layout.size.width)
-                                    - resolved_border.right,
-                                y: layout.location.y - resolved_border.top,
+                                    - border.right,
+                                y: layout.location.y - border.top,
                             }
                         } else {
                             Point {
-                                x: layout.location.x - resolved_border.left,
-                                y: layout.location.y - resolved_border.top,
+                                x: layout.location.x - border.left,
+                                y: layout.location.y - border.top,
                             }
                         };
                         inflow_content_size = inflow_content_size.f32_max(compute_content_size_contribution(
@@ -687,7 +685,7 @@ fn compute_inner(
     }
 
     // 4. Layout absolutely positioned children
-    let absolute_position_inset = resolved_border + scrollbar_gutter;
+    let absolute_position_inset = border + scrollbar_gutter;
     let absolute_position_area = final_outer_size - absolute_position_inset.sum_axes();
     let absolute_position_offset = Point { x: absolute_position_inset.left, y: absolute_position_inset.top };
     let absolute_content_size = perform_absolute_layout_on_absolute_children(
@@ -702,8 +700,8 @@ fn compute_inner(
     {
         // The container's own padding at the end of the content is part of its scrollable
         // overflow region, so it is included in the in-flow content size.
-        inflow_content_size.width += if direction.is_rtl() { resolved_padding.left } else { resolved_padding.right };
-        inflow_content_size.height += resolved_padding.bottom;
+        inflow_content_size.width += if direction.is_rtl() { padding.left } else { padding.right };
+        inflow_content_size.height += padding.bottom;
         output.content_size = inflow_content_size.f32_max(absolute_content_size);
     }
 

@@ -1279,6 +1279,22 @@ mod tests {
         }
 
         #[gpui::test]
+        fn a_block_containers_percentage_padding_is_of_its_parents_width(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, |width| {
+                div()
+                    .w(px(width))
+                    .child(
+                        div()
+                            .w(px(100.))
+                            .pl(calc(4., 0.1))
+                            .child(div().debug_selector(|| "inner".into()).w(px(10.)).h(px(10.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "inner").origin.x, px(4. + 20.));
+        }
+
+        #[gpui::test]
         fn margin_is_resolved_against_the_parents_width(cx: &mut TestAppContext) {
             let (parent, child) =
                 child_of_200px_parent(cx, |child| child.ml(calc(10., 0.05)).w(px(10.)).h(px(10.)));
