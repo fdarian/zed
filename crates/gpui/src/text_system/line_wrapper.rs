@@ -721,8 +721,8 @@ mod tests {
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
     use crate::{
-        OverflowWrap, TabSize, TextLayoutOptions, TextRun, WindowTextSystem, WrapBoundary,
-        WrappedLine, point,
+        OverflowWrap, TabSize, TextLayoutOptions, TextRun, WindowTextSystem, WordBreak,
+        WrapBoundary, WrappedLine, point,
     };
 
     fn build_wrapper() -> LineWrapper {
@@ -1961,6 +1961,7 @@ mod tests {
         tab_size: None,
         hang_trailing_spaces: true,
         break_spaces: false,
+        word_break: WordBreak::Normal,
         overflow_wrap: OverflowWrap::BreakWord,
     };
 
@@ -1969,6 +1970,7 @@ mod tests {
         tab_size: None,
         hang_trailing_spaces: false,
         break_spaces: true,
+        word_break: WordBreak::Normal,
         overflow_wrap: OverflowWrap::BreakWord,
     };
 
@@ -2314,6 +2316,93 @@ mod tests {
             assert!(Arc::ptr_eq(
                 &shape(None, Default::default()).layout,
                 &shape(None, overflowing(OverflowWrap::Normal)).layout
+            ));
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn word_breaking(word_break: WordBreak, overflow_wrap: OverflowWrap) -> TextLayoutOptions {
+        TextLayoutOptions {
+            word_break,
+            overflow_wrap,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_break_all_fills_the_line(cx: &mut TestAppContext) {
+        let width = spaces_wide(cx, 6.5);
+        let normal = word_breaking(WordBreak::Normal, OverflowWrap::Normal);
+        let text = TabbedText::shape_with(cx, "aaaa bbbb", Some(width), normal);
+        assert_eq!(text.line.layout.wrap_boundaries().len(), 1);
+        assert_columns(&text, &[(5, 5., 0), (6, 1., 1)]);
+        let all = word_breaking(WordBreak::BreakAll, OverflowWrap::Normal);
+        let text = TabbedText::shape_with(cx, "aaaa bbbb", Some(width), all);
+        // "aaaa b" fills the line and "bbb" is the next.
+        assert_eq!(text.line.layout.wrap_boundaries().len(), 1);
+        assert_columns(&text, &[(5, 5., 0), (7, 1., 1)]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_keep_all_keeps_cjk_together(cx: &mut TestAppContext) {
+        // Menlo has no CJK, so the characters come from a fallback font, each as
+        // wide as a space here: two of them fit in this and a third does not.
+        let width = px(25.);
+        let lines = |cx: &mut TestAppContext, options| {
+            TabbedText::shape_with(cx, "中中中中", Some(width), options)
+                .line
+                .layout
+                .wrap_boundaries()
+                .len()
+        };
+        let normal = word_breaking(WordBreak::Normal, OverflowWrap::Normal);
+        assert_eq!(lines(cx, normal), 1);
+        let kept = word_breaking(WordBreak::KeepAll, OverflowWrap::Normal);
+        assert_eq!(lines(cx, kept), 0);
+        // Unless the word is cut where it overflows.
+        let cut = word_breaking(WordBreak::KeepAll, OverflowWrap::BreakWord);
+        assert_eq!(lines(cx, cut), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_text_has_a_layout_for_each_word_break(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let shape = |wrap_width, options| {
+                let run = TextRun {
+                    len: 9,
+                    font: font("Menlo"),
+                    ..Default::default()
+                };
+                text_system
+                    .shape_text_with_options(
+                        "aaaa bbbb".into(),
+                        px(16.),
+                        &[run],
+                        wrap_width,
+                        None,
+                        options,
+                    )
+                    .unwrap()
+                    .remove(0)
+            };
+            let wrap_width = Some(px(40.));
+            let default = shape(wrap_width, Default::default());
+            for word_break in [WordBreak::BreakAll, WordBreak::KeepAll] {
+                let options = word_breaking(word_break, OverflowWrap::BreakWord);
+                assert!(!Arc::ptr_eq(
+                    &default.layout,
+                    &shape(wrap_width, options).layout
+                ));
+            }
+            // Without a wrap width there is nothing to break.
+            let all = word_breaking(WordBreak::BreakAll, OverflowWrap::BreakWord);
+            assert!(Arc::ptr_eq(
+                &shape(None, Default::default()).layout,
+                &shape(None, all).layout
             ));
         });
     }

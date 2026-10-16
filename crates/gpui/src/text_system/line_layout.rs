@@ -44,6 +44,21 @@ impl Hash for TabSize {
     }
 }
 
+/// Where a line may break between letters, as in CSS `word-break`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum WordBreak {
+    /// A line breaks after spaces, and before characters that are not part of a
+    /// word, such as CJK.
+    #[default]
+    Normal,
+    /// A line may also break between any two letters, so it is filled to the
+    /// edge even when a space earlier on it would do.
+    BreakAll,
+    /// There is no break between CJK characters, which then behave like the
+    /// letters of a word: only spaces and punctuation remain.
+    KeepAll,
+}
+
 /// Whether a word with no place to break on its line breaks anyway, as in CSS
 /// `overflow-wrap`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -77,6 +92,8 @@ pub struct TextLayoutOptions {
     /// of a line is measured and aligned like any other character. This
     /// overrides `hang_trailing_spaces`.
     pub break_spaces: bool,
+    /// Where a line may break between letters.
+    pub word_break: WordBreak,
     /// Whether a word that does not fit breaks anyway.
     pub overflow_wrap: OverflowWrap,
 }
@@ -87,6 +104,38 @@ impl TextLayoutOptions {
     fn spaces_hang(&self) -> bool {
         self.hang_trailing_spaces && !self.break_spaces
     }
+}
+
+/// Whether a line may break between `before` and `after`, two characters that
+/// are not both part of the same word, under `word-break: break-all`. Spaces
+/// are left to the other rules, and a break stays out of the places where UAX
+/// #14 never has one: before closing punctuation or a combining mark, after
+/// opening punctuation, and on either side of a non-breaking glue character.
+fn may_break_between(before: char, after: char) -> bool {
+    let glue = |c| matches!(c, '\u{00A0}' | '\u{202F}' | '\u{2011}');
+    let closing =
+        |c: char| "!?)]},.:;\"'”’»…".contains(c) || ('\u{0300}'..='\u{036F}').contains(&c);
+    let opening = |c| matches!(c, '(' | '[' | '{' | '“' | '‘' | '«');
+    before != ' ' && !glue(before) && !glue(after) && !closing(after) && !opening(before)
+}
+
+/// Whether the character is one of the CJK scripts or their punctuation, which
+/// `word-break: keep-all` keeps together.
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character,
+        '\u{1100}'..='\u{11FF}' // Hangul Jamo
+            | '\u{2E80}'..='\u{303F}' // CJK radicals, symbols and punctuation
+            | '\u{3040}'..='\u{30FF}' // Hiragana and Katakana
+            | '\u{3130}'..='\u{318F}' // Hangul Compatibility Jamo
+            | '\u{31F0}'..='\u{31FF}' // Katakana Phonetic Extensions
+            | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+            | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
+            | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+            | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
+            | '\u{20000}'..='\u{323AF}' // CJK Extensions B to H
+    )
 }
 
 /// Whether the character hangs at the end of a line.
@@ -305,6 +354,8 @@ impl LineLayout {
         tab_stop: Option<TabStopFor<'_>>,
     ) -> WrapComputation {
         let hang = options.spaces_hang();
+        let keep_all = options.word_break == WordBreak::KeepAll;
+        let break_all = options.word_break == WordBreak::BreakAll;
         let breaks_words = options.overflow_wrap != OverflowWrap::Normal;
         let mut boundaries = SmallVec::new();
         // The glyph each line starts at.
@@ -332,7 +383,7 @@ impl LineLayout {
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
+            if LineWrapper::is_word_char(ch) || (keep_all && is_cjk(ch)) {
                 if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
                     last_candidate_ix = Some(ix);
                 }
@@ -377,6 +428,14 @@ impl LineLayout {
             // starts the next line. Taken after the check above, so that the space
             // itself is measured against the breaks before it.
             if options.break_spaces && ch == ' ' {
+                last_candidate_ix = Some(ix + 1);
+            }
+            // Between letters the line may break, so the candidate is always the
+            // glyph that overflows, and the line is filled to the edge.
+            if break_all
+                && let Some(next) = positions.glyphs.get(ix + 1)
+                && may_break_between(ch, next.wrap_char)
+            {
                 last_candidate_ix = Some(ix + 1);
             }
             prev_ch = ch;
@@ -899,12 +958,17 @@ impl LineLayoutCache {
         // Text without a tab or a space is laid out the same whatever its tab size
         // or what happens to its spaces, so it must not take a cache entry of its
         // own. Hanging that break_spaces overrides is dropped for the same reason,
-        // and so is overflow_wrap when it has no wrap width.
+        // and so are the settings of where a line breaks when it has no wrap width.
         let has_spaces = text.as_ref().contains(hangs);
         let options = TextLayoutOptions {
             tab_size: options.tab_size.filter(|_| text.as_ref().contains('\t')),
             hang_trailing_spaces: options.spaces_hang() && has_spaces,
             break_spaces: options.break_spaces && has_spaces,
+            word_break: if wrap_width.is_some() {
+                options.word_break
+            } else {
+                WordBreak::default()
+            },
             overflow_wrap: if wrap_width.is_some() {
                 options.overflow_wrap
             } else {
@@ -2149,5 +2213,78 @@ mod tests {
         let computation =
             shaped.compute_wrap_boundaries(text, Some(px(35.)), Some(2), options, None);
         assert_eq!(computation.boundaries.len(), 1);
+    }
+
+    fn word_break_line(
+        text: &str,
+        wrap_width: f32,
+        word_break: WordBreak,
+        overflow_wrap: OverflowWrap,
+    ) -> WrappedLineLayout {
+        let options = TextLayoutOptions {
+            word_break,
+            overflow_wrap,
+            ..Default::default()
+        };
+        line_with_options(text, Some(wrap_width), options)
+    }
+
+    #[test]
+    fn test_the_default_word_break_is_normal() {
+        assert_eq!(WordBreak::default(), WordBreak::Normal);
+        let layout = word_break_line("aaaa bbbb", 65., WordBreak::Normal, OverflowWrap::BreakWord);
+        let default = line_with_options("aaaa bbbb", Some(65.), TextLayoutOptions::default());
+        assert_eq!(layout.wrap_boundaries, default.wrap_boundaries);
+    }
+
+    #[test]
+    fn test_break_all_fills_the_line_and_breaks_mid_word() {
+        let text = "aaaa bbbb";
+        // A space is a place to break, but the line holds one more letter.
+        let normal = word_break_line(text, 65., WordBreak::Normal, OverflowWrap::Normal);
+        assert_eq!(boundary_indices(&normal), vec![5]);
+        let all = word_break_line(text, 65., WordBreak::BreakAll, OverflowWrap::Normal);
+        assert_eq!(boundary_indices(&all), vec![6]);
+        // It breaks whatever overflow-wrap says.
+        let all = word_break_line("aaaaaaaa", 35., WordBreak::BreakAll, OverflowWrap::Normal);
+        assert_eq!(boundary_indices(&all), vec![3, 6]);
+    }
+
+    #[test]
+    fn test_break_all_leaves_glue_closing_punctuation_and_spaces_alone() {
+        // ")" cannot start a line, so "b)" moves down together.
+        let layout = word_break_line("ab)cd", 25., WordBreak::BreakAll, OverflowWrap::Normal);
+        assert_eq!(boundary_indices(&layout), vec![1, 3]);
+        // Nor can a line break next to a no-break space.
+        let glued = "aa\u{00A0}bb";
+        let layout = word_break_line(glued, 35., WordBreak::BreakAll, OverflowWrap::Normal);
+        assert_eq!(boundary_chars(&layout, glued), vec![1, 4]);
+        // And a space hangs where it overflows, as it does without break-all.
+        let options = TextLayoutOptions {
+            word_break: WordBreak::BreakAll,
+            overflow_wrap: OverflowWrap::Normal,
+            hang_trailing_spaces: true,
+            ..Default::default()
+        };
+        let layout = line_with_options("aaaa bbbb", Some(45.), options);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        assert_eq!(layout.hanging_widths.to_vec(), pixels(&[10., 0.]));
+    }
+
+    #[test]
+    fn test_keep_all_keeps_a_run_of_cjk_together() {
+        let text = "中中中中 中中";
+        let normal = word_break_line(text, 35., WordBreak::Normal, OverflowWrap::Normal);
+        assert_eq!(boundary_chars(&normal, text), vec![3, 6]);
+        let kept = word_break_line(text, 35., WordBreak::KeepAll, OverflowWrap::Normal);
+        // The word overflows, and the break is at the space after it.
+        assert_eq!(boundary_chars(&kept, text), vec![5]);
+        // The run still breaks at a space, and inside only if overflow-wrap says so.
+        let broken = word_break_line(text, 35., WordBreak::KeepAll, OverflowWrap::BreakWord);
+        assert_eq!(boundary_chars(&broken, text), vec![3, 5]);
+        // Punctuation that is not CJK is still a place to break.
+        let slash = "中中/中中";
+        let kept = word_break_line(slash, 35., WordBreak::KeepAll, OverflowWrap::Normal);
+        assert_eq!(boundary_chars(&kept, slash), vec![2]);
     }
 }
