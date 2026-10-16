@@ -55,6 +55,20 @@ pub struct TextLayoutOptions {
     /// never starts a line, and it is not counted when the line is aligned. Where
     /// a line wraps it hangs past the wrap width.
     pub hang_trailing_spaces: bool,
+    /// Whether a line may break after every space and tab, as with CSS
+    /// `white-space: break-spaces`. A space that does not fit starts the next line,
+    /// so a run of spaces breaks between any two of them, and a space at the end
+    /// of a line is measured and aligned like any other character. This
+    /// overrides `hang_trailing_spaces`.
+    pub break_spaces: bool,
+}
+
+impl TextLayoutOptions {
+    /// Whether the spaces at the end of a line hang. The one place that decides
+    /// how `hang_trailing_spaces` and `break_spaces` combine.
+    fn spaces_hang(&self) -> bool {
+        self.hang_trailing_spaces && !self.break_spaces
+    }
 }
 
 /// Whether the character hangs at the end of a line.
@@ -272,7 +286,7 @@ impl LineLayout {
         options: TextLayoutOptions,
         tab_stop: Option<TabStopFor<'_>>,
     ) -> WrapComputation {
-        let hang = options.hang_trailing_spaces;
+        let hang = options.spaces_hang();
         let mut boundaries = SmallVec::new();
         // The glyph each line starts at.
         let mut line_starts: SmallVec<[usize; 2]> = SmallVec::new();
@@ -285,7 +299,7 @@ impl LineLayout {
         };
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
-        let mut positions = GlyphPositions::new(self, text, tab_stop, hang);
+        let mut positions = GlyphPositions::new(self, text, tab_stop, options);
         let mut placed = 0;
 
         for ix in 0..positions.glyphs.len() {
@@ -336,6 +350,12 @@ impl LineLayout {
                 for moved_ix in line_start_ix + 1..=ix + 1 {
                     positions.place(moved_ix, last_boundary_x);
                 }
+            }
+            // After a space the line may break, and a space that does not fit then
+            // starts the next line. Taken after the check above, so that the space
+            // itself is measured against the breaks before it.
+            if options.break_spaces && ch == ' ' {
+                last_candidate_ix = Some(ix + 1);
             }
             prev_ch = ch;
         }
@@ -421,7 +441,13 @@ struct TabbedPositions<'a> {
 }
 
 impl<'a> GlyphPositions<'a> {
-    fn new(layout: &LineLayout, text: &str, tab_stop: Option<TabStopFor<'a>>, hang: bool) -> Self {
+    fn new(
+        layout: &LineLayout,
+        text: &str,
+        tab_stop: Option<TabStopFor<'a>>,
+        options: TextLayoutOptions,
+    ) -> Self {
+        let tab_is_space = tab_stop.is_some() || options.spaces_hang() || options.break_spaces;
         let glyphs: Vec<WrapGlyph> = layout
             .runs
             .iter()
@@ -433,7 +459,7 @@ impl<'a> GlyphPositions<'a> {
                         boundary: WrapBoundary { run_ix, glyph_ix },
                         // A tab is white space that may break, like the space it is
                         // when the text is not laid out with tab stops.
-                        wrap_char: if (tab_stop.is_some() || hang) && character == '\t' {
+                        wrap_char: if tab_is_space && character == '\t' {
                             ' '
                         } else {
                             character
@@ -849,10 +875,13 @@ impl LineLayoutCache {
         SharedString: From<Text>,
     {
         // Text without a tab or a space is laid out the same whatever its tab size
-        // or hanging, so it must not take a cache entry of its own.
+        // or what happens to its spaces, so it must not take a cache entry of its
+        // own. Hanging that break_spaces overrides is dropped for the same reason.
+        let has_spaces = text.as_ref().contains(hangs);
         let options = TextLayoutOptions {
             tab_size: options.tab_size.filter(|_| text.as_ref().contains('\t')),
-            hang_trailing_spaces: options.hang_trailing_spaces && text.as_ref().contains(hangs),
+            hang_trailing_spaces: options.spaces_hang() && has_spaces,
+            break_spaces: options.break_spaces && has_spaces,
         };
         let key = &CacheKeyRef {
             text: text.as_ref(),
@@ -1703,11 +1732,21 @@ mod tests {
     /// `text` as ten pixel wide characters, wrapped at `wrap_width`, with the
     /// spaces at the end of a line hanging or not.
     fn hanging_line(text: &str, wrap_width: Option<f32>, hang: bool) -> WrappedLineLayout {
-        let shaped = monospace_layout(text, 10.);
         let options = TextLayoutOptions {
             hang_trailing_spaces: hang,
             ..Default::default()
         };
+        line_with_options(text, wrap_width, options)
+    }
+
+    /// `text` as ten pixel wide characters, wrapped at `wrap_width` and laid out
+    /// as `options` say.
+    fn line_with_options(
+        text: &str,
+        wrap_width: Option<f32>,
+        options: TextLayoutOptions,
+    ) -> WrappedLineLayout {
+        let shaped = monospace_layout(text, 10.);
         let computation =
             shaped.compute_wrap_boundaries(text, wrap_width.map(px), None, options, None);
         WrappedLineLayout {
@@ -1860,6 +1899,119 @@ mod tests {
         assert_eq!(
             layout.index_for_position(point(px(5.), px(20.)), line_height),
             Ok(5)
+        );
+    }
+
+    fn breaking_line(text: &str, wrap_width: Option<f32>) -> WrappedLineLayout {
+        let options = TextLayoutOptions {
+            break_spaces: true,
+            ..Default::default()
+        };
+        line_with_options(text, wrap_width, options)
+    }
+
+    #[test]
+    fn test_a_space_that_does_not_fit_starts_the_next_line() {
+        // "a bb " is 50 wide and the second of the three spaces ends at 60, in 55.
+        let layout = breaking_line("a bb   c", Some(55.));
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        // Without it the spaces stay with the word before them, which moves down.
+        let layout = hanging_line("a bb   c", Some(55.), false);
+        assert_eq!(boundary_indices(&layout), vec![2, 7]);
+    }
+
+    #[test]
+    fn test_a_run_of_spaces_breaks_between_any_two() {
+        let text = "a        b";
+        let layout = breaking_line(text, Some(35.));
+        assert_eq!(boundary_indices(&layout), vec![3, 6, 9]);
+        // The characters after the boundary ones, which also end the line above.
+        let columns = columns(&layout, text);
+        assert_eq!(columns[4], (10., 1));
+        assert_eq!(columns[7], (10., 2));
+    }
+
+    #[test]
+    fn test_a_line_of_only_spaces_wraps() {
+        let layout = breaking_line("          ", Some(30.));
+        assert_eq!(boundary_indices(&layout), vec![3, 6, 9]);
+        assert!(layout.hanging_widths.is_empty());
+    }
+
+    #[test]
+    fn test_spaces_break_after_leading_spaces_too() {
+        let layout = breaking_line("   aaaa", Some(55.));
+        assert_eq!(boundary_indices(&layout), vec![3]);
+        // Otherwise the word has no earlier opportunity, and breaks inside.
+        let layout = hanging_line("   aaaa", Some(55.), false);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+    }
+
+    #[test]
+    fn test_spaces_that_break_are_measured_at_the_end_of_a_line() {
+        let layout = breaking_line("aaa  ", Some(100.));
+        assert!(layout.wrap_boundaries.is_empty());
+        assert!(layout.hanging_widths.is_empty());
+        assert_eq!(layout.width(), px(50.));
+        // A space past the edge wraps instead of hanging over it.
+        let layout = breaking_line("aaa    bbb", Some(45.));
+        assert_eq!(boundary_indices(&layout), vec![4, 7]);
+        assert!(layout.hanging_widths.is_empty());
+    }
+
+    #[test]
+    fn test_a_word_that_does_not_fit_still_breaks_inside_when_spaces_break() {
+        let layout = breaking_line("ab cdefghijkl", Some(50.));
+        // "ab " then "cdefg" then "hijkl".
+        assert_eq!(boundary_indices(&layout), vec![3, 8]);
+    }
+
+    #[test]
+    fn test_a_tab_breaks_like_a_space_when_spaces_break() {
+        let text = "aaaa\tbb";
+        let shaped = monospace_layout(text, 10.);
+        let tab_stop = |_: FontId| Some(px(40.));
+        let options = TextLayoutOptions {
+            break_spaces: true,
+            ..Default::default()
+        };
+        let broken =
+            shaped.compute_wrap_boundaries(text, Some(px(50.)), None, options, Some(&tab_stop));
+        // The tab ends at 80, past the line, so it begins the next one, and
+        // neither line hangs it.
+        assert_eq!(broken.boundaries.len(), 2);
+        assert!(broken.hanging_widths.is_empty());
+        let tab_after = line_with_options("aa\tbbbb", Some(45.), options);
+        assert_eq!(boundary_indices(&tab_after), vec![3]);
+    }
+
+    #[test]
+    fn test_breaking_spaces_changes_nothing_in_text_without_spaces() {
+        for text in ["aaaabbbbcc", "aaaa-bbbb-cc"] {
+            let plain = hanging_line(text, Some(45.), false);
+            let breaking = breaking_line(text, Some(45.));
+            assert_eq!(plain.wrap_boundaries, breaking.wrap_boundaries, "{text}");
+        }
+    }
+
+    #[test]
+    fn test_breaking_spaces_overrides_hanging_them() {
+        let options = TextLayoutOptions {
+            hang_trailing_spaces: true,
+            break_spaces: true,
+            ..Default::default()
+        };
+        assert!(!options.spaces_hang());
+        let both = line_with_options("aaaa bbbb", Some(45.), options);
+        let breaking = breaking_line("aaaa bbbb", Some(45.));
+        assert_eq!(both.wrap_boundaries, breaking.wrap_boundaries);
+        assert!(both.hanging_widths.is_empty());
+        assert!(
+            TextLayoutOptions {
+                hang_trailing_spaces: true,
+                ..Default::default()
+            }
+            .spaces_hang()
         );
     }
 }

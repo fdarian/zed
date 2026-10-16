@@ -626,6 +626,10 @@ pub struct TextStyle {
     /// Whether the spaces and tabs at the end of a line hang, as in CSS: they
     /// are not measured to see whether the line fits, nor when it is aligned.
     pub hang_trailing_spaces: bool,
+
+    /// Whether a line may break after every space and tab, and spaces never hang,
+    /// as in CSS `white-space: break-spaces`. Overrides `hang_trailing_spaces`.
+    pub break_spaces: bool,
 }
 
 impl Default for TextStyle {
@@ -649,6 +653,7 @@ impl Default for TextStyle {
             line_clamp: None,
             tab_size: None,
             hang_trailing_spaces: false,
+            break_spaces: false,
         }
     }
 }
@@ -692,6 +697,7 @@ impl TextStyle {
         TextLayoutOptions {
             tab_size: self.tab_size,
             hang_trailing_spaces: self.hang_trailing_spaces,
+            break_spaces: self.break_spaces,
         }
     }
 
