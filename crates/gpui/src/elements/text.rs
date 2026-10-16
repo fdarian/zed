@@ -272,7 +272,7 @@ impl Element for &'static str {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(SharedString::from(*self), None, Vec::new(), window, cx);
+        let layout_id = state.layout(SharedString::from(*self), None, Rc::new(no_insets), window, cx);
         (layout_id, state)
     }
 
@@ -346,7 +346,7 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, Vec::new(), window, cx);
+        let layout_id = state.layout(self.clone(), None, Rc::new(no_insets), window, cx);
         (layout_id, state)
     }
 
@@ -394,8 +394,16 @@ pub struct StyledText {
     runs: Option<Vec<TextRun>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
-    insets: Vec<TextInset>,
+    insets: InsetsForWidth,
     layout: TextLayout,
+}
+
+/// The insets of a text for the width it is laid out in: `None` while the width is
+/// not known, as in an intrinsic size. See [`StyledText::with_insets_for_width`].
+pub type InsetsForWidth = Rc<dyn Fn(Option<Pixels>) -> Vec<TextInset>>;
+
+fn no_insets(_: Option<Pixels>) -> Vec<TextInset> {
+    Vec::new()
 }
 
 impl StyledText {
@@ -406,7 +414,7 @@ impl StyledText {
             runs: None,
             delayed_highlights: None,
             delayed_font_family_overrides: None,
-            insets: Vec::new(),
+            insets: Rc::new(no_insets),
             layout: TextLayout::default(),
         }
     }
@@ -544,7 +552,18 @@ impl StyledText {
     /// Adds the advance of `insets` around ranges of the text, as the padding,
     /// border and margin of an inline box would. See [`TextInset`].
     pub fn with_insets(mut self, insets: Vec<TextInset>) -> Self {
-        self.insets = insets;
+        self.insets = Rc::new(move |_| insets.clone());
+        self
+    }
+
+    /// Like [`Self::with_insets`], for insets that depend on the width the text is laid
+    /// out in, such as a padding in percent of it. `insets` is called each time the text
+    /// is measured, with the width it is measured at, or `None` when it has no width yet.
+    pub fn with_insets_for_width(
+        mut self,
+        insets: impl Fn(Option<Pixels>) -> Vec<TextInset> + 'static,
+    ) -> Self {
+        self.insets = Rc::new(insets);
         self
     }
 }
@@ -581,7 +600,7 @@ impl Element for StyledText {
             Self::apply_font_family_overrides(runs, overrides);
         }
 
-        let insets = mem::take(&mut self.insets);
+        let insets = mem::replace(&mut self.insets, Rc::new(no_insets));
         let layout_id = self
             .layout
             .layout(self.text.clone(), runs, insets, window, cx);
@@ -632,6 +651,8 @@ struct TextLayoutInner {
     line_height: Pixels,
     wrap_width: Option<Pixels>,
     truncate_width: Option<Pixels>,
+    /// The width the insets were asked for.
+    inset_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
@@ -641,7 +662,7 @@ impl TextLayout {
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
-        insets: Vec<TextInset>,
+        insets: InsetsForWidth,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -666,6 +687,7 @@ impl TextLayout {
                     crate::AvailableSpace::Definite(x) => Some(x),
                     _ => None,
                 });
+                let insets = insets(width);
                 let unmeasurable = |wrap_width, truncate_width| {
                     element_state.0.borrow_mut().replace(TextLayoutInner {
                         lines: Default::default(),
@@ -673,6 +695,7 @@ impl TextLayout {
                         line_height,
                         wrap_width,
                         truncate_width,
+                        inset_width: width,
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -720,6 +743,7 @@ impl TextLayout {
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
                     && wrap_width == text_layout.wrap_width
+                    && width == text_layout.inset_width
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
                 {
@@ -837,6 +861,7 @@ impl TextLayout {
                     line_height,
                     wrap_width,
                     truncate_width,
+                    inset_width: width,
                     size: Some(size),
                     bounds: None,
                 });
@@ -978,6 +1003,16 @@ impl TextLayout {
         }
 
         None
+    }
+
+    /// The width the insets of [`StyledText::with_insets_for_width`] were asked for in
+    /// the last measure: the one the text was laid out in, or `None` while it had none.
+    pub fn inset_width(&self) -> Option<Pixels> {
+        self.0
+            .borrow()
+            .as_ref()
+            .expect("measurement has not been performed")
+            .inset_width
     }
 
     /// The insets of the glyph that starts at the byte `index` of the text, summed
@@ -1775,6 +1810,65 @@ mod tests {
             let end_shift = inset.layout.position_for_index(3).unwrap().x
                 - plain.layout.position_for_index(3).unwrap().x;
             assert!((f32::from(end_shift) - 10.).abs() < 0.01);
+        }
+
+        struct WidthInsetText {
+            width: Option<Pixels>,
+            asked: Rc<RefCell<Vec<Option<Pixels>>>>,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for WidthInsetText {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let asked = self.asked.clone();
+                let text = StyledText::new(TEXT).with_insets_for_width(move |width| {
+                    asked.borrow_mut().push(width);
+                    // A tenth of the width in front of "bc".
+                    vec![inset(1..3, width.map_or(0., |width| width.0 / 10.), 0.)]
+                });
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let container = div().text_size(px(16.));
+                match self.width {
+                    Some(width) => container.w(width),
+                    // A flex item is measured for its content before it gets a width.
+                    None => container.flex(),
+                }
+                .child(text)
+            }
+        }
+
+        #[test]
+        fn insets_are_asked_for_the_width_the_text_is_laid_out_in() {
+            let layout_in = |width: Option<Pixels>| {
+                let mut app =
+                    TestApp::with_text_system(Arc::new(Rasterizing(NoopTextSystem::new())));
+                let layout = Rc::new(RefCell::new(None));
+                let asked = Rc::new(RefCell::new(Vec::new()));
+                let mut window = app.open_window({
+                    let (layout, asked) = (layout.clone(), asked.clone());
+                    move |_, _| WidthInsetText {
+                        width,
+                        asked,
+                        layout,
+                    }
+                });
+                window.draw();
+                let layout = layout.borrow().clone().unwrap();
+                let asked = asked.borrow().clone();
+                (layout, asked)
+            };
+
+            let (layout, asked) = layout_in(Some(px(200.)));
+            assert_eq!(layout.inset_width(), Some(px(200.)));
+            assert!(asked.contains(&Some(px(200.))), "{asked:?}");
+            assert_eq!(layout.insets_at(1).unwrap().leading, px(20.));
+
+            // Measured for its content, a text has no width to give the insets, and the
+            // layout it keeps is the one for the width it was finally given.
+            let (layout, asked) = layout_in(None);
+            assert!(asked.contains(&None), "{asked:?}");
+            let width = layout.inset_width().expect("the final measure has a width");
+            assert_eq!(layout.insets_at(1).unwrap().leading, px(width.0 / 10.));
         }
 
         #[test]
