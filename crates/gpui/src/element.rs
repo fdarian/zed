@@ -36,11 +36,14 @@ use crate::{
     DispatchNodeId, ElementId, FocusHandle, InspectorElementId, IsZero, LayoutId, Pixels, Point,
     SharedString, Size, Style, Visibility, Window, util::FluentBuilder, window::with_element_arena,
 };
-use derive_more::{Deref, DerefMut};
+use collections::FxHasher;
 use std::{
     any::Any,
     fmt::{self, Debug, Display},
-    mem, panic,
+    hash::{Hash, Hasher},
+    mem,
+    ops::Deref,
+    panic,
     sync::Arc,
 };
 
@@ -228,12 +231,57 @@ pub trait ParentElement {
 }
 
 /// A globally unique identifier for an element, used to track state across frames.
-#[derive(Deref, DerefMut, Clone, Default, Debug, Eq, PartialEq, Hash)]
-pub struct GlobalElementId(pub(crate) Arc<[ElementId]>);
+///
+/// Element state maps look a `GlobalElementId` up several times per element per frame, so the hash of
+/// the id path is computed once at construction and every later hash just replays it.
+#[derive(Clone, Debug)]
+pub struct GlobalElementId {
+    pub(crate) ids: Arc<[ElementId]>,
+    hash: u64,
+}
+
+impl GlobalElementId {
+    pub(crate) fn new(ids: &[ElementId]) -> Self {
+        let mut hasher = FxHasher::default();
+        ids.hash(&mut hasher);
+        Self {
+            ids: Arc::from(ids),
+            hash: hasher.finish(),
+        }
+    }
+}
+
+impl Default for GlobalElementId {
+    fn default() -> Self {
+        Self::new(&[])
+    }
+}
+
+impl Deref for GlobalElementId {
+    type Target = Arc<[ElementId]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ids
+    }
+}
+
+impl PartialEq for GlobalElementId {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && (Arc::ptr_eq(&self.ids, &other.ids) || self.ids == other.ids)
+    }
+}
+
+impl Eq for GlobalElementId {}
+
+impl Hash for GlobalElementId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
 
 impl Display for GlobalElementId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, element_id) in self.0.iter().enumerate() {
+        for (i, element_id) in self.ids.iter().enumerate() {
             if i > 0 {
                 write!(f, ".")?;
             }
@@ -245,9 +293,8 @@ impl Display for GlobalElementId {
 
 impl GlobalElementId {
     pub(crate) fn accesskit_node_id(&self) -> accesskit::NodeId {
-        use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::default();
-        self.hash(&mut hasher);
+        self.ids.hash(&mut hasher);
         accesskit::NodeId(hasher.finish())
     }
 }
@@ -318,7 +365,7 @@ impl<E: Element> Drawable<E> {
             ElementDrawPhase::Start => {
                 let global_id = self.element.id().map(|element_id| {
                     window.element_id_stack.push(element_id);
-                    GlobalElementId(Arc::from(&*window.element_id_stack))
+                    GlobalElementId::new(&window.element_id_stack)
                 });
 
                 let inspector_id;
@@ -326,7 +373,7 @@ impl<E: Element> Drawable<E> {
                 {
                     inspector_id = self.element.source_location().map(|source| {
                         let path = crate::InspectorElementPath {
-                            global_id: GlobalElementId(Arc::from(&*window.element_id_stack)),
+                            global_id: GlobalElementId::new(&window.element_id_stack),
                             source_location: source,
                         };
                         window.build_inspector_element_id(path)
@@ -377,7 +424,7 @@ impl<E: Element> Drawable<E> {
             } => {
                 if let Some(element_id) = self.element.id() {
                     window.element_id_stack.push(element_id);
-                    debug_assert_eq!(&*global_id.as_ref().unwrap().0, &*window.element_id_stack);
+                    debug_assert_eq!(&*global_id.as_ref().unwrap().ids, &*window.element_id_stack);
                 }
 
                 let mut bounds = window.layout_bounds(layout_id);
@@ -426,7 +473,7 @@ impl<E: Element> Drawable<E> {
                                     crate::window::a11y::debug::NodeDebugInfo {
                                         synthetic: false,
                                         view,
-                                        element_id: global_id.0.last().map(|id| format!("{id:?}")),
+                                        element_id: global_id.ids.last().map(|id| format!("{id:?}")),
                                         source_location,
                                     },
                                 );
@@ -458,7 +505,7 @@ impl<E: Element> Drawable<E> {
                                 .view_type_names
                                 .get(&window.current_view())
                                 .copied(),
-                            element_id: global_id.0.last().map(|id| format!("{id:?}")),
+                            element_id: global_id.ids.last().map(|id| format!("{id:?}")),
                             source_location: self.element.source_location(),
                         };
                         let mut builder = A11ySubtreeBuilder::new(
@@ -509,7 +556,7 @@ impl<E: Element> Drawable<E> {
             } => {
                 if let Some(element_id) = self.element.id() {
                     window.element_id_stack.push(element_id);
-                    debug_assert_eq!(&*global_id.as_ref().unwrap().0, &*window.element_id_stack);
+                    debug_assert_eq!(&*global_id.as_ref().unwrap().ids, &*window.element_id_stack);
                 }
 
                 window.next_frame.dispatch_tree.set_active_node(node_id);
@@ -826,5 +873,143 @@ impl Element for Empty {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+
+    use super::*;
+    use crate::{
+        AppContext as _, Context, IntoElement, Render, Styled as _, TestAppContext, canvas, div,
+    };
+
+    fn path(names: &[&'static str]) -> Vec<ElementId> {
+        names.iter().map(|name| ElementId::from(*name)).collect()
+    }
+
+    fn hash_of(id: &GlobalElementId) -> u64 {
+        let mut hasher = FxHasher::default();
+        id.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn global_ids_of_the_same_path_are_equal_and_hash_alike() {
+        let a = GlobalElementId::new(&path(&["root", "list", "row"]));
+        let b = GlobalElementId::new(&path(&["root", "list", "row"]));
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn global_ids_of_different_paths_differ() {
+        let id = GlobalElementId::new(&path(&["a", "b"]));
+        for other in [
+            path(&["b", "a"]),
+            path(&["a"]),
+            path(&["a", "b", "c"]),
+            path(&["a", "c"]),
+            path(&[]),
+        ] {
+            assert_ne!(id, GlobalElementId::new(&other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn global_ids_with_a_colliding_hash_still_compare_their_paths() {
+        let a = GlobalElementId::new(&path(&["a"]));
+        let b = GlobalElementId {
+            ids: Arc::from(path(&["b"])),
+            hash: a.hash,
+        };
+        assert_eq!(hash_of(&a), hash_of(&b));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn the_default_global_id_is_the_empty_path() {
+        assert_eq!(GlobalElementId::default(), GlobalElementId::new(&[]));
+    }
+
+    type Counts = Rc<RefCell<HashMap<String, Vec<usize>>>>;
+
+    struct CountsStatePerPath {
+        paths: Vec<Vec<&'static str>>,
+        counts: Counts,
+    }
+
+    impl Render for CountsStatePerPath {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paths = self.paths.clone();
+            let counts = self.counts.clone();
+            div().size_full().child(canvas(
+                move |_, window, _| {
+                    for path in &paths {
+                        touch_state(window, path, path, &counts);
+                    }
+                },
+                |_, _, _, _| {},
+            ))
+        }
+    }
+
+    // Each visit increments the element state stored at the path and records the value it saw.
+    fn touch_state(
+        window: &mut Window,
+        full: &[&'static str],
+        rest: &[&'static str],
+        counts: &Counts,
+    ) {
+        match rest.split_first() {
+            Some((last, [])) => window.with_global_id(ElementId::from(*last), |id, window| {
+                window.with_element_state::<usize, _>(id, |state, _| {
+                    let next = state.map_or(1, |state| state + 1);
+                    counts
+                        .borrow_mut()
+                        .entry(full.join("."))
+                        .or_default()
+                        .push(next);
+                    ((), next)
+                })
+            }),
+            Some((first, rest)) => window.with_id(ElementId::from(*first), |window| {
+                touch_state(window, full, rest, counts)
+            }),
+            None => unreachable!(),
+        }
+    }
+
+    fn draw_frames(paths: Vec<Vec<&'static str>>, frames: usize) -> HashMap<String, Vec<usize>> {
+        let mut cx = TestAppContext::single();
+        let counts = Counts::default();
+        let window = cx.add_window({
+            let counts = counts.clone();
+            move |_, _| CountsStatePerPath { paths, counts }
+        });
+        for _ in 1..frames {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
+        let counts = counts.borrow().clone();
+        counts
+    }
+
+    #[test]
+    fn element_state_follows_its_path_across_frames() {
+        let counts = draw_frames(
+            vec![vec!["a", "b"], vec!["a", "c"], vec!["b", "a"], vec!["a"]],
+            3,
+        );
+        for path in ["a.b", "a.c", "b.a", "a"] {
+            assert_eq!(counts[path], vec![1, 2, 3], "{path}");
+        }
+    }
+
+    #[test]
+    fn element_state_of_a_repeated_path_continues_within_the_frame() {
+        let counts = draw_frames(vec![vec!["a", "b"], vec!["a", "b"]], 2);
+        assert_eq!(counts["a.b"], vec![1, 2, 3, 4]);
     }
 }

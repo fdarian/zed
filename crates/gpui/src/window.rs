@@ -3063,7 +3063,7 @@ impl Window {
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
         self.with_id(element_id, |this| {
-            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
+            let global_id = GlobalElementId::new(&this.element_id_stack);
 
             f(&global_id, this)
         })
@@ -5617,7 +5617,7 @@ impl Window {
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let identity = (!self.element_id_stack.is_empty())
-            .then(|| GlobalElementId(Arc::from(&*self.element_id_stack)));
+            .then(|| GlobalElementId::new(&self.element_id_stack));
         if identity.is_some() && self.captured_identity == identity {
             self.captured_hitbox = Some(id);
         }
