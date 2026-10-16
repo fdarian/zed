@@ -979,7 +979,12 @@ impl RatePredictionsModal {
                                             right: Some(Length::Definite(px(0.).into())),
                                             bottom: Some(Length::Definite(px(12.).into())),
                                         },
-                                        border_style: Some(BorderStyle::Solid),
+                                        border_styles: EdgesRefinement {
+                                            top: Some(BorderStyle::Solid),
+                                            right: Some(BorderStyle::Solid),
+                                            bottom: Some(BorderStyle::Solid),
+                                            left: Some(BorderStyle::Solid),
+                                        },
                                         border_widths: EdgesRefinement {
                                             top: Some(AbsoluteLength::Pixels(px(1.))),
                                             left: Some(AbsoluteLength::Pixels(px(1.))),

@@ -355,8 +355,9 @@ pub struct Style {
     #[refineable]
     pub border_colors: Edges<Hsla>,
 
-    /// The border style of this element
-    pub border_style: BorderStyle,
+    /// The border style of each side of this element.
+    #[refineable]
+    pub border_styles: Edges<BorderStyle>,
 
     /// The radius of the corners of this element
     #[refineable]
@@ -961,7 +962,7 @@ impl Style {
                                 chunk,
                                 Edges::default(),
                                 Hsla::default(),
-                                self.border_style,
+                                BorderStyle::default(),
                             )
                             .background_tile(resolved.tile),
                             1.,
@@ -1117,9 +1118,10 @@ impl Style {
                     background,
                     border_widths,
                     self.border_colors.top,
-                    self.border_style,
+                    BorderStyle::default(),
                 )
-                .border_colors(self.border_colors),
+                .border_colors(self.border_colors)
+                .border_styles(self.border_styles),
             );
         }
 
@@ -1187,7 +1189,7 @@ impl Style {
                 background_color.unwrap_or_default(),
                 Edges::default(),
                 border_color,
-                self.border_style,
+                BorderStyle::default(),
             ));
         }
     }
@@ -1209,7 +1211,7 @@ impl Style {
                         chunk,
                         Edges::default(),
                         Hsla::default(),
-                        self.border_style,
+                        BorderStyle::default(),
                     )
                     .background_tile(resolved.tile),
                 );
@@ -1285,7 +1287,7 @@ impl Default for Style {
             mask_layers: Vec::new(),
             clip_path: ClipPathValue::None,
             border_colors: Edges::default(),
-            border_style: BorderStyle::default(),
+            border_styles: Edges::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
             outline: None,

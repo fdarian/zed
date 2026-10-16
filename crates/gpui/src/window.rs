@@ -25,6 +25,7 @@ use crate::{
     transparent_black,
 };
 
+use crate::border_style::resolve_borders;
 use crate::text_decoration::{DecorationKind, decoration_geometry};
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -5137,6 +5138,7 @@ impl Window {
     pub(crate) fn device_quad(&self, quad: PaintQuad, opacity: f32) -> Quad {
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
+        let borders = resolve_borders(&quad.border_styles, &quad.border_colors, &snapped_border_widths);
         Quad {
             order: 0,
             bounds: snapped_bounds,
@@ -5146,10 +5148,11 @@ impl Window {
                 .opacity(opacity)
                 .scale_gradient(self.scale_factor()),
             background_tile: quad.background_tile.scale(self.scale_factor()),
-            border_colors: quad.border_colors.map(|color| color.opacity(opacity)),
+            border_colors: borders.colors.map(|color| color.opacity(opacity)),
+            border_inner_colors: borders.inner_colors.map(|color| color.opacity(opacity)),
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
-            border_style: quad.border_style,
+            border_styles: borders.styles,
         }
     }
 
@@ -8458,8 +8461,8 @@ pub struct PaintQuad {
     pub border_widths: Edges<Pixels>,
     /// The color of each side's border.
     pub border_colors: Edges<Hsla>,
-    /// The style of the quad's borders.
-    pub border_style: BorderStyle,
+    /// The style of each side's border.
+    pub border_styles: Edges<BorderStyle>,
     /// Where a gradient background draws its image and how it repeats. The default has no tile
     /// and the background spans the quad.
     pub background_tile: BackgroundTile,
@@ -8506,6 +8509,22 @@ impl PaintQuad {
         }
     }
 
+    /// Sets the border style of all four sides of the quad.
+    pub fn border_style(self, border_style: BorderStyle) -> Self {
+        PaintQuad {
+            border_styles: Edges::all(border_style),
+            ..self
+        }
+    }
+
+    /// Sets the border style of each side of the quad separately.
+    pub fn border_styles(self, border_styles: Edges<BorderStyle>) -> Self {
+        PaintQuad {
+            border_styles,
+            ..self
+        }
+    }
+
     /// Sets the background color of the quad.
     pub fn background(self, background: impl Into<Background>) -> Self {
         PaintQuad {
@@ -8530,7 +8549,7 @@ pub fn quad(
         background: background.into(),
         border_widths: border_widths.into(),
         border_colors: Edges::all(border_color.into()),
-        border_style,
+        border_styles: Edges::all(border_style),
         background_tile: BackgroundTile::default(),
     }
 }
@@ -8543,7 +8562,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         background: background.into(),
         border_widths: (0.).into(),
         border_colors: Edges::all(transparent_black()),
-        border_style: BorderStyle::default(),
+        border_styles: Edges::default(),
         background_tile: BackgroundTile::default(),
     }
 }
@@ -8560,7 +8579,7 @@ pub fn outline(
         background: transparent_black().into(),
         border_widths: (1.).into(),
         border_colors: Edges::all(border_color.into()),
-        border_style,
+        border_styles: Edges::all(border_style),
         background_tile: BackgroundTile::default(),
     }
 }
@@ -9950,5 +9969,105 @@ mod tests {
         let inset = shadows.iter().find(|shadow| shadow.inset == 1).unwrap();
         assert_eq!(drop.element_bounds.size.width.0, 60. * scale);
         assert_eq!(inset.element_bounds.size.width.0, 56. * scale);
+    }
+
+    fn painted_border_quad(
+        cx: &mut crate::VisualTestContext,
+        decorate: impl FnOnce(crate::Div) -> crate::Div,
+    ) -> (crate::Quad, f32) {
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(200.)), |_, _| {
+            decorate(div().w(px(60.)).h(px(40.)))
+        });
+        cx.update(|window, _| {
+            let quads = window.painted_quads();
+            let border = quads
+                .iter()
+                .find(|quad| quad.border_widths.top.0 > 0.)
+                .expect("a quad with a border");
+            (*border, window.scale_factor())
+        })
+    }
+
+    #[gpui::test]
+    fn a_border_is_solid_on_every_side_by_default(cx: &mut TestAppContext) {
+        use crate::{BorderStyle, Edges, red};
+        let cx = cx.add_empty_window();
+        let (quad, _) = painted_border_quad(cx, |el| el.border(px(4.)).border_color(red()));
+        assert_eq!(quad.border_styles, Edges::all(BorderStyle::Solid));
+        assert_eq!(quad.border_inner_colors, quad.border_colors);
+    }
+
+    #[gpui::test]
+    fn each_side_keeps_its_own_border_style(cx: &mut TestAppContext) {
+        use crate::{BorderStyle, Edges, Styled as _, red};
+        let cx = cx.add_empty_window();
+        let (quad, _) = painted_border_quad(cx, |mut el| {
+            el.style().border_styles.top = Some(BorderStyle::Dotted);
+            el.style().border_styles.left = Some(BorderStyle::Double);
+            el.style().border_styles.bottom = Some(BorderStyle::Dashed);
+            el.border(px(6.)).border_color(red())
+        });
+        assert_eq!(
+            quad.border_styles,
+            Edges {
+                top: BorderStyle::Dotted,
+                right: BorderStyle::Solid,
+                bottom: BorderStyle::Dashed,
+                left: BorderStyle::Double,
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn border_dashed_sets_every_side(cx: &mut TestAppContext) {
+        use crate::{BorderStyle, Edges, red};
+        let cx = cx.add_empty_window();
+        let (quad, _) = painted_border_quad(cx, |el| el.border(px(2.)).border_color(red()).border_dashed());
+        assert_eq!(quad.border_styles, Edges::all(BorderStyle::Dashed));
+    }
+
+    #[gpui::test]
+    fn an_outset_border_paints_shaded_solid_sides(cx: &mut TestAppContext) {
+        use crate::{BorderStyle, Edges, red};
+        let cx = cx.add_empty_window();
+        let (quad, _) = painted_border_quad(cx, |el| {
+            el.border(px(4.)).border_color(red()).border_style(BorderStyle::Outset)
+        });
+        assert_eq!(quad.border_styles, Edges::all(BorderStyle::Solid));
+        assert_eq!(quad.border_colors.top, red());
+        assert_eq!(quad.border_colors.left, red());
+        assert_ne!(quad.border_colors.bottom, red());
+        assert_eq!(quad.border_colors.bottom, quad.border_colors.right);
+    }
+
+    #[gpui::test]
+    fn a_groove_border_carries_both_halves(cx: &mut TestAppContext) {
+        use crate::{BorderStyle, Edges, red};
+        let cx = cx.add_empty_window();
+        let (quad, _) = painted_border_quad(cx, |el| {
+            el.border(px(4.)).border_color(red()).border_style(BorderStyle::Groove)
+        });
+        assert_eq!(quad.border_styles, Edges::all(BorderStyle::Groove));
+        // Inset outside and outset inside: on the top the outer half is the darker one.
+        assert_ne!(quad.border_colors.top, quad.border_inner_colors.top);
+        assert_eq!(quad.border_colors.top, quad.border_inner_colors.bottom);
+        assert_eq!(quad.border_colors.bottom, quad.border_inner_colors.top);
+    }
+
+    #[gpui::test]
+    fn a_double_border_under_three_device_pixels_is_painted_solid(cx: &mut TestAppContext) {
+        use crate::{BorderStyle, red};
+        let cx = cx.add_empty_window();
+        let (thin, scale) = painted_border_quad(cx, |el| {
+            el.border(px(1.)).border_color(red()).border_style(BorderStyle::Double)
+        });
+        let device_width = thin.border_widths.top.0;
+        let expected = if device_width < 3. { BorderStyle::Solid } else { BorderStyle::Double };
+        assert_eq!(thin.border_styles.top, expected, "{device_width} device px at {scale}x");
+
+        let (thick, _) = painted_border_quad(cx, |el| {
+            el.border(px(6.)).border_color(red()).border_style(BorderStyle::Double)
+        });
+        assert_eq!(thick.border_styles.top, BorderStyle::Double);
     }
 }

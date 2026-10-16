@@ -621,10 +621,19 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Sets the border style of the element.
-    fn border_dashed(mut self) -> Self {
-        self.style().border_style = Some(BorderStyle::Dashed);
+    /// Sets the border style of all four sides of the element.
+    fn border_style(mut self, border_style: BorderStyle) -> Self {
+        let styles = &mut self.style().border_styles;
+        styles.top = Some(border_style);
+        styles.right = Some(border_style);
+        styles.bottom = Some(border_style);
+        styles.left = Some(border_style);
         self
+    }
+
+    /// Sets the border style of all four sides of the element to dashed.
+    fn border_dashed(self) -> Self {
+        self.border_style(BorderStyle::Dashed)
     }
 
     /// Returns a mutable reference to the text style that has been configured on this element.

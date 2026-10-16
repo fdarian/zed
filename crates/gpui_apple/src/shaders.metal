@@ -23,15 +23,18 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixe
 float corner_dash_velocity(float dv1, float dv2);
 float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold);
+float dot_alpha(float t, float period, float dot_length, float dash_velocity,
+                float across, float diameter, float antialias_threshold);
 float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
 float quad_sdf_impl(float2 center_to_point, float corner_radius);
 float content_mask_coverage(float2 position, ContentMask_ScaledPixels content_mask);
-float4 select_border_color(float2 center_to_point, float2 corner_to_point,
-                           float2 border, float4 top, float4 right,
-                           float4 bottom, float4 left);
+float border_vertical_weight(float2 corner_to_point, float2 border);
+float4 select_border_color(float2 center_to_point, float vertical_weight,
+                           float4 top, float4 right, float4 bottom,
+                           float4 left);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
@@ -256,12 +259,27 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   float4 color = background_color;
   if (border_sdf < antialias_threshold) {
+    float vertical_weight = border_vertical_weight(corner_to_point, border);
     float4 border_color = select_border_color(
-      center_to_point, corner_to_point, border, input.border_color_top,
+      center_to_point, vertical_weight, input.border_color_top,
       input.border_color_right, input.border_color_bottom, input.border_color_left);
 
-    // Dashed border logic when border_style == 1
-    if (quad.border_style == 1) {
+    // A side's style applies on its own side of the line that separates the
+    // colors at a corner, whatever the style of the side it meets.
+    bool vertical_owner = vertical_weight >= 0.5;
+    uint style = vertical_owner
+      ? (uint)(center_to_point.x < 0.0 ? quad.border_styles.left : quad.border_styles.right)
+      : (uint)(center_to_point.y < 0.0 ? quad.border_styles.top : quad.border_styles.bottom);
+    float owner_width = vertical_owner ? border.x : border.y;
+
+    // Distances from the point to the outer and inner edge of the border. Their
+    // sum is the border's thickness here, and half their difference is the
+    // distance from its mid-line, positive on the outer half.
+    float depth_from_outer = -outer_sdf;
+    float depth_from_inner = -inner_sdf;
+
+    if (style == BorderStyle_Dashed || style == BorderStyle_Dotted) {
+      bool dotted = style == BorderStyle_Dotted;
       // Position along the perimeter in "dash space", where each dash
       // period has length 1
       float t = 0.0;
@@ -274,8 +292,9 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       // used by browsers, but also avoids dashes from different segments
       // overlapping when dash size is smaller than the border width.
       //
-      // Dash pattern: (2 * border width) dash, (1 * border width) gap
-      const float dash_length_per_width = 2.0;
+      // Dash pattern: (2 * border width) dash, (1 * border width) gap.
+      // Dots are one border width across, with a gap of one.
+      const float dash_length_per_width = dotted ? 1.0 : 2.0;
       const float dash_gap_per_width = 1.0;
       const float dash_period_per_width = dash_length_per_width + dash_gap_per_width;
 
@@ -419,8 +438,12 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
         // Adjust dash gap to evenly divide max_t
         float dash_count = floor(max_t);
         float dash_period = max_t / dash_count;
-        border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity,
-                                     antialias_threshold);
+        border_color.a *= dotted
+          ? dot_alpha(t, dash_period, dash_length, dash_velocity,
+                      (depth_from_inner - depth_from_outer) / 2.0, owner_width,
+                      antialias_threshold)
+          : dash_alpha(t, dash_period, dash_length, dash_velocity,
+                       antialias_threshold);
       } else if (unrounded) {
         // When there isn't enough space for the full gap between the
         // two start / end dashes of a straight border, reduce gap to
@@ -428,10 +451,33 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
         float dash_gap = max_t - dash_length;
         if (dash_gap > 0.0) {
           float dash_period = dash_length + dash_gap;
-          border_color.a *= dash_alpha(t, dash_period, dash_length, dash_velocity,
-                                       antialias_threshold);
+          border_color.a *= dotted
+            ? dot_alpha(t, dash_period, dash_length, dash_velocity,
+                        (depth_from_inner - depth_from_outer) / 2.0, owner_width,
+                        antialias_threshold)
+            : dash_alpha(t, dash_period, dash_length, dash_velocity,
+                         antialias_threshold);
         }
       }
+    } else if (style == BorderStyle_Double) {
+      // Two lines of a third of the width each, rounded to whole pixels as
+      // Chrome does, with the rest as the gap.
+      float line_width = floor((owner_width + 1.0) / 3.0);
+      float outer_line = saturate(antialias_threshold - (depth_from_outer - line_width));
+      float inner_line = saturate(antialias_threshold - (depth_from_inner - line_width));
+      border_color.a *= max(outer_line, inner_line);
+    } else if (style == BorderStyle_Groove || style == BorderStyle_Ridge) {
+      // The border cut in two along its mid-line: `border_color` is the outer
+      // half and the inner half has its own color.
+      float4 inner_color = select_border_color(
+        center_to_point, vertical_weight,
+        hsla_to_rgba(quad.border_inner_colors.top),
+        hsla_to_rgba(quad.border_inner_colors.right),
+        hsla_to_rgba(quad.border_inner_colors.bottom),
+        hsla_to_rgba(quad.border_inner_colors.left));
+      float outer_half = floor((owner_width + 1.0) / 2.0);
+      float outer_weight = saturate(antialias_threshold + outer_half - depth_from_outer);
+      border_color = mix(inner_color, border_color, outer_weight);
     }
 
     // Blend the border on top of the background and then linearly interpolate
@@ -444,31 +490,33 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf) * mask_alpha);
 }
 
-// Picks the border color at a point. Two sides meet at each corner and, like
-// CSS, their colors are separated by the line from the outer corner of the
-// quad to the inner corner of its borders, antialiased across that line.
+// How much of the point's corner belongs to the vertical (left or right) side
+// rather than the horizontal one: 1 on the vertical side, 0 on the horizontal
+// one, antialiased across the join line. Like CSS, two sides meet at each corner
+// along the line from the outer corner of the quad to the inner corner of its
+// borders.
 //
-// `border` holds the widths of the nearest vertical (left or right) and
-// horizontal (top or bottom) sides.
-float4 select_border_color(float2 center_to_point, float2 corner_to_point,
-                           float2 border, float4 top, float4 right,
-                           float4 bottom, float4 left) {
+// `border` holds the widths of the nearest vertical and horizontal sides.
+float border_vertical_weight(float2 corner_to_point, float2 border) {
+  // A side without a border never owns the corner.
+  if (border.x <= 0.0) {
+    return 0.0;
+  }
+  if (border.y <= 0.0) {
+    return 1.0;
+  }
+  // Signed distance to the join line, negative on the vertical side's half.
+  float2 distance_from_edges = -corner_to_point;
+  float to_join = (distance_from_edges.x * border.y - distance_from_edges.y * border.x) /
+                  length(border);
+  return saturate(0.5 - to_join);
+}
+
+// Picks the border color at a point, blending the two sides across the join line.
+float4 select_border_color(float2 center_to_point, float vertical_weight,
+                           float4 top, float4 right, float4 bottom, float4 left) {
   float4 vertical_color = center_to_point.x < 0.0 ? left : right;
   float4 horizontal_color = center_to_point.y < 0.0 ? top : bottom;
-
-  // A side without a border never owns the corner.
-  float vertical_weight;
-  if (border.x <= 0.0) {
-    vertical_weight = 0.0;
-  } else if (border.y <= 0.0) {
-    vertical_weight = 1.0;
-  } else {
-    // Signed distance to the join line, negative on the vertical side's half.
-    float2 distance_from_edges = -corner_to_point;
-    float to_join = (distance_from_edges.x * border.y - distance_from_edges.y * border.x) /
-                    length(border);
-    vertical_weight = saturate(0.5 - to_join);
-  }
 
   if (vertical_weight >= 1.0) {
     return vertical_color;
@@ -531,6 +579,21 @@ float dash_alpha(
   float signed_distance = abs(centered) - half_length;
   // Antialiased alpha based on the signed distance
   return saturate(antialias_threshold - signed_distance / dash_velocity);
+}
+
+// Returns alpha used to render antialiased dots: circles one border width across,
+// centered on the border's mid-line and on the middle of each dash cell of `t`
+// (see `dash_alpha`). `across` is the distance from the mid-line, in pixels.
+float dot_alpha(
+    float t, float period, float dot_length, float dash_velocity,
+    float across, float diameter, float antialias_threshold) {
+  float half_period = period / 2.0;
+  float half_length = dot_length / 2.0;
+  // Dash space distance from the middle of the dot, converted to pixels
+  float centered = fmod(t + half_period - half_length, period) - half_period;
+  float along = centered / dash_velocity;
+  float signed_distance = length(float2(along, across)) - diameter / 2.0;
+  return saturate(antialias_threshold - signed_distance);
 }
 
 // This approximates distance to the nearest point to a quarter ellipse in a way

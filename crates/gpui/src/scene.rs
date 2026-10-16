@@ -740,6 +740,8 @@ impl Primitive {
             Primitive::Quad(quad) => {
                 quad.background = quad.background.opacity(opacity);
                 quad.border_colors = quad.border_colors.map(|color| color.opacity(opacity));
+                quad.border_inner_colors =
+                    quad.border_inner_colors.map(|color| color.opacity(opacity));
             }
             Primitive::Path(path) => path.color = path.color.opacity(opacity),
             Primitive::Underline(underline) => {
@@ -1170,11 +1172,16 @@ impl PrimitiveBatch {
 #[expect(missing_docs)]
 pub struct Quad {
     pub order: DrawOrder,
-    pub border_style: BorderStyle,
+    /// What the shaders draw on each side. `Inset` and `Outset` are solid sides with shaded
+    /// colors, so they never appear here (see `border_style::resolve_edge`).
+    pub border_styles: Edges<BorderStyle>,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub background: Background,
     pub border_colors: Edges<Hsla>,
+    /// The color of the inner half of a `Groove` or `Ridge` side, whose `border_colors` entry
+    /// is the outer half. Equal to `border_colors` for every other style.
+    pub border_inner_colors: Edges<Hsla>,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
     pub background_tile: BackgroundTile,
@@ -1233,15 +1240,31 @@ impl From<Shadow> for Primitive {
     }
 }
 
-/// The style of a border.
+/// The style of one side of a border, as CSS `border-style` names them. `none` and `hidden`
+/// are a width of zero, not a style.
+///
+/// `shaders.metal`, `shaders.wgsl` and `shaders.hlsl` repeat the numbers of `Dashed` to
+/// `Ridge`, so change them together.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
 pub enum BorderStyle {
     /// A solid border.
     #[default]
     Solid = 0,
-    /// A dashed border.
+    /// Dashes of two border widths with a gap of one.
     Dashed = 1,
+    /// Round dots, one border width across, two apart.
+    Dotted = 2,
+    /// Two lines with a gap between them, a third of the border width each.
+    Double = 3,
+    /// The outer half is shaded like an `Inset` border and the inner half like an `Outset` one.
+    Groove = 4,
+    /// The outer half is shaded like an `Outset` border and the inner half like an `Inset` one.
+    Ridge = 5,
+    /// The top and left sides are darker than the color, the bottom and right ones lighter.
+    Inset = 6,
+    /// The bottom and right sides are darker than the color, the top and left ones lighter.
+    Outset = 7,
 }
 
 /// A data type representing a 2 dimensional transformation that can be applied to an element.

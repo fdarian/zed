@@ -138,6 +138,20 @@ struct EdgesHsla {
     left: Hsla,
 }
 
+struct EdgesU32 {
+    top: u32,
+    right: u32,
+    bottom: u32,
+    left: u32,
+}
+
+// The numbers of `BorderStyle` in gpui's scene.rs. Solid is 0.
+const BORDER_STYLE_DASHED: u32 = 1u;
+const BORDER_STYLE_DOTTED: u32 = 2u;
+const BORDER_STYLE_DOUBLE: u32 = 3u;
+const BORDER_STYLE_GROOVE: u32 = 4u;
+const BORDER_STYLE_RIDGE: u32 = 5u;
+
 struct LinearColorStop {
     color: Hsla,
     percentage: f32,
@@ -448,16 +462,32 @@ fn content_mask_coverage(position: vec2<f32>, mask: ContentMask) -> f32 {
     return saturate(0.5 - quad_sdf(position, mask.bounds, radii));
 }
 
-// Picks the border color at a point. Two sides meet at each corner and, like
-// CSS, their colors are separated by the line from the outer corner of the
-// quad to the inner corner of its borders, antialiased across that line.
+// How much of the point's corner belongs to the vertical (left or right) side
+// rather than the horizontal one: 1 on the vertical side, 0 on the horizontal
+// one, antialiased across the join line. Like CSS, two sides meet at each corner
+// along the line from the outer corner of the quad to the inner corner of its
+// borders.
 //
-// `border` holds the widths of the nearest vertical (left or right) and
-// horizontal (top or bottom) sides.
+// `border` holds the widths of the nearest vertical and horizontal sides.
+fn border_vertical_weight(corner_to_point: vec2<f32>, border: vec2<f32>) -> f32 {
+    // A side without a border never owns the corner.
+    if (border.x <= 0.0) {
+        return 0.0;
+    }
+    if (border.y <= 0.0) {
+        return 1.0;
+    }
+    // Signed distance to the join line, negative on the vertical side's half.
+    let distance_from_edges = -corner_to_point;
+    let to_join = (distance_from_edges.x * border.y - distance_from_edges.y * border.x) /
+        length(border);
+    return saturate(0.5 - to_join);
+}
+
+// Picks the border color at a point, blending the two sides across the join line.
 fn select_border_color(
     center_to_point: vec2<f32>,
-    corner_to_point: vec2<f32>,
-    border: vec2<f32>,
+    vertical_weight: f32,
     top: vec4<f32>,
     right: vec4<f32>,
     bottom: vec4<f32>,
@@ -465,20 +495,6 @@ fn select_border_color(
 ) -> vec4<f32> {
     let vertical_color = select(right, left, center_to_point.x < 0.0);
     let horizontal_color = select(bottom, top, center_to_point.y < 0.0);
-
-    // A side without a border never owns the corner.
-    var vertical_weight: f32;
-    if (border.x <= 0.0) {
-        vertical_weight = 0.0;
-    } else if (border.y <= 0.0) {
-        vertical_weight = 1.0;
-    } else {
-        // Signed distance to the join line, negative on the vertical side's half.
-        let distance_from_edges = -corner_to_point;
-        let to_join = (distance_from_edges.x * border.y - distance_from_edges.y * border.x) /
-            length(border);
-        vertical_weight = saturate(0.5 - to_join);
-    }
 
     if (vertical_weight >= 1.0) {
         return vertical_color;
@@ -707,11 +723,12 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
 struct Quad {
     order: u32,
-    border_style: u32,
+    border_styles: EdgesU32,
     bounds: Bounds,
     content_mask: ContentMask,
     background: Background,
     border_colors: EdgesHsla,
+    border_inner_colors: EdgesHsla,
     corner_radii: Corners,
     border_widths: Edges,
     background_tile: BackgroundTile,
@@ -913,13 +930,30 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     var color = background_color;
     if (border_sdf < antialias_threshold) {
+        let vertical_weight = border_vertical_weight(corner_to_point, border);
         var border_color = select_border_color(
-            center_to_point, corner_to_point, border,
+            center_to_point, vertical_weight,
             input.border_color_top, input.border_color_right,
             input.border_color_bottom, input.border_color_left);
 
-        // Dashed border logic when border_style == 1
-        if (quad.border_style == 1) {
+        // A side's style applies on its own side of the line that separates the
+        // colors at a corner, whatever the style of the side it meets.
+        let vertical_owner = vertical_weight >= 0.5;
+        let vertical_style = select(
+            quad.border_styles.right, quad.border_styles.left, center_to_point.x < 0.0);
+        let horizontal_style = select(
+            quad.border_styles.bottom, quad.border_styles.top, center_to_point.y < 0.0);
+        let style = select(horizontal_style, vertical_style, vertical_owner);
+        let owner_width = select(border.y, border.x, vertical_owner);
+
+        // Distances from the point to the outer and inner edge of the border. Their
+        // sum is the border's thickness here, and half their difference is the
+        // distance from its mid-line, positive on the outer half.
+        let depth_from_outer = -outer_sdf;
+        let depth_from_inner = -inner_sdf;
+
+        if (style == BORDER_STYLE_DASHED || style == BORDER_STYLE_DOTTED) {
+            let dotted = style == BORDER_STYLE_DOTTED;
             // Position along the perimeter in "dash space", where each dash
             // period has length 1
             var t = 0.0;
@@ -932,8 +966,9 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             // used by browsers, but also avoids dashes from different segments
             // overlapping when dash size is smaller than the border width.
             //
-            // Dash pattern: (2 * border width) dash, (1 * border width) gap
-            let dash_length_per_width = 2.0;
+            // Dash pattern: (2 * border width) dash, (1 * border width) gap.
+            // Dots are one border width across, with a gap of one.
+            let dash_length_per_width = select(2.0, 1.0, dotted);
             let dash_gap_per_width = 1.0;
             let dash_period_per_width = dash_length_per_width + dash_gap_per_width;
 
@@ -1089,11 +1124,14 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 // Adjust dash gap to evenly divide max_t.
                 let dash_count = floor(max_t);
                 let dash_period = max_t / dash_count;
-                border_color.a *= dash_alpha(
+                border_color.a *= dash_or_dot_alpha(
+                    dotted,
                     t,
                     dash_period,
                     dash_length,
                     dash_velocity,
+                    (depth_from_inner - depth_from_outer) / 2.0,
+                    owner_width,
                     antialias_threshold);
             } else if (unrounded) {
                 // When there isn't enough space for the full gap between the
@@ -1102,14 +1140,36 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                 let dash_gap = max_t - dash_length;
                 if (dash_gap > 0.0) {
                     let dash_period = dash_length + dash_gap;
-                    border_color.a *= dash_alpha(
+                    border_color.a *= dash_or_dot_alpha(
+                        dotted,
                         t,
                         dash_period,
                         dash_length,
                         dash_velocity,
+                        (depth_from_inner - depth_from_outer) / 2.0,
+                        owner_width,
                         antialias_threshold);
                 }
             }
+        } else if (style == BORDER_STYLE_DOUBLE) {
+            // Two lines of a third of the width each, rounded to whole pixels as
+            // Chrome does, with the rest as the gap.
+            let line_width = floor((owner_width + 1.0) / 3.0);
+            let outer_line = saturate(antialias_threshold - (depth_from_outer - line_width));
+            let inner_line = saturate(antialias_threshold - (depth_from_inner - line_width));
+            border_color.a *= max(outer_line, inner_line);
+        } else if (style == BORDER_STYLE_GROOVE || style == BORDER_STYLE_RIDGE) {
+            // The border cut in two along its mid-line: `border_color` is the outer
+            // half and the inner half has its own color.
+            let inner_color = select_border_color(
+                center_to_point, vertical_weight,
+                hsla_to_rgba(quad.border_inner_colors.top),
+                hsla_to_rgba(quad.border_inner_colors.right),
+                hsla_to_rgba(quad.border_inner_colors.bottom),
+                hsla_to_rgba(quad.border_inner_colors.left));
+            let outer_half = floor((owner_width + 1.0) / 2.0);
+            let outer_weight = saturate(antialias_threshold + outer_half - depth_from_outer);
+            border_color = mix(inner_color, border_color, outer_weight);
         }
 
         // Blend the border on top of the background and then linearly interpolate
@@ -1152,6 +1212,30 @@ fn dash_alpha(t: f32, period: f32, length: f32, dash_velocity: f32, antialias_th
     let signed_distance = abs(centered) - half_length;
     // Antialiased alpha based on the signed distance.
     return saturate(antialias_threshold - signed_distance / dash_velocity);
+}
+
+// Returns alpha used to render antialiased dots: circles one border width across,
+// centered on the border's mid-line and on the middle of each dash cell of `t`
+// (see `dash_alpha`). `across` is the distance from the mid-line, in pixels.
+fn dot_alpha(
+    t: f32, period: f32, dot_length: f32, dash_velocity: f32,
+    across: f32, diameter: f32, antialias_threshold: f32) -> f32 {
+    let half_period = period / 2;
+    let half_length = dot_length / 2;
+    // Dash space distance from the middle of the dot, converted to pixels.
+    let centered = fmod(t + half_period - half_length, period) - half_period;
+    let along = centered / dash_velocity;
+    let signed_distance = length(vec2<f32>(along, across)) - diameter / 2;
+    return saturate(antialias_threshold - signed_distance);
+}
+
+fn dash_or_dot_alpha(
+    dotted: bool, t: f32, period: f32, mark_length: f32, dash_velocity: f32,
+    across: f32, diameter: f32, antialias_threshold: f32) -> f32 {
+    if (dotted) {
+        return dot_alpha(t, period, mark_length, dash_velocity, across, diameter, antialias_threshold);
+    }
+    return dash_alpha(t, period, mark_length, dash_velocity, antialias_threshold);
 }
 
 // This approximates distance to the nearest point to a quarter ellipse in a way

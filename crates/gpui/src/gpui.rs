@@ -14,6 +14,7 @@ mod app;
 mod arena;
 mod asset_cache;
 mod assets;
+mod border_style;
 mod bounds_tree;
 mod background_layer;
 mod color;

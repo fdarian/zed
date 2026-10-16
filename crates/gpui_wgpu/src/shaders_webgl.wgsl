@@ -96,6 +96,15 @@ fn read_content_mask(cursor: ptr<function, InstanceCursor>) -> ContentMask {
     return ContentMask(read_bounds(cursor), read_corners(cursor));
 }
 
+fn read_border_styles(cursor: ptr<function, InstanceCursor>) -> EdgesU32 {
+    return EdgesU32(
+        read_word(cursor),
+        read_word(cursor),
+        read_word(cursor),
+        read_word(cursor),
+    );
+}
+
 fn read_border_colors(cursor: ptr<function, InstanceCursor>) -> EdgesHsla {
     return EdgesHsla(
         read_hsla(cursor),
@@ -186,13 +195,14 @@ fn read_transformation(cursor: ptr<function, InstanceCursor>) -> TransformationM
 }
 
 fn load_quad(instance_id: u32) -> Quad {
-    var cursor = instance_cursor(instance_id * 86u);
+    var cursor = instance_cursor(instance_id * 105u);
     return Quad(
         read_word(&cursor),
-        read_word(&cursor),
+        read_border_styles(&cursor),
         read_bounds(&cursor),
         read_content_mask(&cursor),
         read_background(&cursor),
+        read_border_colors(&cursor),
         read_border_colors(&cursor),
         read_corners(&cursor),
         read_edges(&cursor),
