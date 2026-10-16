@@ -283,6 +283,9 @@ impl<V: View> IntoElement for ViewElement<V> {
 }
 
 struct ViewElementState {
+    /// False for a view prepainted inside a stacking context. The ranges below index the frame's
+    /// hitboxes and tab stops by position, and the context moves those about once it is done.
+    reusable: bool,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
@@ -390,6 +393,7 @@ impl<V: View> Element for ViewElement<V> {
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
                             && element_state.cache_key.visibility == visibility
+                            && element_state.reusable
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
                         {
@@ -399,10 +403,12 @@ impl<V: View> Element for ViewElement<V> {
                                 .extend_accessed(&element_state.accessed_entities);
                             let prepaint_end = window.prepaint_index();
                             element_state.prepaint_range = prepaint_start..prepaint_end;
+                            element_state.reusable = !window.in_stacking_context();
 
                             return (None, element_state);
                         }
 
+                        let reusable = !window.in_stacking_context();
                         let refreshing = mem::replace(&mut window.refreshing, true);
                         let prepaint_start = window.prepaint_index();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
@@ -423,6 +429,7 @@ impl<V: View> Element for ViewElement<V> {
                         (
                             Some(element),
                             ViewElementState {
+                                reusable,
                                 accessed_entities,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),

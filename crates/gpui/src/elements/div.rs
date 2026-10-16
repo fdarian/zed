@@ -17,7 +17,7 @@
 
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, ClipPathValue, DispatchPhase,
-    Display, Element, ElementId, Entity, EntityId, Escape, ExternalDragPayload, ExternalDragPayloadSource,
+    Display, Element, ElementId, Empty, Entity, EntityId, Escape, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
@@ -26,7 +26,7 @@ use crate::{
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     scroll_routing, size,
     sticky::{self, StickyInsets},
-    window::WindowRegion,
+    window::{LiftedElement, WindowRegion},
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -1859,6 +1859,11 @@ pub fn div() -> Div {
         image_cache: None,
         prepaint_order_fn: None,
         paint_ranks: None,
+        stacking_context: false,
+        z_index: None,
+        lifted: Vec::new(),
+        lifted_children: SmallVec::new(),
+        children_lifting: false,
     }
 }
 
@@ -1870,9 +1875,45 @@ pub struct Div {
     image_cache: Option<Box<dyn ImageCacheProvider>>,
     prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
     paint_ranks: Option<Vec<i32>>,
+    stacking_context: bool,
+    z_index: Option<i32>,
+    /// The positioned descendants this stacking context was handed, in paint order. Set by
+    /// prepaint, painted and emptied by paint.
+    lifted: Vec<LiftedElement>,
+    /// The children that were handed to a stacking context after their prepaint, with the ordinal
+    /// the context knows them by. Their place in `children` holds a placeholder.
+    lifted_children: SmallVec<[(usize, u32); 2]>,
+    /// Whether the children were prepainted inside a stacking context. Positioned ones are then
+    /// lifted and the rest keep document order, whatever `paint_ranks` says.
+    children_lifting: bool,
 }
 
 impl Div {
+    /// Makes this element a CSS stacking context: its positioned descendants, however deep and
+    /// whatever static elements sit between, are painted and hit-tested inside it in
+    /// [`Div::z_index`] order, ties in tree order. Those with a negative index come right above
+    /// its own background, below its in-flow children; the rest come after them. An element that
+    /// is positioned and a context lifts into the next context out as well. A positioned element
+    /// with no context around it, or inside a layout root ([`AnyElement::prepaint_at`], the rows
+    /// of a list), is painted in its place in the tree, ordered by [`Div::paint_ranks`] if its
+    /// parent has them.
+    ///
+    /// An element whose composite is applied as a whole (opacity below 1, a filter, a mask, a
+    /// clip path) is a context in CSS: call this on it, or a lifted descendant escapes the effect.
+    /// A descendant that is lifted does not see the `group`s of the elements between it and the
+    /// context.
+    pub fn stacking_context(mut self) -> Self {
+        self.stacking_context = true;
+        self
+    }
+
+    /// The `z-index` of this element in its stacking context. It takes effect on a positioned
+    /// element, one whose `position` is set and not [`Position::Static`], and no index is 0.
+    pub fn z_index(mut self, z_index: i32) -> Self {
+        self.z_index = Some(z_index);
+        self
+    }
+
     /// Paints and hit-tests children in ascending `ranks` order, ties in child order, while
     /// layout keeps child order. `ranks[i]` belongs to the i-th child; missing entries are 0.
     /// This is how CSS stacking works: positioned children paint over in-flow ones and `z-index`
@@ -1921,6 +1962,31 @@ impl Div {
         self.prepaint_order_fn = Some(Box::new(order_fn));
         self
     }
+}
+
+/// Prepaints `children[index]`. If the stacking context being prepainted takes it because it is
+/// positioned, takes it out of the children too, leaving an empty element that is never drawn.
+fn prepaint_child(
+    children: &mut [StackSafe<AnyElement>],
+    index: usize,
+    lifting: bool,
+    lifted_children: &mut SmallVec<[(usize, u32); 2]>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let child = &mut children[index];
+    let Some(z) = lifting.then(|| child.lift_z()).flatten() else {
+        child.prepaint(window, cx);
+        return;
+    };
+    let ticket = window.begin_lift();
+    child.prepaint(window, cx);
+    #[cfg(feature = "stacker")]
+    let element = mem::replace(child, StackSafe::new(Empty.into_any_element())).into_inner();
+    #[cfg(not(feature = "stacker"))]
+    let element = mem::replace(child, Empty.into_any_element());
+    let ordinal = window.finish_lift(ticket, z, element);
+    lifted_children.push((index, ordinal));
 }
 
 /// A frame state for a `Div` element, which contains layout IDs for its children.
@@ -2070,6 +2136,13 @@ impl Element for Div {
         self.interactivity.base_style.escape()
     }
 
+    fn lift_z(&self) -> Option<i32> {
+        match self.interactivity.base_style.position {
+            None | Some(Position::Static) => None,
+            Some(_) => Some(self.z_index.unwrap_or(0)),
+        }
+    }
+
     fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
         let style = &self.interactivity.base_style;
         if style.position != Some(Position::Sticky) {
@@ -2158,6 +2231,9 @@ impl Element for Div {
         let content_end = self.interactivity.content_end;
         let scrollbar_size = self.interactivity.scrollbar_size;
         let paint_order = self.paint_ranks.as_ref().map(|_| self.child_paint_order());
+        // Prepaint can run again on a div, for example by a measure pass.
+        self.lifted.clear();
+        self.lifted_children.clear();
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2182,22 +2258,60 @@ impl Element for Div {
                     );
                     window.with_element_offset(scroll_offset, |window| {
                         sticky::within(scrollport, containing_block, || {
-                            let mut prepaint_children = |window: &mut Window| {
+                            let mut prepaint_children_in_context = |window: &mut Window| {
+                                let children_hitboxes_start = window.next_frame.hitboxes.len();
+                                if self.stacking_context {
+                                    window.begin_stacking_context();
+                                }
+                                let lifting = window.lifting();
+                                self.children_lifting = lifting;
                                 if let Some(order_fn) = &self.prepaint_order_fn {
+                                    // The order is the caller's to choose, so the tree order
+                                    // that ties between lifted children break by is this one.
                                     let order = order_fn(window, cx);
                                     for idx in order {
-                                        if let Some(child) = self.children.get_mut(idx) {
-                                            child.prepaint(window, cx);
+                                        if idx < self.children.len() {
+                                            prepaint_child(
+                                                &mut self.children,
+                                                idx,
+                                                lifting,
+                                                &mut self.lifted_children,
+                                                window,
+                                                cx,
+                                            );
                                         }
                                     }
-                                } else if let Some(order) = &paint_order {
+                                } else if let Some(order) =
+                                    paint_order.as_ref().filter(|_| !lifting)
+                                {
                                     for &idx in order {
                                         self.children[idx].prepaint(window, cx);
                                     }
                                 } else {
-                                    for child in &mut self.children {
-                                        child.prepaint(window, cx);
+                                    for idx in 0..self.children.len() {
+                                        prepaint_child(
+                                            &mut self.children,
+                                            idx,
+                                            lifting,
+                                            &mut self.lifted_children,
+                                            window,
+                                            cx,
+                                        );
                                     }
+                                }
+                                if self.stacking_context {
+                                    self.lifted =
+                                        window.end_stacking_context(children_hitboxes_start);
+                                }
+                            };
+                            // Nothing under a hidden element is painted, so nothing is lifted
+                            // out of it to be painted by a context above.
+                            let hidden = style.visibility == Visibility::Hidden;
+                            let prepaint_children = move |window: &mut Window| {
+                                if hidden {
+                                    window.with_lift_barrier(prepaint_children_in_context)
+                                } else {
+                                    prepaint_children_in_context(window)
                                 }
                             };
                             if style.position == Position::Static {
@@ -2238,7 +2352,11 @@ impl Element for Div {
             .map(|provider| provider.provide(window, cx));
 
         let overlay_painter = self.interactivity.overlay_painter.take();
-        let paint_order = self.paint_ranks.as_ref().map(|_| self.child_paint_order());
+        let paint_order = self
+            .paint_ranks
+            .as_ref()
+            .filter(|_| !self.children_lifting)
+            .map(|_| self.child_paint_order());
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
@@ -2251,6 +2369,13 @@ impl Element for Div {
                     // skip children
                     if style.display == Display::None {
                         return;
+                    }
+
+                    let mut lifted = mem::take(&mut self.lifted);
+                    let first_above = lifted.partition_point(|entry| entry.z < 0);
+                    let context_node = window.next_frame.dispatch_tree.active_node_id();
+                    for entry in &mut lifted[..first_above] {
+                        window.paint_lifted(entry, context_node.unwrap(), cx);
                     }
 
                     if let Some(order) = &paint_order {
@@ -2272,9 +2397,20 @@ impl Element for Div {
                             .tab_stops
                             .restore_document_order(tab_stops_start, &segments);
                     } else {
-                        for child in &mut self.children {
+                        for (idx, child) in self.children.iter_mut().enumerate() {
+                            if self
+                                .lifted_children
+                                .iter()
+                                .any(|(lifted, _)| *lifted == idx)
+                            {
+                                continue;
+                            }
                             child.paint(window, cx);
                         }
+                    }
+
+                    for entry in &mut lifted[first_above..] {
+                        window.paint_lifted(entry, context_node.unwrap(), cx);
                     }
                     if let Some(painter) = overlay_painter {
                         painter(bounds, window, cx);
@@ -4367,6 +4503,18 @@ impl Stateful<Div> {
         self.element = self.element.paint_ranks(ranks);
         self
     }
+
+    /// See [`Div::stacking_context`].
+    pub fn stacking_context(mut self) -> Self {
+        self.element = self.element.stacking_context();
+        self
+    }
+
+    /// See [`Div::z_index`].
+    pub fn z_index(mut self, z_index: i32) -> Self {
+        self.element = self.element.z_index(z_index);
+        self
+    }
 }
 
 impl<E> StatefulInteractiveElement for Stateful<E>
@@ -4436,6 +4584,10 @@ where
 
     fn escapes_to(&self) -> Option<Escape> {
         self.element.escapes_to()
+    }
+
+    fn lift_z(&self) -> Option<i32> {
+        self.element.lift_z()
     }
 
     fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
@@ -8014,6 +8166,644 @@ mod tests {
                 assert_eq!(visible_area(&window, cx), 190. * 50.);
                 assert_eq!(chain_at(&window, cx, 200., 140.), ["box", "layer"]);
                 assert_eq!(chain_at(&window, cx, 350., 140.), ["root"]);
+            }
+        }
+
+        /// Positioned elements are lifted into the nearest stacking context and painted, and hit
+        /// tested, by z-index there: `A`.. are tints that tell the painted quads apart.
+        mod stacking_contexts {
+            use super::*;
+            use crate::{Hsla, ScrollHandle, hsla};
+
+            const NAMES: [&str; 16] = [
+                "root", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
+            ];
+
+            fn tint(name: &str) -> Hsla {
+                let index = NAMES.iter().position(|known| *known == name);
+                hsla(index.expect("a name from NAMES") as f32 / 16., 1., 0.5, 1.)
+            }
+
+            fn name_of(color: Hsla) -> &'static str {
+                NAMES[(color.h * 16.).round() as usize]
+            }
+
+            /// A positioned box (zed's `absolute`, which is relative to its parent) with a
+            /// background of its own tint.
+            fn boxed(name: &'static str, left: f32, top: f32, size: f32) -> Stateful<Div> {
+                node(name, left, top, size, size)
+                    .debug_selector(move || name.into())
+                    .bg(tint(name))
+            }
+
+            /// An in-flow box that is not positioned: it is never lifted.
+            fn flow(name: &'static str, size: f32) -> Stateful<Div> {
+                let mut element = div()
+                    .id(name)
+                    .w(px(size))
+                    .h(px(size))
+                    .always_hitbox()
+                    .debug_selector(move || name.into())
+                    .bg(tint(name));
+                element.style().position = Some(Position::Static);
+                element
+            }
+
+            /// An in-flow box with no size, for positioned boxes to hang off the same corner.
+            fn corner(name: &'static str) -> Stateful<Div> {
+                let mut element = div().id(name).always_hitbox();
+                element.style().position = Some(Position::Static);
+                element
+            }
+
+            fn context() -> Stateful<Div> {
+                root().bg(tint("root")).stacking_context()
+            }
+
+            /// The tinted quads of the last frame, bottom first.
+            fn painted(window: &AnyWindowHandle, cx: &mut TestAppContext) -> Vec<&'static str> {
+                cx.update_window(*window, |_, window, _| {
+                    window
+                        .painted_quads()
+                        .iter()
+                        .filter_map(|quad| quad.background.as_solid())
+                        .map(name_of)
+                        .collect()
+                })
+                .unwrap()
+            }
+
+            fn bounds_of(
+                window: &AnyWindowHandle,
+                cx: &mut TestAppContext,
+                selector: &'static str,
+            ) -> Bounds<Pixels> {
+                cx.update_window(*window, |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| panic!("no element with debug selector {selector}"))
+            }
+
+            /// The area of the quads of `name` that their content masks let through.
+            fn visible_area(
+                window: &AnyWindowHandle,
+                cx: &mut TestAppContext,
+                name: &'static str,
+            ) -> f32 {
+                cx.update_window(*window, |_, window, _| {
+                    let scale = window.scale_factor();
+                    window
+                        .painted_quads()
+                        .iter()
+                        .filter(|quad| quad.background.as_solid().map(name_of) == Some(name))
+                        .map(|quad| {
+                            let visible = quad.bounds.intersect(&quad.content_mask.bounds);
+                            visible.size.width.0 * visible.size.height.0 / (scale * scale)
+                        })
+                        .sum()
+                })
+                .unwrap()
+            }
+
+            fn redraw(window: &AnyWindowHandle, cx: &mut TestAppContext) {
+                cx.update_window(*window, |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+            }
+
+            #[gpui::test]
+            fn a_z_indexed_descendant_of_an_earlier_sibling_is_above_a_later_sibling(
+                cx: &mut TestAppContext,
+            ) {
+                // "b" is deep in "a" and "c" comes after "a": they overlap at (100..150).
+                let scene = |stacking: bool| {
+                    move || {
+                        let top = root().bg(tint("root"));
+                        let top = if stacking {
+                            top.stacking_context()
+                        } else {
+                            top
+                        };
+                        top.child(
+                            boxed("a", 0., 0., 200.).child(boxed("b", 50., 50., 100.).z_index(5)),
+                        )
+                        .child(boxed("c", 100., 100., 200.))
+                        .into_any_element()
+                    }
+                };
+
+                let window = open_scene(cx, true, scene(true));
+                assert_eq!(painted(&window, cx), ["root", "a", "c", "b"]);
+                assert_eq!(chain_at(&window, cx, 120., 120.), ["b", "a", "root"]);
+                assert_eq!(chain_at(&window, cx, 250., 250.), ["c", "root"]);
+
+                // Without a context every parent orders only its own children.
+                let window = open_scene(cx, true, scene(false));
+                assert_eq!(painted(&window, cx), ["root", "a", "b", "c"]);
+                assert_eq!(chain_at(&window, cx, 120., 120.), ["c", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_nested_context_traps_the_z_index_of_what_is_inside_it(cx: &mut TestAppContext) {
+                // "d" has the highest index but belongs to "b", which is below "c".
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(
+                            boxed("b", 0., 0., 300.)
+                                .stacking_context()
+                                .z_index(1)
+                                .child(boxed("d", 0., 0., 200.).z_index(100)),
+                        )
+                        .child(boxed("c", 100., 100., 300.).stacking_context().z_index(2))
+                        .into_any_element()
+                });
+
+                assert_eq!(painted(&window, cx), ["root", "b", "d", "c"]);
+                assert_eq!(chain_at(&window, cx, 150., 150.), ["c", "root"]);
+                assert_eq!(chain_at(&window, cx, 50., 50.), ["d", "b", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_positioned_context_is_lifted_into_the_next_context_out(cx: &mut TestAppContext) {
+                // "c" is below the inner context "b" inside "a" because "a" is a context of its
+                // own with index 1, below the index 2 of "d".
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(
+                            boxed("a", 0., 0., 300.)
+                                .stacking_context()
+                                .z_index(1)
+                                .child(boxed("b", 10., 10., 100.).stacking_context().z_index(3))
+                                .child(boxed("c", 50., 50., 100.).z_index(2)),
+                        )
+                        .child(boxed("d", 40., 40., 200.).z_index(2))
+                        .into_any_element()
+                });
+
+                // Inside "a": c (2) then b (3) would be wrong order for tree: b has 3, above c.
+                assert_eq!(painted(&window, cx), ["root", "a", "c", "b", "d"]);
+                assert_eq!(chain_at(&window, cx, 60., 30.), ["b", "a", "root"]);
+                assert_eq!(chain_at(&window, cx, 100., 100.), ["d", "root"]);
+            }
+
+            #[gpui::test]
+            fn equal_indices_keep_tree_order_across_parents_and_zero_ties_with_auto(
+                cx: &mut TestAppContext,
+            ) {
+                let scene = |first: Option<i32>, second: Option<i32>| {
+                    move || {
+                        let place = |element: Stateful<Div>, z: Option<i32>| match z {
+                            Some(z) => element.z_index(z),
+                            None => element,
+                        };
+                        context()
+                            .child(corner("a").child(place(boxed("b", 0., 0., 100.), first)))
+                            .child(corner("c").child(place(boxed("d", 50., 50., 100.), second)))
+                            .into_any_element()
+                    }
+                };
+
+                let cases: [(Option<i32>, Option<i32>, [&str; 2]); 5] = [
+                    (None, None, ["b", "d"]),
+                    (Some(0), None, ["b", "d"]),
+                    (None, Some(0), ["b", "d"]),
+                    (Some(3), Some(3), ["b", "d"]),
+                    (Some(4), Some(3), ["d", "b"]),
+                ];
+                for (first, second, expected) in cases {
+                    let window = open_scene(cx, true, scene(first, second));
+                    let order: Vec<_> = painted(&window, cx)
+                        .into_iter()
+                        .filter(|name| matches!(*name, "b" | "d"))
+                        .collect();
+                    assert_eq!(order, expected, "{first:?} {second:?}");
+                    let top = *expected.last().unwrap();
+                    assert_eq!(
+                        chain_at(&window, cx, 75., 75.)[0],
+                        top,
+                        "{first:?} {second:?}"
+                    );
+                }
+            }
+
+            #[gpui::test]
+            fn a_negative_index_is_above_the_context_background_and_below_its_content(
+                cx: &mut TestAppContext,
+            ) {
+                // "a" has a background and is not positioned, so it paints over "b", its own
+                // child, which is lifted to a level below it.
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(flow("a", 300.).child(boxed("b", 10., 10., 100.).z_index(-1)))
+                        .into_any_element()
+                });
+
+                assert_eq!(painted(&window, cx), ["root", "b", "a"]);
+                assert_eq!(chain_at(&window, cx, 50., 50.), ["a", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_negative_index_is_hit_below_an_element_that_does_not_take_the_pointer(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(
+                            flow("a", 300.)
+                                .pointer_events_none()
+                                .child(boxed("b", 10., 10., 100.).z_index(-1)),
+                        )
+                        .into_any_element()
+                });
+
+                // "b" is listed before its parent "a" now, and the chain still finds it.
+                assert_eq!(chain_at(&window, cx, 50., 50.), ["b", "a", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_lifted_element_keeps_the_scroll_offset_and_clip_of_the_scroller_it_is_in(
+                cx: &mut TestAppContext,
+            ) {
+                let handle = ScrollHandle::new();
+                let window = open_scene(cx, true, {
+                    let handle = handle.clone();
+                    move || {
+                        let mut scroller = flow("a", 100.)
+                            .ml(px(200.))
+                            .mt(px(200.))
+                            .overflow_y_scroll()
+                            .track_scroll(&handle);
+                        scroller.style().position = Some(Position::Static);
+                        context()
+                            .child(
+                                scroller
+                                    .child(div().h(px(1000.)).w(px(10.)))
+                                    .child(boxed("b", 10., 60., 150.).z_index(1)),
+                            )
+                            .into_any_element()
+                    }
+                });
+                assert_eq!(
+                    bounds_of(&window, cx, "b").origin,
+                    point(px(210.), px(260.))
+                );
+                // Clipped by the scroller on the right and at the bottom.
+                assert_eq!(visible_area(&window, cx, "b"), 90. * 40.);
+
+                handle.set_offset(point(px(0.), px(-30.)));
+                redraw(&window, cx);
+
+                assert_eq!(
+                    bounds_of(&window, cx, "b").origin,
+                    point(px(210.), px(230.))
+                );
+                assert_eq!(visible_area(&window, cx, "b"), 90. * 70.);
+                assert_eq!(chain_at(&window, cx, 250., 250.), ["b", "a", "root"]);
+                assert_eq!(chain_at(&window, cx, 250., 350.), ["root"]);
+            }
+
+            #[gpui::test]
+            fn an_escaping_lifted_element_still_escapes_the_static_scroller(
+                cx: &mut TestAppContext,
+            ) {
+                let handle = ScrollHandle::new();
+                let window = open_scene(cx, true, {
+                    let handle = handle.clone();
+                    move || {
+                        let mut scroller = flow("a", 100.)
+                            .ml(px(200.))
+                            .mt(px(200.))
+                            .overflow_y_scroll()
+                            .track_scroll(&handle);
+                        scroller.style().position = Some(Position::Static);
+                        let mut escaped = boxed("b", 10., 60., 150.).z_index(1);
+                        escaped.style().position = Some(Position::AbsoluteInAncestor);
+                        context()
+                            .child(scroller.child(div().h(px(1000.)).w(px(10.))).child(escaped))
+                            .into_any_element()
+                    }
+                });
+                handle.set_offset(point(px(0.), px(-30.)));
+                redraw(&window, cx);
+
+                assert_eq!(bounds_of(&window, cx, "b").origin, point(px(10.), px(60.)));
+                assert_eq!(visible_area(&window, cx, "b"), 150. * 150.);
+                assert_eq!(chain_at(&window, cx, 20., 70.), ["b", "a", "root"]);
+            }
+
+            #[gpui::test]
+            fn the_chain_of_a_lifted_element_includes_its_ancestors_in_the_tree(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(
+                            flow("a", 300.)
+                                .child(flow("b", 200.).child(boxed("c", 10., 10., 50.).z_index(1))),
+                        )
+                        .child(boxed("d", 100., 100., 50.))
+                        .into_any_element()
+                });
+
+                assert_eq!(chain_at(&window, cx, 20., 20.), ["c", "b", "a", "root"]);
+                assert_eq!(chain_at(&window, cx, 120., 120.), ["d", "root"]);
+            }
+
+            /// A layout root, like the rows of a list: its own positioned boxes belong to a
+            /// context inside it, never to the one around it.
+            struct LayoutRoot {
+                child: Option<AnyElement>,
+            }
+
+            impl IntoElement for LayoutRoot {
+                type Element = Self;
+
+                fn into_element(self) -> Self::Element {
+                    self
+                }
+            }
+
+            impl Element for LayoutRoot {
+                type RequestLayoutState = ();
+                type PrepaintState = ();
+
+                fn id(&self) -> Option<ElementId> {
+                    None
+                }
+
+                fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+                    None
+                }
+
+                fn request_layout(
+                    &mut self,
+                    _: Option<&GlobalElementId>,
+                    _: Option<&InspectorElementId>,
+                    window: &mut Window,
+                    cx: &mut App,
+                ) -> (LayoutId, ()) {
+                    let mut style = Style::default();
+                    style.size = size(px(400.).into(), px(400.).into());
+                    (window.request_layout(style, None, cx), ())
+                }
+
+                fn prepaint(
+                    &mut self,
+                    _: Option<&GlobalElementId>,
+                    _: Option<&InspectorElementId>,
+                    bounds: Bounds<Pixels>,
+                    _: &mut (),
+                    window: &mut Window,
+                    cx: &mut App,
+                ) {
+                    self.child.as_mut().unwrap().prepaint_as_root(
+                        bounds.origin,
+                        bounds.size.into(),
+                        window,
+                        cx,
+                    );
+                }
+
+                fn paint(
+                    &mut self,
+                    _: Option<&GlobalElementId>,
+                    _: Option<&InspectorElementId>,
+                    _: Bounds<Pixels>,
+                    _: &mut (),
+                    _: &mut (),
+                    window: &mut Window,
+                    cx: &mut App,
+                ) {
+                    self.child.as_mut().unwrap().paint(window, cx);
+                }
+            }
+
+            #[gpui::test]
+            fn nothing_is_lifted_out_of_a_layout_root(cx: &mut TestAppContext) {
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(LayoutRoot {
+                            child: Some(
+                                flow("a", 300.)
+                                    .child(
+                                        boxed("b", 0., 0., 200.)
+                                            .child(boxed("c", 50., 50., 100.).z_index(5)),
+                                    )
+                                    .child(boxed("d", 100., 100., 200.))
+                                    .into_any_element(),
+                            ),
+                        })
+                        .into_any_element()
+                });
+
+                // As in a tree with no context: "d" comes after "c" and covers it.
+                assert_eq!(painted(&window, cx), ["root", "a", "b", "c", "d"]);
+                assert_eq!(chain_at(&window, cx, 120., 120.), ["d", "a", "root"]);
+            }
+
+            #[gpui::test]
+            fn nothing_is_lifted_out_of_a_hidden_element(cx: &mut TestAppContext) {
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(
+                            flow("a", 300.)
+                                .invisible()
+                                .child(boxed("b", 10., 10., 100.).z_index(1)),
+                        )
+                        .child(flow("c", 50.))
+                        .into_any_element()
+                });
+
+                assert_eq!(painted(&window, cx), ["root", "c"]);
+            }
+
+            #[gpui::test]
+            fn paint_ranks_apply_without_a_context_and_give_way_to_one(cx: &mut TestAppContext) {
+                let scene = |stacking: bool| {
+                    move || {
+                        let top = root().bg(tint("root")).paint_ranks(vec![0, -1]);
+                        let top = if stacking {
+                            top.stacking_context()
+                        } else {
+                            top
+                        };
+                        top.child(flow("a", 200.))
+                            .child(flow("b", 200.))
+                            .into_any_element()
+                    }
+                };
+
+                let window = open_scene(cx, true, scene(false));
+                assert_eq!(painted(&window, cx), ["root", "b", "a"]);
+                assert_eq!(chain_at(&window, cx, 50., 50.), ["a", "root"]);
+
+                // Everything in a context that is not lifted is painted in tree order.
+                let window = open_scene(cx, true, scene(true));
+                assert_eq!(painted(&window, cx), ["root", "a", "b"]);
+            }
+
+            #[gpui::test]
+            fn a_lifted_element_gets_the_cursor_and_the_mouse_events_above_a_later_sibling(
+                cx: &mut TestAppContext,
+            ) {
+                let pressed = Rc::new(RefCell::new(Vec::new()));
+                let window = open_scene(cx, true, {
+                    let pressed = pressed.clone();
+                    move || {
+                        let log = |name: &'static str| {
+                            let pressed = pressed.clone();
+                            move |_: &MouseDownEvent, _: &mut Window, _: &mut App| {
+                                pressed.borrow_mut().push(name)
+                            }
+                        };
+                        context()
+                            .child(
+                                boxed("a", 0., 0., 200.).child(
+                                    boxed("b", 50., 50., 100.)
+                                        .z_index(5)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(MouseButton::Left, log("b")),
+                                ),
+                            )
+                            .child(
+                                boxed("c", 100., 100., 200.)
+                                    .cursor(CursorStyle::IBeam)
+                                    .on_mouse_down(MouseButton::Left, log("c")),
+                            )
+                            .into_any_element()
+                    }
+                });
+
+                activate(&window, cx);
+                move_to(&window, cx, 120., 120.);
+                assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+                move_to(&window, cx, 250., 250.);
+                assert_eq!(cx.active_cursor(), CursorStyle::IBeam);
+
+                for (x, y) in [(120., 120.), (250., 250.)] {
+                    cx.update_window(window, |_, window, cx| {
+                        window.dispatch_event(
+                            MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: point(px(x), px(y)),
+                                modifiers: Modifiers::none(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                    })
+                    .unwrap();
+                }
+                assert_eq!(*pressed.borrow(), ["b", "c"]);
+            }
+
+            struct CachedInContext {
+                layers: Entity<CachedLayers>,
+                stacking: Rc<Cell<bool>>,
+            }
+
+            impl Render for CachedInContext {
+                fn render(
+                    &mut self,
+                    _window: &mut Window,
+                    _cx: &mut Context<Self>,
+                ) -> impl IntoElement {
+                    let top = root().bg(tint("root"));
+                    let top = if self.stacking.get() {
+                        top.stacking_context()
+                    } else {
+                        top
+                    };
+                    // "b" goes in front of the hitboxes of "host", which the cached view's
+                    // recorded range would not follow.
+                    top.child(boxed("b", 400., 400., 50.).z_index(-1)).child(
+                        node("host", 0., 0., 200., 200.).child(
+                            self.layers
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
+                    )
+                }
+            }
+
+            #[gpui::test]
+            fn a_cached_view_in_a_context_is_prepainted_again_instead_of_reusing_stale_ranges(
+                cx: &mut TestAppContext,
+            ) {
+                let stacking = Rc::new(Cell::new(false));
+                let host = cx.open_window(size(px(800.), px(600.)), {
+                    let stacking = stacking.clone();
+                    move |_, cx| CachedInContext {
+                        layers: cx.new(|_| CachedLayers),
+                        stacking,
+                    }
+                });
+                let window = AnyWindowHandle::from(host);
+                cx.update_window(window, |_, window, cx| {
+                    window.set_dom_hit_testing(true);
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+
+                // The view is reused out of a context first, then in one: either way the range
+                // it records is only good for the frame it was recorded in.
+                for frame in 0..4 {
+                    assert_eq!(
+                        chain_at(&window, cx, 30., 30.),
+                        ["leaf", "host", "root"],
+                        "{frame}"
+                    );
+                    assert_eq!(chain_at(&window, cx, 420., 420.), ["b", "root"], "{frame}");
+                    assert_eq!(chain_at(&window, cx, 350., 350.), ["layer"], "{frame}");
+                    stacking.set(frame >= 1);
+                    host.update(cx, |_, _, cx| cx.notify()).unwrap();
+                    cx.run_until_parked();
+                }
+            }
+
+            #[gpui::test]
+            fn a_lifted_element_receives_key_events_through_its_ancestors_in_the_tree(
+                cx: &mut TestAppContext,
+            ) {
+                let pressed = Rc::new(RefCell::new(Vec::new()));
+                let handle = cx.update(|cx| cx.focus_handle());
+                let window = open_scene(cx, true, {
+                    let pressed = pressed.clone();
+                    let handle = handle.clone();
+                    move || {
+                        let log = |name: &'static str| {
+                            let pressed = pressed.clone();
+                            move |_: &KeyDownEvent, _: &mut Window, _: &mut App| {
+                                pressed.borrow_mut().push(name)
+                            }
+                        };
+                        context()
+                            .on_key_down(log("root"))
+                            .child(
+                                flow("a", 300.).on_key_down(log("a")).child(
+                                    boxed("b", 10., 10., 50.)
+                                        .z_index(1)
+                                        .track_focus(&handle)
+                                        .on_key_down(log("b")),
+                                ),
+                            )
+                            .child(boxed("c", 100., 100., 50.).on_key_down(log("c")))
+                            .into_any_element()
+                    }
+                });
+                cx.update_window(window, |_, window, cx| window.focus(&handle, cx))
+                    .unwrap();
+                redraw(&window, cx);
+
+                cx.update_window(window, |_, window, cx| {
+                    window.dispatch_keystroke(Keystroke::parse("x").unwrap(), cx)
+                })
+                .unwrap();
+
+                // Bubbling follows the tree, not the paint order: "c" is not an ancestor.
+                assert_eq!(*pressed.borrow(), ["b", "a", "root"]);
             }
         }
     }

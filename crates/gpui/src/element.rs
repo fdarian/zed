@@ -117,6 +117,14 @@ pub trait Element: 'static + IntoElement {
         None
     }
 
+    /// The `z-index` of this element if it is drawn in the stacking order of the nearest
+    /// stacking context (see [`crate::Div::stacking_context`]) instead of in its tree position, as
+    /// a CSS positioned element is: its parent hands it over to that context once it is
+    /// prepainted. `None` keeps it in the tree.
+    fn lift_z(&self) -> Option<i32> {
+        None
+    }
+
     /// Once layout has been completed, this method will be called to paint the element to the screen.
     /// The state argument is the same state that was returned from [`Element::request_layout()`].
     fn paint(
@@ -323,6 +331,8 @@ trait ElementObject {
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId;
 
     fn escapes_to(&self) -> Option<Escape>;
+
+    fn lift_z(&self) -> Option<i32>;
 
     fn prepaint(&mut self, window: &mut Window, cx: &mut App);
 
@@ -706,6 +716,10 @@ where
         self.element.escapes_to()
     }
 
+    fn lift_z(&self) -> Option<i32> {
+        self.element.lift_z()
+    }
+
     #[inline]
     fn layout_as_root(
         &mut self,
@@ -740,6 +754,12 @@ impl AnyElement {
     /// by its child's bounds forwards this from [`Element::escapes_to`].
     pub fn escapes_to(&self) -> Option<Escape> {
         self.0.escapes_to()
+    }
+
+    /// What the element stored in this `AnyElement` lifts to. A wrapper that places something by
+    /// its child's bounds forwards this from [`Element::lift_z`].
+    pub fn lift_z(&self) -> Option<i32> {
+        self.0.lift_z()
     }
 
     /// Request the layout ID of the element stored in this `AnyElement`.
@@ -779,7 +799,8 @@ impl AnyElement {
 
     /// Prepaints this element at the given absolute origin. The element is a layout root, so it is
     /// the containing block of the absolutely positioned boxes that have no positioned ancestor
-    /// inside it.
+    /// inside it, and a stacking context of its own: nothing inside it is lifted into a context
+    /// outside.
     /// If any element in the subtree beneath this element is focused, its FocusHandle is returned.
     pub fn prepaint_at(
         &mut self,
@@ -788,7 +809,9 @@ impl AnyElement {
         cx: &mut App,
     ) -> Option<FocusHandle> {
         window.with_absolute_element_offset(origin, |window| {
-            window.with_positioned_frame(|window| self.prepaint(window, cx))
+            window.with_lift_barrier(|window| {
+                window.with_positioned_frame(|window| self.prepaint(window, cx))
+            })
         })
     }
 
@@ -803,7 +826,9 @@ impl AnyElement {
     ) -> Option<FocusHandle> {
         self.layout_as_root(available_space, window, cx);
         window.with_absolute_element_offset(origin, |window| {
-            window.with_positioned_frame(|window| self.prepaint(window, cx))
+            window.with_lift_barrier(|window| {
+                window.with_positioned_frame(|window| self.prepaint(window, cx))
+            })
         })
     }
 }

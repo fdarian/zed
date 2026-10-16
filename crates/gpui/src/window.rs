@@ -999,18 +999,65 @@ pub(crate) struct PositionedFrame {
     element_offset: Point<Pixels>,
 }
 
-pub(crate) struct DeferredDraw {
+/// What an element that is prepainted or painted away from its place in the tree still needs
+/// from the elements around it.
+#[derive(Clone)]
+pub(crate) struct PaintContext {
     current_view: EntityId,
-    priority: usize,
-    parent_node: DispatchNodeId,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
+    rem_size: Pixels,
     visibility: Visibility,
+}
+
+impl PaintContext {
+    fn capture(window: &Window) -> Self {
+        Self {
+            current_view: window.current_view(),
+            element_id_stack: window.element_id_stack.clone(),
+            text_style_stack: window.text_style_stack.clone(),
+            rem_size: window.rem_size(),
+            visibility: window.visibility,
+        }
+    }
+}
+
+/// An element that its parent handed over to the nearest stacking context because it is
+/// positioned: the context paints it, and hit tests its hitboxes, in z-index order after (or
+/// before) its in-flow content. Everything a normal paint of the element from its place in the tree
+/// would have seen is captured when it is handed over.
+pub(crate) struct LiftedElement {
+    pub(crate) element: AnyElement,
+    pub(crate) z: i32,
+    /// Position in the tree among the elements handed over to the same context.
+    ordinal: u32,
+    /// Moved to the context's place in `Frame::hitboxes` once the context has all its entries.
+    hitboxes: Vec<Hitbox>,
+    context: PaintContext,
+    content_mask: ContentMask<Pixels>,
+    image_cache: Option<AnyImageCache>,
+}
+
+#[derive(Default)]
+struct LiftList {
+    entries: Vec<LiftedElement>,
+    next_ordinal: u32,
+}
+
+/// Where an element being lifted started, see [`Window::begin_lift`].
+pub(crate) struct LiftTicket {
+    ordinal: u32,
+    hitboxes_start: usize,
+}
+
+pub(crate) struct DeferredDraw {
+    context: PaintContext,
+    priority: usize,
+    parent_node: DispatchNodeId,
     /// The innermost positioned frame where the draw was deferred, so a box inside the layer still
     /// finds its containing block.
     positioned_frame: Option<PositionedFrame>,
     content_mask: Option<ContentMask<Pixels>>,
-    rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
@@ -1381,6 +1428,9 @@ pub struct Window {
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     /// What the children of each positioned element see, innermost last. Only prepaint reads it.
     pub(crate) positioned_frames: Vec<PositionedFrame>,
+    /// The elements lifted into each stacking context being prepainted, innermost last. `None`
+    /// marks a layout root: nothing is lifted out of it.
+    lift_lists: Vec<Option<LiftList>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -2097,6 +2147,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             positioned_frames: Vec::new(),
+            lift_lists: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3670,6 +3721,7 @@ impl Window {
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
+        debug_assert!(self.lift_lists.is_empty());
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -3863,6 +3915,9 @@ impl Window {
     fn prepaint_deferred_draws(&mut self, cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
         debug_assert!(self.hitbox_parent_stack.is_empty());
+        // A deferred layer is painted above everything, so nothing in it joins a stacking context
+        // of the tree it was deferred from.
+        assert!(self.lift_lists.is_empty());
 
         // Process deferred draws in multiple rounds to support nesting.
         // Each round processes all current deferred draws, which may push new ones.
@@ -3902,18 +3957,18 @@ impl Window {
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
-                        .clone_from(&deferred_draw.element_id_stack);
+                        .clone_from(&deferred_draw.context.element_id_stack);
                     self.text_style_stack
-                        .clone_from(&deferred_draw.text_style_stack);
+                        .clone_from(&deferred_draw.context.text_style_stack);
                     (
                         deferred_draw.element.take(),
                         deferred_draw.parent_node,
-                        deferred_draw.current_view,
-                        deferred_draw.rem_size,
+                        deferred_draw.context.current_view,
+                        deferred_draw.context.rem_size,
                         deferred_draw.absolute_offset,
                         deferred_draw.positioned_frame,
                         deferred_draw.prepaint_range.clone(),
-                        deferred_draw.visibility,
+                        deferred_draw.context.visibility,
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
@@ -3961,7 +4016,7 @@ impl Window {
         for deferred_draw_ix in traversal_order {
             let mut deferred_draw = &mut deferred_draws[deferred_draw_ix];
             self.element_id_stack
-                .clone_from(&deferred_draw.element_id_stack);
+                .clone_from(&deferred_draw.context.element_id_stack);
             self.next_frame
                 .dispatch_tree
                 .set_active_node(deferred_draw.parent_node);
@@ -3969,10 +4024,10 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_visibility(deferred_draw.visibility, |window| {
+                self.with_rendered_view(deferred_draw.context.current_view, |window| {
+                    window.with_visibility(deferred_draw.context.visibility, |window| {
                         window.with_content_mask(content_mask, |window| {
-                            window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                            window.with_rem_size(Some(deferred_draw.context.rem_size), |window| {
                                 element.paint(window, cx);
                             });
                         })
@@ -4055,14 +4110,10 @@ impl Window {
                 [range.start.deferred_draws_index..range.end.deferred_draws_index]
                 .iter()
                 .map(|deferred_draw| DeferredDraw {
-                    current_view: deferred_draw.current_view,
+                    context: deferred_draw.context.clone(),
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
-                    element_id_stack: deferred_draw.element_id_stack.clone(),
-                    text_style_stack: deferred_draw.text_style_stack.clone(),
-                    visibility: deferred_draw.visibility,
                     positioned_frame: deferred_draw.positioned_frame,
                     content_mask: deferred_draw.content_mask,
-                    rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
@@ -4267,6 +4318,148 @@ impl Window {
                 None => (viewport, Point::default()),
             },
         }
+    }
+
+    /// Whether a positioned element prepainted now is handed over to a stacking context.
+    pub(crate) fn lifting(&self) -> bool {
+        matches!(self.lift_lists.last(), Some(Some(_)))
+    }
+
+    /// Whether the element being prepainted is inside a stacking context, however many layout
+    /// roots away. What is recorded by position in `Frame::hitboxes` and in the tab stop log is
+    /// then moved when the context finishes.
+    pub(crate) fn in_stacking_context(&self) -> bool {
+        self.lift_lists.iter().any(Option::is_some)
+    }
+
+    /// Runs `f`, the prepaint of a layout root, so that nothing it prepaints is lifted out of it.
+    pub(crate) fn with_lift_barrier<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_prepaint();
+        self.lift_lists.push(None);
+        let result = f(self);
+        let barrier = self.lift_lists.pop();
+        debug_assert!(matches!(barrier, Some(None)));
+        result
+    }
+
+    /// Starts the stacking context whose children are about to be prepainted. Pair with
+    /// [`Window::end_stacking_context`].
+    pub(crate) fn begin_stacking_context(&mut self) {
+        self.invalidator.debug_assert_prepaint();
+        self.lift_lists.push(Some(LiftList::default()));
+    }
+
+    /// Ends the context started last and returns its lifted elements in paint order. Their
+    /// hitboxes go where hit testing must find them: those below the in-flow content right
+    /// after `children_hitboxes_start`, the hitboxes of everything the context prepainted, and
+    /// those above it at the end.
+    pub(crate) fn end_stacking_context(
+        &mut self,
+        children_hitboxes_start: usize,
+    ) -> Vec<LiftedElement> {
+        self.invalidator.debug_assert_prepaint();
+        let mut entries = match self.lift_lists.pop() {
+            Some(Some(list)) => list.entries,
+            _ => panic!("end_stacking_context without begin_stacking_context"),
+        };
+        entries.sort_by_key(|entry| (entry.z, entry.ordinal));
+        let first_above = entries.partition_point(|entry| entry.z < 0);
+        let hitboxes = &mut self.next_frame.hitboxes;
+        let mut below = Vec::new();
+        for entry in &mut entries[..first_above] {
+            below.append(&mut entry.hitboxes);
+        }
+        for entry in &mut entries[first_above..] {
+            hitboxes.append(&mut entry.hitboxes);
+        }
+        hitboxes.splice(children_hitboxes_start..children_hitboxes_start, below);
+        self.next_frame.hitboxes_changed();
+        entries
+    }
+
+    /// Call before prepainting an element whose parent will hand it to the stacking context, so
+    /// that it counts in tree order before the elements inside it.
+    pub(crate) fn begin_lift(&mut self) -> LiftTicket {
+        self.invalidator.debug_assert_prepaint();
+        let list = match self.lift_lists.last_mut() {
+            Some(Some(list)) => list,
+            _ => panic!("begin_lift outside a stacking context"),
+        };
+        let ordinal = list.next_ordinal;
+        list.next_ordinal += 1;
+        LiftTicket {
+            ordinal,
+            hitboxes_start: self.next_frame.hitboxes.len(),
+        }
+    }
+
+    /// Hands the prepainted `element` to the stacking context with its hitboxes, and returns the
+    /// ordinal its parent identifies it by. Call where the element was prepainted: what is
+    /// captured here is what its parent's children are painted with.
+    pub(crate) fn finish_lift(&mut self, ticket: LiftTicket, z: i32, element: AnyElement) -> u32 {
+        self.invalidator.debug_assert_prepaint();
+        let hitboxes = self.next_frame.hitboxes.split_off(ticket.hitboxes_start);
+        self.next_frame.hitboxes_changed();
+        let entry = LiftedElement {
+            element,
+            z,
+            ordinal: ticket.ordinal,
+            hitboxes,
+            context: PaintContext::capture(self),
+            content_mask: self.content_mask(),
+            image_cache: self.image_cache_stack.last().cloned(),
+        };
+        match self.lift_lists.last_mut() {
+            Some(Some(list)) => list.entries.push(entry),
+            _ => unreachable!("begin_lift checked for the list"),
+        }
+        ticket.ordinal
+    }
+
+    /// Paints an element that was lifted out of the tree as it would have been painted from its
+    /// place there. `context_node` is the dispatch node of the stacking context painting it, made
+    /// the active node again afterwards.
+    pub(crate) fn paint_lifted(
+        &mut self,
+        entry: &mut LiftedElement,
+        context_node: DispatchNodeId,
+        cx: &mut App,
+    ) {
+        self.invalidator.debug_assert_paint();
+        mem::swap(
+            &mut self.element_id_stack,
+            &mut entry.context.element_id_stack,
+        );
+        mem::swap(
+            &mut self.text_style_stack,
+            &mut entry.context.text_style_stack,
+        );
+        let current_view = entry.context.current_view;
+        let rem_size = entry.context.rem_size;
+        let visibility = entry.context.visibility;
+        let content_mask = entry.content_mask;
+        let image_cache = entry.image_cache.take();
+        let element = &mut entry.element;
+        self.with_rendered_view(current_view, |window| {
+            window.with_visibility(visibility, |window| {
+                window.with_rem_size(Some(rem_size), |window| {
+                    window.with_image_cache(image_cache, |window| {
+                        window.with_replaced_content_mask(content_mask, |window| {
+                            element.paint(window, cx)
+                        })
+                    })
+                })
+            })
+        });
+        mem::swap(
+            &mut self.element_id_stack,
+            &mut entry.context.element_id_stack,
+        );
+        mem::swap(
+            &mut self.text_style_stack,
+            &mut entry.context.text_style_stack,
+        );
+        self.next_frame.dispatch_tree.set_active_node(context_node);
     }
 
     /// Updates the global element offset relative to the current offset. This is used to implement
@@ -4671,14 +4864,10 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
-            current_view: self.current_view(),
+            context: PaintContext::capture(self),
             parent_node,
-            element_id_stack: self.element_id_stack.clone(),
-            text_style_stack: self.text_style_stack.clone(),
-            visibility: self.visibility,
             positioned_frame: self.positioned_frames.last().copied(),
             content_mask,
-            rem_size: self.rem_size(),
             priority,
             element: Some(element),
             absolute_offset,
@@ -8172,7 +8361,7 @@ mod tests {
     use super::{Frame, Hitbox, HitboxId};
     use crate::util::FluentBuilder as _;
     use crate::{
-        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, Context, ContentMask,
+        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, ContentMask, Context,
         DispatchTree, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
         FileDropEvent, FocusHandle, HitboxBehavior, InputEvent as _, InteractiveElement as _,
         IntoElement, Keymap, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
@@ -9287,10 +9476,17 @@ mod tests {
         ]);
 
         for dom in [true, false] {
-            assert_eq!(hit_ids(&frame, 50., 50., dom).first(), Some(&3), "dom: {dom}");
+            assert_eq!(
+                hit_ids(&frame, 50., 50., dom).first(),
+                Some(&3),
+                "dom: {dom}"
+            );
             // The corner is outside the ellipse of 1, two parents up from 3.
-            assert_eq!(hit_ids(&frame, 5., 5., dom), Vec::<u64>::new(), "dom: {dom}");
+            assert_eq!(
+                hit_ids(&frame, 5., 5., dom),
+                Vec::<u64>::new(),
+                "dom: {dom}"
+            );
         }
     }
-
 }
