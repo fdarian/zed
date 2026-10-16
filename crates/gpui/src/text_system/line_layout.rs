@@ -138,6 +138,42 @@ fn is_cjk(character: char) -> bool {
     )
 }
 
+/// Extra inline advance around a byte range of a line of text, as the padding,
+/// border and margin of a CSS inline box with `box-decoration-break: slice` add:
+/// `leading` before the range's first glyph and `trailing` after its last. Later
+/// glyphs are pushed right by both, the line is as much wider, and wrapping and
+/// every x to index mapping count them. Where a range crosses a soft wrap the
+/// insets stay at its two ends, and where it crosses a `\n` each paragraph gets
+/// the end that falls in it.
+///
+/// A range that starts or ends inside a glyph that spans more than one character,
+/// such as a ligature, belongs to the glyphs that start inside it. Text is shaped
+/// in separate font runs at the ends of a range, which stops a ligature from
+/// crossing them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TextInset {
+    /// The bytes of the text this inset surrounds.
+    pub range: Range<usize>,
+    /// The advance added before the first glyph of the range.
+    pub leading: Pixels,
+    /// The advance added after the last glyph of the range.
+    pub trailing: Pixels,
+}
+
+/// The insets a single glyph of a laid out line carries, summed over every
+/// [`TextInset`] that starts or ends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlyphInset {
+    /// Which glyph of the line this is, counting through all its runs.
+    pub glyph_ix: usize,
+    /// The index of the glyph in the text.
+    pub index: usize,
+    /// The advance between the glyph's position and the glyph itself.
+    pub leading: Pixels,
+    /// The advance between the end of the glyph and the position of the next.
+    pub trailing: Pixels,
+}
+
 /// Whether the character hangs at the end of a line.
 fn hangs(character: char) -> bool {
     matches!(character, ' ' | '\t')
@@ -341,10 +377,11 @@ impl LineLayout {
         (left, right)
     }
 
-    /// With a `tab_stop`, also returns the x of every glyph, and then of the end
-    /// of the line, after each tab character has advanced to its tab stop. The
-    /// stops are measured from the start of the wrapped line the tab is on, so
-    /// where the lines break decides where the tabs end.
+    /// With a `tab_stop` or `insets`, also returns the x of every glyph, and then
+    /// of the end of the line, after each tab character has advanced to its tab
+    /// stop and each inset has pushed the glyphs after it. The stops are measured
+    /// from the start of the wrapped line the tab is on, so where the lines break
+    /// decides where the tabs end.
     fn compute_wrap_boundaries(
         &self,
         text: &str,
@@ -352,6 +389,7 @@ impl LineLayout {
         max_lines: Option<usize>,
         options: TextLayoutOptions,
         tab_stop: Option<TabStopFor<'_>>,
+        insets: &[TextInset],
     ) -> WrapComputation {
         let hang = options.spaces_hang();
         let keep_all = options.word_break == WordBreak::KeepAll;
@@ -369,7 +407,7 @@ impl LineLayout {
         };
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
-        let mut positions = GlyphPositions::new(self, text, tab_stop, options);
+        let mut positions = GlyphPositions::new(self, text, tab_stop, options, insets);
         let mut placed = 0;
 
         for ix in 0..positions.glyphs.len() {
@@ -450,10 +488,12 @@ impl LineLayout {
         } else {
             SmallVec::new()
         };
+        let (tabbed_x, glyph_insets) = positions.into_placed();
         WrapComputation {
             boundaries,
-            tabbed_x: positions.into_tabbed_x(),
+            tabbed_x,
             hanging_widths,
+            glyph_insets,
         }
     }
 
@@ -489,10 +529,12 @@ impl LineLayout {
 
 struct WrapComputation {
     boundaries: SmallVec<[WrapBoundary; 1]>,
-    /// With tab stops, the x of every glyph, and then of the end of the line.
+    /// With tab stops or insets, the x of every glyph, and then of the end of the
+    /// line.
     tabbed_x: Option<Vec<Pixels>>,
     /// How much of each line hangs, or nothing when spaces do not hang.
     hanging_widths: SmallVec<[Pixels; 1]>,
+    glyph_insets: Vec<GlyphInset>,
 }
 
 struct WrapGlyph {
@@ -506,19 +548,65 @@ struct WrapGlyph {
 }
 
 /// The x of each glyph of a line and then of its end. They are the shaped
-/// ones, unless the line has tab stops.
+/// ones, unless the line has tab stops or insets.
 struct GlyphPositions<'a> {
     glyphs: Vec<WrapGlyph>,
     shaped_width: Pixels,
     tabbed: Option<TabbedPositions<'a>>,
+    /// Sorted by glyph.
+    insets: Vec<GlyphInset>,
 }
 
 struct TabbedPositions<'a> {
-    tab_stop: TabStopFor<'a>,
+    tab_stop: Option<TabStopFor<'a>>,
     /// Final x per glyph, then the end of the line.
     x: Vec<Pixels>,
-    /// What the tabs before each glyph added to its shaped x.
+    /// What the tabs and insets before each glyph added to its shaped x.
     shift: Vec<Pixels>,
+}
+
+/// The insets that each glyph of `layout` carries, in glyph order. The leading
+/// inset of a range goes to the first glyph that starts inside it and the
+/// trailing one to the last, so a range with no glyph of its own adds nothing.
+fn glyph_insets(layout: &LineLayout, insets: &[TextInset]) -> Vec<GlyphInset> {
+    if insets.is_empty() {
+        return Vec::new();
+    }
+    let indices: Vec<usize> = layout
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+        .collect();
+    let mut glyph_insets: Vec<GlyphInset> = Vec::new();
+    for inset in insets {
+        let first = indices.partition_point(|index| *index < inset.range.start);
+        let end = indices.partition_point(|index| *index < inset.range.end);
+        if first == end {
+            continue;
+        }
+        let last = end - 1;
+        for (glyph_ix, leading, trailing) in [
+            (first, inset.leading, Pixels::ZERO),
+            (last, Pixels::ZERO, inset.trailing),
+        ] {
+            glyph_insets.push(GlyphInset {
+                glyph_ix,
+                index: indices[glyph_ix],
+                leading,
+                trailing,
+            });
+        }
+    }
+    glyph_insets.sort_by_key(|inset| inset.glyph_ix);
+    glyph_insets.dedup_by(|later, earlier| {
+        let same_glyph = later.glyph_ix == earlier.glyph_ix;
+        if same_glyph {
+            earlier.leading += later.leading;
+            earlier.trailing += later.trailing;
+        }
+        same_glyph
+    });
+    glyph_insets
 }
 
 impl<'a> GlyphPositions<'a> {
@@ -527,6 +615,7 @@ impl<'a> GlyphPositions<'a> {
         text: &str,
         tab_stop: Option<TabStopFor<'a>>,
         options: TextLayoutOptions,
+        insets: &[TextInset],
     ) -> Self {
         let tab_is_space = tab_stop.is_some() || options.spaces_hang() || options.break_spaces;
         let glyphs: Vec<WrapGlyph> = layout
@@ -553,7 +642,8 @@ impl<'a> GlyphPositions<'a> {
                 })
             })
             .collect();
-        let tabbed = tab_stop.map(|tab_stop| {
+        let insets = glyph_insets(layout, insets);
+        let tabbed = (tab_stop.is_some() || !insets.is_empty()).then(|| {
             let mut x: Vec<Pixels> = glyphs.iter().map(|glyph| glyph.shaped_x).collect();
             x.push(layout.width);
             TabbedPositions {
@@ -566,6 +656,7 @@ impl<'a> GlyphPositions<'a> {
             glyphs,
             shaped_width: layout.width,
             tabbed,
+            insets,
         }
     }
 
@@ -597,16 +688,24 @@ impl<'a> GlyphPositions<'a> {
             .glyphs
             .get(ix)
             .map_or(self.shaped_width, |glyph| glyph.shaped_x);
-        let stop = previous
-            .is_tab
-            .then(|| (tabbed.tab_stop)(previous.font_id))
-            .flatten();
+        let (leading, trailing) = match self
+            .insets
+            .binary_search_by_key(&(ix - 1), |inset| inset.glyph_ix)
+        {
+            Ok(inset) => (self.insets[inset].leading, self.insets[inset].trailing),
+            Err(_) => (Pixels::ZERO, Pixels::ZERO),
+        };
+        let stop = tabbed
+            .tab_stop
+            .filter(|_| previous.is_tab)
+            .and_then(|tab_stop| tab_stop(previous.font_id));
         if let Some(stop) = stop {
-            let previous_x = tabbed.x[ix - 1];
-            tabbed.x[ix] = previous_x + advance_to_tab_stop(previous_x - line_start_x, stop);
+            // The tab starts after its own leading inset, and its stop counts from there.
+            let pen = tabbed.x[ix - 1] + leading;
+            tabbed.x[ix] = pen + advance_to_tab_stop(pen - line_start_x, stop) + trailing;
             tabbed.shift[ix] = tabbed.x[ix] - shaped_x;
         } else {
-            tabbed.shift[ix] = tabbed.shift[ix - 1];
+            tabbed.shift[ix] = tabbed.shift[ix - 1] + leading + trailing;
             tabbed.x[ix] = shaped_x + tabbed.shift[ix];
         }
     }
@@ -631,8 +730,8 @@ impl<'a> GlyphPositions<'a> {
             .collect()
     }
 
-    fn into_tabbed_x(self) -> Option<Vec<Pixels>> {
-        self.tabbed.map(|tabbed| tabbed.x)
+    fn into_placed(self) -> (Option<Vec<Pixels>>, Vec<GlyphInset>) {
+        (self.tabbed.map(|tabbed| tabbed.x), self.insets)
     }
 }
 
@@ -651,6 +750,10 @@ pub struct WrappedLineLayout {
     /// How wide the spaces that hang at the end of each wrapped line are, which
     /// alignment leaves out. Empty when the layout does not hang spaces.
     pub hanging_widths: SmallVec<[Pixels; 1]>,
+
+    /// The insets of the glyphs that have any, in glyph order. Empty when the
+    /// line was laid out without insets.
+    pub insets: Vec<GlyphInset>,
 }
 
 /// A boundary at which a line was wrapped
@@ -950,6 +1053,7 @@ impl LineLayoutCache {
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
         options: TextLayoutOptions,
+        insets: &[TextInset],
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
@@ -984,6 +1088,7 @@ impl LineLayoutCache {
             max_lines,
             force_width: None,
             options,
+            insets,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -1006,15 +1111,18 @@ impl LineLayoutCache {
             let tab_stop = options
                 .tab_size
                 .map(|tab_size| self.tab_stop_resolver(tab_size, font_size));
-            let needs_pass =
-                tab_stop.is_some() || wrap_width.is_some() || options.hang_trailing_spaces;
-            let (wrap_boundaries, unwrapped_layout, hanging_widths) = if needs_pass {
+            let needs_pass = tab_stop.is_some()
+                || wrap_width.is_some()
+                || options.hang_trailing_spaces
+                || !insets.is_empty();
+            let (wrap_boundaries, unwrapped_layout, hanging_widths, glyph_insets) = if needs_pass {
                 let computation = shaped_layout.compute_wrap_boundaries(
                     text.as_ref(),
                     wrap_width,
                     max_lines,
                     options,
                     tab_stop.as_ref().map(|tab_stop| tab_stop as TabStopFor<'_>),
+                    insets,
                 );
                 let unwrapped_layout = match computation.tabbed_x {
                     Some(x) => Arc::new(shaped_layout.with_x_positions(&x)),
@@ -1024,15 +1132,17 @@ impl LineLayoutCache {
                     computation.boundaries,
                     unwrapped_layout,
                     computation.hanging_widths,
+                    computation.glyph_insets,
                 )
             } else {
-                (SmallVec::new(), shaped_layout, SmallVec::new())
+                (SmallVec::new(), shaped_layout, SmallVec::new(), Vec::new())
             };
             let layout = Arc::new(WrappedLineLayout {
                 unwrapped_layout,
                 wrap_boundaries,
                 wrap_width,
                 hanging_widths,
+                insets: glyph_insets,
             });
             let key = Arc::new(CacheKey {
                 text,
@@ -1042,6 +1152,7 @@ impl LineLayoutCache {
                 max_lines,
                 force_width: None,
                 options,
+                insets: insets.into(),
             });
 
             let mut current_frame = self.current_frame.write();
@@ -1115,6 +1226,7 @@ impl LineLayoutCache {
             max_lines: None,
             force_width,
             options: TextLayoutOptions::default(),
+            insets: &[],
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -1145,6 +1257,7 @@ impl LineLayoutCache {
                 max_lines: None,
                 force_width,
                 options: TextLayoutOptions::default(),
+                insets: Box::default(),
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -1357,6 +1470,7 @@ struct CacheKey {
     max_lines: Option<usize>,
     force_width: Option<Pixels>,
     options: TextLayoutOptions,
+    insets: Box<[TextInset]>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -1369,6 +1483,7 @@ struct CacheKeyRef<'a> {
     max_lines: Option<usize>,
     force_width: Option<Pixels>,
     options: TextLayoutOptions,
+    insets: &'a [TextInset],
 }
 
 #[derive(Clone, Debug)]
@@ -1463,6 +1578,7 @@ impl AsCacheKeyRef for CacheKey {
             max_lines: self.max_lines,
             force_width: self.force_width,
             options: self.options,
+            insets: &self.insets,
         }
     }
 }
@@ -1635,12 +1751,14 @@ mod tests {
             None,
             TextLayoutOptions::default(),
             Some(&tab_stop),
+            &[],
         );
         WrappedLineLayout {
             unwrapped_layout: Arc::new(shaped.with_x_positions(&computation.tabbed_x.unwrap())),
             wrap_boundaries: computation.boundaries,
             wrap_width: wrap_width.map(px),
             hanging_widths: computation.hanging_widths,
+            insets: computation.glyph_insets,
         }
     }
 
@@ -1807,10 +1925,16 @@ mod tests {
         let shaped = monospace_layout(text, 10.);
         let tab_stop = |_: FontId| Some(px(40.));
         let options = TextLayoutOptions::default();
-        let with_stops =
-            shaped.compute_wrap_boundaries(text, Some(px(65.)), None, options, Some(&tab_stop));
+        let with_stops = shaped.compute_wrap_boundaries(
+            text,
+            Some(px(65.)),
+            None,
+            options,
+            Some(&tab_stop),
+            &[],
+        );
         let without_stops =
-            shaped.compute_wrap_boundaries(text, Some(px(65.)), None, options, None);
+            shaped.compute_wrap_boundaries(text, Some(px(65.)), None, options, None, &[]);
         assert_eq!(with_stops.boundaries, without_stops.boundaries);
         assert_eq!(without_stops.tabbed_x, None);
         let shaped_x: Vec<Pixels> = shaped.runs[0]
@@ -1850,12 +1974,13 @@ mod tests {
     ) -> WrappedLineLayout {
         let shaped = monospace_layout(text, 10.);
         let computation =
-            shaped.compute_wrap_boundaries(text, wrap_width.map(px), None, options, None);
+            shaped.compute_wrap_boundaries(text, wrap_width.map(px), None, options, None, &[]);
         WrappedLineLayout {
             unwrapped_layout: Arc::new(shaped),
             wrap_boundaries: computation.boundaries,
             wrap_width: wrap_width.map(px),
             hanging_widths: computation.hanging_widths,
+            insets: computation.glyph_insets,
         }
     }
 
@@ -1962,8 +2087,14 @@ mod tests {
             hang_trailing_spaces: true,
             ..Default::default()
         };
-        let hung =
-            shaped.compute_wrap_boundaries(text, Some(px(50.)), None, hanging, Some(&tab_stop));
+        let hung = shaped.compute_wrap_boundaries(
+            text,
+            Some(px(50.)),
+            None,
+            hanging,
+            Some(&tab_stop),
+            &[],
+        );
         // The tab ends at 80, past the 50 wide line, but it hangs.
         assert_eq!(hung.boundaries.len(), 1);
         assert_eq!(hung.hanging_widths.to_vec(), pixels(&[40., 0.]));
@@ -1974,6 +2105,7 @@ mod tests {
             None,
             TextLayoutOptions::default(),
             Some(&tab_stop),
+            &[],
         );
         // The tab wraps by itself and starts a line.
         assert_eq!(unhung.boundaries.len(), 2);
@@ -2077,8 +2209,14 @@ mod tests {
             break_spaces: true,
             ..Default::default()
         };
-        let broken =
-            shaped.compute_wrap_boundaries(text, Some(px(50.)), None, options, Some(&tab_stop));
+        let broken = shaped.compute_wrap_boundaries(
+            text,
+            Some(px(50.)),
+            None,
+            options,
+            Some(&tab_stop),
+            &[],
+        );
         // The tab ends at 80, past the line, so it begins the next one, and
         // neither line hangs it.
         assert_eq!(broken.boundaries.len(), 2);
@@ -2221,7 +2359,7 @@ mod tests {
             ..Default::default()
         };
         let computation =
-            shaped.compute_wrap_boundaries(text, Some(px(35.)), Some(2), options, None);
+            shaped.compute_wrap_boundaries(text, Some(px(35.)), Some(2), options, None, &[]);
         assert_eq!(computation.boundaries.len(), 1);
     }
 
@@ -2296,5 +2434,397 @@ mod tests {
         let slash = "中中/中中";
         let kept = word_break_line(slash, 35., WordBreak::KeepAll, OverflowWrap::Normal);
         assert_eq!(boundary_chars(&kept, slash), vec![2]);
+    }
+
+    fn inset(range: Range<usize>, leading: f32, trailing: f32) -> TextInset {
+        TextInset {
+            range,
+            leading: px(leading),
+            trailing: px(trailing),
+        }
+    }
+
+    /// `text` as ten pixel wide characters, laid out with `insets`, a tab stop
+    /// every `tab_stop` pixels if there is one, and as `options` say.
+    fn inset_line_with(
+        text: &str,
+        wrap_width: Option<f32>,
+        options: TextLayoutOptions,
+        tab_stop: Option<f32>,
+        insets: &[TextInset],
+    ) -> WrappedLineLayout {
+        let shaped = monospace_layout(text, 10.);
+        let resolver = tab_stop.map(|stop| move |_: FontId| Some(px(stop)));
+        let computation = shaped.compute_wrap_boundaries(
+            text,
+            wrap_width.map(px),
+            None,
+            options,
+            resolver.as_ref().map(|resolver| resolver as TabStopFor<'_>),
+            insets,
+        );
+        WrappedLineLayout {
+            unwrapped_layout: Arc::new(match computation.tabbed_x {
+                Some(x) => shaped.with_x_positions(&x),
+                None => shaped,
+            }),
+            wrap_boundaries: computation.boundaries,
+            wrap_width: wrap_width.map(px),
+            hanging_widths: computation.hanging_widths,
+            insets: computation.glyph_insets,
+        }
+    }
+
+    fn inset_line(text: &str, wrap_width: Option<f32>, insets: &[TextInset]) -> WrappedLineLayout {
+        inset_line_with(text, wrap_width, TextLayoutOptions::default(), None, insets)
+    }
+
+    /// The x of each glyph and then of the end of the line.
+    fn x_and_width(layout: &WrappedLineLayout) -> Vec<f32> {
+        let mut x = glyph_x_positions(&layout.unwrapped_layout);
+        x.push(f32::from(layout.unwrapped_layout.width));
+        x
+    }
+
+    #[test]
+    fn test_no_insets_lay_out_as_before() {
+        let tab_stop = |_: FontId| Some(px(40.));
+        let texts = ["aaaa bbbb", "ab\tcd ef", "a  b", "x", ""];
+        let option_sets = [
+            TextLayoutOptions::default(),
+            TextLayoutOptions {
+                hang_trailing_spaces: true,
+                ..Default::default()
+            },
+            TextLayoutOptions {
+                break_spaces: true,
+                word_break: WordBreak::BreakAll,
+                ..Default::default()
+            },
+        ];
+        for text in texts {
+            for options in option_sets {
+                for wrap_width in [None, Some(25.), Some(65.)] {
+                    for stop in [None, Some(&tab_stop as TabStopFor<'_>)] {
+                        let shaped = monospace_layout(text, 10.);
+                        let wrap_width = wrap_width.map(px);
+                        let plain = shaped.compute_wrap_boundaries(
+                            text,
+                            wrap_width,
+                            None,
+                            options,
+                            stop,
+                            &[],
+                        );
+                        assert!(plain.glyph_insets.is_empty());
+                        assert_eq!(plain.tabbed_x.is_some(), stop.is_some());
+
+                        // Insets that add nothing change nothing.
+                        let zero = [inset(0..text.len(), 0., 0.)];
+                        let inset = shaped
+                            .compute_wrap_boundaries(text, wrap_width, None, options, stop, &zero);
+                        assert_eq!(inset.boundaries, plain.boundaries, "{text:?} {options:?}");
+                        assert_eq!(inset.hanging_widths, plain.hanging_widths);
+                        let shaped_x: Vec<Pixels> = shaped.runs[0]
+                            .glyphs
+                            .iter()
+                            .map(|glyph| glyph.position.x)
+                            .chain([shaped.width])
+                            .collect();
+                        let expected = plain.tabbed_x.unwrap_or(shaped_x);
+                        if !text.is_empty() {
+                            assert_eq!(inset.tabbed_x.unwrap(), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_an_inset_widens_the_line_and_pushes_the_glyphs_after_it() {
+        // "cd" is inset: 5 before c, 7 after d.
+        let layout = inset_line("abcdef", None, &[inset(2..4, 5., 7.)]);
+        assert_eq!(x_and_width(&layout), vec![0., 10., 20., 35., 52., 62., 72.]);
+        assert_eq!(layout.width(), px(72.));
+        assert_eq!(
+            layout.insets,
+            vec![
+                GlyphInset {
+                    glyph_ix: 2,
+                    index: 2,
+                    leading: px(5.),
+                    trailing: px(0.)
+                },
+                GlyphInset {
+                    glyph_ix: 3,
+                    index: 3,
+                    leading: px(0.),
+                    trailing: px(7.)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_an_inset_on_one_glyph_has_both_ends() {
+        let layout = inset_line("abc", None, &[inset(1..2, 6., 4.)]);
+        assert_eq!(x_and_width(&layout), vec![0., 10., 30., 40.]);
+        assert_eq!(layout.insets.len(), 1);
+        assert_eq!(layout.insets[0].leading, px(6.));
+        assert_eq!(layout.insets[0].trailing, px(4.));
+    }
+
+    #[test]
+    fn test_x_and_index_agree_across_an_inset() {
+        let layout = inset_line("abcdef", None, &[inset(2..4, 5., 7.)]);
+        let line = &layout.unwrapped_layout;
+        for (index, x) in [(0, 0.), (1, 10.), (2, 20.), (3, 35.), (4, 52.), (5, 62.)] {
+            assert_eq!(line.x_for_index(index), px(x));
+            assert_eq!(line.index_for_x(px(x)), Some(index));
+            assert_eq!(line.closest_index_for_x(px(x)), index);
+        }
+        assert_eq!(line.x_for_index(6), px(72.));
+        // The cell of c holds its leading inset, and d's its trailing one.
+        assert_eq!(line.index_for_x(px(34.9)), Some(2));
+        assert_eq!(line.index_for_x(px(51.9)), Some(3));
+        assert_eq!(line.index_for_x(px(72.)), None);
+        // Between c at 20 and d at 35: the middle is 27.5.
+        assert_eq!(line.closest_index_for_x(px(27.)), 2);
+        assert_eq!(line.closest_index_for_x(px(28.)), 3);
+    }
+
+    #[test]
+    fn test_hit_testing_at_both_edges_of_an_inset_glyph() {
+        // b is 20 wide: 6 of leading inset, the glyph, and 4 of trailing inset.
+        let layout = inset_line("abc", None, &[inset(1..2, 6., 4.)]);
+        let line_height = px(20.);
+        let at = |x: f32| point(px(x), px(5.));
+        assert_eq!(layout.index_for_position(at(9.9), line_height), Ok(0));
+        assert_eq!(layout.index_for_position(at(10.), line_height), Ok(1));
+        assert_eq!(layout.index_for_position(at(29.9), line_height), Ok(1));
+        assert_eq!(layout.index_for_position(at(30.), line_height), Ok(2));
+        assert_eq!(
+            layout.closest_index_for_position(at(19.), line_height),
+            Ok(1)
+        );
+        assert_eq!(
+            layout.closest_index_for_position(at(21.), line_height),
+            Ok(2)
+        );
+        assert_eq!(
+            layout.position_for_index(1, line_height).unwrap().x,
+            px(10.)
+        );
+        assert_eq!(
+            layout.position_for_index(2, line_height).unwrap().x,
+            px(30.)
+        );
+    }
+
+    #[test]
+    fn test_nested_and_adjacent_insets_add() {
+        let layout = inset_line(
+            "abcdefgh",
+            None,
+            &[
+                inset(0..8, 3., 3.),
+                inset(2..4, 5., 5.),
+                // Two insets that start on the same glyph.
+                inset(4..6, 1., 2.),
+                inset(4..5, 3., 0.),
+            ],
+        );
+        assert_eq!(
+            x_and_width(&layout),
+            vec![0., 13., 23., 38., 53., 67., 79., 89., 102.]
+        );
+        let at_four = layout.insets.iter().find(|inset| inset.index == 4).unwrap();
+        assert_eq!((at_four.leading, at_four.trailing), (px(4.), px(0.)));
+        // Adjacent: the trailing inset of one and the leading inset of the next
+        // are both between their glyphs.
+        let adjacent = inset_line("abcd", None, &[inset(0..2, 0., 4.), inset(2..4, 6., 0.)]);
+        assert_eq!(x_and_width(&adjacent), vec![0., 10., 24., 40., 50.]);
+    }
+
+    #[test]
+    fn test_insets_are_given_in_any_order() {
+        let inner_first = [inset(2..4, 5., 5.), inset(0..8, 3., 3.)];
+        let outer_first = [inset(0..8, 3., 3.), inset(2..4, 5., 5.)];
+        assert_eq!(
+            x_and_width(&inset_line("abcdefgh", None, &inner_first)),
+            x_and_width(&inset_line("abcdefgh", None, &outer_first)),
+        );
+    }
+
+    #[test]
+    fn test_an_inset_with_no_glyph_adds_nothing() {
+        let layout = inset_line("abc", None, &[inset(1..1, 6., 4.), inset(5..9, 6., 4.)]);
+        assert_eq!(x_and_width(&layout), vec![0., 10., 20., 30.]);
+        assert!(layout.insets.is_empty());
+    }
+
+    #[test]
+    fn test_a_break_before_the_span_keeps_its_leading_inset_on_the_new_line() {
+        let text = "aaaa bbbb";
+        let line_height = px(20.);
+        let layout = inset_line(text, Some(55.), &[inset(5..9, 10., 0.)]);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        // The first line ends where the span starts, without the inset...
+        assert_eq!(
+            layout.position_for_index(5, line_height).unwrap().x,
+            px(50.)
+        );
+        assert_eq!(layout.unwrapped_layout.x_for_index(5), px(50.));
+        // ...which is at the start of the second, before the first glyph.
+        let line = &layout.unwrapped_layout;
+        assert_eq!(
+            layout.position_for_index(6, line_height),
+            Some(point(px(20.), line_height))
+        );
+        assert_eq!(line.width, px(100.));
+        assert_eq!(layout.insets[0].index, 5);
+        assert_eq!(
+            layout.index_for_position(point(px(5.), line_height + px(1.)), line_height),
+            Ok(5)
+        );
+    }
+
+    #[test]
+    fn test_a_leading_inset_alone_does_not_end_a_line() {
+        // "aaaa " fits in 55, and so would "aaaa" with b's inset, but the inset
+        // belongs to b and goes where b goes.
+        let layout = inset_line("aaaa bbbb", Some(55.), &[inset(5..9, 10., 0.)]);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        let layout = inset_line("aaaa bbbb", Some(65.), &[inset(5..9, 10., 0.)]);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        // Without the inset the same width keeps the line whole.
+        let layout = inset_line("aaaa bbbb", Some(95.), &[]);
+        assert!(boundary_indices(&layout).is_empty());
+    }
+
+    #[test]
+    fn test_a_trailing_inset_that_does_not_fit_wraps_the_last_word() {
+        let text = "aaa bbb";
+        let line_height = px(20.);
+        // 70 wide in 75, but 80 with the closing padding.
+        let plain = inset_line(text, Some(75.), &[]);
+        assert!(boundary_indices(&plain).is_empty());
+        let layout = inset_line(text, Some(75.), &[inset(4..7, 0., 10.)]);
+        assert_eq!(boundary_indices(&layout), vec![4]);
+        // The padding stays after the word, on the second line.
+        assert_eq!(
+            layout.position_for_index(text.len(), line_height),
+            Some(point(px(40.), line_height))
+        );
+        // And the first line is not wider for it.
+        assert_eq!(
+            layout.position_for_index(4, line_height).unwrap().x,
+            px(40.)
+        );
+    }
+
+    #[test]
+    fn test_an_inset_word_that_fits_nowhere_overflows_or_breaks_like_any_word() {
+        let text = "bbbbbbb";
+        let insets = [inset(0..7, 5., 5.)];
+        let breaking = inset_line(text, Some(40.), &insets);
+        // 0, 15, 25, 35, 45: the fourth glyph overflows 40, and then the seventh.
+        assert_eq!(boundary_indices(&breaking), vec![3, 6]);
+        let overflowing = inset_line_with(
+            text,
+            Some(40.),
+            TextLayoutOptions {
+                overflow_wrap: OverflowWrap::Normal,
+                ..Default::default()
+            },
+            None,
+            &insets,
+        );
+        assert!(boundary_indices(&overflowing).is_empty());
+        assert_eq!(overflowing.unwrapped_layout.width, px(80.));
+    }
+
+    #[test]
+    fn test_a_tab_after_an_inset_goes_to_the_stop_from_the_line_start() {
+        // a and b take 10 + 5 + 10 + 5 = 30; the tab goes on to 40.
+        let layout = inset_line_with(
+            "ab\tc",
+            None,
+            TextLayoutOptions::default(),
+            Some(40.),
+            &[inset(0..2, 5., 5.)],
+        );
+        assert_eq!(x_and_width(&layout), vec![0., 15., 30., 40., 50.]);
+    }
+
+    #[test]
+    fn test_a_tab_with_an_inset_starts_after_its_leading_inset() {
+        // The tab starts at 25 and ends on the stop at 40, then its 5 of
+        // trailing inset.
+        let layout = inset_line_with(
+            "ab\tc",
+            None,
+            TextLayoutOptions::default(),
+            Some(40.),
+            &[inset(2..3, 5., 5.)],
+        );
+        assert_eq!(x_and_width(&layout), vec![0., 10., 20., 45., 55.]);
+    }
+
+    #[test]
+    fn test_tab_stops_count_from_the_wrapped_line_with_insets() {
+        // "aaaa" fills the first line; the second starts at b, whose inset moves
+        // it 6 right, and the tab after it goes to 40 from the line start.
+        let text = "aaaa b\tc";
+        let layout = inset_line_with(
+            text,
+            Some(55.),
+            TextLayoutOptions::default(),
+            Some(40.),
+            &[inset(5..6, 6., 0.)],
+        );
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        let line_height = px(20.);
+        assert_eq!(
+            layout.position_for_index(6, line_height),
+            Some(point(px(16.), line_height))
+        );
+        assert_eq!(
+            layout.position_for_index(7, line_height),
+            Some(point(px(40.), line_height))
+        );
+    }
+
+    #[test]
+    fn test_a_hanging_space_hangs_with_its_trailing_inset() {
+        let options = TextLayoutOptions {
+            hang_trailing_spaces: true,
+            ..Default::default()
+        };
+        let layout = inset_line_with(
+            "aaaa bbbb",
+            Some(45.),
+            options,
+            None,
+            &[inset(4..5, 0., 10.)],
+        );
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        assert_eq!(layout.hanging_widths.to_vec(), pixels(&[20., 0.]));
+    }
+
+    #[test]
+    fn test_insets_on_either_side_of_a_wrap_each_keep_their_end() {
+        // The span covers all of "bb cc" and wraps after the space. Its leading
+        // inset is before "bb", its trailing inset after "cc".
+        let text = "bb cc";
+        let line_height = px(20.);
+        let layout = inset_line(text, Some(45.), &[inset(0..5, 8., 6.)]);
+        assert_eq!(boundary_indices(&layout), vec![3]);
+        let position = |index| layout.position_for_index(index, line_height).unwrap();
+        assert_eq!(position(1), point(px(18.), px(0.)));
+        assert_eq!(position(3), point(px(38.), px(0.)));
+        assert_eq!(position(4), point(px(10.), line_height));
+        assert_eq!(position(5), point(px(26.), line_height));
     }
 }

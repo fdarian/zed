@@ -558,6 +558,21 @@ impl WindowTextSystem {
         line_clamp: Option<usize>,
         options: TextLayoutOptions,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_insets(text, font_size, runs, wrap_width, line_clamp, options, &[])
+    }
+
+    /// Like [`Self::shape_text_with_options`], with `insets` around ranges of the
+    /// text. Their ranges are byte ranges of `text`, newlines included.
+    pub fn shape_text_with_insets(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        options: TextLayoutOptions,
+        insets: &[TextInset],
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -618,6 +633,12 @@ impl WindowTextSystem {
                 run_start += run_len_within_line;
             }
 
+            let line_insets = insets_on_line(insets, line_start..line_end);
+            for inset in &line_insets {
+                split_font_run_at(&mut font_runs, inset.range.start);
+                split_font_run_at(&mut font_runs, inset.range.end);
+            }
+
             let layout = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
                 font_size,
@@ -625,6 +646,7 @@ impl WindowTextSystem {
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
                 options,
+                &line_insets,
             );
             wrapped_lines += layout.wrap_boundaries.len();
 
@@ -882,6 +904,60 @@ impl WindowTextSystem {
         self.font_runs_pool.lock().push(font_runs);
 
         layout
+    }
+}
+
+/// The insets of a text, as they apply to the line of it at `line`, in bytes of
+/// the line. An inset that continues past an end of the line keeps only the
+/// advance at the end that is on it.
+fn insets_on_line(insets: &[TextInset], line: Range<usize>) -> Vec<TextInset> {
+    insets
+        .iter()
+        .filter_map(|inset| {
+            let starts_here = (line.start..line.end).contains(&inset.range.start);
+            let ends_here = inset.range.end > line.start && inset.range.end <= line.end;
+            let leading = if starts_here {
+                inset.leading
+            } else {
+                Pixels::ZERO
+            };
+            let trailing = if ends_here {
+                inset.trailing
+            } else {
+                Pixels::ZERO
+            };
+            let start = inset.range.start.max(line.start);
+            let end = inset.range.end.min(line.end);
+            (start < end && (leading != Pixels::ZERO || trailing != Pixels::ZERO)).then(|| {
+                TextInset {
+                    range: start - line.start..end - line.start,
+                    leading,
+                    trailing,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Splits the font run that `at` falls inside, so that no run crosses it. Shaping
+/// does not join the glyphs of two runs, which keeps a ligature from crossing the
+/// end of an inset.
+fn split_font_run_at(font_runs: &mut Vec<FontRun>, at: usize) {
+    let mut run_start = 0;
+    for ix in 0..font_runs.len() {
+        let run = font_runs[ix];
+        if at > run_start && at < run_start + run.len {
+            font_runs[ix].len = at - run_start;
+            font_runs.insert(
+                ix + 1,
+                FontRun {
+                    len: run_start + run.len - at,
+                    font_id: run.font_id,
+                },
+            );
+            return;
+        }
+        run_start += run.len;
     }
 }
 
@@ -1247,5 +1323,205 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inset(range: Range<usize>, leading: f32, trailing: f32) -> TextInset {
+        TextInset {
+            range,
+            leading: px(leading),
+            trailing: px(trailing),
+        }
+    }
+
+    #[test]
+    fn test_an_inset_across_a_newline_keeps_each_end_on_its_own_line() {
+        // "ab\ncd\nef": the inset covers "b\ncd\ne".
+        let insets = [inset(1..7, 5., 7.)];
+        assert_eq!(insets_on_line(&insets, 0..2), vec![inset(1..2, 5., 0.)]);
+        assert!(insets_on_line(&insets, 3..5).is_empty());
+        assert_eq!(insets_on_line(&insets, 6..8), vec![inset(0..1, 0., 7.)]);
+    }
+
+    #[test]
+    fn test_an_inset_ending_where_a_line_ends_is_on_that_line() {
+        let insets = [inset(0..2, 3., 4.)];
+        assert_eq!(insets_on_line(&insets, 0..2), vec![inset(0..2, 3., 4.)]);
+        // Starting at the newline there is nothing of it on the line before.
+        let insets = [inset(2..4, 3., 4.)];
+        assert!(insets_on_line(&insets, 0..2).is_empty());
+        assert_eq!(insets_on_line(&insets, 3..5), vec![inset(0..1, 0., 4.)]);
+    }
+
+    #[test]
+    fn test_insets_that_add_nothing_are_dropped() {
+        assert!(insets_on_line(&[inset(0..2, 0., 0.)], 0..4).is_empty());
+    }
+
+    fn font_runs(lens: &[usize]) -> Vec<FontRun> {
+        lens.iter()
+            .map(|len| FontRun {
+                len: *len,
+                font_id: FontId(0),
+            })
+            .collect()
+    }
+
+    fn lens(font_runs: &[FontRun]) -> Vec<usize> {
+        font_runs.iter().map(|run| run.len).collect()
+    }
+
+    #[test]
+    fn test_a_font_run_splits_where_an_inset_begins_or_ends() {
+        let mut runs = font_runs(&[4, 6]);
+        split_font_run_at(&mut runs, 2);
+        assert_eq!(lens(&runs), vec![2, 2, 6]);
+        split_font_run_at(&mut runs, 7);
+        assert_eq!(lens(&runs), vec![2, 2, 3, 3]);
+        // On a boundary, or at an end, there is nothing to split.
+        for at in [0, 2, 4, 7, 10] {
+            split_font_run_at(&mut runs, at);
+        }
+        assert_eq!(lens(&runs), vec![2, 2, 3, 3]);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod insets_tests {
+    use super::*;
+    use crate::{TestAppContext, font, px};
+
+    fn run(len: usize) -> TextRun {
+        TextRun {
+            len,
+            font: font("Menlo"),
+            ..Default::default()
+        }
+    }
+
+    fn inset(range: Range<usize>, leading: f32, trailing: f32) -> TextInset {
+        TextInset {
+            range,
+            leading: px(leading),
+            trailing: px(trailing),
+        }
+    }
+
+    fn shape(
+        text_system: &WindowTextSystem,
+        text: &str,
+        wrap_width: Option<Pixels>,
+        insets: &[TextInset],
+    ) -> SmallVec<[WrappedLine; 1]> {
+        text_system
+            .shape_text_with_insets(
+                text.to_string().into(),
+                px(16.),
+                &[run(text.len())],
+                wrap_width,
+                None,
+                TextLayoutOptions::default(),
+                insets,
+            )
+            .unwrap()
+    }
+
+    #[crate::test]
+    fn test_shaped_text_is_as_wide_as_its_insets_add(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let plain = shape(&text_system, "abcd", None, &[]);
+            let inset = shape(&text_system, "abcd", None, &[inset(1..3, 5., 7.)]);
+            assert_eq!(inset[0].layout.width(), plain[0].layout.width() + px(12.));
+            let plain_layout = &plain[0].layout.unwrapped_layout;
+            let inset_layout = &inset[0].layout.unwrapped_layout;
+            assert_eq!(inset_layout.x_for_index(1), plain_layout.x_for_index(1));
+            assert_eq!(
+                inset_layout.x_for_index(2),
+                plain_layout.x_for_index(2) + px(5.)
+            );
+            assert_eq!(
+                inset_layout.x_for_index(3),
+                plain_layout.x_for_index(3) + px(12.)
+            );
+        });
+    }
+
+    #[crate::test]
+    fn test_insets_are_part_of_what_a_layout_is_cached_by(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let a = shape(&text_system, "abcd", None, &[inset(1..3, 5., 7.)]);
+            let again = shape(&text_system, "abcd", None, &[inset(1..3, 5., 7.)]);
+            let wider = shape(&text_system, "abcd", None, &[inset(1..3, 5., 9.)]);
+            let elsewhere = shape(&text_system, "abcd", None, &[inset(0..2, 5., 7.)]);
+            let none = shape(&text_system, "abcd", None, &[]);
+            assert!(Arc::ptr_eq(&a[0].layout, &again[0].layout));
+            for other in [&wider, &elsewhere, &none] {
+                assert!(!Arc::ptr_eq(&a[0].layout, &other[0].layout));
+            }
+            assert_eq!(wider[0].layout.width(), a[0].layout.width() + px(2.));
+        });
+    }
+
+    #[crate::test]
+    fn test_an_inset_across_a_newline_has_each_end_on_its_own_line(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let lines = shape(&text_system, "ab\ncd\nef", None, &[inset(1..7, 5., 7.)]);
+            assert_eq!(lines.len(), 3);
+            let ends = |line: &WrappedLine| {
+                line.layout
+                    .insets
+                    .iter()
+                    .map(|inset| (inset.index, inset.leading, inset.trailing))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ends(&lines[0]), vec![(1, px(5.), px(0.))]);
+            assert!(ends(&lines[1]).is_empty());
+            assert_eq!(ends(&lines[2]), vec![(0, px(0.), px(7.))]);
+            let plain = shape(&text_system, "ab\ncd\nef", None, &[]);
+            assert_eq!(lines[0].layout.width(), plain[0].layout.width() + px(5.));
+            assert_eq!(lines[1].layout.width(), plain[1].layout.width());
+            assert_eq!(lines[2].layout.width(), plain[2].layout.width() + px(7.));
+        });
+    }
+
+    #[crate::test]
+    fn test_wrapping_counts_the_insets(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let space = cx
+                .text_system()
+                .advance(cx.text_system().resolve_font(&font("Menlo")), px(16.), ' ')
+                .unwrap()
+                .width;
+            // "aaa bbb" is 7 columns, and fits in 8.
+            let wrap_width = Some(space * 8.);
+            assert!(
+                shape(&text_system, "aaa bbb", wrap_width, &[])[0]
+                    .layout
+                    .wrap_boundaries()
+                    .is_empty()
+            );
+            // The padding after bbb does not, so bbb moves down.
+            let lines = shape(
+                &text_system,
+                "aaa bbb",
+                wrap_width,
+                &[inset(4..7, 0., f32::from(space) * 2.)],
+            );
+            let line = &lines[0].layout;
+            assert_eq!(line.wrap_boundaries().len(), 1);
+            let boundary = line.wrap_boundaries()[0];
+            assert_eq!(
+                line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index,
+                4
+            );
+        });
     }
 }
