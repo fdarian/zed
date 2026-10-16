@@ -1066,6 +1066,40 @@ impl TextLayout {
         extent
     }
 
+    /// The ascent and descent of the font of an inline box with the font size
+    /// `font_size` that spans the byte range `range` of the text, or `None` when no
+    /// glyph is in `range`: the largest among the runs with a glyph in `range` that
+    /// were shaped at `font_size`. When none was, as when the box holds only nested
+    /// boxes with a font size of their own, the metrics of the first run scaled to
+    /// `font_size`.
+    pub fn content_extent(
+        &self,
+        range: Range<usize>,
+        font_size: Pixels,
+    ) -> Option<(Pixels, Pixels)> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+
+        let mut line_start_ix = 0;
+        let mut runs = Vec::new();
+        for line in &element_state.lines {
+            let line_end_ix = line_start_ix + line.len();
+            if range.end <= line_start_ix {
+                break;
+            }
+            if range.start <= line_end_ix {
+                let within_line =
+                    range.start.saturating_sub(line_start_ix)..range.end - line_start_ix;
+                runs.extend(line.layout.runs_in(within_line));
+            }
+            line_start_ix = line_end_ix + 1;
+        }
+
+        crate::ShapedRun::content_extent(runs, font_size)
+    }
+
     /// Retrieve the layout for the line containing the given byte index.
     pub fn line_layout_for_index(&self, index: usize) -> Option<Arc<WrappedLineLayout>> {
         let element_state = self.0.borrow();
@@ -1615,6 +1649,22 @@ mod tests {
             );
             assert_eq!(layout.run_extent(2..3), None);
             assert_eq!(layout.run_extent(5..9), None);
+        }
+
+        #[crate::test]
+        fn the_content_extent_picks_the_runs_of_the_font_size_across_lines(
+            cx: &mut TestAppContext,
+        ) {
+            let layout = two_lines(cx);
+            let lines = layout.line_layouts();
+            let plain = lines[0].run_extent(0..2).unwrap();
+            let big = lines[1].run_extent(0..2).unwrap();
+            assert_eq!(layout.content_extent(0..5, px(10.)), Some(plain));
+            assert_eq!(layout.content_extent(0..5, px(20.)), Some(big));
+            assert_eq!(layout.content_extent(2..3, px(10.)), None);
+            let scaled = layout.content_extent(3..5, px(40.)).unwrap();
+            assert!((f32::from(scaled.0) - f32::from(big.0) * 2.).abs() < 1e-3);
+            assert!((f32::from(scaled.1) - f32::from(big.1) * 2.).abs() < 1e-3);
         }
     }
 

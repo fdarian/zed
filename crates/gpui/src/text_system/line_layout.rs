@@ -249,6 +249,36 @@ pub struct ShapedRun {
     pub glyphs: Vec<ShapedGlyph>,
 }
 
+impl ShapedRun {
+    /// The ascent and descent of the content area of an inline box with the font size
+    /// `font_size`, given the runs of its text: the largest of those shaped at
+    /// `font_size`, as a nested box with a font size of its own does not change the
+    /// content area of the box around it. When all its text is in such nested boxes,
+    /// the metrics of the first run scaled to `font_size`. `None` without a run.
+    pub fn content_extent<'a>(
+        runs: impl IntoIterator<Item = &'a ShapedRun>,
+        font_size: Pixels,
+    ) -> Option<(Pixels, Pixels)> {
+        let mut first: Option<&ShapedRun> = None;
+        let mut own: Option<(Pixels, Pixels)> = None;
+        for run in runs {
+            first.get_or_insert(run);
+            if (run.font_size - font_size).abs() < px(1e-3) {
+                own = Some(match own {
+                    Some(own) => (own.0.max(run.ascent), own.1.max(run.descent)),
+                    None => (run.ascent, run.descent),
+                });
+            }
+        }
+        own.or_else(|| {
+            first.map(|run| {
+                let scale = font_size / run.font_size;
+                (run.ascent * scale, run.descent * scale)
+            })
+        })
+    }
+}
+
 /// A single glyph, ready to paint.
 #[derive(Clone, Debug)]
 pub struct ShapedGlyph {
@@ -928,12 +958,28 @@ impl WrappedLineLayout {
     /// or `None` when no glyph is. This is the content area of an inline box that
     /// spans those bytes.
     pub fn run_extent(&self, bytes: Range<usize>) -> Option<(Pixels, Pixels)> {
+        self.runs_in(bytes)
+            .map(|run| (run.ascent, run.descent))
+            .reduce(|first, second| (first.0.max(second.0), first.1.max(second.1)))
+    }
+
+    /// The runs that have a glyph in `bytes`.
+    pub fn runs_in(&self, bytes: Range<usize>) -> impl Iterator<Item = &ShapedRun> {
         self.unwrapped_layout
             .runs
             .iter()
-            .filter(|run| run.glyphs.iter().any(|glyph| bytes.contains(&glyph.index)))
-            .map(|run| (run.ascent, run.descent))
-            .reduce(|first, second| (first.0.max(second.0), first.1.max(second.1)))
+            .filter(move |run| run.glyphs.iter().any(|glyph| bytes.contains(&glyph.index)))
+    }
+
+    /// The ascent and descent of the font of an inline box with the font size
+    /// `font_size` that spans `bytes`, or `None` when no glyph is in `bytes`. See
+    /// [`ShapedRun::content_extent`].
+    pub fn content_extent(
+        &self,
+        bytes: Range<usize>,
+        font_size: Pixels,
+    ) -> Option<(Pixels, Pixels)> {
+        ShapedRun::content_extent(self.runs_in(bytes), font_size)
     }
 
     /// The size of the whole wrapped text, for the given line_height.
@@ -3307,6 +3353,35 @@ mod tests {
             );
             assert_eq!(layout.run_extent(20..30), None);
             assert_eq!(layout.run_extent(5..5), None);
+        }
+
+        #[crate::test]
+        fn the_content_extent_is_that_of_the_runs_of_the_font_size(cx: &mut TestAppContext) {
+            let layout = mixed(cx, None);
+            let plain = (layout.runs()[0].ascent, layout.runs()[0].descent);
+            let big = (layout.runs()[1].ascent, layout.runs()[1].descent);
+            assert!(big.0 > plain.0);
+            assert_eq!(layout.content_extent(0..15, px(10.)), Some(plain));
+            assert_eq!(layout.content_extent(0..15, px(20.)), Some(big));
+            assert_eq!(layout.content_extent(3..7, px(10.)), Some(plain));
+            assert_eq!(layout.content_extent(3..7, px(20.)), Some(big));
+            assert_eq!(layout.content_extent(20..30, px(10.)), None);
+            assert_eq!(layout.content_extent(5..5, px(10.)), None);
+        }
+
+        #[crate::test]
+        fn the_content_extent_of_a_font_size_no_run_has_scales_the_first_run(
+            cx: &mut TestAppContext,
+        ) {
+            let layout = mixed(cx, None);
+            let big = &layout.runs()[1];
+            let (ascent, descent) = layout.content_extent(5..10, px(40.)).unwrap();
+            assert_px(ascent, big.ascent * 2.);
+            assert_px(descent, big.descent * 2.);
+            let (ascent, descent) = layout.content_extent(3..7, px(5.)).unwrap();
+            let plain = &layout.runs()[0];
+            assert_px(ascent, plain.ascent / 2.);
+            assert_px(descent, plain.descent / 2.);
         }
     }
 }
