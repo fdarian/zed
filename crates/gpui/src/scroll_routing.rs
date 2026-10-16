@@ -79,9 +79,9 @@ struct WheelRouting(HashMap<WindowId, WindowRouting>);
 impl Global for WheelRouting {}
 
 /// Whether the scroll container with this hitbox is one of the containers the wheel event
-/// reaches. The listeners of those run innermost first (bubble order), and each takes its share
-/// in turn, so this is the only place that decides who is in the chain: the rest of this module
-/// only chains, clamps, latches and applies overscroll behavior.
+/// reaches. The listeners of those run innermost first (bubble order), and the first that can use
+/// the event takes it, so this is the only place that decides who is a candidate: the rest of this
+/// module only picks, clamps, latches and applies overscroll behavior.
 ///
 /// A [`HitboxBehavior::PassThrough`] container is never one of them, even when a descendant that is
 /// not pass-through is under the pointer: like in the DOM, the wheel goes to what is under the
