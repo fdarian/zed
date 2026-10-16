@@ -645,13 +645,16 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     }
   }
 
+  // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
+  float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                    shadow.element_corner_radii);
+  float inside_element = saturate(0.5 - element_distance);
   if (shadow.inset != 0u) {
-    // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
-    // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
-    alpha = 1. - alpha;
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                      shadow.element_corner_radii);
-    alpha *= saturate(0.5 - element_distance);
+    // The complement of the (blurred) hole rect, kept inside the element's padding box.
+    alpha = (1. - alpha) * inside_element;
+  } else {
+    // CSS Backgrounds 3 7.1.1: an outer shadow is only painted outside the border box.
+    alpha *= 1. - inside_element;
   }
 
   alpha *= content_mask_coverage(input.position.xy, shadow.content_mask);

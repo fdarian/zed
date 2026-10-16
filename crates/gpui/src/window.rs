@@ -2922,6 +2922,13 @@ impl Window {
         self.rendered_frame.scene.underlines_with_groups()
     }
 
+    /// The box shadows, as shadow primitives, in the most recently rendered frame's scene.
+    /// Bounds are in scaled pixels and are not clipped.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_shadows(&self) -> Vec<Shadow> {
+        self.rendered_frame.scene.shadows_with_groups()
+    }
+
     /// Surfaces in the most recently rendered frame. Used by tests to assert a
     /// texture was composited without rasterizing.
     #[cfg(any(test, feature = "test-support"))]
@@ -5000,8 +5007,11 @@ impl Window {
     }
 
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
-    /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
-    /// after the element's background so they layer on top of the fill.
+    /// z-index. `bounds` and `corner_radii` are the element's border box: as in CSS
+    /// (Backgrounds 3, 7.1.1) a drop shadow is only painted outside of it, so a translucent
+    /// fill is not darkened by the shadow beneath it. Inset shadows are skipped; paint those
+    /// with [`Self::paint_inset_shadows`] after the element's background so they layer on top
+    /// of the fill.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_drop_shadows(
@@ -5039,6 +5049,8 @@ impl Window {
 
     /// Paint the inset shadows from `shadows` into the scene at the current z-index. Should
     /// be called after the element's background so the shadow layers on top of the fill.
+    /// `bounds` and `corner_radii` are the element's padding box: an inset shadow is only
+    /// painted inside it, never over the border.
     /// Drop shadows are skipped; paint those with [`Self::paint_drop_shadows`] before the background.
     pub fn paint_inset_shadows(
         &mut self,
@@ -9855,5 +9867,88 @@ mod tests {
         let cx = cx.add_empty_window();
         let none = painted_decorations(cx, |el| el.underline().text_decoration_0());
         assert!(none.is_empty());
+    }
+
+    fn painted_box_shadows(
+        cx: &mut crate::VisualTestContext,
+        shadows: Vec<crate::BoxShadow>,
+        decorate: impl FnOnce(crate::Div) -> crate::Div,
+    ) -> (Vec<crate::Shadow>, Vec<crate::Quad>, f32) {
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(200.)), |_, _| {
+            decorate(div().w(px(60.)).h(px(40.)).shadow(shadows))
+        });
+        cx.update(|window, _| {
+            (
+                window.painted_shadows(),
+                window.painted_quads(),
+                window.scale_factor(),
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn a_drop_shadow_is_cut_out_by_the_border_box(cx: &mut TestAppContext) {
+        use crate::{BoxShadow, black, hsla};
+        let cx = cx.add_empty_window();
+        let shadow = BoxShadow::new(px(4.), px(6.), black())
+            .blur_radius(px(8.))
+            .spread_radius(px(5.));
+        let (shadows, quads, scale) = painted_box_shadows(cx, vec![shadow], |el| {
+            el.bg(hsla(0., 0., 1., 0.5)).rounded(px(10.))
+        });
+
+        assert_eq!(quads.len(), 1);
+        assert_eq!(shadows.len(), 1);
+        let painted = &shadows[0];
+        assert_eq!(painted.inset, 0);
+        assert_eq!(painted.element_bounds, quads[0].bounds);
+        assert_eq!(painted.element_corner_radii, quads[0].corner_radii);
+        assert_eq!(painted.element_corner_radii.top_left.0, 10. * scale);
+        // The shadow's own rect is the offset, spread one; the cut-out is not.
+        assert_eq!(painted.bounds.origin.x.0, (4. - 5.) * scale);
+        assert_eq!(painted.bounds.origin.y.0, (6. - 5.) * scale);
+        assert_eq!(painted.bounds.size.width.0, (60. + 10.) * scale);
+        assert_ne!(painted.bounds, painted.element_bounds);
+    }
+
+    #[gpui::test]
+    fn an_inset_shadow_is_kept_inside_the_padding_box(cx: &mut TestAppContext) {
+        use crate::{BoxShadow, black, red};
+        let cx = cx.add_empty_window();
+        let shadow = BoxShadow::new(px(0.), px(0.), black()).blur_radius(px(4.)).inset();
+        let (shadows, _, scale) = painted_box_shadows(cx, vec![shadow], |el| {
+            el.border(px(4.)).border_color(red()).rounded(px(10.))
+        });
+
+        assert_eq!(shadows.len(), 1);
+        let painted = &shadows[0];
+        assert_eq!(painted.inset, 1);
+        let bounds = painted.element_bounds;
+        assert_eq!(bounds.origin.x.0, 4. * scale);
+        assert_eq!(bounds.origin.y.0, 4. * scale);
+        assert_eq!(bounds.size.width.0, (60. - 8.) * scale);
+        assert_eq!(bounds.size.height.0, (40. - 8.) * scale);
+        assert_eq!(painted.element_corner_radii.top_left.0, 6. * scale);
+        // With no spread or offset the hole is the padding box itself.
+        assert_eq!(painted.bounds, painted.element_bounds);
+    }
+
+    #[gpui::test]
+    fn drop_and_inset_shadows_in_one_list_each_keep_their_own_box(cx: &mut TestAppContext) {
+        use crate::{BoxShadow, black};
+        let cx = cx.add_empty_window();
+        let (shadows, _, scale) = painted_box_shadows(
+            cx,
+            vec![
+                BoxShadow::new(px(0.), px(2.), black()),
+                BoxShadow::new(px(0.), px(0.), black()).inset(),
+            ],
+            |el| el.border(px(2.)),
+        );
+        assert_eq!(shadows.len(), 2);
+        let drop = shadows.iter().find(|shadow| shadow.inset == 0).unwrap();
+        let inset = shadows.iter().find(|shadow| shadow.inset == 1).unwrap();
+        assert_eq!(drop.element_bounds.size.width.0, 60. * scale);
+        assert_eq!(inset.element_bounds.size.width.0, 56. * scale);
     }
 }

@@ -568,6 +568,18 @@ impl Scene {
         underlines
     }
 
+    /// The shadows of this scene and of the groups inside it, in this scene's coordinates.
+    pub fn shadows_with_groups(&self) -> Vec<Shadow> {
+        let mut shadows = self.shadows.clone();
+        for group in &self.groups {
+            for mut shadow in group.scene.shadows_with_groups() {
+                shadow.translate(group.bounds.origin);
+                shadows.push(shadow);
+            }
+        }
+        shadows
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);

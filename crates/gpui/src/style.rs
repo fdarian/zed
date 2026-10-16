@@ -1098,7 +1098,11 @@ impl Style {
             });
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_inset_shadows(
+            boxes.padding.bounds,
+            boxes.padding.corner_radii,
+            &self.box_shadow,
+        );
 
         continuation(window, cx);
 
