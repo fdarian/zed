@@ -6,7 +6,7 @@
 //! we capture extra info.
 
 use accesskit::{Action, NodeId, TreeUpdate};
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 
 use crate::{Pixels, SharedString, Size};
 
@@ -106,12 +106,14 @@ impl A11yDebug {
             ephemeral.insert(*id, ephemeral_id(index));
         }
 
+        let inherited_hidden = hidden_through_ancestors(update);
         let mut nodes = serde_json::Map::new();
         for (id, node) in &update.nodes {
             let key = ephemeral
                 .get(id)
                 .cloned()
                 .unwrap_or_else(|| id.0.to_string());
+            let hidden = inherited_hidden.contains(id) || node.is_hidden();
             #[cfg(debug_assertions)]
             let provenance = self
                 .last_node_info
@@ -127,7 +129,7 @@ impl A11yDebug {
                 .unwrap_or_default();
             #[cfg(not(debug_assertions))]
             let provenance = NodeProvenance::default();
-            let value = node_to_json(*id, node, &ephemeral, &provenance);
+            let value = node_to_json(*id, node, hidden, &ephemeral, &provenance);
             nodes.insert(key, value);
         }
 
@@ -171,9 +173,43 @@ struct NodeProvenance<'a> {
     synthetic: Option<bool>,
 }
 
+/// The ids of nodes that are hidden because an ancestor is. AccessKit's hidden
+/// flag applies to the node's descendants, but the flag itself sits only on the
+/// node that carries it, so the dump has to walk down from the root.
+fn hidden_through_ancestors(update: &TreeUpdate) -> FxHashSet<NodeId> {
+    let nodes: FxHashMap<NodeId, &accesskit::Node> = update
+        .nodes
+        .iter()
+        .map(|(id, node)| (*id, node))
+        .collect();
+    let mut hidden = FxHashSet::default();
+    let mut visited = FxHashSet::default();
+    let Some(root) = update.tree.as_ref().map(|tree| tree.root) else {
+        return hidden;
+    };
+    let mut stack = vec![(root, false)];
+    while let Some((id, ancestor_hidden)) = stack.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let Some(node) = nodes.get(&id) else {
+            continue;
+        };
+        let is_hidden = ancestor_hidden || node.is_hidden();
+        if is_hidden {
+            hidden.insert(id);
+        }
+        for child in node.children() {
+            stack.push((*child, is_hidden));
+        }
+    }
+    hidden
+}
+
 fn node_to_json(
     id: NodeId,
     node: &accesskit::Node,
+    hidden: bool,
     ephemeral: &FxHashMap<NodeId, String>,
     provenance: &NodeProvenance,
 ) -> serde_json::Value {
@@ -314,7 +350,7 @@ fn node_to_json(
 
     // Flags and the remaining enum states.
     let flags = [
-        ("hidden", node.is_hidden()),
+        ("hidden", hidden),
         ("disabled", node.is_disabled()),
         ("required", node.is_required()),
         ("read_only", node.is_read_only()),
@@ -410,4 +446,47 @@ fn ephemeral_id(mut index: usize) -> String {
     }
     bytes.reverse();
     String::from_utf8(bytes).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{A11yDebug, FrameDebugInfo};
+    use accesskit::{Node, NodeId, Role, Tree, TreeId, TreeUpdate};
+
+    #[test]
+    fn to_json_reports_descendants_of_hidden_node_as_hidden() {
+        let root = NodeId(1);
+        let hidden_parent = NodeId(2);
+        let hidden_child = NodeId(3);
+        let visible_sibling = NodeId(4);
+
+        let mut root_node = Node::new(Role::Window);
+        root_node.set_children([hidden_parent, visible_sibling]);
+        let mut hidden_parent_node = Node::new(Role::GenericContainer);
+        hidden_parent_node.set_hidden();
+        hidden_parent_node.set_children([hidden_child]);
+        let update = TreeUpdate {
+            nodes: vec![
+                (root, root_node),
+                (hidden_parent, hidden_parent_node),
+                (hidden_child, Node::new(Role::Button)),
+                (visible_sibling, Node::new(Role::Button)),
+            ],
+            tree: Some(Tree::new(root)),
+            tree_id: TreeId::ROOT,
+            focus: root,
+        };
+
+        let mut debug = A11yDebug::default();
+        debug.capture(&update, None, None, None, FrameDebugInfo::default());
+        let json = debug.to_json().expect("a captured tree serializes");
+        let dump: serde_json::Value = serde_json::from_str(&json).expect("dump is valid JSON");
+
+        // Ephemeral keys are assigned in update order: a, b, c, d.
+        let hidden_of = |key: &str| dump["nodes"][key]["aria"].get("hidden").is_some();
+        assert!(!hidden_of("a"), "the root is not hidden");
+        assert!(hidden_of("b"), "the hidden node itself is hidden");
+        assert!(hidden_of("c"), "a child of a hidden node is hidden");
+        assert!(!hidden_of("d"), "a sibling of the hidden node is not hidden");
+    }
 }
