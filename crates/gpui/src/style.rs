@@ -622,6 +622,10 @@ pub struct TextStyle {
     /// Where a tab character in the text ends. `None` leaves tabs to the font,
     /// which gives them no meaning.
     pub tab_size: Option<TabSize>,
+
+    /// Whether the spaces and tabs at the end of a line hang, as in CSS: they
+    /// are not measured to see whether the line fits, nor when it is aligned.
+    pub hang_trailing_spaces: bool,
 }
 
 impl Default for TextStyle {
@@ -644,6 +648,7 @@ impl Default for TextStyle {
             text_align: TextAlign::default(),
             line_clamp: None,
             tab_size: None,
+            hang_trailing_spaces: false,
         }
     }
 }
@@ -686,6 +691,7 @@ impl TextStyle {
     pub fn layout_options(&self) -> TextLayoutOptions {
         TextLayoutOptions {
             tab_size: self.tab_size,
+            hang_trailing_spaces: self.hang_trailing_spaces,
         }
     }
 

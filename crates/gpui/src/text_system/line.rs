@@ -97,6 +97,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            &[],
             window,
             cx,
         )?;
@@ -121,6 +122,7 @@ impl ShapedLine {
             align,
             align_width,
             &self.decoration_runs,
+            &[],
             &[],
             window,
             cx,
@@ -228,6 +230,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            &[],
             window,
             cx,
         )
@@ -255,6 +258,7 @@ impl LineLayout {
             align,
             align_width,
             decoration_runs,
+            &[],
             &[],
             window,
             cx,
@@ -303,6 +307,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            &self.hanging_widths,
             window,
             cx,
         )?;
@@ -333,6 +338,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            &self.hanging_widths,
             window,
             cx,
         )?;
@@ -349,6 +355,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    hanging_widths: &[Pixels],
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -364,6 +371,7 @@ fn paint_line(
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
+        let mut line_ix = 0;
         let mut run_end = 0;
         let mut color = black();
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
@@ -377,6 +385,7 @@ fn paint_line(
                 &align,
                 layout,
                 wraps.peek(),
+                hanging_width(hanging_widths, 0),
             ),
             origin.y,
         );
@@ -429,6 +438,7 @@ fn paint_line(
                         }
                     }
 
+                    line_ix += 1;
                     glyph_origin.x = aligned_origin_x(
                         origin,
                         align_width.unwrap_or(layout.width),
@@ -436,6 +446,7 @@ fn paint_line(
                         &align,
                         layout,
                         wraps.peek(),
+                        hanging_width(hanging_widths, line_ix),
                     );
                     glyph_origin.y += line_height;
                 }
@@ -595,6 +606,7 @@ fn paint_line_background(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    hanging_widths: &[Pixels],
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -608,6 +620,7 @@ fn paint_line_background(
     window.paint_layer(line_bounds, |window| {
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
+        let mut line_ix = 0;
         let mut run_end = 0;
         let mut current_background: Option<(Point<Pixels>, Hsla)> = None;
         let text_system = cx.text_system().clone();
@@ -619,6 +632,7 @@ fn paint_line_background(
                 &align,
                 layout,
                 wraps.peek(),
+                hanging_width(hanging_widths, 0),
             ),
             origin.y,
         );
@@ -652,6 +666,7 @@ fn paint_line_background(
                         }
                     }
 
+                    line_ix += 1;
                     glyph_origin.x = aligned_origin_x(
                         origin,
                         align_width.unwrap_or(layout.width),
@@ -659,6 +674,7 @@ fn paint_line_background(
                         &align,
                         layout,
                         wraps.peek(),
+                        hanging_width(hanging_widths, line_ix),
                     );
                     glyph_origin.y += line_height;
                 }
@@ -736,6 +752,12 @@ fn paint_line_background(
     })
 }
 
+/// How wide the spaces that hang at the end of line `line_ix` are. A layout that
+/// does not hang spaces has no entries, and nothing hangs.
+fn hanging_width(hanging_widths: &[Pixels], line_ix: usize) -> Pixels {
+    hanging_widths.get(line_ix).copied().unwrap_or(Pixels::ZERO)
+}
+
 fn aligned_origin_x(
     origin: Point<Pixels>,
     align_width: Pixels,
@@ -743,6 +765,7 @@ fn aligned_origin_x(
     align: &TextAlign,
     layout: &LineLayout,
     wrap_boundary: Option<&&WrapBoundary>,
+    hanging_width: Pixels,
 ) -> Pixels {
     let end_of_line = if let Some(WrapBoundary { run_ix, glyph_ix }) = wrap_boundary {
         layout.runs[*run_ix].glyphs[*glyph_ix].position.x
@@ -750,7 +773,7 @@ fn aligned_origin_x(
         layout.width
     };
 
-    let line_width = end_of_line - last_glyph_x;
+    let line_width = end_of_line - last_glyph_x - hanging_width;
 
     match align {
         TextAlign::Left => origin.x,
@@ -1021,5 +1044,63 @@ mod tests {
         assert_eq!(right.decoration_runs[0].color, green);
         assert_eq!(right.decoration_runs[1].len, 1);
         assert_eq!(right.decoration_runs[1].color, blue);
+    }
+
+    fn aligned(
+        layout: &LineLayout,
+        align: TextAlign,
+        last_glyph_x: f32,
+        boundary: Option<WrapBoundary>,
+        hanging: f32,
+    ) -> Pixels {
+        aligned_origin_x(
+            point(px(0.), px(0.)),
+            px(100.),
+            px(last_glyph_x),
+            &align,
+            layout,
+            boundary.as_ref().as_ref(),
+            px(hanging),
+        )
+    }
+
+    #[test]
+    fn test_hanging_spaces_are_left_out_of_the_aligned_width() {
+        // "aaaa bbbb", wrapped after the space: the first line is 50 wide with a
+        // space at its end, the second 40.
+        let glyphs: Vec<(usize, f32)> = (0..9).map(|ix| (ix, ix as f32 * 10.)).collect();
+        let line = make_shaped_line("aaaa bbbb", &glyphs, 90., &[]);
+        let layout = &line.layout;
+        let boundary = Some(WrapBoundary {
+            run_ix: 0,
+            glyph_ix: 5,
+        });
+
+        assert_eq!(
+            aligned(layout, TextAlign::Center, 0., boundary, 10.),
+            px(30.)
+        );
+        assert_eq!(
+            aligned(layout, TextAlign::Right, 0., boundary, 10.),
+            px(60.)
+        );
+        assert_eq!(aligned(layout, TextAlign::Left, 0., boundary, 10.), px(0.));
+        // Counted in, as when nothing hangs.
+        assert_eq!(
+            aligned(layout, TextAlign::Center, 0., boundary, 0.),
+            px(25.)
+        );
+        assert_eq!(aligned(layout, TextAlign::Right, 0., boundary, 0.), px(50.));
+        // The last line has nothing hanging here.
+        assert_eq!(aligned(layout, TextAlign::Center, 50., None, 0.), px(30.));
+        assert_eq!(aligned(layout, TextAlign::Right, 50., None, 0.), px(60.));
+    }
+
+    #[test]
+    fn test_a_line_that_hangs_nothing_has_no_hanging_width() {
+        let widths = [px(10.), px(0.)];
+        assert_eq!(hanging_width(&widths, 0), px(10.));
+        assert_eq!(hanging_width(&widths, 1), px(0.));
+        assert_eq!(hanging_width(&[], 0), px(0.));
     }
 }

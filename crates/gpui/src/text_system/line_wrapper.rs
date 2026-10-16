@@ -1702,6 +1702,23 @@ mod tests {
             wrap_width: Option<Pixels>,
             tab_size: Option<TabSize>,
         ) -> Self {
+            Self::shape_with(
+                cx,
+                text,
+                wrap_width,
+                TextLayoutOptions {
+                    tab_size,
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn shape_with(
+            cx: &mut TestAppContext,
+            text: &str,
+            wrap_width: Option<Pixels>,
+            options: TextLayoutOptions,
+        ) -> Self {
             cx.update(|cx| {
                 let text_system = WindowTextSystem::new(cx.text_system().clone());
                 let menlo = font("Menlo");
@@ -1719,14 +1736,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut lines = text_system
-                    .shape_text_with_options(
-                        text,
-                        px(16.),
-                        &[run],
-                        wrap_width,
-                        None,
-                        TextLayoutOptions { tab_size },
-                    )
+                    .shape_text_with_options(text, px(16.), &[run], wrap_width, None, options)
                     .unwrap();
                 Self {
                     line: lines.remove(0),
@@ -1931,7 +1941,10 @@ mod tests {
                         &[run],
                         Some(px(40.)),
                         None,
-                        TextLayoutOptions { tab_size },
+                        TextLayoutOptions {
+                            tab_size,
+                            ..Default::default()
+                        },
                     )
                     .unwrap()
                     .remove(0)
@@ -1939,6 +1952,141 @@ mod tests {
             let with = shape(Some(TabSize::Spaces(4.)));
             let without = shape(None);
             assert!(Arc::ptr_eq(&with.layout, &without.layout));
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    const HANGING: TextLayoutOptions = TextLayoutOptions {
+        tab_size: None,
+        hang_trailing_spaces: true,
+    };
+
+    #[cfg(target_os = "macos")]
+    fn spaces_wide(cx: &mut TestAppContext, spaces: f32) -> Pixels {
+        TabbedText::shape(cx, "a", None, None).space * spaces
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_space_at_a_soft_wrap_hangs(cx: &mut TestAppContext) {
+        // "aaaa " is 5 spaces wide, in 4.5: the space overflows without wrapping.
+        let width = spaces_wide(cx, 4.5);
+        let hung = TabbedText::shape_with(cx, "aaaa bbbb", Some(width), HANGING);
+        assert_eq!(
+            hung.line.layout.wrap_boundaries(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 5
+            }]
+        );
+        let hanging = hung.line.layout.hanging_widths[0];
+        assert!((f32::from(hanging / hung.space) - 1.).abs() < 0.01);
+        assert_eq!(hung.line.layout.hanging_widths[1], px(0.));
+        assert_columns(&hung, &[(4, 4., 0), (6, 1., 1)]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_space_at_a_soft_wrap_wraps_unless_it_hangs(cx: &mut TestAppContext) {
+        let width = spaces_wide(cx, 4.5);
+        let plain = TabbedText::shape_with(cx, "aaaa bbbb", Some(width), Default::default());
+        // The space wraps by itself and begins a line.
+        assert_eq!(plain.line.layout.wrap_boundaries().len(), 2);
+        assert!(plain.line.layout.hanging_widths.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_long_run_of_spaces_at_the_wrap_edge_makes_no_line_of_its_own(
+        cx: &mut TestAppContext,
+    ) {
+        let width = spaces_wide(cx, 5.);
+        let text = TabbedText::shape_with(cx, "aaaa           bbbb", Some(width), HANGING);
+        assert_eq!(text.line.layout.wrap_boundaries().len(), 1);
+        assert_columns(&text, &[(16, 1., 1)]);
+        let hanging = f32::from(text.line.layout.hanging_widths[0] / text.space);
+        assert!((hanging - 11.).abs() < 0.01, "{hanging} spaces hang");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_last_line_keeps_its_width_with_its_trailing_spaces(cx: &mut TestAppContext) {
+        let width = spaces_wide(cx, 20.);
+        let text = TabbedText::shape_with(cx, "aaa  ", Some(width), HANGING);
+        assert!(text.line.layout.wrap_boundaries().is_empty());
+        let measured = f32::from(text.line.layout.width() / text.space);
+        assert!((measured - 5.).abs() < 0.01, "{measured} spaces wide");
+        let hanging = f32::from(text.line.layout.hanging_widths[0] / text.space);
+        assert!((hanging - 2.).abs() < 0.01, "{hanging} spaces hang");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_hanging_space_can_still_be_hit(cx: &mut TestAppContext) {
+        let width = spaces_wide(cx, 4.5);
+        let text = TabbedText::shape_with(cx, "aaaa bbbb", Some(width), HANGING);
+        let layout = &text.line.layout;
+        // The space covers columns 4 to 5, past the edge of the 4.5 wide line.
+        for column in [4.2, 4.8] {
+            let position = point(text.space * column, px(0.));
+            assert_eq!(
+                layout.index_for_position(position, TabbedText::LINE_HEIGHT),
+                Ok(4)
+            );
+        }
+        let position = point(text.space * 5.2, px(0.));
+        assert_eq!(
+            layout.index_for_position(position, TabbedText::LINE_HEIGHT),
+            Err(5)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_tab_hangs_at_a_soft_wrap(cx: &mut TestAppContext) {
+        let width = spaces_wide(cx, 5.);
+        let options = TextLayoutOptions {
+            tab_size: Some(TabSize::Spaces(8.)),
+            hang_trailing_spaces: true,
+        };
+        let text = TabbedText::shape_with(cx, "aaaa\tbb", Some(width), options);
+        assert_eq!(text.line.layout.wrap_boundaries().len(), 1);
+        let hanging = f32::from(text.line.layout.hanging_widths[0] / text.space);
+        assert!((hanging - 4.).abs() < 0.01, "{hanging} spaces hang");
+        assert_columns(&text, &[(6, 1., 1)]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_text_with_spaces_that_hang_has_a_layout_of_its_own(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let shape = |text: &str, options| {
+                let run = TextRun {
+                    len: text.len(),
+                    font: font("Menlo"),
+                    ..Default::default()
+                };
+                text_system
+                    .shape_text_with_options(
+                        text.to_string().into(),
+                        px(16.),
+                        &[run],
+                        Some(px(40.)),
+                        None,
+                        options,
+                    )
+                    .unwrap()
+                    .remove(0)
+            };
+            let spaced = shape("abc de", Default::default());
+            assert!(!Arc::ptr_eq(
+                &spaced.layout,
+                &shape("abc de", HANGING).layout
+            ));
+            // Nothing in a word can hang, so it is the same layout either way.
+            let word = shape("abcde", Default::default());
+            assert!(Arc::ptr_eq(&word.layout, &shape("abcde", HANGING).layout));
         });
     }
 }
