@@ -2420,6 +2420,43 @@ impl ContentMask<Pixels> {
         (radii.x.corner(anchor).0, radii.explicit_y().corner(anchor).0)
     }
 
+    /// Whether `self` lies within `outer` and clear of the corner boxes that `outer` rounds, so
+    /// that `outer` is a plain rectangle wherever `self` is.
+    fn is_within_the_straight_part_of(&self, outer: &Self) -> bool {
+        let inner = self.bounds;
+        let frame = outer.bounds;
+        if inner.origin.x < frame.origin.x
+            || inner.origin.y < frame.origin.y
+            || inner.right() > frame.right()
+            || inner.bottom() > frame.bottom()
+        {
+            return false;
+        }
+        let radii = outer.fitted_radii();
+        let radii_y = radii.explicit_y();
+        [
+            (radii.x.top_left, radii_y.top_left, false, false),
+            (radii.x.top_right, radii_y.top_right, true, false),
+            (radii.x.bottom_right, radii_y.bottom_right, true, true),
+            (radii.x.bottom_left, radii_y.bottom_left, false, true),
+        ]
+        .into_iter()
+        .all(|(radius_x, radius_y, right, bottom)| {
+            // The corner box is the rectangle from the corner to where the arc meets the edges.
+            let clear_x = if right {
+                inner.origin.x >= frame.right() - radius_x
+            } else {
+                inner.right() <= frame.origin.x + radius_x
+            };
+            let clear_y = if bottom {
+                inner.origin.y >= frame.bottom() - radius_y
+            } else {
+                inner.bottom() <= frame.origin.y + radius_y
+            };
+            radius_x.0 <= 0. || clear_x || clear_y
+        })
+    }
+
     /// Whether every point of the corner at `anchor`, a round arc or a square point, is inside
     /// `other`, checked at the arc's two ends and [`EXACT_ARC_SAMPLES`] points between them.
     fn corner_is_inside(&self, anchor: Anchor, other: &Self) -> bool {
@@ -2462,6 +2499,12 @@ impl ContentMask<Pixels> {
     /// point within [`EXACT_TOLERANCE`] of an edge counts as inside it.
     pub fn intersection_is_exact(&self, other: &Self) -> bool {
         if !self.is_rounded() && !other.is_rounded() {
+            return true;
+        }
+        // A mask that sits inside the other without touching a rounded corner of it, the usual
+        // nesting, is cut by nothing but straight edges.
+        if self.is_within_the_straight_part_of(other) || other.is_within_the_straight_part_of(self)
+        {
             return true;
         }
         let bounds = self.bounds.intersect(&other.bounds);
@@ -10890,6 +10933,10 @@ mod tests {
         assert_exactness(&parent, &mask(8., 8., 84., 84., (0., 0.)), true);
         assert_exactness(&parent, &mask(8., 8., 84., 84., (6., 6.)), true);
         assert_exactness(&parent, &mask(20., 20., 60., 60., (10., 10.)), true);
+        // Clear of the corner boxes, which end 16 from the parent's edges, to the pixel.
+        assert_exactness(&parent, &mask(16., 16., 68., 68., (0., 0.)), true);
+        // A hair into a corner box is not yet a cut: only the arc is.
+        assert_exactness(&parent, &mask(15.5, 16., 69., 68., (0., 0.)), true);
         // The edge of the arc is on the line: a child flush with where the arc starts.
         assert_exactness(&parent, &mask(0., 16., 100., 68., (0., 0.)), true);
     }
