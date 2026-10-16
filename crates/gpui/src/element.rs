@@ -845,6 +845,12 @@ impl Element for AnyElement {
         None
     }
 
+    // `ParentElement::child` wraps an `AnyElement` in another one, and the parent asks the outer
+    // one.
+    fn lift_z(&self) -> Option<i32> {
+        AnyElement::lift_z(self)
+    }
+
     fn request_layout(
         &mut self,
         _: Option<&GlobalElementId>,

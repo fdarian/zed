@@ -8348,6 +8348,21 @@ mod tests {
             }
 
             #[gpui::test]
+            fn an_element_given_as_an_any_element_is_lifted(cx: &mut TestAppContext) {
+                // `child` wraps an AnyElement in another one, which is what the parent asks.
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(boxed("a", 0., 0., 200.).child(
+                            boxed("b", 50., 50., 100.).z_index(5).into_any_element(),
+                        ))
+                        .child(boxed("c", 100., 100., 200.).into_any_element())
+                        .into_any_element()
+                });
+                assert_eq!(painted(&window, cx), ["root", "a", "c", "b"]);
+                assert_eq!(chain_at(&window, cx, 120., 120.), ["b", "a", "root"]);
+            }
+
+            #[gpui::test]
             fn a_nested_context_traps_the_z_index_of_what_is_inside_it(cx: &mut TestAppContext) {
                 // "d" has the highest index but belongs to "b", which is below "c".
                 let window = open_scene(cx, true, || {
