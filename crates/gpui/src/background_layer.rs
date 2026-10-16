@@ -209,6 +209,14 @@ pub enum StopPosition {
     Fraction(f32),
     /// A distance along the gradient line or radius. Meaningless for a conic gradient.
     Length(Pixels),
+    /// A distance plus a fraction of the gradient line, as in `calc(10px + 50%)`. Meaningless for
+    /// a conic gradient.
+    Calc {
+        /// The absolute part.
+        length: Pixels,
+        /// The fraction of the gradient line.
+        fraction: f32,
+    },
     /// An angle in degrees. Only meaningful for a conic gradient.
     Angle(f32),
 }
@@ -867,8 +875,11 @@ impl Gradient {
             StopPosition::Length(length) if !is_conic => {
                 Some(length.0 / geometry.reference_length.max(1e-6))
             }
+            StopPosition::Calc { length, fraction } if !is_conic => {
+                Some(length.0 / geometry.reference_length.max(1e-6) + fraction)
+            }
             StopPosition::Angle(degrees) if is_conic => Some(degrees / 360.),
-            StopPosition::Length(_) | StopPosition::Angle(_) => None,
+            StopPosition::Length(_) | StopPosition::Calc { .. } | StopPosition::Angle(_) => None,
         }
     }
 
@@ -1102,6 +1113,27 @@ mod tests {
         let result = positions(&linear, size(px(100.), px(40.)));
         assert_close(result[0], 0.25);
         assert_close(result[1], 0.75);
+    }
+
+    #[test]
+    fn a_sum_of_a_length_and_a_fraction_positions_a_stop() {
+        // `calc(10px + 25%)` on a 100px line.
+        let linear = gradient(
+            GradientShape::Linear(LinearDirection::ToRight),
+            vec![
+                stop(
+                    red(),
+                    Some(StopPosition::Calc {
+                        length: px(10.),
+                        fraction: 0.25,
+                    }),
+                ),
+                stop(blue(), None),
+            ],
+        );
+        let result = positions(&linear, size(px(100.), px(40.)));
+        assert_close(result[0], 0.35);
+        assert_close(result[1], 1.);
     }
 
     #[test]
