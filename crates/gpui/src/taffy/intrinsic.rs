@@ -1,14 +1,16 @@
 //! Intrinsic widths: `min-content`, `max-content`, `fit-content` and `fit-content(<limit>)` for
-//! `width`, `min-width` and `max-width`.
+//! `width`, `min-width`, `max-width` and `flex-basis`.
 //!
 //! Taffy has no such keywords, so a node carrying one is laid out as its own root before the real
 //! layout, once with `min-content` and once with `max-content` available width, and its taffy
 //! style is rewritten with what that measured. The keywords only mean something in the inline
-//! axis: in the block axis they behave as `auto`, so heights need nothing.
+//! axis: in the block axis they behave as `auto`, so heights need nothing. A `flex-basis` keyword
+//! is the same width measured, but only a row flex container's items have the inline axis as
+//! their main axis, so it is resolved where the parent is known, and left `auto` elsewhere.
 
 use super::{EXPECT_MESSAGE, LayoutId, TaffyLayoutEngine, ToTaffy as _};
 use crate::{App, AvailableSpace, IntrinsicSize, Pixels, Style, Window, size};
-use taffy::style::{CompactLength, Dimension};
+use taffy::style::{CompactLength, Dimension, Display, FlexDirection};
 
 #[derive(Copy, Clone)]
 enum Keyword {
@@ -28,17 +30,18 @@ impl Keyword {
     }
 }
 
-/// A node with at least one width keyword, waiting for its measurements.
+/// A node with at least one width or flex basis keyword, waiting for its measurements.
 pub(super) struct IntrinsicNode {
     id: LayoutId,
     width: Option<Keyword>,
     min_width: Option<Keyword>,
     max_width: Option<Keyword>,
+    flex_basis: Option<Keyword>,
 }
 
 impl IntrinsicNode {
     fn keywords(&self) -> impl Iterator<Item = Keyword> {
-        [self.width, self.min_width, self.max_width]
+        [self.width, self.min_width, self.max_width, self.flex_basis]
             .into_iter()
             .flatten()
     }
@@ -71,12 +74,13 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
     ) {
         let widths = &style.intrinsic_widths;
-        let (width, min_width, max_width) = (
+        let (width, min_width, max_width, flex_basis) = (
             widths.width.flatten(),
             widths.min_width.flatten(),
             widths.max_width.flatten(),
+            widths.flex_basis.flatten(),
         );
-        if width.is_none() && min_width.is_none() && max_width.is_none() {
+        if width.is_none() && min_width.is_none() && max_width.is_none() && flex_basis.is_none() {
             return;
         }
         let mut keyword =
@@ -95,6 +99,7 @@ impl TaffyLayoutEngine {
             width: keyword(width),
             min_width: keyword(min_width),
             max_width: keyword(max_width),
+            flex_basis: keyword(flex_basis),
         };
         self.intrinsic_nodes.push(node);
     }
@@ -113,8 +118,24 @@ impl TaffyLayoutEngine {
             return;
         }
         let scale_factor = window.scale_factor();
-        for node in std::mem::take(&mut self.intrinsic_nodes) {
-            let requested = self.taffy.style(node.id.0).expect(EXPECT_MESSAGE).clone();
+        for mut node in std::mem::take(&mut self.intrinsic_nodes) {
+            let mut requested = self.taffy.style(node.id.0).expect(EXPECT_MESSAGE).clone();
+
+            // A flex basis keyword wins over a basis length set next to it, also where it
+            // does not count.
+            if let Some(keyword) = node.flex_basis {
+                if self.is_row_flex_item(node.id) {
+                    // The available space is not known here, and the item shrinks to the
+                    // container anyway, so `fit-content` is `max-content`.
+                    node.flex_basis = Some(match keyword {
+                        Keyword::FitContent => Keyword::MaxContent,
+                        other => other,
+                    });
+                } else {
+                    node.flex_basis = None;
+                    requested.flex_basis = Dimension::auto();
+                }
+            }
 
             // The content is measured without the width it is about to be given.
             let mut probe = requested.clone();
@@ -157,6 +178,19 @@ impl TaffyLayoutEngine {
                 escapable.original = style;
             }
         }
+    }
+
+    /// Whether the main axis of the node's flex container is the inline one.
+    fn is_row_flex_item(&self, id: LayoutId) -> bool {
+        let Some(parent) = self.taffy.parent(id.0) else {
+            return false;
+        };
+        let parent = self.taffy.style(parent).expect(EXPECT_MESSAGE);
+        parent.display == Display::Flex
+            && matches!(
+                parent.flex_direction,
+                FlexDirection::Row | FlexDirection::RowReverse
+            )
     }
 
     fn measure_width(
@@ -235,6 +269,11 @@ fn at_most(current: Dimension, bound: f32) -> Dimension {
 }
 
 fn apply(node: &IntrinsicNode, measured: &Measured, style: &mut taffy::style::Style) {
+    if let Some(keyword) = node.flex_basis {
+        // `Slot::Max` is the bound whose keyword results are a basis: `fit-content` was turned
+        // into `max-content` already.
+        style.flex_basis = bound(keyword, Slot::Max, measured);
+    }
     if let Some(keyword) = node.min_width {
         style.min_size.width = bound(keyword, Slot::Min, measured);
     }

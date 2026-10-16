@@ -1914,6 +1914,167 @@ mod tests {
             assert_eq!(bounds(cx, "box").size.width, px(90.));
         }
 
+        /// The bounds of `style(div())` holding `text` in a flex container `container_width` wide,
+        /// followed by a 100 wide sibling named "sibling" that does not shrink.
+        fn flex_item_in(
+            cx: &mut TestAppContext,
+            direction: fn(crate::Div) -> crate::Div,
+            container_width: f32,
+            text: &'static str,
+            style: impl Fn(crate::Div) -> crate::Div + 'static,
+        ) -> (Bounds<Pixels>, Bounds<Pixels>) {
+            let (_, cx) = probe(cx, text, move |text| {
+                direction(div().flex().w(px(container_width)).h(px(300.)))
+                    .child(style(div().debug_selector(|| "box".into())).child(words(text)))
+                    .child(
+                        div()
+                            .debug_selector(|| "sibling".into())
+                            .flex_shrink_0()
+                            .w(px(100.))
+                            .h(px(100.)),
+                    )
+                    .into_any_element()
+            });
+            (bounds(cx, "box"), bounds(cx, "sibling"))
+        }
+
+        fn row(container: crate::Div) -> crate::Div {
+            container.flex_row()
+        }
+
+        fn column(container: crate::Div) -> crate::Div {
+            container.flex_col()
+        }
+
+        #[gpui::test]
+        fn a_max_content_basis_is_the_text_on_one_line_and_places_the_sibling(
+            cx: &mut TestAppContext,
+        ) {
+            let (item, sibling) = flex_item_in(cx, row, 400., SHORT, |box_| {
+                box_.w(px(20.)).basis_max_content()
+            });
+            assert_eq!(item.size.width, px(110.));
+            assert_eq!(sibling.origin.x - item.origin.x, px(110.));
+        }
+
+        #[gpui::test]
+        fn a_min_content_basis_wraps_text_to_its_longest_word(cx: &mut TestAppContext) {
+            let (item, sibling) = flex_item_in(cx, row, 400., LONG, |box_| {
+                box_.flex_shrink_0().basis_min_content()
+            });
+            assert_eq!(item.size.width, px(90.));
+            assert_eq!(sibling.origin.x - item.origin.x, px(90.));
+        }
+
+        #[gpui::test]
+        fn a_basis_keyword_beats_a_width_keyword(cx: &mut TestAppContext) {
+            let (item, _) = flex_item_in(cx, row, 400., LONG, |box_| {
+                box_.w_min_content().basis_max_content()
+            });
+            assert_eq!(item.size.width, px(210.));
+        }
+
+        #[gpui::test]
+        fn a_basis_keyword_works_in_a_reversed_row(cx: &mut TestAppContext) {
+            let (item, _) = flex_item_in(
+                cx,
+                |container| container.flex_row_reverse(),
+                400.,
+                LONG,
+                |box_| box_.flex_shrink_0().basis_min_content(),
+            );
+            assert_eq!(item.size.width, px(90.));
+        }
+
+        #[gpui::test]
+        fn a_fit_content_basis_is_max_content_and_shrinks_with_the_container(
+            cx: &mut TestAppContext,
+        ) {
+            let (roomy, _) = flex_item_in(cx, row, 500., LONG, |box_| box_.basis_fit_content());
+            assert_eq!(roomy.size.width, px(210.));
+            let (tight, _) = flex_item_in(cx, row, 250., LONG, |box_| box_.basis_fit_content());
+            assert_eq!(tight.size.width, px(150.));
+            let (floored, _) = flex_item_in(cx, row, 150., LONG, |box_| box_.basis_fit_content());
+            assert_eq!(floored.size.width, px(90.));
+        }
+
+        #[gpui::test]
+        fn a_fit_content_basis_limit_is_clamped_between_the_content_sizes(
+            cx: &mut TestAppContext,
+        ) {
+            let limited = |limit: f32| move |box_: crate::Div| {
+                box_.flex_shrink_0().basis_fit_content_to(px(limit))
+            };
+            assert_eq!(
+                flex_item_in(cx, row, 400., LONG, limited(100.)).0.size.width,
+                px(100.)
+            );
+            assert_eq!(
+                flex_item_in(cx, row, 400., LONG, limited(500.)).0.size.width,
+                px(210.)
+            );
+            assert_eq!(
+                flex_item_in(cx, row, 400., LONG, limited(20.)).0.size.width,
+                px(90.)
+            );
+        }
+
+        #[gpui::test]
+        fn a_fit_content_basis_limit_can_be_a_percentage(cx: &mut TestAppContext) {
+            let (item, _) = flex_item_in(cx, row, 400., LONG, |box_| {
+                box_.flex_shrink_0().basis_fit_content_to(relative(0.25))
+            });
+            assert_eq!(item.size.width, px(100.));
+        }
+
+        #[gpui::test]
+        fn a_basis_keyword_is_auto_along_a_column(cx: &mut TestAppContext) {
+            for style in [
+                (|box_: crate::Div| box_.basis_max_content()) as fn(crate::Div) -> crate::Div,
+                |box_| box_.basis_min_content(),
+                |box_| box_.basis_fit_content(),
+                // A keyword also wins over a basis length set next to it.
+                |box_| box_.flex_basis(px(250.)).basis_max_content(),
+            ] {
+                let (item, sibling) = flex_item_in(cx, column, 400., LONG, style);
+                assert_eq!(item.size, size(px(400.), px(10.)));
+                assert_eq!(sibling.origin.y - item.origin.y, px(10.));
+            }
+        }
+
+        #[gpui::test]
+        fn a_basis_keyword_is_ignored_in_a_block_parent(cx: &mut TestAppContext) {
+            assert_eq!(
+                width_in(cx, 400., LONG, |box_| box_.basis_min_content()),
+                px(400.)
+            );
+        }
+
+        #[gpui::test]
+        fn a_refinement_can_clear_a_basis_keyword(cx: &mut TestAppContext) {
+            let mut clearing = StyleRefinement::default();
+            clearing.flex_basis = Some(px(50.).into());
+            clearing.intrinsic_widths.flex_basis = Some(None);
+            let (cleared, _) = flex_item_in(cx, row, 400., SHORT, {
+                let clearing = clearing.clone();
+                move |mut box_| {
+                    box_ = box_.flex_shrink_0().w(px(5.)).basis_max_content();
+                    box_.style().refine(&clearing);
+                    box_
+                }
+            });
+            assert_eq!(cleared.size.width, px(50.));
+
+            let mut untouched = StyleRefinement::default();
+            untouched.flex_basis = Some(px(50.).into());
+            let (kept, _) = flex_item_in(cx, row, 400., SHORT, move |mut box_| {
+                box_ = box_.flex_shrink_0().w(px(5.)).basis_max_content();
+                box_.style().refine(&untouched);
+                box_
+            });
+            assert_eq!(kept.size.width, px(110.));
+        }
+
         #[gpui::test]
         fn a_second_frame_measures_the_new_content(cx: &mut TestAppContext) {
             let (view, cx) = probe(cx, SHORT, |text| {

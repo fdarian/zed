@@ -561,6 +561,32 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the flex basis of the element to `min-content`. Only a row flex container's items
+    /// take it; elsewhere the basis stays `auto`.
+    fn basis_min_content(mut self) -> Self {
+        self.style().intrinsic_widths.flex_basis = Some(Some(IntrinsicSize::MinContent));
+        self
+    }
+
+    /// Sets the flex basis of the element to `max-content`.
+    fn basis_max_content(mut self) -> Self {
+        self.style().intrinsic_widths.flex_basis = Some(Some(IntrinsicSize::MaxContent));
+        self
+    }
+
+    /// Sets the flex basis of the element to `fit-content`, which is `max-content` for a basis.
+    fn basis_fit_content(mut self) -> Self {
+        self.style().intrinsic_widths.flex_basis = Some(Some(IntrinsicSize::FitContent));
+        self
+    }
+
+    /// Sets the flex basis of the element to `fit-content(<limit>)`.
+    fn basis_fit_content_to(mut self, limit: impl Into<DefiniteLength>) -> Self {
+        self.style().intrinsic_widths.flex_basis =
+            Some(Some(IntrinsicSize::FitContentLimit(limit.into())));
+        self
+    }
+
     /// Sets the aspect ratio of the element.
     /// [Docs](https://tailwindcss.com/docs/aspect-ratio)
     fn aspect_ratio(mut self, ratio: f32) -> Self {

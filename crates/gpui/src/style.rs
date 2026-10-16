@@ -176,7 +176,7 @@ pub struct GridTemplate {
     pub min_size: GridTemplateMinSize,
 }
 
-/// A CSS intrinsic size keyword for a width, which depends on the element's content.
+/// A CSS intrinsic size keyword for a width or a flex basis, which depends on the content.
 #[derive(Copy, Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
 pub enum IntrinsicSize {
     /// `min-content`: the narrowest width the content can take without overflowing.
@@ -189,14 +189,16 @@ pub enum IntrinsicSize {
     FitContentLimit(DefiniteLength),
 }
 
-/// The widths that are an [`IntrinsicSize`] keyword. They exist next to `Style::size`,
-/// `min_size` and `max_size` because taffy has no intrinsic size keywords, so those fields
-/// hold `auto` for the width that carries one and layout fills in the measured value.
+/// The widths and the flex basis that are an [`IntrinsicSize`] keyword. They exist next to
+/// `Style::size`, `min_size`, `max_size` and `flex_basis` because taffy has no intrinsic size
+/// keywords, so those fields hold `auto` for the one that carries a keyword and layout fills in
+/// the measured value.
 ///
-/// A keyword wins over a length set for the same width. A style that sets a length or `auto`
-/// for a width a keyword was set on by an earlier style has to clear the keyword: refining with
-/// `Some(None)` does, where `None` leaves it alone. In the block axis the keywords behave as
-/// `auto`, so there are no height fields.
+/// A keyword wins over a length set for the same property. A style that sets a length or `auto`
+/// for a property a keyword was set on by an earlier style has to clear the keyword: refining
+/// with `Some(None)` does, where `None` leaves it alone. In the block axis the keywords behave as
+/// `auto`, so there are no height fields, and a flex basis keyword only counts in a row flex
+/// container, where the main axis is the inline one.
 #[derive(Clone, Copy, Default, PartialEq, Debug, Refineable)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct IntrinsicWidths {
@@ -206,6 +208,9 @@ pub struct IntrinsicWidths {
     pub min_width: Option<Option<IntrinsicSize>>,
     /// The keyword for `max-width`. `fit-content` is `max-content` here.
     pub max_width: Option<Option<IntrinsicSize>>,
+    /// The keyword for `flex-basis`. `fit-content` is `max-content` here: the available space
+    /// is not known to the measurement, and `flex-shrink` narrows the item to the container.
+    pub flex_basis: Option<Option<IntrinsicSize>>,
 }
 
 /// The CSS styling that can be applied to an element via the `Styled` trait
@@ -270,7 +275,8 @@ pub struct Style {
     /// Controls the maximum size of the item
     #[refineable]
     pub max_size: Size<Length>,
-    /// The widths of `size`, `min_size` and `max_size` that are an intrinsic size keyword.
+    /// The widths of `size`, `min_size` and `max_size`, and the `flex_basis`, that are an
+    /// intrinsic size keyword.
     #[refineable]
     pub intrinsic_widths: IntrinsicWidths,
     /// Sets the preferred aspect ratio for the item. The ratio is calculated as width divided by height.
