@@ -275,8 +275,7 @@ pub struct RowMetrics {
 }
 
 impl LineLayout {
-    /// The index for the character at the given x coordinate
-    fn is_styled(&self, run: &ShapedRun) -> bool {
+    pub(crate) fn is_styled(&self, run: &ShapedRun) -> bool {
         run.font_size != self.font_size || run.line_height.is_some()
     }
 
@@ -348,6 +347,7 @@ impl LineLayout {
             .collect()
     }
 
+    /// The index for the character at the given x coordinate
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
         if x >= self.width {
             None
