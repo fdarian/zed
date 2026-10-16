@@ -8,6 +8,7 @@ use std::{
     borrow::Borrow,
     cell::RefCell,
     hash::{Hash, Hasher},
+    iter,
     ops::Range,
     sync::Arc,
 };
@@ -103,6 +104,19 @@ impl TextLayoutOptions {
     /// how `hang_trailing_spaces` and `break_spaces` combine.
     fn spaces_hang(&self) -> bool {
         self.hang_trailing_spaces && !self.break_spaces
+    }
+
+    /// These options as the min-content width of a text sees them: CSS gives
+    /// `overflow-wrap: break-word` no say in it, because it breaks a word only
+    /// once the word does not fit, and `anywhere` breaks between any two letters.
+    pub(crate) fn for_min_content(self) -> Self {
+        Self {
+            overflow_wrap: match self.overflow_wrap {
+                OverflowWrap::Anywhere => OverflowWrap::Anywhere,
+                OverflowWrap::Normal | OverflowWrap::BreakWord => OverflowWrap::Normal,
+            },
+            ..self
+        }
     }
 }
 
@@ -777,6 +791,30 @@ impl WrappedLineLayout {
         self.wrap_width
             .unwrap_or(Pixels::MAX)
             .min(self.unwrapped_layout.width)
+    }
+
+    /// How wide each wrapped line is, as alignment sees it: without the spaces
+    /// that hang at its end, and counting the tab stops and insets on it.
+    pub fn line_widths(&self) -> impl Iterator<Item = Pixels> + '_ {
+        let boundary_x = |boundary: &WrapBoundary| {
+            self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                .position
+                .x
+        };
+        let starts = iter::once(Pixels::ZERO).chain(self.wrap_boundaries.iter().map(boundary_x));
+        let ends = self
+            .wrap_boundaries
+            .iter()
+            .map(boundary_x)
+            .chain(iter::once(self.unwrapped_layout.width));
+        starts.zip(ends).enumerate().map(|(line_ix, (start, end))| {
+            let hanging = self
+                .hanging_widths
+                .get(line_ix)
+                .copied()
+                .unwrap_or(Pixels::ZERO);
+            end - start - hanging
+        })
     }
 
     /// The size of the whole wrapped text, for the given line_height.

@@ -701,6 +701,34 @@ impl WindowTextSystem {
         Ok(lines)
     }
 
+    /// The CSS `min-content` width of `text`: the width of its widest line when it
+    /// breaks at every place `options` let it, which is the narrowest it goes without
+    /// overflowing. It is the text laid out at a wrap width of nothing, so it follows
+    /// the same rules for breaking as the text does, and counts the same tab stops,
+    /// hanging spaces and `insets`.
+    pub fn min_content_width(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        options: TextLayoutOptions,
+        insets: &[TextInset],
+    ) -> Result<Pixels> {
+        let lines = self.shape_text_with_insets(
+            text,
+            font_size,
+            runs,
+            Some(px(0.)),
+            None,
+            options.for_min_content(),
+            insets,
+        )?;
+        Ok(lines
+            .iter()
+            .flat_map(|line| line.line_widths())
+            .fold(px(0.), Pixels::max))
+    }
+
     pub(crate) fn finish_frame(&self) {
         self.line_layout_cache.finish_frame()
     }

@@ -136,36 +136,6 @@ impl LineWrapper {
         })
     }
 
-    /// The width of the widest stretch of `text` between two places `wrap_line` can break, which
-    /// is its CSS `min-content` width: wrapping at it breaks no word. Trailing spaces count,
-    /// because `wrap_line` counts them.
-    pub fn min_content_width(&mut self, text: &str) -> Pixels {
-        let mut widest = px(0.);
-        let mut stretch = px(0.);
-        let mut prev_c = '\0';
-        let mut seen_non_whitespace = false;
-        for c in text.chars() {
-            if c == '\n' {
-                widest = widest.max(stretch);
-                stretch = px(0.);
-                prev_c = '\0';
-                seen_non_whitespace = false;
-                continue;
-            }
-            let breaks_before = seen_non_whitespace
-                && c != ' '
-                && (!Self::is_word_char(c) || prev_c == ' ');
-            if breaks_before {
-                widest = widest.max(stretch);
-                stretch = px(0.);
-            }
-            seen_non_whitespace |= c != ' ';
-            stretch += self.width_for_char(c);
-            prev_c = c;
-        }
-        widest.max(stretch)
-    }
-
     /// Determines if a line should be truncated based on its width.
     ///
     /// Returns the truncation index in `line`.
@@ -579,8 +549,8 @@ mod tests {
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
     use crate::{
-        OverflowWrap, TabSize, TextLayoutOptions, TextRun, WindowTextSystem, WordBreak,
-        WrapBoundary, WrappedLine, point,
+        OverflowWrap, TabSize, TextInset, TextLayoutOptions, TextRun, WindowTextSystem,
+        WordBreak, WrapBoundary, WrappedLine, point,
     };
 
     fn build_wrapper() -> LineWrapper {
@@ -605,39 +575,6 @@ mod tests {
                 ..Default::default()
             })
             .collect()
-    }
-
-    #[test]
-    fn test_min_content_width_is_the_widest_stretch_between_break_opportunities() {
-        let mut wrapper = build_wrapper();
-        let char_width = wrapper.width_for_char('a');
-        let mut chars = |text: &str, count: f32| {
-            let width = wrapper.min_content_width(text);
-            assert!(
-                (width - char_width * count).abs() < px(0.01),
-                "{text:?} is {width:?} wide, expected {count} characters"
-            );
-        };
-
-        chars("", 0.);
-        chars("abc", 3.);
-        // The trailing space belongs to the word it follows.
-        chars("aa bbb cccc ddddd eeee", 6.);
-        chars("  ab cd", 5.);
-        chars("abc\nde fg", 3.);
-
-        let text = "aa bbb cccc ddddd eeee";
-        let narrowest = wrapper.min_content_width(text);
-        let breaks: Vec<_> = wrapper
-            .wrap_line(&[LineFragment::text(text)], narrowest)
-            .map(|boundary| boundary.ix)
-            .collect();
-        assert!(
-            breaks
-                .iter()
-                .all(|ix| text.as_bytes()[*ix - 1] == b' ' && text.as_bytes()[*ix] != b' '),
-            "wrapping at the min-content width broke a word: {breaks:?}"
-        );
     }
 
     #[test]
@@ -2048,5 +1985,191 @@ mod tests {
             assert_eq!(wrapped_lines(Some(2)), 2);
             assert!(wrapped_lines(None) > 2);
         });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn min_content(
+        cx: &mut TestAppContext,
+        text: &str,
+        options: TextLayoutOptions,
+        insets: &[TextInset],
+    ) -> Pixels {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let text: SharedString = text.to_string().into();
+            let run = TextRun {
+                len: text.len(),
+                font: font("Menlo"),
+                ..Default::default()
+            };
+            text_system
+                .min_content_width(text, px(16.), &[run], options, insets)
+                .unwrap()
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_min_content(
+        cx: &mut TestAppContext,
+        text: &str,
+        options: TextLayoutOptions,
+        insets: &[TextInset],
+        spaces: f32,
+    ) {
+        let width = min_content(cx, text, options, insets);
+        let expected = spaces_wide(cx, spaces);
+        assert!(
+            (width - expected).abs() < px(0.01),
+            "{text:?} under {options:?} is {width:?} wide at min-content, expected {spaces} spaces ({expected:?})"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn min_content_is_the_widest_stretch_between_break_opportunities(cx: &mut TestAppContext) {
+        let plain = TextLayoutOptions::default();
+        assert_min_content(cx, "", plain, &[], 0.);
+        assert_min_content(cx, "abc", plain, &[], 3.);
+        // Without hanging, the space after a word belongs to the word.
+        assert_min_content(cx, "aa bbb cccc ddddd eeee", plain, &[], 6.);
+        assert_min_content(cx, "  ab cd", plain, &[], 5.);
+        assert_min_content(cx, "abc\nde fg", plain, &[], 3.);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn min_content_leaves_out_hanging_spaces(cx: &mut TestAppContext) {
+        assert_min_content(cx, "aa bbb cccc ddddd eeee", HANGING, &[], 5.);
+        assert_min_content(cx, "aa     bbb", HANGING, &[], 3.);
+        assert_min_content(cx, "     ", HANGING, &[], 0.);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn min_content_counts_the_spaces_that_break_spaces_keeps(cx: &mut TestAppContext) {
+        // Spaces never hang, so the space after a word is part of its line...
+        assert_min_content(cx, "aaaa bb", BREAKING, &[], 5.);
+        // ...and a run of spaces breaks between any two of them.
+        assert_min_content(cx, "a    b", BREAKING, &[], 2.);
+        assert_min_content(cx, "    ", BREAKING, &[], 1.);
+        // It overrides hanging.
+        let both = TextLayoutOptions {
+            hang_trailing_spaces: true,
+            ..BREAKING
+        };
+        assert_min_content(cx, "aaaa bb", both, &[], 5.);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn min_content_counts_tabs_to_their_stop_from_the_start_of_the_line(cx: &mut TestAppContext) {
+        let tabs = |spaces| TextLayoutOptions {
+            tab_size: Some(TabSize::Spaces(spaces)),
+            ..Default::default()
+        };
+        // A tab breaks like a space, and ends at the stop after it.
+        assert_min_content(cx, "ab\tc", tabs(4.), &[], 4.);
+        assert_min_content(cx, "a\tb\tc", tabs(8.), &[], 8.);
+        assert_min_content(cx, "abcd\tefgh", tabs(4.), &[], 8.);
+        // Each stretch starts a line of its own, so its tab counts from there.
+        assert_min_content(cx, "abcdef\tgh\ti", tabs(4.), &[], 8.);
+        // A hanging tab is left out.
+        let hanging = TextLayoutOptions {
+            hang_trailing_spaces: true,
+            ..tabs(4.)
+        };
+        assert_min_content(cx, "ab\tc", hanging, &[], 2.);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn min_content_follows_word_break(cx: &mut TestAppContext) {
+        let breaking = |word_break| TextLayoutOptions {
+            word_break,
+            ..Default::default()
+        };
+        assert_min_content(cx, "abcdef ghi", breaking(WordBreak::Normal), &[], 7.);
+        // Between any two letters.
+        assert_min_content(cx, "abcdef ghi", breaking(WordBreak::BreakAll), &[], 1.);
+        // CJK breaks between its characters, unless it is kept together.
+        let cjk = "\u{4E2D}\u{4E2D}\u{4E2D}";
+        let normal = min_content(cx, cjk, breaking(WordBreak::Normal), &[]);
+        let kept = min_content(cx, cjk, breaking(WordBreak::KeepAll), &[]);
+        assert!(
+            (kept - normal * 3.).abs() < px(0.01) && kept > px(0.),
+            "keep-all {kept:?} is three characters of {normal:?}"
+        );
+        assert_min_content(cx, "abcdef ghi", breaking(WordBreak::KeepAll), &[], 7.);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn min_content_follows_overflow_wrap_as_css_does(cx: &mut TestAppContext) {
+        let wrapping = |overflow_wrap| TextLayoutOptions {
+            overflow_wrap,
+            ..Default::default()
+        };
+        // break-word breaks a word only when it does not fit, so it does not shrink
+        // the min-content width: only anywhere does.
+        assert_min_content(cx, "aa bbbbbbbb", wrapping(OverflowWrap::Normal), &[], 8.);
+        assert_min_content(cx, "aa bbbbbbbb", wrapping(OverflowWrap::BreakWord), &[], 8.);
+        assert_min_content(cx, "aa bbbbbbbb", wrapping(OverflowWrap::Anywhere), &[], 1.);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn min_content_counts_insets_at_the_ends_of_their_range(cx: &mut TestAppContext) {
+        let space = spaces_wide(cx, 1.);
+        let inset = |range, leading: f32, trailing: f32| TextInset {
+            range,
+            leading: space * leading,
+            trailing: space * trailing,
+        };
+        let plain = TextLayoutOptions::default();
+        // "cd" is a stretch of its own, and 1.5 + 0.5 wider than its letters.
+        assert_min_content(cx, "ab cd", plain, &[inset(3..5, 1.5, 0.5)], 4.);
+        // Inside a word both ends count.
+        assert_min_content(cx, "abcd", plain, &[inset(0..4, 1., 1.)], 6.);
+        // Across a break they stay at the two ends: the first stretch takes the leading
+        // inset, the last the trailing one.
+        assert_min_content(cx, "ab cd", plain, &[inset(0..5, 2., 0.5)], 5.);
+        assert_min_content(cx, "ab cdef", plain, &[inset(0..7, 0., 1.)], 5.);
+        // An inset that sits on a letter by itself makes the letter wider.
+        let anywhere = wrapping_anywhere();
+        assert_min_content(cx, "abc", anywhere, &[inset(1..2, 2., 1.)], 4.);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wrapping_anywhere() -> TextLayoutOptions {
+        TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Anywhere,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn wrapping_at_the_min_content_width_breaks_no_word(cx: &mut TestAppContext) {
+        let text = "aa bbb cccc ddddd eeee";
+        for options in [Default::default(), HANGING, BREAKING] {
+            let width = min_content(cx, text, options, &[]);
+            let line = TabbedText::shape_with(cx, text, Some(width.ceil()), options).line;
+            let breaks: Vec<usize> = line
+                .layout
+                .wrap_boundaries()
+                .iter()
+                .map(|boundary| {
+                    line.layout.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                        .index
+                })
+                .collect();
+            assert!(!breaks.is_empty());
+            assert!(
+                breaks
+                    .iter()
+                    .all(|ix| text.as_bytes()[*ix - 1] == b' ' && text.as_bytes()[*ix] != b' '),
+                "wrapping at the min-content width broke a word under {options:?}: {breaks:?}"
+            );
+        }
     }
 }

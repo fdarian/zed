@@ -666,17 +666,42 @@ impl TextLayout {
                     crate::AvailableSpace::Definite(x) => Some(x),
                     _ => None,
                 });
+                let unmeasurable = |wrap_width, truncate_width| {
+                    element_state.0.borrow_mut().replace(TextLayoutInner {
+                        lines: Default::default(),
+                        len: 0,
+                        line_height,
+                        wrap_width,
+                        truncate_width,
+                        size: Some(Size::default()),
+                        bounds: None,
+                    });
+                    Size::default()
+                };
                 let wrap_width = if text_style.white_space == WhiteSpace::Normal {
-                    known_dimensions.width.or(match available_space.width {
-                        crate::AvailableSpace::Definite(x) => Some(x),
-                        // The narrowest the text goes without breaking a word.
-                        crate::AvailableSpace::MinContent => Some(
-                            cx.text_system()
-                                .line_wrapper(text_style.font(), font_size)
-                                .min_content_width(&text),
-                        ),
-                        crate::AvailableSpace::MaxContent => None,
-                    })
+                    match (known_dimensions.width, available_space.width) {
+                        (Some(width), _) | (None, crate::AvailableSpace::Definite(width)) => {
+                            Some(width)
+                        }
+                        (None, crate::AvailableSpace::MaxContent) => None,
+                        (None, crate::AvailableSpace::MinContent) => {
+                            // Laid out at the width the real pass will give the node, which
+                            // is the measured width rounded up.
+                            match window.text_system().min_content_width(
+                                text.clone(),
+                                font_size,
+                                &runs,
+                                text_style.layout_options(),
+                                &insets,
+                            ) {
+                                Ok(width) => Some(width.ceil()),
+                                Err(error) => {
+                                    log::error!("measuring the min-content width: {error:#}");
+                                    return unmeasurable(None, None);
+                                }
+                            }
+                        }
+                    }
                 } else {
                     None
                 };
@@ -796,16 +821,7 @@ impl TextLayout {
                         .map(|lines| (len, lines))
                 });
                 let Some((len, lines)) = lines else {
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
-                        lines: Default::default(),
-                        len: 0,
-                        line_height,
-                        wrap_width,
-                        truncate_width,
-                        size: Some(Size::default()),
-                        bounds: None,
-                    });
-                    return Size::default();
+                    return unmeasurable(wrap_width, truncate_width);
                 };
 
                 let mut size: Size<Pixels> = Size::default();
@@ -1453,6 +1469,112 @@ mod tests {
         fn a_line_with_tabs_that_does_not_wrap_is_cut_at_its_stop(cx: &mut TestAppContext) {
             let layout = laid_out(cx, "a\tb\tc\td\te", 10., true);
             assert_eq!(layout.text(), "a\tb\tc\u{2026}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod min_content {
+        use super::*;
+        use crate::{
+            AppContext as _, Context, OverflowWrap, ParentElement as _, Render, Styled as _,
+            TestAppContext, WordBreak, div, font, px,
+        };
+
+        struct MinContentText {
+            text: &'static str,
+            style: fn(&mut crate::StyleRefinement),
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for MinContentText {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let text = StyledText::new(self.text);
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let mut keyworded = div()
+                    .w_min_content()
+                    .font_family(font("Menlo").family)
+                    .text_size(px(16.));
+                (self.style)(keyworded.style());
+                div().w(px(400.)).child(keyworded.child(text))
+            }
+        }
+
+        /// The width and the height in lines of `text` in a box whose width is
+        /// `min-content`, with `style` applied to the box.
+        fn laid_out(
+            cx: &mut TestAppContext,
+            text: &'static str,
+            style: fn(&mut crate::StyleRefinement),
+        ) -> (Pixels, usize) {
+            let layout = Rc::new(RefCell::new(None));
+            let window = cx.add_window({
+                let layout = layout.clone();
+                move |_, _| MinContentText {
+                    text,
+                    style,
+                    layout,
+                }
+            });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            let layout = layout.borrow().clone().unwrap();
+            let lines = layout.wrapped_text().split('\n').count();
+            (layout.bounds().size.width, lines)
+        }
+
+        fn space(cx: &mut TestAppContext) -> Pixels {
+            cx.update(|cx| {
+                let text_system = cx.text_system();
+                text_system
+                    .advance(text_system.resolve_font(&font("Menlo")), px(16.), ' ')
+                    .unwrap()
+                    .width
+            })
+        }
+
+        #[crate::test]
+        fn a_box_is_as_wide_as_the_longest_word_and_the_text_wraps_in_it(cx: &mut TestAppContext) {
+            let (width, lines) = laid_out(cx, "aa bbbbbb cccc", |_| {});
+            assert_eq!(width, (space(cx) * 7.).ceil());
+            assert_eq!(lines, 3);
+        }
+
+        #[crate::test]
+        fn overflow_wrap_anywhere_shrinks_the_box_and_break_word_does_not(cx: &mut TestAppContext) {
+            let (normal, normal_lines) = laid_out(cx, "aa bbbbbb cccc", |style| {
+                style.text_style().overflow_wrap = Some(OverflowWrap::Normal);
+            });
+            let (break_word, _) = laid_out(cx, "aa bbbbbb cccc", |style| {
+                style.text_style().overflow_wrap = Some(OverflowWrap::BreakWord);
+            });
+            let (anywhere, anywhere_lines) = laid_out(cx, "aa bbbbbb cccc", |style| {
+                style.text_style().overflow_wrap = Some(OverflowWrap::Anywhere);
+            });
+            let space = space(cx);
+            assert_eq!(normal, (space * 7.).ceil());
+            assert_eq!(break_word, normal);
+            assert_eq!(anywhere, space.ceil());
+            assert_eq!(normal_lines, 3);
+            assert!(anywhere_lines > normal_lines);
+        }
+
+        #[crate::test]
+        fn hanging_spaces_do_not_widen_the_box(cx: &mut TestAppContext) {
+            let (hung, _) = laid_out(cx, "aaaa bb", |style| {
+                style.text_style().hang_trailing_spaces = Some(true);
+            });
+            let (kept, _) = laid_out(cx, "aaaa bb", |_| {});
+            let space = space(cx);
+            assert_eq!(hung, (space * 4.).ceil());
+            assert_eq!(kept, (space * 5.).ceil());
+        }
+
+        #[crate::test]
+        fn break_all_makes_the_box_one_letter_wide(cx: &mut TestAppContext) {
+            let (width, _) = laid_out(cx, "abcdef ghi", |style| {
+                style.text_style().word_break = Some(WordBreak::BreakAll);
+            });
+            assert_eq!(width, space(cx).ceil());
         }
     }
 
