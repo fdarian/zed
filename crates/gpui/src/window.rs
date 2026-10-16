@@ -1081,23 +1081,40 @@ impl ClipIndex {
         if !hitboxes.iter().any(|hitbox| hitbox.clip.is_some()) {
             return None;
         }
-        let mut positions = FxHashMap::with_capacity_and_hasher(hitboxes.len(), Default::default());
-        let mut enclosing_clip: Vec<Option<u32>> = Vec::with_capacity(hitboxes.len());
-        for (ix, hitbox) in hitboxes.iter().enumerate() {
-            // A parent is always inserted before its children.
-            let parent = hitbox
-                .parent
-                .and_then(|parent| positions.get(&parent).copied());
-            enclosing_clip.push(parent.and_then(|parent: usize| {
-                if hitboxes[parent].clip.is_some() {
-                    Some(parent as u32)
-                } else {
-                    enclosing_clip[parent]
+        let positions: FxHashMap<HitboxId, usize> = hitboxes
+            .iter()
+            .enumerate()
+            .map(|(ix, hitbox)| (hitbox.id, ix))
+            .collect();
+        // A hitbox can sit before its parent: a z-indexed element is moved to where it paints.
+        let mut enclosing_clip: Vec<Option<Option<u32>>> = vec![None; hitboxes.len()];
+        let mut unresolved = Vec::new();
+        for start in 0..hitboxes.len() {
+            let mut current = start;
+            let resolved = loop {
+                if let Some(known) = enclosing_clip[current] {
+                    break known;
                 }
-            }));
-            positions.insert(hitbox.id, ix);
+                unresolved.push(current);
+                let Some(parent) = hitboxes[current]
+                    .parent
+                    .and_then(|parent| positions.get(&parent).copied())
+                else {
+                    break None;
+                };
+                if hitboxes[parent].clip.is_some() {
+                    break Some(parent as u32);
+                }
+                current = parent;
+            };
+            // Every hitbox on the walk has the same nearest clip: the ones between were unclipped.
+            for ix in unresolved.drain(..) {
+                enclosing_clip[ix] = Some(resolved);
+            }
         }
-        Some(Self { enclosing_clip })
+        Some(Self {
+            enclosing_clip: enclosing_clip.into_iter().map(Option::unwrap).collect(),
+        })
     }
 }
 
@@ -1268,11 +1285,18 @@ impl Frame {
                 identity: hitbox.identity.clone(),
                 bounds: hitbox.bounds,
             });
-            // A parent is always inserted before its children.
+            // A parent is inserted before its children unless a z-indexed element moved the
+            // child, so look behind first and then ahead.
             next = hitbox.parent.map(|parent| {
                 self.hitboxes[..index]
                     .iter()
                     .rposition(|candidate| candidate.id == parent)
+                    .or_else(|| {
+                        self.hitboxes[index + 1..]
+                            .iter()
+                            .position(|candidate| candidate.id == parent)
+                            .map(|offset| index + 1 + offset)
+                    })
                     .expect("hitbox parent is missing from the frame")
             });
         }
@@ -8145,14 +8169,16 @@ mod tests {
         rc::Rc,
     };
 
+    use super::{Frame, Hitbox, HitboxId};
     use crate::util::FluentBuilder as _;
     use crate::{
-        AnyWindowHandle, App, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
-        ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        HitboxBehavior, InputEvent as _, InteractiveElement as _, IntoElement, MouseButton,
-        MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
-        WindowOptions, canvas, div, point, px, size,
+        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, Context, ContentMask,
+        DispatchTree, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
+        FileDropEvent, FocusHandle, HitboxBehavior, InputEvent as _, InteractiveElement as _,
+        IntoElement, Keymap, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
+        Point, Render, RequestFrameOptions, ResolvedClipPath, StatefulInteractiveElement as _,
+        Styled, TestAppContext, Window, WindowAppearance, WindowOptions, canvas, div, point, px,
+        size,
     };
 
     struct EmptyView;
@@ -9173,4 +9199,98 @@ mod tests {
         assert_eq!(paints.get() - paints_before_press, 3);
         assert!(!cx.update(|window, _| window.invalidator.is_dirty()));
     }
+
+    struct TestHitbox {
+        id: u64,
+        parent: Option<u64>,
+        pass_through: bool,
+        clipped: bool,
+    }
+
+    const fn hitbox(id: u64, parent: Option<u64>) -> TestHitbox {
+        TestHitbox {
+            id,
+            parent,
+            pass_through: false,
+            clipped: false,
+        }
+    }
+
+    /// A frame of 200 by 200 hitboxes listed in the given order, which is the order they paint
+    /// in. A clipped hitbox only lets through the ellipse inscribed in (0, 0, 100, 100).
+    fn frame_of(list: &[TestHitbox]) -> Frame {
+        let mut frame = Frame::new(DispatchTree::new(
+            Rc::new(RefCell::new(Keymap::new(Vec::new()))),
+            Rc::new(ActionRegistry::default()),
+        ));
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(200.), px(200.)));
+        for entry in list {
+            frame.hitboxes.push(Hitbox {
+                id: HitboxId(entry.id),
+                bounds,
+                content_mask: ContentMask::from_bounds(bounds),
+                behavior: if entry.pass_through {
+                    HitboxBehavior::PassThrough
+                } else {
+                    HitboxBehavior::Normal
+                },
+                identity: None,
+                parent: entry.parent.map(HitboxId),
+                clip: entry.clipped.then(|| {
+                    Rc::new(ResolvedClipPath::Ellipse {
+                        center: point(50., 50.),
+                        radii: size(50., 50.),
+                    })
+                }),
+            });
+        }
+        frame
+    }
+
+    fn hit_ids(frame: &Frame, x: f32, y: f32, dom: bool) -> Vec<u64> {
+        frame
+            .hit_test(point(px(x), px(y)), dom)
+            .ids
+            .iter()
+            .map(|id| id.0)
+            .collect()
+    }
+
+    #[test]
+    fn the_hit_chain_finds_a_parent_listed_after_its_child() {
+        // 3 paints below its parent 2, which does not take the pointer.
+        let frame = frame_of(&[
+            hitbox(1, None),
+            hitbox(3, Some(2)),
+            TestHitbox {
+                pass_through: true,
+                ..hitbox(2, Some(1))
+            },
+        ]);
+
+        assert_eq!(hit_ids(&frame, 10., 10., true), [3, 2, 1]);
+    }
+
+    #[test]
+    fn a_clip_path_cuts_descendants_listed_before_the_hitbox_that_has_it() {
+        let frame = frame_of(&[
+            hitbox(3, Some(2)),
+            TestHitbox {
+                pass_through: true,
+                ..hitbox(2, Some(1))
+            },
+            TestHitbox {
+                pass_through: true,
+                clipped: true,
+                ..hitbox(1, None)
+            },
+        ]);
+
+        for dom in [true, false] {
+            assert_eq!(hit_ids(&frame, 50., 50., dom).first(), Some(&3), "dom: {dom}");
+            // The corner is outside the ellipse of 1, two parents up from 3.
+            assert_eq!(hit_ids(&frame, 5., 5., dom), Vec::<u64>::new(), "dom: {dom}");
+        }
+    }
+
 }
