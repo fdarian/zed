@@ -278,6 +278,9 @@ pub struct Style {
     /// Whether this is a replaced element such as an image. In block layout it is sized by its
     /// own content instead of stretching to the container's width.
     pub item_is_replaced: bool,
+    /// Whether layout should also work out the width this element would have if its `width` were
+    /// `auto`, in its real context. See [`Window::layout_natural_width`].
+    pub measure_natural_width: bool,
 
     // Spacing Properties
     /// How large should the margin be on each side?
@@ -1176,6 +1179,7 @@ impl Default for Style {
             intrinsic_widths: IntrinsicWidths::default(),
             aspect_ratio: None,
             item_is_replaced: false,
+            measure_natural_width: false,
             gap: Size::default(),
             // Alignment
             align_items: None,

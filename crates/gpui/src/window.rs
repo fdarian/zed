@@ -5560,6 +5560,28 @@ impl Window {
             .layout_insets(layout_id, scale_factor)
     }
 
+    /// The border-box width the given layout node would have if its `width` were `auto`, in
+    /// logical pixels and unrounded, in the context it was laid out in. `None` unless the node's
+    /// style has `measure_natural_width` and it was laid out this frame.
+    ///
+    /// `min-width` and `max-width` still apply to it.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_natural_width(&mut self, layout_id: LayoutId) -> Option<Pixels> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .layout_natural_width(layout_id, scale_factor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn natural_passes(&self) -> usize {
+        self.layout_engine.as_ref().unwrap().natural_passes()
+    }
+
     /// The space the given layout node reserved for scrollbars, in logical pixels: its
     /// `scrollbar_width` on an axis whose `overflow` is `Scroll`, taken from the right and
     /// bottom of its padding box.

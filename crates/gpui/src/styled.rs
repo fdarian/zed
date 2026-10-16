@@ -479,6 +479,14 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Asks layout to also measure the width this element would have if its `width` were `auto`,
+    /// readable from `Window::layout_natural_width`. It costs an extra layout of the tree every
+    /// frame, so only set it on the elements that need it.
+    fn measure_natural_width(mut self) -> Self {
+        self.style().measure_natural_width = Some(true);
+        self
+    }
+
     /// Sets the width of the element to `min-content`.
     fn w_min_content(mut self) -> Self {
         self.style().intrinsic_widths.width = Some(Some(IntrinsicSize::MinContent));

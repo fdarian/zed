@@ -12,6 +12,7 @@ use std::{fmt::Debug, ops::Range};
 mod calc;
 mod containing_block;
 mod intrinsic;
+mod natural;
 use calc::CalcArena;
 use taffy::{
     TaffyTree, TraversePartialTree as _,
@@ -55,6 +56,13 @@ pub struct TaffyLayoutEngine {
     /// Nodes with a width keyword (`min-content`, `max-content`, `fit-content`) that
     /// `compute_layout` has not measured yet, in the order they were requested.
     intrinsic_nodes: Vec<intrinsic::IntrinsicNode>,
+    /// Nodes asking for their natural width that no `compute_layout` has measured yet.
+    natural_pending: Vec<LayoutId>,
+    /// The measured natural width of each node, in device pixels, unrounded.
+    natural_widths: FxHashMap<LayoutId, f32>,
+    /// How many extra layouts of a whole tree `compute_layout` ran for natural widths.
+    #[cfg(test)]
+    natural_passes: usize,
     /// Owns what the `calc()` lengths in the taffy styles point to, so it is cleared with them.
     calcs: CalcArena,
 }
@@ -76,6 +84,10 @@ impl TaffyLayoutEngine {
             escapable_kinds: FxHashMap::default(),
             detached: FxHashSet::default(),
             intrinsic_nodes: Vec::new(),
+            natural_pending: Vec::new(),
+            natural_widths: FxHashMap::default(),
+            #[cfg(test)]
+            natural_passes: 0,
             calcs: CalcArena::default(),
         }
     }
@@ -91,6 +103,8 @@ impl TaffyLayoutEngine {
         self.escapable_kinds.clear();
         self.detached.clear();
         self.intrinsic_nodes.clear();
+        self.natural_pending.clear();
+        self.natural_widths.clear();
     }
 
     pub fn mark_detached(&mut self, id: LayoutId) {
@@ -122,6 +136,7 @@ impl TaffyLayoutEngine {
         };
         self.track_position(id, style.position, escapable);
         self.track_intrinsic_widths(id, &style, rem_size, scale_factor);
+        self.track_natural_width(id, &style);
         id
     }
 
@@ -152,6 +167,7 @@ impl TaffyLayoutEngine {
             .into();
         self.track_position(id, style.position, escapable);
         self.track_intrinsic_widths(id, &style, rem_size, scale_factor);
+        self.track_natural_width(id, &style);
         id
     }
 
@@ -282,6 +298,7 @@ impl TaffyLayoutEngine {
         );
 
         self.resolve_intrinsic_widths(window, cx);
+        self.measure_natural_widths(id, available_space, scale_factor, window, cx);
         self.run_taffy(id, available_space, scale_factor, window, cx);
         self.settle_containing_blocks(id, available_space, scale_factor, window, cx);
     }
@@ -1922,6 +1939,410 @@ mod tests {
                 cx.run_until_parked();
                 assert_eq!(bounds(cx, "box").size.width, px(width), "text {text:?}");
             }
+        }
+    }
+    mod natural_width {
+        use crate::{
+            AnyElement, App, AvailableSpace, Bounds, Context, Div, Element, ElementId,
+            GlobalElementId, InspectorElementId, InteractiveElement as _, IntoElement,
+            ParentElement as _, Pixels, Position, Render, Style, StyleRefinement, Styled,
+            TestAppContext, VisualTestContext, Window, div, px, relative, size,
+        };
+        use refineable::Refineable as _;
+        use std::{
+            cell::{Cell, RefCell},
+            collections::HashMap,
+            rc::Rc,
+        };
+
+        type Naturals = Rc<RefCell<HashMap<&'static str, Option<Pixels>>>>;
+
+        /// A box that asks for its natural width and records the answer when it is painted.
+        fn flagged(name: &'static str, naturals: &Naturals) -> Div {
+            let naturals = naturals.clone();
+            div()
+                .debug_selector(move || name.into())
+                .measure_natural_width()
+                .on_painted_layout(move |_, layout_id, window, _| {
+                    naturals
+                        .borrow_mut()
+                        .insert(name, window.layout_natural_width(layout_id));
+                })
+        }
+
+        struct Probe {
+            width: f32,
+            build: Rc<dyn Fn(&Naturals, f32) -> AnyElement>,
+            naturals: Naturals,
+        }
+
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child((self.build)(&self.naturals, self.width))
+            }
+        }
+
+        /// Lays out `build(naturals, grandchild_width)` in a 400 by 300 window.
+        fn lay_out<'a>(
+            cx: &'a mut TestAppContext,
+            width: f32,
+            build: impl Fn(&Naturals, f32) -> AnyElement + 'static,
+        ) -> (crate::Entity<Probe>, Naturals, &'a mut VisualTestContext) {
+            let naturals = Naturals::default();
+            let (view, cx) = cx.add_window_view({
+                let naturals = naturals.clone();
+                move |_, _| Probe {
+                    width,
+                    build: Rc::new(build),
+                    naturals,
+                }
+            });
+            cx.simulate_resize(size(px(400.), px(300.)));
+            cx.run_until_parked();
+            (view, naturals, cx)
+        }
+
+        fn bounds(cx: &mut VisualTestContext, selector: &'static str) -> Bounds<Pixels> {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("no element with debug selector {selector}"))
+        }
+
+        fn natural(naturals: &Naturals, name: &'static str) -> Option<Pixels> {
+            *naturals
+                .borrow()
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} was never painted"))
+        }
+
+        #[gpui::test]
+        fn a_fixed_width_is_not_the_natural_width(cx: &mut TestAppContext) {
+            let (_, naturals, cx) = lay_out(cx, 120., |naturals, width| {
+                div()
+                    .flex()
+                    .w(px(400.))
+                    .child(
+                        flagged("box", naturals)
+                            .w(px(50.))
+                            .pl(px(5.))
+                            .border_r(px(3.))
+                            .child(div().w(px(width)).h(px(10.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(50.));
+            assert_eq!(natural(&naturals, "box"), Some(px(128.)));
+        }
+
+        #[gpui::test]
+        fn an_unflagged_node_has_no_natural_width(cx: &mut TestAppContext) {
+            let (_, naturals, _cx) = lay_out(cx, 120., |naturals, width| {
+                let mut unflagged = flagged("box", naturals);
+                unflagged.style().measure_natural_width = None;
+                div()
+                    .child(unflagged.w(px(50.)).child(div().w(px(width)).h(px(10.))))
+                    .into_any_element()
+            });
+            assert_eq!(natural(&naturals, "box"), None);
+        }
+
+        #[gpui::test]
+        fn a_stretched_child_is_as_wide_as_its_container(cx: &mut TestAppContext) {
+            let (_, naturals, cx) = lay_out(cx, 120., |naturals, width| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(400.))
+                    .child(flagged("column", naturals).child(div().w(px(width)).h(px(10.))))
+                    .child(div().child(flagged("block", naturals).child(div().w(px(width)))))
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "column").size.width, px(400.));
+            assert_eq!(natural(&naturals, "column"), Some(px(400.)));
+            assert_eq!(natural(&naturals, "block"), Some(px(400.)));
+        }
+
+        #[gpui::test]
+        fn a_row_item_is_as_wide_as_its_content(cx: &mut TestAppContext) {
+            let (_, naturals, _cx) = lay_out(cx, 120., |naturals, width| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .w(px(400.))
+                    .child(
+                        flagged("box", naturals)
+                            .w(px(30.))
+                            .child(div().w(px(width)).h(px(10.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(natural(&naturals, "box"), Some(px(120.)));
+        }
+
+        #[gpui::test]
+        fn a_percentage_width_is_replaced_by_auto(cx: &mut TestAppContext) {
+            let (_, naturals, cx) = lay_out(cx, 120., |naturals, width| {
+                div()
+                    .flex()
+                    .w(px(400.))
+                    .child(
+                        flagged("box", naturals)
+                            .w(relative(0.25))
+                            .child(div().w(px(width)).h(px(10.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(100.));
+            assert_eq!(natural(&naturals, "box"), Some(px(120.)));
+        }
+
+        #[gpui::test]
+        fn min_and_max_width_still_clamp_the_natural_width(cx: &mut TestAppContext) {
+            let (_, naturals, _cx) = lay_out(cx, 120., |naturals, width| {
+                div()
+                    .flex()
+                    .w(px(400.))
+                    .child(
+                        flagged("capped", naturals)
+                            .max_w(px(80.))
+                            .child(div().w(px(width)).h(px(10.))),
+                    )
+                    .child(
+                        flagged("floored", naturals)
+                            .min_w(px(200.))
+                            .child(div().w(px(width)).h(px(10.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(natural(&naturals, "capped"), Some(px(80.)));
+            assert_eq!(natural(&naturals, "floored"), Some(px(200.)));
+        }
+
+        #[gpui::test]
+        fn nested_flagged_nodes_are_all_auto_in_the_same_pass(cx: &mut TestAppContext) {
+            let (_, naturals, cx) = lay_out(cx, 120., |naturals, width| {
+                div()
+                    .flex()
+                    .w(px(400.))
+                    .child(
+                        flagged("outer", naturals)
+                            .flex()
+                            .w(px(50.))
+                            .child(
+                                flagged("inner", naturals)
+                                    .w(px(30.))
+                                    .flex_none()
+                                    .child(div().w(px(width)).h(px(10.))),
+                            )
+                            .child(div().w(px(40.)).h(px(10.)).flex_none()),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "outer").size.width, px(50.));
+            assert_eq!(bounds(cx, "inner").size.width, px(30.));
+            assert_eq!(natural(&naturals, "inner"), Some(px(120.)));
+            // 120 + 40: the inner node is auto while the outer one is measured, not 30 + 40.
+            assert_eq!(natural(&naturals, "outer"), Some(px(160.)));
+        }
+
+        #[gpui::test]
+        fn a_width_keyword_is_replaced_by_auto(cx: &mut TestAppContext) {
+            let (_, naturals, cx) = lay_out(cx, 120., |naturals, _| {
+                div()
+                    .w(px(400.))
+                    .child(
+                        flagged("box", naturals)
+                            .w_min_content()
+                            .child(div().w(px(30.)).h(px(5.)))
+                            .child(div().w(px(70.)).h(px(5.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(70.));
+            assert_eq!(natural(&naturals, "box"), Some(px(400.)));
+        }
+
+        #[gpui::test]
+        fn an_absolute_node_is_as_wide_as_its_content(cx: &mut TestAppContext) {
+            let (_, naturals, cx) = lay_out(cx, 120., |naturals, width| {
+                div()
+                    .relative()
+                    .w(px(300.))
+                    .h(px(100.))
+                    .child(
+                        flagged("box", naturals)
+                            .absolute()
+                            .w(px(50.))
+                            .child(div().w(px(width)).h(px(10.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "box").size.width, px(50.));
+            assert_eq!(natural(&naturals, "box"), Some(px(120.)));
+        }
+
+        #[gpui::test]
+        fn an_absolute_node_escaping_a_static_parent_keeps_its_place(cx: &mut TestAppContext) {
+            let (_, naturals, cx) = lay_out(cx, 120., |naturals, width| {
+                let mut parent = div().w(px(300.)).h(px(100.)).pl(px(40.));
+                parent.style().position = Some(Position::Static);
+                let mut child = flagged("box", naturals)
+                    .w(px(50.))
+                    .left(px(10.))
+                    .top(px(5.))
+                    .child(div().w(px(width)).h(px(10.)));
+                child.style().position = Some(Position::AbsoluteInAncestor);
+                div()
+                    .relative()
+                    .w(px(350.))
+                    .child(parent.child(child))
+                    .into_any_element()
+            });
+            let placed = bounds(cx, "box");
+            assert_eq!(placed.size.width, px(50.));
+            // The containing block is the outer box, not the padded static parent.
+            assert_eq!((placed.origin.x, placed.origin.y), (px(10.), px(5.)));
+            assert_eq!(natural(&naturals, "box"), Some(px(120.)));
+        }
+
+        #[gpui::test]
+        fn the_next_frame_measures_the_new_content(cx: &mut TestAppContext) {
+            let (view, naturals, cx) = lay_out(cx, 120., |naturals, width| {
+                div()
+                    .flex()
+                    .w(px(400.))
+                    .child(
+                        flagged("box", naturals)
+                            .w(px(50.))
+                            .child(div().w(px(width)).h(px(10.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(natural(&naturals, "box"), Some(px(120.)));
+
+            for width in [30., 200., 120.] {
+                view.update(cx, |view, cx| {
+                    view.width = width;
+                    cx.notify();
+                });
+                cx.run_until_parked();
+                assert_eq!(natural(&naturals, "box"), Some(px(width)), "width {width}");
+                assert_eq!(bounds(cx, "box").size.width, px(50.));
+            }
+        }
+
+        /// A leaf of a fixed size that counts how often layout asks it to measure.
+        struct Counting {
+            calls: Rc<Cell<usize>>,
+            style: StyleRefinement,
+        }
+
+        impl Styled for Counting {
+            fn style(&mut self) -> &mut StyleRefinement {
+                &mut self.style
+            }
+        }
+
+        impl IntoElement for Counting {
+            type Element = Self;
+
+            fn into_element(self) -> Self {
+                self
+            }
+        }
+
+        impl Element for Counting {
+            type RequestLayoutState = ();
+            type PrepaintState = ();
+
+            fn id(&self) -> Option<ElementId> {
+                None
+            }
+
+            fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+                None
+            }
+
+            fn request_layout(
+                &mut self,
+                _: Option<&GlobalElementId>,
+                _: Option<&InspectorElementId>,
+                window: &mut Window,
+                _: &mut App,
+            ) -> (crate::LayoutId, ()) {
+                let mut style = Style::default();
+                style.refine(&self.style);
+                let calls = self.calls.clone();
+                let layout_id = window.request_measured_layout(
+                    style,
+                    move |_: crate::Size<Option<Pixels>>, _: crate::Size<AvailableSpace>, _, _| {
+                        calls.set(calls.get() + 1);
+                        size(px(30.), px(10.))
+                    },
+                );
+                (layout_id, ())
+            }
+
+            fn prepaint(
+                &mut self,
+                _: Option<&GlobalElementId>,
+                _: Option<&InspectorElementId>,
+                _: Bounds<Pixels>,
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+
+            fn paint(
+                &mut self,
+                _: Option<&GlobalElementId>,
+                _: Option<&InspectorElementId>,
+                _: Bounds<Pixels>,
+                _: &mut (),
+                _: &mut (),
+                _: &mut Window,
+                _: &mut App,
+            ) {
+            }
+        }
+
+        /// A sibling beside a flagged (or not) node, and how often the sibling was measured.
+        fn measures_of_a_sibling(cx: &mut TestAppContext, flag: bool) -> (usize, usize) {
+            let calls = Rc::new(Cell::new(0));
+            let (_, _, cx) = lay_out(cx, 120., {
+                let calls = calls.clone();
+                move |naturals, width| {
+                    let mut node = flagged("box", naturals).w(px(50.));
+                    node.style().measure_natural_width = Some(flag);
+                    div()
+                        .flex()
+                        .w(px(400.))
+                        .child(Counting {
+                            calls: calls.clone(),
+                            style: StyleRefinement::default(),
+                        })
+                        .child(node.child(div().w(px(width)).h(px(10.))))
+                        .into_any_element()
+                }
+            });
+            let passes = cx.update(|window, _| window.natural_passes());
+            (calls.get(), passes)
+        }
+
+        #[gpui::test]
+        fn an_unflagged_tree_runs_no_extra_pass(cx: &mut TestAppContext) {
+            let (_, passes) = measures_of_a_sibling(cx, false);
+            assert_eq!(passes, 0);
+        }
+
+        #[gpui::test]
+        fn the_real_layout_only_redoes_the_chain_of_the_flagged_node(cx: &mut TestAppContext) {
+            let (unflagged_measures, _) = measures_of_a_sibling(cx, false);
+            let (flagged_measures, passes) = measures_of_a_sibling(cx, true);
+            assert!(passes > 0 && unflagged_measures > 0);
+            assert_eq!(flagged_measures, unflagged_measures);
         }
     }
 }
