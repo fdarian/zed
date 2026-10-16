@@ -2136,6 +2136,7 @@ impl CodeActionsMenu {
             &label,
             CODE_ACTION_MENU_MAX_WIDTH,
             "…",
+            &[],
             gpui::TruncateFrom::End,
         );
 

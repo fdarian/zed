@@ -1695,6 +1695,63 @@ mod tests {
             let layout = laid_out(cx, "a\tb\tc\td\te", 10., true);
             assert_eq!(layout.text(), "a\tb\tc\u{2026}");
         }
+
+        struct SizedRunsText {
+            width: Pixels,
+            start: bool,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for SizedRunsText {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let run = |len, font_size| TextRun {
+                    len,
+                    font: font("Menlo"),
+                    font_size,
+                    ..Default::default()
+                };
+                let text = StyledText::new("aaaaaaaaaaaaBBBBBBBBBBBBcccccccccccc").with_runs(vec![
+                    run(12, None),
+                    run(12, Some(px(32.))),
+                    run(12, None),
+                ]);
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let container = div()
+                    .w(self.width)
+                    .font_family(font("Menlo").family)
+                    .text_size(px(16.))
+                    .whitespace_nowrap();
+                if self.start {
+                    container.text_ellipsis_start().child(text)
+                } else {
+                    container.text_ellipsis_middle().child(text)
+                }
+            }
+        }
+
+        #[crate::test]
+        fn start_and_middle_truncation_fit_text_with_a_sized_run(cx: &mut TestAppContext) {
+            for start in [true, false] {
+                let layout = Rc::new(RefCell::new(None));
+                let width = px(250.);
+                let window = cx.add_window({
+                    let layout = layout.clone();
+                    move |_, _| SizedRunsText {
+                        width,
+                        start,
+                        layout,
+                    }
+                });
+                cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+                let layout = layout.borrow().clone().unwrap();
+                let text = layout.text();
+                assert!(text.contains('\u{2026}'), "not truncated: {text}");
+                assert!(text.len() < 36, "not truncated: {text}");
+                let measured = layout.line_layouts()[0].unwrapped_layout.width;
+                assert!(measured <= width, "{text} is {measured:?} wide");
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]

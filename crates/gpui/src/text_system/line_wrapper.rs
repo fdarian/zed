@@ -20,6 +20,23 @@ pub struct LineWrapper {
     pub(crate) font_size: Pixels,
     cached_ascii_char_widths: [Option<Pixels>; 128],
     cached_other_char_widths: HashMap<char, Pixels>,
+    cached_run_char_widths: HashMap<(FontId, u32, char), Pixels>,
+}
+
+/// The font and size a run of text is measured with.
+#[derive(Clone, Copy, PartialEq)]
+struct RunStyle {
+    font_id: FontId,
+    font_size: Pixels,
+}
+
+/// The end byte offset of each run and its style, in run order.
+type RunStyles = [(usize, RunStyle)];
+
+fn style_at(styles: &RunStyles, ix: usize, default: RunStyle) -> RunStyle {
+    // Text past the last run is shaped with the line's own font and size.
+    let run_ix = styles.partition_point(|(end, _)| *end <= ix);
+    styles.get(run_ix).map_or(default, |(_, style)| *style)
 }
 
 impl LineWrapper {
@@ -33,6 +50,7 @@ impl LineWrapper {
             font_size,
             cached_ascii_char_widths: [None; 128],
             cached_other_char_widths: HashMap::default(),
+            cached_run_char_widths: HashMap::default(),
         }
     }
 
@@ -138,29 +156,35 @@ impl LineWrapper {
 
     /// Determines if a line should be truncated based on its width.
     ///
+    /// Each character is measured with the font and size of the run it belongs to.
+    /// The truncation affix takes the style of the run of the character it replaces,
+    /// as `update_runs_after_truncation` gives it that run's style.
+    ///
     /// Returns the truncation index in `line`.
     pub fn should_truncate_line(
         &mut self,
         line: &str,
         truncate_width: Pixels,
         truncation_affix: &str,
+        runs: &[TextRun],
         truncate_from: TruncateFrom,
     ) -> Option<usize> {
+        let styles = self.run_styles(runs);
+        let styles = styles.as_deref();
+        let plain_suffix_width = self.width_of(truncation_affix);
         let mut width = px(0.);
-        let suffix_width = truncation_affix
-            .chars()
-            .map(|c| self.width_for_char(c))
-            .fold(px(0.0), |a, x| a + x);
         let mut truncate_ix = 0;
 
         match truncate_from {
             TruncateFrom::Start => {
                 for (ix, c) in line.char_indices().rev() {
+                    let suffix_width =
+                        self.affix_width_at(truncation_affix, ix, styles, plain_suffix_width);
                     if width + suffix_width < truncate_width {
                         truncate_ix = ix;
                     }
 
-                    let char_width = self.width_for_char(c);
+                    let char_width = self.width_at(ix, c, styles);
                     width += char_width;
 
                     if width.floor() > truncate_width {
@@ -170,11 +194,13 @@ impl LineWrapper {
             }
             TruncateFrom::End => {
                 for (ix, c) in line.char_indices() {
+                    let suffix_width =
+                        self.affix_width_at(truncation_affix, ix, styles, plain_suffix_width);
                     if width + suffix_width < truncate_width {
                         truncate_ix = ix;
                     }
 
-                    let char_width = self.width_for_char(c);
+                    let char_width = self.width_at(ix, c, styles);
                     width += char_width;
 
                     if width.floor() > truncate_width {
@@ -193,16 +219,51 @@ impl LineWrapper {
         line: &str,
         truncate_width: Pixels,
         truncation_affix: &str,
+        runs: &[TextRun],
     ) -> Option<(usize, usize)> {
-        let suffix_width = truncation_affix
-            .chars()
-            .map(|c| self.width_for_char(c))
-            .fold(px(0.0), |a, x| a + x);
+        let Some(styles) = self.run_styles(runs) else {
+            let suffix_width = self.width_of(truncation_affix);
+            return self.middle_split(line, truncate_width, suffix_width, None);
+        };
 
-        let total_width: Pixels = line
-            .chars()
-            .map(|c| self.width_for_char(c))
-            .fold(px(0.0), |a, x| a + x);
+        // The affix takes the style of the run at the end of the kept front, and
+        // where that is depends on the affix's width. Of the splits made with the
+        // affix of each style, those whose actual affix is no wider than the one
+        // assumed fit; the one that keeps the most text wins.
+        let mut candidates: Vec<RunStyle> = Vec::new();
+        for (_, style) in &styles {
+            if !candidates.contains(style) {
+                candidates.push(*style);
+            }
+        }
+        let mut best: Option<(usize, usize)> = None;
+        for style in candidates {
+            let assumed_width = self.affix_width_in(truncation_affix, style);
+            let split = self.middle_split(line, truncate_width, assumed_width, Some(&styles))?;
+            let taken = style_at(&styles, split.0, self.style());
+            if self.affix_width_in(truncation_affix, taken) > assumed_width {
+                continue;
+            }
+            let kept = |split: (usize, usize)| split.0 + line.len() - split.1;
+            if best.is_none_or(|best| kept(split) > kept(best)) {
+                best = Some(split);
+            }
+        }
+        // The candidate with the widest affix is always valid.
+        best
+    }
+
+    fn middle_split(
+        &mut self,
+        line: &str,
+        truncate_width: Pixels,
+        suffix_width: Pixels,
+        styles: Option<&RunStyles>,
+    ) -> Option<(usize, usize)> {
+        let mut total_width = px(0.);
+        for (ix, c) in line.char_indices() {
+            total_width += self.width_at(ix, c, styles);
+        }
 
         if total_width <= truncate_width {
             return None;
@@ -219,7 +280,7 @@ impl LineWrapper {
         let mut front_width = px(0.);
         let mut front_end_ix = 0usize;
         for (ix, c) in line.char_indices() {
-            let char_width = self.width_for_char(c);
+            let char_width = self.width_at(ix, c, styles);
             if front_width + char_width > front_budget {
                 break;
             }
@@ -230,7 +291,7 @@ impl LineWrapper {
         let mut back_width = px(0.);
         let mut back_start_ix = line.len();
         for (ix, c) in line.char_indices().rev() {
-            let char_width = self.width_for_char(c);
+            let char_width = self.width_at(ix, c, styles);
             if back_width + char_width > back_budget {
                 break;
             }
@@ -256,7 +317,7 @@ impl LineWrapper {
     ) -> (SharedString, Cow<'a, [TextRun]>) {
         if truncate_from == TruncateFrom::Middle {
             if let Some((front_end_ix, back_start_ix)) =
-                self.should_truncate_line_middle(&line, truncate_width, truncation_affix)
+                self.should_truncate_line_middle(&line, truncate_width, truncation_affix, runs)
             {
                 let result = SharedString::from(format!(
                     "{}{truncation_affix}{}",
@@ -277,7 +338,7 @@ impl LineWrapper {
         }
 
         if let Some(truncate_ix) =
-            self.should_truncate_line(&line, truncate_width, truncation_affix, truncate_from)
+            self.should_truncate_line(&line, truncate_width, truncation_affix, runs, truncate_from)
         {
             let result = match truncate_from {
                 TruncateFrom::Start => SharedString::from(format!(
@@ -368,6 +429,81 @@ impl LineWrapper {
                 .layout_width(self.font_id, self.font_size, c);
             self.cached_other_char_widths.insert(c, width);
             width
+        }
+    }
+
+    fn style(&self) -> RunStyle {
+        RunStyle {
+            font_id: self.font_id,
+            font_size: self.font_size,
+        }
+    }
+
+    /// The style of each run, or `None` when every run is measured exactly as
+    /// the wrapper's own font and size would, which keeps the plain case on the
+    /// ascii cache.
+    fn run_styles(&self, runs: &[TextRun]) -> Option<Vec<(usize, RunStyle)>> {
+        let mut end = 0;
+        let styles: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                end += run.len;
+                let style = RunStyle {
+                    font_id: self.text_system.resolve_font(&run.font),
+                    font_size: run.font_size.unwrap_or(self.font_size),
+                };
+                (end, style)
+            })
+            .collect();
+        let own = self.style();
+        styles
+            .iter()
+            .any(|(_, style)| *style != own)
+            .then_some(styles)
+    }
+
+    fn width_at(&mut self, ix: usize, c: char, styles: Option<&RunStyles>) -> Pixels {
+        match styles {
+            None => self.width_for_char(c),
+            Some(styles) => {
+                let style = style_at(styles, ix, self.style());
+                self.width_in(style, c)
+            }
+        }
+    }
+
+    fn width_in(&mut self, style: RunStyle, c: char) -> Pixels {
+        if style == self.style() {
+            return self.width_for_char(c);
+        }
+        let key = (style.font_id, style.font_size.0.to_bits(), c);
+        if let Some(width) = self.cached_run_char_widths.get(&key) {
+            return *width;
+        }
+        let width = self
+            .text_system
+            .layout_width(style.font_id, style.font_size, c);
+        self.cached_run_char_widths.insert(key, width);
+        width
+    }
+
+    fn affix_width_in(&mut self, affix: &str, style: RunStyle) -> Pixels {
+        affix.chars().map(|c| self.width_in(style, c)).sum()
+    }
+
+    fn affix_width_at(
+        &mut self,
+        affix: &str,
+        ix: usize,
+        styles: Option<&RunStyles>,
+        plain_width: Pixels,
+    ) -> Pixels {
+        match styles {
+            None => plain_width,
+            Some(styles) => {
+                let style = style_at(styles, ix, self.style());
+                self.affix_width_in(affix, style)
+            }
         }
     }
 }
@@ -2206,6 +2342,142 @@ mod tests {
                     .all(|ix| text.as_bytes()[*ix - 1] == b' ' && text.as_bytes()[*ix] != b' '),
                 "wrapping at the min-content width broke a word under {options:?}: {breaks:?}"
             );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod sized_runs {
+        use super::*;
+
+        const ELLIPSIS: &str = "…";
+        const DOTS: &str = "......";
+
+        fn runs_of(segments: &[(&str, Option<Pixels>)]) -> (String, Vec<TextRun>) {
+            let text = segments.iter().map(|(text, _)| *text).collect();
+            let runs = segments
+                .iter()
+                .map(|(text, font_size)| TextRun {
+                    len: text.len(),
+                    font: font("Menlo"),
+                    font_size: *font_size,
+                    ..Default::default()
+                })
+                .collect();
+            (text, runs)
+        }
+
+        fn shaped_width(cx: &mut TestAppContext, text: &str, runs: &[TextRun]) -> Pixels {
+            cx.update(|cx| {
+                WindowTextSystem::new(cx.text_system().clone())
+                    .shape_line(text.to_string().into(), px(16.), runs, None)
+                    .width
+            })
+        }
+
+        fn truncated(
+            cx: &mut TestAppContext,
+            segments: &[(&str, Option<Pixels>)],
+            budget: Pixels,
+            affix: &str,
+            from: TruncateFrom,
+        ) -> (String, Vec<TextRun>) {
+            let (text, runs) = runs_of(segments);
+            let mut wrapper = cx.update(|cx| {
+                LineWrapper::new(
+                    cx.text_system().resolve_font(&font("Menlo")),
+                    px(16.),
+                    cx.text_system().clone(),
+                )
+            });
+            let (result, runs) = wrapper.truncate_line(text.into(), budget, affix, &runs, from);
+            (result.to_string(), runs.into_owned())
+        }
+
+        fn at(size: f32) -> Option<Pixels> {
+            Some(px(size))
+        }
+
+        #[crate::test]
+        fn start_truncation_measures_runs_at_their_size(cx: &mut TestAppContext) {
+            let budget = px(200.);
+            for affix in [ELLIPSIS, DOTS] {
+                let sized = [("BBBBBBBBBB", at(32.)), ("aaaaaaaa", None)];
+                let plain = [("BBBBBBBBBB", None), ("aaaaaaaa", None)];
+                let (result, runs) = truncated(cx, &sized, budget, affix, TruncateFrom::Start);
+                let (plain_result, _) = truncated(cx, &plain, budget, affix, TruncateFrom::Start);
+                assert_ne!(result, plain_result);
+                assert!(
+                    shaped_width(cx, &result, &runs) <= budget,
+                    "{affix}: {result}"
+                );
+
+                // Keeping the character the cut dropped as well would not fit.
+                let (text, all_runs) = runs_of(&sized);
+                let mut wrapper = cx.update(|cx| {
+                    LineWrapper::new(
+                        cx.text_system().resolve_font(&font("Menlo")),
+                        px(16.),
+                        cx.text_system().clone(),
+                    )
+                });
+                let cut = wrapper
+                    .should_truncate_line(&text, budget, affix, &all_runs, TruncateFrom::Start)
+                    .unwrap();
+                let more = format!("{affix}{}", &text[cut..]);
+                let mut more_runs = Vec::new();
+                let mut start = 0;
+                for run in &all_runs {
+                    let end = start + run.len;
+                    if end > cut {
+                        let mut run = run.clone();
+                        run.len = end - start.max(cut);
+                        more_runs.push(run);
+                    }
+                    start = end;
+                }
+                more_runs[0].len += affix.len();
+                assert!(shaped_width(cx, &more, &more_runs) > budget, "{affix}");
+            }
+        }
+
+        #[crate::test]
+        fn middle_truncation_measures_runs_at_their_size(cx: &mut TestAppContext) {
+            let budget = px(250.);
+            let layouts: [&[(&str, Option<Pixels>)]; 3] = [
+                &[
+                    ("aaaaaaaaaaaa", None),
+                    ("BBBBBBBBBB", at(32.)),
+                    ("cccccccccccc", None),
+                ],
+                &[("BBBBBBBBBB", at(32.)), ("aaaaaaaaaaaaaaaaaaaaaaaa", None)],
+                &[("aaaaaaaaaaaaaaaaaaaaaaaa", None), ("BBBBBBBBBB", at(32.))],
+            ];
+            for sized in layouts {
+                for affix in [ELLIPSIS, DOTS] {
+                    let plain: Vec<_> = sized.iter().map(|(text, _)| (*text, None)).collect();
+                    let (result, runs) = truncated(cx, sized, budget, affix, TruncateFrom::Middle);
+                    let (plain_result, _) =
+                        truncated(cx, &plain, budget, affix, TruncateFrom::Middle);
+                    assert_ne!(result, plain_result, "{affix}");
+                    let width = shaped_width(cx, &result, &runs);
+                    assert!(width <= budget, "{affix}: {result} is {width:?}");
+                    // Each end of the split can be a character short of its budget, and
+                    // the affix a run's size narrower than it was assumed to be.
+                    let slack = px(2. * 19.2 + 9.6 * affix.chars().count() as f32 + 1.);
+                    assert!(width > budget - slack, "{affix}: {result} is {width:?}");
+                }
+            }
+        }
+
+        #[crate::test]
+        fn a_run_of_the_lines_own_size_changes_nothing(cx: &mut TestAppContext) {
+            let text = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
+            for from in [TruncateFrom::Start, TruncateFrom::Middle, TruncateFrom::End] {
+                let implicit = truncated(cx, &[(text, None)], px(150.), ELLIPSIS, from);
+                let explicit = truncated(cx, &[(text, at(16.))], px(150.), ELLIPSIS, from);
+                assert_eq!(implicit.0, explicit.0);
+                assert!(implicit.0.len() < text.len());
+            }
         }
     }
 }
