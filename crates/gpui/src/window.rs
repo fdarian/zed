@@ -69,6 +69,7 @@ pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
+use crate::tab_stop::{LiftedMarker, LiftedTabStops};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -1431,6 +1432,9 @@ pub struct Window {
     /// The elements lifted into each stacking context being prepainted, innermost last. `None`
     /// marks a layout root: nothing is lifted out of it.
     lift_lists: Vec<Option<LiftList>>,
+    /// Where the tab stops of the lifted elements were painted, for each stacking context being
+    /// painted, innermost last.
+    lift_paints: Vec<LiftedTabStops>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -2148,6 +2152,7 @@ impl Window {
             content_mask_stack: Vec::new(),
             positioned_frames: Vec::new(),
             lift_lists: Vec::new(),
+            lift_paints: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -4416,6 +4421,44 @@ impl Window {
         ticket.ordinal
     }
 
+    /// Starts the paint of the content of a stacking context. Pair with
+    /// [`Window::end_lift_paint`].
+    pub(crate) fn begin_lift_paint(&mut self) {
+        self.invalidator.debug_assert_paint();
+        self.lift_paints.push(LiftedTabStops {
+            start: self.next_frame.tab_stops.paint_index(),
+            ..Default::default()
+        });
+    }
+
+    /// Notes that the parent painting now skips the lifted element `ordinal`, which is where it
+    /// belongs in tab order.
+    pub(crate) fn mark_lifted(&mut self, ordinal: u32) {
+        self.invalidator.debug_assert_paint();
+        let position = self.next_frame.tab_stops.paint_index();
+        let lifted = self
+            .lift_paints
+            .last_mut()
+            .expect("a lifted element is skipped while its stacking context paints");
+        lifted.markers.push(LiftedMarker {
+            within: lifted.painting,
+            position,
+            ordinal,
+        });
+    }
+
+    /// Ends the paint of a stacking context whose in-flow children registered the tab stops in
+    /// `in_flow`, and puts the tab stops of the lifted elements where they belong.
+    pub(crate) fn end_lift_paint(&mut self, in_flow: Range<usize>) {
+        self.invalidator.debug_assert_paint();
+        let mut lifted = self
+            .lift_paints
+            .pop()
+            .expect("end_lift_paint without begin_lift_paint");
+        lifted.in_flow = Some(in_flow);
+        self.next_frame.tab_stops.restore_lifted_order(&lifted);
+    }
+
     /// Paints an element that was lifted out of the tree as it would have been painted from its
     /// place there. `context_node` is the dispatch node of the stacking context painting it, made
     /// the active node again afterwards.
@@ -4426,6 +4469,13 @@ impl Window {
         cx: &mut App,
     ) {
         self.invalidator.debug_assert_paint();
+        let tab_stops_start = self.next_frame.tab_stops.paint_index();
+        let outer = self
+            .lift_paints
+            .last_mut()
+            .expect("a lifted element is painted by its stacking context")
+            .painting
+            .replace(entry.ordinal);
         mem::swap(
             &mut self.element_id_stack,
             &mut entry.context.element_id_stack,
@@ -4459,6 +4509,12 @@ impl Window {
             &mut self.text_style_stack,
             &mut entry.context.text_style_stack,
         );
+        let tab_stops_end = self.next_frame.tab_stops.paint_index();
+        let lifted = self.lift_paints.last_mut().expect("checked above");
+        lifted.painting = outer;
+        lifted
+            .painted
+            .push((entry.ordinal, tab_stops_start..tab_stops_end));
         self.next_frame.dispatch_tree.set_active_node(context_node);
     }
 

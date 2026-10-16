@@ -15,6 +15,33 @@ pub(crate) struct TabStopMap {
     order: SumTree<TabStopNode>,
 }
 
+/// Where the elements a stacking context lifted were painted, and where they sit in the tree.
+///
+/// A lifted element is painted by its context, after (or before) the context's in-flow children,
+/// so it registers its tab stops there. The element's parent noted the position in the log
+/// where it would have painted it, and [`TabStopMap::restore_lifted_order`] moves the tab stops
+/// back to those positions.
+#[derive(Default)]
+pub(crate) struct LiftedTabStops {
+    /// The length of the log when the context started painting its content.
+    pub(crate) start: usize,
+    /// The part of the log the in-flow children of the context registered.
+    pub(crate) in_flow: Option<std::ops::Range<usize>>,
+    pub(crate) markers: Vec<LiftedMarker>,
+    /// The part of the log each lifted element registered, by ordinal.
+    pub(crate) painted: Vec<(u32, std::ops::Range<usize>)>,
+    /// The lifted element being painted, if any.
+    pub(crate) painting: Option<u32>,
+}
+
+/// The place in the log where a lifted element belongs.
+pub(crate) struct LiftedMarker {
+    /// The lifted element whose paint the parent skipping this one was in, if it was in one.
+    pub(crate) within: Option<u32>,
+    pub(crate) position: usize,
+    pub(crate) ordinal: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum TabStopOperation {
     Insert(FocusHandle),
@@ -120,13 +147,118 @@ impl TabStopMap {
             return;
         }
 
-        let covered_end = segments.iter().map(|range| range.end).max().unwrap_or(start);
+        let covered_end = segments
+            .iter()
+            .map(|range| range.end)
+            .max()
+            .unwrap_or(start);
         let mut operations = self.insertion_history[..start].to_vec();
         for range in segments {
             operations.extend_from_slice(&self.insertion_history[range.clone()]);
         }
         operations.extend_from_slice(&self.insertion_history[covered_end..]);
 
+        self.rebuild(operations);
+    }
+
+    /// Puts the tab stops of the elements a stacking context lifted at the positions of the tree
+    /// where their parents skipped them, so that tab order is document order.
+    pub(crate) fn restore_lifted_order(&mut self, lifted: &LiftedTabStops) {
+        let has_tab_stops = lifted.painted.iter().any(|(_, range)| {
+            self.insertion_history[range.clone()]
+                .iter()
+                .any(|operation| matches!(operation, TabStopOperation::Insert(_)))
+        });
+        if !has_tab_stops {
+            return;
+        }
+
+        let end = self.insertion_history.len();
+        let mut markers: FxHashMap<Option<u32>, Vec<&LiftedMarker>> = FxHashMap::default();
+        for marker in &lifted.markers {
+            markers.entry(marker.within).or_default().push(marker);
+        }
+        let mut covered = vec![false; end - lifted.start];
+        let mut operations = self.insertion_history[..lifted.start].to_vec();
+        let mut emitted = Vec::new();
+        let in_flow = lifted.in_flow.clone().unwrap_or(end..end);
+        self.emit_in_tree_order(
+            None,
+            in_flow.clone(),
+            lifted,
+            &markers,
+            &mut covered,
+            &mut emitted,
+            &mut operations,
+        );
+        // A lifted element nobody skipped has no place in the tree. Keep it where it was painted.
+        for (ordinal, range) in &lifted.painted {
+            if !emitted.contains(ordinal) {
+                self.emit_in_tree_order(
+                    Some(*ordinal),
+                    range.clone(),
+                    lifted,
+                    &markers,
+                    &mut covered,
+                    &mut emitted,
+                    &mut operations,
+                );
+            }
+        }
+        for (offset, covered) in covered.iter().enumerate() {
+            if !covered {
+                operations.push(self.insertion_history[lifted.start + offset].clone());
+            }
+        }
+        debug_assert_eq!(operations.len(), end);
+
+        self.rebuild(operations);
+    }
+
+    /// Appends the operations of `range`, the log of `within`, to `operations`, and the
+    /// operations of each lifted element skipped inside it where it was skipped.
+    fn emit_in_tree_order(
+        &self,
+        within: Option<u32>,
+        range: std::ops::Range<usize>,
+        lifted: &LiftedTabStops,
+        markers: &FxHashMap<Option<u32>, Vec<&LiftedMarker>>,
+        covered: &mut [bool],
+        emitted: &mut Vec<u32>,
+        operations: &mut Vec<TabStopOperation>,
+    ) {
+        let skipped = markers.get(&within).map_or(&[][..], Vec::as_slice);
+        let mut next = 0;
+        let mut position = range.start;
+        loop {
+            while next < skipped.len() && skipped[next].position <= position {
+                let ordinal = skipped[next].ordinal;
+                next += 1;
+                let Some((_, lifted_range)) = lifted.painted.iter().find(|(o, _)| *o == ordinal)
+                else {
+                    continue;
+                };
+                emitted.push(ordinal);
+                self.emit_in_tree_order(
+                    Some(ordinal),
+                    lifted_range.clone(),
+                    lifted,
+                    markers,
+                    covered,
+                    emitted,
+                    operations,
+                );
+            }
+            if position == range.end {
+                break;
+            }
+            operations.push(self.insertion_history[position].clone());
+            covered[position - lifted.start] = true;
+            position += 1;
+        }
+    }
+
+    fn rebuild(&mut self, operations: Vec<TabStopOperation>) {
         self.clear();
         for operation in operations {
             match operation {

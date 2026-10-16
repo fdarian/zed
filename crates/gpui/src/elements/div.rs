@@ -2352,6 +2352,7 @@ impl Element for Div {
             .map(|provider| provider.provide(window, cx));
 
         let overlay_painter = self.interactivity.overlay_painter.take();
+        let is_context = self.stacking_context;
         let paint_order = self
             .paint_ranks
             .as_ref()
@@ -2374,10 +2375,14 @@ impl Element for Div {
                     let mut lifted = mem::take(&mut self.lifted);
                     let first_above = lifted.partition_point(|entry| entry.z < 0);
                     let context_node = window.next_frame.dispatch_tree.active_node_id();
+                    if is_context {
+                        window.begin_lift_paint();
+                    }
                     for entry in &mut lifted[..first_above] {
                         window.paint_lifted(entry, context_node.unwrap(), cx);
                     }
 
+                    let in_flow_start = window.next_frame.tab_stops.paint_index();
                     if let Some(order) = &paint_order {
                         // Tab stops register while painting, so they follow the paint order and
                         // are put back in document order afterwards.
@@ -2398,19 +2403,24 @@ impl Element for Div {
                             .restore_document_order(tab_stops_start, &segments);
                     } else {
                         for (idx, child) in self.children.iter_mut().enumerate() {
-                            if self
+                            if let Some((_, ordinal)) = self
                                 .lifted_children
                                 .iter()
-                                .any(|(lifted, _)| *lifted == idx)
+                                .find(|(lifted, _)| *lifted == idx)
                             {
+                                window.mark_lifted(*ordinal);
                                 continue;
                             }
                             child.paint(window, cx);
                         }
                     }
+                    let in_flow = in_flow_start..window.next_frame.tab_stops.paint_index();
 
                     for entry in &mut lifted[first_above..] {
                         window.paint_lifted(entry, context_node.unwrap(), cx);
+                    }
+                    if is_context {
+                        window.end_lift_paint(in_flow);
                     }
                     if let Some(painter) = overlay_painter {
                         painter(bounds, window, cx);
@@ -8761,6 +8771,195 @@ mod tests {
                     host.update(cx, |_, _, cx| cx.notify()).unwrap();
                     cx.run_until_parked();
                 }
+            }
+
+            fn stop(name: &'static str, handle: &FocusHandle) -> Stateful<Div> {
+                let mut element = div().id(name).w(px(10.)).h(px(10.)).track_focus(handle);
+                element.style().position = Some(Position::Static);
+                element
+            }
+
+            fn handles<const N: usize>(cx: &mut TestAppContext) -> [FocusHandle; N] {
+                cx.update(|cx| std::array::from_fn(|_| cx.focus_handle().tab_stop(true)))
+            }
+
+            /// The names of the tab stops in the order Tab visits them, starting from the first.
+            fn tab_order(
+                window: &AnyWindowHandle,
+                cx: &mut TestAppContext,
+                names: &[(&'static str, &FocusHandle)],
+            ) -> Vec<&'static str> {
+                let ids: Vec<_> = names
+                    .iter()
+                    .map(|(name, handle)| (handle.id, *name))
+                    .collect();
+                cx.update_window(*window, |_, window, _| {
+                    let mut order = Vec::new();
+                    let mut current = None;
+                    for _ in 0..names.len() {
+                        let next = window
+                            .rendered_frame
+                            .tab_stops
+                            .next(current.as_ref())
+                            .expect("a tab stop");
+                        order.push(ids.iter().find(|(id, _)| *id == next.id).unwrap().1);
+                        current = Some(next.id);
+                    }
+                    order
+                })
+                .unwrap()
+            }
+
+            #[gpui::test]
+            fn tab_order_is_document_order_with_a_lifted_element_between_two_stops(
+                cx: &mut TestAppContext,
+            ) {
+                let [first, lifted, inner, last] = handles(cx);
+                for z in [-1, 0, 5] {
+                    let window = open_scene(cx, true, {
+                        let (first, lifted, inner, last) =
+                            (first.clone(), lifted.clone(), inner.clone(), last.clone());
+                        move || {
+                            context()
+                                .child(stop("a", &first))
+                                .child(
+                                    corner("w").child(
+                                        boxed("b", 20., 20., 50.)
+                                            .z_index(z)
+                                            .track_focus(&lifted)
+                                            .child(stop("c", &inner)),
+                                    ),
+                                )
+                                .child(stop("d", &last))
+                                .into_any_element()
+                        }
+                    });
+                    assert_eq!(
+                        tab_order(
+                            &window,
+                            cx,
+                            &[("a", &first), ("b", &lifted), ("c", &inner), ("d", &last)]
+                        ),
+                        ["a", "b", "c", "d"],
+                        "z: {z}"
+                    );
+                }
+            }
+
+            #[gpui::test]
+            fn a_lifted_element_registers_inside_the_tab_group_it_is_in(cx: &mut TestAppContext) {
+                let [outside, inside, after] = handles(cx);
+                // Tab indices are per group: 1 is "g", whose own stop "b" is the first in it.
+                let (outside, inside, after) = (outside.tab_index(0), inside, after.tab_index(1));
+                let window = open_scene(cx, true, {
+                    let (outside, inside, after) = (outside.clone(), inside.clone(), after.clone());
+                    move || {
+                        context()
+                            .child(stop("a", &outside))
+                            .child(
+                                corner("g").tab_group().tab_index(1).child(
+                                    boxed("b", 20., 20., 50.).z_index(2).track_focus(&inside),
+                                ),
+                            )
+                            .child(stop("c", &after))
+                            .into_any_element()
+                    }
+                });
+
+                // "b" is at [1, 0] and "c" at [1]: if "b" had been left in the context's group
+                // it would be at [0], between "a" and "c".
+                assert_eq!(
+                    tab_order(
+                        &window,
+                        cx,
+                        &[("a", &outside), ("c", &after), ("b", &inside)]
+                    ),
+                    ["a", "c", "b"]
+                );
+            }
+
+            #[gpui::test]
+            fn a_lifted_element_inside_a_lifted_element_follows_it_in_tab_order(
+                cx: &mut TestAppContext,
+            ) {
+                let [first, outer, nested, last] = handles(cx);
+                let window = open_scene(cx, true, {
+                    let (first, outer, nested, last) =
+                        (first.clone(), outer.clone(), nested.clone(), last.clone());
+                    move || {
+                        context()
+                            .child(stop("a", &first))
+                            .child(
+                                boxed("b", 20., 20., 100.)
+                                    .z_index(3)
+                                    .track_focus(&outer)
+                                    .child(
+                                        boxed("c", 10., 10., 50.).z_index(1).track_focus(&nested),
+                                    ),
+                            )
+                            .child(stop("d", &last))
+                            .into_any_element()
+                    }
+                });
+
+                // "c" paints before "b" because of its index.
+                assert_eq!(painted(&window, cx), ["root", "c", "b"]);
+                assert_eq!(
+                    tab_order(
+                        &window,
+                        cx,
+                        &[("a", &first), ("b", &outer), ("c", &nested), ("d", &last)]
+                    ),
+                    ["a", "b", "c", "d"]
+                );
+            }
+
+            #[gpui::test]
+            fn tab_order_survives_a_parent_that_paints_its_children_by_rank(
+                cx: &mut TestAppContext,
+            ) {
+                let [first, row_a, row_b, lifted, last] = handles(cx);
+                let window = open_scene(cx, true, {
+                    let (first, row_a, row_b, lifted, last) = (
+                        first.clone(),
+                        row_a.clone(),
+                        row_b.clone(),
+                        lifted.clone(),
+                        last.clone(),
+                    );
+                    move || {
+                        context()
+                            .child(stop("a", &first))
+                            .child(LayoutRoot {
+                                // Painted "c", "b": the parent puts them back in order.
+                                child: Some(
+                                    div()
+                                        .paint_ranks(vec![1, 0])
+                                        .child(stop("b", &row_a))
+                                        .child(stop("c", &row_b))
+                                        .into_any_element(),
+                                ),
+                            })
+                            .child(boxed("d", 20., 20., 50.).z_index(1).track_focus(&lifted))
+                            .child(stop("e", &last))
+                            .into_any_element()
+                    }
+                });
+
+                assert_eq!(
+                    tab_order(
+                        &window,
+                        cx,
+                        &[
+                            ("a", &first),
+                            ("b", &row_a),
+                            ("c", &row_b),
+                            ("d", &lifted),
+                            ("e", &last)
+                        ]
+                    ),
+                    ["a", "b", "c", "d", "e"]
+                );
             }
 
             #[gpui::test]
