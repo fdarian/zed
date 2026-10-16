@@ -1035,6 +1035,44 @@ impl TextLayout {
         None
     }
 
+    /// The wrapped row that [`Self::position_for_index`] puts the byte `index` on, in
+    /// window coordinates.
+    pub fn row_for_index(&self, index: usize) -> Option<TextRow> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+        let line_height = element_state.line_height;
+
+        let mut line_top = bounds.origin.y;
+        let mut line_start_ix = 0;
+        for line in &element_state.lines {
+            let line_end_ix = line_start_ix + line.len();
+            if index < line_start_ix {
+                break;
+            } else if index > line_end_ix {
+                line_top += line.size(line_height).height;
+                line_start_ix = line_end_ix + 1;
+                continue;
+            }
+            let row_ix = line.row_for_index(index - line_start_ix)?;
+            let rows = line.rows(line_height);
+            let top = rows[..row_ix]
+                .iter()
+                .fold(line_top, |top, row| top + row.height);
+            return Some(TextRow {
+                top,
+                height: rows[row_ix].height,
+                baseline: top + rows[row_ix].baseline,
+            });
+        }
+
+        None
+    }
+
     /// The largest ascent and descent among the runs that have a glyph in the byte
     /// range `range` of the text, or `None` when no glyph is.
     pub fn run_extent(&self, range: Range<usize>) -> Option<(Pixels, Pixels)> {
@@ -1640,6 +1678,54 @@ mod tests {
             );
             assert_eq!(layout.row_at_y(px(189.)).unwrap().top, px(130.));
             assert_eq!(layout.row_at_y(px(190.)), None);
+        }
+
+        #[crate::test]
+        fn the_row_of_an_index_is_the_row_its_position_is_on(cx: &mut TestAppContext) {
+            let text = "aaaa BBBB cc dd\nee";
+            let layout = cx.update(|cx| {
+                let text_system = WindowTextSystem::new(cx.text_system().clone());
+                let lines = text_system
+                    .shape_text(
+                        text.into(),
+                        px(10.),
+                        &[
+                            run(5, None, None),
+                            run(5, Some(20.), Some(60.)),
+                            run(8, None, None),
+                        ],
+                        Some(px(60.)),
+                        None,
+                    )
+                    .unwrap();
+                let layout = TextLayout::default();
+                layout.0.replace(Some(TextLayoutInner {
+                    len: text.len(),
+                    lines,
+                    line_height: px(30.),
+                    wrap_width: Some(px(60.)),
+                    truncate_width: None,
+                    inset_width: None,
+                    size: None,
+                    bounds: Some(Bounds::new(
+                        point(px(10.), px(100.)),
+                        size(px(60.), px(200.)),
+                    )),
+                }));
+                layout
+            });
+
+            let mut heights = Vec::new();
+            for index in 0..=text.len() {
+                let row = layout.row_for_index(index).unwrap();
+                assert_eq!(row.top, layout.position_for_index(index).unwrap().y, "{index}");
+                assert_eq!(layout.row_at_y(row.top), Some(row), "{index}");
+                if !heights.contains(&row.height) {
+                    heights.push(row.height);
+                }
+            }
+            assert!(heights.len() >= 2, "rows of one height: {heights:?}");
+            assert_eq!(layout.row_for_index(text.len() + 1), None);
         }
 
         #[crate::test]

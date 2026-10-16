@@ -1125,6 +1125,17 @@ impl WrappedLineLayout {
             .unwrapped_layout
             .has_styled_runs()
             .then(|| self.rows(line_height));
+        let (row_ix, x) = self.row_and_x_for_index(index)?;
+        Some(point(x, row_top(rows.as_deref(), row_ix, line_height)))
+    }
+
+    /// The wrapped row `position_for_index` puts the byte index on: a boundary
+    /// between two rows belongs to the end of the upper one.
+    pub fn row_for_index(&self, index: usize) -> Option<usize> {
+        self.row_and_x_for_index(index).map(|(row_ix, _)| row_ix)
+    }
+
+    fn row_and_x_for_index(&self, index: usize) -> Option<(usize, Pixels)> {
         let mut line_start_ix = 0;
         let mut line_end_indices = self
             .wrap_boundaries
@@ -1137,7 +1148,6 @@ impl WrappedLineLayout {
             .chain([self.len()])
             .enumerate();
         for (ix, line_end_ix) in line_end_indices {
-            let line_y = row_top(rows.as_deref(), ix, line_height);
             if index < line_start_ix {
                 break;
             } else if index > line_end_ix {
@@ -1146,7 +1156,7 @@ impl WrappedLineLayout {
             } else {
                 let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
                 let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
-                return Some(point(x, line_y));
+                return Some((ix, x));
             }
         }
 
