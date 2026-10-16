@@ -246,7 +246,7 @@ mod tests {
     use super::*;
     use crate::{
         BackgroundBox, BackgroundPosition, BackgroundPositionAxis, BackgroundRepeat, Edges,
-        LengthPercentage, Styled,
+        AppContext as _, LengthPercentage, ParentElement, Styled,
     };
 
     const KEY: ImageKey = ImageKey(1);
@@ -740,5 +740,192 @@ mod tests {
 
         let sprites = painted_sprites(window, vec![layer]);
         assert!(!sprites.is_empty());
+    }
+
+    struct MaskView(Vec<BackgroundLayer>);
+
+    impl crate::Render for MaskView {
+        fn render(
+            &mut self,
+            _window: &mut crate::Window,
+            _cx: &mut crate::Context<Self>,
+        ) -> impl crate::IntoElement {
+            let mut element = crate::div().w(px(100.)).h(px(50.)).rounded(px(8.)).bg(crate::red());
+            element.style().mask_layers = Some(self.0.clone());
+            element
+        }
+    }
+
+    /// The mask layers of the one group the element paints. The groups are only built when the
+    /// platform renders them, so the test window is made to.
+    fn mask_of(
+        cx: &mut crate::TestAppContext,
+        layers: Vec<BackgroundLayer>,
+    ) -> (Vec<crate::MaskLayer>, f32) {
+        let window = cx.open_window(size(px(200.), px(100.)), |_, _| MaskView(layers));
+        let window = crate::AnyWindowHandle::from(window);
+        cx.update_window(window, |_, window, cx| {
+            window.force_effect_groups();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let (mut effects, scale) = cx
+            .update_window(window, |_, window, _| (window.painted_group_effects(), window.scale_factor()))
+            .unwrap();
+        assert_eq!(effects.len(), 1);
+        (effects.remove(0).mask.expect("a mask"), scale)
+    }
+
+    fn gradient_layer(composite: crate::MaskComposite) -> BackgroundLayer {
+        let stop = |color| {
+            crate::GradientItem::Stop(crate::GradientStop {
+                color,
+                position: None,
+            })
+        };
+        let mut layer = BackgroundLayer::new(BackgroundImage::Gradient(crate::Gradient {
+            shape: crate::GradientShape::Linear(crate::LinearDirection::ToRight),
+            items: vec![stop(crate::black()), stop(crate::white())],
+            repeating: false,
+            color_space: crate::ColorSpace::Srgb,
+        }));
+        layer.mask_composite = composite;
+        layer
+    }
+
+    #[crate::test]
+    fn mask_layers_are_bottom_first_and_carry_their_mode_and_operator(
+        cx: &mut crate::TestAppContext,
+    ) {
+        use crate::{MaskComposite, MaskMode};
+        let mut top = gradient_layer(MaskComposite::Subtract);
+        top.mask_mode = MaskMode::Luminance;
+        let mut bottom = gradient_layer(MaskComposite::Exclude);
+        bottom.mask_mode = MaskMode::MatchSource;
+
+        let (layers, _) = mask_of(cx, vec![top, bottom]);
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].composite, MaskComposite::Exclude);
+        assert_eq!(layers[0].mode, MaskMode::Alpha);
+        assert_eq!(layers[1].composite, MaskComposite::Subtract);
+        assert_eq!(layers[1].mode, MaskMode::Luminance);
+        assert!(!layers[0].quads.is_empty() && layers[0].sprites.is_empty());
+    }
+
+    #[crate::test]
+    fn an_image_that_has_not_loaded_is_an_empty_layer_not_a_missing_one(
+        cx: &mut crate::TestAppContext,
+    ) {
+        let mut unloaded = sized(KEY, 40., 25.);
+        unloaded.mask_composite = crate::MaskComposite::Subtract;
+        let (layers, _) = mask_of(cx, vec![unloaded, gradient_layer(crate::MaskComposite::Add)]);
+
+        assert_eq!(layers.len(), 2);
+        assert!(layers[1].quads.is_empty() && layers[1].sprites.is_empty());
+        assert_eq!(layers[1].composite, crate::MaskComposite::Subtract);
+        assert!(!layers[0].quads.is_empty());
+    }
+
+    #[crate::test]
+    fn an_image_mask_layer_is_cropped_tiles_under_the_layers_rounded_clip(
+        cx: &mut crate::TestAppContext,
+    ) {
+        let loaded = image(2, 2);
+        cx.update(|cx| BackgroundImages::set(cx, KEY, loaded.clone()));
+
+        let (layers, scale) = mask_of(cx, vec![sized(KEY, 40., 25.)]);
+        let sprites = &layers[0].sprites;
+
+        // 3 columns by 2 rows; the last column hangs 20px out of the 100px box and is cropped.
+        assert!(layers[0].quads.is_empty());
+        assert_eq!(sprites.len(), 6);
+        assert_eq!(sprites[0].bounds.size.width.0, 40. * scale);
+        assert_eq!(sprites[2].bounds.origin.x.0, 80. * scale);
+        assert_eq!(sprites[2].bounds.size.width.0, 20. * scale);
+        assert!(sprites[2].tile.bounds.size.width.0 < sprites[0].tile.bounds.size.width.0);
+        for sprite in sprites {
+            // Mask alpha is not the element's opacity, and the corners are the clip's.
+            assert_eq!(sprite.opacity, 1.);
+            assert_eq!(sprite.corner_radii, Default::default());
+            assert_eq!(sprite.content_mask.bounds.size.width.0, 100. * scale);
+            assert_eq!(sprite.content_mask.corner_radii.top_left.0, 8. * scale);
+            assert_eq!(sprite.content_mask.corner_radii.bottom_right.0, 8. * scale);
+        }
+    }
+
+    #[crate::test]
+    fn an_image_mask_layer_follows_its_group_to_the_groups_origin(cx: &mut crate::TestAppContext) {
+        struct Offset(Vec<BackgroundLayer>);
+
+        impl crate::Render for Offset {
+            fn render(
+                &mut self,
+                _window: &mut crate::Window,
+                _cx: &mut crate::Context<Self>,
+            ) -> impl crate::IntoElement {
+                let mut element = crate::div()
+                    .absolute()
+                    .left(px(30.))
+                    .top(px(20.))
+                    .w(px(100.))
+                    .h(px(50.))
+                    .bg(crate::red());
+                element.style().mask_layers = Some(self.0.clone());
+                crate::div().size_full().child(element)
+            }
+        }
+
+        cx.update(|cx| BackgroundImages::set(cx, KEY, image(2, 2)));
+        let mut layer = sized(KEY, 100., 50.);
+        layer.repeat = no_repeat();
+        let window = cx.open_window(size(px(200.), px(100.)), |_, _| Offset(vec![layer]));
+        let window = crate::AnyWindowHandle::from(window);
+        cx.update_window(window, |_, window, cx| {
+            window.force_effect_groups();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let (effects, scale) = cx
+            .update_window(window, |_, window, _| (window.painted_group_effects(), window.scale_factor()))
+            .unwrap();
+        let layers = effects[0].mask.as_ref().expect("a mask");
+
+        // The group starts at the element's box, so the one tile starts at the origin.
+        assert_eq!(layers[0].sprites.len(), 1);
+        let sprite = &layers[0].sprites[0];
+        assert_eq!(sprite.bounds.origin.x.0, 0.);
+        assert_eq!(sprite.bounds.origin.y.0, 0.);
+        assert_eq!(sprite.content_mask.bounds.origin.x.0, 0.);
+        assert_eq!(sprite.content_mask.bounds.size.width.0, 100. * scale);
+    }
+
+    #[crate::test]
+    fn an_image_mask_layer_drops_the_tiles_outside_the_content_mask(cx: &mut crate::TestAppContext) {
+        struct Clipped(Vec<BackgroundLayer>);
+
+        impl crate::Render for Clipped {
+            fn render(
+                &mut self,
+                _window: &mut crate::Window,
+                _cx: &mut crate::Context<Self>,
+            ) -> impl crate::IntoElement {
+                let mut element = crate::div().w(px(100.)).h(px(50.)).bg(crate::red());
+                element.style().mask_layers = Some(self.0.clone());
+                crate::div().w(px(100.)).h(px(25.)).overflow_hidden().child(element)
+            }
+        }
+
+        cx.update(|cx| BackgroundImages::set(cx, KEY, image(2, 2)));
+        let window = cx.open_window(size(px(200.), px(100.)), |_, _| Clipped(vec![sized(KEY, 40., 25.)]));
+        let window = crate::AnyWindowHandle::from(window);
+        cx.update_window(window, |_, window, cx| {
+            window.force_effect_groups();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let effects = cx.update_window(window, |_, window, _| window.painted_group_effects()).unwrap();
+
+        // Two rows of three tiles would fit the box; the second row lies under the clip.
+        assert_eq!(effects[0].mask.as_ref().expect("a mask")[0].sprites.len(), 3);
     }
 }

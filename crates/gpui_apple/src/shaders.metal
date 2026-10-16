@@ -1856,3 +1856,40 @@ fragment float4 drop_shadow_fragment(
   float shadow_alpha = blurred.sample(linear, (input.position.xy - params.offset) / size).a;
   return base + params.color * shadow_alpha * (1.0 - base.a);
 }
+
+struct MaskCombineParams {
+  // Nonzero to read the layer by luminance, zero by alpha.
+  uint luminance;
+  // 0 add, 1 subtract, 2 intersect, 3 exclude.
+  uint op;
+  // Zero for the bottom layer, which has nothing below it.
+  uint has_below;
+  uint pad;
+};
+
+// One layer of a mask over the mask below it, as `mask-mode` and `mask-composite` say. The result
+// is the new mask, written to every channel; the composite reads its alpha.
+fragment float4 mask_combine_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant MaskCombineParams &params [[buffer(0)]],
+    texture2d<float> layer [[texture(0)]],
+    texture2d<float> below [[texture(1)]]) {
+  uint2 texel = uint2(input.position.xy);
+  float4 premultiplied = layer.read(texel);
+  // The layer is premultiplied, so the luminance of its colour is already scaled by its alpha.
+  float source = params.luminance != 0u
+    ? dot(premultiplied.rgb, float3(0.2125, 0.7154, 0.0721))
+    : premultiplied.a;
+  float destination = params.has_below != 0u ? below.read(texel).a : 0.0;
+  float result;
+  if (params.op == 1u) {
+    result = source * (1.0 - destination);
+  } else if (params.op == 2u) {
+    result = source * destination;
+  } else if (params.op == 3u) {
+    result = source * (1.0 - destination) + destination * (1.0 - source);
+  } else {
+    result = source + destination * (1.0 - source);
+  }
+  return float4(saturate(result));
+}

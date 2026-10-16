@@ -3419,9 +3419,25 @@ impl Window {
             .collect()
     }
 
+    /// The effect of each effect group of the most recently rendered frame, in the group's own
+    /// coordinates.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_group_effects(&self) -> Vec<GroupEffect> {
+        self.rendered_frame
+            .scene
+            .groups
+            .iter()
+            .map(|group| group.effect.clone())
+            .collect()
+    }
+
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
-        let content_mask = self.content_mask();
+        self.snapped_mask(self.content_mask())
+    }
+
+    /// `content_mask` in device pixels, with its bounds grown to whole pixels.
+    pub(crate) fn snapped_mask(&self, content_mask: ContentMask<Pixels>) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.cover_bounds(content_mask.bounds),
             corner_radii: content_mask.corner_radii.scale(self.scale_factor()),

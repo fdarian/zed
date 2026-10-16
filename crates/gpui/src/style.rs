@@ -6,11 +6,11 @@ use std::{
 
 use crate::{
     AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundImages,
-    BackgroundLayer, BackgroundTag,
+    BackgroundLayer, BackgroundTag, MaskLayer, MaskMode,
     BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, CornerRadii,
     CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation, ImageKey,
-    GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
+    GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextDecorationStyle, TextLayoutOptions,
     TextRun, Window, OverflowWrap, WordBreak, black, phi, point, px, quad, rems, size,
 };
@@ -916,7 +916,7 @@ impl Style {
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
     ) {
-        match self.group_effect(bounds, window) {
+        match self.group_effect(bounds, window, cx) {
             Some(effect) => window.with_effect_group(effect, None, |window| {
                 self.paint(bounds, window, cx, continuation)
             }),
@@ -927,7 +927,7 @@ impl Style {
     }
 
     /// The offscreen group effect the style asks for, if any.
-    fn group_effect(&self, bounds: Bounds<Pixels>, window: &Window) -> Option<GroupEffect> {
+    fn group_effect(&self, bounds: Bounds<Pixels>, window: &Window, cx: &App) -> Option<GroupEffect> {
         let opacity = self.opacity.unwrap_or(1.).clamp(0., 1.);
         if opacity >= 1.
             && self.filter.is_empty()
@@ -949,30 +949,13 @@ impl Style {
                 .collect::<Vec<_>>()
         };
 
+        // The style lists the top layer first, the group the bottom one.
         let mask = (!self.mask_layers.is_empty()).then(|| {
-            let mut quads = Vec::new();
-            for layer in self.mask_layers.iter().rev() {
-                let Some(resolved) = layer.resolve(&boxes) else {
-                    continue;
-                };
-                for chunk in resolved.chunks {
-                    quads.push(
-                        window.device_quad(
-                            quad(
-                                resolved.bounds,
-                                resolved.corner_radii,
-                                chunk,
-                                Edges::default(),
-                                Hsla::default(),
-                                BorderStyle::default(),
-                            )
-                            .background_tile(resolved.tile),
-                            1.,
-                        ),
-                    );
-                }
-            }
-            quads
+            self.mask_layers
+                .iter()
+                .rev()
+                .map(|layer| Self::mask_layer(layer, &boxes, window, cx))
+                .collect()
         });
 
         Some(GroupEffect {
@@ -988,6 +971,92 @@ impl Style {
             reference_radii: corner_radii.scale(scale_factor),
             text_mask: false,
         })
+    }
+
+    /// A layer that resolves to nothing is kept, empty: an image that has not loaded is a
+    /// transparent black layer, which `mask-composite` still combines with the others.
+    fn mask_layer(
+        layer: &BackgroundLayer,
+        boxes: &BackgroundBoxes,
+        window: &Window,
+        cx: &App,
+    ) -> MaskLayer {
+        let mut masked = MaskLayer {
+            quads: Vec::new(),
+            sprites: Vec::new(),
+            mode: if layer.mask_mode.is_luminance() {
+                MaskMode::Luminance
+            } else {
+                MaskMode::Alpha
+            },
+            composite: layer.mask_composite,
+        };
+        match &layer.image {
+            BackgroundImage::Gradient(_) => {
+                if let Some(resolved) = layer.resolve(boxes) {
+                    for chunk in resolved.chunks {
+                        masked.quads.push(
+                            window.device_quad(
+                                quad(
+                                    resolved.bounds,
+                                    resolved.corner_radii,
+                                    chunk,
+                                    Edges::default(),
+                                    Hsla::default(),
+                                    BorderStyle::default(),
+                                )
+                                .background_tile(resolved.tile),
+                                1.,
+                            ),
+                        );
+                    }
+                }
+            }
+            BackgroundImage::Image(key) => {
+                masked.sprites = Self::mask_image_sprites(layer, *key, boxes, window, cx);
+            }
+        }
+        masked
+    }
+
+    /// The tiles of an image mask layer. Mask alpha is not scaled by the element's opacity.
+    fn mask_image_sprites(
+        layer: &BackgroundLayer,
+        key: ImageKey,
+        boxes: &BackgroundBoxes,
+        window: &Window,
+        cx: &App,
+    ) -> Vec<PolychromeSprite> {
+        let Some(image) = BackgroundImages::get(cx, key) else {
+            return Vec::new();
+        };
+        let visible = window.content_mask().bounds;
+        let Some(resolved) = layer.resolve_image(boxes, image.render_size(0), visible) else {
+            return Vec::new();
+        };
+        // The sprites keep the rounded clip as their content mask, so each one stays
+        // square-cornered and only has its atlas tile cropped to the clip box.
+        let clip = window.snapped_mask(ContentMask::rounded(resolved.bounds, resolved.corner_radii));
+        resolved
+            .tiles
+            .into_iter()
+            .filter_map(|tile| {
+                window
+                    .image_sprite(
+                        tile.intersect(&resolved.bounds),
+                        tile,
+                        CornerRadii::default(),
+                        image.clone(),
+                        0,
+                        false,
+                        false,
+                        1.,
+                        clip,
+                    )
+                    .log_err()
+                    .flatten()
+            })
+            .collect()
     }
 
     /// The `clip-path` as the pointer sees it, in logical pixels.

@@ -6,7 +6,8 @@
 
 use crate::{
     Anchor, BackgroundBox, BackgroundPosition, BoxRegion, Bounds, CornerRadii, Corners, Edges, Hsla, LengthPercentage,
-    Pixels, Point, Quad, ScaledPixels, Size, ellipse_corner_sdf, point, size,
+    MaskComposite, MaskMode, Pixels, Point, PolychromeSprite, Quad, ScaledPixels, Size, ellipse_corner_sdf, point,
+    size,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -681,6 +682,42 @@ fn polygon_contains(contours: &[Vec<Point<f32>>], position: Point<f32>, even_odd
     }
 }
 
+/// One layer of `mask-image`, drawn in device pixels into the group's mask.
+#[derive(Clone, Debug)]
+pub struct MaskLayer {
+    /// The quads of a gradient layer, drawn in order.
+    pub quads: Vec<Quad>,
+    /// The tiles of an image layer, drawn in order after the quads. Each sprite carries the
+    /// layer's rounded clip as its content mask, which the group keeps instead of rewriting it.
+    pub sprites: Vec<PolychromeSprite>,
+    /// How the layer is read: [`MaskMode::Luminance`], or [`MaskMode::Alpha`] for anything else.
+    pub mode: MaskMode,
+    /// How the layer combines with the ones below it. The bottom layer's is ignored.
+    pub composite: MaskComposite,
+}
+
+impl MaskLayer {
+    /// Whether the layer is read by luminance.
+    pub fn is_luminance(&self) -> bool {
+        self.mode.is_luminance()
+    }
+
+    /// Whether the layer is just drawn over the ones below it: an alpha layer that adds. The
+    /// bottom layer has nothing to combine with, so its operator does not matter.
+    pub fn is_plain(&self, bottom: bool) -> bool {
+        !self.is_luminance() && (bottom || self.composite == MaskComposite::Add)
+    }
+
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        for quad in &mut self.quads {
+            quad.translate(delta);
+        }
+        for sprite in &mut self.sprites {
+            sprite.translate(delta);
+        }
+    }
+}
+
 /// Everything that makes a group of primitives a group, in device pixels. Coordinates are in the
 /// space of the group's content until the scene moves them to the group's own origin.
 #[derive(Clone, Debug)]
@@ -691,9 +728,11 @@ pub struct GroupEffect {
     pub filters: Vec<ResolvedFilter>,
     /// `backdrop-filter`, applied in order to what is behind the group.
     pub backdrop_filters: Vec<ResolvedFilter>,
-    /// The quads that draw `mask-image` into a mask; the group is multiplied by its alpha. `None`
-    /// means no mask, while `Some` of nothing masks everything away.
-    pub mask: Option<Vec<Quad>>,
+    /// The layers of `mask-image`, the bottom one first; the group is multiplied by the alpha
+    /// they combine to. `None` means no mask, while `Some` of nothing masks everything away. A
+    /// layer with nothing to draw (an image that has not loaded) still counts: it is transparent
+    /// black, and the layers above it can subtract from, intersect with or exclude it.
+    pub mask: Option<Vec<MaskLayer>>,
     /// `clip-path`.
     pub clip_path: Option<ResolvedClipPath>,
     /// The element's border box, which the backdrop is clipped to.
@@ -739,9 +778,9 @@ impl GroupEffect {
         if let Some(clip_path) = &mut self.clip_path {
             clip_path.translate(Point::new(delta.x.0, delta.y.0));
         }
-        if let Some(quads) = &mut self.mask {
-            for quad in quads {
-                quad.translate(delta);
+        if let Some(layers) = &mut self.mask {
+            for layer in layers {
+                layer.translate(delta);
             }
         }
     }

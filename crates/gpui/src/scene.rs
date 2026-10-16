@@ -492,9 +492,10 @@ impl Scene {
         scene.translate(delta);
         scene.finish();
         effect.translate(delta);
-        if let Some(quads) = &mut effect.mask {
+        if let Some(layers) = &mut effect.mask {
             let local = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), visual.size);
-            for quad in quads {
+            // The sprites keep their content mask: it is the rounded clip of the layer.
+            for quad in layers.iter_mut().flat_map(|layer| &mut layer.quads) {
                 quad.content_mask = ContentMask {
                     bounds: local,
                     corner_radii: Corners::default(),
@@ -900,7 +901,7 @@ impl SubpixelSprite {
 }
 
 impl PolychromeSprite {
-    fn translate(&mut self, delta: Point<ScaledPixels>) {
+    pub(crate) fn translate(&mut self, delta: Point<ScaledPixels>) {
         translate_bounds(&mut self.bounds, delta);
         translate_mask(&mut self.content_mask, delta);
     }

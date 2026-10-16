@@ -8,7 +8,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, MAX_GROUP_EXTENT,
-    PaintSurface, Path, Point, PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
+    MaskComposite, MaskLayer, PaintSurface, Path, Point, PrimitiveBatch, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
     filter_margin, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -1199,6 +1199,23 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
+        self.draw_polychrome_instances(
+            texture_id,
+            sprites,
+            &instance_bindings.polychrome_sprites,
+            viewport_size,
+            command_encoder,
+        );
+    }
+
+    fn draw_polychrome_instances(
+        &self,
+        texture_id: AtlasTextureId,
+        sprites: Range<usize>,
+        binding: &InstanceBinding,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
         if sprites.is_empty() {
             return;
         }
@@ -1216,8 +1233,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Sprites as u64,
-            Some(&instance_bindings.polychrome_sprites.buffer),
-            instance_bindings.polychrome_sprites.offset as u64,
+            Some(&binding.buffer),
+            binding.offset as u64,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
@@ -1231,8 +1248,8 @@ impl MetalRenderer {
         );
         command_encoder.set_fragment_buffer(
             SpriteInputIndex::Sprites as u64,
-            Some(&instance_bindings.polychrome_sprites.buffer),
-            instance_bindings.polychrome_sprites.offset as u64,
+            Some(&binding.buffer),
+            binding.offset as u64,
         );
         command_encoder.set_fragment_texture(SpriteInputIndex::AtlasTexture as u64, Some(&texture));
 
@@ -1627,15 +1644,46 @@ impl MetalRenderer {
         texture
     }
 
-    fn render_mask_quads(
+    /// Draws the layers of a mask, bottom first, into one texture that holds the mask in its alpha.
+    /// When every layer is plain (alpha, adding) they all go into the one texture; otherwise each
+    /// goes into a texture of its own and a pass combines it with the mask so far.
+    fn render_mask(
         &mut self,
-        quads: &[Quad],
+        layers: &[MaskLayer],
+        texture_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        writer: &mut InstanceBufferWriter,
+    ) -> Result<metal::Texture> {
+        if mask_is_plain(layers) {
+            return self.render_mask_layers(layers, texture_size, command_buffer, writer);
+        }
+
+        let mut mask: Option<metal::Texture> = None;
+        for layer in layers {
+            let drawn =
+                self.render_mask_layers(slice::from_ref(layer), texture_size, command_buffer, writer)?;
+            mask = Some(match mask {
+                // An alpha layer on the bottom is the mask so far as it is.
+                None if !layer.is_luminance() => drawn,
+                below => self.combine_mask_layer(drawn, below, layer, command_buffer),
+            });
+        }
+        Ok(mask.expect("a mask with a layer that is not plain has a layer"))
+    }
+
+    /// Draws `layers` over each other into a new texture.
+    fn render_mask_layers(
+        &mut self,
+        layers: &[MaskLayer],
         texture_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
         writer: &mut InstanceBufferWriter,
     ) -> Result<metal::Texture> {
         let texture = self.acquire_texture(texture_size.width.0 as u32, texture_size.height.0 as u32);
-        let binding = writer.write(quads)?;
+        let mut bindings = Vec::with_capacity(layers.len());
+        for layer in layers {
+            bindings.push((writer.write(&layer.quads)?, writer.write(&layer.sprites)?));
+        }
         let encoder = new_command_encoder_for_texture(
             command_buffer,
             &texture,
@@ -1643,10 +1691,65 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
         );
         let previous_depth = self.group_depth.replace(1);
-        self.draw_quad_instances(&binding, 0..quads.len(), texture_size, encoder);
+        for (layer, (quads, sprites)) in layers.iter().zip(&bindings) {
+            self.draw_quad_instances(quads, 0..layer.quads.len(), texture_size, encoder);
+            let mut start = 0;
+            while start < layer.sprites.len() {
+                let texture_id = layer.sprites[start].tile.texture_id;
+                let run = layer.sprites[start..]
+                    .iter()
+                    .take_while(|sprite| sprite.tile.texture_id == texture_id)
+                    .count();
+                self.draw_polychrome_instances(
+                    texture_id,
+                    start..start + run,
+                    sprites,
+                    texture_size,
+                    encoder,
+                );
+                start += run;
+            }
+        }
         self.group_depth.set(previous_depth);
         encoder.end_encoding();
         Ok(texture)
+    }
+
+    /// Combines a drawn layer with the mask below it into a new texture, and gives both textures
+    /// back. With nothing below, the layer is what is read in its own mode.
+    fn combine_mask_layer(
+        &mut self,
+        layer_texture: metal::Texture,
+        below: Option<metal::Texture>,
+        layer: &MaskLayer,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> metal::Texture {
+        let output = self.acquire_texture(layer_texture.width() as u32, layer_texture.height() as u32);
+        let params = MaskCombineParams {
+            luminance: layer.is_luminance() as u32,
+            operator: match (&below, layer.composite) {
+                (None, _) | (_, MaskComposite::Add) => 0,
+                (_, MaskComposite::Subtract) => 1,
+                (_, MaskComposite::Intersect) => 2,
+                (_, MaskComposite::Exclude) => 3,
+            },
+            has_below: below.is_some() as u32,
+            pad: 0,
+        };
+        self.run_pass(command_buffer, &output, &self.effect_pipelines.mask_combine, |encoder| {
+            encoder.set_fragment_bytes(
+                0,
+                mem::size_of::<MaskCombineParams>() as u64,
+                &params as *const MaskCombineParams as *const _,
+            );
+            encoder.set_fragment_texture(0, Some(&layer_texture));
+            encoder.set_fragment_texture(1, Some(below.as_deref().unwrap_or(&layer_texture)));
+        });
+        self.release_texture(layer_texture);
+        if let Some(below) = below {
+            self.release_texture(below);
+        }
+        output
     }
 
     /// The composite parameters for drawing `dest` of the target from a source texture whose first
@@ -1836,9 +1939,7 @@ impl MetalRenderer {
         let content = self.apply_filters(content, &effect.filters, None, command_buffer);
 
         let mask_a = match &effect.mask {
-            Some(quads) => {
-                Some(self.render_mask_quads(quads, texture_size, command_buffer, writer)?)
-            }
+            Some(layers) => Some(self.render_mask(layers, texture_size, command_buffer, writer)?),
             None => None,
         };
         let mask_b = match &group.text_mask {
@@ -2270,6 +2371,7 @@ struct EffectPipelines {
     blur: metal::RenderPipelineState,
     resample: metal::RenderPipelineState,
     drop_shadow: metal::RenderPipelineState,
+    mask_combine: metal::RenderPipelineState,
 }
 
 impl EffectPipelines {
@@ -2293,6 +2395,7 @@ impl EffectPipelines {
             blur: overwrite("effect_blur", "fullscreen_vertex", "blur_fragment"),
             resample: overwrite("effect_resample", "fullscreen_vertex", "resample_fragment"),
             drop_shadow: overwrite("effect_drop_shadow", "fullscreen_vertex", "drop_shadow_fragment"),
+            mask_combine: overwrite("effect_mask_combine", "fullscreen_vertex", "mask_combine_fragment"),
         }
     }
 }
@@ -2376,6 +2479,15 @@ struct DropShadowParams {
     color: [f32; 4],
 }
 
+/// Mirrors `MaskCombineParams` in the shaders.
+#[repr(C)]
+struct MaskCombineParams {
+    luminance: u32,
+    operator: u32,
+    has_below: u32,
+    pad: u32,
+}
+
 /// How many colour matrices one filter pass applies; longer runs take several passes.
 const MAX_MATRICES_PER_PASS: usize = 8;
 
@@ -2402,17 +2514,31 @@ fn texture_size_class(extent: u32) -> u32 {
     extent.next_multiple_of(step)
 }
 
+/// Whether every layer of a mask can be drawn into the one texture, with no pass to combine them.
+fn mask_is_plain(layers: &[MaskLayer]) -> bool {
+    layers
+        .iter()
+        .enumerate()
+        .all(|(index, layer)| layer.is_plain(index == 0))
+}
+
 fn group_texture_extent(group: &EffectGroup) -> (u32, u32) {
     let width = group.bounds.size.width.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
     let height = group.bounds.size.height.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
     (texture_size_class(width), texture_size_class(height))
 }
 
-/// What the textures a group holds while it waits to be composited take: its content, and a mask
-/// for each of its masks.
+/// What the textures a group holds while it is prepared take: its content, and a mask for each of
+/// its masks. A mask that is not plain also has the layer it is drawing and the mask it combines
+/// it with live at once.
 fn group_texture_bytes(group: &EffectGroup) -> u64 {
     let (width, height) = group_texture_extent(group);
-    let textures = 1 + u64::from(group.effect.mask.is_some()) + u64::from(group.text_mask.is_some());
+    let mask_textures = match &group.effect.mask {
+        None => 0,
+        Some(layers) if mask_is_plain(layers) => 1,
+        Some(_) => 3,
+    };
+    let textures = 1 + mask_textures + u64::from(group.text_mask.is_some());
     u64::from(width) * u64::from(height) * 4 * textures
 }
 
@@ -2929,6 +3055,7 @@ mod tests {
         LengthPercentage, LinearDirection, PlatformHeadlessRenderer, Quad, RadialShape,
         RadialSize, RepeatStyle, ScaledPixels, Scene, StopPosition, point, px, size,
     };
+    use gpui::{MaskComposite, MaskLayer, MaskMode};
 
     const SIZE: f32 = 40.;
 
@@ -3799,7 +3926,12 @@ mod tests {
         group(
             &mut scene,
             GroupEffect {
-                mask: Some(fade_mask(SIZE)),
+                mask: Some(vec![MaskLayer {
+                    quads: fade_mask(SIZE),
+                    sprites: Vec::new(),
+                    mode: MaskMode::Alpha,
+                    composite: MaskComposite::Add,
+                }]),
                 ..GroupEffect::default()
             },
             &[solid(0., 0., SIZE, SIZE, 0xff0000)],
@@ -3825,6 +3957,379 @@ mod tests {
         );
         let image = render(&mut scene);
         assert!(is_cleared(&image, 20, 20));
+    }
+
+    fn tinted(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
+        let mut tinted = solid(x, y, width, height, 0xffffff);
+        tinted.background = color.into();
+        tinted
+    }
+
+    fn white(alpha: f32) -> Hsla {
+        Hsla { a: alpha, ..hex(0xffffff) }
+    }
+
+    fn layer_of(quads: Vec<Quad>, mode: MaskMode, composite: MaskComposite) -> MaskLayer {
+        MaskLayer { quads, sprites: Vec::new(), mode, composite }
+    }
+
+    fn sprites_of(
+        sprites: Vec<gpui::PolychromeSprite>,
+        mode: MaskMode,
+        composite: MaskComposite,
+    ) -> MaskLayer {
+        MaskLayer { quads: Vec::new(), sprites, mode, composite }
+    }
+
+    /// A layer whose image has not loaded.
+    fn nothing(composite: MaskComposite) -> MaskLayer {
+        layer_of(Vec::new(), MaskMode::Alpha, composite)
+    }
+
+    /// The red channel of a red box through the mask, which is the mask times 255.
+    fn through_mask(layers: Vec<MaskLayer>) -> image::RgbaImage {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                mask: Some(layers),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        render(&mut scene)
+    }
+
+    fn assert_mask(image: &image::RgbaImage, x: u32, y: u32, expected: f32) {
+        let actual = image.get_pixel(x, y).0[0] as f32;
+        assert!(
+            (actual - expected * 255.).abs() <= 3.,
+            "the mask at ({x}, {y}) is {actual}/255, expected {expected}"
+        );
+    }
+
+    fn atlas_image(
+        renderer: &MetalHeadlessRenderer,
+        id: usize,
+        width: i32,
+        height: i32,
+        bgra: Vec<u8>,
+    ) -> gpui::AtlasTile {
+        gpui::PlatformHeadlessRenderer::sprite_atlas(renderer)
+            .get_or_insert_with(
+                &gpui::AtlasKey::Image(gpui::RenderImageParams {
+                    image_id: gpui::ImageId(id),
+                    frame_index: 0,
+                }),
+                &mut || Ok(Some((size(DevicePixels(width), DevicePixels(height)), bgra.clone().into()))),
+            )
+            .expect("the atlas takes the image")
+            .expect("the image exists")
+    }
+
+    fn image_sprite(
+        tile: gpui::AtlasTile,
+        bounds: (f32, f32, f32, f32),
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> gpui::PolychromeSprite {
+        gpui::PolychromeSprite {
+            order: 0,
+            nearest_neighbor: true.into(),
+            grayscale: false.into(),
+            opacity: 1.,
+            bounds: Bounds::new(
+                point(ScaledPixels(bounds.0), ScaledPixels(bounds.1)),
+                size(ScaledPixels(bounds.2), ScaledPixels(bounds.3)),
+            ),
+            content_mask,
+            corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
+            tile,
+        }
+    }
+
+    fn through_image_mask(renderer: &mut MetalHeadlessRenderer, layers: Vec<MaskLayer>) -> image::RgbaImage {
+        let mut scene = groups_scene();
+        group(
+            &mut scene,
+            GroupEffect {
+                mask: Some(layers),
+                ..GroupEffect::default()
+            },
+            &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+        );
+        scene.finish();
+        renderer
+            .render_scene_to_image(&scene, size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .expect("scene should render")
+    }
+
+    const OPAQUE_WHITE: [u8; 4] = [255, 255, 255, 255];
+    const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
+    const CLEAR: [u8; 4] = [0; 4];
+
+    fn pixels(pixels: &[[u8; 4]]) -> Vec<u8> {
+        pixels.concat()
+    }
+
+    #[test]
+    fn an_image_mask_shows_the_group_where_the_image_is_opaque() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = atlas_image(&renderer, 1, 2, 1, pixels(&[OPAQUE_WHITE, CLEAR]));
+        let one = image_sprite(tile, (0., 0., 20., 20.), window_mask());
+        let image = through_image_mask(
+            &mut renderer,
+            vec![sprites_of(vec![one], MaskMode::Alpha, MaskComposite::Add)],
+        );
+
+        assert_mask(&image, 5, 5, 1.);
+        assert_mask(&image, 15, 5, 0.);
+        assert_mask(&image, 30, 30, 0.);
+    }
+
+    #[test]
+    fn a_repeated_image_mask_covers_each_tile_alike() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = atlas_image(&renderer, 1, 2, 1, pixels(&[OPAQUE_WHITE, CLEAR]));
+        let tiles = [(0., 0.), (20., 0.), (0., 20.), (20., 20.)]
+            .map(|(x, y)| image_sprite(tile, (x, y, 20., 20.), window_mask()))
+            .to_vec();
+        let image = through_image_mask(
+            &mut renderer,
+            vec![sprites_of(tiles, MaskMode::Alpha, MaskComposite::Add)],
+        );
+
+        for (x, y) in [(5, 5), (25, 5), (5, 25), (25, 25)] {
+            assert_mask(&image, x, y, 1.);
+        }
+        for (x, y) in [(15, 5), (35, 5), (15, 25), (35, 25)] {
+            assert_mask(&image, x, y, 0.);
+        }
+    }
+
+    #[test]
+    fn an_image_masks_inside_the_rounded_clip_it_carries() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = atlas_image(&renderer, 1, 1, 1, pixels(&[OPAQUE_WHITE]));
+        let mut rounded = window_mask();
+        rounded.corner_radii = Corners::all(ScaledPixels(16.));
+        let one = image_sprite(tile, (0., 0., SIZE, SIZE), rounded);
+        let image = through_image_mask(
+            &mut renderer,
+            vec![sprites_of(vec![one], MaskMode::Alpha, MaskComposite::Add)],
+        );
+
+        assert_mask(&image, 1, 1, 0.);
+        assert_mask(&image, 38, 38, 0.);
+        assert_mask(&image, 20, 20, 1.);
+        assert_mask(&image, 20, 1, 1.);
+    }
+
+    #[test]
+    fn gradient_and_image_layers_draw_over_each_other_in_order() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = atlas_image(&renderer, 1, 1, 1, pixels(&[OPAQUE_WHITE]));
+        let top = image_sprite(tile, (20., 0., 20., SIZE), window_mask());
+        let image = through_image_mask(
+            &mut renderer,
+            vec![
+                layer_of(vec![tinted(0., 0., 30., SIZE, white(0.5))], MaskMode::Alpha, MaskComposite::Add),
+                sprites_of(vec![top], MaskMode::Alpha, MaskComposite::Add),
+            ],
+        );
+
+        assert_mask(&image, 10, 20, 0.5);
+        assert_mask(&image, 25, 20, 1.);
+        assert_mask(&image, 35, 20, 1.);
+    }
+
+    #[test]
+    fn luminance_reads_light_as_shown_and_dark_as_hidden() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = atlas_image(&renderer, 1, 2, 1, pixels(&[OPAQUE_WHITE, OPAQUE_BLACK]));
+        let layer = |mode| {
+            let one = image_sprite(tile, (0., 0., SIZE, SIZE), window_mask());
+            sprites_of(vec![one], mode, MaskComposite::Add)
+        };
+
+        let by_luminance = through_image_mask(&mut renderer, vec![layer(MaskMode::Luminance)]);
+        assert_mask(&by_luminance, 10, 20, 1.);
+        assert_mask(&by_luminance, 30, 20, 0.);
+
+        let by_alpha = through_image_mask(&mut renderer, vec![layer(MaskMode::Alpha)]);
+        assert_mask(&by_alpha, 10, 20, 1.);
+        assert_mask(&by_alpha, 30, 20, 1.);
+    }
+
+    #[test]
+    fn luminance_weighs_the_channels_as_rec_709_and_scales_by_alpha() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        // Red, green and blue in BGRA.
+        let tile = atlas_image(
+            &renderer,
+            1,
+            3,
+            1,
+            pixels(&[[0, 0, 255, 255], [0, 255, 0, 255], [255, 0, 0, 255]]),
+        );
+        let one = image_sprite(tile, (0., 0., 39., SIZE), window_mask());
+        let image = through_image_mask(
+            &mut renderer,
+            vec![
+                sprites_of(vec![one], MaskMode::Luminance, MaskComposite::Add),
+                layer_of(
+                    vec![tinted(0., 0., SIZE, 2., white(0.5))],
+                    MaskMode::Luminance,
+                    MaskComposite::Add,
+                ),
+            ],
+        );
+
+        assert_mask(&image, 6, 20, 0.2125);
+        assert_mask(&image, 19, 20, 0.7154);
+        assert_mask(&image, 32, 20, 0.0721);
+        // Half-transparent white has luminance 1, which its alpha halves.
+        assert_mask(&image, 20, 0, 0.5 + (1. - 0.5) * 0.7154);
+    }
+
+    /// A box at the bottom, 25% opaque over the left 30px, and one on top, 80% opaque over the
+    /// right 30px, so that the left 10px have only the bottom, the right 10px only the top, and
+    /// the middle 20px both.
+    fn two_layers(mode: MaskMode, operator: MaskComposite) -> Vec<MaskLayer> {
+        vec![
+            layer_of(vec![tinted(0., 0., 30., SIZE, white(0.25))], mode, MaskComposite::Add),
+            layer_of(vec![tinted(10., 0., 30., SIZE, white(0.8))], mode, operator),
+        ]
+    }
+
+    #[test]
+    fn each_composite_operator_combines_two_overlapping_layers() {
+        // (operator, only the bottom, both, only the top), with `s` = 0.8 and `d` = 0.25.
+        let cases = [
+            (MaskComposite::Add, 0.25, 0.8 + 0.25 * 0.2, 0.8),
+            (MaskComposite::Subtract, 0., 0.8 * 0.75, 0.8),
+            (MaskComposite::Intersect, 0., 0.8 * 0.25, 0.),
+            (MaskComposite::Exclude, 0.25, 0.8 * 0.75 + 0.25 * 0.2, 0.8),
+        ];
+        for mode in [MaskMode::Alpha, MaskMode::Luminance] {
+            for (operator, bottom, both, top) in cases {
+                let image = through_mask(two_layers(mode, operator));
+                let context = format!("{mode:?} {operator:?}");
+                for (x, expected) in [(5, bottom), (20, both), (35, top)] {
+                    let actual = image.get_pixel(x, 20).0[0] as f32;
+                    assert!(
+                        (actual - expected * 255.).abs() <= 3.,
+                        "{context} at {x}: {actual}/255, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_layer_combines_with_the_union_of_every_layer_below_it() {
+        let layer = |x, composite| {
+            layer_of(vec![tinted(x, 0., 20., SIZE, white(1.))], MaskMode::Alpha, composite)
+        };
+        // The top layer, everywhere, minus the first two.
+        let everywhere = layer_of(vec![tinted(0., 0., SIZE, SIZE, white(1.))], MaskMode::Alpha, MaskComposite::Subtract);
+        let image = through_mask(vec![layer(0., MaskComposite::Add), layer(10., MaskComposite::Add), everywhere]);
+
+        assert_mask(&image, 5, 20, 0.);
+        assert_mask(&image, 15, 20, 0.);
+        assert_mask(&image, 25, 20, 0.);
+        assert_mask(&image, 35, 20, 1.);
+    }
+
+    #[test]
+    fn the_bottom_layers_operator_is_ignored() {
+        for operator in [MaskComposite::Subtract, MaskComposite::Intersect, MaskComposite::Exclude] {
+            for mode in [MaskMode::Alpha, MaskMode::Luminance] {
+                let image = through_mask(vec![layer_of(
+                    vec![tinted(0., 0., SIZE, SIZE, white(0.8))],
+                    mode,
+                    operator,
+                )]);
+                assert_mask(&image, 20, 20, 0.8);
+            }
+        }
+    }
+
+    #[test]
+    fn a_layer_whose_image_has_not_loaded_masks_everything_it_adds_to() {
+        let image = through_mask(vec![nothing(MaskComposite::Add)]);
+        assert!(is_cleared(&image, 20, 20));
+    }
+
+    #[test]
+    fn an_unloaded_layer_is_transparent_black_for_the_operators() {
+        let shown = || layer_of(vec![tinted(0., 0., SIZE, SIZE, white(1.))], MaskMode::Alpha, MaskComposite::Add);
+
+        let intersected = through_mask(vec![shown(), nothing(MaskComposite::Intersect)]);
+        assert!(is_cleared(&intersected, 20, 20));
+
+        let subtracted = through_mask(vec![shown(), nothing(MaskComposite::Subtract)]);
+        assert!(is_cleared(&subtracted, 20, 20));
+
+        let excluded = through_mask(vec![shown(), nothing(MaskComposite::Exclude)]);
+        assert_mask(&excluded, 20, 20, 1.);
+
+        // Nothing below to take the layer from.
+        let from_nothing = through_mask(vec![nothing(MaskComposite::Add), shown()]);
+        assert_mask(&from_nothing, 20, 20, 1.);
+        let intersect_nothing = through_mask(vec![
+            nothing(MaskComposite::Add),
+            layer_of(vec![tinted(0., 0., SIZE, SIZE, white(1.))], MaskMode::Alpha, MaskComposite::Intersect),
+        ]);
+        assert!(is_cleared(&intersect_nothing, 20, 20));
+    }
+
+    #[test]
+    fn plain_masks_cost_the_passes_they_always_did() {
+        let encoders = |layers: Vec<MaskLayer>| {
+            let before = super::encoders_opened();
+            through_mask(layers);
+            super::encoders_opened() - before
+        };
+        let plain = |count: usize| {
+            (0..count)
+                .map(|_| layer_of(vec![tinted(0., 0., SIZE, SIZE, white(0.5))], MaskMode::Alpha, MaskComposite::Add))
+                .collect::<Vec<_>>()
+        };
+
+        // The target, the group's content and one texture for the whole mask.
+        assert_eq!(encoders(plain(1)), 3);
+        assert_eq!(encoders(plain(4)), 3);
+        // A subtracting layer takes a texture and a combine pass of its own.
+        assert!(encoders(two_layers(MaskMode::Alpha, MaskComposite::Subtract)) > 3);
+    }
+
+    #[test]
+    fn a_mask_that_is_not_plain_counts_its_extra_textures() {
+        let bytes = |layers: Vec<MaskLayer>| {
+            let mut scene = groups_scene();
+            group(
+                &mut scene,
+                GroupEffect {
+                    mask: Some(layers),
+                    ..GroupEffect::default()
+                },
+                &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+            );
+            super::group_texture_bytes(&scene.groups[0])
+        };
+        let plain = bytes(two_layers(MaskMode::Alpha, MaskComposite::Add));
+        let combined = bytes(two_layers(MaskMode::Alpha, MaskComposite::Subtract));
+        let luminance = bytes(two_layers(MaskMode::Luminance, MaskComposite::Add));
+        let none = {
+            let mut scene = groups_scene();
+            group(&mut scene, filtered(vec![gpui::FilterFunction::Grayscale(1.)]), &[solid(0., 0., SIZE, SIZE, 0xff0000)]);
+            super::group_texture_bytes(&scene.groups[0])
+        };
+        // The content, plus one mask texture or the three a combine holds at once.
+        assert_eq!(plain, none * 2);
+        assert_eq!(combined, none * 4);
+        assert_eq!(luminance, none * 4);
     }
 
     #[test]
