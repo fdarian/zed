@@ -262,6 +262,9 @@ members = [
     "tooling/perf",
     "tooling/xtask",
 ]
+# Vendored upstream crate, patched through [patch.crates-io] below; kept out of the
+# workspace so its manifest stays byte-identical to upstream.
+exclude = ["third_party/taffy"]
 default-members = ["crates/zed"]
 
 [workspace.package]
@@ -975,6 +978,8 @@ libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev =
 notify = { git = "https://github.com/zed-industries/notify", rev = "0890bbb8ca40a4b5d1f67031698dd7918b37d991" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "0890bbb8ca40a4b5d1f67031698dd7918b37d991" }
 webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "d0e27be0cdad89eadab3e36207cda0a2b6e359ee" }
+# gpui pins `taffy = "=0.13.0"`; the vendored copy resolves `calc()` values, which upstream returns 0 for.
+taffy = { path = "third_party/taffy" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
