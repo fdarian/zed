@@ -347,8 +347,42 @@ pub enum BackgroundBox {
     Text,
 }
 
+/// `mask-mode`: which channel of a mask layer says how much of the element shows.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub enum MaskMode {
+    /// `match-source`. A gradient or an image is an alpha mask.
+    #[default]
+    MatchSource,
+    /// `alpha`: the layer's alpha channel.
+    Alpha,
+    /// `luminance`: the layer's luminance, scaled by its alpha.
+    Luminance,
+}
+
+impl MaskMode {
+    /// Whether the layer is read by luminance rather than by alpha. `match-source` is alpha for a
+    /// gradient and for every kind of image a layer can hold.
+    pub fn is_luminance(self) -> bool {
+        self == MaskMode::Luminance
+    }
+}
+
+/// `mask-composite`: how a mask layer combines with the layers below it.
+#[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+pub enum MaskComposite {
+    /// `add`: the layer over the ones below.
+    #[default]
+    Add,
+    /// `subtract`: the layer, minus where the ones below are.
+    Subtract,
+    /// `intersect`: only where the layer and the ones below overlap.
+    Intersect,
+    /// `exclude`: where exactly one of the layer and the ones below is.
+    Exclude,
+}
+
 /// One layer of `background-image` with its `background-size`, `-position`, `-repeat`, `-origin`
-/// and `-clip`.
+/// and `-clip`. A mask layer is the same, plus `mask-mode` and `mask-composite`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct BackgroundLayer {
     /// What is painted.
@@ -363,6 +397,11 @@ pub struct BackgroundLayer {
     pub origin: BackgroundBox,
     /// `background-clip`: the box the layer is painted in. Defaults to the border box.
     pub clip: BackgroundBox,
+    /// `mask-mode`. Only a mask layer reads it.
+    pub mask_mode: MaskMode,
+    /// `mask-composite`: how a mask layer combines with the layers below it. Only a mask layer
+    /// reads it, and the bottom layer's is ignored.
+    pub mask_composite: MaskComposite,
 }
 
 impl BackgroundLayer {
@@ -375,6 +414,8 @@ impl BackgroundLayer {
             repeat: BackgroundRepeat::default(),
             origin: BackgroundBox::PaddingBox,
             clip: BackgroundBox::BorderBox,
+            mask_mode: MaskMode::default(),
+            mask_composite: MaskComposite::default(),
         }
     }
 }
@@ -1584,6 +1625,28 @@ mod tests {
             GradientShape::Linear(LinearDirection::ToBottom),
             vec![stop(red(), None), stop(blue(), None)],
         )))
+    }
+
+    #[test]
+    fn a_new_layer_masks_by_its_source_and_adds() {
+        let layer = solid_layer();
+        assert_eq!(layer.mask_mode, MaskMode::MatchSource);
+        assert_eq!(layer.mask_composite, MaskComposite::Add);
+        assert!(!layer.mask_mode.is_luminance());
+        assert!(!MaskMode::Alpha.is_luminance());
+        assert!(MaskMode::Luminance.is_luminance());
+    }
+
+    #[test]
+    fn the_mask_properties_survive_serialisation() {
+        let layer = BackgroundLayer {
+            mask_mode: MaskMode::Luminance,
+            mask_composite: MaskComposite::Exclude,
+            ..solid_layer()
+        };
+        let json = serde_json::to_string(&layer).unwrap();
+        let back: BackgroundLayer = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, layer);
     }
 
     #[test]
