@@ -1,14 +1,17 @@
 //! Which scroll container a wheel event scrolls.
 //!
-//! A wheel event reaches every container under the pointer, innermost first. Each one
-//! takes what it can scroll along an axis and hands the rest to the next one, so a
-//! container at its limit passes the delta to its ancestor. This is the browser's
-//! scroll chaining. It is a delta budget carried through one dispatch, not
-//! `stop_propagation`, so wheel listeners on the ancestors still run.
+//! One wheel event scrolls one container. The event reaches every container under the pointer,
+//! innermost first, and the first one that can use any of it, or that holds it back with
+//! `overscroll-behavior`, takes the whole event: no other container scrolls for it, on either
+//! axis. A container at its limit takes nothing, so the event goes on to its ancestor. This is how
+//! browsers route a wheel (Chromium's latched `ScrollUpdate`, Firefox's wheel transactions). The
+//! chaining a user sees, a list scrolled to its end handing over to the page, happens between
+//! events: the next event finds the inner container at its limit and picks the next one up. It is
+//! not `stop_propagation`, so wheel listeners on the ancestors still run.
 //!
-//! A gesture is latched to the container that took its first delta. A trackpad gesture
-//! and its momentum keep scrolling that container even after it reaches its limit, so
-//! the momentum never hops to the parent. A latch ends on a new gesture
+//! The container that took an event is latched, and the gesture stays with it. A trackpad gesture
+//! and its momentum keep scrolling that container even after it reaches its limit, so the momentum
+//! never hops to the parent; what it cannot use is dropped. A latch ends on a new gesture
 //! ([`TouchPhase::Started`]), after [`LATCH_TIMEOUT`] without wheel events, or when its container
 //! is no longer in the frame. A mouse wheel has no phases, and its latch also ends when the
 //! pointer moves.
@@ -57,14 +60,7 @@ pub(crate) fn scroller_id(offset: &Rc<RefCell<Point<Pixels>>>) -> ScrollerId {
 
 #[derive(Default)]
 struct WindowRouting {
-    /// The share of the event's delta that no container has taken yet, per axis, from 1 down to
-    /// 0. A share rather than pixels because a mouse wheel's lines are pixels at a rate each
-    /// container chooses.
-    remaining: Point<f32>,
     latch: Option<Latch>,
-    /// The latch was chosen during this dispatch, so containers further up still
-    /// take their share of the remainder.
-    latched_this_event: bool,
     last_event: Option<Instant>,
     /// The containers that took part in the event being dispatched, which are the ones in the
     /// frame. A latch on one that is not here was left behind by an unmounted container.
@@ -124,8 +120,6 @@ pub(crate) fn begin(
         routing.latch = None;
     }
     routing.last_event = Some(now);
-    routing.latched_this_event = false;
-    routing.remaining = point(1.0, 1.0);
     if routing.present_for != window.dispatch_serial() {
         routing.present_for = window.dispatch_serial();
         routing.present.clear();
@@ -151,7 +145,7 @@ pub(crate) struct Claim {
     pub max_offset: Point<Pixels>,
 }
 
-/// Takes this container's share of the event. Returns the offset to scroll to, or
+/// Takes the event for this container if it can use any of it. Returns the offset to scroll to, or
 /// `None` if the event is not this container's.
 ///
 /// An event whose default a capture-phase listener prevented is nobody's: that is the DOM's
@@ -186,37 +180,28 @@ pub(crate) fn claim(window: &Window, cx: &mut App, claim: Claim) -> Option<Point
         routing.latch = None;
     }
 
-    let latched = match &routing.latch {
-        Some(latch) if !routing.latched_this_event => {
-            if latch.scroller != claim.scroller {
-                return None;
-            }
-            true
-        }
-        _ => {
-            if !claim.under_pointer {
-                return None;
-            }
-            false
-        }
-    };
+    match &routing.latch {
+        // The latch is the one container that scrolls. A container that takes the event below
+        // becomes the latch, so the ones above it find a latch that is not theirs.
+        Some(latch) if latch.scroller != claim.scroller => return None,
+        Some(_) => {}
+        None if !claim.under_pointer => return None,
+        None => {}
+    }
 
     let mut offset = claim.offset;
     let mut taken_any = false;
     let mut absorbed = false;
-    let mut remaining = routing.remaining;
     let delta = claim.event.delta.pixel_delta(claim.line_height);
 
     for axis in [Axis2::X, Axis2::Y] {
         if axis.get(claim.overflow) != Overflow::Scroll {
             continue;
         }
-        let full = axis.pixels(delta);
-        let share = axis.share(remaining);
-        if full.is_zero() || share <= 0.0 {
+        let wanted = axis.pixels(delta);
+        if wanted.is_zero() {
             continue;
         }
-        let wanted = full * share;
         let max = axis.pixels(claim.max_offset);
         let current = axis.pixels(offset);
         let target = (current + wanted).clamp(-max, Pixels::ZERO);
@@ -226,28 +211,22 @@ pub(crate) fn claim(window: &Window, cx: &mut App, claim: Claim) -> Option<Point
         if !taken.is_zero() {
             axis.set_pixels(&mut offset, target);
         }
-        let leftover = wanted - taken;
-        axis.set_share(&mut remaining, f32::from(leftover) / f32::from(full));
         taken_any |= !taken.is_zero();
 
-        if !leftover.is_zero() && axis.get_overscroll(claim.overscroll) != OverscrollBehavior::Auto
-        {
-            axis.set_share(&mut remaining, 0.0);
+        if taken != wanted && axis.get_overscroll(claim.overscroll) != OverscrollBehavior::Auto {
             absorbed = true;
         }
     }
 
-    if latched {
-        // Whatever the latched container cannot use is dropped, not chained.
-        remaining = point(0.0, 0.0);
-    } else if (taken_any || absorbed) && routing.latch.is_none() {
+    if routing.latch.is_none() {
+        if !taken_any && !absorbed {
+            return None;
+        }
         routing.latch = Some(Latch {
             scroller: claim.scroller,
             position: claim.event.position,
         });
-        routing.latched_this_event = true;
     }
-    routing.remaining = remaining;
     Some(offset)
 }
 
@@ -283,20 +262,6 @@ impl Axis2 {
         match self {
             Axis2::X => value.x = pixels,
             Axis2::Y => value.y = pixels,
-        }
-    }
-
-    fn share(self, value: Point<f32>) -> f32 {
-        match self {
-            Axis2::X => value.x,
-            Axis2::Y => value.y,
-        }
-    }
-
-    fn set_share(self, value: &mut Point<f32>, share: f32) {
-        match self {
-            Axis2::X => value.x = share,
-            Axis2::Y => value.y = share,
         }
     }
 }

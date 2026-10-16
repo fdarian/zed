@@ -6395,13 +6395,25 @@ mod tests {
         }
 
         fn wheel_at(window: &AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
+            wheel_by(window, cx, x, y, -10., TouchPhase::Moved);
+        }
+
+        /// A wheel of `dy` pixels (negative scrolls down) at the point.
+        fn wheel_by(
+            window: &AnyWindowHandle,
+            cx: &mut TestAppContext,
+            x: f32,
+            y: f32,
+            dy: f32,
+            touch_phase: TouchPhase,
+        ) {
             cx.update_window(*window, |_, window, cx| {
                 window.dispatch_event(
                     ScrollWheelEvent {
                         position: point(px(x), px(y)),
-                        delta: ScrollDelta::Pixels(point(px(0.), px(-10.))),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                         modifiers: Default::default(),
-                        touch_phase: TouchPhase::Moved,
+                        touch_phase,
                     }
                     .to_platform_input(),
                     cx,
@@ -6418,6 +6430,58 @@ mod tests {
             wheel_at(&window, cx, 50., 50.);
             assert_eq!(scrollers.inner.offset().y, px(-10.));
             assert_eq!(scrollers.outer.offset().y, px(0.));
+        }
+
+        #[gpui::test]
+        fn one_wheel_event_scrolls_one_scroller(cx: &mut TestAppContext) {
+            let (window, scrollers) = nested_scrollers(cx);
+            move_to(&window, cx, 50., 50.);
+            // The inner scroller can move 400px; the other 50px do not go to the outer one.
+            wheel_by(&window, cx, 50., 50., -450., TouchPhase::Started);
+            assert_eq!(scrollers.inner.offset().y, px(-400.));
+            assert_eq!(scrollers.outer.offset().y, px(0.));
+        }
+
+        #[gpui::test]
+        fn a_gesture_stays_with_the_scroller_that_took_it(cx: &mut TestAppContext) {
+            let (window, scrollers) = nested_scrollers(cx);
+            move_to(&window, cx, 50., 50.);
+            wheel_by(&window, cx, 50., 50., -450., TouchPhase::Started);
+            wheel_by(&window, cx, 50., 50., -10., TouchPhase::Moved);
+            wheel_by(&window, cx, 50., 50., -10., TouchPhase::Moved);
+            assert_eq!(scrollers.inner.offset().y, px(-400.));
+            assert_eq!(scrollers.outer.offset().y, px(0.));
+        }
+
+        #[gpui::test]
+        fn a_new_gesture_chains_to_the_scroller_above_an_inner_one_at_its_limit(
+            cx: &mut TestAppContext,
+        ) {
+            let (window, scrollers) = nested_scrollers(cx);
+            move_to(&window, cx, 50., 50.);
+            wheel_by(&window, cx, 50., 50., -450., TouchPhase::Started);
+            assert_eq!(scrollers.outer.offset().y, px(0.));
+
+            wheel_by(&window, cx, 50., 50., -10., TouchPhase::Started);
+            assert_eq!(scrollers.inner.offset().y, px(-400.));
+            assert_eq!(scrollers.outer.offset().y, px(-10.));
+        }
+
+        #[gpui::test]
+        fn an_idle_wheel_chains_to_the_scroller_above_an_inner_one_at_its_limit(
+            cx: &mut TestAppContext,
+        ) {
+            let (window, scrollers) = nested_scrollers(cx);
+            move_to(&window, cx, 50., 50.);
+            wheel_by(&window, cx, 50., 50., -450., TouchPhase::Moved);
+            wheel_by(&window, cx, 50., 50., -10., TouchPhase::Moved);
+            assert_eq!(scrollers.outer.offset().y, px(0.));
+
+            // The latch is a wall-clock one, so the test waits it out.
+            std::thread::sleep(Duration::from_millis(520));
+            wheel_by(&window, cx, 50., 50., -10., TouchPhase::Moved);
+            assert_eq!(scrollers.inner.offset().y, px(-400.));
+            assert_eq!(scrollers.outer.offset().y, px(-10.));
         }
 
         #[gpui::test]
