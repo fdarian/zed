@@ -9055,6 +9055,43 @@ mod tests {
                 assert_eq!(*pressed.borrow(), ["b", "a", "root"]);
             }
         }
+
+        fn pointer_cursor(window: &AnyWindowHandle, cx: &mut TestAppContext) -> CursorStyle {
+            cx.update_window(*window, |_, window, _| window.pointer_cursor_style())
+                .unwrap()
+        }
+
+        #[gpui::test]
+        fn the_pointer_cursor_is_what_the_platform_is_asked_for_even_when_the_window_is_inactive(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("link", 0., 0., 100., 100.).cursor_pointer())
+                    .child(
+                        drag(node("bar", 0., 200., 400., 40.)).cursor_pointer(),
+                    )
+                    .into_any_element()
+            });
+
+            move_to(&window, cx, 500., 500.);
+            assert_eq!(pointer_cursor(&window, cx), CursorStyle::Arrow);
+            move_to(&window, cx, 50., 50.);
+            assert_eq!(pointer_cursor(&window, cx), CursorStyle::PointingHand);
+            assert_eq!(cx.active_cursor(), CursorStyle::Arrow, "the window is not active");
+            move_to(&window, cx, 500., 500.);
+            assert_eq!(pointer_cursor(&window, cx), CursorStyle::Arrow);
+            move_to(&window, cx, 200., 220.);
+            assert_eq!(
+                pointer_cursor(&window, cx),
+                CursorStyle::Arrow,
+                "a drag area shows the arrow"
+            );
+
+            activate(&window, cx);
+            move_to(&window, cx, 50., 50.);
+            assert_eq!(cx.active_cursor(), pointer_cursor(&window, cx));
+        }
     }
 
     mod visibility {

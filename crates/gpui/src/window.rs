@@ -6284,14 +6284,21 @@ impl Window {
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
         if self.is_window_hovered() {
-            let style = if self.drag_area_overrides_cursor() {
-                CursorStyle::Arrow
-            } else {
-                self.rendered_frame
-                    .cursor_style(self)
-                    .unwrap_or(CursorStyle::Arrow)
-            };
-            cx.platform.set_cursor_style(style);
+            cx.platform.set_cursor_style(self.pointer_cursor_style());
+        }
+    }
+
+    /// The cursor the window asks the platform for at the pointer's last hit test: the last
+    /// request of the rendered frame whose hitbox is hovered, the arrow over a window drag
+    /// area, and the arrow when nothing asks. It changes with a mouse move or a draw, and
+    /// whether the platform shows it depends on the window being active, which this does not.
+    pub fn pointer_cursor_style(&self) -> CursorStyle {
+        if self.drag_area_overrides_cursor() {
+            CursorStyle::Arrow
+        } else {
+            self.rendered_frame
+                .cursor_style(self)
+                .unwrap_or(CursorStyle::Arrow)
         }
     }
 
