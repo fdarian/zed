@@ -125,6 +125,7 @@ impl LineWrapper {
                         width += self.width_for_char(' ') * indent as f32;
                     }
 
+                    prev_c = new_prev_c;
                     return Some(Boundary::new(last_wrap_ix, indent.unwrap_or(0)));
                 }
 
@@ -133,6 +134,36 @@ impl LineWrapper {
 
             None
         })
+    }
+
+    /// The width of the widest stretch of `text` between two places `wrap_line` can break, which
+    /// is its CSS `min-content` width: wrapping at it breaks no word. Trailing spaces count,
+    /// because `wrap_line` counts them.
+    pub fn min_content_width(&mut self, text: &str) -> Pixels {
+        let mut widest = px(0.);
+        let mut stretch = px(0.);
+        let mut prev_c = '\0';
+        let mut seen_non_whitespace = false;
+        for c in text.chars() {
+            if c == '\n' {
+                widest = widest.max(stretch);
+                stretch = px(0.);
+                prev_c = '\0';
+                seen_non_whitespace = false;
+                continue;
+            }
+            let breaks_before = seen_non_whitespace
+                && c != ' '
+                && (!Self::is_word_char(c) || prev_c == ' ');
+            if breaks_before {
+                widest = widest.max(stretch);
+                stretch = px(0.);
+            }
+            seen_non_whitespace |= c != ' ';
+            stretch += self.width_for_char(c);
+            prev_c = c;
+        }
+        widest.max(stretch)
     }
 
     /// Determines if a line should be truncated based on its width.
@@ -713,6 +744,39 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_min_content_width_is_the_widest_stretch_between_break_opportunities() {
+        let mut wrapper = build_wrapper();
+        let char_width = wrapper.width_for_char('a');
+        let mut chars = |text: &str, count: f32| {
+            let width = wrapper.min_content_width(text);
+            assert!(
+                (width - char_width * count).abs() < px(0.01),
+                "{text:?} is {width:?} wide, expected {count} characters"
+            );
+        };
+
+        chars("", 0.);
+        chars("abc", 3.);
+        // The trailing space belongs to the word it follows.
+        chars("aa bbb cccc ddddd eeee", 6.);
+        chars("  ab cd", 5.);
+        chars("abc\nde fg", 3.);
+
+        let text = "aa bbb cccc ddddd eeee";
+        let narrowest = wrapper.min_content_width(text);
+        let breaks: Vec<_> = wrapper
+            .wrap_line(&[LineFragment::text(text)], narrowest)
+            .map(|boundary| boundary.ix)
+            .collect();
+        assert!(
+            breaks
+                .iter()
+                .all(|ix| text.as_bytes()[*ix - 1] == b' ' && text.as_bytes()[*ix] != b' '),
+            "wrapping at the min-content width broke a word: {breaks:?}"
+        );
     }
 
     #[test]
