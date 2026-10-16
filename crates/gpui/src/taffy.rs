@@ -46,6 +46,9 @@ pub struct TaffyLayoutEngine {
     escapable_absolutes: Vec<containing_block::EscapableAbsolute>,
     /// The kind of each node in `escapable_absolutes`, for lookups while walking the tree.
     escapable_kinds: FxHashMap<LayoutId, containing_block::EscapableKind>,
+    /// Nodes whose subtree belongs to another layer (deferred and anchored elements), so it is
+    /// not part of the scrollable overflow of the scrollers it sits in.
+    detached: FxHashSet<LayoutId>,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -63,6 +66,7 @@ impl TaffyLayoutEngine {
             static_nodes: FxHashSet::default(),
             escapable_absolutes: Vec::new(),
             escapable_kinds: FxHashMap::default(),
+            detached: FxHashSet::default(),
         }
     }
 
@@ -74,6 +78,11 @@ impl TaffyLayoutEngine {
         self.static_nodes.clear();
         self.escapable_absolutes.clear();
         self.escapable_kinds.clear();
+        self.detached.clear();
+    }
+
+    pub fn mark_detached(&mut self, id: LayoutId) {
+        self.detached.insert(id);
     }
 
     pub fn request_layout(
@@ -430,8 +439,10 @@ impl TaffyLayoutEngine {
     /// not used because it also counts the part of a box before the origin as extent, so a
     /// negative margin would add scroll range, and it counts `fixed` descendants.
     ///
-    /// Left out, as in CSS where they belong to another box: `display: none` nodes, `fixed` nodes,
-    /// and `absolute` nodes whose containing block is not `container` or inside it.
+    /// Left out, as in CSS where they belong to another box or layer: `display: none` nodes,
+    /// `fixed` nodes, `absolute` nodes whose containing block is not `container` or inside it, and
+    /// detached nodes (deferred and anchored elements, which are popups and portals) with their
+    /// subtrees.
     pub fn layout_scrollable_overflow_end(
         &mut self,
         container: LayoutId,
@@ -459,7 +470,7 @@ impl TaffyLayoutEngine {
                     .expect(EXPECT_MESSAGE),
             );
             let style = self.taffy.style(child.0).expect(EXPECT_MESSAGE);
-            if style.display == taffy::style::Display::None {
+            if style.display == taffy::style::Display::None || self.detached.contains(&child) {
                 continue;
             }
             let overflow = style.overflow;

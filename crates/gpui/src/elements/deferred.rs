@@ -48,6 +48,7 @@ impl Element for Deferred {
         cx: &mut App,
     ) -> (LayoutId, ()) {
         let layout_id = self.child.as_mut().unwrap().request_layout(window, cx);
+        window.mark_layout_detached(layout_id);
         (layout_id, ())
     }
 

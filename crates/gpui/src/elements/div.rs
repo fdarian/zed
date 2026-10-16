@@ -6687,6 +6687,40 @@ mod tests {
             assert_eq!(range, point(px(0.), px(0.)));
         }
 
+        #[gpui::test]
+        fn an_anchored_element_wider_than_the_scroller_adds_no_scroll_range(
+            cx: &mut TestAppContext,
+        ) {
+            // As a direct child and as a descendant.
+            let range = scroll_range(cx, || {
+                div()
+                    .id("wrapper")
+                    .h(px(50.))
+                    .child(crate::anchored().child(wide_row()))
+                    .into_any_element()
+            });
+            assert_eq!(range, point(px(0.), px(0.)));
+
+            let range = scroll_range(cx, || {
+                crate::anchored().child(wide_row()).into_any_element()
+            });
+            assert_eq!(range, point(px(0.), px(0.)));
+        }
+
+        #[gpui::test]
+        fn a_deferred_element_wider_than_the_scroller_adds_no_scroll_range(
+            cx: &mut TestAppContext,
+        ) {
+            let range = scroll_range(cx, || {
+                div()
+                    .id("wrapper")
+                    .h(px(50.))
+                    .child(deferred(wide_row()))
+                    .into_any_element()
+            });
+            assert_eq!(range, point(px(0.), px(0.)));
+        }
+
         struct CachedLayers;
 
         impl Render for CachedLayers {

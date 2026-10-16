@@ -5456,6 +5456,14 @@ impl Window {
         Some(self.layout_bounds(parent))
     }
 
+    /// Marks a layout node as belonging to another layer, like a popup or a portal: it and its
+    /// subtree add nothing to the scrollable overflow of the scrollers they sit in.
+    pub(crate) fn mark_layout_detached(&mut self, layout_id: LayoutId) {
+        self.invalidator.debug_assert_prepaint();
+
+        self.layout_engine.as_mut().unwrap().mark_detached(layout_id);
+    }
+
     /// Where the scrollable overflow of the given layout node's descendants ends, relative to
     /// the window: the far corner of their border boxes, descending through every node that does
     /// not clip. `None` if no descendant counts. See

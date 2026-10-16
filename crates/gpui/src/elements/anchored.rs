@@ -141,6 +141,7 @@ impl Element for Anchored {
         };
 
         let layout_id = window.request_layout(anchored_style, child_layout_ids.iter().copied(), cx);
+        window.mark_layout_detached(layout_id);
 
         (
             layout_id,
