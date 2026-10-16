@@ -193,17 +193,19 @@ pub enum IntrinsicSize {
 /// `min_size` and `max_size` because taffy has no intrinsic size keywords, so those fields
 /// hold `auto` for the width that carries one and layout fills in the measured value.
 ///
-/// A keyword wins over a length set for the same width. In the block axis the keywords behave
-/// as `auto`, so there are no height fields.
+/// A keyword wins over a length set for the same width. A style that sets a length or `auto`
+/// for a width a keyword was set on by an earlier style has to clear the keyword: refining with
+/// `Some(None)` does, where `None` leaves it alone. In the block axis the keywords behave as
+/// `auto`, so there are no height fields.
 #[derive(Clone, Copy, Default, PartialEq, Debug, Refineable)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct IntrinsicWidths {
     /// The keyword for `width`.
-    pub width: Option<IntrinsicSize>,
+    pub width: Option<Option<IntrinsicSize>>,
     /// The keyword for `min-width`. `fit-content` is `min-content` here.
-    pub min_width: Option<IntrinsicSize>,
+    pub min_width: Option<Option<IntrinsicSize>>,
     /// The keyword for `max-width`. `fit-content` is `max-content` here.
-    pub max_width: Option<IntrinsicSize>,
+    pub max_width: Option<Option<IntrinsicSize>>,
 }
 
 /// The CSS styling that can be applied to an element via the `Styled` trait

@@ -481,75 +481,75 @@ pub trait Styled: Sized {
 
     /// Sets the width of the element to `min-content`.
     fn w_min_content(mut self) -> Self {
-        self.style().intrinsic_widths.width = Some(IntrinsicSize::MinContent);
+        self.style().intrinsic_widths.width = Some(Some(IntrinsicSize::MinContent));
         self
     }
 
     /// Sets the width of the element to `max-content`.
     fn w_max_content(mut self) -> Self {
-        self.style().intrinsic_widths.width = Some(IntrinsicSize::MaxContent);
+        self.style().intrinsic_widths.width = Some(Some(IntrinsicSize::MaxContent));
         self
     }
 
     /// Sets the width of the element to `fit-content`.
     fn w_fit_content(mut self) -> Self {
-        self.style().intrinsic_widths.width = Some(IntrinsicSize::FitContent);
+        self.style().intrinsic_widths.width = Some(Some(IntrinsicSize::FitContent));
         self
     }
 
     /// Sets the width of the element to `fit-content(<limit>)`.
     fn w_fit_content_to(mut self, limit: impl Into<DefiniteLength>) -> Self {
-        self.style().intrinsic_widths.width = Some(IntrinsicSize::FitContentLimit(limit.into()));
+        self.style().intrinsic_widths.width = Some(Some(IntrinsicSize::FitContentLimit(limit.into())));
         self
     }
 
     /// Sets the minimum width of the element to `min-content`.
     fn min_w_min_content(mut self) -> Self {
-        self.style().intrinsic_widths.min_width = Some(IntrinsicSize::MinContent);
+        self.style().intrinsic_widths.min_width = Some(Some(IntrinsicSize::MinContent));
         self
     }
 
     /// Sets the minimum width of the element to `max-content`.
     fn min_w_max_content(mut self) -> Self {
-        self.style().intrinsic_widths.min_width = Some(IntrinsicSize::MaxContent);
+        self.style().intrinsic_widths.min_width = Some(Some(IntrinsicSize::MaxContent));
         self
     }
 
     /// Sets the minimum width of the element to `fit-content`.
     fn min_w_fit_content(mut self) -> Self {
-        self.style().intrinsic_widths.min_width = Some(IntrinsicSize::FitContent);
+        self.style().intrinsic_widths.min_width = Some(Some(IntrinsicSize::FitContent));
         self
     }
 
     /// Sets the minimum width of the element to `fit-content(<limit>)`.
     fn min_w_fit_content_to(mut self, limit: impl Into<DefiniteLength>) -> Self {
         self.style().intrinsic_widths.min_width =
-            Some(IntrinsicSize::FitContentLimit(limit.into()));
+            Some(Some(IntrinsicSize::FitContentLimit(limit.into())));
         self
     }
 
     /// Sets the maximum width of the element to `min-content`.
     fn max_w_min_content(mut self) -> Self {
-        self.style().intrinsic_widths.max_width = Some(IntrinsicSize::MinContent);
+        self.style().intrinsic_widths.max_width = Some(Some(IntrinsicSize::MinContent));
         self
     }
 
     /// Sets the maximum width of the element to `max-content`.
     fn max_w_max_content(mut self) -> Self {
-        self.style().intrinsic_widths.max_width = Some(IntrinsicSize::MaxContent);
+        self.style().intrinsic_widths.max_width = Some(Some(IntrinsicSize::MaxContent));
         self
     }
 
     /// Sets the maximum width of the element to `fit-content`.
     fn max_w_fit_content(mut self) -> Self {
-        self.style().intrinsic_widths.max_width = Some(IntrinsicSize::FitContent);
+        self.style().intrinsic_widths.max_width = Some(Some(IntrinsicSize::FitContent));
         self
     }
 
     /// Sets the maximum width of the element to `fit-content(<limit>)`.
     fn max_w_fit_content_to(mut self, limit: impl Into<DefiniteLength>) -> Self {
         self.style().intrinsic_widths.max_width =
-            Some(IntrinsicSize::FitContentLimit(limit.into()));
+            Some(Some(IntrinsicSize::FitContentLimit(limit.into())));
         self
     }
 

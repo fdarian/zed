@@ -71,7 +71,12 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
     ) {
         let widths = &style.intrinsic_widths;
-        if widths.width.is_none() && widths.min_width.is_none() && widths.max_width.is_none() {
+        let (width, min_width, max_width) = (
+            widths.width.flatten(),
+            widths.min_width.flatten(),
+            widths.max_width.flatten(),
+        );
+        if width.is_none() && min_width.is_none() && max_width.is_none() {
             return;
         }
         let mut keyword =
@@ -87,9 +92,9 @@ impl TaffyLayoutEngine {
             };
         let node = IntrinsicNode {
             id,
-            width: keyword(widths.width),
-            min_width: keyword(widths.min_width),
-            max_width: keyword(widths.max_width),
+            width: keyword(width),
+            min_width: keyword(min_width),
+            max_width: keyword(max_width),
         };
         self.intrinsic_nodes.push(node);
     }

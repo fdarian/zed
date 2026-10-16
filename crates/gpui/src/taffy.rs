@@ -1830,6 +1830,35 @@ mod tests {
         }
 
         #[gpui::test]
+        fn a_refinement_can_clear_a_keyword(cx: &mut TestAppContext) {
+            let mut clearing = StyleRefinement::default();
+            clearing.size.width = Some(px(50.).into());
+            clearing.intrinsic_widths.width = Some(None);
+            assert_eq!(
+                width_in(cx, 400., LONG, {
+                    let clearing = clearing.clone();
+                    move |mut box_| {
+                        box_ = box_.w_max_content();
+                        box_.style().refine(&clearing);
+                        box_
+                    }
+                }),
+                px(50.)
+            );
+
+            let mut untouched = StyleRefinement::default();
+            untouched.size.width = Some(px(50.).into());
+            assert_eq!(
+                width_in(cx, 400., LONG, move |mut box_| {
+                    box_ = box_.w_max_content();
+                    box_.style().refine(&untouched);
+                    box_
+                }),
+                px(210.)
+            );
+        }
+
+        #[gpui::test]
         fn an_absolute_box_is_sized_by_its_content(cx: &mut TestAppContext) {
             let (_, cx) = probe(cx, LONG, |text| {
                 div()
