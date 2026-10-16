@@ -2990,6 +2990,13 @@ impl Window {
         self.rendered_frame.scene.quads_with_groups()
     }
 
+    /// The images, as polychrome sprites, in the most recently rendered frame's scene. Bounds are
+    /// in scaled pixels and are not clipped; each sprite carries the content mask it is clipped to.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_sprites(&self) -> Vec<crate::PolychromeSprite> {
+        self.rendered_frame.scene.polychrome_sprites_with_groups()
+    }
+
     /// The text decoration lines, as underline primitives, in the most recently rendered
     /// frame's scene. Bounds are in scaled pixels and are not clipped.
     #[cfg(any(test, feature = "test-support"))]

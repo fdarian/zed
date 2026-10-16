@@ -5,15 +5,17 @@ use std::{
 };
 
 use crate::{
-    AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundLayer, BackgroundTag,
+    AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundImages,
+    BackgroundLayer, BackgroundTag,
     BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, CornerRadii,
     CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextDecorationStyle, TextLayoutOptions,
     TextRun, Window, OverflowWrap, WordBreak, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
+use gpui_util::ResultExt;
 use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1105,7 +1107,7 @@ impl Style {
             self.paint_background_color(bounds, corner_radii, window);
         }
         let boxes = self.background_boxes(bounds, corner_radii, rem_size);
-        self.paint_background_layers(&boxes, false, window);
+        self.paint_background_layers(&boxes, false, window, cx);
         if text_clip {
             let effect = GroupEffect {
                 text_mask: true,
@@ -1118,7 +1120,7 @@ impl Style {
                 if colour_in_text {
                     self.paint_background_color(bounds, corner_radii, window);
                 }
-                self.paint_background_layers(&boxes, true, window);
+                self.paint_background_layers(&boxes, true, window, cx);
             });
         }
 
@@ -1210,28 +1212,77 @@ impl Style {
     }
 
     /// Paints the layers clipped to the glyphs when `text` is set, and the others otherwise.
-    fn paint_background_layers(&self, boxes: &BackgroundBoxes, text: bool, window: &mut Window) {
+    fn paint_background_layers(
+        &self,
+        boxes: &BackgroundBoxes,
+        text: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         for layer in self.background_layers.iter().rev() {
             if (layer.clip == BackgroundBox::Text) != text {
                 continue;
             }
-            let Some(resolved) = layer.resolve(boxes) else {
-                continue;
-            };
-            for chunk in resolved.chunks {
-                window.paint_quad(
-                    quad(
-                        resolved.bounds,
-                        resolved.corner_radii,
-                        chunk,
-                        Edges::default(),
-                        Hsla::default(),
-                        BorderStyle::default(),
-                    )
-                    .background_tile(resolved.tile),
-                );
+            match &layer.image {
+                BackgroundImage::Gradient(_) => Self::paint_gradient_layer(layer, boxes, window),
+                BackgroundImage::Image(key) => {
+                    Self::paint_image_layer(layer, *key, boxes, window, cx)
+                }
             }
         }
+    }
+
+    fn paint_gradient_layer(layer: &BackgroundLayer, boxes: &BackgroundBoxes, window: &mut Window) {
+        let Some(resolved) = layer.resolve(boxes) else {
+            return;
+        };
+        for chunk in resolved.chunks {
+            window.paint_quad(
+                quad(
+                    resolved.bounds,
+                    resolved.corner_radii,
+                    chunk,
+                    Edges::default(),
+                    Hsla::default(),
+                    BorderStyle::default(),
+                )
+                .background_tile(resolved.tile),
+            );
+        }
+    }
+
+    /// Only the first frame of an animated image is drawn.
+    fn paint_image_layer(
+        layer: &BackgroundLayer,
+        key: ImageKey,
+        boxes: &BackgroundBoxes,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(image) = BackgroundImages::get(cx, key) else {
+            return;
+        };
+        let visible = window.content_mask().bounds;
+        let Some(resolved) = layer.resolve_image(boxes, image.render_size(0), visible) else {
+            return;
+        };
+        // The rounded clip is the content mask, so each sprite stays square-cornered and only
+        // needs its atlas tile cropped to the clip box.
+        let clip = ContentMask::rounded(resolved.bounds, resolved.corner_radii);
+        window.with_content_mask(Some(clip), |window| {
+            for tile in resolved.tiles {
+                window
+                    .paint_image(
+                        tile.intersect(&resolved.bounds),
+                        tile,
+                        CornerRadii::default(),
+                        image.clone(),
+                        0,
+                        false,
+                    )
+                    .log_err();
+            }
+        });
     }
 
     fn is_border_visible(&self) -> bool {

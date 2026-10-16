@@ -6,7 +6,7 @@
 
 use crate::{
     Background, BackgroundTag, Bounds, ColorSpace, CornerRadii, Edges, GradientGeometry, GradientKind,
-    GradientParams, Hsla, LinearColorStop, Pixels, Point, Rgba, Size, point, px, size,
+    GradientParams, Hsla, ImageKey, LinearColorStop, Pixels, Point, Rgba, Size, point, px, size,
     solid_background,
 };
 use schemars::JsonSchema;
@@ -282,17 +282,23 @@ pub struct Gradient {
 pub enum BackgroundImage {
     /// A gradient.
     Gradient(Gradient),
+    /// A raster or vector image, looked up by key in [`BackgroundImages`](crate::BackgroundImages)
+    /// when painted. Until the table has an entry for the key the layer paints nothing.
+    Image(ImageKey),
 }
 
 /// `background-size`.
 #[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub enum BackgroundSize {
-    /// `auto`. A gradient has no intrinsic size, so this is the whole positioning area.
+    /// `auto`. A gradient has no intrinsic size, so this is the whole positioning area; an image
+    /// keeps its own size.
     #[default]
     Auto,
-    /// `cover`. Same as `auto` for a gradient.
+    /// `cover`. Same as `auto` for a gradient; an image is scaled to the smallest size that
+    /// covers the positioning area.
     Cover,
-    /// `contain`. Same as `auto` for a gradient.
+    /// `contain`. Same as `auto` for a gradient; an image is scaled to the largest size that fits
+    /// the positioning area.
     Contain,
     /// Explicit sizes, where `None` is `auto`.
     Explicit {
@@ -489,17 +495,21 @@ pub struct ResolvedBackgroundLayer {
     pub chunks: Vec<Background>,
 }
 
-struct Axis {
-    origin: f32,
-    size: f32,
-    pitch: f32,
-    repeats: bool,
+pub(crate) struct PlacedAxis {
+    pub(crate) origin: f32,
+    pub(crate) size: f32,
+    pub(crate) pitch: f32,
+    pub(crate) repeats: bool,
 }
 
 impl BackgroundLayer {
-    /// Places the image in the boxes. `None` means there is nothing to paint: a box has no area
-    /// or the gradient has no stops.
+    /// Places the gradient in the boxes. `None` means there is nothing to paint: a box has no area,
+    /// the gradient has no stops, or the layer is an image, which [`BackgroundLayer::resolve_image`]
+    /// places.
     pub fn resolve(&self, boxes: &BackgroundBoxes) -> Option<ResolvedBackgroundLayer> {
+        let BackgroundImage::Gradient(gradient) = &self.image else {
+            return None;
+        };
         let clip = boxes.region(self.clip);
         let area = boxes.region(self.origin).bounds;
         if clip.bounds.is_empty() || area.size.width <= px(0.) || area.size.height <= px(0.) {
@@ -526,7 +536,6 @@ impl BackgroundLayer {
             self.position.y,
         );
 
-        let BackgroundImage::Gradient(gradient) = &self.image;
         let chunks = gradient.resolve(size(px(x.size), px(y.size)));
         if chunks.is_empty() {
             return None;
@@ -567,22 +576,22 @@ impl BackgroundLayer {
         tile
     }
 
-    fn place_axis(
+    pub(crate) fn place_axis(
         repeat: RepeatStyle,
         area_origin: f32,
         area_size: f32,
         tile_size: f32,
         position: BackgroundPositionAxis,
-    ) -> Axis {
+    ) -> PlacedAxis {
         let offset = position.resolve_offset(px(area_size), px(tile_size)).0;
         match repeat {
-            RepeatStyle::NoRepeat => Axis {
+            RepeatStyle::NoRepeat => PlacedAxis {
                 origin: area_origin + offset,
                 size: tile_size,
                 pitch: tile_size,
                 repeats: false,
             },
-            RepeatStyle::Repeat | RepeatStyle::Round => Axis {
+            RepeatStyle::Repeat | RepeatStyle::Round => PlacedAxis {
                 origin: area_origin + offset,
                 size: tile_size,
                 pitch: tile_size,
@@ -592,21 +601,21 @@ impl BackgroundLayer {
                 let count = (area_size / tile_size).floor();
                 if count >= 2. {
                     let gap = (area_size - count * tile_size) / (count - 1.);
-                    Axis {
+                    PlacedAxis {
                         origin: area_origin,
                         size: tile_size,
                         pitch: tile_size + gap,
                         repeats: true,
                     }
                 } else if count >= 1. {
-                    Axis {
+                    PlacedAxis {
                         origin: area_origin,
                         size: tile_size,
                         pitch: tile_size,
                         repeats: false,
                     }
                 } else {
-                    Axis {
+                    PlacedAxis {
                         origin: area_origin + offset,
                         size: tile_size,
                         pitch: tile_size,

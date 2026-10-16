@@ -575,6 +575,18 @@ impl Scene {
         quads
     }
 
+    /// The image sprites of this scene and of the groups inside it, in this scene's coordinates.
+    pub fn polychrome_sprites_with_groups(&self) -> Vec<PolychromeSprite> {
+        let mut sprites = self.polychrome_sprites.clone();
+        for group in &self.groups {
+            for mut sprite in group.scene.polychrome_sprites_with_groups() {
+                sprite.translate(group.bounds.origin);
+                sprites.push(sprite);
+            }
+        }
+        sprites
+    }
+
     /// The underlines of this scene and of the groups inside it, in this scene's coordinates.
     pub fn underlines_with_groups(&self) -> Vec<Underline> {
         let mut underlines = self.underlines.clone();
