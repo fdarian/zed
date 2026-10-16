@@ -554,10 +554,12 @@ impl WebWindowInner {
             is_held: false,
             prefer_character_input: false,
             native_key: Default::default(),
+            is_composing: false,
         }));
         self.dispatch_input(PlatformInput::KeyUp(KeyUpEvent {
             keystroke,
             native_key: Default::default(),
+            is_composing: false,
         }));
     }
 
@@ -716,6 +718,7 @@ impl WebWindowInner {
                 is_held,
                 prefer_character_input: false,
                 native_key: Default::default(),
+                is_composing: false,
             }));
 
             if let Some(result) = result {
@@ -779,6 +782,7 @@ impl WebWindowInner {
             let result = this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent {
                 keystroke,
                 native_key: Default::default(),
+                is_composing: false,
             }));
             if let Some(result) = result {
                 if !result.propagate {

@@ -1633,6 +1633,10 @@ impl PlatformInputHandler {
         self.handler.replace_text_in_range(None, input, window, cx);
     }
 
+    pub fn is_composing(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.handler.marked_text_range(window, cx).is_some()
+    }
+
     pub fn compute_ime_candidate_bounds(
         marked_range: Option<Range<usize>>,
         selection: &UTF16Selection,

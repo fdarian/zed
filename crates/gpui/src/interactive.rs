@@ -53,6 +53,10 @@ pub struct KeyDownEvent {
 
     /// The physical key and the layout's character for it.
     pub native_key: NativeKey,
+
+    /// Whether an input method composition was in progress when the key was
+    /// pressed, as DOM `KeyboardEvent.isComposing`. Only macOS reports it.
+    pub is_composing: bool,
 }
 
 impl Sealed for KeyDownEvent {}
@@ -71,6 +75,10 @@ pub struct KeyUpEvent {
 
     /// The physical key and the layout's character for it.
     pub native_key: NativeKey,
+
+    /// Whether an input method composition was in progress when the key was
+    /// released. Only macOS reports it.
+    pub is_composing: bool,
 }
 
 impl Sealed for KeyUpEvent {}

@@ -133,10 +133,13 @@ pub(crate) unsafe fn platform_input_from_native(
                 is_held: native_event.isARepeat() == YES,
                 prefer_character_input: false,
                 native_key: native_key(native_event),
+                // `handle_key_event` knows the input handler; this has not asked it.
+                is_composing: false,
             })),
             NSEventType::NSKeyUp => Some(PlatformInput::KeyUp(KeyUpEvent {
                 keystroke: parse_keystroke(native_event),
                 native_key: native_key(native_event),
+                is_composing: false,
             })),
             NSEventType::NSLeftMouseDown
             | NSEventType::NSRightMouseDown

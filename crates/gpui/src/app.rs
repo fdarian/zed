@@ -3042,6 +3042,9 @@ pub struct KeystrokeEvent {
 
     /// The physical key and the layout's character for it
     pub native_key: NativeKey,
+
+    /// Whether an input method composition was in progress, see [`KeyDownEvent::is_composing`]
+    pub is_composing: bool,
 }
 
 struct NullHttpClient;

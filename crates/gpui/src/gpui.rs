@@ -32,6 +32,8 @@ mod grid_template;
 mod gestures;
 mod global;
 mod input;
+#[cfg(test)]
+mod ime_tests;
 mod inspector;
 mod interactive;
 mod key_dispatch;

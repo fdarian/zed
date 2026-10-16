@@ -416,6 +416,7 @@ impl WindowsWindowInner {
             PlatformInput::KeyUp(KeyUpEvent {
                 keystroke,
                 native_key: Default::default(),
+                is_composing: false,
             })
         })?;
         let mut func = self.state.callbacks.input.take()?;
@@ -440,6 +441,7 @@ impl WindowsWindowInner {
                     is_held: lparam.0 & (0x1 << 30) > 0,
                     prefer_character_input,
                     native_key: Default::default(),
+                    is_composing: false,
                 })
             },
         ) else {
@@ -462,6 +464,7 @@ impl WindowsWindowInner {
             PlatformInput::KeyUp(KeyUpEvent {
                 keystroke,
                 native_key: Default::default(),
+                is_composing: false,
             })
         }) else {
             return Some(1);

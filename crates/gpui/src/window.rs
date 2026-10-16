@@ -2628,6 +2628,7 @@ impl Window {
                     context_stack: context_stack.clone(),
                     is_held: key_down_event.is_held,
                     native_key: key_down_event.native_key.clone(),
+                    is_composing: key_down_event.is_composing,
                 },
                 self,
                 cx,
@@ -2655,6 +2656,7 @@ impl Window {
                         context_stack: context_stack.clone(),
                         is_held: key_down_event.is_held,
                         native_key: key_down_event.native_key.clone(),
+                        is_composing: key_down_event.is_composing,
                     },
                     self,
                     cx,
@@ -6339,12 +6341,14 @@ impl Window {
         cx: &mut App,
     ) -> bool {
         let keystroke = keystroke.with_simulated_ime();
+        let is_composing = self.is_composing(cx);
         let result = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
                 is_held: false,
                 prefer_character_input: false,
                 native_key,
+                is_composing,
             }),
             cx,
         );
@@ -6361,6 +6365,17 @@ impl Window {
         }
 
         false
+    }
+
+    /// Whether the focused input handler has marked text, which is what an input
+    /// method composition leaves in it.
+    pub fn is_composing(&mut self, cx: &mut App) -> bool {
+        let Some(mut input_handler) = self.platform_window.take_input_handler() else {
+            return false;
+        };
+        let composing = input_handler.is_composing(self, cx);
+        self.platform_window.set_input_handler(input_handler);
+        composing
     }
 
     /// Return a key binding string for an action, to display in the UI. Uses the highest precedence
@@ -6985,6 +7000,7 @@ impl Window {
                 is_held: false,
                 prefer_character_input: true,
                 native_key: NativeKey::default(),
+                is_composing: false,
             };
 
             cx.propagate_event = true;

@@ -2560,7 +2560,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     };
 
     match event {
-        PlatformInput::KeyDown(key_down_event) => {
+        PlatformInput::KeyDown(mut key_down_event) => {
             // For certain keystrokes, macOS will first dispatch a "key equivalent" event.
             // If that event isn't handled, it will then dispatch a "key down" event. GPUI
             // makes no distinction between these two types of events, so we need to ignore
@@ -2577,6 +2577,8 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                 with_input_handler(this, |input_handler| input_handler.marked_text_range())
                     .flatten()
                     .is_some();
+            // Set after the key-equivalent comparison above: the earlier call never asked the input handler.
+            key_down_event.is_composing = is_composing;
 
             // If we're composing, send the key to the input handler first;
             // otherwise we only send to the input handler if we don't have a matching binding.
@@ -2672,9 +2674,13 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
             }
         }
 
-        PlatformInput::KeyUp(_) => {
+        PlatformInput::KeyUp(mut key_up_event) => {
             drop(lock);
-            run_callback(event)
+            key_up_event.is_composing =
+                with_input_handler(this, |input_handler| input_handler.marked_text_range())
+                    .flatten()
+                    .is_some();
+            run_callback(PlatformInput::KeyUp(key_up_event))
         }
 
         _ => NO,
@@ -3318,11 +3324,16 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
     drop(lock);
 
     if let Some(((keystroke, native_key), callback)) = keystroke.zip(event_callback.as_mut()) {
+        let is_composing =
+            with_input_handler(this, |input_handler| input_handler.marked_text_range())
+                .flatten()
+                .is_some();
         let handled = (callback)(PlatformInput::KeyDown(KeyDownEvent {
             keystroke,
             is_held: false,
             prefer_character_input: false,
             native_key,
+            is_composing,
         }));
         state.as_ref().lock().do_command_handled = Some(!handled.propagate);
     }

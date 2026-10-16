@@ -1120,6 +1120,7 @@ impl X11Client {
                     is_held: false,
                     prefer_character_input: false,
                     native_key: Default::default(),
+                    is_composing: false,
                 }));
             }
             Event::KeyRelease(event) => {
@@ -1145,6 +1146,7 @@ impl X11Client {
                 window.handle_input(PlatformInput::KeyUp(gpui::KeyUpEvent {
                     keystroke,
                     native_key: Default::default(),
+                    is_composing: false,
                 }));
             }
             Event::XinputButtonPress(event) => {

@@ -5955,6 +5955,7 @@ mod tests {
                     is_held: false,
                     prefer_character_input: false,
                     native_key: Default::default(),
+                    is_composing: false,
                 }
                 .to_platform_input(),
                 cx,
@@ -5970,6 +5971,7 @@ mod tests {
                 KeyUpEvent {
                     keystroke,
                     native_key: Default::default(),
+                    is_composing: false,
                 }
                 .to_platform_input(),
                 cx,

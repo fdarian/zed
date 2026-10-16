@@ -1997,6 +1997,7 @@ mod test {
                     is_held: false,
                     prefer_character_input: false,
                     native_key: Default::default(),
+                    is_composing: false,
                 }),
                 cx,
             )
