@@ -102,6 +102,10 @@ impl Element for Surface {
         None
     }
 
+    fn escapes_to(&self) -> Option<crate::Escape> {
+        self.style.escape()
+    }
+
     fn request_layout(
         &mut self,
         _global_id: Option<&GlobalElementId>,

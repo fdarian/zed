@@ -1,7 +1,7 @@
 use crate::{
     AnyElement, AnyEntity, App, AppContext, Asset, AssetLogger, Bounds, Element, ElementId, Entity,
     GlobalElementId, ImageAssetLoader, ImageCacheError, InspectorElementId, IntoElement, LayoutId,
-    ParentElement, Pixels, RenderImage, Resource, Style, StyleRefinement, Styled, Task, Window,
+    ParentElement, Pixels, Position, RenderImage, Resource, Style, StyleRefinement, Styled, Task, Window,
     hash,
 };
 
@@ -137,8 +137,17 @@ impl Element for ImageCacheElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        for child in &mut self.children {
-            child.prepaint(window, cx);
+        let mut style = Style::default();
+        style.refine(&self.style);
+        let mut prepaint_children = |window: &mut Window| {
+            for child in &mut self.children {
+                child.prepaint(window, cx);
+            }
+        };
+        if style.position == Position::Static {
+            prepaint_children(window);
+        } else {
+            window.with_positioned_frame(prepaint_children);
         }
     }
 

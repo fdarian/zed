@@ -7,7 +7,7 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundLayer, BackgroundTag,
     BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, Corners,
-    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
+    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
     Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi, point, px, quad,
@@ -425,6 +425,17 @@ impl StyleRefinement {
     /// The grid location of this element
     pub fn grid_location_mut(&mut self) -> &mut GridLocation {
         self.grid_location.get_or_insert_default()
+    }
+
+    /// What an element with this style escapes to, for `Element::escapes_to`: a
+    /// [`Position::AbsoluteInAncestor`] box to its containing block, a [`Position::Fixed`] one to
+    /// the viewport.
+    pub fn escape(&self) -> Option<Escape> {
+        match self.position {
+            Some(Position::AbsoluteInAncestor) => Some(Escape::ContainingBlock),
+            Some(Position::Fixed) => Some(Escape::Viewport),
+            _ => None,
+        }
     }
 }
 

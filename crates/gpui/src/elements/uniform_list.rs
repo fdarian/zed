@@ -272,6 +272,10 @@ impl Element for UniformList {
         None
     }
 
+    fn escapes_to(&self) -> Option<crate::Escape> {
+        self.interactivity.base_style.escape()
+    }
+
     fn request_layout(
         &mut self,
         global_id: Option<&GlobalElementId>,

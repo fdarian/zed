@@ -81,6 +81,10 @@ impl Element for Svg {
         self.interactivity.source_location()
     }
 
+    fn escapes_to(&self) -> Option<crate::Escape> {
+        self.interactivity.base_style.escape()
+    }
+
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.interactivity
             .override_role

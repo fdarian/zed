@@ -7,7 +7,7 @@ use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    Capslock, Context, Corners, CursorHideMode, CursorStyle, Escape, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
@@ -991,6 +991,14 @@ pub(crate) struct TooltipRequest {
     tooltip: AnyTooltip,
 }
 
+/// The content mask and element offset the children of a positioned element are drawn with: the
+/// ones an absolutely positioned descendant is placed in, whatever static boxes sit between.
+#[derive(Clone, Copy)]
+pub(crate) struct PositionedFrame {
+    content_mask: ContentMask<Pixels>,
+    element_offset: Point<Pixels>,
+}
+
 pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
@@ -998,6 +1006,9 @@ pub(crate) struct DeferredDraw {
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
     visibility: Visibility,
+    /// The innermost positioned frame where the draw was deferred, so a box inside the layer still
+    /// finds its containing block.
+    positioned_frame: Option<PositionedFrame>,
     content_mask: Option<ContentMask<Pixels>>,
     rem_size: Pixels,
     element: Option<AnyElement>,
@@ -1344,6 +1355,8 @@ pub struct Window {
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    /// What the children of each positioned element see, innermost last. Only prepaint reads it.
+    pub(crate) positioned_frames: Vec<PositionedFrame>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -2059,6 +2072,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
+            positioned_frames: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -3858,6 +3872,7 @@ impl Window {
                     current_view,
                     rem_size,
                     absolute_offset,
+                    positioned_frame,
                     prepaint_range,
                     visibility,
                 ) = {
@@ -3872,6 +3887,7 @@ impl Window {
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
+                        deferred_draw.positioned_frame,
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.visibility,
                     )
@@ -3880,6 +3896,8 @@ impl Window {
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
+                    debug_assert!(self.positioned_frames.is_empty());
+                    self.positioned_frames.extend(positioned_frame);
                     self.with_rendered_view(current_view, |window| {
                         window.with_visibility(visibility, |window| {
                             window.with_rem_size(Some(rem_size), |window| {
@@ -3889,6 +3907,7 @@ impl Window {
                             });
                         });
                     });
+                    self.positioned_frames.clear();
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
                     self.reuse_prepaint(prepaint_range);
@@ -4017,6 +4036,7 @@ impl Window {
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
                     visibility: deferred_draw.visibility,
+                    positioned_frame: deferred_draw.positioned_frame,
                     content_mask: deferred_draw.content_mask,
                     rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
@@ -4180,6 +4200,48 @@ impl Window {
             result
         } else {
             f(self)
+        }
+    }
+
+    /// Invoke the given function with the given content mask in place of the current one, not
+    /// intersected with it. A box that escapes the overflow clip of its ancestors is drawn with
+    /// this. This method should only be called during element drawing.
+    pub fn with_replaced_content_mask<R>(
+        &mut self,
+        mask: ContentMask<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        self.content_mask_stack.push(mask);
+        let result = f(self);
+        self.content_mask_stack.pop();
+        result
+    }
+
+    /// Runs `f`, the drawing of the children of a positioned element, so that its content mask and
+    /// element offset are what an absolutely positioned descendant escapes to. Call it inside the
+    /// element's own overflow mask and scroll offset.
+    pub(crate) fn with_positioned_frame<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_prepaint();
+        let frame = PositionedFrame {
+            content_mask: self.content_mask(),
+            element_offset: self.element_offset(),
+        };
+        self.positioned_frames.push(frame);
+        let result = f(self);
+        self.positioned_frames.pop();
+        result
+    }
+
+    /// The content mask and element offset a box that escapes to `escape` is drawn with.
+    pub(crate) fn escape_frame(&self, escape: Escape) -> (ContentMask<Pixels>, Point<Pixels>) {
+        let viewport = ContentMask::from_bounds(Bounds::new(Point::default(), self.viewport_size));
+        match escape {
+            Escape::Viewport => (viewport, Point::default()),
+            Escape::ContainingBlock => match self.positioned_frames.last() {
+                Some(frame) => (frame.content_mask, frame.element_offset),
+                None => (viewport, Point::default()),
+            },
         }
     }
 
@@ -4590,6 +4652,7 @@ impl Window {
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
             visibility: self.visibility,
+            positioned_frame: self.positioned_frames.last().copied(),
             content_mask,
             rem_size: self.rem_size(),
             priority,

@@ -17,7 +17,7 @@
 
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, ClipPathValue, DispatchPhase,
-    Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
+    Display, Element, ElementId, Entity, EntityId, Escape, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
@@ -2066,6 +2066,10 @@ impl Element for Div {
         )
     }
 
+    fn escapes_to(&self) -> Option<Escape> {
+        self.interactivity.base_style.escape()
+    }
+
     fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
         let style = &self.interactivity.base_style;
         if style.position != Some(Position::Sticky) {
@@ -2178,21 +2182,28 @@ impl Element for Div {
                     );
                     window.with_element_offset(scroll_offset, |window| {
                         sticky::within(scrollport, containing_block, || {
-                            if let Some(order_fn) = &self.prepaint_order_fn {
-                                let order = order_fn(window, cx);
-                                for idx in order {
-                                    if let Some(child) = self.children.get_mut(idx) {
+                            let mut prepaint_children = |window: &mut Window| {
+                                if let Some(order_fn) = &self.prepaint_order_fn {
+                                    let order = order_fn(window, cx);
+                                    for idx in order {
+                                        if let Some(child) = self.children.get_mut(idx) {
+                                            child.prepaint(window, cx);
+                                        }
+                                    }
+                                } else if let Some(order) = &paint_order {
+                                    for &idx in order {
+                                        self.children[idx].prepaint(window, cx);
+                                    }
+                                } else {
+                                    for child in &mut self.children {
                                         child.prepaint(window, cx);
                                     }
                                 }
-                            } else if let Some(order) = &paint_order {
-                                for &idx in order {
-                                    self.children[idx].prepaint(window, cx);
-                                }
+                            };
+                            if style.position == Position::Static {
+                                prepaint_children(window);
                             } else {
-                                for child in &mut self.children {
-                                    child.prepaint(window, cx);
-                                }
+                                window.with_positioned_frame(prepaint_children);
                             }
                         })
                     });
@@ -4423,6 +4434,10 @@ where
         self.element.request_layout(id, inspector_id, window, cx)
     }
 
+    fn escapes_to(&self) -> Option<Escape> {
+        self.element.escapes_to()
+    }
+
     fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
         self.element.prepaint_offset(layout_bounds, window)
     }
@@ -6131,7 +6146,7 @@ mod tests {
         use super::*;
         use crate::{
             CursorStyle, Entity, MouseUpEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
-            TouchPhase, WindowHandle, deferred, size,
+            TouchPhase, WindowHandle, anchored, canvas, deferred, size,
         };
         use std::cell::Cell;
 
@@ -7649,6 +7664,357 @@ mod tests {
             activate(&window, cx);
             move_to(&window, cx, 200., 20.);
             assert_eq!(cx.active_cursor(), CursorStyle::PointingHand);
+        }
+
+        /// Absolute and fixed boxes take the overflow clip and the scroll offset of their
+        /// containing block, and of nothing between it and them.
+        mod escaping_boxes {
+            use super::*;
+            use crate::{ScrollHandle, hsla, red};
+
+            fn with_position<E: Styled>(mut element: E, position: Position) -> E {
+                element.style().position = Some(position);
+                element
+            }
+
+            /// An in-flow box that is not a containing block, `size` square and `offset` from the
+            /// top left of its parent.
+            fn static_box(name: &'static str, offset: f32, size: f32) -> Stateful<Div> {
+                with_position(
+                    div()
+                        .id(name)
+                        .ml(px(offset))
+                        .mt(px(offset))
+                        .w(px(size))
+                        .h(px(size))
+                        .always_hitbox(),
+                    Position::Static,
+                )
+            }
+
+            fn escaping(name: &'static str, left: f32, top: f32, width: f32) -> Stateful<Div> {
+                with_position(
+                    node(name, left, top, width, 50.)
+                        .debug_selector(move || name.into())
+                        .bg(red()),
+                    Position::AbsoluteInAncestor,
+                )
+            }
+
+            fn fixed(name: &'static str, left: f32, top: f32, width: f32) -> Stateful<Div> {
+                with_position(escaping(name, left, top, width), Position::Fixed)
+            }
+
+            fn tall() -> Div {
+                div().h(px(1000.)).w(px(10.))
+            }
+
+            fn bounds_of(
+                window: &AnyWindowHandle,
+                cx: &mut TestAppContext,
+                selector: &'static str,
+            ) -> Bounds<Pixels> {
+                cx.update_window(*window, |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| panic!("no element with debug selector {selector}"))
+            }
+
+            /// The area of the red quad that its content mask lets through, in logical pixels.
+            fn visible_area(window: &AnyWindowHandle, cx: &mut TestAppContext) -> f32 {
+                cx.update_window(*window, |_, window, _| {
+                    let scale = window.scale_factor();
+                    window
+                        .painted_quads()
+                        .iter()
+                        .filter(|quad| quad.background.as_solid() == Some(hsla(0., 1., 0.5, 1.)))
+                        .map(|quad| {
+                            let visible = quad.bounds.intersect(&quad.content_mask.bounds);
+                            visible.size.width.0 * visible.size.height.0 / (scale * scale)
+                        })
+                        .sum()
+                })
+                .unwrap()
+            }
+
+            fn redraw(window: &AnyWindowHandle, cx: &mut TestAppContext) {
+                cx.update_window(*window, |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+            }
+
+            #[gpui::test]
+            fn a_static_overflow_ancestor_does_not_clip_an_absolute_box(cx: &mut TestAppContext) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            static_box("clip", 200., 100.)
+                                .overflow_hidden()
+                                .child(escaping("box", 10., 10., 50.)),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(10.), px(10.)));
+                assert_eq!(visible_area(&window, cx), 50. * 50.);
+                assert_eq!(chain_at(&window, cx, 30., 30.), ["box", "clip", "root"]);
+                assert_eq!(chain_at(&window, cx, 250., 250.), ["clip", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_positioned_overflow_ancestor_clips_an_absolute_box(cx: &mut TestAppContext) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            node("clip", 200., 200., 100., 100.)
+                                .overflow_hidden()
+                                .child(escaping("box", 10., 10., 150.)),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(210.), px(210.)));
+                assert_eq!(visible_area(&window, cx), 90. * 50.);
+                assert_eq!(chain_at(&window, cx, 250., 230.), ["box", "clip", "root"]);
+                assert_eq!(chain_at(&window, cx, 350., 230.), ["root"]);
+            }
+
+            #[gpui::test]
+            fn only_the_overflow_inside_the_containing_block_clips(cx: &mut TestAppContext) {
+                // The outer clip is a positioned ancestor of the containing block, so it still
+                // clips; the static clip between the block and the box does not.
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            node("outer", 0., 0., 300., 300.).overflow_hidden().child(
+                                node("block", 200., 200., 300., 300.).child(
+                                    static_box("clip", 0., 20.)
+                                        .overflow_hidden()
+                                        .child(escaping("box", 0., 0., 300.)),
+                                ),
+                            ),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(visible_area(&window, cx), 100. * 50.);
+                assert_eq!(chain_at(&window, cx, 250., 220.), ["box", "clip", "block", "outer", "root"]);
+                assert_eq!(chain_at(&window, cx, 350., 220.), ["root"]);
+            }
+
+            #[gpui::test]
+            fn a_static_scroller_does_not_move_an_absolute_box(cx: &mut TestAppContext) {
+                let handle = ScrollHandle::new();
+                let window = open_scene(cx, true, {
+                    let handle = handle.clone();
+                    move || {
+                        root()
+                            .child(
+                                with_position(
+                                    div()
+                                        .id("scroller")
+                                        .w(px(100.))
+                                        .h(px(100.))
+                                        .always_hitbox()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&handle),
+                                    Position::Static,
+                                )
+                                .child(tall().debug_selector(|| "content".into()))
+                                .child(escaping("box", 300., 10., 50.)),
+                            )
+                            .into_any_element()
+                    }
+                });
+                let before = bounds_of(&window, cx, "box");
+                assert_eq!(before.origin, point(px(300.), px(10.)));
+
+                handle.set_offset(point(px(0.), px(-30.)));
+                redraw(&window, cx);
+
+                assert_eq!(bounds_of(&window, cx, "content").origin.y, px(-30.));
+                assert_eq!(bounds_of(&window, cx, "box"), before);
+                assert_eq!(visible_area(&window, cx), 50. * 50.);
+                assert_eq!(chain_at(&window, cx, 320., 20.), ["box", "scroller", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_positioned_scroller_moves_an_absolute_box(cx: &mut TestAppContext) {
+                let handle = ScrollHandle::new();
+                let window = open_scene(cx, true, {
+                    let handle = handle.clone();
+                    move || {
+                        root()
+                            .child(
+                                node("scroller", 100., 100., 200., 200.)
+                                    .overflow_y_scroll()
+                                    .track_scroll(&handle)
+                                    .child(tall())
+                                    .child(escaping("box", 10., 60., 50.)),
+                            )
+                            .into_any_element()
+                    }
+                });
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(110.), px(160.)));
+
+                handle.set_offset(point(px(0.), px(-30.)));
+                redraw(&window, cx);
+
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(110.), px(130.)));
+                assert_eq!(chain_at(&window, cx, 120., 140.), ["box", "scroller", "root"]);
+                assert_eq!(chain_at(&window, cx, 120., 190.), ["scroller", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_fixed_box_escapes_a_positioned_overflow_ancestor(cx: &mut TestAppContext) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            node("clip", 200., 200., 100., 100.)
+                                .overflow_hidden()
+                                .child(fixed("box", 10., 10., 50.)),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(10.), px(10.)));
+                assert_eq!(visible_area(&window, cx), 50. * 50.);
+                assert_eq!(chain_at(&window, cx, 30., 30.), ["box", "clip", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_fixed_box_scrolls_with_nothing(cx: &mut TestAppContext) {
+                let handle = ScrollHandle::new();
+                let window = open_scene(cx, true, {
+                    let handle = handle.clone();
+                    move || {
+                        root()
+                            .child(
+                                node("scroller", 100., 100., 200., 200.)
+                                    .overflow_y_scroll()
+                                    .track_scroll(&handle)
+                                    .child(tall())
+                                    .child(fixed("box", 400., 60., 50.)),
+                            )
+                            .into_any_element()
+                    }
+                });
+                handle.set_offset(point(px(0.), px(-30.)));
+                redraw(&window, cx);
+
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(400.), px(60.)));
+                assert_eq!(visible_area(&window, cx), 50. * 50.);
+                assert_eq!(chain_at(&window, cx, 420., 70.), ["box", "scroller", "root"]);
+            }
+
+            #[gpui::test]
+            fn zeds_own_absolute_still_belongs_to_its_parent(cx: &mut TestAppContext) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            static_box("clip", 200., 100.).overflow_hidden().child(
+                                node("box", 10., 10., 150., 50.)
+                                    .debug_selector(|| "box".into())
+                                    .bg(red()),
+                            ),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(210.), px(210.)));
+                assert_eq!(visible_area(&window, cx), 90. * 50.);
+                assert_eq!(chain_at(&window, cx, 250., 230.), ["box", "clip", "root"]);
+                assert_eq!(chain_at(&window, cx, 350., 230.), ["root"]);
+            }
+
+            #[gpui::test]
+            fn an_escaping_leaf_paints_without_the_mask_of_a_static_ancestor(
+                cx: &mut TestAppContext,
+            ) {
+                let painted = Rc::new(RefCell::new(None));
+                open_scene(cx, true, {
+                    let painted = painted.clone();
+                    move || {
+                        let painted = painted.clone();
+                        let mut leaf = canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                *painted.borrow_mut() = Some((bounds, window.content_mask()));
+                            },
+                        )
+                        .w(px(50.))
+                        .h(px(50.));
+                        leaf.style().position = Some(Position::Fixed);
+                        leaf.style().inset.left = Some(px(10.).into());
+                        leaf.style().inset.top = Some(px(10.).into());
+                        root()
+                            .child(static_box("clip", 200., 100.).overflow_hidden().child(leaf))
+                            .into_any_element()
+                    }
+                });
+
+                let (bounds, mask) = painted.borrow().expect("the canvas was painted");
+                assert_eq!(bounds.origin, point(px(10.), px(10.)));
+                assert_eq!(mask.bounds, Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.))));
+            }
+
+            #[gpui::test]
+            fn an_anchored_popup_is_the_containing_block_of_an_escaped_box(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            anchored().position(point(px(300.), px(300.))).child(
+                                static_box("holder", 0., 20.)
+                                    .overflow_hidden()
+                                    .child(escaping("box", 5., 5., 50.)),
+                            ),
+                        )
+                        .into_any_element()
+                });
+
+                let origin = bounds_of(&window, cx, "box").origin;
+                assert_eq!(origin, point(px(305.), px(305.)));
+                assert_eq!(visible_area(&window, cx), 50. * 50.);
+                assert_eq!(chain_at(&window, cx, 320., 320.), ["box", "holder", "root"]);
+            }
+
+            #[gpui::test]
+            fn an_escaped_box_in_a_deferred_layer_keeps_its_containing_block(
+                cx: &mut TestAppContext,
+            ) {
+                let handle = ScrollHandle::new();
+                let window = open_scene(cx, true, {
+                    let handle = handle.clone();
+                    move || {
+                        root()
+                            .child(
+                                node("block", 100., 100., 200., 200.)
+                                    .overflow_y_scroll()
+                                    .track_scroll(&handle)
+                                    .child(tall())
+                                    .child(
+                                        static_box("clip", 50., 20.).overflow_hidden().child(
+                                            deferred(
+                                                static_box("layer", 0., 20.)
+                                                    .child(escaping("box", 10., 60., 300.)),
+                                            ),
+                                        ),
+                                    ),
+                            )
+                            .into_any_element()
+                    }
+                });
+                handle.set_offset(point(px(0.), px(-30.)));
+                redraw(&window, cx);
+
+                // Moved by the scroll offset of the block and clipped by its right edge.
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(110.), px(130.)));
+                assert_eq!(visible_area(&window, cx), 190. * 50.);
+                assert_eq!(chain_at(&window, cx, 200., 140.), ["box", "layer"]);
+                assert_eq!(chain_at(&window, cx, 350., 140.), ["root"]);
+            }
         }
     }
 

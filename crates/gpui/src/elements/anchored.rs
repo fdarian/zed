@@ -195,9 +195,11 @@ impl Element for Anchored {
             let offset = origin - bounds.origin;
             let offset = point(offset.x.round(), offset.y.round());
             window.with_element_offset(offset, |window| {
-                for child in &mut self.children {
-                    child.prepaint(window, cx);
-                }
+                window.with_positioned_frame(|window| {
+                    for child in &mut self.children {
+                        child.prepaint(window, cx);
+                    }
+                })
             });
             return;
         }
@@ -271,9 +273,11 @@ impl Element for Anchored {
         let offset = point(offset.x.round(), offset.y.round());
 
         window.with_element_offset(offset, |window| {
-            for child in &mut self.children {
-                child.prepaint(window, cx);
-            }
+            window.with_positioned_frame(|window| {
+                for child in &mut self.children {
+                    child.prepaint(window, cx);
+                }
+            })
         })
     }
 

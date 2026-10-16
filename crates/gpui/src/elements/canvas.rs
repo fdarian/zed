@@ -46,6 +46,10 @@ impl<T: 'static> Element for Canvas<T> {
         None
     }
 
+    fn escapes_to(&self) -> Option<crate::Escape> {
+        self.style.escape()
+    }
+
     fn request_layout(
         &mut self,
         _id: Option<&GlobalElementId>,

@@ -32,7 +32,7 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    A11yRelation, A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context,
+    A11yRelation, A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context, ContentMask,
     DispatchNodeId, ElementId, FocusHandle, InspectorElementId, IsZero, LayoutId, Pixels, Point,
     SharedString, Size, Style, Visibility, Window, util::FluentBuilder, window::with_element_arena,
 };
@@ -46,6 +46,17 @@ use std::{
     panic,
     sync::Arc,
 };
+
+/// Where an element that escapes the clip and scroll of its ancestors is drawn instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Escape {
+    /// Drawn with the content mask and element offset of the nearest positioned ancestor's
+    /// children: ancestors between the two neither clip nor scroll it. The window if there is no
+    /// positioned ancestor.
+    ContainingBlock,
+    /// Clipped by the window only, and scrolled by nothing.
+    Viewport,
+}
 
 /// Implemented by types that participate in laying out and painting the contents of a window.
 /// Elements form a tree and are laid out according to web-based layout rules, as implemented by Taffy.
@@ -97,6 +108,13 @@ pub trait Element: 'static + IntoElement {
     /// children and its own paint move with it. Called in prepaint with the laid-out bounds.
     fn prepaint_offset(&self, _layout_bounds: Bounds<Pixels>, _window: &Window) -> Point<Pixels> {
         Point::default()
+    }
+
+    /// Whether this element is drawn without the content mask and element offset it inherits, like
+    /// CSS `position: absolute` and `position: fixed`, which only the overflow and scroll of their
+    /// containing block apply to. The element's bounds, hitboxes and paint all follow it.
+    fn escapes_to(&self) -> Option<Escape> {
+        None
     }
 
     /// Once layout has been completed, this method will be called to paint the element to the screen.
@@ -304,6 +322,8 @@ trait ElementObject {
 
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId;
 
+    fn escapes_to(&self) -> Option<Escape>;
+
     fn prepaint(&mut self, window: &mut Window, cx: &mut App);
 
     fn paint(&mut self, window: &mut Window, cx: &mut App);
@@ -345,6 +365,8 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
         global_id: Option<GlobalElementId>,
         inspector_id: Option<InspectorElementId>,
         bounds: Bounds<Pixels>,
+        /// The content mask an escaping element paints with.
+        escaped_mask: Option<ContentMask<Pixels>>,
         request_layout: RequestLayoutState,
         prepaint: PrepaintState,
     },
@@ -427,6 +449,15 @@ impl<E: Element> Drawable<E> {
                     debug_assert_eq!(&*global_id.as_ref().unwrap().ids, &*window.element_id_stack);
                 }
 
+                let escaped = self
+                    .element
+                    .escapes_to()
+                    .map(|escape| window.escape_frame(escape));
+                if let Some((mask, offset)) = escaped {
+                    window.content_mask_stack.push(mask);
+                    window.element_offset_stack.push(offset);
+                }
+
                 let mut bounds = window.layout_bounds(layout_id);
                 let sticky_offset = self.element.prepaint_offset(bounds, window);
                 if !sticky_offset.is_zero() {
@@ -495,6 +526,10 @@ impl<E: Element> Drawable<E> {
                 if !sticky_offset.is_zero() {
                     window.element_offset_stack.pop();
                 }
+                if escaped.is_some() {
+                    window.content_mask_stack.pop();
+                    window.element_offset_stack.pop();
+                }
 
                 if pushed_a11y_node {
                     if let Some(global_id) = global_id.as_ref() {
@@ -531,6 +566,7 @@ impl<E: Element> Drawable<E> {
                     global_id,
                     inspector_id,
                     bounds,
+                    escaped_mask: escaped.map(|(mask, _)| mask),
                     request_layout,
                     prepaint,
                 };
@@ -550,6 +586,7 @@ impl<E: Element> Drawable<E> {
                 global_id,
                 inspector_id,
                 bounds,
+                escaped_mask,
                 mut request_layout,
                 mut prepaint,
                 ..
@@ -560,15 +597,22 @@ impl<E: Element> Drawable<E> {
                 }
 
                 window.next_frame.dispatch_tree.set_active_node(node_id);
-                self.element.paint(
-                    global_id.as_ref(),
-                    inspector_id.as_ref(),
-                    bounds,
-                    &mut request_layout,
-                    &mut prepaint,
-                    window,
-                    cx,
-                );
+                let element = &mut self.element;
+                let mut paint = |window: &mut Window| {
+                    element.paint(
+                        global_id.as_ref(),
+                        inspector_id.as_ref(),
+                        bounds,
+                        &mut request_layout,
+                        &mut prepaint,
+                        window,
+                        cx,
+                    )
+                };
+                match escaped_mask {
+                    Some(mask) => window.with_replaced_content_mask(mask, paint),
+                    None => paint(window),
+                }
 
                 if global_id.is_some() {
                     window.element_id_stack.pop();
@@ -658,6 +702,10 @@ where
         Drawable::paint(self, window, cx);
     }
 
+    fn escapes_to(&self) -> Option<Escape> {
+        self.element.escapes_to()
+    }
+
     #[inline]
     fn layout_as_root(
         &mut self,
@@ -686,6 +734,12 @@ impl AnyElement {
     /// Attempt to downcast a reference to the boxed element to a specific type.
     pub fn downcast_mut<T: 'static>(&mut self) -> Option<&mut T> {
         self.0.inner_element().downcast_mut::<T>()
+    }
+
+    /// What the element stored in this `AnyElement` escapes to. A wrapper that places something
+    /// by its child's bounds forwards this from [`Element::escapes_to`].
+    pub fn escapes_to(&self) -> Option<Escape> {
+        self.0.escapes_to()
     }
 
     /// Request the layout ID of the element stored in this `AnyElement`.
@@ -723,7 +777,9 @@ impl AnyElement {
         self.0.layout_as_root(available_space, window, cx)
     }
 
-    /// Prepaints this element at the given absolute origin.
+    /// Prepaints this element at the given absolute origin. The element is a layout root, so it is
+    /// the containing block of the absolutely positioned boxes that have no positioned ancestor
+    /// inside it.
     /// If any element in the subtree beneath this element is focused, its FocusHandle is returned.
     pub fn prepaint_at(
         &mut self,
@@ -731,7 +787,9 @@ impl AnyElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<FocusHandle> {
-        window.with_absolute_element_offset(origin, |window| self.prepaint(window, cx))
+        window.with_absolute_element_offset(origin, |window| {
+            window.with_positioned_frame(|window| self.prepaint(window, cx))
+        })
     }
 
     /// Performs layout on this element in the available space, then prepaints it at the given absolute origin.
@@ -744,7 +802,9 @@ impl AnyElement {
         cx: &mut App,
     ) -> Option<FocusHandle> {
         self.layout_as_root(available_space, window, cx);
-        window.with_absolute_element_offset(origin, |window| self.prepaint(window, cx))
+        window.with_absolute_element_offset(origin, |window| {
+            window.with_positioned_frame(|window| self.prepaint(window, cx))
+        })
     }
 }
 
