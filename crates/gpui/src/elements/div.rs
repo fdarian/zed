@@ -1627,7 +1627,8 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     }
 
     /// Runs when this element has prepainted its children, with its bounds, so an overlay can
-    /// insert hitboxes that sit above them (see [`Self::paint_overlay`]). Only [`Div`] runs it.
+    /// insert hitboxes that sit above them (see [`Self::paint_overlay`]). Only [`Div`] and
+    /// [`crate::List`] run it.
     fn prepaint_overlay(
         mut self,
         prepainter: impl FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static,
@@ -1639,7 +1640,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// Paint something over this element's children, inside its content mask. `painter`
     /// gets the element's bounds, which a scroll offset does not move, and takes no part
     /// in layout, so unlike a child it cannot extend what the element scrolls. Only
-    /// [`Div`] paints it.
+    /// [`Div`] and [`crate::List`] paint it.
     fn paint_overlay(
         mut self,
         painter: impl FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static,
@@ -6314,8 +6315,9 @@ mod tests {
     mod dom_hit_testing {
         use super::*;
         use crate::{
-            CursorStyle, Entity, MouseUpEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
-            TouchPhase, WindowHandle, anchored, canvas, deferred, size,
+            CursorStyle, Entity, HitboxBehavior, List, ListAlignment, ListState, MouseUpEvent,
+            ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement, TouchPhase, WindowHandle,
+            anchored, canvas, deferred, list, size,
         };
         use std::cell::Cell;
 
@@ -7179,7 +7181,7 @@ mod tests {
         use crate::{BackgroundBox, ClipPath, ClipShape, InsetRadii, LengthPercentage};
 
         /// Clips `element` to its right half, from `left` in.
-        fn clipped_from(mut element: Stateful<Div>, left: f32) -> Stateful<Div> {
+        fn clipped_from<E: Styled>(mut element: E, left: f32) -> E {
             let none = LengthPercentage::Length(px(0.));
             element.style().clip_path = Some(ClipPathValue::Shape(ClipPath {
                 shape: ClipShape::Inset {
@@ -7224,6 +7226,85 @@ mod tests {
             assert_eq!(chain_at(&window, cx, 20., 20.), ["under", "root"]);
             assert_eq!(chain_at(&window, cx, 70., 20.), ["kept", "clipped", "root"]);
             assert_eq!(chain_at(&window, cx, 130., 20.), ["under", "root"]);
+        }
+
+        fn rows() -> ListState {
+            ListState::new(3, ListAlignment::Top, px(0.))
+        }
+
+        /// A list at (0, 0), 100 x 100, with three 40px rows, clipped from x = 50.
+        fn clipped_list() -> Stateful<List> {
+            let list = list(rows(), |ix, _, _| {
+                div()
+                    .id(SharedString::from(format!("row-{ix}")))
+                    .h(px(40.))
+                    .w_full()
+                    .always_hitbox()
+                    .into_any_element()
+            })
+            .id("list");
+            clipped_from(list, 50.).absolute().left(px(0.)).top(px(0.)).w(px(100.)).h(px(100.))
+        }
+
+        #[gpui::test]
+        fn a_clip_path_cuts_the_hit_area_of_a_list_and_its_rows(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(clipped_list())
+                    .into_any_element()
+            });
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 70., 20.), ["row-0", "list", "root"]);
+            assert_eq!(chain_at(&window, cx, 150., 20.), ["under", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_list_overlay_is_cut_by_the_clip_path_of_the_list(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(clipped_list().prepaint_overlay(|bounds, window, _| {
+                        // A strip on each side of the clip edge, as a scrollbar's would be.
+                        for left in [0., 90.] {
+                            window.insert_hitbox(
+                                Bounds::new(
+                                    point(bounds.left() + px(left), bounds.top() + px(45.)),
+                                    size(px(10.), px(10.)),
+                                ),
+                                HitboxBehavior::BlockMouse,
+                            );
+                        }
+                    }))
+                    .into_any_element()
+            });
+            // Row 1 spans y 40..80. The strip over the cut half lets the pointer through.
+            assert_eq!(chain_at(&window, cx, 5., 50.), ["under", "root"]);
+            // The other is a hitbox of the list, ahead of the row under it.
+            assert_eq!(chain_at(&window, cx, 95., 50.), ["list", "list", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_list_misses_the_pointer_at_its_rounded_corners(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(
+                        list(ListState::new(0, ListAlignment::Top, px(0.)), |_, _, _| {
+                            div().into_any_element()
+                        })
+                        .id("list")
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(0.))
+                        .w(px(100.))
+                        .h(px(100.))
+                        .rounded(px(40.)),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(chain_at(&window, cx, 2., 2.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 50.), ["list", "root"]);
         }
 
         #[gpui::test]

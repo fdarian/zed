@@ -246,6 +246,7 @@ struct ItemLayout {
 /// Frame state used by the [List] element after layout.
 pub struct ListPrepaintState {
     hitbox: Hitbox,
+    style: Style,
     layout: LayoutItemsResponse,
 }
 
@@ -1631,13 +1632,20 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) -> ListPrepaintState {
-        let state = &mut *self.state.0.borrow_mut();
+        let mut state_guard = self.state.0.borrow_mut();
+        let state = &mut *state_guard;
         state.reset = false;
 
         let mut style = Style::default();
         style.refine(&self.style);
 
-        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let rem_size = window.rem_size();
+        let hitbox = window.insert_hitbox_shaped(
+            bounds,
+            HitboxBehavior::Normal,
+            style.border_box_radii(bounds, rem_size),
+            style.hit_clip_path(bounds, rem_size),
+        );
 
         let padding = style
             .padding
@@ -1679,7 +1687,16 @@ impl Element for List {
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
-        ListPrepaintState { hitbox, layout }
+        // The overlay reads the list state, which must not be borrowed meanwhile.
+        drop(state_guard);
+        if let Some(prepainter) = self.interactivity.overlay_prepainter.take() {
+            window.with_hitbox_parent(&hitbox, |window| prepainter(bounds, window, cx));
+        }
+        ListPrepaintState {
+            hitbox,
+            style,
+            layout,
+        }
     }
 
     fn paint(
@@ -1750,11 +1767,20 @@ impl Element for List {
             );
         });
 
-        window.with_content_mask(Some(ContentMask::from_bounds(bounds)), |window| {
-            for item in &mut prepaint.layout.item_layouts {
-                item.element.paint(window, cx);
-            }
-        });
+        let overlay_painter = self.interactivity.overlay_painter.take();
+        let layout = &mut prepaint.layout;
+        prepaint
+            .style
+            .paint_with_effects(bounds, window, cx, |window, cx| {
+                window.with_content_mask(Some(ContentMask::from_bounds(bounds)), |window| {
+                    for item in &mut layout.item_layouts {
+                        item.element.paint(window, cx);
+                    }
+                    if let Some(painter) = overlay_painter {
+                        painter(bounds, window, cx);
+                    }
+                });
+            });
     }
 }
 
