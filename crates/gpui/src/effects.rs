@@ -271,17 +271,31 @@ pub enum ShapeRadius {
     FarthestSide,
 }
 
-/// The radii of an `inset()` shape's `round` corners.
+/// The radii of an `inset()` shape's `round` corners, the two values of `round x / y`. The
+/// horizontal radii are a fraction of the reference box's width and the vertical ones of its
+/// height.
+///
+/// A vertical radius of zero stands for the horizontal one, so `InsetRadii` built from the
+/// horizontal radii alone is circular. A corner that is meant to be square sets its horizontal
+/// radius to zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct InsetRadii {
-    /// The top left corner.
+    /// The horizontal radius of the top left corner.
     pub top_left: LengthPercentage,
-    /// The top right corner.
+    /// The horizontal radius of the top right corner.
     pub top_right: LengthPercentage,
-    /// The bottom right corner.
+    /// The horizontal radius of the bottom right corner.
     pub bottom_right: LengthPercentage,
-    /// The bottom left corner.
+    /// The horizontal radius of the bottom left corner.
     pub bottom_left: LengthPercentage,
+    /// The vertical radius of the top left corner.
+    pub top_left_y: LengthPercentage,
+    /// The vertical radius of the top right corner.
+    pub top_right_y: LengthPercentage,
+    /// The vertical radius of the bottom right corner.
+    pub bottom_right_y: LengthPercentage,
+    /// The vertical radius of the bottom left corner.
+    pub bottom_left_y: LengthPercentage,
 }
 
 /// The shape of a `clip-path`.
@@ -297,7 +311,7 @@ pub enum ClipShape {
         bottom: LengthPercentage,
         /// Distance in from the left edge.
         left: LengthPercentage,
-        /// The `round` radii, circular. Percentages refer to the smaller side of the box.
+        /// The `round` radii.
         radii: InsetRadii,
     },
     /// `rect()` and `xywh()`: the same box as an inset, but every edge is a distance from the
@@ -312,7 +326,7 @@ pub enum ClipShape {
         bottom: LengthPercentage,
         /// Distance right from the left edge to the left edge of the shape.
         left: LengthPercentage,
-        /// The `round` radii, circular. Percentages refer to the smaller side of the box.
+        /// The `round` radii.
         radii: InsetRadii,
     },
     /// `circle(radius at position)`.
@@ -410,17 +424,22 @@ impl ClipPath {
         let bounds = reference.bounds;
         let (width, height) = (bounds.size.width, bounds.size.height);
         let to_device = |value: f32| value * scale_factor;
-        let smaller_side = width.min(height);
         let rounded_rect = |shape: Bounds<Pixels>, radii: &InsetRadii| {
-            let radius = |radius: &LengthPercentage| radius.resolve(smaller_side);
+            let horizontal = |radius: &LengthPercentage| radius.resolve(width);
+            let vertical = |radius: &LengthPercentage| radius.resolve(height);
             let corner_radii = CornerRadii::new(
                 Corners {
-                    top_left: radius(&radii.top_left),
-                    top_right: radius(&radii.top_right),
-                    bottom_right: radius(&radii.bottom_right),
-                    bottom_left: radius(&radii.bottom_left),
+                    top_left: horizontal(&radii.top_left),
+                    top_right: horizontal(&radii.top_right),
+                    bottom_right: horizontal(&radii.bottom_right),
+                    bottom_left: horizontal(&radii.bottom_left),
                 },
-                Corners::default(),
+                Corners {
+                    top_left: vertical(&radii.top_left_y),
+                    top_right: vertical(&radii.top_right_y),
+                    bottom_right: vertical(&radii.bottom_right_y),
+                    bottom_left: vertical(&radii.bottom_left_y),
+                },
                 shape.size,
             );
             ResolvedClipPath::RoundedRect {
@@ -865,6 +884,7 @@ mod tests {
                     top_right: LengthPercentage::Length(px(8.)),
                     bottom_right: LengthPercentage::Length(px(8.)),
                     bottom_left: LengthPercentage::Length(px(8.)),
+                    ..InsetRadii::default()
                 },
             },
             reference: BackgroundBox::BorderBox,
@@ -879,6 +899,104 @@ mod tests {
         assert_eq!(bounds.origin, point(ScaledPixels(40.), ScaledPixels(50.)));
         assert_eq!(bounds.size, size(ScaledPixels(160.), ScaledPixels(100.)));
         assert_eq!(corner_radii.x.top_left, ScaledPixels(16.));
+    }
+
+    fn inset_clip(top: f32, radii: InsetRadii) -> ClipPath {
+        let inset = LengthPercentage::Length(px(top));
+        ClipPath {
+            shape: ClipShape::Inset {
+                top: inset,
+                right: inset,
+                bottom: inset,
+                left: inset,
+                radii,
+            },
+            reference: BackgroundBox::BorderBox,
+        }
+    }
+
+    fn resolved_radii(clip: &ClipPath, scale_factor: f32) -> CornerRadii<ScaledPixels> {
+        let ResolvedClipPath::RoundedRect { corner_radii, .. } = clip.resolve(region(), scale_factor)
+        else {
+            panic!("inset is a rounded rect");
+        };
+        corner_radii
+    }
+
+    #[test]
+    fn inset_round_takes_a_horizontal_and_a_vertical_radius_per_corner() {
+        // `round 20% 10px 0 30px / 50% 0 0 10px` on a 100 x 60 box, at 2x. A vertical radius of zero
+        // stands for the horizontal one and a horizontal radius of zero makes the corner square.
+        let radii = resolved_radii(
+            &inset_clip(
+                0.,
+                InsetRadii {
+                    top_left: percent(0.2),
+                    top_right: LengthPercentage::Length(px(10.)),
+                    bottom_right: LengthPercentage::Length(px(0.)),
+                    bottom_left: LengthPercentage::Length(px(30.)),
+                    top_left_y: percent(0.5),
+                    top_right_y: LengthPercentage::Length(px(0.)),
+                    bottom_right_y: LengthPercentage::Length(px(0.)),
+                    bottom_left_y: LengthPercentage::Length(px(10.)),
+                },
+            ),
+            2.,
+        );
+        // Horizontal percentages are of the 100 wide box and vertical ones of the 60 high one.
+        assert_eq!(radii.x.top_left, ScaledPixels(40.));
+        assert_eq!(radii.y.top_left, ScaledPixels(60.));
+        assert_eq!(radii.x.top_right, ScaledPixels(20.));
+        assert_eq!(radii.y.top_right, ScaledPixels(20.));
+        assert_eq!(radii.x.bottom_right, ScaledPixels(0.));
+        assert_eq!(radii.y.bottom_right, ScaledPixels(0.));
+        assert_eq!(radii.x.bottom_left, ScaledPixels(60.));
+        assert_eq!(radii.y.bottom_left, ScaledPixels(20.));
+    }
+
+    #[test]
+    fn inset_round_fifty_percent_is_the_ellipse_of_the_box() {
+        let all = |value| InsetRadii {
+            top_left: value,
+            top_right: value,
+            bottom_right: value,
+            bottom_left: value,
+            top_left_y: value,
+            top_right_y: value,
+            bottom_right_y: value,
+            bottom_left_y: value,
+        };
+        let clip = inset_clip(0., all(percent(0.5)));
+        let radii = resolved_radii(&clip, 1.);
+        assert_eq!(radii.x.top_left, ScaledPixels(50.));
+        assert_eq!(radii.y.top_left, ScaledPixels(30.));
+        let resolved = clip.resolve(region(), 1.);
+        // The box is at (10, 20) and 100 x 60; its ellipse is about (60, 50).
+        assert!(resolved.contains(Point::new(60., 21.)));
+        assert!(resolved.contains(Point::new(11., 50.)));
+        assert!(!resolved.contains(Point::new(11., 21.)));
+        assert!(!resolved.contains(Point::new(109., 79.)));
+        // Near the arc, inside the ellipse.
+        assert!(resolved.contains(Point::new(60. - 35., 50. - 20.)));
+    }
+
+    #[test]
+    fn inset_round_radii_are_fitted_to_the_inset_shape() {
+        // The shape is 60 x 20 inside the 100 x 60 box, and radii of 50 x 30 do not fit it: the
+        // top side needs 60 / 100, the left side 20 / 60, so everything scales by a third.
+        let all = |x, y| InsetRadii {
+            top_left: x,
+            top_right: x,
+            bottom_right: x,
+            bottom_left: x,
+            top_left_y: y,
+            top_right_y: y,
+            bottom_right_y: y,
+            bottom_left_y: y,
+        };
+        let radii = resolved_radii(&inset_clip(20., all(percent(0.5), percent(0.5))), 1.);
+        assert!((radii.x.bottom_right.0 - 50. / 3.).abs() < 1e-4);
+        assert!((radii.y.bottom_right.0 - 10.).abs() < 1e-4);
     }
 
     fn rect_clip(
