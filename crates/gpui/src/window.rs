@@ -6388,12 +6388,49 @@ impl Window {
     /// Whether the focused input handler has marked text, which is what an input
     /// method composition leaves in it.
     pub fn is_composing(&mut self, cx: &mut App) -> bool {
+        let mut composing = false;
+        self.with_platform_input_handler(cx, |input_handler, window, cx| {
+            composing = input_handler.is_composing(window, cx)
+        });
+        composing
+    }
+
+    /// Calls the focused input handler as the platform's input method does while composing:
+    /// `input` replaces the marked text, or the selection when nothing is marked, and stays
+    /// marked. Returns whether there was an input handler to call.
+    pub fn dispatch_marked_text(&mut self, input: &str, cx: &mut App) -> bool {
+        self.with_platform_input_handler(cx, |input_handler, window, cx| {
+            input_handler.dispatch_marked_input(input, window, cx)
+        })
+    }
+
+    /// Ends the composition with `input` as the final text, as the input method does when the
+    /// user commits. Returns whether there was an input handler to call.
+    pub fn dispatch_composed_text(&mut self, input: &str, cx: &mut App) -> bool {
+        self.with_platform_input_handler(cx, |input_handler, window, cx| {
+            input_handler.dispatch_input(input, window, cx)
+        })
+    }
+
+    /// Ends the composition and keeps the marked text, as the input method does when it
+    /// commits without replacing anything. Returns whether there was an input handler to call.
+    pub fn dispatch_unmark_text(&mut self, cx: &mut App) -> bool {
+        self.with_platform_input_handler(cx, |input_handler, window, cx| {
+            input_handler.dispatch_unmark(window, cx)
+        })
+    }
+
+    fn with_platform_input_handler(
+        &mut self,
+        cx: &mut App,
+        f: impl FnOnce(&mut PlatformInputHandler, &mut Window, &mut App),
+    ) -> bool {
         let Some(mut input_handler) = self.platform_window.take_input_handler() else {
             return false;
         };
-        let composing = input_handler.is_composing(self, cx);
+        f(&mut input_handler, self, cx);
         self.platform_window.set_input_handler(input_handler);
-        composing
+        true
     }
 
     /// Return a key binding string for an action, to display in the UI. Uses the highest precedence

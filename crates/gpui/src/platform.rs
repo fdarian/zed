@@ -1637,6 +1637,15 @@ impl PlatformInputHandler {
         self.handler.marked_text_range(window, cx).is_some()
     }
 
+    pub fn dispatch_marked_input(&mut self, input: &str, window: &mut Window, cx: &mut App) {
+        self.handler
+            .replace_and_mark_text_in_range(None, input, None, window, cx);
+    }
+
+    pub fn dispatch_unmark(&mut self, window: &mut Window, cx: &mut App) {
+        self.handler.unmark_text(window, cx);
+    }
+
     pub fn compute_ime_candidate_bounds(
         marked_range: Option<Range<usize>>,
         selection: &UTF16Selection,

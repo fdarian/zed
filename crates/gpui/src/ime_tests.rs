@@ -217,3 +217,40 @@ fn an_ime_key_reaches_only_the_ime_observers(cx: &mut TestAppContext) {
     );
     assert_eq!(composer.read_with(cx, |composer, _| composer.text.clone()), "");
 }
+
+#[gpui::test]
+fn the_window_drives_the_focused_input_handler_like_an_input_method(cx: &mut TestAppContext) {
+    let (composer, cx) = focused_composer(cx);
+    let state = |cx: &mut crate::VisualTestContext| {
+        composer.read_with(cx, |composer, _| (composer.text.clone(), composer.marked.clone()))
+    };
+
+    cx.update(|window, cx| {
+        assert!(window.dispatch_marked_text("ka", cx));
+        assert!(window.is_composing(cx));
+    });
+    assert_eq!(state(cx), ("ka".to_string(), Some(0..2)));
+
+    cx.update(|window, cx| window.dispatch_marked_text("KA", cx));
+    assert_eq!(state(cx), ("KA".to_string(), Some(0..2)), "the marked text is replaced");
+
+    cx.update(|window, cx| window.dispatch_composed_text("Ka", cx));
+    assert_eq!(state(cx), ("Ka".to_string(), None));
+
+    cx.update(|window, cx| {
+        window.dispatch_marked_text("x", cx);
+        window.dispatch_unmark_text(cx);
+        assert!(!window.is_composing(cx));
+    });
+    assert_eq!(state(cx), ("Kax".to_string(), None), "unmarking keeps the text");
+}
+
+#[gpui::test]
+fn driving_a_window_without_an_input_handler_says_so(cx: &mut TestAppContext) {
+    let (_, cx) = cx.add_window_view(|_, _| crate::Empty);
+    cx.update(|window, cx| {
+        assert!(!window.dispatch_marked_text("a", cx));
+        assert!(!window.dispatch_composed_text("a", cx));
+        assert!(!window.dispatch_unmark_text(cx));
+    });
+}
