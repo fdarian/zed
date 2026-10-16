@@ -511,7 +511,7 @@ impl Element for Img {
                         .style
                         .object_fit
                         .get_bounds(bounds, data.size(layout_state.frame_index));
-                    let corner_radii = style.corner_radii.to_pixels(window.rem_size());
+                    let corner_radii = style.border_box_radii(bounds, window.rem_size());
                     window
                         .paint_image(
                             bounds,

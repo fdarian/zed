@@ -6,6 +6,7 @@ mod selection;
 
 use base64::Engine as _;
 
+use gpui::CornerRadius;
 use gpui::EdgesRefinement;
 use gpui::HitboxBehavior;
 use gpui::UnderlineStyle;
@@ -379,7 +380,7 @@ impl MarkdownStyle {
         };
         self.code_block.margin.top = Some(Length::Definite(px(16.).into()));
         self.code_block.margin.bottom = Some(Length::Definite(px(16.).into()));
-        let code_block_corner_radius = AbsoluteLength::Pixels(px(6.));
+        let code_block_corner_radius = CornerRadius::from(AbsoluteLength::Pixels(px(6.)));
         self.code_block.corner_radii.top_left = Some(code_block_corner_radius);
         self.code_block.corner_radii.top_right = Some(code_block_corner_radius);
         self.code_block.corner_radii.bottom_left = Some(code_block_corner_radius);

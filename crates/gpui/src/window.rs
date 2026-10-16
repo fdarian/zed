@@ -5,11 +5,11 @@ use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+    Action, Anchor, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Escape, Decorations, DevicePixels,
+    Capslock, Context, CornerRadii, Corners, CursorHideMode, CursorStyle, Escape, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragOperation, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
     Keystroke, KeystrokeEvent, LayoutId, LayoutInsets, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, OverlineStyle, Path, Pixels,
@@ -861,39 +861,45 @@ pub struct Hitbox {
     /// The radii of the rounded corners of `bounds`, already clamped to fit them. The pointer
     /// does not hit the hitbox in the rounded-away corners, and unlike a `clip-path` or an
     /// overflow clip this does not reach the hitboxes inside it.
-    pub corner_radii: Corners<Pixels>,
+    pub corner_radii: CornerRadii<Pixels>,
     identity: Option<GlobalElementId>,
     parent: Option<HitboxId>,
     clip: Option<Rc<ResolvedClipPath>>,
 }
 
-/// Whether `point` is inside `bounds` with its corners rounded by `radii`. The radii must already
-/// fit the bounds (see [`Corners::clamp_radii_for_quad_size`]).
+/// Whether `point` is inside `bounds` with its corners rounded by `radii`, each corner a quarter
+/// ellipse. The radii must already fit the bounds (see [`CornerRadii::new`]); a zero vertical
+/// radius is the same as the horizontal one.
 pub fn point_in_rounded_rect(
     point: Point<Pixels>,
     bounds: Bounds<Pixels>,
-    radii: Corners<Pixels>,
+    radii: CornerRadii<Pixels>,
 ) -> bool {
     if !bounds.contains(&point) {
         return false;
     }
     let center = bounds.center();
     // The corner the point is nearest to, and the direction from that corner towards the inside.
-    let (radius, corner, toward_x, toward_y) = match (point.x < center.x, point.y < center.y) {
-        (true, true) => (radii.top_left, bounds.origin, 1., 1.),
-        (false, true) => (radii.top_right, bounds.top_right(), -1., 1.),
-        (false, false) => (radii.bottom_right, bounds.bottom_right(), -1., -1.),
-        (true, false) => (radii.bottom_left, bounds.bottom_left(), 1., -1.),
+    let (anchor, toward_x, toward_y) = match (point.x < center.x, point.y < center.y) {
+        (true, true) => (Anchor::TopLeft, 1., 1.),
+        (false, true) => (Anchor::TopRight, -1., 1.),
+        (false, false) => (Anchor::BottomRight, -1., -1.),
+        (true, false) => (Anchor::BottomLeft, 1., -1.),
     };
-    // The semi-axes of the corner's ellipse; a circle until the radii get a vertical component.
-    let (radius_x, radius_y) = (radius.0, radius.0);
+    let corner = bounds.corner(anchor);
+    let radius_x = radii.x.corner(anchor).0;
+    let radius_y = radii.explicit_y().corner(anchor).0;
     if radius_x <= 0. || radius_y <= 0. {
         return true;
     }
-    let dx = (point.x.0 - corner.x.0) * toward_x - radius_x;
-    let dy = (point.y.0 - corner.y.0) * toward_y - radius_y;
+    let from_centre = Point::new(
+        radius_x - (point.x.0 - corner.x.0) * toward_x,
+        radius_y - (point.y.0 - corner.y.0) * toward_y,
+    );
     // Past the ellipse's centre on either axis the point is along a straight edge.
-    dx >= 0. || dy >= 0. || (dx / radius_x).powi(2) + (dy / radius_y).powi(2) <= 1.
+    from_centre.x <= 0.
+        || from_centre.y <= 0.
+        || ellipse_corner_sdf(from_centre, Size::new(radius_x, radius_y)) <= 0.
 }
 
 impl Hitbox {
@@ -2289,8 +2295,10 @@ pub struct DispatchEventResult {
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
-    /// The radii of the rounded corners of `bounds`. All zero for a plain rectangle.
+    /// The horizontal radii of the rounded corners of `bounds`. All zero for a plain rectangle.
     pub corner_radii: Corners<P>,
+    /// The vertical radii of the rounded corners; zero for the same as `corner_radii`.
+    pub corner_radii_y: Corners<P>,
 }
 
 impl ContentMask<Pixels> {
@@ -2299,6 +2307,24 @@ impl ContentMask<Pixels> {
         ContentMask {
             bounds,
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
+        }
+    }
+
+    /// A mask of `bounds` with its corners rounded by `radii`, which must already fit it.
+    pub fn rounded(bounds: Bounds<Pixels>, radii: CornerRadii<Pixels>) -> Self {
+        ContentMask {
+            bounds,
+            corner_radii: radii.x,
+            corner_radii_y: radii.y,
+        }
+    }
+
+    /// The radii of the rounded corners.
+    pub fn radii(&self) -> CornerRadii<Pixels> {
+        CornerRadii {
+            x: self.corner_radii,
+            y: self.corner_radii_y,
         }
     }
 
@@ -2307,6 +2333,7 @@ impl ContentMask<Pixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
             corner_radii: self.corner_radii.scale(factor),
+            corner_radii_y: self.corner_radii_y.scale(factor),
         }
     }
 
@@ -2315,38 +2342,51 @@ impl ContentMask<Pixels> {
         point_in_rounded_rect(
             *position,
             self.bounds,
-            self.corner_radii.clamp_radii_for_quad_size(self.bounds.size),
+            CornerRadii::new(self.corner_radii, self.corner_radii_y, self.bounds.size),
         )
     }
 
     /// Intersect the content mask with the given content mask.
     ///
-    /// The bounds are the rectangle intersection. A corner of the result keeps the radius of
-    /// whichever input has a corner at the same point (the larger one if both do), and is square
+    /// The bounds are the rectangle intersection. A corner of the result keeps the radii of
+    /// whichever input has a corner at the same point (the larger ones if both do), and is square
     /// otherwise. That is exact when masks are nested, the usual case, where a child's rounded
     /// corner lies inside its parent's. It is approximate when one mask's straight edge cuts
     /// through the other's rounded corner: the cut corner comes out square instead of keeping the
     /// arc's remaining part.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        let radius = |corner: fn(&Bounds<Pixels>) -> Point<Pixels>,
-                      radius: fn(&Corners<Pixels>) -> Pixels| {
-            let own = (corner(&self.bounds) == corner(&bounds)).then(|| radius(&self.corner_radii));
-            let theirs =
-                (corner(&other.bounds) == corner(&bounds)).then(|| radius(&other.corner_radii));
-            match (own, theirs) {
-                (Some(own), Some(theirs)) => own.max(theirs),
-                (Some(radius), None) | (None, Some(radius)) => radius,
-                (None, None) => Pixels::ZERO,
-            }
+        // The horizontal and vertical radius of a corner, `None` unless the mask has the corner
+        // where the result has it.
+        let radius = |mask: &Self, anchor: Anchor| {
+            (mask.bounds.corner(anchor) == bounds.corner(anchor)).then(|| {
+                let horizontal = mask.corner_radii.corner(anchor);
+                let vertical = mask.corner_radii_y.corner(anchor);
+                (horizontal, if vertical == Pixels::ZERO { horizontal } else { vertical })
+            })
         };
+        let merged = |anchor: Anchor| match (radius(self, anchor), radius(other, anchor)) {
+            (Some(own), Some(theirs)) => (own.0.max(theirs.0), own.1.max(theirs.1)),
+            (Some(radii), None) | (None, Some(radii)) => radii,
+            (None, None) => (Pixels::ZERO, Pixels::ZERO),
+        };
+        let top_left = merged(Anchor::TopLeft);
+        let top_right = merged(Anchor::TopRight);
+        let bottom_right = merged(Anchor::BottomRight);
+        let bottom_left = merged(Anchor::BottomLeft);
         ContentMask {
             bounds,
             corner_radii: Corners {
-                top_left: radius(|bounds| bounds.origin, |radii| radii.top_left),
-                top_right: radius(|bounds| bounds.top_right(), |radii| radii.top_right),
-                bottom_right: radius(|bounds| bounds.bottom_right(), |radii| radii.bottom_right),
-                bottom_left: radius(|bounds| bounds.bottom_left(), |radii| radii.bottom_left),
+                top_left: top_left.0,
+                top_right: top_right.0,
+                bottom_right: bottom_right.0,
+                bottom_left: bottom_left.0,
+            },
+            corner_radii_y: Corners {
+                top_left: top_left.1,
+                top_right: top_right.1,
+                bottom_right: bottom_right.1,
+                bottom_left: bottom_left.1,
             },
         }
     }
@@ -3345,6 +3385,7 @@ impl Window {
         ContentMask {
             bounds: self.cover_bounds(content_mask.bounds),
             corner_radii: content_mask.corner_radii.scale(self.scale_factor()),
+            corner_radii_y: content_mask.corner_radii_y.scale(self.scale_factor()),
         }
     }
 
@@ -5048,7 +5089,7 @@ impl Window {
     pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: CornerRadii<Pixels>,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
@@ -5068,10 +5109,12 @@ impl Window {
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: element_corner_radii.x,
+                corner_radii_y: element_corner_radii.y,
                 color: shadow.color.opacity(opacity),
                 element_bounds,
-                element_corner_radii,
+                element_corner_radii: element_corner_radii.x,
+                element_corner_radii_y: element_corner_radii.y,
                 inset: 0,
                 pad: 0,
             });
@@ -5086,7 +5129,7 @@ impl Window {
     pub fn paint_inset_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: CornerRadii<Pixels>,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
@@ -5102,23 +5145,19 @@ impl Window {
             }
             let hole = (bounds + shadow.offset).dilate(-shadow.spread_radius);
             // Clamp at zero so a large spread can't produce negative radii, which would
-            // break the SDF in the shader.
-            let zero = Pixels::ZERO;
-            let hole_corner_radii = Corners {
-                top_left: (corner_radii.top_left - shadow.spread_radius).max(zero),
-                top_right: (corner_radii.top_right - shadow.spread_radius).max(zero),
-                bottom_right: (corner_radii.bottom_right - shadow.spread_radius).max(zero),
-                bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
-            };
+            // break the SDF in the shader. A corner that reaches zero on one axis is square.
+            let hole_corner_radii = corner_radii.shrink(shadow.spread_radius).scale(scale_factor);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(hole),
                 content_mask,
-                corner_radii: hole_corner_radii.scale(scale_factor),
+                corner_radii: hole_corner_radii.x,
+                corner_radii_y: hole_corner_radii.y,
                 color: shadow.color.opacity(opacity),
                 element_bounds,
-                element_corner_radii,
+                element_corner_radii: element_corner_radii.x,
+                element_corner_radii_y: element_corner_radii.y,
                 inset: 1,
                 pad: 0,
             });
@@ -5126,13 +5165,20 @@ impl Window {
     }
 
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
-        let radii = &quad.corner_radii;
+        let horizontal = &quad.corner_radii;
+        let vertical = CornerRadii {
+            x: quad.corner_radii,
+            y: quad.corner_radii_y,
+        }
+        .explicit_y();
         let widths = &quad.border_widths;
+        // How far in from each edge a rounded corner reaches: the vertical radius from the top and
+        // bottom, the horizontal one from the left and right.
         let edge_radii = Edges {
-            top: radii.top_left.max(radii.top_right),
-            right: radii.top_right.max(radii.bottom_right),
-            bottom: radii.bottom_left.max(radii.bottom_right),
-            left: radii.top_left.max(radii.bottom_left),
+            top: vertical.top_left.max(vertical.top_right),
+            right: horizontal.top_right.max(horizontal.bottom_right),
+            bottom: vertical.bottom_left.max(vertical.bottom_right),
+            left: horizontal.top_left.max(horizontal.bottom_left),
         };
 
         let antialias_inset = point(ScaledPixels(1.0), ScaledPixels(1.0));
@@ -5180,7 +5226,8 @@ impl Window {
             background_tile: quad.background_tile.scale(self.scale_factor()),
             border_colors: borders.colors.map(|color| color.opacity(opacity)),
             border_inner_colors: borders.inner_colors.map(|color| color.opacity(opacity)),
-            corner_radii: quad.corner_radii.scale(self.scale_factor()),
+            corner_radii: quad.corner_radii.x.scale(self.scale_factor()),
+            corner_radii_y: quad.corner_radii.y.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_styles: borders.styles,
         }
@@ -5193,8 +5240,8 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     ///
     /// Note that the `quad.corner_radii` are allowed to exceed the bounds, creating sharp corners
-    /// where the circular arcs meet. This will not display well when combined with dashed borders.
-    /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
+    /// where the arcs meet. This will not display well when combined with dashed borders.
+    /// Use [`CornerRadii::new`] if the radii should fit within the bounds.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
 
@@ -5248,6 +5295,7 @@ impl Window {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
                         corner_radii: Corners::default(),
+                        corner_radii_y: Corners::default(),
                     },
                     ..quad
                 });
@@ -5524,6 +5572,7 @@ impl Window {
                 grayscale: false.into(),
                 bounds,
                 corner_radii: Default::default(),
+                corner_radii_y: Default::default(),
                 content_mask,
                 tile,
                 opacity,
@@ -5609,7 +5658,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<CornerRadii<Pixels>>,
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
@@ -5630,7 +5679,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<CornerRadii<Pixels>>,
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
@@ -5650,7 +5699,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: impl Into<CornerRadii<Pixels>>,
         data: Arc<RenderImage>,
         frame_index: usize,
         grayscale: bool,
@@ -5727,8 +5776,8 @@ impl Window {
         };
 
         let content_mask = self.snapped_content_mask();
-        let corner_radii = corner_radii
-            .clamp_radii_for_quad_size(visible_bounds.size)
+        let corner_radii = corner_radii.into();
+        let corner_radii = CornerRadii::new(corner_radii.x, corner_radii.y, visible_bounds.size)
             .scale(self.scale_factor());
         let opacity = self.element_opacity();
 
@@ -5738,7 +5787,8 @@ impl Window {
             grayscale: grayscale.into(),
             bounds: visible_bounds_snapped,
             content_mask,
-            corner_radii,
+            corner_radii: corner_radii.x,
+            corner_radii_y: corner_radii.y,
             tile: sub_tile,
             opacity,
         });
@@ -6065,7 +6115,7 @@ impl Window {
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
-        self.insert_hitbox_shaped(bounds, behavior, Corners::default(), None)
+        self.insert_hitbox_shaped(bounds, behavior, CornerRadii::default(), None)
     }
 
     /// Like [`Window::insert_hitbox`], for an element with rounded corners and a `clip-path`.
@@ -6080,7 +6130,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         behavior: HitboxBehavior,
-        corner_radii: Corners<Pixels>,
+        corner_radii: CornerRadii<Pixels>,
         clip: Option<ResolvedClipPath>,
     ) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
@@ -8488,7 +8538,7 @@ pub struct PaintQuad {
     /// The bounds of the quad within the window.
     pub bounds: Bounds<Pixels>,
     /// The radii of the quad's corners.
-    pub corner_radii: Corners<Pixels>,
+    pub corner_radii: CornerRadii<Pixels>,
     /// The background color of the quad.
     pub background: Background,
     /// The widths of the quad's borders.
@@ -8512,7 +8562,7 @@ impl PaintQuad {
     }
 
     /// Sets the corner radii of the quad.
-    pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
+    pub fn corner_radii(self, corner_radii: impl Into<CornerRadii<Pixels>>) -> Self {
         PaintQuad {
             corner_radii: corner_radii.into(),
             ..self
@@ -8571,7 +8621,7 @@ impl PaintQuad {
 /// Creates a quad with the given parameters.
 pub fn quad(
     bounds: Bounds<Pixels>,
-    corner_radii: impl Into<Corners<Pixels>>,
+    corner_radii: impl Into<CornerRadii<Pixels>>,
     background: impl Into<Background>,
     border_widths: impl Into<Edges<Pixels>>,
     border_color: impl Into<Hsla>,
@@ -8621,6 +8671,7 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use super::point_in_rounded_rect;
+    use crate::{ContentMask, CornerRadii, ScaledPixels};
     use std::{
         cell::{Cell, RefCell},
         path::PathBuf,
@@ -8630,7 +8681,7 @@ mod tests {
     use super::{Frame, Hitbox, HitboxId};
     use crate::util::FluentBuilder as _;
     use crate::{
-        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, ContentMask, Context, Corners,
+        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, Context, Corners,
         DispatchTree, DragMoveEvent, DragOperation, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
         FileDropEvent, FocusHandle, HitboxBehavior, InputEvent as _, InteractiveElement as _,
         IntoElement, Keymap, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, NativeKey, ParentElement, Pixels,
@@ -9787,7 +9838,7 @@ mod tests {
             frame.hitboxes.push(Hitbox {
                 id: HitboxId(entry.id),
                 bounds,
-                corner_radii: Corners::default(),
+                corner_radii: CornerRadii::default(),
                 content_mask: ContentMask::from_bounds(bounds),
                 behavior: if entry.pass_through {
                     HitboxBehavior::PassThrough
@@ -9967,6 +10018,44 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_box_with_elliptical_corners_paints_its_quad_and_shadows_with_both_radii(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{BoxShadow, CornerRadius, black, red};
+        let cx = cx.add_empty_window();
+        let drop = BoxShadow::new(px(0.), px(2.), black()).blur_radius(px(4.));
+        let inset = BoxShadow::new(px(0.), px(0.), black())
+            .blur_radius(px(2.))
+            .spread_radius(px(2.))
+            .inset();
+        let (shadows, quads, scale) = painted_box_shadows(cx, vec![drop, inset], |el| {
+            el.bg(red()).border(px(4.)).border_color(black()).rounded(CornerRadius {
+                x: px(20.).into(),
+                y: px(10.).into(),
+            })
+        });
+
+        assert_eq!(shadows.len(), 2);
+        let drop = shadows.iter().find(|shadow| shadow.inset == 0).unwrap();
+        let border_box = quads
+            .iter()
+            .find(|quad| quad.bounds == drop.element_bounds)
+            .expect("the border box is painted");
+        assert_eq!(border_box.corner_radii.top_left.0, 20. * scale);
+        assert_eq!(border_box.corner_radii_y.top_left.0, 10. * scale);
+        assert_eq!(drop.corner_radii, border_box.corner_radii);
+        assert_eq!(drop.corner_radii_y, border_box.corner_radii_y);
+        assert_eq!(drop.element_corner_radii_y, border_box.corner_radii_y);
+        // The padding box is inside the 4 wide border, and the hole of the inset shadow is 2 inside
+        // that, on each axis.
+        let inset = shadows.iter().find(|shadow| shadow.inset == 1).unwrap();
+        assert_eq!(inset.element_corner_radii.top_left.0, 16. * scale);
+        assert_eq!(inset.element_corner_radii_y.top_left.0, 6. * scale);
+        assert_eq!(inset.corner_radii.top_left.0, 14. * scale);
+        assert_eq!(inset.corner_radii_y.top_left.0, 4. * scale);
+    }
+
+    #[gpui::test]
     fn an_inset_shadow_is_kept_inside_the_padding_box(cx: &mut TestAppContext) {
         use crate::{BoxShadow, black, red};
         let cx = cx.add_empty_window();
@@ -10110,12 +10199,12 @@ mod tests {
     #[test]
     fn a_point_in_a_rounded_corner_is_outside_the_rounded_rect() {
         let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(60.)));
-        let radii = Corners {
+        let radii = CornerRadii::from(Corners {
             top_left: px(20.),
             top_right: px(10.),
             bottom_right: px(0.),
             bottom_left: px(30.),
-        };
+        });
         let inside = |x: f32, y: f32| point_in_rounded_rect(point(px(x), px(y)), bounds, radii);
 
         // Each corner's pixel next to the vertex is cut, unless the corner is square.
@@ -10139,7 +10228,7 @@ mod tests {
     fn a_rounded_rect_without_radii_is_its_bounds() {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(40.), px(40.)));
         let contains = |x: f32, y: f32| {
-            point_in_rounded_rect(point(px(x), px(y)), bounds, Corners::default())
+            point_in_rounded_rect(point(px(x), px(y)), bounds, CornerRadii::default())
         };
         assert!(contains(0., 0.));
         assert!(contains(39., 39.));
@@ -10149,7 +10238,7 @@ mod tests {
     #[test]
     fn a_fully_rounded_box_is_a_circle() {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(40.), px(40.)));
-        let radii = Corners::all(px(20.));
+        let radii = CornerRadii::all(px(20.));
         let contains = |x: f32, y: f32| point_in_rounded_rect(point(px(x), px(y)), bounds, radii);
         assert!(contains(20., 20.));
         assert!(contains(20., 0.5));
@@ -10157,5 +10246,106 @@ mod tests {
         assert!(contains(20. + 14., 20. + 14.));
         assert!(!contains(20. + 15., 20. + 15.));
         assert!(!contains(1., 1.));
+    }
+
+    /// A 100 x 60 box at (10, 20), whose corners are quarter ellipses of different shapes; the
+    /// bottom left one is square.
+    fn elliptical_box() -> (Bounds<Pixels>, CornerRadii<Pixels>) {
+        (
+            Bounds::new(point(px(10.), px(20.)), size(px(100.), px(60.))),
+            CornerRadii {
+                x: Corners {
+                    top_left: px(40.),
+                    top_right: px(20.),
+                    bottom_right: px(40.),
+                    bottom_left: px(0.),
+                },
+                y: Corners {
+                    top_left: px(20.),
+                    top_right: px(40.),
+                    bottom_right: px(10.),
+                    bottom_left: px(0.),
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn a_point_in_an_elliptical_corner_is_outside_the_rounded_rect() {
+        let (bounds, radii) = elliptical_box();
+        let inside = |x: f32, y: f32| point_in_rounded_rect(point(px(x), px(y)), bounds, radii);
+
+        // Top left, an ellipse of 40 x 20 about (50, 40). (30, 20.5) is inside the circle of
+        // radius 20 and outside the ellipse; (23, 27) is outside the circle of radius 40 and inside
+        // the ellipse.
+        assert!(!inside(11.5, 20.5));
+        assert!(!inside(16., 24.));
+        assert!(!inside(30., 20.5));
+        assert!(inside(23., 27.));
+        assert!(inside(50., 20.5), "straight edge past the arc's centre");
+        assert!(inside(10.5, 40.), "straight edge past the arc's centre");
+        // Top right, 20 x 40 about (90, 60).
+        assert!(!inside(108., 24.));
+        assert!(inside(100., 28.));
+        // Bottom right, 40 x 10 about (70, 70).
+        assert!(!inside(108., 78.));
+        assert!(inside(95., 76.));
+        // Bottom left is square.
+        assert!(inside(10.5, 79.5));
+    }
+
+    #[test]
+    fn a_zero_vertical_radius_hits_like_an_equal_one() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(40.), px(40.)));
+        let stood_for = CornerRadii::all(px(15.));
+        let explicit = CornerRadii {
+            x: stood_for.x,
+            y: stood_for.x,
+        };
+        for x in 0..40 {
+            for y in 0..40 {
+                let at = point(px(x as f32 + 0.5), px(y as f32 + 0.5));
+                assert_eq!(
+                    point_in_rounded_rect(at, bounds, stood_for),
+                    point_in_rounded_rect(at, bounds, explicit),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_content_mask_with_elliptical_corners_contains_the_points_inside_the_ellipses() {
+        let (bounds, radii) = elliptical_box();
+        let mask = ContentMask::rounded(bounds, radii);
+        assert!(mask.contains(&point(px(23.), px(27.))));
+        assert!(!mask.contains(&point(px(30.), px(20.5))));
+        assert!(!mask.contains(&point(px(108.), px(24.))));
+        assert!(mask.contains(&point(px(100.), px(28.))));
+        assert_eq!(mask.radii(), radii);
+        // Scaling keeps the proportions of the corners.
+        let scaled = mask.scale(2.);
+        assert_eq!(scaled.corner_radii.top_left, ScaledPixels(80.));
+        assert_eq!(scaled.corner_radii_y.top_left, ScaledPixels(40.));
+        assert_eq!(scaled.corner_radii_y.top_right, ScaledPixels(80.));
+    }
+
+    #[test]
+    fn a_content_mask_intersection_keeps_the_vertical_radius_of_a_corner() {
+        let (bounds, radii) = elliptical_box();
+        let mask = ContentMask::rounded(bounds, radii);
+        // A rectangle covering the whole box shares every corner with it.
+        let wide = ContentMask::rounded(
+            Bounds::new(point(px(0.), px(0.)), size(px(200.), px(200.))),
+            CornerRadii::default(),
+        );
+        assert_eq!(mask.intersect(&wide).radii(), radii);
+        // A zero vertical radius is the horizontal one, also when the other mask has the larger.
+        let circular = ContentMask::rounded(bounds, CornerRadii::from(Corners::all(px(10.))));
+        let merged = mask.intersect(&circular).radii();
+        assert_eq!(merged.x.top_left, px(40.));
+        assert_eq!(merged.y.top_left, px(20.));
+        assert_eq!(merged.y.top_right, px(40.));
+        assert_eq!(merged.x.bottom_left, px(10.));
+        assert_eq!(merged.y.bottom_left, px(10.));
     }
 }

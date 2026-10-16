@@ -6,8 +6,8 @@ use std::{
 
 use crate::{
     AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundLayer, BackgroundTag,
-    BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, Corners,
-    CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
+    BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, CornerRadii,
+    CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextDecorationStyle, TextLayoutOptions,
@@ -359,9 +359,10 @@ pub struct Style {
     #[refineable]
     pub border_styles: Edges<BorderStyle>,
 
-    /// The radius of the corners of this element
+    /// The radii of the corners of this element, horizontal and vertical. A length is circular
+    /// and a fraction is of the border box's width (horizontal) or height (vertical).
     #[refineable]
-    pub corner_radii: Corners<AbsoluteLength>,
+    pub corner_radii: Corners<CornerRadius>,
 
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
@@ -849,7 +850,7 @@ impl Style {
                             point(min.x, bounds.origin.y),
                             point(max.x, bounds.bottom_right().y),
                         ),
-                        Corners::default(),
+                        CornerRadii::default(),
                     ),
                     // x hidden, y visible
                     (false, true) => (
@@ -857,49 +858,16 @@ impl Style {
                             point(bounds.origin.x, min.y),
                             point(bounds.bottom_right().x, max.y),
                         ),
-                        Corners::default(),
+                        CornerRadii::default(),
                     ),
                     // both hidden
-                    (false, false) => {
-                        let outer_radii = self
-                            .corner_radii
-                            .to_pixels(rem_size)
-                            .clamp_radii_for_quad_size(bounds.size);
-                        let inner_radius = |radius: Pixels, horizontal: Pixels, vertical: Pixels| {
-                            (radius - horizontal.max(vertical)).max(Pixels::ZERO)
-                        };
-                        (
-                            Bounds::from_corners(min, max),
-                            Corners {
-                                top_left: inner_radius(
-                                    outer_radii.top_left,
-                                    border_widths.left,
-                                    border_widths.top,
-                                ),
-                                top_right: inner_radius(
-                                    outer_radii.top_right,
-                                    border_widths.right,
-                                    border_widths.top,
-                                ),
-                                bottom_right: inner_radius(
-                                    outer_radii.bottom_right,
-                                    border_widths.right,
-                                    border_widths.bottom,
-                                ),
-                                bottom_left: inner_radius(
-                                    outer_radii.bottom_left,
-                                    border_widths.left,
-                                    border_widths.bottom,
-                                ),
-                            },
-                        )
-                    }
+                    (false, false) => (
+                        Bounds::from_corners(min, max),
+                        self.border_box_radii(bounds, rem_size).inset(border_widths),
+                    ),
                 };
 
-                Some(ContentMask {
-                    bounds,
-                    corner_radii,
-                })
+                Some(ContentMask::rounded(bounds, corner_radii))
             }
         }
     }
@@ -1000,21 +968,39 @@ impl Style {
         Some(clip_path.resolve(boxes.region(clip_path.reference), 1.))
     }
 
-    /// The corner radii of the border box, clamped to fit it. Painting and hit testing use these.
+    /// The corner radii of the border box, resolved against its size and fitted to it (see
+    /// [`CornerRadii::new`]). Painting and hit testing use these.
     pub(crate) fn border_box_radii(
         &self,
         bounds: Bounds<Pixels>,
         rem_size: Pixels,
-    ) -> Corners<Pixels> {
-        self.corner_radii
-            .to_pixels(rem_size)
-            .clamp_radii_for_quad_size(bounds.size)
+    ) -> CornerRadii<Pixels> {
+        let radius = |corner: &CornerRadius| corner.to_pixels(bounds.size, rem_size);
+        let top_left = radius(&self.corner_radii.top_left);
+        let top_right = radius(&self.corner_radii.top_right);
+        let bottom_right = radius(&self.corner_radii.bottom_right);
+        let bottom_left = radius(&self.corner_radii.bottom_left);
+        CornerRadii::new(
+            Corners {
+                top_left: top_left.width,
+                top_right: top_right.width,
+                bottom_right: bottom_right.width,
+                bottom_left: bottom_left.width,
+            },
+            Corners {
+                top_left: top_left.height,
+                top_right: top_right.height,
+                bottom_right: bottom_right.height,
+                bottom_left: bottom_left.height,
+            },
+            bounds.size,
+        )
     }
 
     fn background_boxes(
         &self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: CornerRadii<Pixels>,
         rem_size: Pixels,
     ) -> BackgroundBoxes {
         BackgroundBoxes::new(
@@ -1138,15 +1124,7 @@ impl Style {
             // the line sits outside the element and follows its corners.
             let grow = outline.offset + outline.width;
             let outer = bounds.dilate(grow);
-            let grow_corner = |radius: Pixels| {
-                if radius > px(0.) { (radius + grow).max(px(0.)) } else { px(0.) }
-            };
-            let radii = Corners {
-                top_left: grow_corner(corner_radii.top_left),
-                top_right: grow_corner(corner_radii.top_right),
-                bottom_right: grow_corner(corner_radii.bottom_right),
-                bottom_left: grow_corner(corner_radii.bottom_left),
-            };
+            let radii = corner_radii.inset(Edges::all(-grow));
             let mut background = outline.color;
             background.a = 0.;
             window.paint_quad(quad(
@@ -1168,7 +1146,7 @@ impl Style {
     fn paint_background_color(
         &self,
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: CornerRadii<Pixels>,
         window: &mut Window,
     ) {
         let background_color = self.background.as_ref().and_then(Fill::color);
@@ -1881,10 +1859,7 @@ mod tests {
     use util_macros::perf;
 
     fn rounded_mask(bounds: Bounds<Pixels>, radius: f32) -> ContentMask<Pixels> {
-        ContentMask {
-            bounds,
-            corner_radii: Corners::all(px(radius)),
-        }
+        ContentMask::rounded(bounds, CornerRadii::all(px(radius)))
     }
 
     #[test]
@@ -1924,12 +1899,7 @@ mod tests {
             x: Overflow::Hidden,
             y: Overflow::Hidden,
         };
-        style.corner_radii = Corners {
-            top_left: AbsoluteLength::Pixels(px(10.)),
-            top_right: AbsoluteLength::Pixels(px(10.)),
-            bottom_right: AbsoluteLength::Pixels(px(10.)),
-            bottom_left: AbsoluteLength::Pixels(px(10.)),
-        };
+        style.corner_radii = CornerRadius::from(px(10.)).on_all_corners();
         style.border_widths = Edges {
             top: AbsoluteLength::Pixels(px(2.)),
             right: AbsoluteLength::Pixels(px(4.)),
@@ -1944,15 +1914,93 @@ mod tests {
             mask.bounds,
             Bounds::from_corners(point(px(11.), px(22.)), point(px(106.), px(70.)))
         );
+        // The horizontal radius shrinks by the left or right border and the vertical one by the top
+        // or bottom border.
         assert_eq!(
             mask.corner_radii,
             Corners {
-                top_left: px(8.),
+                top_left: px(9.),
                 top_right: px(6.),
                 bottom_right: px(6.),
                 bottom_left: px(9.),
             }
         );
+        assert_eq!(
+            mask.corner_radii_y,
+            Corners {
+                top_left: px(8.),
+                top_right: px(8.),
+                bottom_right: px(10.),
+                bottom_left: px(10.),
+            }
+        );
+    }
+
+    #[test]
+    fn overflow_mask_follows_the_inner_ellipse_of_the_border() {
+        let mut style = Style::default();
+        style.overflow = Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        };
+        style.corner_radii = CornerRadius {
+            x: px(20.).into(),
+            y: px(10.).into(),
+        }
+        .on_all_corners();
+        style.border_widths = Edges {
+            top: AbsoluteLength::Pixels(px(2.)),
+            right: AbsoluteLength::Pixels(px(2.)),
+            bottom: AbsoluteLength::Pixels(px(1.)),
+            left: AbsoluteLength::Pixels(px(4.)),
+        };
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(50.)));
+
+        let mask = style.overflow_mask(bounds, px(16.)).unwrap();
+
+        // The padding edge's radii are the outer ones less the border on each axis.
+        assert_eq!(mask.corner_radii.top_left, px(16.));
+        assert_eq!(mask.corner_radii_y.top_left, px(8.));
+        assert_eq!(mask.corner_radii.top_right, px(18.));
+        assert_eq!(mask.corner_radii_y.bottom_right, px(9.));
+        // That ellipse is about (20, 10): (5, 3) is cut away and (8, 5) is not.
+        assert!(!mask.contains(&point(px(5.), px(3.))));
+        assert!(mask.contains(&point(px(8.), px(5.))));
+        assert!(mask.contains(&point(px(50.), px(2.5))));
+    }
+
+    #[test]
+    fn border_box_radii_resolve_percentages_against_each_side() {
+        let mut style = Style::default();
+        style.corner_radii = CornerRadius::from(DefiniteLength::Fraction(0.5)).on_all_corners();
+        let bounds = Bounds::new(point(px(10.), px(10.)), size(px(200.), px(100.)));
+
+        let radii = style.border_box_radii(bounds, px(16.));
+
+        assert_eq!(radii.x, Corners::all(px(100.)));
+        assert_eq!(radii.y, Corners::all(px(50.)));
+    }
+
+    #[test]
+    fn border_box_radii_fit_the_box_the_way_css_does() {
+        let mut style = Style::default();
+        style.corner_radii = CornerRadius::from(px(9999.)).on_all_corners();
+        let radii = style.border_box_radii(
+            Bounds::new(point(px(0.), px(0.)), size(px(100.), px(40.))),
+            px(16.),
+        );
+        assert_eq!(radii.x, Corners::all(px(20.)));
+        assert_eq!(radii.y, Corners::all(px(20.)));
+
+        // One corner alone is only limited by the sides it touches.
+        let mut style = Style::default();
+        style.corner_radii.top_left = CornerRadius::from(px(30.));
+        let radii = style.border_box_radii(
+            Bounds::new(point(px(0.), px(0.)), size(px(100.), px(40.))),
+            px(16.),
+        );
+        assert_eq!(radii.x.top_left, px(30.));
+        assert_eq!(radii.y.top_left, px(30.));
     }
 
     #[test]
@@ -1962,12 +2010,7 @@ mod tests {
             x: Overflow::Visible,
             y: Overflow::Hidden,
         };
-        style.corner_radii = Corners {
-            top_left: AbsoluteLength::Pixels(px(10.)),
-            top_right: AbsoluteLength::Pixels(px(10.)),
-            bottom_right: AbsoluteLength::Pixels(px(10.)),
-            bottom_left: AbsoluteLength::Pixels(px(10.)),
-        };
+        style.corner_radii = CornerRadius::from(px(10.)).on_all_corners();
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(50.)));
 
         let mask = style.overflow_mask(bounds, px(16.)).unwrap();

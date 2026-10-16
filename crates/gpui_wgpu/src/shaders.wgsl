@@ -119,9 +119,11 @@ struct Edges {
 }
 
 // A rectangle whose corners may be rounded. Fragments outside it are not drawn.
+// `corner_radii_y` is the vertical radius of each corner; zero stands for the horizontal one.
 struct ContentMask {
     bounds: Bounds,
     corner_radii: Corners,
+    corner_radii_y: Corners,
 }
 
 struct Hsla {
@@ -730,6 +732,8 @@ struct Quad {
     border_colors: EdgesHsla,
     border_inner_colors: EdgesHsla,
     corner_radii: Corners,
+    // The vertical radius of each corner; zero stands for the horizontal one.
+    corner_radii_y: Corners,
     border_widths: Edges,
     background_tile: BackgroundTile,
 }
@@ -1267,12 +1271,14 @@ struct Shadow {
     // The shadow rect for drop shadows; the "hole" rect for inset shadows.
     bounds: Bounds,
     corner_radii: Corners,
+    corner_radii_y: Corners,
     content_mask: ContentMask,
     color: Hsla,
     // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
     // clip so the shadow never escapes the element.
     element_bounds: Bounds,
     element_corner_radii: Corners,
+    element_corner_radii_y: Corners,
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
     pad: u32, // align to 8 bytes
@@ -1604,6 +1610,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let content_mask = ContentMask(
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
         Corners(input.mask_corner_radii.x, input.mask_corner_radii.y, input.mask_corner_radii.z, input.mask_corner_radii.w),
+        Corners(0.0, 0.0, 0.0, 0.0),
     );
     return blend_color(input.color, alpha_corrected * content_mask_coverage(input.position.xy, content_mask));
 }
@@ -1618,6 +1625,7 @@ struct PolychromeSprite {
     bounds: Bounds,
     content_mask: ContentMask,
     corner_radii: Corners,
+    corner_radii_y: Corners,
     tile: AtlasTile,
 }
 

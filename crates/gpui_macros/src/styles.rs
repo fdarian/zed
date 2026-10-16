@@ -640,7 +640,7 @@ fn generate_methods() -> Vec<TokenStream2> {
         methods.push(generate_custom_value_setter(
             visibility.clone(),
             corner_style_prefix.prefix,
-            quote! { AbsoluteLength },
+            quote! { CornerRadius },
             &corner_style_prefix.fields,
             corner_style_prefix.doc_string_prefix,
         ));

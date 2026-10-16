@@ -5,8 +5,8 @@
 //! ones are what travels in the [`Scene`](crate::Scene), in device pixels.
 
 use crate::{
-    BackgroundBox, BackgroundPosition, BoxRegion, Bounds, Corners, Edges, Hsla, LengthPercentage,
-    Pixels, Point, Quad, ScaledPixels, Size, point, size,
+    Anchor, BackgroundBox, BackgroundPosition, BoxRegion, Bounds, CornerRadii, Corners, Edges, Hsla, LengthPercentage,
+    Pixels, Point, Quad, ScaledPixels, Size, ellipse_corner_sdf, point, size,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -381,12 +381,12 @@ impl From<Option<ClipPath>> for ClipPathValue {
 /// A clip path in device pixels.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResolvedClipPath {
-    /// A rectangle with circular corners.
+    /// A rectangle with rounded corners.
     RoundedRect {
         /// The rectangle.
         bounds: Bounds<ScaledPixels>,
         /// Its corner radii.
-        corner_radii: Corners<ScaledPixels>,
+        corner_radii: CornerRadii<ScaledPixels>,
     },
     /// An axis-aligned ellipse.
     Ellipse {
@@ -413,13 +413,16 @@ impl ClipPath {
         let smaller_side = width.min(height);
         let rounded_rect = |shape: Bounds<Pixels>, radii: &InsetRadii| {
             let radius = |radius: &LengthPercentage| radius.resolve(smaller_side);
-            let corner_radii = Corners {
-                top_left: radius(&radii.top_left),
-                top_right: radius(&radii.top_right),
-                bottom_right: radius(&radii.bottom_right),
-                bottom_left: radius(&radii.bottom_left),
-            }
-            .clamp_radii_for_quad_size(shape.size);
+            let corner_radii = CornerRadii::new(
+                Corners {
+                    top_left: radius(&radii.top_left),
+                    top_right: radius(&radii.top_right),
+                    bottom_right: radius(&radii.bottom_right),
+                    bottom_left: radius(&radii.bottom_left),
+                },
+                Corners::default(),
+                shape.size,
+            );
             ResolvedClipPath::RoundedRect {
                 bounds: shape.scale(scale_factor),
                 corner_radii: corner_radii.scale(scale_factor),
@@ -589,22 +592,32 @@ impl ResolvedClipPath {
                     position.x - (bounds.origin.x.0 + half.x),
                     position.y - (bounds.origin.y.0 + half.y),
                 );
-                let radius = match (from_center.x < 0., from_center.y < 0.) {
-                    (true, true) => corner_radii.top_left,
-                    (false, true) => corner_radii.top_right,
-                    (false, false) => corner_radii.bottom_right,
-                    (true, false) => corner_radii.bottom_left,
-                }
-                .0;
+                let anchor = match (from_center.x < 0., from_center.y < 0.) {
+                    (true, true) => Anchor::TopLeft,
+                    (false, true) => Anchor::TopRight,
+                    (false, false) => Anchor::BottomRight,
+                    (true, false) => Anchor::BottomLeft,
+                };
+                let radius_x = corner_radii.x.corner(anchor).0;
+                let radius_y = corner_radii.explicit_y().corner(anchor).0;
                 let corner_to_point = Point::new(
-                    from_center.x.abs() - half.x + radius,
-                    from_center.y.abs() - half.y + radius,
+                    from_center.x.abs() - half.x,
+                    from_center.y.abs() - half.y,
                 );
-                let outside = Point::new(corner_to_point.x.max(0.), corner_to_point.y.max(0.));
-                let distance = outside.x.hypot(outside.y)
-                    + corner_to_point.x.max(corner_to_point.y).min(0.)
-                    - radius;
-                distance <= 0.
+                if corner_to_point.x > 0. || corner_to_point.y > 0. {
+                    return false;
+                }
+                // The corner arc is a quarter ellipse about the point `(radius_x, radius_y)` in from
+                // the corner; beyond that point on either axis the edge is straight.
+                let from_arc_centre = Point::new(
+                    corner_to_point.x + radius_x,
+                    corner_to_point.y + radius_y,
+                );
+                radius_x <= 0.
+                    || radius_y <= 0.
+                    || from_arc_centre.x <= 0.
+                    || from_arc_centre.y <= 0.
+                    || ellipse_corner_sdf(from_arc_centre, Size::new(radius_x, radius_y)) <= 0.
             }
             ResolvedClipPath::Ellipse { center, radii } => {
                 if radii.width <= 0. || radii.height <= 0. {
@@ -667,7 +680,7 @@ pub struct GroupEffect {
     /// The element's border box, which the backdrop is clipped to.
     pub reference: Bounds<ScaledPixels>,
     /// The border box's corner radii.
-    pub reference_radii: Corners<ScaledPixels>,
+    pub reference_radii: CornerRadii<ScaledPixels>,
     /// Multiply the group by the alpha of the glyphs painted after it, as `background-clip: text`.
     pub text_mask: bool,
 }
@@ -681,7 +694,7 @@ impl Default for GroupEffect {
             mask: None,
             clip_path: None,
             reference: Bounds::default(),
-            reference_radii: Corners::default(),
+            reference_radii: CornerRadii::default(),
             text_mask: false,
         }
     }
@@ -831,7 +844,7 @@ mod tests {
     fn region() -> BoxRegion {
         BoxRegion {
             bounds: Bounds::new(point(px(10.), px(20.)), size(px(100.), px(60.))),
-            corner_radii: Corners::default(),
+            corner_radii: CornerRadii::default(),
         }
     }
 
@@ -865,7 +878,7 @@ mod tests {
         };
         assert_eq!(bounds.origin, point(ScaledPixels(40.), ScaledPixels(50.)));
         assert_eq!(bounds.size, size(ScaledPixels(160.), ScaledPixels(100.)));
-        assert_eq!(corner_radii.top_left, ScaledPixels(16.));
+        assert_eq!(corner_radii.x.top_left, ScaledPixels(16.));
     }
 
     fn rect_clip(
@@ -1007,7 +1020,7 @@ mod tests {
                 point(ScaledPixels(0.), ScaledPixels(0.)),
                 size(ScaledPixels(20.), ScaledPixels(20.)),
             ),
-            corner_radii: Corners::all(ScaledPixels(10.)),
+            corner_radii: CornerRadii::from(Corners::all(ScaledPixels(10.))),
         };
         assert!(clip.contains(Point::new(10., 10.)));
         assert!(!clip.contains(Point::new(1., 1.)));

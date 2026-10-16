@@ -83,6 +83,7 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct PodContentMask {
     bounds: PodBounds,
     corner_radii: [f32; 4],
+    corner_radii_y: [f32; 4],
 }
 
 impl From<ContentMask<ScaledPixels>> for PodContentMask {
@@ -94,6 +95,12 @@ impl From<ContentMask<ScaledPixels>> for PodContentMask {
                 content_mask.corner_radii.top_right.0,
                 content_mask.corner_radii.bottom_right.0,
                 content_mask.corner_radii.bottom_left.0,
+            ],
+            corner_radii_y: [
+                content_mask.corner_radii_y.top_left.0,
+                content_mask.corner_radii_y.top_right.0,
+                content_mask.corner_radii_y.bottom_right.0,
+                content_mask.corner_radii_y.bottom_left.0,
             ],
         }
     }
@@ -2327,14 +2334,14 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 105 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 56 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 113 * 4);
+        assert_eq!(std::mem::size_of::<Shadow>(), 44 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 60 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 22 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
+        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 36 * 4);
+        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 36 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 36 * 4);
     }
 
     // gpui-ce samples an RGBA wgpu texture, not YCbCr video planes.

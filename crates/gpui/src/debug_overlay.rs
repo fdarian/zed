@@ -138,6 +138,7 @@ impl DebugFrameOverlay {
 
         let content_mask = ContentMask {
             corner_radii: Default::default(),
+            corner_radii_y: Default::default(),
             bounds: Bounds {
                 origin: point(ScaledPixels(0.), ScaledPixels(0.)),
                 size: viewport,
@@ -253,6 +254,7 @@ fn solid_quad(
         border_colors: Edges::all(transparent_black()),
         border_inner_colors: Edges::all(transparent_black()),
         corner_radii: Corners::default(),
+        corner_radii_y: Corners::default(),
         border_widths: Edges::default(),
         background_tile: Default::default(),
     }

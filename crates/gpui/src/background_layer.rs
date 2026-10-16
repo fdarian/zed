@@ -5,7 +5,7 @@
 //! [`Style::paint`](crate::Style::paint) paints them.
 
 use crate::{
-    Background, BackgroundTag, Bounds, ColorSpace, Corners, Edges, GradientGeometry, GradientKind,
+    Background, BackgroundTag, Bounds, ColorSpace, CornerRadii, Edges, GradientGeometry, GradientKind,
     GradientParams, Hsla, LinearColorStop, Pixels, Point, Rgba, Size, point, px, size,
     solid_background,
 };
@@ -379,7 +379,7 @@ pub struct BoxRegion {
     /// The box.
     pub bounds: Bounds<Pixels>,
     /// Its corner radii.
-    pub corner_radii: Corners<Pixels>,
+    pub corner_radii: CornerRadii<Pixels>,
 }
 
 /// The three boxes of an element that backgrounds refer to.
@@ -394,11 +394,12 @@ pub struct BackgroundBoxes {
 }
 
 impl BackgroundBoxes {
-    /// Derives the padding and content boxes. A corner's radius shrinks by the larger of the two
-    /// widths that meet there, never below zero.
+    /// Derives the padding and content boxes. A corner's horizontal radius shrinks by the width of
+    /// the vertical side it meets and its vertical radius by the horizontal side's, and the corner is
+    /// square once either reaches zero (see [`CornerRadii::inset`]).
     pub fn new(
         bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
+        corner_radii: CornerRadii<Pixels>,
         border_widths: Edges<Pixels>,
         padding: Edges<Pixels>,
     ) -> Self {
@@ -423,17 +424,9 @@ impl BackgroundBoxes {
             origin,
             point(bottom_right.x.max(origin.x), bottom_right.y.max(origin.y)),
         );
-        let shrink = |radius: Pixels, horizontal: Pixels, vertical: Pixels| {
-            (radius - horizontal.max(vertical)).max(Pixels::ZERO)
-        };
         BoxRegion {
             bounds,
-            corner_radii: Corners {
-                top_left: shrink(outer.corner_radii.top_left, widths.left, widths.top),
-                top_right: shrink(outer.corner_radii.top_right, widths.right, widths.top),
-                bottom_right: shrink(outer.corner_radii.bottom_right, widths.right, widths.bottom),
-                bottom_left: shrink(outer.corner_radii.bottom_left, widths.left, widths.bottom),
-            },
+            corner_radii: outer.corner_radii.inset(widths),
         }
     }
 
@@ -489,7 +482,7 @@ pub struct ResolvedBackgroundLayer {
     /// The clip box.
     pub bounds: Bounds<Pixels>,
     /// The clip box's corner radii.
-    pub corner_radii: Corners<Pixels>,
+    pub corner_radii: CornerRadii<Pixels>,
     /// The image placement.
     pub tile: BackgroundTile,
     /// The gradient, split so each chunk needs at most four stops.
@@ -1561,12 +1554,7 @@ mod tests {
     fn boxes(width: f32, height: f32) -> BackgroundBoxes {
         BackgroundBoxes::new(
             Bounds::new(point(px(10.), px(20.)), size(px(width), px(height))),
-            Corners {
-                top_left: px(8.),
-                top_right: px(8.),
-                bottom_right: px(8.),
-                bottom_left: px(8.),
-            },
+            CornerRadii::all(px(8.)),
             Edges {
                 top: px(2.),
                 right: px(2.),
@@ -1596,12 +1584,12 @@ mod tests {
             boxes.padding.bounds,
             Bounds::new(point(px(12.), px(22.)), size(px(96.), px(56.)))
         );
-        assert_eq!(boxes.padding.corner_radii.top_left, px(6.));
+        assert_eq!(boxes.padding.corner_radii.x.top_left, px(6.));
         assert_eq!(
             boxes.content.bounds,
             Bounds::new(point(px(17.), px(27.)), size(px(86.), px(46.)))
         );
-        assert_eq!(boxes.content.corner_radii.top_left, px(1.));
+        assert_eq!(boxes.content.corner_radii.x.top_left, px(1.));
     }
 
     #[test]

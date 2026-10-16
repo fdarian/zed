@@ -523,6 +523,7 @@ impl StickyHeaderLine {
         window.with_content_mask(
             Some(ContentMask {
                 corner_radii: Default::default(),
+                corner_radii_y: Default::default(),
                 bounds: Bounds::new(
                     layout.position_map.text_hitbox.bounds.origin
                         + point(Pixels::ZERO, self.offset),

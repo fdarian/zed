@@ -213,6 +213,7 @@ mod tests {
                 ),
                 content_mask: ContentMask {
                     corner_radii: Default::default(),
+                    corner_radii_y: Default::default(),
                     bounds: bounds(
                         point(ScaledPixels(0.), ScaledPixels(0.)),
                         size(ScaledPixels(64.), ScaledPixels(64.)),

@@ -5546,6 +5546,7 @@ impl EditorElement {
         window.with_content_mask(
             Some(ContentMask {
                 corner_radii: Default::default(),
+                corner_radii_y: Default::default(),
                 bounds: layout.position_map.text_hitbox.bounds,
             }),
             |window| {
@@ -9545,6 +9546,7 @@ impl Element for EditorElement {
                         .and_then(|h| h.lines.last())
                         .map(|last| ContentMask {
                             corner_radii: Default::default(),
+                            corner_radii_y: Default::default(),
                             bounds: Bounds {
                                 origin: point(
                                     bounds.origin.x,
@@ -10827,6 +10829,7 @@ mod tests {
             bounds: zero_bounds,
             content_mask: ContentMask {
                 corner_radii: Default::default(),
+                corner_radii_y: Default::default(),
                 bounds: zero_bounds,
             },
             behavior: HitboxBehavior::Normal,

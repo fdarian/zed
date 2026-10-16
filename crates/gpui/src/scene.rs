@@ -466,6 +466,7 @@ impl Scene {
                 quad.content_mask = ContentMask {
                     bounds: local,
                     corner_radii: Corners::default(),
+                    corner_radii_y: Corners::default(),
                 };
             }
         }
@@ -1183,6 +1184,8 @@ pub struct Quad {
     /// is the outer half. Equal to `border_colors` for every other style.
     pub border_inner_colors: Edges<Hsla>,
     pub corner_radii: Corners<ScaledPixels>,
+    /// The vertical radii of the corners; zero for the same as `corner_radii`.
+    pub corner_radii_y: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
     pub background_tile: BackgroundTile,
 }
@@ -1225,10 +1228,14 @@ pub struct Shadow {
     pub blur_radius: ScaledPixels,
     pub bounds: Bounds<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    /// The vertical radii of the corners; zero for the same as `corner_radii`.
+    pub corner_radii_y: Corners<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub element_bounds: Bounds<ScaledPixels>,
     pub element_corner_radii: Corners<ScaledPixels>,
+    /// The vertical radii of the element's corners; zero for the same as `element_corner_radii`.
+    pub element_corner_radii_y: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
@@ -1419,6 +1426,8 @@ pub struct PolychromeSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    /// The vertical radii of the corners; zero for the same as `corner_radii`.
+    pub corner_radii_y: Corners<ScaledPixels>,
     pub tile: AtlasTile,
 }
 
@@ -1654,6 +1663,7 @@ mod tests {
         ContentMask {
             bounds: bounds(0., 0., WINDOW, WINDOW),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
         }
     }
 
@@ -2003,6 +2013,7 @@ mod tests {
         let wide = ContentMask {
             bounds: bounds(0., 0., 1.0e6, 1.0e6),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
         };
         let mut huge = quad(0., 0., 1.0e6, 1.0e6);
         huge.content_mask = wide;

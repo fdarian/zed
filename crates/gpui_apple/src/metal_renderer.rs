@@ -1659,7 +1659,7 @@ impl MetalRenderer {
         source_size: [f32; 2],
         mask_a_size: Option<[f32; 2]>,
         mask_b_size: Option<[f32; 2]>,
-        reference: Option<(Bounds<ScaledPixels>, gpui::Corners<ScaledPixels>)>,
+        reference: Option<(Bounds<ScaledPixels>, gpui::CornerRadii<ScaledPixels>)>,
     ) -> (CompositeParams, Option<Vec<[f32; 2]>>) {
         let effect = &group.effect;
         let origin = group.bounds.origin;
@@ -1690,7 +1690,7 @@ impl MetalRenderer {
         }
         if let Some((bounds, radii)) = reference {
             params.reference = rect_array(&bounds);
-            params.reference_radii = radii_array(&radii);
+            params.reference_radii = radii_array(&radii.x);
         }
 
         let mut polygon = None;
@@ -1702,7 +1702,7 @@ impl MetalRenderer {
             }) => {
                 params.group[2] = 1.;
                 params.clip_a = rect_array(bounds);
-                params.clip_radii = radii_array(corner_radii);
+                params.clip_radii = radii_array(&corner_radii.x);
             }
             Some(ResolvedClipPath::Ellipse { center, radii }) => {
                 params.group[2] = 2.;
@@ -2919,7 +2919,7 @@ mod tests {
     use gpui::{
         Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundLayer,
         BackgroundPosition, BackgroundRepeat, BackgroundSize, Bounds, ColorSpace, ContentMask,
-        Corners, DevicePixels, Edges, Gradient, GradientItem, GradientShape, GradientStop, GroupEffect, Hsla,
+        CornerRadii, Corners, DevicePixels, Edges, Gradient, GradientItem, GradientShape, GradientStop, GroupEffect, Hsla,
         LengthPercentage, LinearDirection, PlatformHeadlessRenderer, Quad, RadialShape,
         RadialSize, RepeatStyle, ScaledPixels, Scene, StopPosition, point, px, size,
     };
@@ -2950,6 +2950,7 @@ mod tests {
             content_mask: ContentMask {
                 bounds: full_bounds(),
                 corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
             },
             background: background.into(),
             border_colors,
@@ -3052,7 +3053,7 @@ mod tests {
     /// Paints the layer into the whole 40x40 target, one quad per chunk.
     fn render_layer(layer: &BackgroundLayer) -> image::RgbaImage {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
-        let boxes = BackgroundBoxes::new(bounds, Corners::default(), Edges::default(), Edges::default());
+        let boxes = BackgroundBoxes::new(bounds, CornerRadii::default(), Edges::default(), Edges::default());
         let resolved = layer.resolve(&boxes).expect("layer has something to paint");
         let mut scene = Scene::default();
         for chunk in resolved.chunks {
@@ -3236,12 +3237,7 @@ mod tests {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
         let boxes = BackgroundBoxes::new(
             bounds,
-            Corners {
-                top_left: px(16.),
-                top_right: px(16.),
-                bottom_right: px(16.),
-                bottom_left: px(16.),
-            },
+            CornerRadii::all(px(16.)),
             Edges::default(),
             Edges::default(),
         );
@@ -3297,7 +3293,7 @@ mod tests {
     #[test]
     fn dithering_a_gradient_does_not_make_it_translucent() {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
-        let boxes = BackgroundBoxes::new(bounds, Corners::default(), Edges::default(), Edges::default());
+        let boxes = BackgroundBoxes::new(bounds, CornerRadii::default(), Edges::default(), Edges::default());
         let resolved = layer(
             GradientShape::Linear(LinearDirection::ToRight),
             vec![stop(0x000000, at(0.)), stop(0x000000, at(1.))],
@@ -3328,6 +3324,7 @@ mod tests {
         ContentMask {
             bounds: full_bounds(),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
         }
     }
 
@@ -3565,7 +3562,7 @@ mod tests {
             GroupEffect {
                 backdrop_filters: vec![gpui::FilterFunction::Blur(px(4.)).resolve(1.)],
                 reference: region,
-                reference_radii: Corners::all(ScaledPixels(14.)),
+                reference_radii: CornerRadii::from(Corners::all(ScaledPixels(14.))),
                 ..GroupEffect::default()
             },
             window_mask(),
@@ -3635,7 +3632,7 @@ mod tests {
 
     fn fade_mask(width: f32) -> Vec<Quad> {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(width), px(SIZE)));
-        let boxes = BackgroundBoxes::new(bounds, Corners::default(), Edges::default(), Edges::default());
+        let boxes = BackgroundBoxes::new(bounds, CornerRadii::default(), Edges::default(), Edges::default());
         let fade = layer(
             GradientShape::Linear(LinearDirection::ToRight),
             vec![
@@ -3792,7 +3789,7 @@ mod tests {
             GroupEffect {
                 clip_path: Some(gpui::ResolvedClipPath::RoundedRect {
                     bounds: full_bounds(),
-                    corner_radii: Corners::all(ScaledPixels(16.)),
+                    corner_radii: CornerRadii::from(Corners::all(ScaledPixels(16.))),
                 }),
                 ..GroupEffect::default()
             },
@@ -3867,6 +3864,7 @@ mod tests {
                 size(ScaledPixels(20.), ScaledPixels(40.)),
             ),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
         };
         scene.start_group(filtered(vec![gpui::FilterFunction::Blur(px(1.))]), mask, None);
         let mut inside = solid(0., 0., SIZE, SIZE, 0xff0000);
@@ -3986,6 +3984,7 @@ mod tests {
                     size(ScaledPixels(WIDTH as f32), ScaledPixels(HEIGHT as f32)),
                 ),
                 corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
             };
             let solid = |x, y, width, height, color| Quad {
                 content_mask: mask,
@@ -4238,6 +4237,7 @@ mod tests {
                 size(ScaledPixels(WIDTH as f32), ScaledPixels(HEIGHT as f32)),
             ),
             corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
         };
         let mut peak = 0;
         for frame in 0..60 {

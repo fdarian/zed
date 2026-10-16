@@ -63,6 +63,7 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
     let content_mask = ContentMask(
         Bounds(input.mask_bounds.xy, input.mask_bounds.zw),
         Corners(input.mask_corner_radii.x, input.mask_corner_radii.y, input.mask_corner_radii.z, input.mask_corner_radii.w),
+        Corners(0.0, 0.0, 0.0, 0.0),
     );
     out.alpha = vec4<f32>(input.color.a * alpha_corrected * content_mask_coverage(input.position.xy, content_mask), 1.0);
     return out;

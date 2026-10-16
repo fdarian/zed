@@ -6315,7 +6315,7 @@ mod tests {
     mod dom_hit_testing {
         use super::*;
         use crate::{
-            CursorStyle, Entity, HitboxBehavior, List, ListAlignment, ListState, MouseUpEvent,
+            CornerRadius, CursorStyle, DefiniteLength, Entity, HitboxBehavior, List, ListAlignment, ListState, MouseUpEvent,
             ScrollDelta, ScrollWheelEvent, SharedString, StyleRefinement, TouchPhase, WindowHandle,
             anchored, canvas, deferred, list, size,
         };
@@ -7393,6 +7393,73 @@ mod tests {
             move_to(&window, cx, 20., 20.);
             assert!(hovered.get());
             move_to(&window, cx, 98., 98.);
+            assert!(!hovered.get());
+        }
+
+        #[gpui::test]
+        fn a_box_with_elliptical_corners_misses_the_pointer_where_the_ellipse_is_cut_away(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(node("ellipse", 0., 0., 100., 50.).rounded(CornerRadius {
+                        x: px(40.).into(),
+                        y: px(20.).into(),
+                    }))
+                    .into_any_element()
+            });
+            // The top left arc is an ellipse of 40 x 20 about (40, 20). (20, 1) would be inside a
+            // circle of radius 20 and is outside the ellipse; (10, 10) is just inside it.
+            assert_eq!(chain_at(&window, cx, 2., 2.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 20., 1.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 98., 48.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 10., 10.), ["ellipse", "root"]);
+            assert_eq!(chain_at(&window, cx, 40., 1.), ["ellipse", "root"]);
+            assert_eq!(chain_at(&window, cx, 1., 20.), ["ellipse", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_fifty_percent_radius_is_the_ellipse_that_fills_the_box(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(
+                        node("ellipse", 0., 0., 100., 50.)
+                            .rounded(CornerRadius::from(DefiniteLength::Fraction(0.5))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(chain_at(&window, cx, 5., 5.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 95., 45.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 14., 14.), ["ellipse", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 1.), ["ellipse", "root"]);
+            assert_eq!(chain_at(&window, cx, 1., 25.), ["ellipse", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_box_with_elliptical_corners_is_not_hovered_where_the_ellipse_is_cut_away_outside_dom_hit_testing(
+            cx: &mut TestAppContext,
+        ) {
+            let hovered = Rc::new(Cell::new(false));
+            let window = open_scene(cx, false, {
+                let hovered = hovered.clone();
+                move || {
+                    let hovered = hovered.clone();
+                    root()
+                        .child(node("ellipse", 0., 0., 100., 50.).rounded(CornerRadius {
+                            x: px(40.).into(),
+                            y: px(20.).into(),
+                        })
+                        .on_hover(move |state, _, _| hovered.set(*state)))
+                        .into_any_element()
+                }
+            });
+            move_to(&window, cx, 20., 1.);
+            assert!(!hovered.get());
+            move_to(&window, cx, 10., 10.);
+            assert!(hovered.get());
+            move_to(&window, cx, 2., 2.);
             assert!(!hovered.get());
         }
 
