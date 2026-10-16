@@ -2746,9 +2746,10 @@ impl Interactivity {
                             style.overflow_mask(bounds, window.rem_size()),
                             |window| {
                                 let hitbox = if self.should_insert_hitbox(&style, window, cx) {
-                                    Some(window.insert_hitbox_clipped(
+                                    Some(window.insert_hitbox_shaped(
                                         bounds,
                                         hitbox_behavior,
+                                        style.border_box_radii(bounds, window.rem_size()),
                                         style.hit_clip_path(bounds, window.rem_size()),
                                     ))
                                 } else {
@@ -7249,6 +7250,92 @@ mod tests {
             assert_eq!(chain_at(&window, cx, 50., 2.), ["fill", "rounded", "root"]);
             // A child spilling past the clip is cut by it, as it is painted.
             assert_eq!(chain_at(&window, cx, 150., 150.), ["under", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_rounded_box_without_overflow_clipping_misses_the_pointer_at_its_corners(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(node("rounded", 0., 0., 100., 100.).rounded(px(40.)))
+                    .into_any_element()
+            });
+            assert_eq!(chain_at(&window, cx, 2., 2.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 98., 98.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 98., 2.), ["under", "root"]);
+            // Inside the arc and along the straight edges the box is hit.
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["rounded", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 2.), ["rounded", "root"]);
+            assert_eq!(chain_at(&window, cx, 2., 50.), ["rounded", "root"]);
+            // The radius is the one the box paints with: it is clamped to half the shorter side.
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(node("pill", 0., 0., 100., 20.).rounded(px(500.)))
+                    .into_any_element()
+            });
+            assert_eq!(chain_at(&window, cx, 2., 2.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 2.), ["pill", "root"]);
+            assert_eq!(chain_at(&window, cx, 10., 10.), ["pill", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_rounded_box_without_overflow_clipping_is_not_hovered_at_its_corners_outside_dom_hit_testing(
+            cx: &mut TestAppContext,
+        ) {
+            let hovered = Rc::new(Cell::new(false));
+            let under = Rc::new(Cell::new(false));
+            let window = open_scene(cx, false, {
+                let hovered = hovered.clone();
+                let under = under.clone();
+                move || {
+                    let hovered = hovered.clone();
+                    let under = under.clone();
+                    root()
+                        .child(
+                            node("under", 0., 0., 300., 300.)
+                                .on_hover(move |state, _, _| under.set(*state)),
+                        )
+                        .child(
+                            node("rounded", 0., 0., 100., 100.)
+                                .rounded(px(40.))
+                                .on_hover(move |state, _, _| hovered.set(*state)),
+                        )
+                        .into_any_element()
+                }
+            });
+            move_to(&window, cx, 2., 2.);
+            assert!(!hovered.get());
+            assert!(under.get());
+            move_to(&window, cx, 20., 20.);
+            assert!(hovered.get());
+            move_to(&window, cx, 98., 98.);
+            assert!(!hovered.get());
+        }
+
+        #[gpui::test]
+        fn a_child_overflowing_the_rounded_corner_of_its_parent_is_hit_through_its_own_box(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || {
+                root()
+                    .child(node("under", 0., 0., 300., 300.))
+                    .child(
+                        node("rounded", 50., 50., 100., 100.)
+                            .rounded(px(40.))
+                            .child(node("spill", -10., -10., 30., 30.))
+                            .child(node("cornered", 80., 80., 20., 20.)),
+                    )
+                    .into_any_element()
+            });
+            // `spill` covers the rounded-away corner of its parent with its own square box, and
+            // the parent is still in the chain.
+            assert_eq!(chain_at(&window, cx, 55., 55.), ["spill", "rounded", "root"]);
+            assert_eq!(chain_at(&window, cx, 140., 140.), ["cornered", "rounded", "root"]);
+            // No child there: the corner falls through.
+            assert_eq!(chain_at(&window, cx, 148., 52.), ["under", "root"]);
         }
 
         /// A chain of `depth` nested boxes under `top`, the deepest holding `leaves` leaves that

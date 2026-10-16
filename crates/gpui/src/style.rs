@@ -1000,7 +1000,12 @@ impl Style {
         Some(clip_path.resolve(boxes.region(clip_path.reference), 1.))
     }
 
-    fn border_box_radii(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> Corners<Pixels> {
+    /// The corner radii of the border box, clamped to fit it. Painting and hit testing use these.
+    pub(crate) fn border_box_radii(
+        &self,
+        bounds: Bounds<Pixels>,
+        rem_size: Pixels,
+    ) -> Corners<Pixels> {
         self.corner_radii
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size)

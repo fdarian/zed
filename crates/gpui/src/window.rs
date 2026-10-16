@@ -858,12 +858,56 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// The radii of the rounded corners of `bounds`, already clamped to fit them. The pointer
+    /// does not hit the hitbox in the rounded-away corners, and unlike a `clip-path` or an
+    /// overflow clip this does not reach the hitboxes inside it.
+    pub corner_radii: Corners<Pixels>,
     identity: Option<GlobalElementId>,
     parent: Option<HitboxId>,
     clip: Option<Rc<ResolvedClipPath>>,
 }
 
+/// Whether `point` is inside `bounds` with its corners rounded by `radii`. The radii must already
+/// fit the bounds (see [`Corners::clamp_radii_for_quad_size`]).
+pub fn point_in_rounded_rect(
+    point: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    radii: Corners<Pixels>,
+) -> bool {
+    if !bounds.contains(&point) {
+        return false;
+    }
+    let center = bounds.center();
+    // The corner the point is nearest to, and the direction from that corner towards the inside.
+    let (radius, corner, toward_x, toward_y) = match (point.x < center.x, point.y < center.y) {
+        (true, true) => (radii.top_left, bounds.origin, 1., 1.),
+        (false, true) => (radii.top_right, bounds.top_right(), -1., 1.),
+        (false, false) => (radii.bottom_right, bounds.bottom_right(), -1., -1.),
+        (true, false) => (radii.bottom_left, bounds.bottom_left(), 1., -1.),
+    };
+    // The semi-axes of the corner's ellipse; a circle until the radii get a vertical component.
+    let (radius_x, radius_y) = (radius.0, radius.0);
+    if radius_x <= 0. || radius_y <= 0. {
+        return true;
+    }
+    let dx = (point.x.0 - corner.x.0) * toward_x - radius_x;
+    let dy = (point.y.0 - corner.y.0) * toward_y - radius_y;
+    // Past the ellipse's centre on either axis the point is along a straight edge.
+    dx >= 0. || dy >= 0. || (dx / radius_x).powi(2) + (dy / radius_y).powi(2) <= 1.
+}
+
 impl Hitbox {
+    /// Whether `position` is on this hitbox: inside its bounds, its rounded corners and the
+    /// content mask it was inserted under. A `clip-path` is not part of this, as it also cuts the
+    /// hitboxes inside, see `Frame::clipped_out`.
+    fn contains_point(&self, position: Point<Pixels>) -> bool {
+        self.bounds
+            .intersect(&self.content_mask.bounds)
+            .contains(&position)
+            && self.content_mask.contains(&position)
+            && point_in_rounded_rect(position, self.bounds, self.corner_radii)
+    }
+
     /// The innermost hitbox that enclosed this one when it was inserted, see
     /// [`Window::with_hitbox_parent`]. A deferred draw starts a new hitbox root, so the outermost
     /// hitboxes of a deferred layer have no parent, like content portaled to `body` in the DOM.
@@ -1254,8 +1298,7 @@ impl Frame {
             if hitbox.behavior == HitboxBehavior::PassThrough {
                 continue;
             }
-            if hitbox.bounds.intersect(&hitbox.content_mask.bounds).contains(&position)
-                && hitbox.content_mask.contains(&position)
+            if hitbox.contains_point(position)
                 && !clips.is_some_and(|clips| self.clipped_out(clips, ix, position))
             {
                 hit_test.ids.push(hitbox.id);
@@ -1321,11 +1364,7 @@ impl Frame {
         let mut hit_test = HitTest::default();
         let mut next = self.hitboxes.iter().enumerate().rposition(|(ix, hitbox)| {
             hitbox.behavior != HitboxBehavior::PassThrough
-                && hitbox
-                    .bounds
-                    .intersect(&hitbox.content_mask.bounds)
-                    .contains(&position)
-                && hitbox.content_mask.contains(&position)
+                && hitbox.contains_point(position)
                 && !clips.is_some_and(|clips| self.clipped_out(clips, ix, position))
         });
         while let Some(index) = next {
@@ -2273,20 +2312,11 @@ impl ContentMask<Pixels> {
 
     /// Whether the point is inside the mask, rounded corners included.
     pub fn contains(&self, position: &Point<Pixels>) -> bool {
-        if !self.bounds.contains(position) {
-            return false;
-        }
-        if self.corner_radii == Corners::default() {
-            return true;
-        }
-        ResolvedClipPath::RoundedRect {
-            bounds: self.bounds.map(|pixels| ScaledPixels(pixels.0)),
-            corner_radii: self
-                .corner_radii
-                .clamp_radii_for_quad_size(self.bounds.size)
-                .map(|pixels| ScaledPixels(pixels.0)),
-        }
-        .contains(Point::new(position.x.0, position.y.0))
+        point_in_rounded_rect(
+            *position,
+            self.bounds,
+            self.corner_radii.clamp_radii_for_quad_size(self.bounds.size),
+        )
     }
 
     /// Intersect the content mask with the given content mask.
@@ -6035,19 +6065,22 @@ impl Window {
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
-        self.insert_hitbox_clipped(bounds, behavior, None)
+        self.insert_hitbox_shaped(bounds, behavior, Corners::default(), None)
     }
 
-    /// Like [`Window::insert_hitbox`], for an element with a `clip-path`: the pointer only hits
-    /// this hitbox, and every hitbox inserted inside it (see [`Window::with_hitbox_parent`]),
-    /// where `clip` contains it. `clip` is in the same logical pixels as `bounds`, so resolve it
-    /// with a scale factor of 1.
+    /// Like [`Window::insert_hitbox`], for an element with rounded corners and a `clip-path`.
+    /// The pointer misses the hitbox in the corners rounded away by `corner_radii` (already
+    /// clamped to `bounds`, as the box paints them), and the hitboxes inside it still hit through
+    /// their own boxes. It only hits this hitbox, and every hitbox inserted inside it (see
+    /// [`Window::with_hitbox_parent`]), where `clip` contains it. `clip` is in the same logical
+    /// pixels as `bounds`, so resolve it with a scale factor of 1.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
-    pub fn insert_hitbox_clipped(
+    pub fn insert_hitbox_shaped(
         &mut self,
         bounds: Bounds<Pixels>,
         behavior: HitboxBehavior,
+        corner_radii: Corners<Pixels>,
         clip: Option<ResolvedClipPath>,
     ) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
@@ -6065,6 +6098,7 @@ impl Window {
             bounds,
             content_mask,
             behavior,
+            corner_radii,
             identity,
             parent: self.hitbox_parent_stack.last().copied(),
             clip: clip.map(Rc::new),
@@ -8586,6 +8620,7 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
+    use super::point_in_rounded_rect;
     use std::{
         cell::{Cell, RefCell},
         path::PathBuf,
@@ -8595,7 +8630,7 @@ mod tests {
     use super::{Frame, Hitbox, HitboxId};
     use crate::util::FluentBuilder as _;
     use crate::{
-        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, ContentMask, Context,
+        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, ContentMask, Context, Corners,
         DispatchTree, DragMoveEvent, DragOperation, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
         FileDropEvent, FocusHandle, HitboxBehavior, InputEvent as _, InteractiveElement as _,
         IntoElement, Keymap, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, NativeKey, ParentElement, Pixels,
@@ -9752,6 +9787,7 @@ mod tests {
             frame.hitboxes.push(Hitbox {
                 id: HitboxId(entry.id),
                 bounds,
+                corner_radii: Corners::default(),
                 content_mask: ContentMask::from_bounds(bounds),
                 behavior: if entry.pass_through {
                     HitboxBehavior::PassThrough
@@ -10069,5 +10105,57 @@ mod tests {
             el.border(px(6.)).border_color(red()).border_style(BorderStyle::Double)
         });
         assert_eq!(thick.border_styles.top, BorderStyle::Double);
+    }
+
+    #[test]
+    fn a_point_in_a_rounded_corner_is_outside_the_rounded_rect() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(60.)));
+        let radii = Corners {
+            top_left: px(20.),
+            top_right: px(10.),
+            bottom_right: px(0.),
+            bottom_left: px(30.),
+        };
+        let inside = |x: f32, y: f32| point_in_rounded_rect(point(px(x), px(y)), bounds, radii);
+
+        // Each corner's pixel next to the vertex is cut, unless the corner is square.
+        assert!(!inside(11., 21.));
+        assert!(!inside(109., 21.));
+        assert!(inside(109., 79.));
+        assert!(!inside(11., 79.));
+        // On the arc: 20 * (1 - cos 45deg) = 5.86 in from the top left vertex.
+        assert!(!inside(10. + 5., 20. + 5.));
+        assert!(inside(10. + 6.5, 20. + 6.5));
+        // Straight edges and the middle are in, and so is the box up to its far edges.
+        assert!(inside(60., 21.));
+        assert!(inside(11., 50.));
+        assert!(inside(60., 50.));
+        // Outside the bounds, whatever the radii.
+        assert!(!inside(9., 50.));
+        assert!(!inside(60., 81.));
+    }
+
+    #[test]
+    fn a_rounded_rect_without_radii_is_its_bounds() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(40.), px(40.)));
+        let contains = |x: f32, y: f32| {
+            point_in_rounded_rect(point(px(x), px(y)), bounds, Corners::default())
+        };
+        assert!(contains(0., 0.));
+        assert!(contains(39., 39.));
+        assert!(!contains(40., 40.));
+    }
+
+    #[test]
+    fn a_fully_rounded_box_is_a_circle() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(40.), px(40.)));
+        let radii = Corners::all(px(20.));
+        let contains = |x: f32, y: f32| point_in_rounded_rect(point(px(x), px(y)), bounds, radii);
+        assert!(contains(20., 20.));
+        assert!(contains(20., 0.5));
+        assert!(contains(0.5, 20.));
+        assert!(contains(20. + 14., 20. + 14.));
+        assert!(!contains(20. + 15., 20. + 15.));
+        assert!(!contains(1., 1.));
     }
 }
