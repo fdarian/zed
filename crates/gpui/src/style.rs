@@ -265,9 +265,10 @@ pub struct Style {
     /// element, one whose `position` is not [`Position::Static`], and 0 is `auto`. See
     /// [`crate::Div::stacking_context`].
     pub z_index: i32,
-    /// Whether a positioned element is handed to the stacking context around it. An element that
-    /// is positioned only for layout (the containing block of an absolute child, say) turns this
-    /// off to keep its place in the tree. See [`crate::Styled::unlifted`].
+    /// Whether an element is handed to the stacking context around it. A positioned element is
+    /// unless this is off: one positioned only for layout (the containing block of an absolute
+    /// child, say) turns it off to keep its place in the tree, see [`crate::Styled::unlifted`]. A
+    /// static element is not, unless this is turned on, see [`crate::Styled::lifted`].
     pub lifts: bool,
     /// How should the position of this element be tweaked relative to the layout defined?
     #[refineable]
@@ -449,14 +450,14 @@ impl StyleRefinement {
     }
 
     /// The `z-index` of an element with this style for `Element::lift_z`: a positioned element
-    /// (`position` set and not [`Position::Static`]) has one, an in-flow element has none.
+    /// (`position` set and not [`Position::Static`]) has one, and so has one that asked to be
+    /// lifted ([`crate::Styled::lifted`]). An in-flow element has none.
     pub fn lift_z(&self) -> Option<i32> {
-        if self.lifts == Some(false) {
-            return None;
-        }
-        match self.position {
-            None | Some(Position::Static) => None,
-            Some(_) => Some(self.z_index.unwrap_or(0)),
+        let positioned = !matches!(self.position, None | Some(Position::Static));
+        match self.lifts {
+            Some(false) => None,
+            Some(true) => Some(self.z_index.unwrap_or(0)),
+            None => positioned.then(|| self.z_index.unwrap_or(0)),
         }
     }
 }

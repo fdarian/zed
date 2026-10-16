@@ -8594,6 +8594,33 @@ mod tests {
             }
 
             #[gpui::test]
+            fn a_static_element_asking_to_be_lifted_is_ordered_by_its_z_index(
+                cx: &mut TestAppContext,
+            ) {
+                // "b" is in flow inside "a" and overlaps "c" at 50..100.
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(boxed("a", 0., 0., 200.).child(flow("b", 100.).lifted().z_index(5)))
+                        .child(boxed("c", 50., 50., 200.))
+                        .into_any_element()
+                });
+                assert_eq!(painted(&window, cx), ["root", "a", "c", "b"]);
+                assert_eq!(chain_at(&window, cx, 75., 75.), ["b", "a", "root"]);
+
+                // It stays in flow: "a" is where it was and "b" sits at its corner.
+                assert_eq!(bounds_of(&window, cx, "b").origin, point(px(0.), px(0.)));
+
+                // Not asking, it paints in tree order whatever its index.
+                let window = open_scene(cx, true, || {
+                    context()
+                        .child(boxed("a", 0., 0., 200.).child(flow("b", 100.).z_index(5)))
+                        .child(boxed("c", 50., 50., 200.))
+                        .into_any_element()
+                });
+                assert_eq!(painted(&window, cx), ["root", "a", "b", "c"]);
+            }
+
+            #[gpui::test]
             fn an_element_given_as_an_any_element_is_lifted(cx: &mut TestAppContext) {
                 // `child` wraps an AnyElement in another one, which is what the parent asks.
                 let window = open_scene(cx, true, || {

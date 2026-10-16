@@ -597,6 +597,15 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Hands a static element to the stacking context around it, painted and hit-tested by its
+    /// [`crate::Div::z_index`] like a positioned one. This is how CSS stacks a flex or grid item
+    /// with a `z-index`, and an element with `opacity` below 1, whatever their `position`. Layout
+    /// is not affected. Without a context around it, nothing changes.
+    fn lifted(mut self) -> Self {
+        self.style().lifts = Some(true);
+        self
+    }
+
     /// Sets the aspect ratio of the element.
     /// [Docs](https://tailwindcss.com/docs/aspect-ratio)
     fn aspect_ratio(mut self, ratio: f32) -> Self {
