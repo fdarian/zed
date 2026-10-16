@@ -2299,9 +2299,10 @@ impl Element for Div {
                                         window.end_stacking_context(children_hitboxes_start);
                                 }
                             };
-                            // Nothing under a hidden element is painted, so nothing is lifted
-                            // out of it to be painted by a context above.
-                            let hidden = style.visibility == Visibility::Hidden;
+                            // A hidden element paints nothing of its own, so nothing is lifted out of
+                            // it to be painted by a context above: a `visible` descendant paints in
+                            // place.
+                            let hidden = window.visibility() == Visibility::Hidden;
                             let prepaint_children = move |window: &mut Window| {
                                 if hidden {
                                     window.with_lift_barrier(prepaint_children_in_context)
