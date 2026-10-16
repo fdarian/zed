@@ -2291,6 +2291,14 @@ pub struct DispatchEventResult {
     pub drag_operation: Option<DragOperation>,
 }
 
+/// How far, in logical pixels, a point may lie outside a mask and still count as inside it when
+/// [`ContentMask::intersection_is_exact`] tests whether one mask's corner fits inside another.
+const EXACT_TOLERANCE: f32 = 0.01;
+
+/// The points between the two ends of a corner's arc that [`ContentMask::intersection_is_exact`]
+/// tests.
+const EXACT_ARC_SAMPLES: usize = 16;
+
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
 /// rendered. The mask is a rectangle whose corners may be rounded, which is how `overflow: hidden`
 /// clips to a rounded padding box.
@@ -2343,11 +2351,123 @@ impl ContentMask<Pixels> {
 
     /// Whether the point is inside the mask, rounded corners included.
     pub fn contains(&self, position: &Point<Pixels>) -> bool {
+        point_in_rounded_rect(*position, self.bounds, self.fitted_radii())
+    }
+
+    fn fitted_radii(&self) -> CornerRadii<Pixels> {
+        CornerRadii::new(self.corner_radii, self.corner_radii_y, self.bounds.size)
+    }
+
+    fn is_rounded(&self) -> bool {
+        let radii = &self.corner_radii;
+        [radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left]
+            .iter()
+            .any(|radius| radius.0 > 0.)
+    }
+
+    /// Whether `position` is inside the mask grown by [`EXACT_TOLERANCE`], so that a point
+    /// computed to lie on the mask's edge counts as inside it. Growing the bounds and every
+    /// round corner's radii by the same amount grows the whole shape by that much.
+    fn contains_within_tolerance(&self, position: Point<Pixels>) -> bool {
+        let radii = self.fitted_radii();
+        let grow = |radius: &Pixels| {
+            if radius.0 > 0. {
+                Pixels(radius.0 + EXACT_TOLERANCE)
+            } else {
+                *radius
+            }
+        };
         point_in_rounded_rect(
-            *position,
-            self.bounds,
-            CornerRadii::new(self.corner_radii, self.corner_radii_y, self.bounds.size),
+            position,
+            self.bounds.dilate(Pixels(EXACT_TOLERANCE)),
+            CornerRadii {
+                x: radii.x.map(grow),
+                y: radii.y.map(grow),
+            },
         )
+    }
+
+    /// The horizontal and vertical radius of the corner at `anchor` as it is drawn, both zero when
+    /// the corner is square.
+    fn ellipse_at(&self, anchor: Anchor) -> (f32, f32) {
+        let radii = self.fitted_radii();
+        (radii.x.corner(anchor).0, radii.explicit_y().corner(anchor).0)
+    }
+
+    /// Whether every point of the corner at `anchor`, a round arc or a square point, is inside
+    /// `other`, checked at the arc's two ends and [`EXACT_ARC_SAMPLES`] points between them.
+    fn corner_is_inside(&self, anchor: Anchor, other: &Self) -> bool {
+        let corner = self.bounds.corner(anchor);
+        let (radius_x, radius_y) = self.ellipse_at(anchor);
+        if radius_x <= 0. {
+            return other.contains_within_tolerance(corner);
+        }
+        // The direction from the corner towards the inside of the mask on each axis.
+        let (toward_x, toward_y) = match anchor {
+            Anchor::TopLeft => (1., 1.),
+            Anchor::TopRight => (-1., 1.),
+            Anchor::BottomRight => (-1., -1.),
+            _ => (1., -1.),
+        };
+        let centre = point(
+            corner.x.0 + toward_x * radius_x,
+            corner.y.0 + toward_y * radius_y,
+        );
+        (0..=EXACT_ARC_SAMPLES).all(|step| {
+            let angle = std::f32::consts::FRAC_PI_2 * step as f32 / EXACT_ARC_SAMPLES as f32;
+            other.contains_within_tolerance(point(
+                Pixels(centre.x - toward_x * radius_x * angle.cos()),
+                Pixels(centre.y - toward_y * radius_y * angle.sin()),
+            ))
+        })
+    }
+
+    /// Whether [`ContentMask::intersect`] of the two masks is their true intersection, so that
+    /// painting under it clips exactly like painting under both masks.
+    ///
+    /// Judged per corner of the intersection's bounds. Where both masks have their corner, the
+    /// result keeps the larger radii, which is the intersection only when one mask's radii are at
+    /// least the other's on both axes. Where one mask has its corner, the result keeps its arc,
+    /// which is the intersection only when that arc lies inside the other mask. Where neither
+    /// does, the result is square, which is the intersection only when that point lies inside both.
+    ///
+    /// An arc is sampled rather than solved for, so a sliver of the other mask's edge that crosses
+    /// it between two samples (a few hundredths of a percent of the radius) goes unnoticed, and a
+    /// point within [`EXACT_TOLERANCE`] of an edge counts as inside it.
+    pub fn intersection_is_exact(&self, other: &Self) -> bool {
+        if !self.is_rounded() && !other.is_rounded() {
+            return true;
+        }
+        let bounds = self.bounds.intersect(&other.bounds);
+        if bounds.is_empty() {
+            return true;
+        }
+        [
+            Anchor::TopLeft,
+            Anchor::TopRight,
+            Anchor::BottomRight,
+            Anchor::BottomLeft,
+        ]
+        .into_iter()
+        .all(|anchor| {
+            let corner = bounds.corner(anchor);
+            match (
+                self.bounds.corner(anchor) == corner,
+                other.bounds.corner(anchor) == corner,
+            ) {
+                (true, true) => {
+                    let own = self.ellipse_at(anchor);
+                    let theirs = other.ellipse_at(anchor);
+                    (own.0 >= theirs.0 && own.1 >= theirs.1)
+                        || (theirs.0 >= own.0 && theirs.1 >= own.1)
+                }
+                (true, false) => self.corner_is_inside(anchor, other),
+                (false, true) => other.corner_is_inside(anchor, self),
+                (false, false) => {
+                    self.contains_within_tolerance(corner) && other.contains_within_tolerance(corner)
+                }
+            }
+        })
     }
 
     /// Intersect the content mask with the given content mask.
@@ -10561,5 +10681,104 @@ mod tests {
         assert_eq!(merged.y.top_right, px(40.));
         assert_eq!(merged.x.bottom_left, px(10.));
         assert_eq!(merged.y.bottom_left, px(10.));
+    }
+
+    fn mask(x: f32, y: f32, width: f32, height: f32, radius: (f32, f32)) -> ContentMask<Pixels> {
+        ContentMask::rounded(
+            Bounds::new(point(px(x), px(y)), size(px(width), px(height))),
+            CornerRadii {
+                x: Corners::all(px(radius.0)),
+                y: Corners::all(px(radius.1)),
+            },
+        )
+    }
+
+    /// How many points of a quarter-pixel grid `intersect` gets wrong against being inside both.
+    fn intersect_mismatches(a: &ContentMask<Pixels>, b: &ContentMask<Pixels>) -> usize {
+        let both = a.intersect(b);
+        let mut wrong = 0;
+        for x in -240..640 {
+            for y in -240..640 {
+                let at = point(px(x as f32 * 0.25 + 0.125), px(y as f32 * 0.25 + 0.125));
+                if both.contains(&at) != (a.contains(&at) && b.contains(&at)) {
+                    wrong += 1;
+                }
+            }
+        }
+        wrong
+    }
+
+    /// Asserts the predicate against what `intersect` really does to the points, both ways.
+    fn assert_exactness(a: &ContentMask<Pixels>, b: &ContentMask<Pixels>, exact: bool) {
+        assert_eq!(a.intersection_is_exact(b), exact, "{a:?} with {b:?}");
+        assert_eq!(b.intersection_is_exact(a), exact, "{b:?} with {a:?}");
+        let wrong = intersect_mismatches(a, b);
+        assert_eq!(wrong == 0, exact, "{wrong} points differ for {a:?} with {b:?}");
+    }
+
+    #[test]
+    fn square_content_masks_always_intersect_exactly() {
+        let a = mask(0., 0., 100., 100., (0., 0.));
+        let b = mask(30., -20., 100., 60., (0., 0.));
+        assert_exactness(&a, &b, true);
+        let apart = mask(500., 500., 10., 10., (0., 0.));
+        assert!(a.intersection_is_exact(&apart));
+    }
+
+    #[test]
+    fn a_nested_content_mask_with_a_coinciding_corner_is_exact() {
+        let parent = mask(0., 0., 100., 100., (20., 20.));
+        // Flush with the parent's top-left corner, where the parent's larger radius wins.
+        let child = mask(0., 0., 60., 60., (5., 5.));
+        assert_exactness(&parent, &child, true);
+        // The same mask twice.
+        assert_exactness(&parent, &parent, true);
+        // A square child over the whole parent.
+        assert_exactness(&parent, &mask(0., 0., 100., 100., (0., 0.)), true);
+    }
+
+    #[test]
+    fn a_child_edge_cutting_the_parents_arc_is_inexact() {
+        let parent = mask(0., 0., 100., 100., (16., 16.));
+        // The child's square corner at (4, 4) is in the corner the parent rounds away.
+        assert_exactness(&parent, &mask(4., 4., 92., 92., (0., 0.)), false);
+        // So is a rounded one inset by 2: its arc crosses the parent's.
+        assert_exactness(&parent, &mask(2., 2., 96., 96., (8., 8.)), false);
+        // A child larger than the parent whose edge slides through the parent's arc.
+        assert_exactness(&parent, &mask(3., -50., 200., 200., (0., 0.)), false);
+    }
+
+    #[test]
+    fn a_child_inset_past_the_parents_arc_is_exact() {
+        let parent = mask(0., 0., 100., 100., (16., 16.));
+        // (8, 8) is inside the quarter circle of radius 16.
+        assert_exactness(&parent, &mask(8., 8., 84., 84., (0., 0.)), true);
+        assert_exactness(&parent, &mask(8., 8., 84., 84., (6., 6.)), true);
+        assert_exactness(&parent, &mask(20., 20., 60., 60., (10., 10.)), true);
+        // The edge of the arc is on the line: a child flush with where the arc starts.
+        assert_exactness(&parent, &mask(0., 16., 100., 68., (0., 0.)), true);
+    }
+
+    #[test]
+    fn mixed_elliptical_radii_at_a_shared_corner_are_inexact() {
+        let wide = mask(0., 0., 100., 100., (20., 5.));
+        let tall = mask(0., 0., 100., 100., (5., 20.));
+        assert_exactness(&wide, &tall, false);
+        // One larger on both axes is exact.
+        let circle = mask(0., 0., 100., 100., (20., 20.));
+        assert_exactness(&wide, &circle, true);
+        assert_exactness(&tall, &circle, true);
+    }
+
+    #[test]
+    fn a_corner_that_neither_mask_has_is_exact_only_inside_both() {
+        let parent = mask(0., 0., 100., 100., (20., 20.));
+        // The child's left edge is the parent's and its top edge is 10 down: the corner at
+        // (0, 10) is not the parent's and not the child's, and it lies in the rounded-away part.
+        let low = mask(-50., 10., 100., 100., (0., 0.));
+        assert_exactness(&parent, &low, false);
+        // Lower down the same corner is on the parent's straight edge.
+        let lower = mask(-50., 30., 100., 100., (0., 0.));
+        assert_exactness(&parent, &lower, true);
     }
 }
