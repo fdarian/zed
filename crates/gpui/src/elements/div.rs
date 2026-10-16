@@ -8073,7 +8073,7 @@ mod tests {
         /// containing block, and of nothing between it and them.
         mod escaping_boxes {
             use super::*;
-            use crate::{ScrollHandle, hsla, red};
+            use crate::{ScrollHandle, blue, hsla, red};
 
             fn with_position<E: Styled>(mut element: E, position: Position) -> E {
                 element.style().position = Some(position);
@@ -8162,6 +8162,120 @@ mod tests {
                 assert_eq!(visible_area(&window, cx), 50. * 50.);
                 assert_eq!(chain_at(&window, cx, 30., 30.), ["box", "clip", "root"]);
                 assert_eq!(chain_at(&window, cx, 250., 250.), ["clip", "root"]);
+            }
+
+            fn open_with_groups(
+                cx: &mut TestAppContext,
+                build: impl Fn() -> AnyElement + 'static,
+            ) -> AnyWindowHandle {
+                let build: Rc<dyn Fn() -> AnyElement> = Rc::new(build);
+                let window =
+                    cx.open_window(size(px(800.), px(600.)), move |_, _| SceneView { build });
+                let window = AnyWindowHandle::from(window);
+                cx.update_window(window, |_, window, cx| {
+                    window.force_effect_groups();
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+                window
+            }
+
+            fn group_masks(
+                window: &AnyWindowHandle,
+                cx: &mut TestAppContext,
+            ) -> Vec<Bounds<Pixels>> {
+                cx.update_window(*window, |_, window, _| {
+                    let scale = window.scale_factor();
+                    window
+                        .painted_group_masks()
+                        .iter()
+                        .map(|mask| {
+                            let origin = mask.bounds.origin;
+                            let extent = mask.bounds.size;
+                            Bounds::new(
+                                point(px(origin.x.0 / scale), px(origin.y.0 / scale)),
+                                size(px(extent.width.0 / scale), px(extent.height.0 / scale)),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap()
+            }
+
+            #[gpui::test]
+            fn an_effect_group_does_not_cut_an_escaped_box_to_its_start_mask(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_with_groups(cx, || {
+                    root()
+                        .child(
+                            static_box("clip", 200., 100.).overflow_hidden().child(
+                                static_box("card", 0., 100.)
+                                    .bg(blue())
+                                    .opacity(0.5)
+                                    .overflow_hidden()
+                                    .child(escaping("box", 10., 10., 50.)),
+                            ),
+                        )
+                        .into_any_element()
+                });
+
+                let box_bounds = bounds_of(&window, cx, "box");
+                assert_eq!(box_bounds.origin, point(px(10.), px(10.)));
+                assert_eq!(visible_area(&window, cx), 50. * 50.);
+                let masks = group_masks(&window, cx);
+                assert_eq!(masks.len(), 1);
+                assert!(masks[0].contains(&box_bounds.origin));
+                assert!(masks[0].contains(&box_bounds.bottom_right()));
+                // What the clip lets through of the card is still there.
+                assert!(masks[0].contains(&point(px(250.), px(250.))));
+            }
+
+            #[gpui::test]
+            fn an_effect_group_keeps_its_start_mask_without_an_escaped_box(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_with_groups(cx, || {
+                    root()
+                        .child(
+                            static_box("clip", 200., 100.).overflow_hidden().child(
+                                static_box("card", 0., 100.)
+                                    .bg(blue())
+                                    .opacity(0.5)
+                                    .child(div().w(px(50.)).h(px(50.)).bg(red())),
+                            ),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(
+                    group_masks(&window, cx),
+                    [Bounds::new(point(px(200.), px(200.)), size(px(100.), px(100.)))]
+                );
+            }
+
+            #[gpui::test]
+            fn an_effect_group_inside_the_containing_block_keeps_that_clip(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_with_groups(cx, || {
+                    root()
+                        .child(
+                            node("clip", 200., 200., 100., 100.).overflow_hidden().child(
+                                static_box("card", 0., 100.)
+                                    .bg(blue())
+                                    .opacity(0.5)
+                                    .child(escaping("box", 10., 10., 150.)),
+                            ),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(
+                    group_masks(&window, cx),
+                    [Bounds::new(point(px(200.), px(200.)), size(px(100.), px(100.)))]
+                );
+                assert_eq!(visible_area(&window, cx), 90. * 50.);
             }
 
             #[gpui::test]

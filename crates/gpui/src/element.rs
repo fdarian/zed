@@ -620,7 +620,7 @@ impl<E: Element> Drawable<E> {
                     )
                 };
                 match escaped_mask {
-                    Some(mask) => window.with_replaced_content_mask(mask, paint),
+                    Some(mask) => window.with_escaped_content_mask(mask, paint),
                     None => paint(window),
                 }
 

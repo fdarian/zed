@@ -1476,6 +1476,8 @@ pub struct Window {
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     /// What the children of each positioned element see, innermost last. Only prepaint reads it.
     pub(crate) positioned_frames: Vec<PositionedFrame>,
+    #[cfg(any(test, feature = "test-support"))]
+    effect_groups_forced: bool,
     /// The elements lifted into each stacking context being prepainted, innermost last. `None`
     /// marks a layout root: nothing is lifted out of it.
     lift_lists: Vec<Option<LiftList>>,
@@ -2199,6 +2201,8 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             positioned_frames: Vec::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            effect_groups_forced: false,
             lift_lists: Vec::new(),
             lift_paints: Vec::new(),
             element_opacity: 1.0,
@@ -3379,6 +3383,35 @@ impl Window {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn effect_groups_forced(&self) -> bool {
+        self.effect_groups_forced
+    }
+
+    #[cfg(not(any(test, feature = "test-support")))]
+    fn effect_groups_forced(&self) -> bool {
+        false
+    }
+
+    /// Builds the scene with effect groups even though the test platform has no renderer for
+    /// them, so a test can look at the groups in [`Window::painted_group_masks`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_effect_groups(&mut self) {
+        self.effect_groups_forced = true;
+    }
+
+    /// The content mask each effect group of the most recently rendered frame composites with, in
+    /// scaled pixels.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_group_masks(&self) -> Vec<ContentMask<ScaledPixels>> {
+        self.rendered_frame
+            .scene
+            .groups
+            .iter()
+            .map(|group| group.content_mask)
+            .collect()
+    }
+
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         let content_mask = self.content_mask();
@@ -3723,7 +3756,7 @@ impl Window {
     /// what they do with it afterwards.
     fn build_next_frame(&mut self, cx: &mut App) {
         self.captured_hitbox = None;
-        let effect_groups = self.platform_window.supports_effect_groups();
+        let effect_groups = self.platform_window.supports_effect_groups() || self.effect_groups_forced();
         self.next_frame
             .scene
             .set_effect_groups_enabled(effect_groups);
@@ -4417,6 +4450,24 @@ impl Window {
         let result = f(self);
         self.content_mask_stack.pop();
         result
+    }
+
+    /// Like [`Window::with_replaced_content_mask`] for the paint of a box that escaped its
+    /// ancestors' clip. An effect group (opacity, filter, mask, clip-path) around it composites
+    /// the box with the rest of the group, so the group is widened to the box's mask instead of
+    /// cutting the box to the mask it started with.
+    pub(crate) fn with_escaped_content_mask<R>(
+        &mut self,
+        mask: ContentMask<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let scale_factor = self.scale_factor();
+        self.next_frame.scene.widen_groups(ContentMask {
+            bounds: self.cover_bounds(mask.bounds),
+            corner_radii: mask.corner_radii.scale(scale_factor),
+            corner_radii_y: mask.corner_radii_y.scale(scale_factor),
+        });
+        self.with_replaced_content_mask(mask, f)
     }
 
     /// Runs `f`, the drawing of the children of a positioned element, so that its content mask and

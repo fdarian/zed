@@ -405,6 +405,24 @@ impl Scene {
         });
     }
 
+    /// Lets the open groups composite where `escaped` is, for a box that escaped the clip of
+    /// the elements between it and its containing block. The group's own primitives keep the mask
+    /// they were painted with, so only what the filters spread of the clipped part is let past
+    /// the clip.
+    pub fn widen_groups(&mut self, escaped: ContentMask<ScaledPixels>) {
+        self.record(PaintOperation::WidenGroups(escaped));
+        for builder in &mut self.group_stack {
+            let union = builder.content_mask.bounds.union(&escaped.bounds);
+            if union != builder.content_mask.bounds {
+                builder.content_mask = ContentMask {
+                    bounds: union,
+                    corner_radii: Corners::default(),
+                    corner_radii_y: Corners::default(),
+                };
+            }
+        }
+    }
+
     pub fn end_group(&mut self) {
         self.record(PaintOperation::EndGroup);
         if !self.effect_groups_enabled {
@@ -595,6 +613,7 @@ impl Scene {
                     reserved,
                 } => self.start_group(effect.clone(), *content_mask, *reserved),
                 PaintOperation::EndGroup => self.end_group(),
+                PaintOperation::WidenGroups(escaped) => self.widen_groups(*escaped),
                 PaintOperation::StartTextClip => self.start_text_clip(),
                 PaintOperation::EndTextClip => self.end_text_clip(),
             }
@@ -679,6 +698,7 @@ pub(crate) enum PaintOperation {
         reserved: Option<Bounds<ScaledPixels>>,
     },
     EndGroup,
+    WidenGroups(ContentMask<ScaledPixels>),
     StartTextClip,
     EndTextClip,
 }
@@ -1881,6 +1901,60 @@ mod tests {
         assert_eq!(next.groups[0].bounds, previous.groups[0].bounds);
         assert_eq!(next.groups[0].scene.quads.len(), 2);
         assert_eq!(next.len(), end - start);
+    }
+
+    fn narrow() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: bounds(0., 0., 50., 50.),
+            ..mask()
+        }
+    }
+
+    fn painted_around_an_escaped_quad(scene: &mut Scene) {
+        scene.start_group(fade(0.5), narrow(), None);
+        let mut inside = quad(10., 10., 20., 20.);
+        inside.content_mask = narrow();
+        scene.insert_primitive(inside);
+        scene.widen_groups(mask());
+        scene.insert_primitive(quad(100., 100., 20., 20.));
+        scene.end_group();
+    }
+
+    #[test]
+    fn a_group_widens_to_the_mask_of_an_escaped_primitive() {
+        let mut scene = scene();
+        painted_around_an_escaped_quad(&mut scene);
+        scene.finish();
+
+        assert_eq!(scene.groups[0].bounds, bounds(10., 10., 110., 110.));
+        assert_eq!(scene.groups[0].content_mask.bounds, mask().bounds);
+    }
+
+    #[test]
+    fn a_group_that_is_not_widened_stays_cut_to_its_start_mask() {
+        let mut scene = scene();
+        scene.start_group(fade(0.5), narrow(), None);
+        scene.insert_primitive(quad(10., 10., 20., 20.));
+        scene.insert_primitive(quad(100., 100., 20., 20.));
+        scene.end_group();
+
+        assert_eq!(scene.groups[0].bounds, bounds(10., 10., 40., 40.));
+        assert_eq!(scene.groups[0].content_mask, narrow());
+    }
+
+    #[test]
+    fn a_replayed_group_is_widened_too() {
+        let mut previous = scene();
+        painted_around_an_escaped_quad(&mut previous);
+        let end = previous.len();
+        previous.finish();
+
+        let mut next = scene();
+        next.replay(0..end, &previous);
+        next.finish();
+
+        assert_eq!(next.groups[0].bounds, previous.groups[0].bounds);
+        assert_eq!(next.groups[0].content_mask, previous.groups[0].content_mask);
     }
 
     #[test]
