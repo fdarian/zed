@@ -24,6 +24,13 @@ pub enum LengthPercentage {
     Length(Pixels),
     /// A fraction of a reference length: `0.5` is `50%`.
     Percent(f32),
+    /// The sum of a length and a fraction of the reference length, as in `calc(10px + 50%)`.
+    Calc {
+        /// The absolute part.
+        length: Pixels,
+        /// The fraction of the reference length.
+        percent: f32,
+    },
 }
 
 impl Default for LengthPercentage {
@@ -37,6 +44,7 @@ impl LengthPercentage {
         match self {
             LengthPercentage::Length(length) => length,
             LengthPercentage::Percent(fraction) => reference * fraction,
+            LengthPercentage::Calc { length, percent } => length + reference * percent,
         }
     }
 }
@@ -1198,6 +1206,21 @@ mod tests {
         assert_close(radius, 50f32.hypot(25.));
         let (radius, _) = radii(RadialShape::Circle, RadialSize::FarthestCorner, position);
         assert_close(radius, 150f32.hypot(75.));
+    }
+
+    #[test]
+    fn a_sum_of_a_length_and_a_fraction_resolves_against_the_reference() {
+        let calc = LengthPercentage::Calc {
+            length: px(10.),
+            percent: 0.25,
+        };
+        assert_eq!(calc.resolve(px(200.)), px(60.));
+        assert_eq!(calc.resolve(px(0.)), px(10.));
+        let negative = LengthPercentage::Calc {
+            length: px(-10.),
+            percent: 0.5,
+        };
+        assert_eq!(negative.resolve(px(100.)), px(40.));
     }
 
     #[test]
