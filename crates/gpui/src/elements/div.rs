@@ -4717,8 +4717,8 @@ impl ScrollHandle {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, Modifiers,
-        MouseMoveEvent, TestAppContext, canvas, svg, util::FluentBuilder as _,
+        AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, LayoutInsets, Modifiers,
+        MouseMoveEvent, TestAppContext, canvas, relative, svg, util::FluentBuilder as _,
     };
     use std::{
         cell::{Cell, RefCell},
@@ -5128,6 +5128,53 @@ mod tests {
         // Padding and both children; the 2px top border is not part of it.
         assert_eq!(content.height, px(5. + 40. + 30. + 7.));
         assert_eq!(parent, Some(size(px(180.), px(80.))));
+    }
+
+    struct InsetsTestView {
+        recorded: Rc<RefCell<Vec<LayoutInsets>>>,
+    }
+
+    impl Render for InsetsTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let recorded = self.recorded.clone();
+            div().w(px(200.)).h(px(100.)).p(px(10.)).child(
+                div()
+                    .w_full()
+                    .h(px(40.))
+                    .pl(relative(0.1))
+                    .pt(px(5.))
+                    .border_l(px(3.))
+                    .border_b(px(2.))
+                    .on_painted_layout(move |_, layout_id, window, _| {
+                        recorded.borrow_mut().push(window.layout_insets(layout_id));
+                    }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn layout_insets_are_the_resolved_padding_and_border(cx: &mut TestAppContext) {
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let recorded = recorded.clone();
+            move |_, _| InsetsTestView { recorded }
+        });
+        let any_window = AnyWindowHandle::from(window);
+
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let insets = *recorded
+            .borrow()
+            .last()
+            .expect("the listener ran at least once");
+        // 10% of the 180px content box of the parent.
+        assert_eq!(insets.padding.left, px(18.));
+        assert_eq!(insets.padding.top, px(5.));
+        assert_eq!(insets.padding.right, px(0.));
+        assert_eq!(insets.border.left, px(3.));
+        assert_eq!(insets.border.bottom, px(2.));
+        assert_eq!(insets.border.top, px(0.));
     }
 
     struct HoverProbeView {

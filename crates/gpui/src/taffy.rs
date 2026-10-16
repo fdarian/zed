@@ -516,6 +516,22 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// The padding and border widths the node was laid out with, with percentages and
+    /// the style of the current state (hover, focus) already resolved.
+    pub fn layout_insets(&mut self, id: LayoutId, scale_factor: f32) -> LayoutInsets {
+        let layout = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE);
+        let edges = |rect: &TaffyRect<f32>| Edges {
+            top: Pixels(rect.top / scale_factor),
+            right: Pixels(rect.right / scale_factor),
+            bottom: Pixels(rect.bottom / scale_factor),
+            left: Pixels(rect.left / scale_factor),
+        };
+        LayoutInsets {
+            padding: edges(&layout.padding),
+            border: edges(&layout.border),
+        }
+    }
+
     /// The content box of the node's parent: the box a percentage length on the
     /// node resolves against. `None` for a root.
     pub fn layout_parent_content_size(
@@ -530,6 +546,15 @@ impl TaffyLayoutEngine {
             height: Pixels(layout.content_box_height() / scale_factor),
         })
     }
+}
+
+/// The padding and border widths of a laid-out node, in logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LayoutInsets {
+    /// The padding on each side.
+    pub padding: Edges<Pixels>,
+    /// The border width on each side.
+    pub border: Edges<Pixels>,
 }
 
 /// A unique identifier for a layout node, generated when requesting a layout from Taffy

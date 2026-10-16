@@ -11,7 +11,7 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LayoutInsets, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
@@ -5543,6 +5543,21 @@ impl Window {
             .as_mut()
             .unwrap()
             .layout_content_size(layout_id, scale_factor)
+    }
+
+    /// The padding and border widths the given layout node was laid out with, in
+    /// logical pixels. They are the resolved ones: a percentage is a length, and a
+    /// style that depends on state (hover, focus) is the state's.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_insets(&mut self, layout_id: LayoutId) -> LayoutInsets {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .layout_insets(layout_id, scale_factor)
     }
 
     /// The content box of the given layout node's parent, in logical pixels:
