@@ -2503,7 +2503,8 @@ impl ContentMask<Pixels> {
     /// otherwise. That is exact when masks are nested, the usual case, where a child's rounded
     /// corner lies inside its parent's. It is approximate when one mask's straight edge cuts
     /// through the other's rounded corner: the cut corner comes out square instead of keeping the
-    /// arc's remaining part.
+    /// arc's remaining part. [`ContentMask::intersection_is_exact`] tells which it is, and
+    /// [`Window::with_exact_content_mask`] paints the inexact case through a group.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
         // The horizontal and vertical radius of a corner, `None` unless the mask has the corner

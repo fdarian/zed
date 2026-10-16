@@ -856,7 +856,10 @@ impl Style {
     /// Like CSS `overflow`, the mask is the padding box: the border box minus the borders, with
     /// the corners rounded by the border radius minus the adjacent border width. The rounded
     /// corners only apply when both axes clip; with one visible axis the mask is a plain
-    /// rectangle.
+    /// rectangle. That is what browsers do: the CSSWG resolved (csswg-drafts#7434, now the
+    /// "corner clipping" rule of CSS Overflow 3) that `border-radius` does not round the clip when
+    /// `clip` is mixed with `visible`, and Chromium implements it (WPT
+    /// `css-overflow/rounded-overflow-clip-visible.html`).
     pub fn overflow_mask(
         &self,
         bounds: Bounds<Pixels>,
