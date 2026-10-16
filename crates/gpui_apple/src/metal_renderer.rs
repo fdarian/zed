@@ -4572,6 +4572,163 @@ mod tests {
         assert!(is_cleared(&image, 30, 20));
     }
 
+    fn clip_mask(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: (f32, f32),
+    ) -> ContentMask<gpui::Pixels> {
+        ContentMask::rounded(
+            Bounds::new(point(px(x), px(y)), size(px(width), px(height))),
+            gpui::CornerRadii {
+                x: Corners::all(px(radius.0)),
+                y: Corners::all(px(radius.1)),
+            },
+        )
+    }
+
+    /// The pixels of a red quad covering the target, clipped by `parent` and `child` the way
+    /// `Window::with_exact_content_mask` paints them when `grouped`, and by the approximate
+    /// `intersect` of the two otherwise.
+    fn clipped_by_two(
+        parent: &ContentMask<gpui::Pixels>,
+        child: &ContentMask<gpui::Pixels>,
+        grouped: bool,
+    ) -> image::RgbaImage {
+        let mut scene = groups_scene();
+        let mut red = solid(0., 0., SIZE, SIZE, 0xff0000);
+        if grouped {
+            let effect = GroupEffect {
+                exact_clip: true,
+                ..GroupEffect::default()
+            };
+            red.content_mask = child.scale(1.);
+            scene.start_group(effect, parent.scale(1.), None);
+            scene.insert_primitive(red);
+            scene.end_group();
+        } else {
+            red.content_mask = parent.intersect(child).scale(1.);
+            scene.insert_primitive(red);
+        }
+        render(&mut scene)
+    }
+
+    /// The pixels whose centre is clearly inside or outside both masks (not within a pixel of
+    /// an edge of either), with whether they are inside.
+    fn unambiguous_pixels(
+        parent: &ContentMask<gpui::Pixels>,
+        child: &ContentMask<gpui::Pixels>,
+    ) -> Vec<(u32, u32, bool)> {
+        let inside = |x: f32, y: f32| {
+            let at = point(px(x), px(y));
+            parent.contains(&at) && child.contains(&at)
+        };
+        let mut pixels = Vec::new();
+        for y in 0..SIZE as u32 {
+            for x in 0..SIZE as u32 {
+                let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                let here = inside(cx, cy);
+                let steady = [(-1., 0.), (1., 0.), (0., -1.), (0., 1.), (-1., -1.), (1., 1.), (1., -1.), (-1., 1.)]
+                    .iter()
+                    .all(|(dx, dy)| inside(cx + dx, cy + dy) == here);
+                if steady {
+                    pixels.push((x, y, here));
+                }
+            }
+        }
+        pixels
+    }
+
+    /// How many unambiguous pixels the image gets wrong.
+    fn wrong_pixels(
+        image: &image::RgbaImage,
+        parent: &ContentMask<gpui::Pixels>,
+        child: &ContentMask<gpui::Pixels>,
+    ) -> Vec<(u32, u32)> {
+        unambiguous_pixels(parent, child)
+            .into_iter()
+            .filter(|(x, y, inside)| {
+                let [red, green, blue, _] = image.get_pixel(*x, *y).0;
+                let painted = red > 245 && green < 10 && blue < 10;
+                let cleared = red < 10 && green < 10 && blue < 10;
+                if *inside { !painted } else { !cleared }
+            })
+            .map(|(x, y, _)| (x, y))
+            .collect()
+    }
+
+    #[test]
+    fn a_child_clip_cutting_the_parents_rounded_corner_is_exact_in_a_group() {
+        // The child's square corner at (3, 3) lies in the part of the corner the parent rounds
+        // away, so one rounded rectangle cannot be the intersection.
+        let parent = clip_mask(0., 0., 40., 40., (18., 18.));
+        let child = clip_mask(3., 3., 34., 34., (0., 0.));
+        assert!(!child.intersection_is_exact(&parent));
+
+        let approximate = clipped_by_two(&parent, &child, false);
+        assert!(
+            !wrong_pixels(&approximate, &parent, &child).is_empty(),
+            "the approximate intersection was expected to bleed at the corner"
+        );
+        assert!(!is_cleared(&approximate, 3, 3));
+
+        let exact = clipped_by_two(&parent, &child, true);
+        assert_eq!(wrong_pixels(&exact, &parent, &child), vec![]);
+        assert!(is_cleared(&exact, 3, 3));
+        assert!(is_cleared(&exact, 36, 36));
+        assert_color(&exact, 8, 8, [255, 0, 0]);
+        assert_color(&exact, 20, 20, [255, 0, 0]);
+    }
+
+    #[test]
+    fn a_rounded_child_clip_crossing_the_parents_arc_is_exact_in_a_group() {
+        let parent = clip_mask(0., 0., 40., 40., (16., 16.));
+        let child = clip_mask(2., 2., 36., 36., (8., 8.));
+        assert!(!child.intersection_is_exact(&parent));
+        let exact = clipped_by_two(&parent, &child, true);
+        assert_eq!(wrong_pixels(&exact, &parent, &child), vec![]);
+    }
+
+    #[test]
+    fn mixed_elliptical_corners_at_a_shared_corner_are_exact_in_a_group() {
+        let parent = clip_mask(0., 0., 40., 40., (18., 6.));
+        let child = clip_mask(0., 0., 40., 40., (6., 18.));
+        assert!(!child.intersection_is_exact(&parent));
+
+        let approximate = clipped_by_two(&parent, &child, false);
+        assert!(
+            !wrong_pixels(&approximate, &parent, &child).is_empty(),
+            "the larger radius per axis was expected to cut more than the intersection"
+        );
+
+        let exact = clipped_by_two(&parent, &child, true);
+        assert_eq!(wrong_pixels(&exact, &parent, &child), vec![]);
+    }
+
+    #[test]
+    fn an_exact_pair_paints_the_same_with_or_without_a_group() {
+        for (parent, child) in [
+            (clip_mask(0., 0., 40., 40., (16., 16.)), clip_mask(8., 8., 24., 24., (0., 0.))),
+            (clip_mask(0., 0., 40., 40., (16., 16.)), clip_mask(0., 0., 40., 40., (6., 6.))),
+            (clip_mask(0., 0., 40., 40., (0., 0.)), clip_mask(5., 5., 30., 30., (0., 0.))),
+        ] {
+            assert!(child.intersection_is_exact(&parent));
+            let plain = clipped_by_two(&parent, &child, false);
+            let grouped = clipped_by_two(&parent, &child, true);
+            assert_eq!(wrong_pixels(&plain, &parent, &child), vec![]);
+            assert_eq!(wrong_pixels(&grouped, &parent, &child), vec![]);
+            // The edges are antialiased the same way in both, within a rounding step.
+            let worst = plain
+                .pixels()
+                .zip(grouped.pixels())
+                .flat_map(|(plain, grouped)| (0..3).map(|i| plain.0[i].abs_diff(grouped.0[i])))
+                .max()
+                .unwrap();
+            assert!(worst <= 24, "the group changed an edge pixel by {worst}/255");
+        }
+    }
+
     #[test]
     fn background_clip_text_shows_the_fill_only_through_the_glyphs() {
         let mut renderer = MetalHeadlessRenderer::new();
