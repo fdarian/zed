@@ -1,15 +1,70 @@
 use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
+    cell::RefCell,
     hash::{Hash, Hasher},
     ops::Range,
     sync::Arc,
 };
 
 use super::LineWrapper;
+use gpui_util::ResultExt as _;
+
+/// How far apart the tab stops are, as in CSS `tab-size`. Tab stops are measured
+/// from the start of each wrapped line.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum TabSize {
+    /// This many times the advance of a space in the font of the tab.
+    Spaces(f32),
+    /// A fixed distance.
+    Length(Pixels),
+}
+
+// A `TabSize` is never NaN, so the bitwise comparison agrees with `PartialEq`
+// everywhere except on `-0.0`, which no one writes.
+impl Eq for TabSize {}
+
+impl Hash for TabSize {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Spaces(spaces) => {
+                0u8.hash(state);
+                spaces.to_bits().hash(state);
+            }
+            Self::Length(length) => {
+                1u8.hash(state);
+                length.hash(state);
+            }
+        }
+    }
+}
+
+/// The distance between the tab stops, for the font a tab is shaped in. `None`
+/// when it cannot be known, and the tab then keeps the advance it was shaped with.
+type TabStopFor<'a> = &'a dyn Fn(FontId) -> Option<Pixels>;
+
+/// Closer than this to a tab stop counts as being on it, so float error in a
+/// glyph position does not make a tab one pixel wide.
+const TAB_STOP_TOLERANCE: f32 = 0.01;
+
+/// How far a tab at `position` advances, to the next tab stop after it.
+fn advance_to_tab_stop(position: Pixels, stop: Pixels) -> Pixels {
+    let stop = f32::from(stop);
+    if stop <= 0. {
+        return px(0.);
+    }
+    let advance = stop - f32::from(position).rem_euclid(stop);
+    px(if advance < TAB_STOP_TOLERANCE {
+        advance + stop
+    } else {
+        advance
+    })
+}
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -187,39 +242,34 @@ impl LineLayout {
         (left, right)
     }
 
+    /// With a `tab_stop`, also returns the x of every glyph, and then of the end
+    /// of the line, after each tab character has advanced to its tab stop. The
+    /// stops are measured from the start of the wrapped line the tab is on, so
+    /// where the lines break decides where the tabs end.
     fn compute_wrap_boundaries(
         &self,
         text: &str,
-        wrap_width: Pixels,
+        wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
-    ) -> SmallVec<[WrapBoundary; 1]> {
+        tab_stop: Option<TabStopFor<'_>>,
+    ) -> (SmallVec<[WrapBoundary; 1]>, Option<Vec<Pixels>>) {
         let mut boundaries = SmallVec::new();
         let mut first_non_whitespace_ix = None;
         let mut last_candidate_ix = None;
-        let mut last_candidate_x = px(0.);
         let mut last_boundary = WrapBoundary {
             run_ix: 0,
             glyph_ix: 0,
         };
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
-        let mut glyphs = self
-            .runs
-            .iter()
-            .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                    )
-                })
-            })
-            .peekable();
+        let mut positions = GlyphPositions::new(self, text, tab_stop);
+        let mut placed = 0;
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        for ix in 0..positions.glyphs.len() {
+            positions.place(ix + 1, last_boundary_x);
+            placed = ix + 1;
+            let boundary = positions.glyphs[ix].boundary;
+            let ch = positions.glyphs[ix].wrap_char;
             if ch == '\n' {
                 continue;
             }
@@ -228,24 +278,19 @@ impl LineLayout {
             // but there are some differences, so we have to duplicate the code here.
             if LineWrapper::is_word_char(ch) {
                 if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
+                    last_candidate_ix = Some(ix);
                 }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
+            } else if ch != ' ' && first_non_whitespace_ix.is_some() {
+                last_candidate_ix = Some(ix);
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
                 first_non_whitespace_ix = Some(boundary);
             }
 
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
-            let width = next_x - last_boundary_x;
+            let width = positions.x(ix + 1) - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            if wrap_width.is_some_and(|wrap_width| width > wrap_width) && boundary > last_boundary {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -253,19 +298,165 @@ impl LineLayout {
                     break;
                 }
 
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
-                }
+                let line_start_ix = last_candidate_ix.take().unwrap_or(ix);
+                last_boundary = positions.glyphs[line_start_ix].boundary;
+                last_boundary_x = positions.x(line_start_ix);
                 boundaries.push(last_boundary);
+                // The tab stops of what moved to the new line count from its start.
+                for moved_ix in line_start_ix + 1..=ix + 1 {
+                    positions.place(moved_ix, last_boundary_x);
+                }
             }
             prev_ch = ch;
         }
 
-        boundaries
+        for ix in placed + 1..=positions.glyphs.len() {
+            positions.place(ix, last_boundary_x);
+        }
+
+        (boundaries, positions.into_tabbed_x())
+    }
+
+    /// This layout with the glyphs at `x` and the line `x`'s last entry wide, as
+    /// computed by [`Self::compute_wrap_boundaries`].
+    fn with_x_positions(&self, x: &[Pixels]) -> LineLayout {
+        let mut x_iter = x.iter();
+        let runs = self
+            .runs
+            .iter()
+            .map(|run| ShapedRun {
+                font_id: run.font_id,
+                glyphs: run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| ShapedGlyph {
+                        position: point(*x_iter.next().expect("one x per glyph"), glyph.position.y),
+                        ..glyph.clone()
+                    })
+                    .collect(),
+            })
+            .collect();
+        LineLayout {
+            font_size: self.font_size,
+            width: *x.last().expect("the end of the line has an x"),
+            ascent: self.ascent,
+            descent: self.descent,
+            runs,
+            len: self.len,
+        }
+    }
+}
+
+struct WrapGlyph {
+    boundary: WrapBoundary,
+    /// The character at the glyph's index, as the wrapping rules see it.
+    wrap_char: char,
+    is_tab: bool,
+    font_id: FontId,
+    shaped_x: Pixels,
+}
+
+/// The x of each glyph of a line and then of its end. They are the shaped
+/// ones, unless the line has tab stops.
+struct GlyphPositions<'a> {
+    glyphs: Vec<WrapGlyph>,
+    shaped_width: Pixels,
+    tabbed: Option<TabbedPositions<'a>>,
+}
+
+struct TabbedPositions<'a> {
+    tab_stop: TabStopFor<'a>,
+    /// Final x per glyph, then the end of the line.
+    x: Vec<Pixels>,
+    /// What the tabs before each glyph added to its shaped x.
+    shift: Vec<Pixels>,
+}
+
+impl<'a> GlyphPositions<'a> {
+    fn new(layout: &LineLayout, text: &str, tab_stop: Option<TabStopFor<'a>>) -> Self {
+        let glyphs: Vec<WrapGlyph> = layout
+            .runs
+            .iter()
+            .enumerate()
+            .flat_map(|(run_ix, run)| {
+                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
+                    let character = text[glyph.index..].chars().next().unwrap();
+                    WrapGlyph {
+                        boundary: WrapBoundary { run_ix, glyph_ix },
+                        // A tab is white space that may break, like the space it is
+                        // when the text is not laid out with tab stops.
+                        wrap_char: if tab_stop.is_some() && character == '\t' {
+                            ' '
+                        } else {
+                            character
+                        },
+                        is_tab: character == '\t',
+                        font_id: run.font_id,
+                        shaped_x: glyph.position.x,
+                    }
+                })
+            })
+            .collect();
+        let tabbed = tab_stop.map(|tab_stop| {
+            let mut x: Vec<Pixels> = glyphs.iter().map(|glyph| glyph.shaped_x).collect();
+            x.push(layout.width);
+            TabbedPositions {
+                tab_stop,
+                shift: vec![px(0.); x.len()],
+                x,
+            }
+        });
+        Self {
+            glyphs,
+            shaped_width: layout.width,
+            tabbed,
+        }
+    }
+
+    fn shaped_x(&self, ix: usize) -> Pixels {
+        self.glyphs
+            .get(ix)
+            .map_or(self.shaped_width, |glyph| glyph.shaped_x)
+    }
+
+    fn x(&self, ix: usize) -> Pixels {
+        match &self.tabbed {
+            Some(tabbed) => tabbed.x[ix],
+            None => self.shaped_x(ix),
+        }
+    }
+
+    /// Positions glyph `ix`, or the end of the line when it is past the last
+    /// glyph, on a line that starts at `line_start_x`. The glyph before it must
+    /// be placed already.
+    fn place(&mut self, ix: usize, line_start_x: Pixels) {
+        let Some(tabbed) = self.tabbed.as_mut() else {
+            return;
+        };
+        if ix == 0 {
+            return;
+        }
+        let previous = &self.glyphs[ix - 1];
+        let shaped_x = self
+            .glyphs
+            .get(ix)
+            .map_or(self.shaped_width, |glyph| glyph.shaped_x);
+        let stop = previous
+            .is_tab
+            .then(|| (tabbed.tab_stop)(previous.font_id))
+            .flatten();
+        if let Some(stop) = stop {
+            let previous_x = tabbed.x[ix - 1];
+            tabbed.x[ix] = previous_x + advance_to_tab_stop(previous_x - line_start_x, stop);
+            tabbed.shift[ix] = tabbed.x[ix] - shaped_x;
+        } else {
+            tabbed.shift[ix] = tabbed.shift[ix - 1];
+            tabbed.x[ix] = shaped_x + tabbed.shift[ix];
+        }
+    }
+
+    fn into_tabbed_x(self) -> Option<Vec<Pixels>> {
+        self.tabbed.map(|tabbed| tabbed.x)
     }
 }
 
@@ -578,17 +769,22 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
+        tab_size: Option<TabSize>,
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        // Text without a tab is laid out the same whatever its tab size, so it
+        // must not take a cache entry of its own.
+        let tab_size = tab_size.filter(|_| text.as_ref().contains('\t'));
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
             runs,
             wrap_width,
             force_width: None,
+            tab_size,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -607,11 +803,30 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
-            let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
+            let shaped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let (wrap_boundaries, unwrapped_layout) = if let Some(tab_size) = tab_size {
+                let tab_stop = self.tab_stop_resolver(tab_size, font_size);
+                let (wrap_boundaries, x) = shaped_layout.compute_wrap_boundaries(
+                    text.as_ref(),
+                    wrap_width,
+                    max_lines,
+                    Some(&tab_stop),
+                );
+                let x = x.expect("tab stops were asked for");
+                (
+                    wrap_boundaries,
+                    Arc::new(shaped_layout.with_x_positions(&x)),
+                )
+            } else if let Some(wrap_width) = wrap_width {
+                let (wrap_boundaries, _) = shaped_layout.compute_wrap_boundaries(
+                    text.as_ref(),
+                    Some(wrap_width),
+                    max_lines,
+                    None,
+                );
+                (wrap_boundaries, shaped_layout)
             } else {
-                SmallVec::new()
+                (SmallVec::new(), shaped_layout)
             };
             let layout = Arc::new(WrappedLineLayout {
                 unwrapped_layout,
@@ -624,6 +839,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                tab_size,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -634,6 +850,48 @@ impl LineLayoutCache {
 
             layout
         }
+    }
+
+    /// The distance between tab stops for each font a tab is shaped in. A
+    /// space is as wide as its font says, not as the line around it.
+    fn tab_stop_resolver(
+        &self,
+        tab_size: TabSize,
+        font_size: Pixels,
+    ) -> impl Fn(FontId) -> Option<Pixels> + '_ {
+        let advances = RefCell::new(SmallVec::<[(FontId, Option<Pixels>); 2]>::new());
+        move |font_id| match tab_size {
+            TabSize::Length(length) => Some(length),
+            TabSize::Spaces(spaces) => {
+                let mut advances = advances.borrow_mut();
+                let advance = match advances.iter().find(|(id, _)| *id == font_id) {
+                    Some((_, advance)) => *advance,
+                    None => {
+                        let advance = self.space_advance(font_id, font_size);
+                        advances.push((font_id, advance));
+                        advance
+                    }
+                };
+                advance.map(|advance| advance * spaces)
+            }
+        }
+    }
+
+    fn space_advance(&self, font_id: FontId, font_size: Pixels) -> Option<Pixels> {
+        let glyph_id = self.platform_text_system.glyph_for_char(font_id, ' ');
+        let advance = glyph_id.and_then(|glyph_id| {
+            self.platform_text_system
+                .advance(font_id, glyph_id)
+                .log_err()
+        });
+        let Some(advance) = advance else {
+            log::error!("font {font_id:?} has no space to measure tab stops with");
+            return None;
+        };
+        let units_per_em = self.platform_text_system.font_metrics(font_id).units_per_em;
+        Some(px(
+            advance.width / units_per_em as f32 * f32::from(font_size)
+        ))
     }
 
     pub fn layout_line<Text>(
@@ -653,6 +911,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            tab_size: None,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -681,6 +940,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                tab_size: None,
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -890,6 +1150,7 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    tab_size: Option<TabSize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -899,6 +1160,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    tab_size: Option<TabSize>,
 }
 
 #[derive(Clone, Debug)]
@@ -991,6 +1253,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            tab_size: self.tab_size,
         }
     }
 }
@@ -1136,5 +1399,215 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    /// One glyph per character, `advance` apart, in one run.
+    fn monospace_layout(text: &str, advance: f32) -> LineLayout {
+        let glyphs = text
+            .char_indices()
+            .enumerate()
+            .map(|(column, (index, _))| glyph_at(column as f32 * advance, index))
+            .collect();
+        LineLayout {
+            width: px(text.chars().count() as f32 * advance),
+            len: text.len(),
+            ..make_layout(glyphs)
+        }
+    }
+
+    /// `text` laid out as ten pixel wide characters, with a tab stop every `stop`
+    /// pixels.
+    fn tabbed_line(text: &str, wrap_width: Option<f32>, stop: f32) -> WrappedLineLayout {
+        let shaped = monospace_layout(text, 10.);
+        let tab_stop = |_: FontId| Some(px(stop));
+        let (wrap_boundaries, x) =
+            shaped.compute_wrap_boundaries(text, wrap_width.map(px), None, Some(&tab_stop));
+        WrappedLineLayout {
+            unwrapped_layout: Arc::new(shaped.with_x_positions(&x.unwrap())),
+            wrap_boundaries,
+            wrap_width: wrap_width.map(px),
+        }
+    }
+
+    /// Where each character starts, within its wrapped line, and which line.
+    fn columns(layout: &WrappedLineLayout, text: &str) -> Vec<(f32, usize)> {
+        let line_height = px(20.);
+        text.char_indices()
+            .map(|(index, _)| {
+                let position = layout.position_for_index(index, line_height).unwrap();
+                (f32::from(position.x), (position.y / line_height) as usize)
+            })
+            .collect()
+    }
+
+    fn boundary_indices(layout: &WrappedLineLayout) -> Vec<usize> {
+        layout
+            .wrap_boundaries
+            .iter()
+            .map(|boundary| {
+                layout.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_tab_advances_to_the_next_stop_from_the_line_start() {
+        let text = "ab\tc\tdefghijk\tl";
+        let layout = tabbed_line(text, None, 40.);
+        let xs: Vec<f32> = columns(&layout, text)
+            .iter()
+            .map(|column| column.0)
+            .collect();
+        // a b [tab to 40] c [tab to 80] d..k (80..160) [tab to 200] l
+        assert_eq!(
+            xs,
+            vec![
+                0., 10., 20., 40., 50., 80., 90., 100., 110., 120., 130., 140., 150., 160., 200.
+            ]
+        );
+        assert_eq!(layout.unwrapped_layout.width, px(210.));
+    }
+
+    #[test]
+    fn test_a_tab_on_a_stop_goes_to_the_next_one() {
+        let text = "abcd\te";
+        let layout = tabbed_line(text, None, 40.);
+        assert_eq!(layout.position_for_index(5, px(20.)).unwrap().x, px(80.));
+    }
+
+    #[test]
+    fn test_two_tabs_make_two_stops() {
+        let text = "a\t\tb";
+        let layout = tabbed_line(text, None, 40.);
+        let xs: Vec<f32> = columns(&layout, text)
+            .iter()
+            .map(|column| column.0)
+            .collect();
+        assert_eq!(xs, vec![0., 10., 40., 80.]);
+    }
+
+    #[test]
+    fn test_a_line_ending_in_a_tab_is_as_wide_as_the_tab() {
+        assert_eq!(tabbed_line("ab\t", None, 40.).width(), px(40.));
+        assert_eq!(tabbed_line("abcd\t", None, 40.).width(), px(80.));
+        assert_eq!(tabbed_line("\t", None, 40.).width(), px(40.));
+    }
+
+    #[test]
+    fn test_tab_stops_count_from_the_start_of_each_wrapped_line() {
+        // "bb" does not fit after "aaaa " in 65px, so the second line is "bb\tc".
+        // Its tab ends at 40px from the line start. Counted from the start of the
+        // unwrapped line it would end at 80px, which is 30px on the second line.
+        let text = "aaaa bb\tc";
+        let layout = tabbed_line(text, Some(65.), 40.);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        let columns = columns(&layout, text);
+        // The index of a boundary is the end of the line above.
+        assert_eq!(columns[5], (50., 0));
+        assert_eq!(columns[7], (20., 1));
+        assert_eq!(columns[8], (40., 1));
+        assert_eq!(layout.unwrapped_layout.width, px(100.));
+    }
+
+    #[test]
+    fn test_a_tab_that_pushes_a_word_past_the_edge_moves_it_down() {
+        // Without tab stops this is 8 characters, 80px, which fits in 90px.
+        let text = "aa bb\tcc";
+        let layout = tabbed_line(text, Some(90.), 80.);
+        assert_eq!(boundary_indices(&layout), vec![6]);
+        assert_eq!(layout.size(px(20.)).height, px(40.));
+    }
+
+    #[test]
+    fn test_indices_and_positions_agree_across_a_tab() {
+        let text = "ab\tcd";
+        let line_height = px(20.);
+        let layout = tabbed_line(text, None, 40.);
+        for (index, _) in text.char_indices() {
+            let position = layout.position_for_index(index, line_height).unwrap();
+            let inside = point(position.x + px(1.), position.y);
+            assert_eq!(layout.index_for_position(inside, line_height), Ok(index));
+        }
+        // The tab covers 20..40.
+        for x in [20., 30., 39.] {
+            assert_eq!(
+                layout.index_for_position(point(px(x), px(0.)), line_height),
+                Ok(2)
+            );
+        }
+        assert_eq!(
+            layout.closest_index_for_position(point(px(24.), px(0.)), line_height),
+            Ok(2)
+        );
+        assert_eq!(
+            layout.closest_index_for_position(point(px(36.), px(0.)), line_height),
+            Ok(3)
+        );
+        // Past the end is the end.
+        assert_eq!(
+            layout.index_for_position(point(px(500.), px(0.)), line_height),
+            Err(5)
+        );
+        assert_eq!(
+            layout.position_for_index(5, line_height).unwrap().x,
+            px(60.)
+        );
+    }
+
+    #[test]
+    fn test_indices_and_positions_agree_on_a_wrapped_line_with_a_tab() {
+        let text = "aaaa bb\tcd";
+        let line_height = px(20.);
+        let layout = tabbed_line(text, Some(65.), 40.);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        for (index, _) in text.char_indices() {
+            // The index of a boundary is the end of the line above, and the
+            // start of the line below is found by position.
+            let position = if index == 5 {
+                point(px(0.), line_height)
+            } else {
+                layout.position_for_index(index, line_height).unwrap()
+            };
+            let inside = point(position.x + px(1.), position.y + px(1.));
+            assert_eq!(layout.index_for_position(inside, line_height), Ok(index));
+        }
+        // The tab on the second line covers 20..40.
+        assert_eq!(
+            layout.index_for_position(point(px(30.), px(21.)), line_height),
+            Ok(7)
+        );
+        assert_eq!(
+            layout.index_for_position(point(px(500.), px(21.)), line_height),
+            Err(text.len())
+        );
+        assert_eq!(
+            layout.position_for_index(text.len(), line_height),
+            Some(point(px(60.), line_height))
+        );
+    }
+
+    #[test]
+    fn test_text_without_a_tab_is_laid_out_as_shaped() {
+        let text = "aaaa bb cc";
+        let shaped = monospace_layout(text, 10.);
+        let tab_stop = |_: FontId| Some(px(40.));
+        let (with_stops, x) =
+            shaped.compute_wrap_boundaries(text, Some(px(65.)), None, Some(&tab_stop));
+        let (without_stops, none) = shaped.compute_wrap_boundaries(text, Some(px(65.)), None, None);
+        assert_eq!(with_stops, without_stops);
+        assert_eq!(none, None);
+        let shaped_x: Vec<Pixels> = shaped.runs[0]
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.position.x)
+            .collect();
+        assert_eq!(&x.unwrap()[..text.len()], shaped_x.as_slice());
+    }
+
+    #[test]
+    fn test_a_tab_stop_that_is_not_positive_makes_the_tab_empty() {
+        let text = "a\tb";
+        let layout = tabbed_line(text, None, 0.);
+        assert_eq!(layout.position_for_index(2, px(20.)).unwrap().x, px(10.));
     }
 }

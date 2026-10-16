@@ -10,7 +10,7 @@ use crate::{
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
-    Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi, point, px, quad,
+    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextRun, Window, black, phi, point, px, quad,
     rems, size,
 };
 use collections::HashSet;
@@ -618,6 +618,10 @@ pub struct TextStyle {
 
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
+
+    /// Where a tab character in the text ends. `None` leaves tabs to the font,
+    /// which gives them no meaning.
+    pub tab_size: Option<TabSize>,
 }
 
 impl Default for TextStyle {
@@ -639,6 +643,7 @@ impl Default for TextStyle {
             text_overflow: None,
             text_align: TextAlign::default(),
             line_clamp: None,
+            tab_size: None,
         }
     }
 }

@@ -720,7 +720,7 @@ mod tests {
     use super::*;
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
-    use crate::{TextRun, WindowTextSystem, WrapBoundary};
+    use crate::{TabSize, TextRun, WindowTextSystem, WrapBoundary, WrappedLine, point};
 
     fn build_wrapper() -> LineWrapper {
         let dispatcher = TestDispatcher::new(0);
@@ -1680,5 +1680,256 @@ mod tests {
             "Text that fits exactly should not be modified: '{}'",
             result
         );
+    }
+
+    /// Menlo has the same advance for every character, so tab stops land on
+    /// multiples of it.
+    #[cfg(target_os = "macos")]
+    struct TabbedText {
+        line: WrappedLine,
+        space: Pixels,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl TabbedText {
+        const LINE_HEIGHT: Pixels = px(20.);
+
+        fn shape(
+            cx: &mut TestAppContext,
+            text: &str,
+            wrap_width: Option<Pixels>,
+            tab_size: Option<TabSize>,
+        ) -> Self {
+            cx.update(|cx| {
+                let text_system = WindowTextSystem::new(cx.text_system().clone());
+                let menlo = font("Menlo");
+                let space = cx
+                    .text_system()
+                    .advance(cx.text_system().resolve_font(&menlo), px(16.), ' ')
+                    .unwrap()
+                    .width;
+                let text: SharedString = text.to_string().into();
+                let run = TextRun {
+                    len: text.len(),
+                    font: menlo,
+                    color: Default::default(),
+                    underline: Default::default(),
+                    ..Default::default()
+                };
+                let mut lines = text_system
+                    .shape_text_with_tab_size(text, px(16.), &[run], wrap_width, None, tab_size)
+                    .unwrap();
+                Self {
+                    line: lines.remove(0),
+                    space,
+                }
+            })
+        }
+
+        /// Where the character at `index` starts, in spaces from the start of its
+        /// wrapped line, and the wrapped line.
+        fn column(&self, index: usize) -> (f32, usize) {
+            let position = self
+                .line
+                .layout
+                .position_for_index(index, Self::LINE_HEIGHT)
+                .unwrap();
+            (
+                f32::from(position.x / self.space),
+                (position.y / Self::LINE_HEIGHT) as usize,
+            )
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_columns(text: &TabbedText, expected: &[(usize, f32, usize)]) {
+        for (index, column, line) in expected {
+            let (actual_column, actual_line) = text.column(*index);
+            assert!(
+                (actual_column - column).abs() < 0.01 && actual_line == *line,
+                "index {index} is at column {actual_column} of line {actual_line}, expected column {column} of line {line}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_tab_aligns_the_next_glyph_to_a_multiple_of_the_tab_size(cx: &mut TestAppContext) {
+        let text = TabbedText::shape(cx, "ab\tc\tdefg\th", None, Some(TabSize::Spaces(4.)));
+        // a b [tab to 4] c [tab to 8] d e f g [tab to 16] h
+        assert_columns(
+            &text,
+            &[
+                (0, 0., 0),
+                (1, 1., 0),
+                (2, 2., 0),
+                (3, 4., 0),
+                (5, 8., 0),
+                (9, 12., 0),
+                (10, 16., 0),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_tab_on_a_stop_goes_to_the_next_stop(cx: &mut TestAppContext) {
+        let text = TabbedText::shape(cx, "abcd\te", None, Some(TabSize::Spaces(4.)));
+        assert_columns(&text, &[(5, 8., 0)]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_two_tabs_are_two_stops(cx: &mut TestAppContext) {
+        let text = TabbedText::shape(cx, "a\t\tb", None, Some(TabSize::Spaces(4.)));
+        assert_columns(&text, &[(1, 1., 0), (2, 4., 0), (3, 8., 0)]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_tab_length_is_a_distance(cx: &mut TestAppContext) {
+        let text = TabbedText::shape(cx, "a\tb", None, Some(TabSize::Length(px(60.))));
+        let position = text
+            .line
+            .layout
+            .position_for_index(2, TabbedText::LINE_HEIGHT);
+        assert_eq!(position.unwrap().x, px(60.));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_tab_after_a_wrap_counts_from_the_new_line(cx: &mut TestAppContext) {
+        // Text wraps in 6.5 spaces: "aaaa " then "bb\tc". Counted from the start of
+        // the unwrapped line the tab would end at column 8, which is 3 on the second
+        // line.
+        let width = TabbedText::shape(cx, "a", None, None).space * 6.5;
+        let text = TabbedText::shape(cx, "aaaa bb\tc", Some(width), Some(TabSize::Spaces(4.)));
+        assert_eq!(
+            text.line.layout.wrap_boundaries(),
+            &[WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 5
+            }]
+        );
+        assert_columns(&text, &[(6, 1., 1), (7, 2., 1), (8, 4., 1)]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_tab_stops_decide_where_the_line_wraps(cx: &mut TestAppContext) {
+        // Eight characters fit in 9 spaces, but the tab makes the second word end at 10.
+        let width = TabbedText::shape(cx, "a", None, None).space * 9.;
+        let tabbed = TabbedText::shape(cx, "aa bb\tcc", Some(width), Some(TabSize::Spaces(8.)));
+        assert_eq!(tabbed.line.layout.wrap_boundaries().len(), 1);
+        let untabbed = TabbedText::shape(cx, "aa bb\tcc", Some(width), None);
+        assert_eq!(untabbed.line.layout.wrap_boundaries().len(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_line_ending_in_a_tab_ends_at_the_stop(cx: &mut TestAppContext) {
+        let text = TabbedText::shape(cx, "ab\t", None, Some(TabSize::Spaces(4.)));
+        let width = f32::from(text.line.layout.width() / text.space);
+        assert!((width - 4.).abs() < 0.01, "width is {width} spaces");
+        assert!(
+            (f32::from(text.line.layout.unwrapped_layout.width / text.space) - 4.).abs() < 0.01
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_index_and_position_round_trip_across_a_tab(cx: &mut TestAppContext) {
+        let text = TabbedText::shape(cx, "ab\tcd", None, Some(TabSize::Spaces(4.)));
+        let layout = &text.line.layout;
+        for index in 0..5 {
+            let position = layout
+                .position_for_index(index, TabbedText::LINE_HEIGHT)
+                .unwrap();
+            let inside = position + point(px(0.5), px(0.));
+            assert_eq!(
+                layout.index_for_position(inside, TabbedText::LINE_HEIGHT),
+                Ok(index)
+            );
+        }
+        // The tab covers the columns from 2 to 4.
+        for column in [2.1, 3., 3.9] {
+            let position = point(text.space * column, px(0.));
+            assert_eq!(
+                layout.index_for_position(position, TabbedText::LINE_HEIGHT),
+                Ok(2)
+            );
+        }
+        let position = point(text.space * 3.6, px(0.));
+        assert_eq!(
+            layout.closest_index_for_position(position, TabbedText::LINE_HEIGHT),
+            Ok(3)
+        );
+        let position = point(text.space * 2.4, px(0.));
+        assert_eq!(
+            layout.closest_index_for_position(position, TabbedText::LINE_HEIGHT),
+            Ok(2)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_text_without_a_tab_size_keeps_the_width_of_the_tab_it_was_shaped_with(
+        cx: &mut TestAppContext,
+    ) {
+        let plain = TabbedText::shape(cx, "ab\tc", None, None);
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let run = TextRun {
+                len: 4,
+                font: font("Menlo"),
+                ..Default::default()
+            };
+            let shaped = text_system.layout_line("ab\tc", px(16.), &[run], None);
+            assert_eq!(plain.line.layout.unwrapped_layout.width, shaped.width);
+            let positions: Vec<Pixels> = shaped
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter())
+                .map(|glyph| glyph.position.x)
+                .collect();
+            let plain_positions: Vec<Pixels> = plain
+                .line
+                .layout
+                .runs()
+                .iter()
+                .flat_map(|run| run.glyphs.iter())
+                .map(|glyph| glyph.position.x)
+                .collect();
+            assert_eq!(plain_positions, positions);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn shaped_text_without_a_tab_shares_its_layout_whatever_the_tab_size(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let shape = |tab_size| {
+                let run = TextRun {
+                    len: 6,
+                    font: font("Menlo"),
+                    ..Default::default()
+                };
+                text_system
+                    .shape_text_with_tab_size(
+                        "abc de".into(),
+                        px(16.),
+                        &[run],
+                        Some(px(40.)),
+                        None,
+                        tab_size,
+                    )
+                    .unwrap()
+                    .remove(0)
+            };
+            let with = shape(Some(TabSize::Spaces(4.)));
+            let without = shape(None);
+            assert!(Arc::ptr_eq(&with.layout, &without.layout));
+        });
     }
 }
