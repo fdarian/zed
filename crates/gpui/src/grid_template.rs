@@ -16,6 +16,15 @@ pub enum GridTrackSize {
     Length(f32),
     /// A fraction of the grid container, `0.5` for `50%`
     Percent(f32),
+    /// `calc(<pixels> + <percentage>)`: `length` pixels plus `fraction` of the grid container.
+    /// The fraction may be negative. Only a mix of the two needs this: a sum of lengths is
+    /// [`GridTrackSize::Length`].
+    Calc {
+        /// The fixed part, in pixels.
+        length: f32,
+        /// The part proportional to the grid container, `0.5` for `50%`.
+        fraction: f32,
+    },
     /// A share of the free space. Only valid as the maximum of a track.
     Fr(f32),
     /// `auto`

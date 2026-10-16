@@ -630,12 +630,14 @@ fn border_widths_to_taffy(
 fn to_taffy_track_size_min(
     size: crate::GridTrackSize,
     scale_factor: f32,
+    calcs: &mut CalcArena,
 ) -> taffy::style::MinTrackSizingFunction {
     use crate::GridTrackSize::*;
     use taffy::style::MinTrackSizingFunction as Min;
     match size {
         Length(value) => Min::length(value * scale_factor),
         Percent(value) => Min::percent(value),
+        Calc { length, fraction } => Min::calc(calcs.alloc(length * scale_factor, fraction)),
         MinContent => Min::min_content(),
         MaxContent => Min::max_content(),
         // `auto`, and the maximum-only sizes, which a parser never puts in a minimum
@@ -646,12 +648,14 @@ fn to_taffy_track_size_min(
 fn to_taffy_track_size_max(
     size: crate::GridTrackSize,
     scale_factor: f32,
+    calcs: &mut CalcArena,
 ) -> taffy::style::MaxTrackSizingFunction {
     use crate::GridTrackSize::*;
     use taffy::style::MaxTrackSizingFunction as Max;
     match size {
         Length(value) => Max::length(value * scale_factor),
         Percent(value) => Max::percent(value),
+        Calc { length, fraction } => Max::calc(calcs.alloc(length * scale_factor, fraction)),
         Fr(value) => Max::fr(value),
         Auto => Max::auto(),
         MinContent => Max::min_content(),
@@ -665,10 +669,11 @@ fn to_taffy_track_size_max(
 fn to_taffy_track(
     track: &crate::GridTrack,
     scale_factor: f32,
+    calcs: &mut CalcArena,
 ) -> taffy::style::TrackSizingFunction {
     taffy::style::TrackSizingFunction {
-        min: to_taffy_track_size_min(track.min, scale_factor),
-        max: to_taffy_track_size_max(track.max, scale_factor),
+        min: to_taffy_track_size_min(track.min, scale_factor, calcs),
+        max: to_taffy_track_size_max(track.max, scale_factor, calcs),
     }
 }
 
@@ -682,6 +687,7 @@ fn to_taffy_names(names: &[Vec<crate::SharedString>]) -> Vec<Vec<String>> {
 fn to_taffy_template(
     template: &crate::GridTemplateTracks,
     scale_factor: f32,
+    calcs: &mut CalcArena,
 ) -> (
     Vec<taffy::GridTemplateComponent<String>>,
     Vec<Vec<String>>,
@@ -691,7 +697,7 @@ fn to_taffy_template(
         .iter()
         .map(|entry| match entry {
             crate::GridTemplateEntry::Track(track) => {
-                taffy::GridTemplateComponent::Single(to_taffy_track(track, scale_factor))
+                taffy::GridTemplateComponent::Single(to_taffy_track(track, scale_factor, calcs))
             }
             crate::GridTemplateEntry::Repeat {
                 repetition,
@@ -705,7 +711,7 @@ fn to_taffy_template(
                 },
                 tracks: tracks
                     .iter()
-                    .map(|track| to_taffy_track(track, scale_factor))
+                    .map(|track| to_taffy_track(track, scale_factor, calcs))
                     .collect(),
                 line_names: to_taffy_names(line_names),
             }),
@@ -786,11 +792,11 @@ impl ToTaffy<taffy::style::Style> for Style {
         }
 
         let (grid_template_columns, grid_template_column_names) = match &self.grid_cols_template {
-            Some(template) => to_taffy_template(template, scale_factor),
+            Some(template) => to_taffy_template(template, scale_factor, calcs),
             None => (to_grid_repeat(&self.grid_cols), Vec::new()),
         };
         let (grid_template_rows, grid_template_row_names) = match &self.grid_rows_template {
-            Some(template) => to_taffy_template(template, scale_factor),
+            Some(template) => to_taffy_template(template, scale_factor, calcs),
             None => (to_grid_repeat(&self.grid_rows), Vec::new()),
         };
 
@@ -837,13 +843,13 @@ impl ToTaffy<taffy::style::Style> for Style {
                 .grid_auto_rows
                 .iter()
                 .flatten()
-                .map(|track| to_taffy_track(track, scale_factor))
+                .map(|track| to_taffy_track(track, scale_factor, calcs))
                 .collect(),
             grid_auto_columns: self
                 .grid_auto_cols
                 .iter()
                 .flatten()
-                .map(|track| to_taffy_track(track, scale_factor))
+                .map(|track| to_taffy_track(track, scale_factor, calcs))
                 .collect(),
             grid_auto_flow: self.grid_auto_flow.unwrap_or_default().into(),
             grid_template_areas: self.grid_template_areas.as_ref().map(to_taffy_areas),
@@ -1398,6 +1404,46 @@ mod tests {
                     "parent width {width}"
                 );
             }
+        }
+
+        fn grid_tracks(sizes: Vec<crate::GridTrack>) -> crate::GridTemplateTracks {
+            crate::GridTemplateTracks {
+                line_names: vec![Vec::new(); sizes.len() + 1],
+                entries: sizes
+                    .into_iter()
+                    .map(crate::GridTemplateEntry::Track)
+                    .collect(),
+            }
+        }
+
+        fn fixed(size: crate::GridTrackSize) -> crate::GridTrack {
+            crate::GridTrack {
+                min: size,
+                max: size,
+            }
+        }
+
+        #[gpui::test]
+        fn a_grid_track_is_a_length_plus_a_fraction_of_the_grid(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, |width| {
+                let mut grid = div().grid().w(px(width)).h(px(100.));
+                grid.style().grid_cols_template = Some(grid_tracks(vec![
+                    fixed(crate::GridTrackSize::Calc {
+                        length: -20.,
+                        fraction: 1.,
+                    }),
+                    fixed(crate::GridTrackSize::Length(20.)),
+                ]));
+                grid.style().grid_auto_rows = Some(vec![fixed(crate::GridTrackSize::Calc {
+                    length: 10.,
+                    fraction: 0.5,
+                })]);
+                grid.child(div().debug_selector(|| "first".into()))
+                    .child(div().debug_selector(|| "second".into()))
+                    .into_any_element()
+            });
+            assert_eq!(bounds(cx, "first").size, size(px(180.), px(60.)));
+            assert_eq!(bounds(cx, "second").size, size(px(20.), px(60.)));
         }
 
         #[test]
