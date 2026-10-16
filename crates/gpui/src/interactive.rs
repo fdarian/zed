@@ -20,6 +20,24 @@ pub trait MouseEvent: InputEvent {}
 /// A gesture event from the platform.
 pub trait GestureEvent: InputEvent {}
 
+/// What the platform knows about a key press beyond its [`Keystroke`].
+///
+/// A `Keystroke` is hashed by keymaps and names a key by what it types, so the
+/// physical key and the layout's character live here, on the events, instead.
+/// Both are `None` where the platform does not report them, and for keystrokes
+/// that are synthesized rather than typed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NativeKey {
+    /// The platform's virtual key code for the physical key. On macOS this is
+    /// `NSEvent.keyCode`, which does not change with the keyboard layout.
+    pub key_code: Option<u16>,
+
+    /// The character the active layout types on this key with shift and option
+    /// (and caps lock) applied, control and command ignored. `None` for a key
+    /// that types no character, such as an arrow or a function key.
+    pub layout_char: Option<String>,
+}
+
 /// The key down event equivalent for the platform.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyDownEvent {
@@ -32,6 +50,9 @@ pub struct KeyDownEvent {
     /// Whether to prefer character input over keybindings for this keystroke.
     /// In some cases, like AltGr on Windows, modifiers are significant for character input.
     pub prefer_character_input: bool,
+
+    /// The physical key and the layout's character for it.
+    pub native_key: NativeKey,
 }
 
 impl Sealed for KeyDownEvent {}
@@ -47,6 +68,9 @@ impl KeyEvent for KeyDownEvent {}
 pub struct KeyUpEvent {
     /// The keystroke that was released.
     pub keystroke: Keystroke,
+
+    /// The physical key and the layout's character for it.
+    pub native_key: NativeKey,
 }
 
 impl Sealed for KeyUpEvent {}

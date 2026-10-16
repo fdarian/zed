@@ -1,6 +1,6 @@
 use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent, NativeKey,
     NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
     ScrollWheelEvent, TouchPhase, point, px,
 };
@@ -132,9 +132,11 @@ pub(crate) unsafe fn platform_input_from_native(
                 keystroke: parse_keystroke(native_event),
                 is_held: native_event.isARepeat() == YES,
                 prefer_character_input: false,
+                native_key: native_key(native_event),
             })),
             NSEventType::NSKeyUp => Some(PlatformInput::KeyUp(KeyUpEvent {
                 keystroke: parse_keystroke(native_event),
+                native_key: native_key(native_event),
             })),
             NSEventType::NSLeftMouseDown
             | NSEventType::NSRightMouseDown
@@ -456,15 +458,10 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
                 }
 
                 if !control && !command && !function {
-                    let mut mods = NO_MOD;
-                    if shift {
-                        mods |= SHIFT_MOD;
-                    }
-                    if alt {
-                        mods |= OPTION_MOD;
-                    }
-
-                    key_char = Some(chars_for_modified_key(native_event.keyCode(), mods));
+                    key_char = Some(chars_for_modified_key(
+                        native_event.keyCode(),
+                        translation_modifiers(shift, alt, false),
+                    ));
                 }
 
                 if shift
@@ -496,6 +493,34 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
     }
 }
 
+/// The physical key, and what the active layout types on it with shift, option
+/// and caps lock applied. Control and command are left out of the translation,
+/// as in a browser, so Ctrl+C on a Cyrillic layout still reports the Cyrillic
+/// letter on the C key.
+unsafe fn native_key(native_event: id) -> NativeKey {
+    unsafe {
+        use cocoa::appkit::*;
+
+        let key_code = native_event.keyCode();
+        let flags = native_event.modifierFlags();
+        let modifiers = translation_modifiers(
+            flags.contains(NSEventModifierFlags::NSShiftKeyMask),
+            flags.contains(NSEventModifierFlags::NSAlternateKeyMask),
+            flags.contains(NSEventModifierFlags::NSAlphaShiftKeyMask),
+        );
+        NativeKey {
+            key_code: Some(key_code),
+            layout_char: printable(chars_for_modified_key(key_code, modifiers)),
+        }
+    }
+}
+
+/// `chars` if it is text, `None` for the control characters that Return, Tab,
+/// Escape, Delete, the arrows and the function keys translate to.
+fn printable(chars: String) -> Option<String> {
+    (!chars.is_empty() && !chars.chars().any(char::is_control)).then_some(chars)
+}
+
 fn always_use_command_layout() -> bool {
     if chars_for_modified_key(0, NO_MOD).is_ascii() {
         return false;
@@ -507,7 +532,23 @@ fn always_use_command_layout() -> bool {
 const NO_MOD: u32 = 0;
 const CMD_MOD: u32 = 1;
 const SHIFT_MOD: u32 = 2;
+const CAPS_LOCK_MOD: u32 = 4;
 const OPTION_MOD: u32 = 8;
+
+/// The `UCKeyTranslate` modifier state for the keys that change what a key types.
+fn translation_modifiers(shift: bool, option: bool, caps_lock: bool) -> u32 {
+    let mut modifiers = NO_MOD;
+    if shift {
+        modifiers |= SHIFT_MOD;
+    }
+    if option {
+        modifiers |= OPTION_MOD;
+    }
+    if caps_lock {
+        modifiers |= CAPS_LOCK_MOD;
+    }
+    modifiers
+}
 
 fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
     // Values from: https://github.com/phracker/MacOSX-SDKs/blob/master/MacOSX10.6.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h#L126
@@ -571,4 +612,34 @@ fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
         let _: () = msg_send![keyboard, release];
     }
     String::from_utf16(&buffer[..buffer_size]).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translation_modifiers_are_the_carbon_bits_shifted_right_by_eight() {
+        // shiftKey 0x200, alphaLock 0x400, optionKey 0x800
+        assert_eq!(translation_modifiers(false, false, false), 0);
+        assert_eq!(translation_modifiers(true, false, false), 0x200 >> 8);
+        assert_eq!(translation_modifiers(false, true, false), 0x800 >> 8);
+        assert_eq!(translation_modifiers(false, false, true), 0x400 >> 8);
+        assert_eq!(
+            translation_modifiers(true, true, true),
+            (0x200 | 0x800 | 0x400) >> 8
+        );
+    }
+
+    #[test]
+    fn text_is_printable_and_control_characters_are_not() {
+        for text in ["a", "A", "ß", "с", " ", "1", "`", "\u{fb01}"] {
+            assert_eq!(printable(text.to_string()).as_deref(), Some(text));
+        }
+        for control in [
+            "", "\r", "\u{3}", "\t", "\u{1b}", "\u{7f}", "\u{8}", "\u{1c}", "\u{10}",
+        ] {
+            assert_eq!(printable(control.to_string()), None, "{control:?}");
+        }
+    }
 }

@@ -12,7 +12,7 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
     Keystroke, KeystrokeEvent, LayoutId, LayoutInsets, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedClipPath, SMOOTH_SVG_SCALE_FACTOR,
@@ -2627,6 +2627,7 @@ impl Window {
                     action: action.as_ref().map(|action| action.boxed_clone()),
                     context_stack: context_stack.clone(),
                     is_held: key_down_event.is_held,
+                    native_key: key_down_event.native_key.clone(),
                 },
                 self,
                 cx,
@@ -2653,6 +2654,7 @@ impl Window {
                         action: None,
                         context_stack: context_stack.clone(),
                         is_held: key_down_event.is_held,
+                        native_key: key_down_event.native_key.clone(),
                     },
                     self,
                     cx,
@@ -6325,12 +6327,24 @@ impl Window {
     /// Dispatch a given keystroke as though the user had typed it.
     /// You can create a keystroke with Keystroke::parse("").
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
+        self.dispatch_native_keystroke(keystroke, NativeKey::default(), cx)
+    }
+
+    /// [`Self::dispatch_keystroke`] for a key whose physical key and layout
+    /// character are known, as a platform would report them.
+    pub fn dispatch_native_keystroke(
+        &mut self,
+        keystroke: Keystroke,
+        native_key: NativeKey,
+        cx: &mut App,
+    ) -> bool {
         let keystroke = keystroke.with_simulated_ime();
         let result = self.dispatch_event(
             PlatformInput::KeyDown(KeyDownEvent {
                 keystroke: keystroke.clone(),
                 is_held: false,
                 prefer_character_input: false,
+                native_key,
             }),
             cx,
         );
@@ -6970,6 +6984,7 @@ impl Window {
                 keystroke: replay.keystroke.clone(),
                 is_held: false,
                 prefer_character_input: true,
+                native_key: NativeKey::default(),
             };
 
             cx.propagate_event = true;
@@ -8427,7 +8442,7 @@ mod tests {
         ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, ContentMask, Context,
         DispatchTree, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
         FileDropEvent, FocusHandle, HitboxBehavior, InputEvent as _, InteractiveElement as _,
-        IntoElement, Keymap, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
+        IntoElement, Keymap, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, NativeKey, ParentElement, Pixels,
         Point, Render, RequestFrameOptions, ResolvedClipPath, StatefulInteractiveElement as _,
         Styled, TestAppContext, Window, WindowAppearance, WindowOptions, canvas, div, point, px,
         size,
@@ -9307,6 +9322,43 @@ mod tests {
         );
         assert_eq!(neighbour_bounds.get().origin.y, px(0.));
         cx.update(|window, _| assert_eq!(window.dispatch_depth.get(), 0));
+    }
+
+    #[gpui::test]
+    fn dispatch_native_keystroke_hands_the_native_key_to_interceptors_and_observers(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, cx) = cx.add_window_view(|_, _| EmptyView);
+        let intercepted = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let intercepted = intercepted.clone();
+            cx.intercept_keystrokes(move |event, _, _| {
+                intercepted.borrow_mut().push(event.native_key.clone());
+            })
+            .detach();
+            let observed = observed.clone();
+            cx.observe_keystrokes(move |event, _, _| {
+                observed.borrow_mut().push(event.native_key.clone());
+            })
+            .detach();
+        });
+
+        let native_key = NativeKey {
+            key_code: Some(0),
+            layout_char: Some("ф".to_string()),
+        };
+        cx.update(|window, cx| {
+            window.dispatch_native_keystroke(
+                Keystroke::parse("a").unwrap(),
+                native_key.clone(),
+                cx,
+            );
+            window.dispatch_keystroke(Keystroke::parse("b").unwrap(), cx);
+        });
+
+        assert_eq!(*intercepted.borrow(), [native_key.clone(), NativeKey::default()]);
+        assert_eq!(*observed.borrow(), [native_key, NativeKey::default()]);
     }
 
     struct HoverProbe {

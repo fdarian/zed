@@ -26,9 +26,9 @@ use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NativeKey,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, point, px, size,
 };
@@ -688,7 +688,7 @@ struct MacWindowState {
     traffic_light_frames: Option<TrafficLightFrames>,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
-    keystroke_for_do_command: Option<Keystroke>,
+    keystroke_for_do_command: Option<(Keystroke, NativeKey)>,
     do_command_handled: Option<bool>,
     external_files_dragged: bool,
     // Whether the next left-mouse click is also the focusing click.
@@ -2617,7 +2617,10 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
             {
                 {
                     let mut lock = window_state.as_ref().lock();
-                    lock.keystroke_for_do_command = Some(key_down_event.keystroke.clone());
+                    lock.keystroke_for_do_command = Some((
+                        key_down_event.keystroke.clone(),
+                        key_down_event.native_key.clone(),
+                    ));
                     lock.do_command_handled.take();
                     drop(lock);
                 }
@@ -3314,11 +3317,12 @@ extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
     let mut event_callback = lock.event_callback.take();
     drop(lock);
 
-    if let Some((keystroke, callback)) = keystroke.zip(event_callback.as_mut()) {
+    if let Some(((keystroke, native_key), callback)) = keystroke.zip(event_callback.as_mut()) {
         let handled = (callback)(PlatformInput::KeyDown(KeyDownEvent {
             keystroke,
             is_held: false,
             prefer_character_input: false,
+            native_key,
         }));
         state.as_ref().lock().do_command_handled = Some(!handled.propagate);
     }
