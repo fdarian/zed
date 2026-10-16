@@ -5456,6 +5456,27 @@ impl Window {
         Some(self.layout_bounds(parent))
     }
 
+    /// Where the scrollable overflow of the given layout node's descendants ends, relative to
+    /// the window: the far corner of their border boxes, descending through every node that does
+    /// not clip. `None` if no descendant counts. See
+    /// [`TaffyLayoutEngine::layout_scrollable_overflow_end`].
+    ///
+    /// This method should only be called as part of element drawing.
+    pub(crate) fn layout_scrollable_overflow_end(
+        &mut self,
+        layout_id: LayoutId,
+    ) -> Option<Point<Pixels>> {
+        self.invalidator.debug_assert_prepaint();
+
+        let scale_factor = self.scale_factor();
+        let snapped_offset = self.pixel_snap_point(self.element_offset());
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .layout_scrollable_overflow_end(layout_id, scale_factor)
+            .map(|end| end + snapped_offset)
+    }
+
     /// The extent of the content of the given layout node, in logical pixels,
     /// measured from its padding-box origin, so it includes padding but not
     /// border. It is the scrollable-overflow extent, so it is independent of how

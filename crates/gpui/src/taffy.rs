@@ -44,6 +44,8 @@ pub struct TaffyLayoutEngine {
     /// requested with. Taffy always resolves an absolute node against its parent, so
     /// `compute_layout` rewrites these styles to where the real containing block is.
     escapable_absolutes: Vec<containing_block::EscapableAbsolute>,
+    /// The kind of each node in `escapable_absolutes`, for lookups while walking the tree.
+    escapable_kinds: FxHashMap<LayoutId, containing_block::EscapableKind>,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -60,6 +62,7 @@ impl TaffyLayoutEngine {
             layout_bounds_scratch_space: Vec::new(),
             static_nodes: FxHashSet::default(),
             escapable_absolutes: Vec::new(),
+            escapable_kinds: FxHashMap::default(),
         }
     }
 
@@ -70,6 +73,7 @@ impl TaffyLayoutEngine {
         self.computed_layouts.clear();
         self.static_nodes.clear();
         self.escapable_absolutes.clear();
+        self.escapable_kinds.clear();
     }
 
     pub fn request_layout(
@@ -415,6 +419,75 @@ impl TaffyLayoutEngine {
         let bounds = (snapped_bounds / scale_factor).map(Pixels);
         self.absolute_layout_bounds.insert(id, bounds);
         bounds
+    }
+
+    /// Where the scrollable overflow of `container` ends: the far corner of the border boxes of
+    /// its descendants, in the layout root's coordinates, or `None` if it has none that count.
+    ///
+    /// CSS scrollable overflow, which taffy's own `content_size` approximates: a descendant's
+    /// border box counts, and so do the boxes inside it unless it clips that axis (overflow other
+    /// than `visible`), which then contributes only its own border box. Taffy's `content_size` is
+    /// not used because it also counts the part of a box before the origin as extent, so a
+    /// negative margin would add scroll range, and it counts `fixed` descendants.
+    ///
+    /// Left out, as in CSS where they belong to another box: `display: none` nodes, `fixed` nodes,
+    /// and `absolute` nodes whose containing block is not `container` or inside it.
+    pub fn layout_scrollable_overflow_end(
+        &mut self,
+        container: LayoutId,
+        scale_factor: f32,
+    ) -> Option<Point<Pixels>> {
+        let mut end = Point::new(Pixels::MIN, Pixels::MIN);
+        let positioned = !self.static_nodes.contains(&container);
+        self.extend_scrollable_overflow(container, positioned, scale_factor, &mut end);
+        (end.x != Pixels::MIN).then_some(end)
+    }
+
+    /// `positioned`: `parent` or an ancestor of it up to the scroll container is a containing
+    /// block for absolutely positioned descendants.
+    fn extend_scrollable_overflow(
+        &mut self,
+        parent: LayoutId,
+        positioned: bool,
+        scale_factor: f32,
+        end: &mut Point<Pixels>,
+    ) {
+        for index in 0..self.taffy.child_count(parent.0) {
+            let child = LayoutId(
+                self.taffy
+                    .child_at_index(parent.0, index)
+                    .expect(EXPECT_MESSAGE),
+            );
+            let style = self.taffy.style(child.0).expect(EXPECT_MESSAGE);
+            if style.display == taffy::style::Display::None {
+                continue;
+            }
+            let overflow = style.overflow;
+            match self.escapable_kinds.get(&child) {
+                Some(containing_block::EscapableKind::Fixed) => continue,
+                Some(containing_block::EscapableKind::Ancestor) if !positioned => continue,
+                Some(containing_block::EscapableKind::Ancestor) | None => {}
+            }
+
+            let bounds = self.layout_bounds(child, scale_factor);
+            let far = bounds.bottom_right();
+            end.x = end.x.max(far.x);
+            end.y = end.y.max(far.y);
+
+            let visible_x = overflow.x == taffy::style::Overflow::Visible;
+            let visible_y = overflow.y == taffy::style::Overflow::Visible;
+            if visible_x || visible_y {
+                let mut inner = Point::new(Pixels::MIN, Pixels::MIN);
+                let child_positioned = positioned || !self.static_nodes.contains(&child);
+                self.extend_scrollable_overflow(child, child_positioned, scale_factor, &mut inner);
+                if visible_x {
+                    end.x = end.x.max(inner.x);
+                }
+                if visible_y {
+                    end.y = end.y.max(inner.y);
+                }
+            }
+        }
     }
 
     /// The extent of the node's content, measured from its padding-box origin.

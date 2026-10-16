@@ -60,6 +60,7 @@ impl TaffyLayoutEngine {
             self.static_nodes.insert(id);
         }
         if let Some((kind, original)) = escapable {
+            self.escapable_kinds.insert(id, kind);
             self.escapable_absolutes
                 .push(EscapableAbsolute { id, kind, original });
         }

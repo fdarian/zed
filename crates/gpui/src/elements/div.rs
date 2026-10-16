@@ -1922,6 +1922,7 @@ impl Div {
 /// a child element of the `Div`. These IDs are used to query the layout engine for the computed
 /// bounds of the children after the layout phase is complete.
 pub struct DivFrameState {
+    layout_id: LayoutId,
     child_layout_ids: SmallVec<[LayoutId; 2]>,
 }
 
@@ -2032,7 +2033,13 @@ impl Element for Div {
             )
         });
 
-        (layout_id, DivFrameState { child_layout_ids })
+        (
+            layout_id,
+            DivFrameState {
+                layout_id,
+                child_layout_ids,
+            },
+        )
     }
 
     fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
@@ -2074,8 +2081,7 @@ impl Element for Div {
             0
         });
 
-        // The far corner of the children, which is where this div's scrollable overflow
-        // ends. Nothing that starts before the origin counts, as in CSS.
+        // The far corner of the children. Nothing that starts before the origin counts, as in CSS.
         let mut child_max = bounds.origin;
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
@@ -2105,6 +2111,13 @@ impl Element for Div {
             }
             (child_max - child_min).into()
         };
+        // A scroller's range reaches the descendants that overflow its children, not only the
+        // children. Elements that do not scroll never read where the content ends.
+        if self.interactivity.scroll_offset.is_some() {
+            child_max = window
+                .layout_scrollable_overflow_end(request_layout.layout_id)
+                .map_or(bounds.origin, |end| end.max(&bounds.origin));
+        }
         self.interactivity.content_end = Some(child_max - bounds.origin);
 
         if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
@@ -2281,8 +2294,10 @@ pub struct Interactivity {
     pub hovered: Option<bool>,
     pub(crate) tooltip_id: Option<TooltipId>,
     pub(crate) content_size: Size<Pixels>,
-    /// Where the children end, measured from the border box origin. A `Div` sets it so
-    /// that its scroll range follows CSS scrollable overflow, `content_size` otherwise.
+    /// Where the scrollable overflow ends, measured from the border box origin: the far corner of
+    /// the border boxes of the descendants, through every descendant that does not clip. A `Div`
+    /// sets it, so that its scroll range follows CSS scrollable overflow. Without it the range is
+    /// `content_size` plus the padding.
     pub(crate) content_end: Option<Point<Pixels>>,
     pub(crate) overscroll_behavior: Point<OverscrollBehavior>,
     pub(crate) programmatic_scroll_only: Point<bool>,
@@ -6555,6 +6570,121 @@ mod tests {
             .unwrap();
             wheel_at(&window, cx, 50., 50.);
             assert_eq!(scrollers.outer.offset().y, px(-10.));
+        }
+
+        /// How far a 100 by 100 scroller holding `content` can scroll along each axis.
+        fn scroll_range(
+            cx: &mut TestAppContext,
+            content: impl Fn() -> AnyElement + 'static,
+        ) -> Point<Pixels> {
+            let handle = ScrollHandle::new();
+            let _window = open_scene(cx, true, {
+                let handle = handle.clone();
+                move || {
+                    root()
+                        .child(
+                            div()
+                                .id("scroller")
+                                .w(px(100.))
+                                .h(px(100.))
+                                .overflow_scroll()
+                                .track_scroll(&handle)
+                                .child(content()),
+                        )
+                        .into_any_element()
+                }
+            });
+            handle.max_offset()
+        }
+
+        fn wide_row() -> Stateful<Div> {
+            div().id("row").w(px(300.)).h(px(20.))
+        }
+
+        #[gpui::test]
+        fn a_grandchild_wider_than_its_auto_width_parent_extends_the_scroll_range(
+            cx: &mut TestAppContext,
+        ) {
+            let range = scroll_range(cx, || {
+                div()
+                    .id("wrapper")
+                    .h(px(50.))
+                    .child(wide_row())
+                    .into_any_element()
+            });
+            assert_eq!(range, point(px(200.), px(0.)));
+        }
+
+        #[gpui::test]
+        fn a_deeply_nested_descendant_extends_the_scroll_range(cx: &mut TestAppContext) {
+            let range = scroll_range(cx, || {
+                div()
+                    .id("wrapper")
+                    .h(px(50.))
+                    .child(
+                        div()
+                            .id("inner-wrapper")
+                            .h(px(50.))
+                            .child(div().id("tall").w(px(10.)).h(px(400.))),
+                    )
+                    .into_any_element()
+            });
+            assert_eq!(range, point(px(0.), px(300.)));
+        }
+
+        #[gpui::test]
+        fn a_grandchild_inside_an_overflow_hidden_child_does_not_extend_the_scroll_range(
+            cx: &mut TestAppContext,
+        ) {
+            let range = scroll_range(cx, || {
+                div()
+                    .id("wrapper")
+                    .h(px(50.))
+                    .overflow_hidden()
+                    .child(wide_row())
+                    .into_any_element()
+            });
+            assert_eq!(range, point(px(0.), px(0.)));
+        }
+
+        #[gpui::test]
+        fn an_overflow_hidden_child_still_counts_its_own_border_box(cx: &mut TestAppContext) {
+            let range = scroll_range(cx, || {
+                div()
+                    .id("wrapper")
+                    .w(px(250.))
+                    .h(px(50.))
+                    .overflow_hidden()
+                    .child(wide_row())
+                    .into_any_element()
+            });
+            assert_eq!(range, point(px(150.), px(0.)));
+        }
+
+        #[gpui::test]
+        fn content_before_the_origin_does_not_extend_the_scroll_range(cx: &mut TestAppContext) {
+            let range = scroll_range(cx, || {
+                div()
+                    .id("wrapper")
+                    .h(px(50.))
+                    .child(div().id("shifted").ml(px(-20.)).w(px(110.)).h(px(20.)))
+                    .into_any_element()
+            });
+            assert_eq!(range, point(px(0.), px(0.)));
+        }
+
+        #[gpui::test]
+        fn a_fixed_descendant_does_not_extend_the_scroll_range(cx: &mut TestAppContext) {
+            let range = scroll_range(cx, || {
+                let mut layer = div().id("layer").w(px(300.)).h(px(300.));
+                layer.style().position = Some(crate::Position::Fixed);
+                div()
+                    .id("wrapper")
+                    .h(px(50.))
+                    .child(layer)
+                    .into_any_element()
+            });
+            assert_eq!(range, point(px(0.), px(0.)));
         }
 
         struct CachedLayers;
