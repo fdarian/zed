@@ -2636,6 +2636,24 @@ impl Window {
         });
     }
 
+    fn dispatch_ime_keystroke_observers(&mut self, event: &KeyDownEvent, cx: &mut App) {
+        let context_stack = self.context_stack();
+        cx.ime_keystroke_observers.clone().retain(&(), move |callback| {
+            (callback)(
+                &KeystrokeEvent {
+                    keystroke: event.keystroke.clone(),
+                    action: None,
+                    context_stack: context_stack.clone(),
+                    is_held: event.is_held,
+                    native_key: event.native_key.clone(),
+                    is_composing: event.is_composing,
+                },
+                self,
+                cx,
+            )
+        });
+    }
+
     pub(crate) fn dispatch_keystroke_interceptors(
         &mut self,
         event: &dyn Any,
@@ -6410,7 +6428,7 @@ impl Window {
         // doesn't show hover highlights on the item under the mouse cursor.
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
-            PlatformInput::KeyDown(_) => InputModality::Keyboard,
+            PlatformInput::KeyDown(_) | PlatformInput::ImeKeyDown(_) => InputModality::Keyboard,
             // A drag is deliberate; only an idle pointer gets the slop.
             PlatformInput::MouseMove(mouse_move)
                 if old_modality == InputModality::Keyboard
@@ -6531,7 +6549,9 @@ impl Window {
                 }
             },
             PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
-            PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
+            PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) | PlatformInput::ImeKeyDown(_) => {
+                event
+            }
         };
 
         match &event {
@@ -6584,6 +6604,8 @@ impl Window {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
+        } else if let PlatformInput::ImeKeyDown(key_down_event) = &event {
+            self.dispatch_ime_keystroke_observers(key_down_event, cx);
         }
 
         // Must run after the move is dispatched: the platform owns the gesture afterwards, so this

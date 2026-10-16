@@ -718,6 +718,7 @@ pub struct App {
     pub(crate) event_listeners: SubscriberSet<EntityId, (TypeId, Listener)>,
     pub(crate) keystroke_observers: SubscriberSet<(), KeystrokeObserver>,
     pub(crate) keystroke_interceptors: SubscriberSet<(), KeystrokeObserver>,
+    pub(crate) ime_keystroke_observers: SubscriberSet<(), KeystrokeObserver>,
     pub(crate) keyboard_layout_observers: SubscriberSet<(), Handler>,
     pub(crate) thermal_state_observers: SubscriberSet<(), Handler>,
     pub(crate) system_wake_observers: SubscriberSet<(), Handler>,
@@ -852,6 +853,7 @@ impl App {
                 release_listeners: SubscriberSet::new(),
                 keystroke_observers: SubscriberSet::new(),
                 keystroke_interceptors: SubscriberSet::new(),
+                ime_keystroke_observers: SubscriberSet::new(),
                 keyboard_layout_observers: SubscriberSet::new(),
                 thermal_state_observers: SubscriberSet::new(),
                 system_wake_observers: SubscriberSet::new(),
@@ -2246,6 +2248,26 @@ impl App {
                 true
             }),
         )
+    }
+
+    /// Register a callback to be invoked for a key the platform's input method receives
+    /// before GPUI does (see [`PlatformInput::ImeKeyDown`]), in any window. It fires before
+    /// the input method sees the key, so it can tell a key that composes from one that
+    /// does not, and it cannot stop the input method. [`App::observe_keystrokes`] and
+    /// [`App::intercept_keystrokes`] never see these keys.
+    pub fn observe_ime_keystrokes(
+        &mut self,
+        mut f: impl FnMut(&KeystrokeEvent, &mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) = self.ime_keystroke_observers.insert(
+            (),
+            Box::new(move |event, window, cx| {
+                f(event, window, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
     }
 
     /// Register key bindings.

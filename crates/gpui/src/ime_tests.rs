@@ -4,9 +4,8 @@
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use crate::{
-    App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle, InteractiveElement,
-    IntoElement, Keystroke, ParentElement, Pixels, Point, Render, Styled, TestAppContext,
-    UTF16Selection, Window, canvas, div,
+    App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, NativeKey, ParentElement, Pixels,
+    Point, Render, Styled, TestAppContext, UTF16Selection, Window, canvas, div,
 };
 
 /// ASCII only, so UTF-16 offsets are byte offsets.
@@ -170,4 +169,51 @@ fn key_events_say_whether_the_focused_input_has_marked_text(cx: &mut TestAppCont
 fn a_window_with_no_input_handler_is_not_composing(cx: &mut TestAppContext) {
     let (_, cx) = cx.add_window_view(|_, _| crate::Empty);
     cx.update(|window, cx: &mut App| assert!(!window.is_composing(cx)));
+}
+
+#[gpui::test]
+fn an_ime_key_reaches_only_the_ime_observers(cx: &mut TestAppContext) {
+    let (composer, cx) = focused_composer(cx);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    cx.update(|_, cx| {
+        let intercepted = seen.clone();
+        cx.intercept_keystrokes(move |_, _, _| intercepted.borrow_mut().push("intercepted".into()))
+            .detach();
+        let observed = seen.clone();
+        cx.observe_keystrokes(move |_, _, _| observed.borrow_mut().push("observed".into()))
+            .detach();
+        let seen = seen.clone();
+        cx.observe_ime_keystrokes(move |event, _, _| {
+            seen.borrow_mut().push(format!(
+                "ime {} composing={} held={}",
+                event.keystroke.key, event.is_composing, event.is_held
+            ));
+        })
+        .detach();
+    });
+
+    let ime_key_down = |keystroke: &str, is_composing: bool| KeyDownEvent {
+        keystroke: Keystroke::parse(keystroke).unwrap(),
+        is_held: false,
+        prefer_character_input: false,
+        native_key: NativeKey::default(),
+        is_composing,
+    };
+    cx.update(|window, cx| {
+        let result = window.dispatch_event(
+            crate::PlatformInput::ImeKeyDown(ime_key_down("a", false)),
+            cx,
+        );
+        assert!(result.propagate, "the platform still hands the key to the input method");
+        window.dispatch_event(
+            crate::PlatformInput::ImeKeyDown(ime_key_down("enter", true)),
+            cx,
+        );
+    });
+
+    assert_eq!(
+        *seen.borrow(),
+        ["ime a composing=false held=false", "ime enter composing=true held=false"]
+    );
+    assert_eq!(composer.read_with(cx, |composer, _| composer.text.clone()), "");
 }

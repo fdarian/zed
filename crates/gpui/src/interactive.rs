@@ -796,6 +796,12 @@ pub enum PlatformInput {
     KeyDown(KeyDownEvent),
     /// A key was released.
     KeyUp(KeyUpEvent),
+    /// A key the platform's input method receives before GPUI does, sent
+    /// before it hands the key over. It reaches [`App::observe_ime_keystrokes`]
+    /// and nothing else: no interceptor, key binding, action or text input
+    /// sees it, and nothing it does can stop the input method. If the input
+    /// method declines the key, a [`PlatformInput::KeyDown`] for it follows.
+    ImeKeyDown(KeyDownEvent),
     /// The keyboard modifiers were changed.
     ModifiersChanged(ModifiersChangedEvent),
     /// The mouse was pressed.
@@ -823,6 +829,7 @@ impl PlatformInput {
         match self {
             PlatformInput::KeyDown { .. } => None,
             PlatformInput::KeyUp { .. } => None,
+            PlatformInput::ImeKeyDown { .. } => None,
             PlatformInput::ModifiersChanged { .. } => None,
             PlatformInput::MouseDown(event) => Some(event),
             PlatformInput::MouseUp(event) => Some(event),
@@ -840,6 +847,7 @@ impl PlatformInput {
         match self {
             PlatformInput::KeyDown(event) => Some(event),
             PlatformInput::KeyUp(event) => Some(event),
+            PlatformInput::ImeKeyDown(_) => None,
             PlatformInput::ModifiersChanged(event) => Some(event),
             PlatformInput::MouseDown(_) => None,
             PlatformInput::MouseUp(_) => None,
@@ -859,6 +867,7 @@ impl PlatformInput {
         match self {
             PlatformInput::KeyDown(_) => "key_down",
             PlatformInput::KeyUp(_) => "key_up",
+            PlatformInput::ImeKeyDown(_) => "ime_key_down",
             PlatformInput::ModifiersChanged(_) => "modifiers_changed",
             PlatformInput::MouseDown(_) => "mouse_down",
             PlatformInput::MouseUp(_) => "mouse_up",

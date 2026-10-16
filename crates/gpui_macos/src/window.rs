@@ -2617,6 +2617,12 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
                     && !key_down_event.keystroke.modifiers.function
                     && !key_down_event.keystroke.modifiers.platform)
             {
+                // Only a key the input method will take, not one it is merely
+                // offered (arrows, escape): those mostly come straight back
+                // through `do_command_by_selector` as the one KeyDown.
+                if is_composing || is_ime_printable_key {
+                    run_callback(PlatformInput::ImeKeyDown(key_down_event.clone()));
+                }
                 {
                     let mut lock = window_state.as_ref().lock();
                     lock.keystroke_for_do_command = Some((
