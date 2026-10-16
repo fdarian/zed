@@ -720,7 +720,9 @@ mod tests {
     use super::*;
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
-    use crate::{TabSize, TextRun, WindowTextSystem, WrapBoundary, WrappedLine, point};
+    use crate::{
+        TabSize, TextLayoutOptions, TextRun, WindowTextSystem, WrapBoundary, WrappedLine, point,
+    };
 
     fn build_wrapper() -> LineWrapper {
         let dispatcher = TestDispatcher::new(0);
@@ -1717,7 +1719,14 @@ mod tests {
                     ..Default::default()
                 };
                 let mut lines = text_system
-                    .shape_text_with_tab_size(text, px(16.), &[run], wrap_width, None, tab_size)
+                    .shape_text_with_options(
+                        text,
+                        px(16.),
+                        &[run],
+                        wrap_width,
+                        None,
+                        TextLayoutOptions { tab_size },
+                    )
                     .unwrap();
                 Self {
                     line: lines.remove(0),
@@ -1916,13 +1925,13 @@ mod tests {
                     ..Default::default()
                 };
                 text_system
-                    .shape_text_with_tab_size(
+                    .shape_text_with_options(
                         "abc de".into(),
                         px(16.),
                         &[run],
                         Some(px(40.)),
                         None,
-                        tab_size,
+                        TextLayoutOptions { tab_size },
                     )
                     .unwrap()
                     .remove(0)

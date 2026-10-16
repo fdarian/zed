@@ -715,13 +715,13 @@ impl TextLayout {
                         )
                     } else if let Some(unclipped) = window
                         .text_system()
-                        .shape_text_with_tab_size(
+                        .shape_text_with_options(
                             text.clone(),
                             font_size,
                             &runs,
                             None,
                             None,
-                            text_style.tab_size,
+                            text_style.layout_options(),
                         )
                         .log_err()
                         && unclipped
@@ -751,13 +751,13 @@ impl TextLayout {
 
                 let Some(lines) = window
                     .text_system()
-                    .shape_text_with_tab_size(
+                    .shape_text_with_options(
                         text,
                         font_size,
                         &runs,
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.
-                        text_style.tab_size,
+                        text_style.layout_options(),
                     )
                     .log_err()
                 else {

@@ -536,20 +536,25 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
-        self.shape_text_with_tab_size(text, font_size, runs, wrap_width, line_clamp, None)
+        self.shape_text_with_options(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+            TextLayoutOptions::default(),
+        )
     }
 
-    /// Like [`Self::shape_text`], with the tab characters of the text advancing
-    /// to tab stops, `tab_size` apart and counted from the start of each wrapped
-    /// line. Without a `tab_size` the font decides how wide a tab is.
-    pub fn shape_text_with_tab_size(
+    /// Like [`Self::shape_text`], laying the text out as `options` say.
+    pub fn shape_text_with_options(
         &self,
         text: SharedString,
         font_size: Pixels,
         runs: &[TextRun],
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
-        tab_size: Option<TabSize>,
+        options: TextLayoutOptions,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
@@ -617,7 +622,7 @@ impl WindowTextSystem {
                 &font_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
-                tab_size,
+                options,
             );
             wrapped_lines += layout.wrap_boundaries.len();
 

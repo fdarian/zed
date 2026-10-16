@@ -10,8 +10,8 @@ use crate::{
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement,
-    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextRun, Window, black, phi, point, px, quad,
-    rems, size,
+    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextLayoutOptions, TextRun, Window,
+    black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -680,6 +680,13 @@ impl TextStyle {
         }
 
         self
+    }
+
+    /// What the text of this style is laid out with, beyond its font and wrap width.
+    pub fn layout_options(&self) -> TextLayoutOptions {
+        TextLayoutOptions {
+            tab_size: self.tab_size,
+        }
     }
 
     /// Get the font configured for this text style.

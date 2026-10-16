@@ -44,6 +44,14 @@ impl Hash for TabSize {
     }
 }
 
+/// What a line of text is laid out with, beyond its fonts and its wrap width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TextLayoutOptions {
+    /// Where a tab character ends. `None` leaves the tab to the font, which gives
+    /// it no meaning.
+    pub tab_size: Option<TabSize>,
+}
+
 /// The distance between the tab stops, for the font a tab is shaped in. `None`
 /// when it cannot be known, and the tab then keeps the advance it was shaped with.
 type TabStopFor<'a> = &'a dyn Fn(FontId) -> Option<Pixels>;
@@ -769,7 +777,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
-        tab_size: Option<TabSize>,
+        options: TextLayoutOptions,
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
@@ -777,14 +785,16 @@ impl LineLayoutCache {
     {
         // Text without a tab is laid out the same whatever its tab size, so it
         // must not take a cache entry of its own.
-        let tab_size = tab_size.filter(|_| text.as_ref().contains('\t'));
+        let options = TextLayoutOptions {
+            tab_size: options.tab_size.filter(|_| text.as_ref().contains('\t')),
+        };
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
             runs,
             wrap_width,
             force_width: None,
-            tab_size,
+            options,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -804,7 +814,7 @@ impl LineLayoutCache {
             drop(current_frame);
             let text = SharedString::from(text);
             let shaped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
-            let (wrap_boundaries, unwrapped_layout) = if let Some(tab_size) = tab_size {
+            let (wrap_boundaries, unwrapped_layout) = if let Some(tab_size) = options.tab_size {
                 let tab_stop = self.tab_stop_resolver(tab_size, font_size);
                 let (wrap_boundaries, x) = shaped_layout.compute_wrap_boundaries(
                     text.as_ref(),
@@ -839,7 +849,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
-                tab_size,
+                options,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -911,7 +921,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
-            tab_size: None,
+            options: TextLayoutOptions::default(),
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -940,7 +950,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
-                tab_size: None,
+                options: TextLayoutOptions::default(),
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -1150,7 +1160,7 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
-    tab_size: Option<TabSize>,
+    options: TextLayoutOptions,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -1160,7 +1170,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
-    tab_size: Option<TabSize>,
+    options: TextLayoutOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -1253,7 +1263,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
-            tab_size: self.tab_size,
+            options: self.options,
         }
     }
 }
