@@ -12,7 +12,7 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragOperation, Edges, Effect, Entity,
     EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
-    Keystroke, KeystrokeEvent, LayoutId, LayoutInsets, LineLayoutIndex, MeasuredLeaf, Modifiers, ModifiersChangedEvent,
+    Keystroke, KeystrokeEvent, LayoutCounters, LayoutId, LayoutInsets, LineLayoutIndex, MeasuredLeaf, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, OverlineStyle, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
@@ -1497,6 +1497,9 @@ pub struct Window {
     layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
+    /// [`GlobalElementId::scope_hash`] of the element being drawn, or of the nearest ancestor of
+    /// it that has an id: what the layout nodes it requests are keyed by.
+    pub(crate) layout_scope: u64,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     visibility: Visibility,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
@@ -2247,6 +2250,7 @@ impl Window {
             layout_engine: Some(TaffyLayoutEngine::new()),
             root: None,
             element_id_stack: SmallVec::default(),
+            layout_scope: 0,
             text_style_stack: Vec::new(),
             visibility: Visibility::Visible,
             rendered_entity_stack: Vec::new(),
@@ -4049,7 +4053,7 @@ impl Window {
         self.captured_hitbox = captured_hitbox;
         self.mouse_hit_test = mouse_hit_test;
 
-        self.layout_engine.as_mut().unwrap().end_frame();
+        self.layout_engine.as_mut().unwrap().end_pass();
         // An element's state was moved out of `rendered_frame` when the pass reached it. Hand
         // it back, updated, or the next draw would find it gone and start the element over.
         for (key, state) in self.next_frame.element_states.drain() {
@@ -4255,7 +4259,7 @@ impl Window {
     /// Throws an abandoned pass away so the next one starts from what the frame before it left.
     /// What a pass publishes outside the frame stays published.
     fn discard_pass(&mut self, cx: &mut App) {
-        self.layout_engine.as_mut().unwrap().end_frame();
+        self.layout_engine.as_mut().unwrap().end_pass();
         // An element's state was moved out of `rendered_frame` when the pass reached it. Hand
         // it back, updated, or the next pass would find it gone and start the element over.
         for (key, state) in self.next_frame.element_states.drain() {
@@ -6644,7 +6648,8 @@ impl Window {
         let rem_size = self.rem_size();
         let scale_factor = self.scale_factor();
 
-        self.layout_engine.as_mut().unwrap().request_layout(
+        self.layout_engine.as_mut().unwrap().request_keyed_layout(
+            self.layout_scope,
             style,
             rem_size,
             scale_factor,
@@ -6897,6 +6902,11 @@ impl Window {
             .as_ref()
             .unwrap()
             .layout_natural_width(layout_id, scale_factor)
+    }
+
+    /// What the layout engine of the window has done since the window was made.
+    pub fn layout_counters(&self) -> LayoutCounters {
+        self.layout_engine.as_ref().unwrap().counters()
     }
 
     #[cfg(test)]

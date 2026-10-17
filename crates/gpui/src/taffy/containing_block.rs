@@ -88,7 +88,10 @@ impl TaffyLayoutEngine {
             let id = self.escapable_nodes[index];
             let escapable = self.meta(id).escapable();
             let kind = escapable.kind;
+            // A node without a parent is a root, whatever it was under before.
             let Some(parent) = self.taffy.parent(id.0) else {
+                let original = escapable.original.clone();
+                changed |= self.set_taffy_style(id, original);
                 continue;
             };
             let parent = LayoutId(parent);
@@ -100,10 +103,7 @@ impl TaffyLayoutEngine {
             if containing != parent {
                 self.rebase_onto(&mut desired, parent, containing, root);
             }
-            if self.taffy.style(id.0).expect(EXPECT_MESSAGE) != &desired {
-                self.taffy.set_style(id.0, desired).expect(EXPECT_MESSAGE);
-                changed = true;
-            }
+            changed |= self.set_taffy_style(id, desired);
         }
         changed
     }

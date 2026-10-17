@@ -98,7 +98,6 @@ impl CalcArena {
             .retain(|_, entry| std::mem::take(&mut entry.marked));
     }
 
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.values.len()
     }

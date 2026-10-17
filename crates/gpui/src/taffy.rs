@@ -56,9 +56,54 @@ type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 struct NodeContext {
     measure: NodeMeasureFn,
 }
+/// Which node of a frame a request is, for the engine to give it the node it kept from the frame
+/// before: the requests under one scope (the hash of the [`crate::GlobalElementId`] of the element
+/// asking, or of the nearest ancestor that has one) in the order they were made.
+///
+/// Two requests can have one key (a hash collision, or an element built twice), and a request can
+/// get the node of another one. That is why a request only takes a node from this key to compare
+/// what it has and change what differs.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+struct NodeKey {
+    scope: u64,
+    ordinal: u32,
+}
+
+/// What the engine does, for tests and for the counters gpuix shows. They count since the engine
+/// was made.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayoutCounters {
+    /// Nodes taffy was asked to make.
+    pub nodes_created: u64,
+    /// Requests that got the node of the frame before.
+    pub nodes_reused: u64,
+    /// Nodes freed as garbage.
+    pub nodes_removed: u64,
+    /// Times a style was given to taffy that differed from the one the node had.
+    pub styles_set: u64,
+    /// Times the children of a node were set to a list that differed from its own.
+    pub children_set: u64,
+}
+
 /// What the engine knows about a node besides what taffy does. It lives as long as the node.
 #[derive(Default)]
 struct NodeMeta {
+    /// What the node is looked up by, if it is keyed.
+    key: Option<NodeKey>,
+    /// The pass that last requested the node: a node whose parent was not requested in the pass
+    /// that is under way has a parent that is out of date.
+    requested_in_pass: u64,
+    /// The style the element asked for, when the node was given another one in place of it
+    /// (`intrinsic` widths, a natural-width probe, a forced width, a rebased containing block, a
+    /// window root stretched to fill). `None` when taffy holds the style as requested. A request
+    /// compares its style with this and not with what taffy holds.
+    requested: Option<Box<taffy::style::Style>>,
+    /// The node asks for its natural width ([`Style::measure_natural_width`]).
+    natural: bool,
+    /// Which collection last reached the node.
+    mark: u32,
+    /// The pass that last gave the node a width to fill the window with, if any.
+    stretched_in_pass: u64,
     /// The node is [`crate::Position::Static`]. It lays out as taffy `Relative` but is not a
     /// containing block, which taffy has no way to say.
     is_static: bool,
@@ -85,6 +130,9 @@ impl NodeMeta {
 
     /// Calls `visit` with every calc that the node holds besides the ones in its taffy style.
     fn for_each_length(&self, mut visit: impl FnMut(taffy::style::CompactLength)) {
+        if let Some(requested) = &self.requested {
+            calc::for_each_length(requested, &mut visit);
+        }
         if let Some(escapable) = &self.escapable {
             calc::for_each_length(&escapable.original, &mut visit);
         }
@@ -116,12 +164,30 @@ pub struct TaffyLayoutEngine {
     #[cfg(test)]
     natural_passes: usize,
 
-    /// The nodes with `NodeMeta::escapable`, in the order they were requested.
+    /// The nodes with `NodeMeta::escapable` that the pass requested, in the order they were
+    /// requested.
     escapable_nodes: Vec<LayoutId>,
     /// Owns what the `calc()` lengths in the taffy styles point to.
     calcs: CalcArena,
     /// [`Self::painted_extent`] of the nodes it has been asked about, and of what is below them.
     painted_extents: FxHashMap<LayoutId, PaintedExtent>,
+    /// How many values `calcs` held after the last sweep: it only needs a sweep when it holds more.
+    calcs_after_sweep: usize,
+
+    /// The nodes that keyed requests can get, by key.
+    keys: FxHashMap<NodeKey, LayoutId>,
+    /// How many keyed requests each scope made in the pass.
+    ordinals: FxHashMap<u64, u32>,
+    /// The number of the pass under way. Starts at 1: no node is from pass 0.
+    pass: u64,
+    /// The nodes that were given a width to fill the window with and have not got their style back.
+    stretched: Vec<LayoutId>,
+    /// Counts the collections, to tell the nodes one reached.
+    collection: u32,
+    /// How many nodes the last collection found alive.
+    alive_after_collection: usize,
+    scratch_stack: Vec<LayoutId>,
+    counters: LayoutCounters,
 }
 
 /// Where the boxes of a subtree reach.
@@ -135,6 +201,10 @@ struct PaintedExtent {
     /// node is one itself.
     open_absolute: bool,
 }
+
+/// A pass that ends without a frame lets its nodes pile up until there are this many more than
+/// the last collection left, over twice as many, and then collects.
+const GARBAGE_SLACK: usize = 4096;
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
 
@@ -157,7 +227,20 @@ impl TaffyLayoutEngine {
             escapable_nodes: Vec::new(),
             calcs: CalcArena::default(),
             painted_extents: FxHashMap::default(),
+            calcs_after_sweep: 0,
+            keys: FxHashMap::default(),
+            ordinals: FxHashMap::default(),
+            pass: 1,
+            stretched: Vec::new(),
+            collection: 0,
+            alive_after_collection: 0,
+            scratch_stack: Vec::new(),
+            counters: LayoutCounters::default(),
         }
+    }
+
+    pub fn counters(&self) -> LayoutCounters {
+        self.counters
     }
 
     fn meta(&self, id: LayoutId) -> &NodeMeta {
@@ -173,8 +256,15 @@ impl TaffyLayoutEngine {
     }
 
     /// Ends a pass over the tree, whether or not a frame came of it: forgets what the pass
-    /// computed and what it asked layout for. The nodes stay.
+    /// computed and what it asked layout for. The nodes stay, for the next pass to find by their
+    /// keys; they are freed by [`Self::end_frame`], or here when a run of passes that make no
+    /// frame (layout-only passes, abandoned ones) has left far more of them than the last
+    /// collection did.
     pub fn end_pass(&mut self) {
+        if self.meta.len() > self.alive_after_collection * 2 + GARBAGE_SLACK {
+            self.collect_garbage();
+        }
+        self.give_back_stretched_widths(false);
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
@@ -182,21 +272,65 @@ impl TaffyLayoutEngine {
         self.natural_pending.clear();
         self.natural_widths.clear();
         self.painted_extents.clear();
-    }
-
-    /// Ends a pass and frees the nodes that nothing needs anymore, along with their calcs.
-    ///
-    /// Every node is built anew by every pass, so none is needed: freeing is dropping all of
-    /// them.
-    pub fn end_frame(&mut self) {
-        self.end_pass();
-        self.taffy.clear();
-        self.meta.clear();
         self.escapable_nodes.clear();
-        self.sweep_calcs();
+        self.ordinals.clear();
+        self.pass += 1;
     }
 
-    /// Frees the calcs that no node holds, which are all of them when no node is left.
+    /// Ends a pass and frees the nodes that nothing needs anymore, along with their calcs: the
+    /// ones that no root laid out in the pass reaches.
+    pub fn end_frame(&mut self) {
+        self.collect_garbage();
+        self.end_pass();
+        if self.calcs.len() > self.calcs_after_sweep {
+            self.sweep_calcs();
+        }
+    }
+
+    /// Frees every node that is not in the tree of a root that the pass laid out. Nodes that were
+    /// requested and then left out of every tree are garbage, so are the ones of an abandoned
+    /// pass that the last pass did not ask for again.
+    fn collect_garbage(&mut self) {
+        self.collection += 1;
+        let collection = self.collection;
+        let mut alive = 0;
+        let mut stack = std::mem::take(&mut self.scratch_stack);
+        stack.extend(self.computed_layouts.iter().copied());
+        while let Some(id) = stack.pop() {
+            let meta = self.meta_mut(id);
+            if std::mem::replace(&mut meta.mark, collection) == collection {
+                continue;
+            }
+            alive += 1;
+            for index in 0..self.taffy.child_count(id.0) {
+                stack.push(LayoutId(
+                    self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE),
+                ));
+            }
+        }
+        self.scratch_stack = stack;
+        self.alive_after_collection = alive;
+        if alive == self.meta.len() {
+            return;
+        }
+
+        let garbage: Vec<LayoutId> = self
+            .meta
+            .iter()
+            .filter(|(_, meta)| meta.mark != collection)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in garbage {
+            let meta = self.meta.remove(&id).expect("garbage was found in the metadata");
+            if let Some(key) = meta.key {
+                self.keys.remove(&key);
+            }
+            self.taffy.remove(id.0).expect(EXPECT_MESSAGE);
+            self.counters.nodes_removed += 1;
+        }
+    }
+
+    /// Frees the calcs that no node holds.
     fn sweep_calcs(&mut self) {
         for (id, meta) in &self.meta {
             let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
@@ -204,12 +338,56 @@ impl TaffyLayoutEngine {
             meta.for_each_length(|length| self.calcs.mark(length));
         }
         self.calcs.sweep();
+        self.calcs_after_sweep = self.calcs.len();
     }
 
     pub fn mark_detached(&mut self, id: LayoutId) {
         self.meta_mut(id).detached = true;
     }
 
+    /// The style of the node as its element asked for it, whatever layout did to it since.
+    fn requested_style(&self, id: LayoutId) -> &taffy::style::Style {
+        self.meta(id)
+            .requested
+            .as_deref()
+            .unwrap_or_else(|| self.taffy.style(id.0).expect(EXPECT_MESSAGE))
+    }
+
+    /// Gives taffy `style` for the node, and says whether that changed anything: a style equal to
+    /// the node's own is left alone, so the node keeps its layout results and so do its
+    /// ancestors.
+    fn set_taffy_style(&mut self, id: LayoutId, style: taffy::style::Style) -> bool {
+        if self.taffy.style(id.0).expect(EXPECT_MESSAGE) == &style {
+            return false;
+        }
+        self.counters.styles_set += 1;
+        self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+        true
+    }
+
+    /// Gives the node a style that its element did not ask for, remembering the one it did. See
+    /// [`NodeMeta::requested`].
+    fn rewrite_style(&mut self, id: LayoutId, style: taffy::style::Style) -> bool {
+        if self.taffy.style(id.0).expect(EXPECT_MESSAGE) == &style {
+            return false;
+        }
+        if self.meta(id).requested.is_none() {
+            let requested = self.taffy.style(id.0).expect(EXPECT_MESSAGE).clone();
+            self.meta_mut(id).requested = Some(Box::new(requested));
+        }
+        self.set_taffy_style(id, style)
+    }
+
+    /// Gives the node the style its element asked for, if layout changed it.
+    fn restore_requested_style(&mut self, id: LayoutId) {
+        let meta = self.meta_mut(id);
+        meta.unforced_width = None;
+        if let Some(requested) = meta.requested.take() {
+            self.set_taffy_style(id, *requested);
+        }
+    }
+
+    /// A request of a node that no frame keeps: the node is new every time.
     pub fn request_layout(
         &mut self,
         style: Style,
@@ -218,8 +396,57 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
-        let meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
+        self.new_node(None, &style, taffy_style, rem_size, scale_factor, children)
+    }
 
+    /// A request of a node that the next frame's request with the same `scope` and place in the
+    /// requests under it can get back: it has the node of this one, with the style and children
+    /// the request gave it. Everything that the request leaves as it was keeps its layout results
+    /// from the frame before.
+    pub fn request_keyed_layout(
+        &mut self,
+        scope: u64,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        children: &[LayoutId],
+    ) -> LayoutId {
+        let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
+        let ordinal = self.ordinals.entry(scope).or_default();
+        let key = NodeKey {
+            scope,
+            ordinal: *ordinal,
+        };
+        *ordinal += 1;
+
+        let Some(id) = self.keys.get(&key).copied() else {
+            return self.new_node(Some(key), &style, taffy_style, rem_size, scale_factor, children);
+        };
+        debug_assert_ne!(
+            self.meta(id).requested_in_pass,
+            self.pass,
+            "a key is given to one request of a pass"
+        );
+        self.counters.nodes_reused += 1;
+        let meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
+        self.reuse_node(id, meta, taffy_style);
+        self.set_children_if_changed(id, children);
+        self.register(id, &style);
+        id
+    }
+
+    fn new_node(
+        &mut self,
+        key: Option<NodeKey>,
+        style: &Style,
+        taffy_style: taffy::style::Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        children: &[LayoutId],
+    ) -> LayoutId {
+        let mut meta = self.node_meta(style, &taffy_style, rem_size, scale_factor);
+        meta.key = key;
+        self.counters.nodes_created += 1;
         let id: LayoutId = if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
@@ -232,8 +459,61 @@ impl TaffyLayoutEngine {
                 .expect(EXPECT_MESSAGE)
                 .into()
         };
-        self.register(id, &style, meta);
+        if let Some(key) = key {
+            self.keys.insert(key, id);
+        }
+        self.meta.insert(id, meta);
+        self.register(id, style);
         id
+    }
+
+    /// Makes the node the one that a request with `meta` and `taffy_style` describes, changing
+    /// what differs and nothing else.
+    fn reuse_node(&mut self, id: LayoutId, mut meta: NodeMeta, taffy_style: taffy::style::Style) {
+        let old = self.meta.get_mut(&id).expect("a key leads to a node of the engine");
+        let differs = old
+            .requested
+            .as_deref()
+            .unwrap_or_else(|| self.taffy.style(id.0).expect(EXPECT_MESSAGE))
+            != &taffy_style;
+        // A node that stops being rewritten by layout, or was left forced, is asked for again
+        // as the element wants it: what layout did to its style does not follow from the request.
+        let rewriters_changed = old.escapable.is_some() != meta.escapable.is_some()
+            || old.intrinsic.is_some() != meta.intrinsic.is_some()
+            || old.natural != meta.natural
+            || old.unforced_width.is_some();
+        let requested = old.requested.take();
+        meta.key = old.key;
+        meta.mark = old.mark;
+        meta.stretched_in_pass = old.stretched_in_pass;
+        let escapable_requested = meta.requested.take();
+        *old = meta;
+
+        old.requested = if differs { None } else { requested };
+        if differs {
+            self.set_taffy_style(id, taffy_style);
+        } else if rewriters_changed {
+            self.restore_requested_style(id);
+        }
+        let meta = self.meta_mut(id);
+        if meta.escapable.is_some() && meta.requested.is_none() {
+            meta.requested = escapable_requested;
+        }
+    }
+
+    fn set_children_if_changed(&mut self, id: LayoutId, children: &[LayoutId]) {
+        let unchanged = self.taffy.child_count(id.0) == children.len()
+            && children.iter().enumerate().all(|(index, child)| {
+                self.taffy.child_at_index(id.0, index) == Ok(child.0)
+                    && self.taffy.parent(child.0) == Some(id.0)
+            });
+        if unchanged {
+            return;
+        }
+        self.counters.children_set += 1;
+        self.taffy
+            .set_children(id.0, LayoutId::to_taffy_slice(children))
+            .expect(EXPECT_MESSAGE);
     }
 
     pub fn request_measured_layout(
@@ -255,15 +535,18 @@ impl TaffyLayoutEngine {
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
 
+        self.counters.nodes_created += 1;
         let id: LayoutId = self
             .taffy
             .new_leaf_with_context(taffy_style, NodeContext { measure })
             .expect(EXPECT_MESSAGE)
             .into();
-        self.register(id, &style, meta);
+        self.meta.insert(id, meta);
+        self.register(id, &style);
         id
     }
 
+    /// What a request says about its node besides the taffy style.
     fn node_meta(
         &mut self,
         style: &Style,
@@ -271,9 +554,15 @@ impl TaffyLayoutEngine {
         rem_size: Pixels,
         scale_factor: f32,
     ) -> NodeMeta {
+        let escapable = containing_block::Escapable::of(style.position, taffy_style);
         NodeMeta {
+            requested_in_pass: self.pass,
+            // The containing block pass rewrites the style of an escapable node from its
+            // `original`, which the keywords can replace, so the request is kept on its own.
+            requested: escapable.is_some().then(|| Box::new(taffy_style.clone())),
+            natural: style.measure_natural_width,
             is_static: style.position == crate::Position::Static,
-            escapable: containing_block::Escapable::of(style.position, taffy_style),
+            escapable,
             intrinsic: intrinsic::IntrinsicKeywords::of(
                 style,
                 rem_size,
@@ -284,17 +573,19 @@ impl TaffyLayoutEngine {
         }
     }
 
-    fn register(&mut self, id: LayoutId, style: &Style, meta: NodeMeta) {
-        if meta.escapable.is_some() {
+    /// Queues the node for what layout does to the nodes of a pass that ask for it.
+    fn register(&mut self, id: LayoutId, style: &Style) {
+        let meta = self.meta(id);
+        let (escapable, intrinsic) = (meta.escapable.is_some(), meta.intrinsic.is_some());
+        if escapable {
             self.escapable_nodes.push(id);
         }
-        if meta.intrinsic.is_some() {
+        if intrinsic {
             self.intrinsic_pending.push(id);
         }
         if style.measure_natural_width {
             self.natural_pending.push(id);
         }
-        self.meta.insert(id, meta);
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -309,13 +600,13 @@ impl TaffyLayoutEngine {
         size: Size<Pixels>,
         scale_factor: f32,
     ) {
-        let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
-        let stretch_width = style.size.width.is_auto();
-        let stretch_height = style.size.height.is_auto();
+        let requested = self.requested_style(id);
+        let stretch_width = requested.size.width.is_auto();
+        let stretch_height = requested.size.height.is_auto();
         if !stretch_width && !stretch_height {
             return;
         }
-        let mut style = style.clone();
+        let mut style = requested.clone();
         if stretch_width {
             style.size.width =
                 taffy::style::Dimension::length(round_to_device_pixel(size.width.0, scale_factor));
@@ -324,7 +615,33 @@ impl TaffyLayoutEngine {
             style.size.height =
                 taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
         }
-        self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+        self.rewrite_style(id, style);
+        let pass = self.pass;
+        let meta = self.meta_mut(id);
+        if std::mem::replace(&mut meta.stretched_in_pass, pass) == 0 {
+            self.stretched.push(id);
+        }
+    }
+
+    /// Gives back their requested style to the nodes that were stretched to fill the window in a
+    /// pass before and were not in this one: a node is stretched when the pass says so, not on
+    /// its own. Layout calls this before laying out, for the nodes this pass has asked for (it
+    /// stretches them right after asking), and the end of the pass for all of them.
+    fn give_back_stretched_widths(&mut self, requested_only: bool) {
+        let pass = self.pass;
+        let mut stretched = std::mem::take(&mut self.stretched);
+        stretched.retain(|id| {
+            let Some(meta) = self.meta.get_mut(id) else {
+                return false;
+            };
+            if meta.stretched_in_pass == pass || (requested_only && meta.requested_in_pass != pass) {
+                return true;
+            }
+            meta.stretched_in_pass = 0;
+            self.restore_requested_style(*id);
+            false
+        });
+        self.stretched = stretched;
     }
 
     /// Whether the `min-width` or `max-width` of the node is a percentage, or a `calc()` with one.
@@ -353,7 +670,7 @@ impl TaffyLayoutEngine {
                 None => return,
             },
         }
-        self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+        self.rewrite_style(id, style);
     }
 
     // Used to understand performance
@@ -435,6 +752,8 @@ impl TaffyLayoutEngine {
         // }
         //
 
+        self.detach_from_stale_parent(id);
+        self.give_back_stretched_widths(true);
         if !self.computed_layouts.insert(id) {
             let stack = &mut self.layout_bounds_scratch_space;
             stack.push(id);
@@ -470,6 +789,24 @@ impl TaffyLayoutEngine {
         let containing_width = containing_width.map(|width| width.map(|width| width.0 * scale_factor));
         self.run_taffy_in(id, available_space, containing_width, scale_factor, window, cx);
         self.settle_containing_blocks(id, available_space, scale_factor, window, cx);
+    }
+
+    /// A root that a frame before had under a parent which this pass did not ask for is not under
+    /// it anymore: layout would measure it from, and place it in, a tree that is not there.
+    fn detach_from_stale_parent(&mut self, id: LayoutId) {
+        let Some(parent) = self.taffy.parent(id.0) else {
+            return;
+        };
+        if self.meta(LayoutId(parent)).requested_in_pass == self.pass {
+            return;
+        }
+        let index = (0..self.taffy.child_count(parent))
+            .find(|index| self.taffy.child_at_index(parent, *index) == Ok(id.0));
+        if let Some(index) = index {
+            self.taffy
+                .remove_child_at_index(parent, index)
+                .expect(EXPECT_MESSAGE);
+        }
     }
 
     fn run_taffy(

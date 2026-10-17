@@ -804,9 +804,13 @@ impl<NodeContext> TaffyTree<NodeContext> {
         }
 
         // Remove "parent" references to a node when removing that node
+        //
+        // fdarian fork patch: a child that moved to another parent since `node` listed it keeps the parent it has.
         if let Some(children) = self.children.get(key) {
             for child in children.iter().copied() {
-                self.parents[child.into()] = None;
+                if self.parents[child.into()] == Some(node) {
+                    self.parents[child.into()] = None;
+                }
             }
         }
 
@@ -1726,6 +1730,23 @@ mod tests {
         assert_eq!(taffy.parent(other), Some(first));
         assert_eq!(taffy.children(first).unwrap().as_slice(), &[other]);
         assert!(taffy.children(second).unwrap().is_empty());
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn remove_leaves_a_child_that_moved_to_another_parent_with_that_parent() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child = taffy.new_leaf(Style::default()).unwrap();
+        let kept = taffy.new_leaf(Style::default()).unwrap();
+        let old_parent = taffy.new_with_children(Style::default(), &[child, kept]).unwrap();
+        // `new_with_children` does not take the child from the parent that lists it.
+        let new_parent = taffy.new_with_children(Style::default(), &[child]).unwrap();
+
+        taffy.remove(old_parent).unwrap();
+
+        assert_eq!(taffy.parent(child), Some(new_parent));
+        assert_eq!(taffy.parent(kept), None);
+        assert_eq!(taffy.children(new_parent).unwrap().as_slice(), &[child]);
     }
 
     // fdarian fork patch.
