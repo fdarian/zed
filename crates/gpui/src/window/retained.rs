@@ -359,26 +359,14 @@ impl Window {
         self.retained.rendered_serial + 1
     }
 
-    /// Re-adds the element states that the range of the rendered frame's accessed states names
-    /// to the frame being built, so that it keeps them, and returns where they are now.
-    pub(crate) fn reuse_accessed_states(&mut self, range: Range<usize>) -> Range<usize> {
-        let start = self.next_frame.accessed_element_states.len();
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
-        );
-        start..self.next_frame.accessed_element_states.len()
+    /// Re-adds `states` to the frame being built, so that it keeps them.
+    pub(crate) fn keep_states(&mut self, states: &[(GlobalElementId, TypeId)]) {
+        self.next_frame.accessed_element_states.extend(states.iter().cloned());
     }
 
-    /// The layout of the subtrees inside one that was not requested again accessed states, which
-    /// moved from `from` to `to` in the frame with the range of the one that holds them.
-    pub(crate) fn move_nested_layout_states(&mut self, nested: &[(GlobalElementId, TypeId)], from: usize, to: usize) {
-        for key in nested {
-            if let Some(state) = self.rendered_state_mut(key) {
-                state.move_layout(from, to);
-            }
-        }
+    /// The element states accessed since the position `start` of the frame being built.
+    pub(crate) fn accessed_states_since(&self, start: usize) -> Rc<[(GlobalElementId, TypeId)]> {
+        self.next_frame.accessed_element_states[start..].into()
     }
 
     pub(crate) fn accessed_states_len(&self) -> usize {

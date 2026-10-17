@@ -39,7 +39,7 @@ use crate::{
     PrepaintStateIndex, ReplayKey, Window,
 };
 use collections::FxHashSet;
-use std::{any::TypeId, ops::Range, rc::Rc};
+use std::{any::TypeId, rc::Rc};
 
 /// Wraps the subtree that `build` makes, so that a frame which asks for the same `key` as the
 /// frame before need not build it. See the [module documentation](self).
@@ -136,9 +136,8 @@ pub(crate) struct RetainedState {
     /// The layout engine that made `root`.
     engine: u64,
     root: LayoutId,
-    /// The element states the subtree accessed while it requested its layout, as positions in
-    /// the accessed states of the frame it was recorded in.
-    layout_states: Range<usize>,
+    /// The element states the subtree accessed while it requested its layout.
+    layout_states: Rc<[(GlobalElementId, TypeId)]>,
     /// Every entity the subtree read, so that a frame that does not build it still observes them.
     accessed_entities: FxHashSet<crate::EntityId>,
     recorded: Option<Recorded>,
@@ -162,11 +161,6 @@ impl RetainedState {
         }) {
             paint.range = paint.range.start.moved(from, to)..paint.range.end.moved(from, to);
         }
-    }
-
-    /// The same for the accessed states of the layout of the subtree, which `range` is of.
-    pub(crate) fn move_layout(&mut self, from: usize, to: usize) {
-        self.layout_states = self.layout_states.start + to - from..self.layout_states.end + to - from;
     }
 
     /// What the last prepaint and paint of the subtree left in the frame being built, as text.
@@ -275,15 +269,7 @@ impl Element for Retained {
                 })
             {
                 window.retained.counters.hits += 1;
-                let layout_states = window.reuse_accessed_states(state.layout_states.clone());
-                if let Some(recorded) = &state.recorded {
-                    window.move_nested_layout_states(
-                        &recorded.prepaint.nested,
-                        state.layout_states.start,
-                        layout_states.start,
-                    );
-                }
-                state.layout_states = layout_states;
+                window.keep_states(&state.layout_states);
                 cx.entities.extend_accessed(&state.accessed_entities);
                 return ((state.root, RetainedLayout::Skipped), state);
             }
@@ -303,7 +289,7 @@ impl Element for Retained {
                 key,
                 engine: window.layout_engine_id(),
                 root,
-                layout_states: accessed_states_start..window.accessed_states_len(),
+                layout_states: window.accessed_states_since(accessed_states_start),
                 accessed_entities,
                 recorded: None,
             };
@@ -513,7 +499,7 @@ impl Retained {
             let root = request_subtree_layout(&mut element, lift_z, window, cx);
             (element, root)
         });
-        let layout_states = accessed_states_start..window.accessed_states_len();
+        let layout_states = window.accessed_states_since(accessed_states_start);
         let unstable = window.unstable_layout_requests() != unstable_before;
         let counters_after = window.engine_counters();
         let mismatch = built_root != root
