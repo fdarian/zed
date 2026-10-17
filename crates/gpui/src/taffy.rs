@@ -83,6 +83,8 @@ pub struct LayoutCounters {
     pub styles_set: u64,
     /// Times the children of a node were set to a list that differed from its own.
     pub children_set: u64,
+    /// Passes over the tree that ended, with a frame or without.
+    pub passes: u64,
 }
 
 /// What the engine knows about a node besides what taffy does. It lives as long as the node.
@@ -100,8 +102,6 @@ struct NodeMeta {
     requested: Option<Box<taffy::style::Style>>,
     /// The node asks for its natural width ([`Style::measure_natural_width`]).
     natural: bool,
-    /// Which collection last reached the node.
-    mark: u32,
     /// The pass that last gave the node a width to fill the window with, if any.
     stretched_in_pass: u64,
     /// The node is [`crate::Position::Static`]. It lays out as taffy `Relative` but is not a
@@ -275,6 +275,7 @@ impl TaffyLayoutEngine {
         self.escapable_nodes.clear();
         self.ordinals.clear();
         self.pass += 1;
+        self.counters.passes += 1;
     }
 
     /// Ends a pass and frees the nodes that nothing needs anymore, along with their calcs: the
@@ -297,8 +298,7 @@ impl TaffyLayoutEngine {
         let mut stack = std::mem::take(&mut self.scratch_stack);
         stack.extend(self.computed_layouts.iter().copied());
         while let Some(id) = stack.pop() {
-            let meta = self.meta_mut(id);
-            if std::mem::replace(&mut meta.mark, collection) == collection {
+            if !self.taffy.mark_reached(id.0, collection) {
                 continue;
             }
             alive += 1;
@@ -314,13 +314,8 @@ impl TaffyLayoutEngine {
             return;
         }
 
-        let garbage: Vec<LayoutId> = self
-            .meta
-            .iter()
-            .filter(|(_, meta)| meta.mark != collection)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in garbage {
+        for id in self.taffy.unreached_nodes(collection) {
+            let id = LayoutId(id);
             let meta = self.meta.remove(&id).expect("garbage was found in the metadata");
             if let Some(key) = meta.key {
                 self.keys.remove(&key);
@@ -484,7 +479,6 @@ impl TaffyLayoutEngine {
             || old.unforced_width.is_some();
         let requested = old.requested.take();
         meta.key = old.key;
-        meta.mark = old.mark;
         meta.stretched_in_pass = old.stretched_in_pass;
         let escapable_requested = meta.requested.take();
         *old = meta;
