@@ -1272,6 +1272,7 @@ impl PlatformTextSystem for NoopTextSystem {
                         descent: run_size * (metrics.descent / units_per_em),
                         line_height: font_run.line_height,
                         glyphs: Vec::new(),
+                        inline: Default::default(),
                     });
                 }
                 runs.last_mut().unwrap().glyphs.push(ShapedGlyph {

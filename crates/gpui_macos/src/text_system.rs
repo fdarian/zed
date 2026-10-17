@@ -622,6 +622,7 @@ impl MacTextSystemState {
                         descent: input_run.descent,
                         line_height: input_run.line_height,
                         glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
+                        inline: Default::default(),
                     });
                     &mut runs.last_mut().unwrap().glyphs
                 }

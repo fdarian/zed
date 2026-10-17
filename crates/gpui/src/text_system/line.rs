@@ -329,6 +329,46 @@ impl WrappedLine {
         Ok(())
     }
 
+    /// Where the atomic inlines of this line are in the window, as the top left corners
+    /// of their margin boxes, when the line is painted at `origin` with `align` in
+    /// `bounds`: the byte of each one's placeholder and its position.
+    pub fn object_origins(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+    ) -> SmallVec<[(usize, Point<Pixels>); 2]> {
+        let align_width = match bounds {
+            Some(bounds) => bounds.size.width,
+            None => self.layout.wrap_width.unwrap_or(self.layout.unwrapped_layout.width),
+        };
+        let layout = &self.layout.unwrapped_layout;
+        self.layout
+            .objects(line_height)
+            .into_iter()
+            .map(|object| {
+                let row_start = match object.row_ix.checked_sub(1) {
+                    Some(previous) => {
+                        let boundary = self.wrap_boundaries[previous];
+                        layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x
+                    }
+                    None => Pixels::ZERO,
+                };
+                let row_x = aligned_origin_x(
+                    origin,
+                    align_width,
+                    row_start,
+                    &align,
+                    layout,
+                    self.wrap_boundaries.get(object.row_ix).as_ref(),
+                    hanging_width(&self.hanging_widths, object.row_ix),
+                );
+                (object.index, point(row_x + object.x, origin.y + object.y))
+            })
+            .collect()
+    }
+
     /// Paint the background of line of text to the window.
     pub fn paint_background(
         &self,
@@ -398,7 +438,8 @@ fn paint_line(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    let rows = layout.rows(wrap_boundaries, line_height);
+    let line_rows = layout.line_rows(wrap_boundaries, line_height);
+    let rows = &line_rows.rows;
     let line_bounds = Bounds::new(
         origin,
         size(layout.width, rows.iter().map(|row| row.height).sum()),
@@ -523,7 +564,9 @@ fn paint_line(
                     );
                 }
                 prev_glyph_position = glyph.position;
-                let row_baseline = glyph_origin.y + rows[line_ix].baseline;
+                // Where this run sits in its row, which a vertical alignment moves.
+                let run_baseline = rows[line_ix].baseline - line_rows.raise(run_ix, line_ix);
+                let row_baseline = glyph_origin.y + run_baseline;
 
                 let mut finished_underline: Option<OpenDecoration<UnderlineStyle>> = None;
                 let mut finished_strikethrough: Option<OpenDecoration<StrikethroughStyle>> = None;
@@ -690,8 +733,10 @@ fn paint_line(
                 };
 
                 let content_mask = window.content_mask();
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
-                    let baseline_offset = point(px(0.0), rows[line_ix].baseline);
+                // The placeholder of an atomic inline is not a glyph: the element in
+                // its place paints itself.
+                if !run.inline.object && max_glyph_bounds.intersects(&content_mask.bounds) {
+                    let baseline_offset = point(px(0.0), run_baseline);
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji(
@@ -1116,6 +1161,7 @@ mod tests {
                     descent: px(4.0),
                     line_height: None,
                     glyphs: shaped_glyphs,
+                    inline: Default::default(),
                 }],
                 len: text.len(),
             }),
@@ -1214,6 +1260,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        inline: Default::default(),
                     },
                     ShapedRun {
                         font_id: FontId(1),
@@ -1241,6 +1288,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        inline: Default::default(),
                     },
                 ],
                 len: 6,

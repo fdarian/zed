@@ -13,7 +13,10 @@ use std::{
     sync::Arc,
 };
 
-use super::LineWrapper;
+use super::{
+    AtomicExtent, InlineRun, InlineSpec, LineMetrics, LineWrapper, RunPlacement, apply_inline,
+    resolve_placements,
+};
 use gpui_util::ResultExt as _;
 
 /// How far apart the tab stops are, as in CSS `tab-size`. Tab stops are measured
@@ -247,6 +250,9 @@ pub struct ShapedRun {
     pub line_height: Option<Pixels>,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
+    /// How the run sits on its line besides its font. A platform shaper leaves it at its
+    /// default: it is set when the line is laid out with [`InlineBox`]es.
+    pub inline: InlineRun,
 }
 
 impl ShapedRun {
@@ -304,9 +310,36 @@ pub struct RowMetrics {
     pub baseline: Pixels,
 }
 
+/// The rows a line makes when wrapped, and where each run sits in them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineRows {
+    /// The metrics of each row.
+    pub rows: SmallVec<[RowMetrics; 1]>,
+    /// The runs that are not on the baseline of their row, with how far above it.
+    raises: SmallVec<[RunRaise; 1]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RunRaise {
+    row_ix: usize,
+    run_ix: usize,
+    raise: Pixels,
+}
+
+impl LineRows {
+    /// How far above the baseline of row `row_ix` the baseline of run `run_ix` is, where it
+    /// is in that row: zero for a run on the baseline, negative for one below it.
+    pub fn raise(&self, run_ix: usize, row_ix: usize) -> Pixels {
+        self.raises
+            .iter()
+            .find(|raise| raise.row_ix == row_ix && raise.run_ix == run_ix)
+            .map_or(Pixels::ZERO, |raise| raise.raise)
+    }
+}
+
 impl LineLayout {
     pub(crate) fn is_styled(&self, run: &ShapedRun) -> bool {
-        run.font_size != self.font_size || run.line_height.is_some()
+        run.font_size != self.font_size || run.line_height.is_some() || !run.inline.is_default()
     }
 
     fn has_styled_runs(&self) -> bool {
@@ -322,6 +355,15 @@ impl LineLayout {
         wrap_boundaries: &[WrapBoundary],
         line_height: Pixels,
     ) -> SmallVec<[RowMetrics; 1]> {
+        self.line_rows(wrap_boundaries, line_height).rows
+    }
+
+    /// [`Self::rows`] with where the runs sit in them. A run with a vertical alignment
+    /// is raised or lowered from the baseline of its row, and one aligned to the top or
+    /// bottom of the row is not on its baseline at all, as CSS 2.1 §10.8 has it: the row
+    /// is first made as tall as the runs on its baseline need, and then as tall as the
+    /// tallest run aligned to its top or bottom.
+    pub fn line_rows(&self, wrap_boundaries: &[WrapBoundary], line_height: Pixels) -> LineRows {
         let row_count = wrap_boundaries.len() + 1;
         let half_leading = (line_height - self.ascent - self.descent) / 2.;
         let strut = RowMetrics {
@@ -329,12 +371,21 @@ impl LineLayout {
             baseline: half_leading + self.ascent,
         };
         if !self.has_styled_runs() {
-            return smallvec![strut; row_count];
+            return LineRows {
+                rows: smallvec![strut; row_count],
+                raises: SmallVec::new(),
+            };
         }
 
         let strut_above = half_leading + self.ascent;
         let strut_below = half_leading + self.descent;
-        let mut grown: SmallVec<[Option<(Pixels, Pixels)>; 1]> = smallvec![None; row_count];
+        let mut above: SmallVec<[Pixels; 1]> = smallvec![strut_above; row_count];
+        let mut below: SmallVec<[Pixels; 1]> = smallvec![strut_below; row_count];
+        let mut top_height: SmallVec<[Pixels; 1]> = smallvec![Pixels::ZERO; row_count];
+        let mut bottom_height: SmallVec<[Pixels; 1]> = smallvec![Pixels::ZERO; row_count];
+        // Every run that is not simply on the baseline, in each row it has a glyph in.
+        let mut placed: SmallVec<[(usize, usize, RunPlacement, Pixels, Pixels); 1]> =
+            SmallVec::new();
         let mut row_ix = 0;
         let mut next_boundary = 0;
         for (run_ix, run) in self.runs.iter().enumerate() {
@@ -352,29 +403,80 @@ impl LineLayout {
             let run_line_height = run.line_height.unwrap_or(line_height);
             let run_above = run.ascent + (run_line_height - run.ascent - run.descent) / 2.;
             let run_below = run_line_height - run_above;
+            let mut last_row = None;
             for glyph_ix in 0..run.glyphs.len() {
                 while wrap_boundaries.get(next_boundary) == Some(&WrapBoundary { run_ix, glyph_ix })
                 {
                     row_ix += 1;
                     next_boundary += 1;
                 }
-                let (above, below) = grown[row_ix].unwrap_or((strut_above, strut_below));
-                grown[row_ix] = Some((above.max(run_above), below.max(run_below)));
+                if last_row == Some(row_ix) {
+                    continue;
+                }
+                last_row = Some(row_ix);
+                match run.inline.placement {
+                    RunPlacement::Baseline => {
+                        above[row_ix] = above[row_ix].max(run_above);
+                        below[row_ix] = below[row_ix].max(run_below);
+                    }
+                    RunPlacement::Raised(raise) => {
+                        above[row_ix] = above[row_ix].max(run_above + raise);
+                        below[row_ix] = below[row_ix].max(run_below - raise);
+                    }
+                    RunPlacement::Top => {
+                        top_height[row_ix] = top_height[row_ix].max(run_above + run_below);
+                    }
+                    RunPlacement::Bottom => {
+                        bottom_height[row_ix] = bottom_height[row_ix].max(run_above + run_below);
+                    }
+                }
+                if run.inline.placement != RunPlacement::Baseline {
+                    placed.push((row_ix, run_ix, run.inline.placement, run_above, run_below));
+                }
             }
         }
 
-        grown
-            .into_iter()
-            .map(|grown| match grown {
-                Some((above, below)) if above != strut_above || below != strut_below => {
+        let rows: SmallVec<[RowMetrics; 1]> = (0..row_count)
+            .map(|row_ix| {
+                let (mut above, mut below) = (above[row_ix], below[row_ix]);
+                // The taller of the runs aligned to the top and to the bottom decides
+                // which way the row grows: down for the top one, up for the bottom one.
+                let (top, bottom) = (top_height[row_ix], bottom_height[row_ix]);
+                if top.max(bottom) > above + below {
+                    if top >= bottom {
+                        below = top - above;
+                    } else {
+                        above = bottom - below;
+                    }
+                }
+                if above == strut_above && below == strut_below {
+                    strut
+                } else {
                     RowMetrics {
                         height: above + below,
                         baseline: above,
                     }
                 }
-                _ => strut,
             })
-            .collect()
+            .collect();
+        let raises = placed
+            .into_iter()
+            .filter_map(|(row_ix, run_ix, placement, run_above, run_below)| {
+                let row = rows[row_ix];
+                let raise = match placement {
+                    RunPlacement::Baseline => return None,
+                    RunPlacement::Raised(raise) => raise,
+                    RunPlacement::Top => row.baseline - run_above,
+                    RunPlacement::Bottom => row.baseline - (row.height - run_below),
+                };
+                (raise != Pixels::ZERO).then_some(RunRaise {
+                    row_ix,
+                    run_ix,
+                    raise,
+                })
+            })
+            .collect();
+        LineRows { rows, raises }
     }
 
     /// The index for the character at the given x coordinate
@@ -473,6 +575,7 @@ impl LineLayout {
                     descent: run.descent,
                     line_height: run.line_height,
                     glyphs: run.glyphs[..split_pos].to_vec(),
+                    inline: run.inline,
                 });
             }
 
@@ -493,6 +596,7 @@ impl LineLayout {
                     descent: run.descent,
                     line_height: run.line_height,
                     glyphs: right_glyphs,
+                    inline: run.inline,
                 });
             }
         }
@@ -548,6 +652,7 @@ impl LineLayout {
         };
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
+        let mut prev_was_object = false;
         let mut positions = GlyphPositions::new(self, text, tab_stop, options, insets);
         let mut placed = 0;
 
@@ -562,7 +667,14 @@ impl LineLayout {
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) || (keep_all && is_cjk(ch)) {
+            if positions.glyphs[ix].is_object {
+                // A line may break on either side of an atomic inline, like an image.
+                if first_non_whitespace_ix.is_some() {
+                    last_candidate_ix = Some(ix);
+                }
+            } else if prev_was_object && ch != ' ' && first_non_whitespace_ix.is_some() {
+                last_candidate_ix = Some(ix);
+            } else if LineWrapper::is_word_char(ch) || (keep_all && is_cjk(ch)) {
                 if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
                     last_candidate_ix = Some(ix);
                 }
@@ -618,6 +730,7 @@ impl LineLayout {
                 last_candidate_ix = Some(ix + 1);
             }
             prev_ch = ch;
+            prev_was_object = positions.glyphs[ix].is_object;
         }
 
         for ix in placed + 1..=positions.glyphs.len() {
@@ -659,6 +772,7 @@ impl LineLayout {
                         ..glyph.clone()
                     })
                     .collect(),
+                inline: run.inline,
             })
             .collect();
         LineLayout {
@@ -687,6 +801,8 @@ struct WrapGlyph {
     /// The character at the glyph's index, as the wrapping rules see it.
     wrap_char: char,
     is_tab: bool,
+    /// The placeholder of an atomic inline, which a line may break on either side of.
+    is_object: bool,
     hangs: bool,
     font_id: FontId,
     shaped_x: Pixels,
@@ -780,6 +896,7 @@ impl<'a> GlyphPositions<'a> {
                             character
                         },
                         is_tab: character == '\t',
+                        is_object: run.inline.object,
                         hangs: hangs(character),
                         font_id: run.font_id,
                         shaped_x: glyph.position.x,
@@ -899,6 +1016,21 @@ pub struct WrappedLineLayout {
     /// The insets of the glyphs that have any, in glyph order. Empty when the
     /// line was laid out without insets.
     pub insets: Vec<GlyphInset>,
+}
+
+/// Where the placeholder of an atomic inline sits in a wrapped line: the top left corner
+/// of the box's margin box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjectPlacement {
+    /// The byte of the text the placeholder is at.
+    pub index: usize,
+    /// The wrapped row of the line the box is on.
+    pub row_ix: usize,
+    /// The distance from the start of the row to the box, before the row is aligned and
+    /// after the leading inset of the box's glyph.
+    pub x: Pixels,
+    /// The distance from the top of the line to the top of the box.
+    pub y: Pixels,
 }
 
 /// A boundary at which a line was wrapped
@@ -1119,14 +1251,86 @@ impl WrappedLineLayout {
         }
     }
 
-    /// Returns the pixel position for the given byte index.
+    /// Returns the pixel position for the given byte index. For the placeholder of an
+    /// atomic inline it is where the top left corner of the box's margin box is.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
+        let (row_ix, x) = self.row_and_x_for_index(index)?;
+        if let Some(object) = self
+            .objects(line_height)
+            .into_iter()
+            .find(|object| object.index == index)
+        {
+            return Some(point(object.x, object.y));
+        }
         let rows = self
             .unwrapped_layout
             .has_styled_runs()
             .then(|| self.rows(line_height));
-        let (row_ix, x) = self.row_and_x_for_index(index)?;
         Some(point(x, row_top(rows.as_deref(), row_ix, line_height)))
+    }
+
+    /// The distance from the top of the line to the baseline of the run that the glyph at
+    /// `index`, or the first one after it, is in, where the run sits in its row. `None`
+    /// when no glyph is at or after `index`.
+    pub fn baseline_for_index(&self, index: usize, line_height: Pixels) -> Option<Pixels> {
+        let layout = &self.unwrapped_layout;
+        let (run_ix, glyph_ix) = layout.runs.iter().enumerate().find_map(|(run_ix, run)| {
+            run.glyphs
+                .iter()
+                .position(|glyph| glyph.index >= index)
+                .map(|glyph_ix| (run_ix, glyph_ix))
+        })?;
+        let line_rows = layout.line_rows(&self.wrap_boundaries, line_height);
+        let row_ix = self
+            .wrap_boundaries
+            .partition_point(|boundary| *boundary <= WrapBoundary { run_ix, glyph_ix });
+        let row_top = line_rows.rows[..row_ix]
+            .iter()
+            .fold(Pixels::ZERO, |top, row| top + row.height);
+        Some(row_top + line_rows.rows[row_ix].baseline - line_rows.raise(run_ix, row_ix))
+    }
+
+    /// Where each atomic inline of this line sits, in the order they come in the text.
+    pub fn objects(&self, line_height: Pixels) -> SmallVec<[ObjectPlacement; 2]> {
+        let layout = &self.unwrapped_layout;
+        let mut objects = SmallVec::new();
+        if !layout.runs.iter().any(|run| run.inline.object) {
+            return objects;
+        }
+        let line_rows = layout.line_rows(&self.wrap_boundaries, line_height);
+        for (run_ix, run) in layout.runs.iter().enumerate() {
+            if !run.inline.object {
+                continue;
+            }
+            for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+                let row_ix = self
+                    .wrap_boundaries
+                    .partition_point(|boundary| *boundary <= WrapBoundary { run_ix, glyph_ix });
+                let row_start_x = match row_ix.checked_sub(1) {
+                    Some(previous) => {
+                        let boundary = self.wrap_boundaries[previous];
+                        layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x
+                    }
+                    None => Pixels::ZERO,
+                };
+                let row_top = line_rows.rows[..row_ix]
+                    .iter()
+                    .fold(Pixels::ZERO, |top, row| top + row.height);
+                let baseline = line_rows.rows[row_ix].baseline - line_rows.raise(run_ix, row_ix);
+                let leading = self
+                    .insets
+                    .iter()
+                    .find(|inset| inset.index == glyph.index)
+                    .map_or(Pixels::ZERO, |inset| inset.leading);
+                objects.push(ObjectPlacement {
+                    index: glyph.index,
+                    row_ix,
+                    x: glyph.position.x - row_start_x + leading,
+                    y: row_top + baseline - run.ascent,
+                });
+            }
+        }
+        objects
     }
 
     /// The wrapped row `position_for_index` puts the byte index on: a boundary
@@ -1304,11 +1508,20 @@ impl LineLayoutCache {
         max_lines: Option<usize>,
         options: TextLayoutOptions,
         insets: &[TextInset],
+        inline: &[InlineSpec],
+        line_height: Pixels,
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        // The line height only decides where inline boxes sit, so it must not take a
+        // cache entry of its own when there are none.
+        let line_height = if inline.is_empty() {
+            Pixels::ZERO
+        } else {
+            line_height
+        };
         // Text without a tab or a space is laid out the same whatever its tab size
         // or what happens to its spaces, so it must not take a cache entry of its
         // own. Hanging that break_spaces overrides is dropped for the same reason,
@@ -1339,6 +1552,8 @@ impl LineLayoutCache {
             force_width: None,
             options,
             insets,
+            inline,
+            line_height,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -1357,7 +1572,7 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let shaped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
+            let shaped_layout = self.layout_inline_line(&text, font_size, runs, inline, line_height);
             let tab_stop = options
                 .tab_size
                 .map(|tab_size| self.tab_stop_resolver(tab_size, font_size));
@@ -1403,6 +1618,8 @@ impl LineLayoutCache {
                 force_width: None,
                 options,
                 insets: insets.into(),
+                inline: inline.into(),
+                line_height,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -1457,6 +1674,163 @@ impl LineLayoutCache {
         ))
     }
 
+    /// `text` shaped as `runs` say, with the atomic inlines of `inline` taking the place of
+    /// their characters and every run placed on its line as `inline` says.
+    fn layout_inline_line(
+        &self,
+        text: &SharedString,
+        font_size: Pixels,
+        runs: &[FontRun],
+        inline: &[InlineSpec],
+        line_height: Pixels,
+    ) -> Arc<LineLayout> {
+        if inline.is_empty() {
+            return self.layout_line::<&SharedString>(text, font_size, runs, None);
+        }
+        let shaped = if inline.iter().any(|spec| spec.atomic().is_some()) {
+            Arc::new(self.layout_line_with_atomics(text, font_size, runs, inline))
+        } else {
+            self.layout_line::<&SharedString>(text, font_size, runs, None)
+        };
+        let x_height = runs.first().map_or(Pixels::ZERO, |run| {
+            self.platform_text_system
+                .font_metrics(run.font_id)
+                .x_height(run.font_size.unwrap_or(font_size))
+        });
+        let placements = resolve_placements(
+            inline,
+            LineMetrics {
+                font_size,
+                ascent: shaped.ascent,
+                descent: shaped.descent,
+                x_height,
+            },
+            line_height,
+            &|font_id| self.platform_text_system.font_metrics(font_id),
+        );
+        Arc::new(apply_inline(&shaped, inline, &placements))
+    }
+
+    /// Shapes the text between the atomic inlines of `inline`, which the shaper never
+    /// sees, and puts one glyph of the atomic's advance where each one is. A run of the
+    /// atomic's own holds the glyph, with the extent of its box for an ascent and descent.
+    fn layout_line_with_atomics(
+        &self,
+        text: &SharedString,
+        font_size: Pixels,
+        runs: &[FontRun],
+        inline: &[InlineSpec],
+    ) -> LineLayout {
+        let mut layout_runs: Vec<ShapedRun> = Vec::new();
+        let mut x = Pixels::ZERO;
+        let mut ascent = Pixels::ZERO;
+        let mut descent = Pixels::ZERO;
+
+        let mut segment: SmallVec<[FontRun; 4]> = SmallVec::new();
+        let mut segment_start = 0;
+        let mut position = 0;
+        let mut shape_segment = |segment: &mut SmallVec<[FontRun; 4]>,
+                                 segment_start: usize,
+                                 position: usize,
+                                 x: &mut Pixels,
+                                 layout_runs: &mut Vec<ShapedRun>,
+                                 ascent: &mut Pixels,
+                                 descent: &mut Pixels| {
+            if segment.is_empty() {
+                return;
+            }
+            let shaped = self.layout_line::<&SharedString>(
+                &SharedString::new(&text[segment_start..position]),
+                font_size,
+                segment,
+                None,
+            );
+            for run in &shaped.runs {
+                layout_runs.push(ShapedRun {
+                    glyphs: run
+                        .glyphs
+                        .iter()
+                        .map(|glyph| ShapedGlyph {
+                            position: point(glyph.position.x + *x, glyph.position.y),
+                            index: glyph.index + segment_start,
+                            ..glyph.clone()
+                        })
+                        .collect(),
+                    ..run.clone()
+                });
+            }
+            *x += shaped.width;
+            *ascent = (*ascent).max(shaped.ascent);
+            *descent = (*descent).max(shaped.descent);
+            segment.clear();
+        };
+
+        for run in runs {
+            let end = position + run.len;
+            let atomic = inline.iter().find_map(|spec| {
+                spec.atomic()
+                    .filter(|_| spec.range == (position..end))
+            });
+            match atomic {
+                Some(extent) => {
+                    shape_segment(
+                        &mut segment,
+                        segment_start,
+                        position,
+                        &mut x,
+                        &mut layout_runs,
+                        &mut ascent,
+                        &mut descent,
+                    );
+                    let run_size = run.font_size.unwrap_or(font_size);
+                    let metrics = self.platform_text_system.font_metrics(run.font_id);
+                    ascent = ascent.max(metrics.ascent(font_size));
+                    descent = descent.max(-metrics.descent(font_size));
+                    layout_runs.push(ShapedRun {
+                        font_id: run.font_id,
+                        font_size: run_size,
+                        ascent: extent.ascent,
+                        descent: extent.descent,
+                        line_height: Some(extent.ascent + extent.descent),
+                        glyphs: vec![ShapedGlyph {
+                            id: GlyphId(0),
+                            position: point(x, Pixels::ZERO),
+                            index: position,
+                            is_emoji: false,
+                        }],
+                        inline: InlineRun::default(),
+                    });
+                    x += extent.advance;
+                }
+                None => {
+                    if segment.is_empty() {
+                        segment_start = position;
+                    }
+                    segment.push(*run);
+                }
+            }
+            position = end;
+        }
+        shape_segment(
+            &mut segment,
+            segment_start,
+            position,
+            &mut x,
+            &mut layout_runs,
+            &mut ascent,
+            &mut descent,
+        );
+
+        LineLayout {
+            font_size,
+            width: x,
+            ascent,
+            descent,
+            runs: layout_runs,
+            len: text.len(),
+        }
+    }
+
     pub fn layout_line<Text>(
         &self,
         text: Text,
@@ -1477,6 +1851,8 @@ impl LineLayoutCache {
             force_width,
             options: TextLayoutOptions::default(),
             insets: &[],
+            inline: &[],
+            line_height: Pixels::ZERO,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -1508,6 +1884,8 @@ impl LineLayoutCache {
                 force_width,
                 options: TextLayoutOptions::default(),
                 insets: Box::default(),
+                inline: Box::default(),
+                line_height: Pixels::ZERO,
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -1740,6 +2118,8 @@ struct CacheKey {
     force_width: Option<Pixels>,
     options: TextLayoutOptions,
     insets: Box<[TextInset]>,
+    inline: Box<[InlineSpec]>,
+    line_height: Pixels,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -1753,6 +2133,8 @@ struct CacheKeyRef<'a> {
     force_width: Option<Pixels>,
     options: TextLayoutOptions,
     insets: &'a [TextInset],
+    inline: &'a [InlineSpec],
+    line_height: Pixels,
 }
 
 #[derive(Clone, Debug)]
@@ -1848,6 +2230,8 @@ impl AsCacheKeyRef for CacheKey {
             force_width: self.force_width,
             options: self.options,
             insets: &self.insets,
+            inline: &self.inline,
+            line_height: self.line_height,
         }
     }
 }
@@ -1903,6 +2287,7 @@ mod tests {
                 descent: px(4.),
                 line_height: None,
                 glyphs,
+                inline: InlineRun::default(),
             }],
             len: 0,
         }

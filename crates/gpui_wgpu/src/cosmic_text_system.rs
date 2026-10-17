@@ -745,6 +745,7 @@ impl CosmicTextSystemState {
                     descent: layout.max_descent.into(),
                     line_height,
                     glyphs: vec![shaped_glyph],
+                    inline: Default::default(),
                 });
             }
         }

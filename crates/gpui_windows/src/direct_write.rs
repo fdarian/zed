@@ -1625,6 +1625,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             descent: context.descent,
             line_height,
             glyphs,
+            inline: Default::default(),
         });
         Ok(())
     }

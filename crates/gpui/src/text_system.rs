@@ -1,5 +1,6 @@
 mod font_fallbacks;
 mod font_features;
+mod inline;
 mod line;
 mod line_layout;
 mod line_truncation;
@@ -7,6 +8,7 @@ mod line_wrapper;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
+pub use inline::*;
 pub use line::*;
 pub use line_layout::*;
 pub(crate) use line_truncation::EndTruncation;
@@ -588,6 +590,36 @@ impl WindowTextSystem {
         options: TextLayoutOptions,
         insets: &[TextInset],
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_inline(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+            options,
+            insets,
+            &[],
+            Pixels::ZERO,
+        )
+    }
+
+    /// Like [`Self::shape_text_with_insets`], with the `inline` boxes of the text: atomic
+    /// inlines such as an `inline-block`, which take the place of a U+FFFC character each,
+    /// and the vertical alignment of boxes on their line. The ranges are byte ranges of
+    /// `text`, newlines included. `line_height` is the one the lines are measured and
+    /// painted with, which decides where `middle` and the like put a box.
+    pub fn shape_text_inline(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        options: TextLayoutOptions,
+        insets: &[TextInset],
+        inline: &[InlineBox],
+        line_height: Pixels,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -661,6 +693,11 @@ impl WindowTextSystem {
                 split_font_run_at(&mut font_runs, inset.range.start);
                 split_font_run_at(&mut font_runs, inset.range.end);
             }
+            let line_inline = self.inline_on_line(inline, line_start..line_end);
+            for spec in line_inline.iter().filter(|spec| spec.atomic().is_some()) {
+                split_font_run_at(&mut font_runs, spec.range.start);
+                split_font_run_at(&mut font_runs, spec.range.end);
+            }
 
             let layout = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
@@ -670,6 +707,8 @@ impl WindowTextSystem {
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
                 options,
                 &line_insets,
+                &line_inline,
+                line_height,
             );
             wrapped_lines += layout.wrap_boundaries.len();
 
@@ -737,7 +776,23 @@ impl WindowTextSystem {
         options: TextLayoutOptions,
         insets: &[TextInset],
     ) -> Result<Pixels> {
-        let lines = self.shape_text_with_insets(
+        self.min_content_width_inline(text, font_size, runs, options, insets, &[], Pixels::ZERO)
+    }
+
+    /// Like [`Self::min_content_width`], with the `inline` boxes of the text, which
+    /// [`Self::shape_text_inline`] takes. An atomic inline is as wide as the advance it
+    /// is given, so that is its min-content contribution.
+    pub fn min_content_width_inline(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        options: TextLayoutOptions,
+        insets: &[TextInset],
+        inline: &[InlineBox],
+        line_height: Pixels,
+    ) -> Result<Pixels> {
+        let lines = self.shape_text_inline(
             text,
             font_size,
             runs,
@@ -745,11 +800,57 @@ impl WindowTextSystem {
             None,
             options.for_min_content(),
             insets,
+            inline,
+            line_height,
         )?;
         Ok(lines
             .iter()
             .flat_map(|line| line.line_widths())
             .fold(px(0.), Pixels::max))
+    }
+
+    /// The `inline` boxes of a text, as they apply to the line of it at `line`, with
+    /// their fonts resolved. A box that continues past an end of the line is cut to it,
+    /// and one with no part on it is dropped, with the boxes inside it.
+    fn inline_on_line(&self, inline: &[InlineBox], line: Range<usize>) -> Vec<InlineSpec> {
+        let mut specs: Vec<InlineSpec> = Vec::new();
+        // Where each box of `inline` is in `specs`, once it has a spec.
+        let mut spec_ix: Vec<Option<usize>> = Vec::with_capacity(inline.len());
+        for inline_box in inline {
+            let start = inline_box.range.start.max(line.start);
+            let end = inline_box.range.end.min(line.end);
+            let parent = inline_box
+                .parent
+                .and_then(|parent| spec_ix.get(parent).copied().flatten());
+            let on_line = start < end && (inline_box.parent.is_none() || parent.is_some());
+            if !on_line {
+                spec_ix.push(None);
+                continue;
+            }
+            let content = match &inline_box.content {
+                InlineContent::Text { font, font_size } => SpecContent::Text {
+                    font_id: self.resolve_font(font),
+                    font_size: *font_size,
+                },
+                InlineContent::Atomic(extent) => {
+                    debug_assert_eq!(
+                        end - start,
+                        OBJECT_REPLACEMENT_CHARACTER.len_utf8(),
+                        "an atomic inline takes the place of one U+FFFC"
+                    );
+                    SpecContent::Atomic(*extent)
+                }
+            };
+            spec_ix.push(Some(specs.len()));
+            specs.push(InlineSpec {
+                range: start - line.start..end - line.start,
+                parent,
+                align: inline_box.align,
+                line_height: inline_box.line_height,
+                content,
+            });
+        }
+        specs
     }
 
     pub(crate) fn finish_frame(&self) {
