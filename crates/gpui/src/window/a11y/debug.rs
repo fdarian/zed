@@ -435,6 +435,14 @@ fn node_to_json(
 
     map.insert("aria".into(), serde_json::Value::Object(aria));
 
+    // In device pixels, where the window's content origin is (0, 0).
+    if let Some(bounds) = node.bounds() {
+        map.insert(
+            "bounds".into(),
+            json!({ "x0": bounds.x0, "y0": bounds.y0, "x1": bounds.x1, "y1": bounds.y1 }),
+        );
+    }
+
     serde_json::Value::Object(map)
 }
 
