@@ -36,7 +36,7 @@ float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
 float quad_sdf_impl(float2 center_to_point, float2 corner_radius);
 float content_mask_coverage(float2 position, ContentMask_ScaledPixels content_mask);
 float border_vertical_weight(float2 corner_to_point, float2 border);
-float4 select_border_color(float2 center_to_point, float vertical_weight,
+float4 select_border_color(bool is_left, bool is_top, float vertical_weight,
                            float4 top, float4 right, float4 bottom,
                            float4 left);
 float gaussian(float x, float sigma);
@@ -184,10 +184,20 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   float2 corner_radius = pick_corner_radius(
     center_to_point, quad.corner_radii, quad.corner_radii_y);
 
+  // Which side of each axis owns the point. A point inside a border belongs to
+  // that border's side even when it is past the centre: a box as tall as its
+  // top border has every row in the top border, and picking by the centre would
+  // give the lower rows the 0 bottom width and paint them as background. Away
+  // from both borders the centre decides, as it always has.
+  bool is_left = point.x < quad.border_widths.left ||
+    (center_to_point.x < 0.0 && point.x < size.x - quad.border_widths.right);
+  bool is_top = point.y < quad.border_widths.top ||
+    (center_to_point.y < 0.0 && point.y < size.y - quad.border_widths.bottom);
+
   // Width of the nearest borders
   float2 border = float2(
-    center_to_point.x < 0.0 ? quad.border_widths.left : quad.border_widths.right,
-    center_to_point.y < 0.0 ? quad.border_widths.top : quad.border_widths.bottom
+    is_left ? quad.border_widths.left : quad.border_widths.right,
+    is_top ? quad.border_widths.top : quad.border_widths.bottom
   );
 
   // 0-width borders are reduced so that `inner_sdf >= antialias_threshold`.
@@ -270,15 +280,15 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   if (border_sdf < antialias_threshold) {
     float vertical_weight = border_vertical_weight(corner_to_point, border);
     float4 border_color = select_border_color(
-      center_to_point, vertical_weight, input.border_color_top,
+      is_left, is_top, vertical_weight, input.border_color_top,
       input.border_color_right, input.border_color_bottom, input.border_color_left);
 
     // A side's style applies on its own side of the line that separates the
     // colors at a corner, whatever the style of the side it meets.
     bool vertical_owner = vertical_weight >= 0.5;
     uint style = vertical_owner
-      ? (uint)(center_to_point.x < 0.0 ? quad.border_styles.left : quad.border_styles.right)
-      : (uint)(center_to_point.y < 0.0 ? quad.border_styles.top : quad.border_styles.bottom);
+      ? (uint)(is_left ? quad.border_styles.left : quad.border_styles.right)
+      : (uint)(is_top ? quad.border_styles.top : quad.border_styles.bottom);
     float owner_width = vertical_owner ? border.x : border.y;
 
     // Distances from the point to the outer and inner edge of the border. Their
@@ -420,7 +430,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
           // Straight borders
           bool is_horizontal = corner_center_to_point.x < corner_center_to_point.y;
           if (is_horizontal) {
-            if (center_to_point.y < 0.0) {
+            if (is_top) {
               dash_velocity = dv_t;
               t = (point.x - r_tl.x) * dash_velocity;
             } else {
@@ -428,7 +438,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
               t = upto_bl - (point.x - r_bl.x) * dash_velocity;
             }
           } else {
-            if (center_to_point.x < 0.0) {
+            if (is_left) {
               dash_velocity = dv_l;
               t = upto_tl - (point.y - r_tl.y) * dash_velocity;
             } else {
@@ -481,7 +491,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       // The border cut in two along its mid-line: `border_color` is the outer
       // half and the inner half has its own color.
       float4 inner_color = select_border_color(
-        center_to_point, vertical_weight,
+        is_left, is_top, vertical_weight,
         hsla_to_rgba(quad.border_inner_colors.top),
         hsla_to_rgba(quad.border_inner_colors.right),
         hsla_to_rgba(quad.border_inner_colors.bottom),
@@ -524,10 +534,10 @@ float border_vertical_weight(float2 corner_to_point, float2 border) {
 }
 
 // Picks the border color at a point, blending the two sides across the join line.
-float4 select_border_color(float2 center_to_point, float vertical_weight,
+float4 select_border_color(bool is_left, bool is_top, float vertical_weight,
                            float4 top, float4 right, float4 bottom, float4 left) {
-  float4 vertical_color = center_to_point.x < 0.0 ? left : right;
-  float4 horizontal_color = center_to_point.y < 0.0 ? top : bottom;
+  float4 vertical_color = is_left ? left : right;
+  float4 horizontal_color = is_top ? top : bottom;
 
   if (vertical_weight >= 1.0) {
     return vertical_color;
