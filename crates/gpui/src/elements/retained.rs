@@ -25,7 +25,9 @@
 //! abandoned after it replayed leaves the pass that follows it a frame to build from), the
 //! passes that measure, and any frame while the inspector is on.
 //!
-//! The element must have an element id that is unique among the elements around it. The root of
+//! The element must have an element id that is unique among the elements around it. It names the
+//! element's state and is not on the id stack below it: the subtree has the ids it would have
+//! without the element. The root of
 //! the subtree it builds must not escape the clip around it (such a box is laid out by the
 //! engine as one that a frame cannot keep, see [`NonReusable::UnstableLayout`]); if it is
 //! lifted into a stacking context, say so with [`Retained::lift_z`], since the parent decides
@@ -98,6 +100,12 @@ impl Retained {
         self
     }
 
+    /// Where the state of the element is kept, which is what the id of an element on the stack
+    /// would give it.
+    fn global_id(&self, window: &mut Window) -> GlobalElementId {
+        window.with_global_id(self.id.clone(), |global_id, _| global_id.clone())
+    }
+
     fn build(&mut self) -> Build {
         self.build.take().expect("a retained element builds its subtree once")
     }
@@ -162,8 +170,11 @@ impl Element for Retained {
     type RequestLayoutState = RetainedLayout;
     type PrepaintState = RetainedPrepaint;
 
+    // The element has no id on the stack: the subtree below it has the ids it would have without
+    // the element, so that wrapping a subtree or not changes nothing that is named by the path of
+    // an id (the accessibility nodes, the hitboxes). Its own state is keyed by `Self::global_id`.
     fn id(&self) -> Option<ElementId> {
-        Some(self.id.clone())
+        None
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
@@ -176,12 +187,12 @@ impl Element for Retained {
 
     fn request_layout(
         &mut self,
-        global_id: Option<&GlobalElementId>,
+        _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, RetainedLayout) {
-        let global_id = global_id.expect("a retained element has an id");
+        let global_id = &self.global_id(window);
         let lift_z = self.lift_z;
         if !window.retention_allowed() {
             window.retained.counters.builds += 1;
@@ -201,6 +212,7 @@ impl Element for Retained {
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             if let Some(mut state) = state
                 && state.key == key
+                && !window.retained.reference
                 && !window.refreshing
                 && !state
                     .accessed_entities
@@ -255,14 +267,14 @@ impl Element for Retained {
 
     fn prepaint(
         &mut self,
-        global_id: Option<&GlobalElementId>,
+        _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut RetainedLayout,
         window: &mut Window,
         cx: &mut App,
     ) -> RetainedPrepaint {
-        let global_id = global_id.expect("a retained element has an id");
+        let global_id = &self.global_id(window);
         match std::mem::replace(request_layout, RetainedLayout::Handed) {
             RetainedLayout::Skipped => {
                 self.prepaint_skipped(global_id, bounds, window, cx)
@@ -298,7 +310,7 @@ impl Element for Retained {
 
     fn paint(
         &mut self,
-        global_id: Option<&GlobalElementId>,
+        _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut RetainedLayout,
@@ -306,7 +318,7 @@ impl Element for Retained {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let global_id = global_id.expect("a retained element has an id");
+        let global_id = &self.global_id(window);
         match prepaint {
             RetainedPrepaint::Replayed => {
                 let hook = self.on_replay.clone();
@@ -810,11 +822,12 @@ mod tests {
         assert_eq!(replayed.a11y, built.a11y);
         assert_eq!(replayed.chains, built.chains);
         assert!(built.a11y.contains("Button 2"));
-        // From the button up to the window, through the boundary of the subtree.
+        // From the button up to the window, through the boundary of the subtree, which is not in
+        // the ids.
         let links: Vec<&str> = built.chains[1].split(" > ").collect();
         assert_eq!(links.len(), 3, "{}", built.chains[1]);
         assert!(links[0].contains(".card-0.button-0 "), "{}", links[0]);
-        assert!(links[1].contains(".retained-card-0.card-0 "), "{}", links[1]);
+        assert!(links[1].contains(".root.card-0 "), "{}", links[1]);
         assert!(links[2].contains(".root "), "{}", links[2]);
         assert!(built.chains[2].contains("card-0"), "{}", built.chains[2]);
 
