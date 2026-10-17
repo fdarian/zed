@@ -7,6 +7,7 @@
 //!
 //! If all of your elements are the same height, see [`crate::UniformList`] for a simpler API
 
+use crate::taffy::hash_measure_key;
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement,
@@ -1591,8 +1592,14 @@ impl Element for List {
                     let summary = state.items.summary();
                     let total_height = summary.height;
 
-                    window.request_measured_layout(
+                    let measure_key = hash_measure_key((
+                        max_element_width.0.to_bits(),
+                        total_height.0.to_bits(),
+                    ));
+                    window.request_keyed_measured_layout(
+                        measure_key,
                         style,
+                        (),
                         move |known_dimensions, available_space, _window, _cx| {
                             let width =
                                 known_dimensions
@@ -1612,6 +1619,7 @@ impl Element for List {
                             size(width, height)
                         },
                     )
+                    .0
                 })
             }
             ListSizingBehavior::Auto => {

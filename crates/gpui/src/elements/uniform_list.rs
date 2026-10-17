@@ -4,6 +4,7 @@
 //! measurement. This is much faster than the full layout system, but only works for
 //! elements with uniform height.
 
+use crate::taffy::hash_measure_key;
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
@@ -297,8 +298,15 @@ impl Element for UniformList {
             |style, window, cx| match self.sizing_behavior {
                 ListSizingBehavior::Infer => {
                     window.with_text_style(style.text_style().cloned(), |window| {
-                        window.request_measured_layout(
+                        let measure_key = hash_measure_key((
+                            item_size.width.0.to_bits(),
+                            item_size.height.0.to_bits(),
+                            max_items,
+                        ));
+                        window.request_keyed_measured_layout(
+                            measure_key,
                             style,
+                            (),
                             move |known_dimensions, available_space, _window, _cx| {
                                 let desired_height = item_size.height * max_items;
                                 let width = known_dimensions.width.unwrap_or(match available_space
@@ -318,6 +326,7 @@ impl Element for UniformList {
                                 size(width, height)
                             },
                         )
+                        .0
                     })
                 }
                 ListSizingBehavior::Auto => window

@@ -60,6 +60,9 @@ pub struct TextSystem {
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    /// Counts the times fonts were added, which can change what text in a family that did not
+    /// resolve before looks like.
+    font_generation: std::sync::atomic::AtomicU64,
 }
 
 impl TextSystem {
@@ -72,6 +75,7 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
+            font_generation: std::sync::atomic::AtomicU64::new(0),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -102,9 +106,17 @@ impl TextSystem {
         names
     }
 
+    /// How many times fonts were added to the text system.
+    pub(crate) fn font_generation(&self) -> u64 {
+        self.font_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform_text_system.add_fonts(fonts)?;
+        self.font_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A family that was requested before its font was added is cached as an
         // error, and would never resolve. Resolved families stay valid.
         self.font_ids_by_font
@@ -1278,7 +1290,7 @@ impl Display for FontStyle {
 }
 
 /// A styled run of text, for use in [`crate::TextLayout`].
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TextRun {
     /// A number of utf8 bytes
     pub len: usize,

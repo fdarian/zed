@@ -15,7 +15,12 @@ use crate::{
     AbsoluteLength, DefiniteLength, Display, GridTemplate, GridTemplateMinSize, IntrinsicSize, Length,
     Overflow, Position, TestAppContext, px, relative,
 };
-use std::collections::BTreeMap;
+use std::{
+    cell::Cell,
+    collections::BTreeMap,
+    hash::{Hash as _, Hasher as _},
+    rc::Rc,
+};
 
 const REM_SIZE: Pixels = Pixels(16.);
 
@@ -54,9 +59,20 @@ struct Text {
     width: f32,
     line_height: f32,
     has_baseline: bool,
+    /// Whether the node asks with a measure key, which is all of the text it measures.
+    keyed: bool,
 }
 
+/// What a text leaf keeps of its last measure, as a text keeps its lines.
+type Lines = Rc<Cell<Option<(Size<Pixels>, Option<Pixels>)>>>;
+
 impl Text {
+    fn measure_key(&self) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        (self.width.to_bits(), self.line_height.to_bits(), self.has_baseline).hash(&mut hasher);
+        hasher.finish()
+    }
+
     fn measure(
         &self,
         known: Size<Option<Pixels>>,
@@ -201,11 +217,15 @@ impl Generator {
     }
 
     fn text(&mut self) -> Text {
-        Text {
+        let mut text = Text {
             width: self.random.pixels() + 10.,
             line_height: (self.random.below(3) * 4 + 8) as f32,
             has_baseline: self.random.one_in(2),
-        }
+            keyed: true,
+        };
+        // Not another draw, so that the trees stay what they were before leaves had keys.
+        text.keyed = (text.width as usize / 5 + text.line_height as usize) % 4 != 0;
+        text
     }
 
     /// `parent_scope` is the scope of the node around it. A quarter of the nodes have none of
@@ -392,29 +412,59 @@ fn edit(root: &mut Node, generator: &mut Generator) {
     }
 }
 
+/// A node of a frame as the engine knows it, and what its leaf keeps.
+struct Requested {
+    key: Key,
+    id: LayoutId,
+    lines: Option<Lines>,
+}
+
 /// How a frame hands a node to an engine, children first.
 fn request_node(
     engine: &mut TaffyLayoutEngine,
     node: &Node,
     children: &[LayoutId],
     scale_factor: f32,
-) -> LayoutId {
+) -> (LayoutId, Option<Lines>) {
     match &node.content {
-        Content::Container(_) => engine.request_keyed_layout(
-            node.scope.into(),
-            node.style.clone(),
-            REM_SIZE,
-            scale_factor,
-            children,
-        ),
-        Content::Text(text) => {
-            let text = *text;
-            engine.request_measured_layout(
+        Content::Container(_) => (
+            engine.request_keyed_layout(
+                node.scope.into(),
                 node.style.clone(),
                 REM_SIZE,
                 scale_factor,
-                move |known, available, _window, _cx| text.measure(known, available),
-            )
+                children,
+            ),
+            None,
+        ),
+        Content::Text(text) => {
+            let text = *text;
+            let lines = Lines::default();
+            let measure = {
+                let lines = lines.clone();
+                move |known, available, _window: &mut Window, _cx: &mut App| {
+                    let measured = text.measure(known, available);
+                    lines.set(Some((measured.size, measured.first_baseline)));
+                    measured
+                }
+            };
+            if !text.keyed {
+                let id = engine.request_measured_layout(node.style.clone(), REM_SIZE, scale_factor, measure);
+                return (id, None);
+            }
+            let (id, adopted) = engine.request_keyed_measured_layout(
+                node.scope.into(),
+                text.measure_key(),
+                node.style.clone(),
+                REM_SIZE,
+                scale_factor,
+                lines.clone(),
+                measure,
+            );
+            if let Some(previous) = adopted {
+                lines.set(previous.get());
+            }
+            (id, Some(lines))
         }
     }
 }
@@ -423,7 +473,7 @@ fn request_tree(
     engine: &mut TaffyLayoutEngine,
     node: &Node,
     scale_factor: f32,
-    requested: &mut Vec<(Key, LayoutId)>,
+    requested: &mut Vec<Requested>,
 ) -> LayoutId {
     let children: Vec<LayoutId> = match &node.content {
         Content::Container(children) => children
@@ -432,8 +482,12 @@ fn request_tree(
             .collect(),
         Content::Text(_) => Vec::new(),
     };
-    let id = request_node(engine, node, &children, scale_factor);
-    requested.push((node.key, id));
+    let (id, lines) = request_node(engine, node, &children, scale_factor);
+    requested.push(Requested {
+        key: node.key,
+        id,
+        lines,
+    });
     id
 }
 
@@ -447,6 +501,25 @@ struct Observed {
     parent_content_size: Option<Size<Pixels>>,
     natural_width: Option<Pixels>,
     scrollable_overflow_end: Option<Point<Pixels>>,
+    /// What a keyed text leaf holds of its last measure: the answer to the call that placed it.
+    lines: Option<Option<(Size<Pixels>, Option<Pixels>)>>,
+    /// Whether layout placed the leaf that `lines` is of. What a leaf holds when only asked about
+    /// sizes, or hidden, is up to the calls that happened to be made.
+    placed: bool,
+}
+
+/// Whether the node or a node above it is `display: none`. An absolutely positioned node there can
+/// still be laid out, against whatever its containing block was when the layout that decided its
+/// size ran: it is invisible, so what it measured at is up to the history of the engine.
+fn is_hidden(engine: &TaffyLayoutEngine, id: LayoutId) -> bool {
+    let mut node = Some(id.0);
+    while let Some(current) = node {
+        if engine.taffy.style(current).expect(EXPECT_MESSAGE).display == taffy::style::Display::None {
+            return true;
+        }
+        node = engine.taffy.parent(current);
+    }
+    false
 }
 
 /// The nodes of one layout of the tree, by key.
@@ -454,13 +527,15 @@ type Observation = BTreeMap<Key, Observed>;
 
 fn observe(
     engine: &mut TaffyLayoutEngine,
-    requested: &[(Key, LayoutId)],
+    requested: &[Requested],
     scale_factor: f32,
 ) -> Observation {
     requested
         .iter()
-        .map(|(key, id)| {
+        .map(|Requested { key, id, lines }| {
             let observed = Observed {
+                lines: lines.as_ref().map(|lines| lines.get()),
+                placed: lines.is_some() && engine.is_placed(*id) && !is_hidden(engine, *id),
                 bounds: engine.layout_bounds(*id, scale_factor),
                 content_size: engine.layout_content_size(*id, scale_factor),
                 insets: engine.layout_insets(*id, scale_factor),
@@ -479,7 +554,7 @@ fn request_scene(
     engine: &mut TaffyLayoutEngine,
     scene: &Scene,
     scale_factor: f32,
-) -> (Vec<(Key, LayoutId)>, Vec<LayoutId>) {
+) -> (Vec<Requested>, Vec<LayoutId>) {
     let mut requested = Vec::new();
     let mut roots = vec![request_tree(engine, &scene.root, scale_factor, &mut requested)];
     if let Some(detached) = &scene.detached {
@@ -601,9 +676,14 @@ fn assert_reuse_matches_new_engine(
             for (layout, (kept, new)) in kept.iter().zip(&new).enumerate() {
                 assert_eq!(kept.len(), new.len(), "seed {seed}, step {step}, layout {layout}");
                 for (key, kept) in kept {
+                    let expected = new.get(key).map(|new| Observed {
+                        lines: if new.placed { new.lines } else { kept.lines },
+                        placed: if new.placed { true } else { kept.placed },
+                        ..*new
+                    });
                     assert_eq!(
                         Some(kept),
-                        new.get(key),
+                        expected.as_ref(),
                         "seed {seed}, step {step}, layout {layout}: node {key} was laid out \
                          differently by the engine that kept state",
                     );
@@ -632,6 +712,7 @@ fn assert_reuse_matches_new_engine(
         total.styles_set += counters.styles_set;
         total.children_set += counters.children_set;
         total.passes += counters.passes;
+        total.measures += counters.measures;
     }
     total
 }
@@ -873,6 +954,7 @@ fn delta(before: LayoutCounters, after: LayoutCounters) -> LayoutCounters {
         styles_set: after.styles_set - before.styles_set,
         children_set: after.children_set - before.children_set,
         passes: after.passes - before.passes,
+        measures: after.measures - before.measures,
     }
 }
 
