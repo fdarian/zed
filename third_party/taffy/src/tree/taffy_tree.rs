@@ -12,7 +12,7 @@ use crate::style::{AvailableSpace, Display, Style};
 use crate::sys::DefaultCheapStr;
 use crate::tree::{
     Cache, ClearState, Layout, LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, PrintTree, RoundTree, RunMode,
-    TraversePartialTree, TraverseTree,
+    SizingMode, TraversePartialTree, TraverseTree,
 };
 use crate::util::debug::{debug_log, debug_log_node};
 use crate::util::sys::{new_vec_with_capacity, ChildrenVec, Vec};
@@ -49,6 +49,47 @@ pub struct LinearCalc {
     pub length: f32,
     /// The part proportional to the basis, as a fraction (0.5 is 50%).
     pub percent: f32,
+}
+
+/// `inputs` for a node with size containment: a contained axis that layout would size from the
+/// content is known to be the node's padding and border instead (clamped by `min-` and `max-`),
+/// which is what the node measures with no children. An axis the node is given, or that its
+/// own definite size styles decide, is left to the layout algorithm.
+///
+/// fdarian fork patch.
+fn contained_inputs(style: &Style, mut inputs: LayoutInput) -> LayoutInput {
+    use crate::style::{BoxSizing, Overflow};
+    use crate::util::{MaybeMath, MaybeResolve, ResolveOrZero};
+
+    let parent_size = inputs.parent_size;
+    let padding = style.padding.resolve_or_zero(parent_size.width, resolve_linear_calc);
+    let border = style.border.resolve_or_zero(parent_size.width, resolve_linear_calc);
+    let mut padding_border = (padding + border).sum_axes();
+    if style.overflow.y == Overflow::Scroll {
+        padding_border.width += style.scrollbar_width;
+    }
+    if style.overflow.x == Overflow::Scroll {
+        padding_border.height += style.scrollbar_width;
+    }
+    let box_sizing_adjustment =
+        if style.box_sizing == BoxSizing::ContentBox { padding_border } else { Size::ZERO };
+    let min_size = style.min_size.maybe_resolve(parent_size, resolve_linear_calc).maybe_add(box_sizing_adjustment);
+    let max_size = style.max_size.maybe_resolve(parent_size, resolve_linear_calc).maybe_add(box_sizing_adjustment);
+    let styled_size = style.size.maybe_resolve(parent_size, resolve_linear_calc);
+    let sized_by_content = |known: Option<f32>, styled: Option<f32>| {
+        known.is_none() && (styled.is_none() || inputs.sizing_mode == SizingMode::ContentSize)
+    };
+    let contained = |padding_border: f32, min: Option<f32>, max: Option<f32>| {
+        let floor = min.map_or(padding_border, |min| padding_border.max(min));
+        Some(max.map_or(floor, |max| floor.min(max).max(padding_border)))
+    };
+    if style.contain_inline_size && sized_by_content(inputs.known_dimensions.width, styled_size.width) {
+        inputs.known_dimensions.width = contained(padding_border.width, min_size.width, max_size.width);
+    }
+    if style.contain_block_size && sized_by_content(inputs.known_dimensions.height, styled_size.height) {
+        inputs.known_dimensions.height = contained(padding_border.height, min_size.height, max_size.height);
+    }
+    inputs
 }
 
 // fdarian fork patch: upstream returns 0.0.
@@ -327,6 +368,15 @@ where
         //
         // If there was no cache match and a new result needs to be computed then that result will be added to the cache
         compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+            // fdarian fork patch: size containment.
+            let inputs = {
+                let style = &tree.taffy.nodes[node_id.into()].style;
+                if style.contain_inline_size || style.contain_block_size {
+                    contained_inputs(style, inputs)
+                } else {
+                    inputs
+                }
+            };
             let display_mode = tree.taffy.nodes[node_id.into()].style.display;
             let has_children = tree.child_count(node_id) > 0;
 

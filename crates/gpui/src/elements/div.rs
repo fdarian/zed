@@ -5424,6 +5424,80 @@ mod tests {
         assert_eq!(insets.border.top, px(0.));
     }
 
+    struct ContainedItems {
+        inline: bool,
+        block: bool,
+    }
+
+    impl Render for ContainedItems {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let (inline, block) = (self.inline, self.block);
+            let item = |name: &'static str| {
+                let mut item = div()
+                    .debug_selector(move || name.into())
+                    .p(px(10.))
+                    .border_2()
+                    .child(div().w(px(200.)).h(px(50.)));
+                item.style().contain_inline_size = Some(inline);
+                item.style().contain_block_size = Some(block);
+                item
+            };
+            div()
+                .w(px(600.))
+                .flex()
+                .items_start()
+                .child(item("plain"))
+                .child(item("sized").w(px(100.)))
+                .child(item("grow").flex_grow(1.))
+        }
+    }
+
+    fn contained_bounds(inline: bool, block: bool, cx: &mut TestAppContext) -> [Bounds<Pixels>; 3] {
+        let window = cx.add_window(move |_, _| ContainedItems { inline, block });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        ["plain", "sized", "grow"].map(|selector| {
+            cx.update_window(window.into(), |_, window, _| {
+                window.rendered_frame.debug_bounds.get(selector).copied()
+            })
+            .unwrap()
+            .unwrap_or_else(|| panic!("{selector} was not rendered"))
+        })
+    }
+
+    #[gpui::test]
+    fn without_containment_an_item_is_as_wide_as_its_content(cx: &mut TestAppContext) {
+        let [plain, sized, grow] = contained_bounds(false, false, cx);
+        // 200px of child, 10px of padding and 2px of border on each side.
+        assert_eq!(plain.size, size(px(224.), px(74.)));
+        assert_eq!(sized.size.width, px(100.));
+        // 224 of content, plus what is left of 600 after 224 and 100: 52.
+        assert_eq!(grow.size.width, px(276.));
+    }
+
+    #[gpui::test]
+    fn inline_size_containment_makes_the_content_based_width_the_padding_and_border(
+        cx: &mut TestAppContext,
+    ) {
+        let [plain, sized, grow] = contained_bounds(true, false, cx);
+        assert_eq!(plain.size, size(px(24.), px(74.)), "the height still follows the content");
+        assert_eq!(sized.size.width, px(100.), "a definite width wins");
+        assert_eq!(sized.origin.x, px(24.));
+        // flex-grow takes what is left of 600 after the other two: 600 - 24 - 100.
+        assert_eq!(grow.size.width, px(476.));
+    }
+
+    #[gpui::test]
+    fn block_size_containment_makes_the_content_based_height_the_padding_and_border(
+        cx: &mut TestAppContext,
+    ) {
+        let [plain, ..] = contained_bounds(false, true, cx);
+        assert_eq!(plain.size, size(px(224.), px(24.)), "the width still follows the content");
+        let [plain, sized, _] = contained_bounds(true, true, cx);
+        assert_eq!(plain.size, size(px(24.), px(24.)));
+        assert_eq!(sized.size, size(px(100.), px(24.)));
+    }
+
     struct RedrawView {
         renders: Rc<Cell<usize>>,
         painted: Rc<Cell<usize>>,

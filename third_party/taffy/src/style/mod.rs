@@ -453,6 +453,12 @@ pub struct Style<S: CheapCloneStr = DefaultCheapStr> {
     /// Is it a replaced element like an image or form field?
     /// <https://drafts.csswg.org/css-sizing-3/#min-content-zero>
     pub item_is_replaced: bool,
+    // fdarian fork patch: CSS size containment.
+    /// `contain: inline-size`: the node's width never depends on its content. With no definite
+    /// width its content-based width is only its padding and border, as if it had no children.
+    pub contain_inline_size: bool,
+    /// `contain: block-size`: the same for the height.
+    pub contain_block_size: bool,
     /// Should size styles apply to the content box or the border box of the node
     pub box_sizing: BoxSizing,
     /// Sets the direction of text, table and grid columns, and horizontal overflow.
@@ -602,6 +608,8 @@ impl<S: CheapCloneStr> Style<S> {
         display: Display::DEFAULT,
         item_is_table: false,
         item_is_replaced: false,
+        contain_inline_size: false,
+        contain_block_size: false,
         box_sizing: BoxSizing::BorderBox,
         direction: Direction::Ltr,
         overflow: Point { x: Overflow::Visible, y: Overflow::Visible },
@@ -1237,6 +1245,8 @@ mod tests {
             display: Default::default(),
             item_is_table: false,
             item_is_replaced: false,
+            contain_inline_size: false,
+            contain_block_size: false,
             box_sizing: Default::default(),
             #[cfg(feature = "float_layout")]
             float: Default::default(),
