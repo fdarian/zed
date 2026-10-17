@@ -3005,4 +3005,189 @@ mod chrome {
             ],
         );
     }
+
+    /// A table in a flex container that aligns by baseline: the first baseline of the table is that of its first row,
+    /// with the spacing, padding and border above it. The box next to it has no baseline, so it is the bottom of the box.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <div style="display:flex;align-items:baseline">
+    ///   <div style="width:10px;height:10px"></div>
+    ///   <table style="border-spacing:4px;padding:3px;border-width:2px">
+    ///     <tr>
+    ///       <td>
+    ///         <div style="width:20px;height:30px"></div>
+    ///       </td>
+    ///       <td>
+    ///         <div style="width:10px;height:10px"></div>
+    ///       </td>
+    ///     </tr>
+    ///   </table>
+    ///   <div style="width:5px;height:5px"></div>
+    /// </div>
+    /// ```
+    #[test]
+    fn first_baseline_of_a_table_is_the_baseline_of_its_first_row() {
+        let tree = vec![
+            flex(|s| { s.align_items = Some(AlignItems::BASELINE); }, vec![
+                boxed(10.0, 10.0),
+                table(|s| {
+                s.border_spacing = Size { width: 4.0, height: 4.0 };
+                s.padding = sides(3.0, 3.0, 3.0, 3.0);
+                s.border = sides(2.0, 2.0, 2.0, 2.0);
+            }, vec![
+                    tr(|_| {}, vec![
+                        td(|_| {}, vec![
+                            boxed(20.0, 30.0),
+                        ]),
+                        td(|_| {}, vec![
+                            boxed(10.0, 10.0),
+                        ]),
+                    ]),
+                ]),
+                boxed(5.0, 5.0),
+            ]),
+        ];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 300.0, 48.0], // div
+                [0.0, 29.0, 10.0, 10.0], // box
+                [10.0, 0.0, 52.0, 48.0], // table
+                [19.0, 9.0, 34.0, 30.0], // tr
+                [19.0, 9.0, 20.0, 30.0], // td
+                [19.0, 9.0, 20.0, 30.0], // box
+                [43.0, 9.0, 10.0, 30.0], // td
+                [43.0, 29.0, 10.0, 10.0], // box
+                [62.0, 34.0, 5.0, 5.0], // box
+            ],
+        );
+    }
+
+    /// If no cell of the first row is aligned to the baseline, the bottom of the row is the baseline.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <div style="display:flex;align-items:baseline">
+    ///   <div style="width:10px;height:40px"></div>
+    ///   <table>
+    ///     <tr>
+    ///       <td style="vertical-align:top">
+    ///         <div style="width:20px;height:30px"></div>
+    ///       </td>
+    ///       <td style="vertical-align:bottom">
+    ///         <div style="width:10px;height:10px"></div>
+    ///       </td>
+    ///     </tr>
+    ///     <tr>
+    ///       <td>
+    ///         <div style="width:10px;height:50px"></div>
+    ///       </td>
+    ///     </tr>
+    ///   </table>
+    ///   <div style="width:5px;height:5px"></div>
+    /// </div>
+    /// ```
+    #[test]
+    fn first_baseline_of_a_table_is_the_bottom_of_its_first_row_without_baseline_cells() {
+        let tree = vec![
+            flex(|s| { s.align_items = Some(AlignItems::BASELINE); }, vec![
+                boxed(10.0, 40.0),
+                table(|_| {}, vec![
+                    tr(|_| {}, vec![
+                        td(|s| { s.vertical_align = VerticalAlign::Top; }, vec![
+                            boxed(20.0, 30.0),
+                        ]),
+                        td(|s| { s.vertical_align = VerticalAlign::Bottom; }, vec![
+                            boxed(10.0, 10.0),
+                        ]),
+                    ]),
+                    tr(|_| {}, vec![
+                        td(|_| {}, vec![
+                            boxed(10.0, 50.0),
+                        ]),
+                    ]),
+                ]),
+                boxed(5.0, 5.0),
+            ]),
+        ];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 300.0, 90.0], // div
+                [0.0, 0.0, 10.0, 40.0], // box
+                [10.0, 10.0, 30.0, 80.0], // table
+                [10.0, 10.0, 30.0, 30.0], // tr
+                [10.0, 10.0, 20.0, 30.0], // td
+                [10.0, 10.0, 20.0, 30.0], // box
+                [30.0, 10.0, 10.0, 30.0], // td
+                [30.0, 30.0, 10.0, 10.0], // box
+                [10.0, 40.0, 30.0, 50.0], // tr
+                [10.0, 40.0, 20.0, 50.0], // td
+                [10.0, 40.0, 10.0, 50.0], // box
+                [40.0, 35.0, 5.0, 5.0], // box
+            ],
+        );
+    }
+
+    /// A caption above the rows is above the baseline too.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <div style="display:flex;align-items:baseline">
+    ///   <div style="width:10px;height:40px"></div>
+    ///   <table>
+    ///     <caption>
+    ///       <div style="width:20px;height:12px"></div>
+    ///     </caption>
+    ///     <tr>
+    ///       <td>
+    ///         <div style="width:20px;height:30px"></div>
+    ///       </td>
+    ///       <td>
+    ///         <div style="width:10px;height:10px"></div>
+    ///       </td>
+    ///     </tr>
+    ///   </table>
+    ///   <div style="width:5px;height:5px"></div>
+    /// </div>
+    /// ```
+    #[test]
+    fn first_baseline_of_a_table_comes_after_the_caption_above_it() {
+        let tree = vec![
+            flex(|s| { s.align_items = Some(AlignItems::BASELINE); }, vec![
+                boxed(10.0, 40.0),
+                table(|_| {}, vec![
+                    caption(CaptionSide::Top, vec![
+                        boxed(20.0, 12.0),
+                    ]),
+                    tr(|_| {}, vec![
+                        td(|_| {}, vec![
+                            boxed(20.0, 30.0),
+                        ]),
+                        td(|_| {}, vec![
+                            boxed(10.0, 10.0),
+                        ]),
+                    ]),
+                ]),
+                boxed(5.0, 5.0),
+            ]),
+        ];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 300.0, 42.0], // div
+                [0.0, 2.0, 10.0, 40.0], // box
+                [10.0, 0.0, 30.0, 42.0], // table
+                [10.0, 0.0, 30.0, 12.0], // caption
+                [10.0, 0.0, 20.0, 12.0], // box
+                [10.0, 12.0, 30.0, 30.0], // tr
+                [10.0, 12.0, 20.0, 30.0], // td
+                [10.0, 12.0, 20.0, 30.0], // box
+                [30.0, 12.0, 10.0, 30.0], // td
+                [30.0, 32.0, 10.0, 10.0], // box
+                [40.0, 37.0, 5.0, 5.0], // box
+            ],
+        );
+    }
 }

@@ -2,7 +2,29 @@
 //!
 //! The table node lays out its row groups, rows and cells itself: nobody calls `compute_child_layout` for a row group
 //! or a row, only for the cells (as block containers) and the captions. Row groups and rows get their layout set here,
-//! relative to their parent, so the layouts of a table's subtree nest like the nodes do.
+//! relative to their parent, so the layouts of a table's subtree nest like the nodes do: a row group is placed in the
+//! table, a row in its row group (or in the table, when it has none), a cell in its row.
+//!
+//! A cell is told its whole box, the width of its columns and the height of its rows, and puts its content where its
+//! `vertical-align` says by being given a height that leaves exactly the offset as free space, see
+//! [`BlockContainerStyle::align_content`](crate::BlockContainerStyle) of [`Style`](crate::Style).
+//!
+//! Where it differs from Chrome (everything else is compared against it in `tests`):
+//!   - A child of a table, row group or row that is not a table part is a cell of its own, where CSS wraps it and its
+//!     neighbours in one anonymous cell. It is as big as its row, and its content stays at the top: only nodes with the
+//!     role of a cell are aligned in their row.
+//!   - Percentage heights of rows, row groups and cells are `auto`.
+//!   - Cells and rows with `rowspan`s that leave rows without a cell of their own (and no height) share the height of
+//!     the spanning cell differently in some cases, and percent rows past 100% are not shrunk the way Chrome does.
+//!   - `direction: rtl` is ignored, columns are not mirrored.
+//!   - Leaf nodes that are measured (text) have no baseline, so a cell aligned to the baseline with text in it is
+//!     aligned by the bottom of its content instead of its first line.
+//!   - A table that is a flex item and is given less width than its min-content still reports its min-content width,
+//!     but the flex container positions it for the width it asked for.
+//!   - The max-content width of a table whose percentage columns add up to 100% next to columns without one is
+//!     unbounded in Chrome. Here it is what the columns ask for, and a definite available width is filled.
+//!   - Absolutely positioned children of the table are placed by their insets, auto margins do not centre them.
+//!   - The sums are f32 where Chrome has 1/64 of a pixel, so widths shared out can differ in the second decimal.
 use crate::geometry::{Point, Rect, Size};
 use crate::style::{AvailableSpace, BoxSizing, CaptionSide, CoreStyle, Dimension, VerticalAlign};
 use crate::style::{TableContainerStyle, TableItemStyle, TableLayout};
@@ -256,7 +278,8 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
 
     // Where the first row's baseline is, for a table that is itself aligned by baseline
     let grid_top = captions_top + padding_border.top;
-    let first_baseline = rows.first().map(|row| grid_top + spacing.height + row.baseline.unwrap_or(0.0));
+    // The first row has its baseline, or its bottom when none of its cells is aligned to it
+    let first_baseline = rows.first().map(|row| grid_top + spacing.height + row.baseline.unwrap_or(row.height));
 
     if inputs.run_mode == RunMode::ComputeSize {
         return LayoutOutput::from_sizes_and_baselines(table_size, Size::ZERO, Point { x: None, y: first_baseline });
