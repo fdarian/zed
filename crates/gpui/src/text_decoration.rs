@@ -3,6 +3,22 @@ use std::iter;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// How the thickness of a text decoration line is decided, from CSS
+/// `text-decoration-thickness`.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum DecorationThickness {
+    /// `thickness` is a length: rounded to a device pixel when painted.
+    #[default]
+    Length,
+    /// `thickness` is what `auto` computes to, a tenth of the decorating box's font size.
+    /// It stays fractional (the gap of an `auto` underline offset grows from it) and
+    /// solid lines floor it to a device pixel when painted, as Chrome does.
+    Auto,
+    /// The underline thickness the font reports, with `thickness` (the `auto` value)
+    /// for a font that has none. Snapped like `Auto`.
+    FromFont,
+}
+
 /// The CSS `text-decoration-style` of a text decoration line.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum TextDecorationStyle {

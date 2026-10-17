@@ -1,5 +1,5 @@
 use crate::{
-    App, Bounds, DevicePixels, ExtraDecoration, FontId, GlyphInset, Half, Hsla, LineLayout,
+    App, Bounds, DecorationThickness, DevicePixels, ExtraDecoration, FontId, GlyphInset, Half, Hsla, LineLayout,
     OverlineStyle, Pixels, Point, RenderGlyphParams, Result, ShapedRun, SharedString,
     StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
@@ -401,16 +401,17 @@ impl WrappedLine {
     }
 }
 
-/// `thickness` unless the style asks for the font's own underline thickness and the
-/// font has one, as CSS `text-decoration-thickness: from-font` falls back to `auto`.
+/// The thickness a decoration line has before painting snaps it. A length is `thickness`;
+/// `from-font` is the font's own underline thickness when it has one, and the
+/// `thickness` the style carries (the `auto` value) when it has none.
 fn decoration_thickness(
     thickness: Pixels,
-    from_font: bool,
+    kind: DecorationThickness,
     text_system: &TextSystem,
     font_id: FontId,
     font_size: Pixels,
 ) -> Pixels {
-    if !from_font {
+    if kind != DecorationThickness::FromFont {
         return thickness;
     }
     let font_thickness = text_system.underline_thickness(font_id, font_size);
@@ -594,7 +595,7 @@ fn paint_line(
                         if let Some(run_underline) = style_run.underline.as_ref() {
                             let thickness = decoration_thickness(
                                 run_underline.thickness,
-                                run_underline.thickness_from_font,
+                                run_underline.thickness_kind,
                                 &text_system,
                                 run.font_id,
                                 layout.font_size,
@@ -626,7 +627,7 @@ fn paint_line(
                                     color: Some(run_strikethrough.color.unwrap_or(style_run.color)),
                                     thickness: decoration_thickness(
                                         run_strikethrough.thickness,
-                                        run_strikethrough.thickness_from_font,
+                                        run_strikethrough.thickness_kind,
                                         &text_system,
                                         run.font_id,
                                         layout.font_size,
@@ -648,7 +649,7 @@ fn paint_line(
                                     color: Some(run_overline.color.unwrap_or(style_run.color)),
                                     thickness: decoration_thickness(
                                         run_overline.thickness,
-                                        run_overline.thickness_from_font,
+                                        run_overline.thickness_kind,
                                         &text_system,
                                         run.font_id,
                                         layout.font_size,
@@ -1001,10 +1002,10 @@ fn open_extra(
     text_system: &TextSystem,
     scale_factor: f32,
 ) -> OpenDecoration<ExtraDecoration> {
-    let thickness = |thickness, from_font| {
+    let thickness = |thickness, kind| {
         decoration_thickness(
             thickness,
-            from_font,
+            kind,
             text_system,
             run.font_id,
             layout.font_size,
@@ -1012,7 +1013,7 @@ fn open_extra(
     };
     let (baseline_offset, style) = match extra {
         ExtraDecoration::Underline(underline) => {
-            let thickness = thickness(underline.thickness, underline.thickness_from_font);
+            let thickness = thickness(underline.thickness, underline.thickness_kind);
             (
                 underline_offset(underline.offset, thickness, scale_factor),
                 ExtraDecoration::Underline(UnderlineStyle {
@@ -1026,7 +1027,7 @@ fn open_extra(
             strikethrough_offset(layout, run, line_height),
             ExtraDecoration::Strikethrough(StrikethroughStyle {
                 color: Some(strikethrough.color.unwrap_or(run_color)),
-                thickness: thickness(strikethrough.thickness, strikethrough.thickness_from_font),
+                thickness: thickness(strikethrough.thickness, strikethrough.thickness_kind),
                 ..*strikethrough
             }),
         ),
@@ -1034,7 +1035,7 @@ fn open_extra(
             overline_offset(layout, run),
             ExtraDecoration::Overline(OverlineStyle {
                 color: Some(overline.color.unwrap_or(run_color)),
-                thickness: thickness(overline.thickness, overline.thickness_from_font),
+                thickness: thickness(overline.thickness, overline.thickness_kind),
                 ..*overline
             }),
         ),

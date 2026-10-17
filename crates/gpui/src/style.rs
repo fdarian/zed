@@ -11,7 +11,7 @@ use crate::{
     CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
-    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, TextDecorationStyle, TextLayoutOptions,
+    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions,
     TextRun, Window, OverflowWrap, WordBreak, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
@@ -1511,12 +1511,11 @@ impl Default for Style {
     Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub struct UnderlineStyle {
-    /// The thickness of the underline. With `thickness_from_font` this is the fallback
-    /// for a font that has no underline thickness.
+    /// The thickness of the underline, in the way `thickness_kind` says.
     pub thickness: Pixels,
 
-    /// Use the underline thickness the font reports (CSS `text-decoration-thickness: from-font`).
-    pub thickness_from_font: bool,
+    /// What `thickness` is: a length, or the CSS `auto` or `from-font` value.
+    pub thickness_kind: DecorationThickness,
 
     /// The color of the underline.
     pub color: Option<Hsla>,
@@ -1535,12 +1534,11 @@ pub struct UnderlineStyle {
     Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub struct StrikethroughStyle {
-    /// The thickness of the strikethrough. With `thickness_from_font` this is the fallback
-    /// for a font that has no underline thickness.
+    /// The thickness of the strikethrough, in the way `thickness_kind` says.
     pub thickness: Pixels,
 
-    /// Use the underline thickness the font reports (CSS `text-decoration-thickness: from-font`).
-    pub thickness_from_font: bool,
+    /// What `thickness` is: a length, or the CSS `auto` or `from-font` value.
+    pub thickness_kind: DecorationThickness,
 
     /// The color of the strikethrough.
     pub color: Option<Hsla>,
@@ -1554,12 +1552,11 @@ pub struct StrikethroughStyle {
     Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub struct OverlineStyle {
-    /// The thickness of the overline. With `thickness_from_font` this is the fallback
-    /// for a font that has no underline thickness.
+    /// The thickness of the overline, in the way `thickness_kind` says.
     pub thickness: Pixels,
 
-    /// Use the underline thickness the font reports (CSS `text-decoration-thickness: from-font`).
-    pub thickness_from_font: bool,
+    /// What `thickness` is: a length, or the CSS `auto` or `from-font` value.
+    pub thickness_kind: DecorationThickness,
 
     /// The color of the overline.
     pub color: Option<Hsla>,

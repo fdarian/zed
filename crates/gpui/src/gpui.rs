@@ -178,7 +178,7 @@ use taffy::TaffyLayoutEngine;
 pub use taffy::{AvailableSpace, LayoutId, LayoutInsets, MeasuredLeaf};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
-pub use text_decoration::TextDecorationStyle;
+pub use text_decoration::{DecorationThickness, TextDecorationStyle};
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;

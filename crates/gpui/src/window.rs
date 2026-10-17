@@ -19,7 +19,7 @@ use crate::{
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextDecorationStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle, Visibility,
+    DecorationThickness, TextDecorationStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle, Visibility,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
     transparent_black,
@@ -3609,6 +3609,25 @@ impl Window {
         ScaledPixels(round_stroke_to_device_pixel(value.0, self.scale_factor()))
     }
 
+    /// A computed `auto` or `from-font` thickness is fractional. Chrome fills a solid or
+    /// double line with the thickness floored to a device pixel and strokes a dotted or
+    /// dashed one with it rounded; a length was already rounded when it resolved.
+    #[inline]
+    fn snap_decoration_thickness(
+        &self,
+        thickness: Pixels,
+        kind: DecorationThickness,
+        style: TextDecorationStyle,
+    ) -> ScaledPixels {
+        let floors = kind != DecorationThickness::Length
+            && matches!(style, TextDecorationStyle::Solid | TextDecorationStyle::Double);
+        if floors {
+            ScaledPixels(floor_to_device_pixel(thickness.0, self.scale_factor()).max(1.0))
+        } else {
+            self.snap_stroke(thickness)
+        }
+    }
+
     #[inline]
     fn snap_border_widths(&self, edges: Edges<Pixels>) -> Edges<ScaledPixels> {
         edges.map(|e| self.snap_stroke(*e))
@@ -5829,6 +5848,7 @@ impl Window {
             origin,
             width,
             style.thickness,
+            style.thickness_kind,
             style.color,
             style.style,
         );
@@ -5848,6 +5868,7 @@ impl Window {
             origin,
             width,
             style.thickness,
+            style.thickness_kind,
             style.color,
             style.style,
         );
@@ -5862,6 +5883,7 @@ impl Window {
             origin,
             width,
             style.thickness,
+            style.thickness_kind,
             style.color,
             style.style,
         );
@@ -5874,13 +5896,14 @@ impl Window {
         origin: Point<Pixels>,
         width: Pixels,
         thickness: Pixels,
+        thickness_kind: DecorationThickness,
         color: Option<Hsla>,
         style: TextDecorationStyle,
     ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let thickness = self.snap_stroke(thickness);
+        let thickness = self.snap_decoration_thickness(thickness, thickness_kind, style);
         if thickness.0 == 0. {
             return;
         }
@@ -10761,6 +10784,129 @@ mod tests {
             inner.bounds.origin.y.0 - outer.bounds.origin.y.0,
             gap(8.) - gap(1.)
         );
+    }
+
+    /// Every kind of line at `font_size` with the thickness `thickness` of kind `kind`,
+    /// in the order underline, overline, line-through.
+    fn painted_thickness_lines(
+        cx: &mut crate::VisualTestContext,
+        font_size: f32,
+        thickness: Pixels,
+        kind: crate::DecorationThickness,
+        style: crate::TextDecorationStyle,
+    ) -> Vec<crate::Underline> {
+        use crate::{OverlineStyle, StrikethroughStyle, UnderlineStyle};
+        cx.draw(point(px(0.), px(0.)), size(px(1000.), px(200.)), |_, _| {
+            let mut el = div().text_size(px(font_size));
+            el.text_style().underline = Some(UnderlineStyle {
+                thickness,
+                thickness_kind: kind,
+                style,
+                ..Default::default()
+            });
+            el.text_style().overline = Some(OverlineStyle {
+                thickness,
+                thickness_kind: kind,
+                style,
+                ..Default::default()
+            });
+            el.text_style().strikethrough = Some(StrikethroughStyle {
+                thickness,
+                thickness_kind: kind,
+                style,
+                ..Default::default()
+            });
+            el.child("decorated")
+        });
+        cx.update(|window, _| window.painted_underlines())
+    }
+
+    #[gpui::test]
+    fn an_auto_thickness_is_floored_to_a_device_pixel_on_a_solid_line(cx: &mut TestAppContext) {
+        use crate::{DecorationThickness, TextDecorationStyle};
+        let cx = cx.add_empty_window();
+        let scale = cx.update(|window, _| window.scale_factor());
+        for font_size in [16., 29., 32., 40.] {
+            let lines = painted_thickness_lines(
+                cx,
+                font_size,
+                px(font_size / 10.),
+                DecorationThickness::Auto,
+                TextDecorationStyle::Solid,
+            );
+            assert_eq!(lines.len(), 3, "{font_size}");
+            let expected = (font_size / 10. * scale).floor().max(1.);
+            for line in &lines {
+                assert_eq!(line.thickness.0, expected, "{font_size}");
+                assert_eq!(line.bounds.size.height.0, expected, "{font_size}");
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn an_auto_thickness_is_rounded_on_a_dotted_line_and_a_length_always(cx: &mut TestAppContext) {
+        use crate::{DecorationThickness, TextDecorationStyle};
+        let cx = cx.add_empty_window();
+        let scale = cx.update(|window, _| window.scale_factor());
+        let dotted = painted_thickness_lines(
+            cx,
+            29.,
+            px(2.9),
+            DecorationThickness::Auto,
+            TextDecorationStyle::Dotted,
+        );
+        assert!(dotted.iter().all(|line| line.thickness.0 == (2.9 * scale).round()));
+        let length = painted_thickness_lines(
+            cx,
+            29.,
+            px(2.9),
+            DecorationThickness::Length,
+            TextDecorationStyle::Solid,
+        );
+        assert!(length.iter().all(|line| line.thickness.0 == (2.9 * scale).round()));
+    }
+
+    #[gpui::test]
+    fn from_font_uses_the_font_underline_thickness_for_every_line_and_falls_back_to_auto(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{DecorationThickness, TextDecorationStyle};
+        let cx = cx.add_empty_window();
+        let scale = cx.update(|window, _| window.scale_factor());
+        // The test font's underline is 0.06em, 6px at 100px; the fallback is 10px.
+        let lines = painted_thickness_lines(
+            cx,
+            100.,
+            px(10.),
+            DecorationThickness::FromFont,
+            TextDecorationStyle::Solid,
+        );
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert_eq!(line.thickness.0, (6. * scale).floor());
+        }
+    }
+
+    #[gpui::test]
+    fn an_auto_underline_gap_comes_from_the_unfloored_thickness(cx: &mut TestAppContext) {
+        use crate::{DecorationThickness, TextDecorationStyle};
+        let cx = cx.add_empty_window();
+        let scale = cx.update(|window, _| window.scale_factor());
+        let at = |cx: &mut crate::VisualTestContext, font_size: f32, thickness: f32, kind| {
+            let lines = painted_thickness_lines(
+                cx,
+                font_size,
+                px(thickness),
+                kind,
+                TextDecorationStyle::Solid,
+            );
+            lines[0].bounds.origin.y.0
+        };
+        // 2.4px at 24px: Chrome's gap is ceil(2.4 / 2), not that of the floored 2.
+        let auto = at(cx, 24., 2.4, DecorationThickness::Auto);
+        let explicit_two = at(cx, 24., 2., DecorationThickness::Length);
+        let gap = |thickness: f32| (thickness * scale / 2.).ceil().max(1.);
+        assert_eq!(auto - explicit_two, gap(2.4) - gap(2.));
     }
 
     #[gpui::test]
