@@ -1974,6 +1974,29 @@ mod tests {
         });
     }
 
+    struct Static;
+
+    impl Render for Static {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().id("static").w(px(30.)).h(px(30.)).bg(crate::blue())
+        }
+    }
+
+    #[gpui::test]
+    fn a_subtree_with_a_cached_view_drawn_from_its_last_frame_is_never_replayed(
+        cx: &mut TestAppContext,
+    ) {
+        let view = cx.new(|_| Static);
+        never_replayed(cx, NonReusable::CachedView, move |_, _| {
+            div()
+                .id("holder")
+                .w(px(100.))
+                .h(px(100.))
+                .child(view.clone().cached(crate::StyleRefinement::default().size_full()))
+                .into_any_element()
+        });
+    }
+
     #[gpui::test]
     fn a_subtree_with_a_width_keyword_is_never_replayed(cx: &mut TestAppContext) {
         never_replayed(cx, NonReusable::UnstableLayout, |_, _| {
