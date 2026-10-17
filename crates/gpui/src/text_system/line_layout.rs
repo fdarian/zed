@@ -14,7 +14,7 @@ use std::{
 };
 
 use super::{
-    AtomicExtent, InlineRun, InlineSpec, LineMetrics, LineWrapper, RunPlacement, apply_inline,
+    InlineRun, InlineSpec, LineMetrics, LineWrapper, RunPlacement, apply_inline,
     resolve_placements,
 };
 use gpui_util::ResultExt as _;

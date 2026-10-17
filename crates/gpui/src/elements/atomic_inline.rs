@@ -170,10 +170,6 @@ impl AtomicInlines {
         Self { engine, slots }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.slots.is_empty()
-    }
-
     /// Measures every box for a text laid out at `measure`, and returns them as the
     /// inline boxes the text is shaped with.
     pub(crate) fn measure(
