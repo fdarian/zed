@@ -10630,6 +10630,30 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_box_can_stop_the_decoration_of_the_boxes_around_it(cx: &mut TestAppContext) {
+        use crate::{blue, red};
+        let cx = cx.add_empty_window();
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(60.)), |_, _| {
+            let mut stopped = div().child("stopped");
+            stopped.text_style().reset_decorations = Some(true);
+            let mut own = div().underline().text_decoration_color(blue()).child("own");
+            own.text_style().reset_decorations = Some(true);
+            div()
+                .text_size(px(16.))
+                .underline()
+                .text_decoration_color(red())
+                .child("outer")
+                .child(stopped)
+                .child(own)
+        });
+        let lines = cx.update(|window, _| window.painted_underlines());
+        // The outer text's, and the blue one of the box that declares its own: the red line does
+        // not reach "stopped", and it is not drawn beside the blue one either.
+        assert_eq!(lines.iter().filter(|line| line.color == red()).count(), 1);
+        assert_eq!(lines.iter().filter(|line| line.color == blue()).count(), 1);
+    }
+
+    #[gpui::test]
     fn a_zero_thickness_decoration_paints_nothing(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         let none = painted_decorations(cx, |el| el.underline().text_decoration_0());

@@ -623,6 +623,11 @@ pub struct TextStyle {
     /// The lines drawn besides `underline`, `strikethrough` and `overline`.
     pub extra_decorations: Vec<ExtraDecoration>,
 
+    /// In a refinement: the element does not draw the decoration lines of the elements
+    /// around it on its text, as an atomic inline (`inline-block`) does not in CSS. Lines the
+    /// element declares itself are drawn. Nothing is inherited from this.
+    pub reset_decorations: bool,
+
     /// How to handle whitespace in the text
     pub white_space: WhiteSpace,
 
@@ -673,6 +678,7 @@ impl Default for TextStyle {
             strikethrough: None,
             overline: None,
             extra_decorations: Vec::new(),
+            reset_decorations: false,
             white_space: WhiteSpace::Normal,
             text_overflow: None,
             text_align: TextAlign::default(),
@@ -724,6 +730,12 @@ impl TextStyle {
     /// descendant declares is drawn besides the one of the same kind it inherits
     /// rather than in its place.
     pub(crate) fn refine_nested(&mut self, refinement: &TextStyleRefinement) {
+        if refinement.reset_decorations == Some(true) {
+            self.underline = None;
+            self.strikethrough = None;
+            self.overline = None;
+            self.extra_decorations.clear();
+        }
         let outer_underline = self.underline;
         let outer_strikethrough = self.strikethrough;
         let outer_overline = self.overline;
