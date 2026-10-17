@@ -387,6 +387,14 @@ where
             match (display_mode, has_children) {
                 (Display::None, _) => compute_hidden_layout(tree, node_id),
                 #[cfg(feature = "block_layout")]
+                // fdarian fork patch: a box with size containment is a container, which lays its
+                // content out in a formatting context of its own, so no margin collapses through it.
+                (Display::Block, true) if tree.taffy.nodes[node_id.into()].style.contain_inline_size
+                    || tree.taffy.nodes[node_id.into()].style.contain_block_size =>
+                {
+                    compute_block_layout(tree, node_id, inputs, None)
+                }
+                #[cfg(feature = "block_layout")]
                 (Display::Block, true) => compute_block_layout(tree, node_id, inputs, block_ctx),
                 #[cfg(feature = "block_layout")]
                 (Display::FlowRoot, true) => compute_block_layout(tree, node_id, inputs, None),

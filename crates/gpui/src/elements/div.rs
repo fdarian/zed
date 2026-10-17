@@ -5498,6 +5498,44 @@ mod tests {
         assert_eq!(sized.size, size(px(100.), px(24.)));
     }
 
+    struct ContainedMargins {
+        contained: bool,
+    }
+
+    impl Render for ContainedMargins {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut container = div()
+                .debug_selector(|| "container".into())
+                .block()
+                .child(div().debug_selector(|| "child".into()).mt(px(7.)).h(px(10.)));
+            container.style().contain_inline_size = Some(self.contained);
+            div().block().child(container)
+        }
+    }
+
+    #[gpui::test]
+    fn a_contained_box_keeps_the_margins_of_its_children_inside(cx: &mut TestAppContext) {
+        let mut offsets = |contained: bool| {
+            let window = cx.add_window(move |_, _| ContainedMargins { contained });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            ["container", "child"].map(|selector| {
+                cx.update_window(window.into(), |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| panic!("{selector} was not rendered"))
+            })
+        };
+        // The margin of the first child collapses through a plain block and moves it.
+        let [container, child] = offsets(false);
+        assert_eq!((container.origin.y, child.origin.y), (px(7.), px(7.)));
+        // A container is a formatting context of its own: the child is 7px inside it.
+        let [container, child] = offsets(true);
+        assert_eq!((container.origin.y, child.origin.y), (px(0.), px(7.)));
+        assert_eq!(container.size.height, px(17.));
+    }
+
     struct RedrawView {
         renders: Rc<Cell<usize>>,
         painted: Rc<Cell<usize>>,

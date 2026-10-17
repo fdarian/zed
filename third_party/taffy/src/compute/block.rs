@@ -499,11 +499,13 @@ fn compute_inner(
     let own_margins_collapse_with_children = Line {
         start: vertical_margins_are_collapsible.start
             && !is_scroll_container
+            && !block_ctx.is_bfc_root()
             && style.position() == Position::Relative
             && padding.top == 0.0
             && border.top == 0.0,
         end: vertical_margins_are_collapsible.end
             && !is_scroll_container
+            && !block_ctx.is_bfc_root()
             && style.position() == Position::Relative
             && padding.bottom == 0.0
             && border.bottom == 0.0
