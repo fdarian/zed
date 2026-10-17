@@ -583,40 +583,487 @@ mod tests {
             .into_any_element()
     }
 
+    /// A window of `count` cards in a column, each in a retained subtree that has the key
+    /// `key` holds. A frame with the key the frame before had replays them.
+    struct Fixture {
+        window: AnyWindowHandle,
+        key: Rc<Cell<u64>>,
+        builds: Rc<Cell<usize>>,
+        clicks: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl Fixture {
+        fn new(cx: &mut TestAppContext, count: usize) -> Self {
+            let key = Rc::new(Cell::new(1));
+            let builds = Rc::new(Cell::new(0));
+            let clicks = Rc::new(RefCell::new(Vec::new()));
+            let window = open(cx, {
+                let key = key.clone();
+                let builds = builds.clone();
+                let clicks = clicks.clone();
+                Rc::new(move |_, _| {
+                    let cards = (0..count).map(|index| {
+                        retained(("retained-card", index), key.get(), {
+                            let builds = builds.clone();
+                            let clicks = clicks.clone();
+                            move |_, _| {
+                                builds.set(builds.get() + 1);
+                                card(index, &clicks)
+                            }
+                        })
+                    });
+                    div()
+                        .id("root")
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .children(cards)
+                        .into_any_element()
+                })
+            });
+            // The window was refreshed to turn the accessibility tree on, which builds everything.
+            draw(window, cx);
+            Self { window, key, builds, clicks }
+        }
+
+        fn draw(&self, cx: &mut TestAppContext) {
+            draw(self.window, cx);
+        }
+
+        /// Draws with a key that the frame before did not have, so that everything is built.
+        fn rebuild(&self, cx: &mut TestAppContext) {
+            self.key.set(self.key.get() + 1);
+            self.draw(cx);
+        }
+
+        fn counters(&self, cx: &mut TestAppContext) -> RetainedCounters {
+            counters(self.window, cx)
+        }
+    }
+
+    /// Everything a frame shows and answers, in a form that is equal for two frames that show
+    /// and answer the same.
+    #[derive(Debug, PartialEq)]
+    struct Snapshot {
+        scene: String,
+        a11y: String,
+        chains: Vec<String>,
+    }
+
+    fn snapshot(window: AnyWindowHandle, cx: &mut TestAppContext, points: &[(f32, f32)]) -> Snapshot {
+        cx.update_window(window, |_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            let scene = format!(
+                "{} operations\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{} groups",
+                scene.len(),
+                scene.shadows,
+                scene.quads,
+                scene.underlines,
+                scene.monochrome_sprites,
+                scene.subpixel_sprites,
+                scene.polychrome_sprites,
+                scene.paths,
+                scene.groups.len(),
+            );
+            let update = window.a11y.last_tree_update().expect("a11y is on");
+            let mut nodes = update.nodes.clone();
+            nodes.sort_by_key(|(id, _)| id.0);
+            let mut dump: serde_json::Value =
+                serde_json::from_str(&window.debug_a11y_tree_json().expect("a11y is on")).unwrap();
+            dump.as_object_mut().unwrap().remove("frame");
+            let a11y = format!("{nodes:#?}\nfocus {:?}\n{dump}", update.focus);
+            let chains = points
+                .iter()
+                .map(|(x, y)| {
+                    let chain = window.hit_chain_at(point(px(*x), px(*y)));
+                    format!(
+                        "({x}, {y}): {}",
+                        chain
+                            .iter()
+                            .map(|(id, bounds)| format!("{id} {bounds:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" > ")
+                    )
+                })
+                .collect();
+            Snapshot { scene, a11y, chains }
+        })
+        .unwrap()
+    }
+
+    const POINTS: [(f32, f32); 6] = [
+        (5., 5.),
+        (50., 15.),
+        (90., 30.),
+        (5., 50.),
+        (50., 95.),
+        (350., 250.),
+    ];
+
+    fn click(window: AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
+        cx.update_window(window, |_, window, cx| {
+            let position = point(px(x), px(y));
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+    }
+
+    /// The focus the window has after each of `presses` tabs, and the handles it went through.
+    fn tab_order(window: AnyWindowHandle, cx: &mut TestAppContext, presses: usize) -> Vec<Option<FocusHandle>> {
+        cx.update_window(window, |_, window, cx| {
+            window.blur();
+            (0..presses)
+                .map(|_| {
+                    window.focus_next(cx);
+                    window.focused(cx)
+                })
+                .collect()
+        })
+        .unwrap()
+    }
+
     #[gpui::test]
     fn a_second_frame_with_the_same_key_does_not_build_the_subtree(cx: &mut TestAppContext) {
+        let fixture = Fixture::new(cx, 3);
+        let before = fixture.counters(cx);
+        let builds = fixture.builds.get();
+        fixture.draw(cx);
+        fixture.draw(cx);
+        assert_eq!(fixture.builds.get(), builds);
+        let counters = fixture.counters(cx);
+        assert_eq!(counters.builds, before.builds);
+        assert_eq!(counters.hits, before.hits + 6);
+        assert_eq!(counters.replays, before.replays + 6);
+        assert_eq!(counters.lazy_builds, 0);
+        assert_eq!(counters.total_non_reusable(), 0);
+    }
+
+    #[gpui::test]
+    fn a_replayed_frame_is_the_frame_a_build_makes(cx: &mut TestAppContext) {
+        let fixture = Fixture::new(cx, 3);
+        fixture.draw(cx);
+        let replayed = snapshot(fixture.window, cx, &POINTS);
+        let replays = fixture.counters(cx).replays;
+        fixture.rebuild(cx);
+        let built = snapshot(fixture.window, cx, &POINTS);
+        assert_eq!(fixture.counters(cx).replays, replays, "a new key builds");
+        assert_eq!(replayed.scene, built.scene);
+        assert_eq!(replayed.a11y, built.a11y);
+        assert_eq!(replayed.chains, built.chains);
+        assert!(built.a11y.contains("Button 2"));
+        assert!(built.chains[1].contains("button"), "{}", built.chains[1]);
+
+        // A replay of a replay is the same again.
+        fixture.draw(cx);
+        fixture.draw(cx);
+        assert_eq!(fixture.counters(cx).replays, replays + 6);
+        assert_eq!(snapshot(fixture.window, cx, &POINTS), built);
+    }
+
+    #[gpui::test]
+    fn a_click_on_a_replayed_button_reaches_its_listener(cx: &mut TestAppContext) {
+        let fixture = Fixture::new(cx, 3);
+        fixture.draw(cx);
+        fixture.draw(cx);
+        assert!(fixture.counters(cx).replays >= 3);
+        // Button 1 is 60 by 20 at the top of the second card.
+        click(fixture.window, cx, 30., 50.);
+        assert_eq!(*fixture.clicks.borrow(), [1]);
+        // The click focused the button, which draws everything once. Then it is replayed from a
+        // replay: the listener moved to the frame that replayed it.
+        fixture.draw(cx);
+        let replays = fixture.counters(cx).replays;
+        fixture.draw(cx);
+        fixture.draw(cx);
+        assert_eq!(fixture.counters(cx).replays, replays + 6);
+        click(fixture.window, cx, 30., 90.);
+        assert_eq!(*fixture.clicks.borrow(), [1, 2]);
+    }
+
+    #[gpui::test]
+    fn tabbing_goes_through_a_replayed_subtree_in_the_order_it_was_built(cx: &mut TestAppContext) {
+        let fixture = Fixture::new(cx, 3);
+        fixture.draw(cx);
+        assert!(fixture.counters(cx).replays >= 3);
+        let replayed = tab_order(fixture.window, cx, 4);
+        // A tab stop per button, and around once more to the first.
+        assert_eq!(replayed.iter().flatten().count(), 4);
+        assert_eq!(replayed[0], replayed[3]);
+        assert_ne!(replayed[0], replayed[1]);
+
+        // The focus moved, which draws everything. Replay again and compare with a build.
+        fixture.draw(cx);
+        fixture.draw(cx);
+        let replays = fixture.counters(cx).replays;
+        let replayed_again = tab_order(fixture.window, cx, 4);
+        fixture.rebuild(cx);
+        let built = tab_order(fixture.window, cx, 4);
+        assert_eq!(fixture.counters(cx).replays, replays);
+        assert_eq!(replayed, replayed_again);
+        assert_eq!(replayed, built);
+    }
+
+    /// A scene of retained cards under a spacer, in a clip, with a bar after them, whose sizes the
+    /// test sets between frames.
+    struct Layout {
+        fixture: Fixture,
+        spacer: Rc<Cell<f32>>,
+        clip: Rc<Cell<f32>>,
+        bar: Rc<Cell<f32>>,
+    }
+
+    impl Layout {
+        fn new(cx: &mut TestAppContext, count: usize) -> Self {
+            let key = Rc::new(Cell::new(1));
+            let builds = Rc::new(Cell::new(0));
+            let clicks = Rc::new(RefCell::new(Vec::new()));
+            let spacer = Rc::new(Cell::new(0.));
+            let clip = Rc::new(Cell::new(300.));
+            let bar = Rc::new(Cell::new(10.));
+            let window = open(cx, {
+                let key = key.clone();
+                let builds = builds.clone();
+                let clicks = clicks.clone();
+                let spacer = spacer.clone();
+                let clip = clip.clone();
+                let bar = bar.clone();
+                Rc::new(move |_, _| {
+                    let cards = (0..count).map(|index| {
+                        retained(("retained-card", index), key.get(), {
+                            let builds = builds.clone();
+                            let clicks = clicks.clone();
+                            move |_, _| {
+                                builds.set(builds.get() + 1);
+                                card(index, &clicks)
+                            }
+                        })
+                    });
+                    div()
+                        .id("root")
+                        .size_full()
+                        .child(
+                            div()
+                                .id("clip")
+                                .overflow_hidden()
+                                .w(px(clip.get()))
+                                .h(px(clip.get()))
+                                .flex()
+                                .flex_col()
+                                .child(div().id("spacer").flex_none().h(px(spacer.get())).w(px(10.)))
+                                .children(cards)
+                                .child(div().id("bar").flex_none().h(px(bar.get())).w(px(50.)).bg(crate::green())),
+                        )
+                        .into_any_element()
+                })
+            });
+            draw(window, cx);
+            Layout {
+                fixture: Fixture { window, key, builds, clicks },
+                spacer,
+                clip,
+                bar,
+            }
+        }
+    }
+
+    /// Draws with `change` applied, then draws a build of the same, and expects the two frames to
+    /// show and answer the same. Returns how the counters moved in the first.
+    fn changed_frame_is_the_built_frame(
+        layout: &Layout,
+        cx: &mut TestAppContext,
+        change: impl FnOnce(),
+    ) -> (RetainedCounters, RetainedCounters) {
+        let fixture = &layout.fixture;
+        fixture.draw(cx);
+        let before = fixture.counters(cx);
+        change();
+        fixture.draw(cx);
+        let after = fixture.counters(cx);
+        let drawn = snapshot(fixture.window, cx, &POINTS);
+        fixture.rebuild(cx);
+        let built = snapshot(fixture.window, cx, &POINTS);
+        assert_eq!(drawn.scene, built.scene);
+        assert_eq!(drawn.a11y, built.a11y);
+        assert_eq!(drawn.chains, built.chains);
+        (before, after)
+    }
+
+    #[gpui::test]
+    fn a_new_key_builds_the_subtree(cx: &mut TestAppContext) {
+        let fixture = Fixture::new(cx, 3);
+        fixture.draw(cx);
+        let before = fixture.counters(cx);
+        let builds = fixture.builds.get();
+        fixture.rebuild(cx);
+        let after = fixture.counters(cx);
+        assert_eq!(fixture.builds.get(), builds + 3);
+        assert_eq!(after.hits, before.hits);
+        assert_eq!(after.builds, before.builds + 3);
+        assert_eq!(after.replays, before.replays);
+    }
+
+    #[gpui::test]
+    fn a_sibling_that_moves_the_subtree_has_it_built_in_prepaint(cx: &mut TestAppContext) {
+        let layout = Layout::new(cx, 3);
+        let (before, after) = changed_frame_is_the_built_frame(&layout, cx, || layout.spacer.set(17.));
+        let builds = layout.fixture.builds.get();
+        assert_eq!(after.hits, before.hits + 3, "layout kept the nodes");
+        assert_eq!(after.lazy_builds, before.lazy_builds + 3);
+        assert_eq!(after.replays, before.replays);
+        assert_eq!(after.layout_fallbacks, 0);
+
+        // The frame after replays again, where the subtree is now.
+        layout.fixture.draw(cx);
+        layout.fixture.draw(cx);
+        let replayed = layout.fixture.counters(cx);
+        assert_eq!(replayed.replays, after.replays + 6);
+        assert_eq!(layout.fixture.builds.get(), builds);
+    }
+
+    #[gpui::test]
+    fn a_sibling_that_does_not_move_the_subtree_leaves_it_replayed(cx: &mut TestAppContext) {
+        let layout = Layout::new(cx, 3);
+        let (before, after) = changed_frame_is_the_built_frame(&layout, cx, || layout.bar.set(25.));
+        assert_eq!(after.replays, before.replays + 3);
+        assert_eq!(after.lazy_builds, before.lazy_builds);
+    }
+
+    #[gpui::test]
+    fn a_parent_clip_that_changes_has_the_subtree_built_in_prepaint(cx: &mut TestAppContext) {
+        let layout = Layout::new(cx, 3);
+        // The cards stay where they are and are cut by a clip that is not the one they had.
+        let (before, after) = changed_frame_is_the_built_frame(&layout, cx, || layout.clip.set(130.));
+        assert_eq!(after.lazy_builds, before.lazy_builds + 3);
+        assert_eq!(after.replays, before.replays);
+    }
+
+    #[gpui::test]
+    fn an_animating_sibling_does_not_build_the_subtrees(cx: &mut TestAppContext) {
+        let layout = Layout::new(cx, 5);
+        layout.fixture.draw(cx);
+        let before = layout.fixture.counters(cx);
+        let builds = layout.fixture.builds.get();
+        for frame in 0..10 {
+            // The bar, which is after the cards, grows with each frame.
+            layout.bar.set(10. + frame as f32);
+            layout.fixture.draw(cx);
+        }
+        let after = layout.fixture.counters(cx);
+        assert_eq!(layout.fixture.builds.get(), builds, "no frame built a card");
+        assert_eq!(after.builds, before.builds);
+        assert_eq!(after.replays, before.replays + 50);
+        assert_eq!(after.lazy_builds, before.lazy_builds);
+    }
+
+    #[gpui::test]
+    fn a_draw_with_several_passes_builds_everything(cx: &mut TestAppContext) {
+        let layout = Layout::new(cx, 3);
+        let fixture = &layout.fixture;
+        fixture.draw(cx);
+        let before = fixture.counters(cx);
+        cx.update_window(fixture.window, |_, window, _| window.set_max_draw_passes(2))
+            .unwrap();
+        let builds = fixture.builds.get();
+        fixture.draw(cx);
+        fixture.draw(cx);
+        let after = fixture.counters(cx);
+        assert_eq!(fixture.builds.get(), builds + 6);
+        assert_eq!(after.hits, before.hits);
+        assert_eq!(after.replays, before.replays);
+
+        // And a single pass again replays what the passes before it did not record.
+        cx.update_window(fixture.window, |_, window, _| window.set_max_draw_passes(1))
+            .unwrap();
+        fixture.draw(cx);
+        fixture.draw(cx);
+        let last = fixture.counters(cx);
+        assert_eq!(fixture.builds.get(), builds + 6 + 3);
+        assert_eq!(last.replays, before.replays + 3);
+    }
+
+    #[gpui::test]
+    fn an_abandoned_pass_builds_everything(cx: &mut TestAppContext) {
+        let abandon = Rc::new(Cell::new(false));
         let builds = Rc::new(Cell::new(0));
-        let clicks = Rc::new(RefCell::new(Vec::new()));
         let window = open(cx, {
+            let abandon = abandon.clone();
             let builds = builds.clone();
-            let clicks = clicks.clone();
-            Rc::new(move |_, _| {
+            Rc::new(move |window, _| {
+                // The first pass asks for another, as a container query does once it knows a size.
+                if abandon.get() && window.draw_pass() == 1 {
+                    window.request_redraw_before_present();
+                }
                 div()
                     .id("root")
-                    .size_full()
-                    .child(retained("retained-card", 1, {
+                    .child(retained("retained", 1, {
                         let builds = builds.clone();
-                        let clicks = clicks.clone();
                         move |_, _| {
                             builds.set(builds.get() + 1);
-                            card(0, &clicks)
+                            div().id("inside").w(px(10.)).h(px(10.)).bg(crate::red()).into_any_element()
                         }
                     }))
                     .into_any_element()
             })
         });
-        // The window was refreshed to turn the accessibility tree on, which builds everything.
-        draw(window, cx);
-        let before = counters(window, cx);
-        let builds_before = builds.get();
         draw(window, cx);
         draw(window, cx);
-        assert_eq!(builds.get(), builds_before);
-        let counters = counters(window, cx);
-        assert_eq!(counters.builds, before.builds);
-        assert_eq!(counters.hits, before.hits + 2);
-        assert_eq!(counters.replays, before.replays + 2);
-        assert_eq!(counters.lazy_builds, 0);
-        assert_eq!(counters.total_non_reusable(), 0);
+        let replays = counters(window, cx).replays;
+        assert!(replays >= 1, "the window replays before it abandons a pass");
+        let built = builds.get();
+
+        abandon.set(true);
+        cx.update_window(window, |_, window, _| window.set_max_draw_passes(2))
+            .unwrap();
+        draw(window, cx);
+        assert_eq!(builds.get(), built + 2, "both passes built it");
+        let after = counters(window, cx);
+        assert_eq!(after.replays, replays);
+        assert_eq!(after.hits, replays);
+    }
+
+    #[gpui::test]
+    fn a_measure_pass_between_frames_builds_and_the_next_frame_still_replays(cx: &mut TestAppContext) {
+        let layout = Layout::new(cx, 3);
+        let fixture = &layout.fixture;
+        fixture.draw(cx);
+        let replayed = {
+            let before = fixture.counters(cx);
+            fixture.draw(cx);
+            let after = fixture.counters(cx);
+            assert_eq!(after.replays, before.replays + 3);
+            snapshot(fixture.window, cx, &POINTS)
+        };
+        let builds = fixture.builds.get();
+        cx.update_window(fixture.window, |view, window, cx| {
+            let view = view.downcast::<SceneView>().unwrap();
+            view.update(cx, |_, cx| cx.notify());
+            assert!(window.draw_if_dirty(cx), "a pass ran");
+        })
+        .unwrap();
+        assert_eq!(fixture.builds.get(), builds + 3, "the measure pass builds");
+        let before = fixture.counters(cx);
+        fixture.draw(cx);
+        let after = fixture.counters(cx);
+        assert_eq!(after.replays, before.replays + 3);
+        assert_eq!(fixture.builds.get(), builds + 3, "the draw after it replays");
+        assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
     }
 }
