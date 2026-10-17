@@ -220,7 +220,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 Size { width: Some(width), height: None },
                 Size { width: Some(table_width), height: None },
                 Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent },
-                SizingMode::ContentSize,
+                SizingMode::InherentSize,
                 AbsoluteAxis::Vertical,
                 Line::FALSE,
             );
