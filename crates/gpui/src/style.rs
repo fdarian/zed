@@ -1523,6 +1523,11 @@ pub struct UnderlineStyle {
 
     /// How the underline is drawn, e.g. wavy like in a spell checker.
     pub style: TextDecorationStyle,
+
+    /// How far below the alphabetic baseline the top edge of the line sits (CSS
+    /// `text-underline-offset`; negative is above it). `None` is `auto`: a gap below
+    /// the baseline that grows with the thickness.
+    pub offset: Option<Pixels>,
 }
 
 /// The properties that can be applied to a strikethrough.

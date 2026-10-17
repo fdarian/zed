@@ -456,6 +456,7 @@ fn paint_line(
         let mut current_extras: Vec<OpenDecoration<ExtraDecoration>> = Vec::new();
         let mut extras_source: &[ExtraDecoration] = &[];
         let text_system = cx.text_system().clone();
+        let scale_factor = window.scale_factor();
         let mut glyph_origin = point(
             aligned_origin_x(
                 origin,
@@ -591,18 +592,23 @@ fn paint_line(
                             finished_underline = current_underline.take();
                         }
                         if let Some(run_underline) = style_run.underline.as_ref() {
+                            let thickness = decoration_thickness(
+                                run_underline.thickness,
+                                run_underline.thickness_from_font,
+                                &text_system,
+                                run.font_id,
+                                layout.font_size,
+                            );
                             current_underline.get_or_insert(OpenDecoration {
                                 x: glyph_origin.x + leading,
-                                baseline_offset: underline_offset(layout, run),
+                                baseline_offset: underline_offset(
+                                    run_underline.offset,
+                                    thickness,
+                                    scale_factor,
+                                ),
                                 style: UnderlineStyle {
                                     color: Some(run_underline.color.unwrap_or(style_run.color)),
-                                    thickness: decoration_thickness(
-                                        run_underline.thickness,
-                                        run_underline.thickness_from_font,
-                                        &text_system,
-                                        run.font_id,
-                                        layout.font_size,
-                                    ),
+                                    thickness,
                                     ..*run_underline
                                 },
                             });
@@ -666,6 +672,7 @@ fn paint_line(
                                         run,
                                         line_height,
                                         &text_system,
+                                        scale_factor,
                                     )
                                 })
                                 .collect();
@@ -992,6 +999,7 @@ fn open_extra(
     run: &ShapedRun,
     line_height: Pixels,
     text_system: &TextSystem,
+    scale_factor: f32,
 ) -> OpenDecoration<ExtraDecoration> {
     let thickness = |thickness, from_font| {
         decoration_thickness(
@@ -1003,14 +1011,17 @@ fn open_extra(
         )
     };
     let (baseline_offset, style) = match extra {
-        ExtraDecoration::Underline(underline) => (
-            underline_offset(layout, run),
-            ExtraDecoration::Underline(UnderlineStyle {
-                color: Some(underline.color.unwrap_or(run_color)),
-                thickness: thickness(underline.thickness, underline.thickness_from_font),
-                ..*underline
-            }),
-        ),
+        ExtraDecoration::Underline(underline) => {
+            let thickness = thickness(underline.thickness, underline.thickness_from_font);
+            (
+                underline_offset(underline.offset, thickness, scale_factor),
+                ExtraDecoration::Underline(UnderlineStyle {
+                    color: Some(underline.color.unwrap_or(run_color)),
+                    thickness,
+                    ..*underline
+                }),
+            )
+        }
         ExtraDecoration::Strikethrough(strikethrough) => (
             strikethrough_offset(layout, run, line_height),
             ExtraDecoration::Strikethrough(StrikethroughStyle {
@@ -1055,15 +1066,17 @@ fn paint_extra(
     }
 }
 
-/// An unstyled run was shaped with the metrics of the line, which can be the
-/// largest of several fonts, so the line's are used for it.
-fn underline_offset(layout: &LineLayout, run: &ShapedRun) -> Pixels {
-    let descent = if layout.is_styled(run) {
-        run.descent
-    } else {
-        layout.descent
+/// Where the top of an underline of `thickness` sits below the baseline, as Chrome
+/// places it with `text-underline-position: auto`. An `auto` offset leaves a gap of
+/// half the thickness, rounded up, and at least a device pixel; a length replaces
+/// that gap and is rounded to the device pixel. The font's own underline position is
+/// only for `text-underline-position: from-font`.
+fn underline_offset(offset: Option<Pixels>, thickness: Pixels, scale_factor: f32) -> Pixels {
+    let device_pixels = match offset {
+        Some(offset) => (offset.0 * scale_factor).round(),
+        None => (thickness.0 * scale_factor / 2.0).ceil().max(1.0),
     };
-    descent * 0.618
+    px(device_pixels / scale_factor)
 }
 
 /// Where an overline on `run` sits relative to the baseline: the top of the run's
@@ -1129,6 +1142,27 @@ fn aligned_origin_x(
 mod tests {
     use super::*;
     use crate::{FontId, GlyphId, ShapedGlyph, ShapedRun};
+
+    #[test]
+    fn an_auto_underline_offset_is_half_the_thickness_rounded_up_and_at_least_a_pixel() {
+        for (thickness, expected) in [(0., 1.), (1., 1.), (1.6, 1.), (2., 1.), (2.2, 2.), (3., 2.), (5., 3.)] {
+            assert_eq!(underline_offset(None, px(thickness), 1.), px(expected), "{thickness}");
+        }
+    }
+
+    #[test]
+    fn an_underline_offset_length_replaces_the_gap_and_rounds_to_the_device_pixel() {
+        for (offset, expected) in [(4., 4.), (0., 0.), (-3., -3.), (4.4, 4.), (4.5, 5.), (-4.5, -5.)] {
+            assert_eq!(underline_offset(Some(px(offset)), px(9.), 1.), px(expected), "{offset}");
+        }
+        assert_eq!(underline_offset(Some(px(4.3)), px(1.), 2.), px(4.5));
+    }
+
+    #[test]
+    fn an_auto_underline_offset_counts_device_pixels() {
+        assert_eq!(underline_offset(None, px(1.), 2.), px(0.5));
+        assert_eq!(underline_offset(None, px(3.), 2.), px(1.5));
+    }
 
     /// Helper: build a ShapedLine from glyph descriptors without the platform text system.
     /// Each glyph is described as (byte_index, x_position).
@@ -1571,6 +1605,17 @@ mod tests {
             }
         }
 
+        fn underlined_at(run: TextRun, thickness: Pixels, offset: Option<Pixels>) -> TextRun {
+            TextRun {
+                underline: Some(UnderlineStyle {
+                    thickness,
+                    offset,
+                    ..Default::default()
+                }),
+                ..run
+            }
+        }
+
         fn struck(run: TextRun) -> TextRun {
             TextRun {
                 strikethrough: Some(StrikethroughStyle {
@@ -1718,15 +1763,13 @@ mod tests {
         }
 
         #[test]
-        fn an_underline_on_big_text_sits_at_the_descent_of_the_big_text() {
+        fn an_underline_on_big_text_sits_a_pixel_below_the_baseline_whatever_the_descent() {
             let painted = mixed(|ix, run| if ix == 0 { run } else { underlined(run) });
-            let descent = painted.run(5).descent;
-            assert_ne!(descent, painted.layout.descent());
+            assert_ne!(painted.run(5).descent, painted.layout.descent());
             assert_eq!(painted.lines.len(), 2);
-            let offset = f32::from(descent * 0.618);
             assert_close(
                 painted.lines[0].0,
-                painted.baseline(1) + offset,
+                painted.baseline(1) + 1.,
                 "underline in its first row",
             );
         }
@@ -1734,11 +1777,10 @@ mod tests {
         #[test]
         fn a_wrapped_underline_keeps_its_offset_from_the_baseline() {
             let painted = mixed(|ix, run| if ix == 0 { run } else { underlined(run) });
-            let offset = f32::from(painted.run(5).descent * 0.618);
             assert_eq!(painted.lines.len(), 2);
             assert_close(
                 painted.lines[1].0,
-                painted.baseline(2) + offset,
+                painted.baseline(2) + 1.,
                 "underline in its second row",
             );
         }
@@ -1747,12 +1789,42 @@ mod tests {
         fn an_underline_on_plain_text_follows_the_baseline_of_a_taller_row() {
             let painted = mixed(|ix, run| if ix == 2 { underlined(run) } else { run });
             assert_eq!(painted.lines.len(), 1);
-            let offset = f32::from(painted.layout.descent() * 0.618);
             assert_close(
                 painted.lines[0].0,
-                painted.baseline(2) + offset,
+                painted.baseline(2) + 1.,
                 "underline of the plain run",
             );
+        }
+
+        #[test]
+        fn an_underline_offset_is_measured_from_the_baseline_of_every_row() {
+            for offset in [4., 0., -3.] {
+                let painted = mixed(|ix, run| {
+                    if ix == 0 { run } else { underlined_at(run, px(1.), Some(px(offset))) }
+                });
+                assert_eq!(painted.lines.len(), 2);
+                for (line, row) in painted.lines.iter().zip([1, 2]) {
+                    assert_close(line.0, painted.baseline(row) + offset, "underline");
+                }
+            }
+        }
+
+        #[test]
+        fn an_auto_offset_leaves_a_gap_of_half_the_thickness() {
+            for (thickness, gap) in [(1., 1.), (2., 1.), (3., 2.), (4., 2.)] {
+                let painted = mixed(|ix, run| {
+                    if ix == 2 { underlined_at(run, px(thickness), None) } else { run }
+                });
+                assert_close(painted.lines[0].0, painted.baseline(2) + gap, "underline");
+            }
+        }
+
+        #[test]
+        fn an_explicit_offset_ignores_the_thickness() {
+            let painted = mixed(|ix, run| {
+                if ix == 2 { underlined_at(run, px(6.), Some(px(2.))) } else { run }
+            });
+            assert_close(painted.lines[0].0, painted.baseline(2) + 2., "underline");
         }
 
         #[test]
@@ -1805,7 +1877,7 @@ mod tests {
             for (row, line) in underlined.lines.iter().enumerate() {
                 assert_close(
                     line.0,
-                    top + row as f32 * LINE_HEIGHT + padding_top + ascent + descent * 0.618,
+                    top + row as f32 * LINE_HEIGHT + padding_top + ascent + 1.,
                     "underline",
                 );
             }

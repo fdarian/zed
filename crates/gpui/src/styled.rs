@@ -3,8 +3,9 @@ use crate::{
     CellVerticalAlign, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
-    JustifyContent, Length, OverlineStyle, SharedString, StrikethroughStyle, StyleRefinement,
-    TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace,
+    JustifyContent, Length, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
+    StyleRefinement, TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow,
+    TextStyleRefinement, UnderlineStyle, WhiteSpace,
     px, relative, rems,
 };
 pub use gpui_macros::{
@@ -843,6 +844,16 @@ pub trait Styled: Sized {
         let style = self.text_style();
         let underline = style.underline.get_or_insert_with(Default::default);
         underline.color = Some(color.into());
+        self
+    }
+
+    /// Sets how far below the baseline the underline on this element sits, instead of the
+    /// automatic gap. Negative is above the baseline.
+    /// [Docs](https://tailwindcss.com/docs/text-underline-offset)
+    fn text_underline_offset(mut self, offset: Pixels) -> Self {
+        let style = self.text_style();
+        let underline = style.underline.get_or_insert_with(Default::default);
+        underline.offset = Some(offset);
         self
     }
 

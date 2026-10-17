@@ -10605,6 +10605,7 @@ mod tests {
             el.text_style().underline = Some(UnderlineStyle {
                 thickness: px(1.),
                 color: Some(red()),
+                offset: Some(px(2.)),
                 ..Default::default()
             });
             el.text_style().extra_decorations = Some(vec![
@@ -10612,6 +10613,7 @@ mod tests {
                     thickness: px(3.),
                     color: Some(blue()),
                     style: crate::TextDecorationStyle::Dotted,
+                    offset: Some(px(2.)),
                     ..Default::default()
                 }),
                 ExtraDecoration::Overline(OverlineStyle {
@@ -10635,7 +10637,7 @@ mod tests {
         assert_eq!(dotted.thickness.0, solid.thickness.0 * 3.);
         assert_eq!(
             dotted.bounds.origin.y, solid.bounds.origin.y,
-            "both sit at the underline's place"
+            "both sit at the same offset from the baseline"
         );
         assert_eq!(dotted.bounds.size.width, solid.bounds.size.width);
         let overline = lines
@@ -10680,10 +10682,12 @@ mod tests {
             div()
                 .text_size(px(16.))
                 .underline()
+                .text_underline_offset(px(2.))
                 .text_decoration_color(red())
                 .child(
                     div()
                         .underline()
+                        .text_underline_offset(px(2.))
                         .text_decoration_dotted()
                         .text_decoration_2()
                         .text_decoration_color(blue())
@@ -10728,6 +10732,35 @@ mod tests {
         // not reach "stopped", and it is not drawn beside the blue one either.
         assert_eq!(lines.iter().filter(|line| line.color == red()).count(), 1);
         assert_eq!(lines.iter().filter(|line| line.color == blue()).count(), 1);
+    }
+
+    #[gpui::test]
+    fn nested_auto_underlines_leave_a_gap_of_their_own_thickness(cx: &mut TestAppContext) {
+        use crate::{blue, red};
+        let cx = cx.add_empty_window();
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(40.)), |_, _| {
+            div()
+                .text_size(px(16.))
+                .underline()
+                .text_decoration_color(red())
+                .child(
+                    div()
+                        .underline()
+                        .text_decoration_8()
+                        .text_decoration_color(blue())
+                        .child("inner"),
+                )
+        });
+        let lines = cx.update(|window, _| window.painted_underlines());
+        let outer = lines.iter().find(|line| line.color == red()).unwrap();
+        let inner = lines.iter().find(|line| line.color == blue()).unwrap();
+        let scale = cx.update(|window, _| window.scale_factor());
+        // Half of 8px is 4px; half of 1px rounds up to the pixel at least one device pixel.
+        let gap = |thickness: f32| (thickness * scale / 2.).ceil().max(1.);
+        assert_eq!(
+            inner.bounds.origin.y.0 - outer.bounds.origin.y.0,
+            gap(8.) - gap(1.)
+        );
     }
 
     #[gpui::test]
