@@ -510,6 +510,8 @@ pub struct Outline {
     pub color: Hsla,
     /// Gap between the border box and the line. Negative values draw it inside.
     pub offset: Pixels,
+    /// How the line is drawn: solid, dashed, dotted, and the rest of CSS's `outline-style`.
+    pub style: BorderStyle,
 }
 
 /// The possible values of the box-shadow property
@@ -1285,7 +1287,7 @@ impl Style {
                 background,
                 outline.width,
                 outline.color,
-                BorderStyle::default(),
+                outline.style,
             ));
         }
 
