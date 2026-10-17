@@ -4,6 +4,7 @@ use crate::DebugFrameOverlayMode;
 use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
+use crate::element::Culled;
 use crate::{
     Action, Anchor, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
@@ -1583,6 +1584,12 @@ pub struct Window {
     /// The pass running is one that does not paint: see [`Window::draw_if_dirty`].
     layout_only: bool,
     layout_passes: u64,
+    /// A culled subtree is being prepainted: see [`Element::cull_outset`].
+    culling: bool,
+    /// The next element prepainted is the top of that subtree.
+    cull_root_next: bool,
+    /// How many subtrees have been culled over the life of the window.
+    culled_subtrees: u64,
     /// How many times one draw may build the frame before it presents. See
     /// [`Window::set_max_draw_passes`].
     pub(crate) max_draw_passes: usize,
@@ -2298,6 +2305,9 @@ impl Window {
             measuring: false,
             layout_only: false,
             layout_passes: 0,
+            culling: false,
+            cull_root_next: false,
+            culled_subtrees: 0,
             max_draw_passes: 1,
             draw_pass: 0,
             redraw_before_present: false,
@@ -3876,6 +3886,93 @@ impl Window {
         // fired; wake the platform so something presents this frame.
         self.invalidator.wake_platform();
         true
+    }
+
+    /// Whether the element being drawn is in a culled subtree, which lies outside the content
+    /// mask and is drawn through [`Element::prepaint_culled`] and [`Element::paint_culled`].
+    /// Only prepaint knows: paint reads what prepaint decided.
+    pub fn is_culling(&self) -> bool {
+        self.culling
+    }
+
+    /// How many subtrees this window has culled, see [`Element::cull_outset`].
+    pub fn culled_subtree_count(&self) -> u64 {
+        self.culled_subtrees
+    }
+
+    pub(crate) fn begin_culling(&mut self) {
+        debug_assert!(!self.culling, "a culled subtree is not culled again");
+        self.culling = true;
+        self.cull_root_next = true;
+        self.culled_subtrees += 1;
+    }
+
+    pub(crate) fn end_culling(&mut self) {
+        self.culling = false;
+        self.cull_root_next = false;
+    }
+
+    pub(crate) fn take_culled(&mut self) -> Culled {
+        if self.cull_root_next {
+            self.cull_root_next = false;
+            Culled::Root
+        } else if self.culling {
+            Culled::Inside
+        } else {
+            Culled::No
+        }
+    }
+
+    /// Whether the child whose layout node is `layout_id`, with border box `bounds`, lies
+    /// outside the content mask for good: its box and the scrollable overflow of what is below
+    /// it, inflated by `outset` (and a pixel, for snapping), do not touch the mask.
+    ///
+    /// Not while the pointer is captured by an element, which has to keep its hitbox, nor when an
+    /// accessibility tree is built, which holds off-screen content too.
+    pub(crate) fn lies_outside_the_mask(
+        &mut self,
+        layout_id: LayoutId,
+        bounds: Bounds<Pixels>,
+        outset: Edges<Pixels>,
+    ) -> bool {
+        if self.a11y.is_active() || self.captured_identity.is_some() || self.captured_hitbox.is_some()
+        {
+            return false;
+        }
+        let mask = self.content_mask().bounds;
+        let slack = px(1.);
+        let inflate = |bounds: Bounds<Pixels>| {
+            let origin = point(bounds.origin.x - outset.left - slack, bounds.origin.y - outset.top - slack);
+            let far = point(
+                bounds.right() + outset.right + slack,
+                bounds.bottom() + outset.bottom + slack,
+            );
+            Bounds::from_corners(origin, far)
+        };
+        let apart = |reach: Bounds<Pixels>| {
+            reach.right() < mask.left()
+                || reach.left() > mask.right()
+                || reach.bottom() < mask.top()
+                || reach.top() > mask.bottom()
+        };
+        // Most children are inside the mask, and their own box says so before anything below
+        // them is looked at.
+        if !apart(inflate(bounds)) {
+            return false;
+        }
+        let scale_factor = self.scale_factor();
+        let snapped_offset = self.pixel_snap_point(self.element_offset());
+        let Some(extent) = self
+            .layout_engine
+            .as_mut()
+            .unwrap()
+            .painted_extent(layout_id, scale_factor)
+        else {
+            return false;
+        };
+        let mut extent = extent;
+        extent.origin += snapped_offset;
+        apart(inflate(extent))
     }
 
     /// How many layout-only passes this window has run, see [`Window::draw_if_dirty`].

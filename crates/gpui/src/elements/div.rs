@@ -16,7 +16,7 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, ClipPathValue, CollapsedBorders,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, Edges, ClickEvent, ClipPathValue, CollapsedBorders,
     DispatchPhase,
     Display, Element, ElementId, Empty, Entity, EntityId, Escape, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
@@ -828,6 +828,25 @@ pub trait InteractiveElement: Sized {
         self.interactivity()
             .prepaint_layout_listeners
             .push(Box::new(listener));
+        self
+    }
+
+    /// Lets the parent skip this element, and everything below it, when it lies outside the
+    /// content mask: the border box and the scrollable overflow of the subtree, inflated by
+    /// `outset`, must not touch the mask. A culled subtree is not prepainted or painted. It has
+    /// no hitbox, no listener, no tooltip, no cursor and no style of its own, and it draws
+    /// nothing, but it still publishes what readers of layout see: bounds and sizes (the
+    /// `on_painted`, `on_painted_layout` and `on_prepainted_layout` listeners, and
+    /// `on_children_prepainted`), the scroll metrics of the scrollers in it, and the tab stops
+    /// of the focusable elements in it. See [`Element::cull_outset`].
+    ///
+    /// The caller vouches that nothing below draws or is hit outside the box by more than
+    /// `outset` (a shadow, an outline, a blur), that nothing below is placed by a transform or a
+    /// sticky offset, and that all of it is made of divs and elements that draw through
+    /// their own `Element::paint_culled`. A child that is lifted or escapes its clip
+    /// is never culled. Without a call to this the element is never culled.
+    fn cullable(mut self, outset: Edges<Pixels>) -> Self {
+        self.interactivity().cull_outset = Some(outset);
         self
     }
 
@@ -2003,6 +2022,7 @@ impl Div {
 fn prepaint_child(
     children: &mut [StackSafe<AnyElement>],
     index: usize,
+    layout_ids: &[LayoutId],
     lifting: bool,
     lifted_children: &mut SmallVec<[(usize, u32); 2]>,
     window: &mut Window,
@@ -2010,7 +2030,7 @@ fn prepaint_child(
 ) {
     let child = &mut children[index];
     let Some(z) = lifting.then(|| child.lift_z()).flatten() else {
-        child.prepaint(window, cx);
+        prepaint_unlifted_child(child, layout_ids.get(index).copied(), window, cx);
         return;
     };
     let ticket = window.begin_lift();
@@ -2021,6 +2041,30 @@ fn prepaint_child(
     let element = mem::replace(child, Empty.into_any_element());
     let ordinal = window.finish_lift(ticket, z, element);
     lifted_children.push((index, ordinal));
+}
+
+/// Prepaints a child that is not handed to a stacking context, culled when it lies outside the
+/// content mask for good (see [`InteractiveElement::cullable`]). A child that escapes the clip
+/// of its ancestors, or is lifted, is placed by something else than its parent's box.
+fn prepaint_unlifted_child(
+    child: &mut AnyElement,
+    layout_id: Option<LayoutId>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(outset) = child.cull_outset()
+        && let Some(layout_id) = layout_id
+        && !window.is_culling()
+        && child.escapes_to().is_none()
+        && child.lift_z().is_none()
+    {
+        let bounds = window.layout_bounds(layout_id);
+        if window.lies_outside_the_mask(layout_id, bounds, outset) {
+            child.prepaint_culled(window, cx);
+            return;
+        }
+    }
+    child.prepaint(window, cx);
 }
 
 /// A frame state for a `Div` element, which contains layout IDs for its children.
@@ -2174,6 +2218,19 @@ impl Element for Div {
         self.interactivity.base_style.lift_z()
     }
 
+    fn cull_outset(&self) -> Option<Edges<Pixels>> {
+        // A sticky box is placed by its scrollport at prepaint, and an image cache or a custom
+        // prepaint order is state the children read.
+        if self.interactivity.base_style.position == Some(Position::Sticky)
+            || self.interactivity.base_style.escape().is_some()
+            || self.image_cache.is_some()
+            || self.prepaint_order_fn.is_some()
+        {
+            return None;
+        }
+        self.interactivity.cull_outset
+    }
+
     fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
         let style = &self.interactivity.base_style;
         if style.position != Some(Position::Sticky) {
@@ -2191,13 +2248,67 @@ impl Element for Div {
         sticky::offset(layout_bounds, insets, viewport)
     }
 
-    #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
     fn prepaint(
         &mut self,
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Hitbox> {
+        self.prepaint_with(global_id, inspector_id, bounds, request_layout, false, window, cx)
+    }
+
+    fn prepaint_culled(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Hitbox> {
+        self.prepaint_with(global_id, inspector_id, bounds, request_layout, true, window, cx)
+    }
+
+    #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        hitbox: &mut Option<Hitbox>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.paint_with(global_id, inspector_id, bounds, request_layout, hitbox, false, window, cx)
+    }
+
+    fn paint_culled(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        hitbox: &mut Option<Hitbox>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.paint_with(global_id, inspector_id, bounds, request_layout, hitbox, true, window, cx)
+    }
+}
+
+impl Div {
+    #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
+    fn prepaint_with(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut DivFrameState,
+        culled: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Hitbox> {
@@ -2265,6 +2376,45 @@ impl Element for Div {
         // Prepaint can run again on a div, for example by a measure pass.
         self.lifted.clear();
         self.lifted_children.clear();
+        if culled {
+            self.children_lifting = false;
+            let children = &mut self.children;
+            self.interactivity.prepaint_culled(
+                global_id,
+                bounds,
+                content_size,
+                window,
+                cx,
+                |display_none, position, scroll_offset, window, cx| {
+                    if display_none {
+                        return;
+                    }
+                    let mut prepaint_children = |window: &mut Window| {
+                        for child in children.iter_mut() {
+                            child.prepaint(window, cx);
+                        }
+                    };
+                    // The offset of a positioned box is what an escaping descendant is
+                    // placed by.
+                    let mut with_frame = |window: &mut Window| {
+                        if position == Position::Static {
+                            prepaint_children(window)
+                        } else {
+                            window.with_positioned_frame(prepaint_children)
+                        }
+                    };
+                    if scroll_offset.is_zero() {
+                        with_frame(window)
+                    } else {
+                        window.with_element_offset(scroll_offset, with_frame)
+                    }
+                },
+            );
+            if let Some(listener) = self.prepaint_listener.as_ref() {
+                listener(children_bounds, window, cx);
+            }
+            return None;
+        }
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -2305,6 +2455,7 @@ impl Element for Div {
                                             prepaint_child(
                                                 &mut self.children,
                                                 idx,
+                                                &request_layout.child_layout_ids,
                                                 lifting,
                                                 &mut self.lifted_children,
                                                 window,
@@ -2316,13 +2467,19 @@ impl Element for Div {
                                     paint_order.as_ref().filter(|_| !lifting)
                                 {
                                     for &idx in order {
-                                        self.children[idx].prepaint(window, cx);
+                                        prepaint_unlifted_child(
+                                            &mut self.children[idx],
+                                            request_layout.child_layout_ids.get(idx).copied(),
+                                            window,
+                                            cx,
+                                        );
                                     }
                                 } else {
                                     for idx in 0..self.children.len() {
                                         prepaint_child(
                                             &mut self.children,
                                             idx,
+                                            &request_layout.child_layout_ids,
                                             lifting,
                                             &mut self.lifted_children,
                                             window,
@@ -2368,16 +2525,27 @@ impl Element for Div {
     }
 
     #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
-    fn paint(
+    fn paint_with(
         &mut self,
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        _request_layout: &mut DivFrameState,
         hitbox: &mut Option<Hitbox>,
+        culled: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
+        if culled {
+            self.interactivity.overlay_painter = None;
+            let children = &mut self.children;
+            self.interactivity.paint_culled(global_id, bounds, window, cx, |window, cx| {
+                for child in children.iter_mut() {
+                    child.paint(window, cx);
+                }
+            });
+            return;
+        }
         let image_cache = self
             .image_cache
             .as_mut()
@@ -2587,6 +2755,8 @@ pub struct Interactivity {
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,
+    /// See [`InteractiveElement::cullable`].
+    pub(crate) cull_outset: Option<Edges<Pixels>>,
 
     pub(crate) a11y_action_listeners:
         Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
@@ -2827,6 +2997,107 @@ impl Interactivity {
                 })
             },
         )
+    }
+
+    /// [`Interactivity::prepaint`] for an element in a culled subtree. It has no hitbox and no
+    /// style computed from its state: what it needs of its style (`display`, `position`,
+    /// `visibility`) is read from the base style, and a scroller computes the whole style, since
+    /// its scroll range is read.
+    ///
+    /// `f` gets whether the element has `display: none`, its `position`, and the scroll offset of
+    /// its children.
+    pub(crate) fn prepaint_culled<R: Default>(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        content_size: Size<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        f: impl FnOnce(bool, Position, Point<Pixels>, &mut Window, &mut App) -> R,
+    ) -> R {
+        self.content_size = content_size;
+
+        let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
+        if let Some(layout_id) = self.layout_id {
+            for listener in prepaint_layout_listeners {
+                listener(bounds, layout_id, window, cx);
+            }
+        }
+
+        // A culled element is not hit, but a focused one keeps its place in the focus path.
+        if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
+            window.set_focus_handle(focus_handle, cx);
+        }
+
+        let (display_none, position, visibility, scroll_offset) = if self.scroll_offset.is_some() {
+            let style = self.compute_style_internal(None, None, window, cx);
+            let scroll_offset = self.clamp_scroll_position(bounds, &style, window, cx);
+            (
+                style.display == Display::None,
+                style.position,
+                style.visibility.unwrap_or(window.visibility()),
+                scroll_offset,
+            )
+        } else {
+            (
+                self.base_style.display == Some(Display::None),
+                self.base_style.position.unwrap_or_default(),
+                self.base_style.visibility.unwrap_or(window.visibility()),
+                Point::default(),
+            )
+        };
+        let _ = global_id;
+        if window.is_layout_pass() {
+            self.publish_layout(bounds, visibility, window);
+        }
+        window.with_visibility(visibility, |window| {
+            f(display_none, position, scroll_offset, window, cx)
+        })
+    }
+
+    /// [`Interactivity::paint`] for an element in a culled subtree: no drawing and no listeners
+    /// of its own. What it still does is what paint reports to the listeners of its bounds, and
+    /// the tab stops of the focusable elements.
+    pub(crate) fn paint_culled(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        f: impl FnOnce(&mut Window, &mut App),
+    ) {
+        let visibility = self.base_style.visibility.unwrap_or(window.visibility());
+        let tab_group = self.tab_group.then_some(self.tab_index).flatten();
+        let skip_children = self.base_style.display == Some(Display::None);
+
+        #[cfg(any(feature = "test-support", test))]
+        if let Some(debug_selector) = &self.debug_selector {
+            window
+                .next_frame
+                .debug_bounds
+                .insert(debug_selector.clone(), bounds);
+        }
+
+        window.with_visibility(visibility, |window| {
+            if let Some(listener) = self.paint_bounds_listener.take() {
+                listener(bounds, window, cx);
+            }
+            if let Some(listener) = self.paint_layout_listener.take()
+                && let Some(layout_id) = self.layout_id
+            {
+                listener(bounds, layout_id, window, cx);
+            }
+            window.with_tab_group(tab_group, |window| {
+                if visibility == Visibility::Visible
+                    && let Some(focus_handle) = &self.tracked_focus_handle
+                {
+                    window.next_frame.tab_stops.insert(focus_handle);
+                }
+                if !skip_children {
+                    f(window, cx);
+                }
+            });
+        });
     }
 
     /// What paint reports to the listeners, for a pass that does not paint.
@@ -4698,6 +4969,10 @@ where
         self.element.lift_z()
     }
 
+    fn cull_outset(&self) -> Option<Edges<Pixels>> {
+        self.element.cull_outset()
+    }
+
     fn prepaint_offset(&self, layout_bounds: Bounds<Pixels>, window: &Window) -> Point<Pixels> {
         self.element.prepaint_offset(layout_bounds, window)
     }
@@ -4713,6 +4988,40 @@ where
     ) -> Self::PrepaintState {
         self.element
             .prepaint(id, inspector_id, bounds, state, window, cx)
+    }
+
+    fn prepaint_culled(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.element
+            .prepaint_culled(id, inspector_id, bounds, state, window, cx)
+    }
+
+    fn paint_culled(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.element.paint_culled(
+            id,
+            inspector_id,
+            bounds,
+            request_layout,
+            prepaint,
+            window,
+            cx,
+        );
     }
 
     fn paint(
@@ -10284,6 +10593,445 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(order, Some(handles[2].id));
+        }
+    }
+
+    /// A child lying outside the clip of its parent is culled when it says it can be
+    /// ([`InteractiveElement::cullable`]): it is not prepainted or painted, yet it still reports
+    /// what layout readers see.
+    mod culling {
+        use super::*;
+        use crate::{Edges, ScrollHandle, red, size};
+
+        const ROW: f32 = 40.;
+        const CLIP: f32 = 100.;
+
+        struct SceneView {
+            build: Rc<dyn Fn(&mut Context<Self>) -> AnyElement>,
+        }
+
+        impl Render for SceneView {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                (self.build.clone())(cx)
+            }
+        }
+
+        fn open_scene(
+            cx: &mut TestAppContext,
+            build: impl Fn(&mut Context<SceneView>) -> AnyElement + 'static,
+        ) -> AnyWindowHandle {
+            let build: Rc<dyn Fn(&mut Context<SceneView>) -> AnyElement> = Rc::new(build);
+            let window = cx.open_window(size(px(400.), px(300.)), move |_, _| SceneView { build });
+            let window = AnyWindowHandle::from(window);
+            cx.update_window(window, |_, window, _| window.set_dom_hit_testing(true))
+                .unwrap();
+            redraw(&window, cx);
+            window
+        }
+
+        fn redraw(window: &AnyWindowHandle, cx: &mut TestAppContext) {
+            cx.update_window(*window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        }
+
+        /// How many subtrees one more frame culls.
+        fn culled(window: &AnyWindowHandle, cx: &mut TestAppContext) -> u64 {
+            let count = |cx: &mut TestAppContext| {
+                cx.update_window(*window, |_, window, _| window.culled_subtree_count())
+                    .unwrap()
+            };
+            let before = count(cx);
+            redraw(window, cx);
+            count(cx) - before
+        }
+
+        fn quads(window: &AnyWindowHandle, cx: &mut TestAppContext) -> usize {
+            cx.update_window(*window, |_, window, _| window.painted_quads().len())
+                .unwrap()
+        }
+
+        fn hitboxes(window: &AnyWindowHandle, cx: &mut TestAppContext) -> usize {
+            cx.update_window(*window, |_, window, _| window.rendered_frame.hitboxes.len())
+                .unwrap()
+        }
+
+        fn debug_bounds(
+            window: &AnyWindowHandle,
+            cx: &mut TestAppContext,
+        ) -> Vec<(String, Bounds<Pixels>)> {
+            cx.update_window(*window, |_, window, _| {
+                let mut all: Vec<_> = window
+                    .rendered_frame
+                    .debug_bounds
+                    .iter()
+                    .map(|(name, bounds)| (name.clone(), *bounds))
+                    .collect();
+                all.sort_by(|left, right| left.0.cmp(&right.0));
+                all
+            })
+            .unwrap()
+        }
+
+        /// What the listeners of a row saw, by row.
+        type Seen = Rc<RefCell<Vec<(String, Bounds<Pixels>)>>>;
+
+        /// A row of `ROW` px, `index` places down, that reports to `seen` from paint
+        /// (`painted`), from prepaint (`prepainted`) and through its children's bounds.
+        fn row(index: usize, seen: &Seen, outset: Option<Edges<Pixels>>) -> Stateful<Div> {
+            let name = format!("row{index}");
+            let record = |kind: &'static str| {
+                let seen = seen.clone();
+                let name = name.clone();
+                move |bounds: Bounds<Pixels>| {
+                    seen.borrow_mut().push((format!("{kind} {name}"), bounds));
+                }
+            };
+            let painted = record("painted");
+            let prepainted = record("prepainted");
+            let mut row = div()
+                .id(("row", index))
+                .w(px(CLIP))
+                .h(px(ROW))
+                .flex_shrink_0()
+                .bg(red())
+                .always_hitbox()
+                .debug_selector({
+                    let name = name.clone();
+                    move || name.clone()
+                })
+                .on_painted(move |bounds, _, _| painted(bounds))
+                .on_prepainted_layout(move |bounds, _, _, _| prepainted(bounds));
+            row.style().position = Some(Position::Static);
+            match outset {
+                Some(outset) => row.cullable(outset),
+                None => row,
+            }
+        }
+
+        fn clip(handle: Option<&ScrollHandle>) -> Stateful<Div> {
+            let clip = div()
+                .id("clip")
+                .w(px(CLIP))
+                .h(px(CLIP))
+                .always_hitbox()
+                .debug_selector(|| "clip".into());
+            match handle {
+                Some(handle) => clip.overflow_y_scroll().track_scroll(handle),
+                None => clip.overflow_hidden(),
+            }
+        }
+
+        fn rows(count: usize, seen: &Seen, outset: Option<Edges<Pixels>>) -> Vec<Stateful<Div>> {
+            (0..count).map(|index| row(index, seen, outset)).collect()
+        }
+
+        fn scene(
+            cx: &mut TestAppContext,
+            seen: &Seen,
+            outset: Option<Edges<Pixels>>,
+        ) -> AnyWindowHandle {
+            let seen = seen.clone();
+            open_scene(cx, move |_| {
+                clip(None).children(rows(5, &seen, outset)).into_any_element()
+            })
+        }
+
+        #[gpui::test]
+        fn a_child_outside_the_clip_is_culled(cx: &mut TestAppContext) {
+            let seen = Seen::default();
+            let window = scene(cx, &seen, Some(Edges::default()));
+
+            // Rows 0 and 1 are inside, row 2 is cut by the clip at 100, rows 3 and 4 are outside.
+            assert_eq!(culled(&window, cx), 2);
+            let baseline = Seen::default();
+            let plain = scene(cx, &baseline, None);
+            assert_eq!(culled(&plain, cx), 0);
+            assert_eq!(hitboxes(&plain, cx) - hitboxes(&window, cx), 2);
+            assert_eq!(quads(&plain, cx) - quads(&window, cx), 0, "the clip dropped them anyway");
+        }
+
+        #[gpui::test]
+        fn a_culled_child_still_reports_its_bounds(cx: &mut TestAppContext) {
+            let culled_seen = Seen::default();
+            let culled_window = scene(cx, &culled_seen, Some(Edges::default()));
+            let plain_seen = Seen::default();
+            let plain_window = scene(cx, &plain_seen, None);
+
+            assert_eq!(
+                debug_bounds(&culled_window, cx),
+                debug_bounds(&plain_window, cx),
+                "debug selectors are read from paint"
+            );
+            let sorted = |seen: &Seen| {
+                let mut all = seen.borrow().clone();
+                all.sort_by(|left, right| left.0.cmp(&right.0));
+                all
+            };
+            let reported = sorted(&culled_seen);
+            assert_eq!(reported, sorted(&plain_seen));
+            let row4 = reported.iter().find(|(kind, _)| kind == "painted row4").unwrap().1;
+            assert_eq!(row4.origin.y, px(4. * ROW));
+            assert!(reported.iter().any(|(kind, _)| kind == "prepainted row4"));
+        }
+
+        #[gpui::test]
+        fn a_child_that_says_nothing_is_never_culled(cx: &mut TestAppContext) {
+            let window = scene(cx, &Seen::default(), None);
+            assert_eq!(culled(&window, cx), 0);
+        }
+
+        #[gpui::test]
+        fn the_outset_keeps_a_child_whose_ink_reaches_the_clip(cx: &mut TestAppContext) {
+            // Row 3 is 20 px below the clip: a 30 px outset reaches in, a 30 px outset on row 4,
+            // 60 px below, does not.
+            let window = scene(cx, &Seen::default(), Some(Edges::all(px(30.))));
+            assert_eq!(culled(&window, cx), 1);
+        }
+
+        #[gpui::test]
+        fn an_overflowing_descendant_keeps_its_ancestor(cx: &mut TestAppContext) {
+            let reach = |clipped: bool| {
+                move |cx: &mut TestAppContext| {
+                    let seen = Seen::default();
+                    let window = open_scene(cx, move |_| {
+                        let mut parent = row(3, &seen, Some(Edges::default()));
+                        if clipped {
+                            parent = parent.overflow_hidden();
+                        }
+                        // A child pulled up by its margin, into the clip, out of its parent's box.
+                        let pulled = div()
+                            .mt(px(-ROW * 3.))
+                            .w(px(10.))
+                            .h(px(10.))
+                            .bg(red())
+                            .cullable(Edges::default());
+                        clip(None)
+                            .children(rows(3, &Seen::default(), None))
+                            .child(parent.child(pulled))
+                            .into_any_element()
+                    });
+                    culled(&window, cx)
+                }
+            };
+            assert_eq!(reach(false)(cx), 0, "the child is painted inside the clip");
+            assert_eq!(reach(true)(cx), 1, "a clipping parent hides it");
+        }
+
+        #[gpui::test]
+        fn an_absolute_descendant_placed_by_a_containing_block_above_keeps_its_ancestor(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, |_| {
+                let mut escaping = div()
+                    .id("escaping")
+                    .w(px(10.))
+                    .h(px(10.))
+                    .top(px(10.))
+                    .left(px(10.))
+                    .bg(red())
+                    .debug_selector(|| "escaping".into());
+                escaping.style().position = Some(Position::AbsoluteInAncestor);
+                // Row 3 is below the clip and is not a containing block: the box is placed by
+                // the clip, which is, and it is inside.
+                clip(None)
+                    .relative()
+                    .children(rows(3, &Seen::default(), None))
+                    .child(row(3, &Seen::default(), Some(Edges::default())).child(escaping))
+                    .into_any_element()
+            });
+            assert_eq!(culled(&window, cx), 0);
+            assert_eq!(
+                debug_bounds(&window, cx)
+                    .into_iter()
+                    .find(|(name, _)| name == "escaping")
+                    .unwrap()
+                    .1
+                    .origin,
+                point(px(10.), px(10.))
+            );
+        }
+
+        #[gpui::test]
+        fn a_child_scrolled_into_view_is_painted_again(cx: &mut TestAppContext) {
+            let handle = ScrollHandle::new();
+            let seen = Seen::default();
+            let window = open_scene(cx, {
+                let handle = handle.clone();
+                let seen = seen.clone();
+                move |_| {
+                    clip(Some(&handle))
+                        .children(rows(5, &seen, Some(Edges::default())))
+                        .into_any_element()
+                }
+            });
+            assert_eq!(culled(&window, cx), 2);
+            let quads_before = quads(&window, cx);
+
+            handle.set_offset(point(px(0.), px(-100.)));
+            // Rows 0 and 1 are above the clip now, rows 3 and 4 are in, row 2 is cut by it.
+            assert_eq!(culled(&window, cx), 2);
+            assert_eq!(quads(&window, cx), quads_before);
+            let row4 = seen
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(kind, _)| kind == "painted row4")
+                .unwrap()
+                .1;
+            assert_eq!(row4.origin.y, px(4. * ROW - 100.));
+        }
+
+        #[gpui::test]
+        fn a_culled_focusable_keeps_its_place_in_the_tab_order(cx: &mut TestAppContext) {
+            struct Tabs {
+                handles: [FocusHandle; 3],
+            }
+
+            impl Render for Tabs {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    // Rows 0, 3 and 4 are focusable: only the first is inside the clip.
+                    clip(None).children((0..5).map(|place| {
+                        let item = row(place, &Seen::default(), Some(Edges::default()));
+                        match [0, 3, 4].iter().position(|focusable| *focusable == place) {
+                            Some(index) => item.track_focus(&self.handles[index].clone().tab_stop(true)),
+                            None => item,
+                        }
+                    }))
+                }
+            }
+
+            let handles = cx.update(|cx| [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()]);
+            let window: AnyWindowHandle = cx
+                .add_window({
+                    let handles = handles.clone();
+                    move |_, _| Tabs { handles }
+                })
+                .into();
+            redraw(&window, cx);
+            assert_eq!(culled(&window, cx), 2, "rows 3 and 4 are below the clip");
+
+            let order = cx
+                .update_window(window, |_, window, cx| {
+                    window.focus(&handles[0], cx);
+                    let mut order = Vec::new();
+                    for _ in 0..2 {
+                        window.focus_next(cx);
+                        order.push(window.focused(cx).map(|handle| handle.id));
+                    }
+                    order
+                })
+                .unwrap();
+            assert_eq!(order, [Some(handles[1].id), Some(handles[2].id)]);
+        }
+
+        #[gpui::test]
+        fn a_scroller_in_a_culled_child_publishes_its_scroll_range(cx: &mut TestAppContext) {
+            let inner = ScrollHandle::new();
+            let window = open_scene(cx, {
+                let inner = inner.clone();
+                move |_| {
+                    let scroller = div()
+                        .id("inner")
+                        .w(px(50.))
+                        .h(px(20.))
+                        .overflow_y_scroll()
+                        .track_scroll(&inner)
+                        .child(div().w(px(10.)).h(px(100.)));
+                    clip(None)
+                        .children(rows(3, &Seen::default(), None))
+                        .child(row(3, &Seen::default(), Some(Edges::default())).child(scroller))
+                        .into_any_element()
+                }
+            });
+            assert_eq!(culled(&window, cx), 1);
+            assert_eq!(inner.max_offset().y, px(80.));
+            assert_eq!(inner.bounds().origin.y, px(3. * ROW));
+        }
+
+        #[gpui::test]
+        fn a_layout_pass_publishes_from_a_culled_child(cx: &mut TestAppContext) {
+            let seen = Seen::default();
+            let window = scene(cx, &seen, Some(Edges::default()));
+            seen.borrow_mut().clear();
+
+            let before = cx
+                .update_window(window, |_, window, _| window.culled_subtree_count())
+                .unwrap();
+            let ran = cx
+                .update_window(window, |_, window, cx| {
+                    window.refresh();
+                    window.draw_if_dirty(cx)
+                })
+                .unwrap();
+
+            assert!(ran, "a pass laid the tree out");
+            let after = cx
+                .update_window(window, |_, window, _| window.culled_subtree_count())
+                .unwrap();
+            assert!(after > before, "the pass skipped the rows outside the clip too");
+            let seen = seen.borrow();
+            let row4 = seen.iter().find(|(kind, _)| kind == "painted row4").unwrap().1;
+            assert_eq!(row4.origin.y, px(4. * ROW));
+        }
+
+        #[gpui::test]
+        fn nothing_is_culled_while_a_screen_reader_is_connected(cx: &mut TestAppContext) {
+            let window = scene(cx, &Seen::default(), Some(Edges::default()));
+            assert_eq!(culled(&window, cx), 2);
+
+            cx.update_window(window, |_, window, _| window.set_a11y_active_for_tests(true))
+                .unwrap();
+            assert_eq!(culled(&window, cx), 0);
+
+            cx.update_window(window, |_, window, _| window.set_a11y_active_for_tests(false))
+                .unwrap();
+            assert_eq!(culled(&window, cx), 2);
+        }
+
+        #[gpui::test]
+        fn the_children_of_a_culled_child_still_report_their_bounds_to_its_listener(
+            cx: &mut TestAppContext,
+        ) {
+            let reported = Rc::new(RefCell::new(Vec::new()));
+            let window = open_scene(cx, {
+                let reported = reported.clone();
+                move |_| {
+                    let parent = div()
+                        .w(px(CLIP))
+                        .h(px(ROW))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_row()
+                        .cullable(Edges::default())
+                        .child(div().w(px(10.)).h(px(10.)))
+                        .child(div().w(px(20.)).h(px(10.)))
+                        .on_children_prepainted({
+                            let reported = reported.clone();
+                            move |bounds, _, _| *reported.borrow_mut() = bounds
+                        });
+                    clip(None)
+                        .children(rows(3, &Seen::default(), None))
+                        .child(parent)
+                        .into_any_element()
+                }
+            });
+            assert_eq!(culled(&window, cx), 1);
+            let reported = reported.borrow();
+            assert_eq!(reported.len(), 2);
+            assert_eq!(reported[1].size, size(px(20.), px(10.)));
+            assert_eq!(reported[1].origin, point(px(10.), px(3. * ROW)));
+        }
+
+        #[gpui::test]
+        fn a_culled_child_is_not_hit(cx: &mut TestAppContext) {
+            let window = scene(cx, &Seen::default(), Some(Edges::default()));
+            let hit = cx
+                .update_window(window, |_, window, _| {
+                    window.rendered_frame.hitboxes.iter().filter(|hitbox| hitbox.bounds.origin.y >= px(CLIP)).count()
+                })
+                .unwrap();
+            // Row 2 starts at 80, so rows 3 and 4 are the ones at or past the clip.
+            assert_eq!(hit, 0);
         }
     }
 }

@@ -33,7 +33,7 @@
 
 use crate::{
     A11yRelation, A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context, ContentMask,
-    DispatchNodeId, ElementId, FocusHandle, InspectorElementId, IsZero, LayoutId, Pixels, Point,
+    DispatchNodeId, Edges, ElementId, FocusHandle, InspectorElementId, IsZero, LayoutId, Pixels, Point,
     SharedString, Size, Style, Visibility, Window, util::FluentBuilder, window::with_element_arena,
 };
 use collections::FxHasher;
@@ -137,6 +137,54 @@ pub trait Element: 'static + IntoElement {
         window: &mut Window,
         cx: &mut App,
     );
+
+    /// How far past its laid-out box this element and everything below it can draw, or be hit.
+    /// An element that returns `Some` may be culled: when the box and the scrollable overflow of
+    /// the whole subtree lie outside the content mask, inflated by this, the parent prepaints
+    /// and paints it through [`Element::prepaint_culled`] and [`Element::paint_culled`] instead
+    /// of [`Element::prepaint`] and [`Element::paint`]. `None`, the default, is never culled.
+    ///
+    /// The caller vouches for the whole subtree: nothing in it draws or is hit outside what this
+    /// says (so no transform, and no box that escapes its clip or is placed by a sticky offset),
+    /// and nothing in it needs a hitbox, a listener or a paint of its own to behave, since
+    /// the subtree is outside the mask and has none of those. See [`Window::is_culling`].
+    fn cull_outset(&self) -> Option<Edges<Pixels>> {
+        None
+    }
+
+    /// [`Element::prepaint`] for an element in a culled subtree, called while
+    /// [`Window::is_culling`]. Everything below the content mask is empty: nothing drawn is seen
+    /// and nothing inserted can be hit. The element still owes what layout readers see of it:
+    /// its bounds, the sizes and scroll metrics it reports, and its place in the tab order (see
+    /// [`Element::paint_culled`]). The default does a full prepaint, which is correct and not
+    /// faster.
+    fn prepaint_culled(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.prepaint(id, inspector_id, bounds, request_layout, window, cx)
+    }
+
+    /// [`Element::paint`] for an element in a culled subtree. What paint registers that is not
+    /// drawing is still owed: tab stops, and what listeners publish from paint. The default does
+    /// a full paint, which is correct and not faster.
+    fn paint_culled(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.paint(id, inspector_id, bounds, request_layout, prepaint, window, cx)
+    }
 
     /// Returns the accessible role for this element, if any.
     /// Elements that return `None` are not included in the accessibility tree.
@@ -334,6 +382,8 @@ trait ElementObject {
 
     fn lift_z(&self) -> Option<i32>;
 
+    fn cull_outset(&self) -> Option<Edges<Pixels>>;
+
     fn prepaint(&mut self, window: &mut Window, cx: &mut App);
 
     fn paint(&mut self, window: &mut Window, cx: &mut App);
@@ -351,6 +401,15 @@ pub struct Drawable<E: Element> {
     /// The drawn element.
     pub element: E,
     phase: ElementDrawPhase<E::RequestLayoutState, E::PrepaintState>,
+}
+
+/// Whether an element was prepainted as part of a culled subtree, see [`Element::cull_outset`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Culled {
+    No,
+    /// The top of the culled subtree, which empties the content mask for everything below it.
+    Root,
+    Inside,
 }
 
 #[derive(Default)]
@@ -377,6 +436,7 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
         bounds: Bounds<Pixels>,
         /// The content mask an escaping element paints with.
         escaped_mask: Option<ContentMask<Pixels>>,
+        culled: Culled,
         request_layout: RequestLayoutState,
         prepaint: PrepaintState,
     },
@@ -459,13 +519,22 @@ impl<E: Element> Drawable<E> {
                     debug_assert_eq!(&*global_id.as_ref().unwrap().ids, &*window.element_id_stack);
                 }
 
+                let culled = window.take_culled();
+                if culled == Culled::Root {
+                    window.content_mask_stack.push(ContentMask::default());
+                }
+
+                // Inside a culled subtree nothing draws or is hit, so only the offset an
+                // escaping box is placed by matters: its bounds are read.
                 let escaped = self
                     .element
                     .escapes_to()
                     .map(|escape| window.escape_frame(escape));
                 if let Some((mask, offset)) = escaped {
-                    window.note_escape(&mask);
-                    window.content_mask_stack.push(mask);
+                    if culled == Culled::No {
+                        window.note_escape(&mask);
+                        window.content_mask_stack.push(mask);
+                    }
                     window.element_offset_stack.push(offset);
                 }
 
@@ -525,21 +594,37 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
-                let mut prepaint = self.element.prepaint(
-                    global_id.as_ref(),
-                    inspector_id.as_ref(),
-                    bounds,
-                    &mut request_layout,
-                    window,
-                    cx,
-                );
+                let mut prepaint = if culled == Culled::No {
+                    self.element.prepaint(
+                        global_id.as_ref(),
+                        inspector_id.as_ref(),
+                        bounds,
+                        &mut request_layout,
+                        window,
+                        cx,
+                    )
+                } else {
+                    self.element.prepaint_culled(
+                        global_id.as_ref(),
+                        inspector_id.as_ref(),
+                        bounds,
+                        &mut request_layout,
+                        window,
+                        cx,
+                    )
+                };
                 window.next_frame.dispatch_tree.pop_node();
                 if !sticky_offset.is_zero() {
                     window.element_offset_stack.pop();
                 }
                 if escaped.is_some() {
-                    window.content_mask_stack.pop();
+                    if culled == Culled::No {
+                        window.content_mask_stack.pop();
+                    }
                     window.element_offset_stack.pop();
+                }
+                if culled == Culled::Root {
+                    window.content_mask_stack.pop();
                 }
 
                 if pushed_a11y_node {
@@ -577,7 +662,8 @@ impl<E: Element> Drawable<E> {
                     global_id,
                     inspector_id,
                     bounds,
-                    escaped_mask: escaped.map(|(mask, _)| mask),
+                    escaped_mask: escaped.map(|(mask, _)| mask).filter(|_| culled == Culled::No),
+                    culled,
                     request_layout,
                     prepaint,
                 };
@@ -598,6 +684,7 @@ impl<E: Element> Drawable<E> {
                 inspector_id,
                 bounds,
                 escaped_mask,
+                culled,
                 mut request_layout,
                 mut prepaint,
                 ..
@@ -610,18 +697,35 @@ impl<E: Element> Drawable<E> {
                 window.next_frame.dispatch_tree.set_active_node(node_id);
                 let element = &mut self.element;
                 let mut paint = |window: &mut Window| {
-                    element.paint(
-                        global_id.as_ref(),
-                        inspector_id.as_ref(),
-                        bounds,
-                        &mut request_layout,
-                        &mut prepaint,
-                        window,
-                        cx,
-                    )
+                    if culled == Culled::No {
+                        element.paint(
+                            global_id.as_ref(),
+                            inspector_id.as_ref(),
+                            bounds,
+                            &mut request_layout,
+                            &mut prepaint,
+                            window,
+                            cx,
+                        )
+                    } else {
+                        element.paint_culled(
+                            global_id.as_ref(),
+                            inspector_id.as_ref(),
+                            bounds,
+                            &mut request_layout,
+                            &mut prepaint,
+                            window,
+                            cx,
+                        )
+                    }
                 };
                 match escaped_mask {
                     Some(mask) => window.with_escaped_content_mask(mask, paint),
+                    None if culled == Culled::Root => {
+                        window.content_mask_stack.push(ContentMask::default());
+                        paint(window);
+                        window.content_mask_stack.pop();
+                    }
                     None => paint(window),
                 }
 
@@ -721,6 +825,10 @@ where
         self.element.lift_z()
     }
 
+    fn cull_outset(&self) -> Option<Edges<Pixels>> {
+        self.element.cull_outset()
+    }
+
     #[inline]
     fn layout_as_root(
         &mut self,
@@ -763,6 +871,13 @@ impl AnyElement {
         self.0.lift_z()
     }
 
+    /// What the element stored in this `AnyElement` says it can be culled by, see
+    /// [`Element::cull_outset`]. A wrapper that places something by its child's bounds does not
+    /// forward this: it is never culled.
+    pub fn cull_outset(&self) -> Option<Edges<Pixels>> {
+        self.0.cull_outset()
+    }
+
     /// Request the layout ID of the element stored in this `AnyElement`.
     /// Used for laying out child elements in a parent element.
     pub fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
@@ -781,6 +896,15 @@ impl AnyElement {
         }
 
         None
+    }
+
+    /// Prepaints the element stored in this `AnyElement` as the top of a culled subtree: it and
+    /// everything below it publish what layout readers see through [`Element::prepaint_culled`],
+    /// under an empty content mask, and [`AnyElement::paint`] then does the same.
+    pub fn prepaint_culled(&mut self, window: &mut Window, cx: &mut App) {
+        window.begin_culling();
+        self.0.prepaint(window, cx);
+        window.end_culling();
     }
 
     /// Paints the element stored in this `AnyElement`.
@@ -850,6 +974,14 @@ impl Element for AnyElement {
     // one.
     fn lift_z(&self) -> Option<i32> {
         AnyElement::lift_z(self)
+    }
+
+    // The wrapper does not escape, but the element inside may, and its parent asks the wrapper.
+    fn cull_outset(&self) -> Option<Edges<Pixels>> {
+        if AnyElement::escapes_to(self).is_some() {
+            return None;
+        }
+        AnyElement::cull_outset(self)
     }
 
     fn request_layout(
