@@ -3907,6 +3907,48 @@ mod tests {
         }
 
         #[gpui::test]
+        fn a_stretched_root_with_a_width_limit_keyword_keeps_its_stretch(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                for frame in 0..3 {
+                    let mut root_style = flex();
+                    root_style.intrinsic_widths.min_width = Some(Some(crate::IntrinsicSize::MinContent));
+                    let child = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                    let root = engine.request_keyed_layout(1, root_style, REM, 1., &[child]);
+                    engine.stretch_auto_size_to_fill(root, size(px(300.), px(200.)), 1.);
+                    engine.compute_layout(root, space(), window, cx);
+                    assert_eq!(
+                        engine.layout_bounds(root, 1.).size,
+                        size(px(300.), px(200.)),
+                        "frame {frame}"
+                    );
+                    engine.end_frame();
+                }
+            });
+        }
+
+        #[gpui::test]
+        fn a_stretched_root_with_a_width_keyword_keeps_its_stretched_height(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                for frame in 0..3 {
+                    let mut root_style = flex();
+                    root_style.intrinsic_widths.width = Some(Some(crate::IntrinsicSize::MaxContent));
+                    let child = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                    let root = engine.request_keyed_layout(1, root_style, REM, 1., &[child]);
+                    engine.stretch_auto_size_to_fill(root, size(px(300.), px(200.)), 1.);
+                    engine.compute_layout(root, space(), window, cx);
+                    let bounds = engine.layout_bounds(root, 1.);
+                    assert_eq!(bounds.size.height, px(200.), "frame {frame}");
+                    assert_eq!(bounds.size.width, px(0.), "frame {frame}: the keyword sets the width");
+                    engine.end_frame();
+                }
+            });
+        }
+
+        #[gpui::test]
         fn a_forced_width_that_was_a_calc_survives_a_sweep(cx: &mut TestAppContext) {
             let cx = cx.add_empty_window();
             cx.update(|_, _| {

@@ -133,6 +133,17 @@ impl TaffyLayoutEngine {
                 .as_deref()
                 .expect("a pending intrinsic node has keywords");
             let mut requested = self.requested_style(id).clone();
+            if self.meta(id).stretched_in_pass == self.pass {
+                // The size the window gave this root is part of what it is laid out with, under the
+                // keywords: they replace the dimensions they are about and nothing else.
+                let stretched = self.taffy.style(id.0).expect(EXPECT_MESSAGE).size;
+                if requested.size.width.is_auto() {
+                    requested.size.width = stretched.width;
+                }
+                if requested.size.height.is_auto() {
+                    requested.size.height = stretched.height;
+                }
+            }
 
             // A flex basis keyword wins over a basis length set next to it, also where it
             // does not count.
