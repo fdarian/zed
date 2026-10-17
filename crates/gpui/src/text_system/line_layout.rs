@@ -14,7 +14,7 @@ use std::{
 };
 
 use super::{
-    InlineRun, InlineSpec, LineMetrics, LineWrapper, NarrowedLines, RunPlacement, TextWrapStyle,
+    InlineRun, InlineSpec, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
     apply_inline,
     resolve_placements,
 };
@@ -651,25 +651,6 @@ impl LineLayout {
         tab_stop: Option<TabStopFor<'_>>,
         insets: &[TextInset],
     ) -> WrapComputation {
-        self.compute_narrowed_wrap_boundaries(
-            text, wrap_width, None, max_lines, options, tab_stop, insets,
-        )
-    }
-
-    /// [`Self::compute_wrap_boundaries`] where the lines from `narrowed` on break at
-    /// a width of their own. How `text-wrap-style` picks its breaks without
-    /// reimplementing the tab stops, insets and hanging spaces that the rest of the
-    /// pass keeps consistent.
-    pub(super) fn compute_narrowed_wrap_boundaries(
-        &self,
-        text: &str,
-        wrap_width: Option<Pixels>,
-        narrowed: Option<NarrowedLines>,
-        max_lines: Option<usize>,
-        options: TextLayoutOptions,
-        tab_stop: Option<TabStopFor<'_>>,
-        insets: &[TextInset],
-    ) -> WrapComputation {
         let hang = options.spaces_hang();
         let keep_all = options.word_break == WordBreak::KeepAll;
         let break_all = options.word_break == WordBreak::BreakAll;
@@ -725,15 +706,11 @@ impl LineLayout {
             // after it overflows instead, and the line wraps before that word.
             let hanging = hang && positions.glyphs[ix].hangs;
             let width = positions.x(ix + 1) - last_boundary_x;
-            let line_wrap_width = match narrowed {
-                Some(narrowed) if boundaries.len() >= narrowed.from_line => Some(narrowed.width),
-                _ => wrap_width,
-            };
 
             // Without a place to break, a word that does not fit is left to overflow
             // when `overflow_wrap` is normal, and goes on until one turns up.
             if !hanging
-                && line_wrap_width.is_some_and(|wrap_width| width > wrap_width)
+                && wrap_width.is_some_and(|wrap_width| width > wrap_width)
                 && boundary > last_boundary
                 && (last_candidate_ix.is_some() || breaks_words)
             {
@@ -794,6 +771,78 @@ impl LineLayout {
             line_widths,
             last_line_words,
             broke_word,
+            line_starts,
+        }
+    }
+
+    /// Where the text may break, and the x of its glyphs. A text wrapped at no width
+    /// at all breaks at every place a line may break, without cutting a word.
+    pub(super) fn break_opportunities(
+        &self,
+        text: &str,
+        options: TextLayoutOptions,
+        insets: &[TextInset],
+    ) -> BreakOpportunities {
+        let everywhere = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            text_wrap_style: TextWrapStyle::Auto,
+            ..options
+        };
+        let computation =
+            self.compute_wrap_boundaries(text, Some(px(0.)), None, everywhere, None, insets);
+        let breaks = computation.line_starts[1..].to_vec();
+        let glyphs = || self.runs.iter().flat_map(|run| run.glyphs.iter());
+        let x = computation.tabbed_x.unwrap_or_else(|| {
+            glyphs()
+                .map(|glyph| glyph.position.x)
+                .chain(iter::once(self.width))
+                .collect()
+        });
+        let hangs = glyphs()
+            .map(|glyph| text[glyph.index..].chars().next().is_some_and(hangs))
+            .collect();
+        BreakOpportunities { x, hangs, breaks }
+    }
+
+    /// The wrap computation of a line that starts a new line at each of the glyphs
+    /// `breaks`, as [`Self::compute_wrap_boundaries`] would give it had it broken
+    /// there. Without tab stops, which count from the start of the line they are on.
+    pub(super) fn compute_wrap_boundaries_at(
+        &self,
+        text: &str,
+        breaks: &[usize],
+        options: TextLayoutOptions,
+        insets: &[TextInset],
+    ) -> WrapComputation {
+        let hang = options.spaces_hang();
+        let mut positions = GlyphPositions::new(self, text, None, options, insets);
+        for ix in 1..=positions.glyphs.len() {
+            positions.place(ix, px(0.));
+        }
+        let boundaries = breaks
+            .iter()
+            .map(|ix| positions.glyphs[*ix].boundary)
+            .collect();
+        let mut line_starts: SmallVec<[usize; 2]> = SmallVec::new();
+        line_starts.push(0);
+        line_starts.extend(breaks.iter().copied());
+        let hanging_widths = if hang {
+            positions.hanging_widths(&line_starts)
+        } else {
+            SmallVec::new()
+        };
+        let line_widths = positions.line_widths(&line_starts, hang);
+        let last_line_words = positions.words_on_line(line_starts[line_starts.len() - 1]);
+        let (tabbed_x, glyph_insets) = positions.into_placed();
+        WrapComputation {
+            boundaries,
+            tabbed_x,
+            hanging_widths,
+            glyph_insets,
+            line_widths,
+            last_line_words,
+            broke_word: false,
+            line_starts,
         }
     }
 
@@ -846,6 +895,19 @@ pub(super) struct WrapComputation {
     pub(super) last_line_words: usize,
     /// Whether a line broke inside a word because the word did not fit.
     pub(super) broke_word: bool,
+    /// The glyph each line starts at, counting through all the runs.
+    pub(super) line_starts: SmallVec<[usize; 2]>,
+}
+
+/// The places a text may break and where each of its glyphs is, for choosing among
+/// the ways it can break.
+pub(super) struct BreakOpportunities {
+    /// The x of every glyph, and then of the end of the line.
+    pub(super) x: Vec<Pixels>,
+    /// Whether each glyph is a space or tab that hangs at the end of a line.
+    pub(super) hangs: Vec<bool>,
+    /// The glyphs a line may start at, but the first.
+    pub(super) breaks: Vec<usize>,
 }
 
 struct WrapGlyph {
@@ -3649,6 +3711,51 @@ mod tests {
         }
 
         #[test]
+        fn test_balance_evens_out_lines_that_no_narrower_width_would_move() {
+            // Greedy fills three lines of four words, so a width that keeps four
+            // lines is as wide as the first. The breaks still move, 3, 3, 3, 4.
+            let text = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk llll mm";
+            assert_eq!(breaks(text, 200., TextWrapStyle::Auto), vec![20, 40, 60]);
+            assert_eq!(breaks(text, 200., TextWrapStyle::Balance), vec![15, 30, 45]);
+            assert_eq!(
+                widths(text, 200., TextWrapStyle::Balance),
+                vec![140., 140., 140., 170.]
+            );
+        }
+
+        #[test]
+        fn test_balance_counts_the_insets_of_a_line() {
+            // The inset makes "cccc" 30 wider, which the lines are measured with.
+            let text = "aaaa bbbb cccc dddd eeee ffff";
+            let shaped = monospace_layout(text, 10.);
+            let insets = [inset(10..14, 15., 15.)];
+            let options = TextLayoutOptions {
+                hang_trailing_spaces: true,
+                text_wrap_style: TextWrapStyle::Balance,
+                ..Default::default()
+            };
+            let computation = shaped.compute_styled_wrap_boundaries(
+                text,
+                Some(px(200.)),
+                None,
+                options,
+                None,
+                &insets,
+            );
+            let layout = WrappedLineLayout {
+                unwrapped_layout: Arc::new(shaped.with_x_positions(&computation.tabbed_x.unwrap())),
+                wrap_boundaries: computation.boundaries,
+                wrap_width: Some(px(200.)),
+                hanging_widths: computation.hanging_widths,
+                insets: computation.glyph_insets,
+            };
+            let widths: Vec<_> = layout.line_widths().map(f32::from).collect();
+            assert_eq!(widths.len(), 2);
+            assert!(widths.iter().all(|width| *width <= 200.), "{widths:?}");
+            assert!((widths[0] - widths[1]).abs() <= 50., "{widths:?}");
+        }
+
+        #[test]
         fn test_balance_keeps_the_reported_width() {
             let text = "aaaa bbbb cccc dddd eeeeeeee";
             let (layout, _) = styled(text, 200., TextWrapStyle::Balance, None);
@@ -3773,8 +3880,7 @@ mod tests {
 
         #[test]
         fn test_pretty_moves_as_little_as_it_takes() {
-            // Both of "cccc", "dddd" and "ee" fit the narrowed last line, but only
-            // one word has to move.
+            // Only "dddd" has to move to the last line.
             let text = "aaaa bbbb cccc dddd ee";
             let (_, computation) = styled(text, 200., TextWrapStyle::Pretty, None);
             assert_eq!(computation.boundaries.len(), 1);

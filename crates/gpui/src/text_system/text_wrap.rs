@@ -1,10 +1,11 @@
 //! CSS `text-wrap-style`: which of the ways a text can break into lines of the
 //! given width it takes.
 //!
-//! Both styles are found by laying the text out again at a narrower width and
-//! keeping the breaks, so tab stops, insets and hanging spaces stay consistent
-//! with them. The width the text reports to layout is not touched: the box is sized
-//! from the available width and only the breaks move, as in CSS.
+//! The breaks are chosen among the places a line may break (the ones greedy wrapping
+//! at no width at all uses), by the same measure of a line that greedy wrapping uses:
+//! hanging spaces, insets and all. The width the text reports to layout is not
+//! touched, the box is sized from the available width and only the breaks move, as
+//! in CSS.
 
 use super::line_layout::{LineLayout, TabStopFor, TextInset, TextLayoutOptions, WrapComputation};
 use crate::{Pixels, px};
@@ -22,15 +23,8 @@ pub enum TextWrapStyle {
     /// many lines as `Auto` makes.
     Balance,
     /// The last lines of a paragraph are re-broken so that the last one is not a
-    /// single word, with as many lines as `Auto` makes.
+    /// single short word, with as many lines as `Auto` makes.
     Pretty,
-}
-
-/// Lines from line `from_line` (counting from 0) on break at `width`.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct NarrowedLines {
-    pub(super) from_line: usize,
-    pub(super) width: Pixels,
 }
 
 /// Chromium balances a paragraph of at most this many lines (`kMaxLinesForBalance`
@@ -41,19 +35,30 @@ const MAX_BALANCED_LINES: usize = 6;
 /// (`kMaxLinesForOptimal`).
 const PRETTY_LINES: usize = 4;
 
-/// A last line shorter than this fraction of the line is short, for `pretty`.
+/// The last line of a paragraph is short for `pretty` when it is narrower than this
+/// fraction of the line (`kShortLineDenominator`).
 const SHORT_LINE_DENOMINATOR: f32 = 3.;
 
-/// A search for a width stops when its bounds are this close.
-const WIDTH_PRECISION: f32 = 1. / 16.;
+/// What a last line of a single word costs, in the square pixels a line's slack
+/// costs (`kOrphansPenalty`).
+const ORPHAN_PENALTY: f32 = 10_000.;
 
-/// A line wider than its wrap width by no more than this still counts as fitting:
-/// glyph positions are floats.
+/// A line wider than its wrap width by no more than this still fits: glyph
+/// positions are floats.
 const FIT_TOLERANCE: f32 = 1. / 256.;
+
+/// What the last line of the lines being broken costs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastLine {
+    /// The square of what is left of the wrap width, as every other line costs.
+    Slack,
+    /// Nothing for its slack, and a lot for being a single word.
+    Orphan,
+}
 
 impl LineLayout {
     /// [`Self::compute_wrap_boundaries`], with the breaks `options.text_wrap_style`
-    /// asks for among those that make no more lines than the greedy ones do.
+    /// asks for among those that make as many lines as the greedy ones.
     pub(super) fn compute_styled_wrap_boundaries(
         &self,
         text: &str,
@@ -68,7 +73,8 @@ impl LineLayout {
         let (Some(wrap_width), None) = (wrap_width, max_lines) else {
             return greedy;
         };
-        let line_count = greedy.boundaries.len() + 1;
+        let line_count = greedy.line_starts.len();
+        let widest = greedy.line_widths.iter().copied().fold(px(0.), Pixels::max);
         // Chromium lays out a text with a tab, or that breaks after every space, as
         // `auto` does, and so one with a line that overflows. A word wider than the
         // line leaves nothing to even out.
@@ -76,95 +82,113 @@ impl LineLayout {
             || text.contains('\t')
             || options.break_spaces
             || greedy.broke_word
-            || widest(&greedy.line_widths, 0) > wrap_width + px(FIT_TOLERANCE)
+            || widest > wrap_width + px(FIT_TOLERANCE)
         {
             return greedy;
         }
-        let narrowed = |from_line, width| {
-            self.compute_narrowed_wrap_boundaries(
-                text,
-                Some(wrap_width),
-                Some(NarrowedLines { from_line, width }),
-                None,
-                options,
-                tab_stop,
-                insets,
-            )
-        };
-        match options.text_wrap_style {
-            TextWrapStyle::Auto => greedy,
-            TextWrapStyle::Balance if line_count <= MAX_BALANCED_LINES => {
-                // The narrowest width that still makes no more lines than greedy
-                // does, bisected: a line count only grows as the width shrinks.
-                let mut balanced = None;
-                let (mut lo, mut hi) = (px(0.), wrap_width);
-                while f32::from(hi - lo) > WIDTH_PRECISION {
-                    let mid = (lo + hi) / 2.;
-                    let computation = narrowed(0, mid);
-                    if fits(&computation, line_count, 0, mid) {
-                        hi = mid;
-                        balanced = Some(computation);
-                    } else {
-                        lo = mid;
-                    }
-                }
-                balanced.unwrap_or(greedy)
-            }
-            TextWrapStyle::Balance => greedy,
+        let (last_line, first_line) = match options.text_wrap_style {
+            TextWrapStyle::Auto => return greedy,
+            TextWrapStyle::Balance if line_count <= MAX_BALANCED_LINES => (LastLine::Slack, 0),
+            TextWrapStyle::Balance => return greedy,
             TextWrapStyle::Pretty => {
-                // Chromium only re-breaks when the last line is one word and shorter
-                // than a third of the line (`kShortLineDenominator`).
+                // Chromium only re-breaks when the last line is one word, shorter
+                // than a third of the line.
                 let last_line_width = greedy.line_widths[line_count - 1];
                 if greedy.last_line_words >= 2
                     || last_line_width * SHORT_LINE_DENOMINATOR >= wrap_width
                 {
                     return greedy;
                 }
-                // Narrowing the last lines moves words onto the last one. Move as
-                // few lines as it takes, the last two first. For each, bisect to the
-                // widest width that gives the last line a second word, which is also
-                // the one that moves the fewest words.
-                let first_narrowed = line_count.saturating_sub(PRETTY_LINES);
-                for from_line in (first_narrowed..line_count - 1).rev() {
-                    let (mut lo, mut hi) = (px(0.), wrap_width);
-                    while f32::from(hi - lo) > WIDTH_PRECISION {
-                        let mid = (lo + hi) / 2.;
-                        let computation = narrowed(from_line, mid);
-                        if fits(&computation, line_count, from_line, mid)
-                            && computation.last_line_words < 2
-                        {
-                            hi = mid;
-                        } else {
-                            lo = mid;
-                        }
-                    }
-                    let computation = narrowed(from_line, lo);
-                    if fits(&computation, line_count, from_line, lo)
-                        && computation.last_line_words >= 2
-                    {
-                        return computation;
+                (LastLine::Orphan, line_count.saturating_sub(PRETTY_LINES))
+            }
+        };
+
+        let opportunities = self.break_opportunities(text, options, insets);
+        // The lines before the first one that is re-broken stay where greedy put them.
+        let start = greedy.line_starts[first_line];
+        let mut candidates = vec![start];
+        candidates.extend(opportunities.breaks.iter().copied().filter(|ix| *ix > start));
+        candidates.push(opportunities.x.len() - 1);
+        let hangs = options.hang_trailing_spaces && !options.break_spaces;
+
+        let line_cost = |from: usize, to: usize| -> Option<f32> {
+            let first = candidates[from];
+            let mut end = candidates[to];
+            let after_hanging = if hangs {
+                while end > first && opportunities.hangs[end - 1] {
+                    end -= 1;
+                }
+                opportunities.x[end]
+            } else {
+                opportunities.x[end]
+            };
+            let width = after_hanging - opportunities.x[first];
+            if width > wrap_width + px(FIT_TOLERANCE) {
+                return None;
+            }
+            let slack = f32::from(wrap_width - width);
+            let last = to == candidates.len() - 1;
+            Some(match last_line {
+                LastLine::Orphan if last => {
+                    if to - from == 1 {
+                        ORPHAN_PENALTY
+                    } else {
+                        0.
                     }
                 }
-                greedy
-            }
-        }
+                _ => slack * slack,
+            })
+        };
+        let Some(chosen) = cheapest_breaks(candidates.len(), line_count - first_line, line_cost)
+        else {
+            return greedy;
+        };
+
+        let mut breaks: Vec<usize> = greedy.line_starts[1..=first_line].to_vec();
+        breaks.extend(chosen.into_iter().map(|candidate| candidates[candidate]));
+        self.compute_wrap_boundaries_at(text, &breaks, options, insets)
     }
 }
 
-/// The widest of the lines from `from_line` on.
-fn widest(line_widths: &[Pixels], from_line: usize) -> Pixels {
-    line_widths
-        .iter()
-        .skip(from_line)
-        .copied()
-        .fold(px(0.), Pixels::max)
-}
-
-/// Whether `computation` makes no more than `line_count` lines, none of those from
-/// `from_line` on wider than `width`, and breaks no word: a narrower wrap width must
-/// not make a word overflow or cut it.
-fn fits(computation: &WrapComputation, line_count: usize, from_line: usize, width: Pixels) -> bool {
-    !computation.broke_word
-        && computation.boundaries.len() < line_count
-        && widest(&computation.line_widths, from_line) <= width + px(FIT_TOLERANCE)
+/// Which of `count` candidate places to break, the first the start of the text and
+/// the last its end, start the second to the last of `lines` lines when the lines
+/// cost the least in all; or `None` when no way of making that many lines has every
+/// one fit. `cost` is the cost of the line between two candidates, `None` for one
+/// that does not fit. Returns indices into the candidates.
+fn cheapest_breaks(
+    count: usize,
+    lines: usize,
+    cost: impl Fn(usize, usize) -> Option<f32>,
+) -> Option<Vec<usize>> {
+    // The cheapest way to make `k` lines that end at a candidate, and the candidate
+    // the last of them starts at.
+    let mut cheapest = vec![vec![None::<(f32, usize)>; count]; lines + 1];
+    cheapest[0][0] = Some((0., 0));
+    for k in 1..=lines {
+        for to in 1..count {
+            for from in (0..to).rev() {
+                // A line only gets wider as it takes more words.
+                let Some(line) = cost(from, to) else { break };
+                let Some((before, _)) = cheapest[k - 1][from] else {
+                    continue;
+                };
+                let total = before + line;
+                if cheapest[k][to].is_none_or(|(best, _)| total < best) {
+                    cheapest[k][to] = Some((total, from));
+                }
+            }
+        }
+    }
+    cheapest[lines][count - 1]?;
+    let mut breaks = Vec::with_capacity(lines - 1);
+    let mut to = count - 1;
+    for k in (1..=lines).rev() {
+        let (_, from) = cheapest[k][to]?;
+        if k > 1 {
+            breaks.push(from);
+        }
+        to = from;
+    }
+    breaks.reverse();
+    Some(breaks)
 }
