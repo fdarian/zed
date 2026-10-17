@@ -4104,7 +4104,10 @@ impl Window {
     /// does it: the window stays dirty, and views stay marked dirty and are not recorded as
     /// observers. Nothing is cached across the pass: views render in full instead of reusing
     /// their last prepaint and paint, which would move listeners out of `rendered_frame`, and
-    /// the element states a view cache keeps point into the frame they were made for. Neither
+    /// the element states a view cache keeps point into the frame they were made for. Retained
+    /// subtrees (see [`crate::retained`]) are skipped when the presented frame recorded them as
+    /// the same, and are not replayed into the frame: their owner publishes what they reported,
+    /// and their recordings stay for the draw that follows. Neither
     /// the focus path nor the input handler is touched, and no accessibility tree is built.
     fn layout_pass(&mut self, cx: &mut App, paint: bool) -> bool {
         if cx.mode.skip_drawing() {
@@ -4130,6 +4133,12 @@ impl Window {
         let a11y_was_active = self.a11y.suspend();
         self.measuring = true;
         self.layout_only = !paint;
+        // The draw that follows takes these from the invalidator; a subtree that read one of
+        // them is not the one the last presented frame recorded.
+        let pending_views = self.invalidator.take_views();
+        self.retained.notified.clear();
+        self.retained.notified.extend(pending_views.iter().copied());
+        self.invalidator.replace_views(pending_views);
 
         self.build_next_frame(cx);
 

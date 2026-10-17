@@ -154,6 +154,8 @@ pub(crate) struct A11y {
     /// never sent, so it must not build a tree or replace the action listeners of the frame
     /// that was.
     suspended: bool,
+    /// What [`Self::is_active`] was when the suspension began.
+    active_before_suspension: bool,
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
@@ -185,6 +187,7 @@ impl A11y {
             active_flag,
             active_this_frame: false,
             suspended: false,
+            active_before_suspension: false,
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
@@ -230,7 +233,8 @@ impl A11y {
     /// Makes [`Self::is_active`] false until [`Self::resume`], returning what to resume with.
     pub(crate) fn suspend(&mut self) -> bool {
         self.suspended = true;
-        std::mem::replace(&mut self.active_this_frame, false)
+        self.active_before_suspension = std::mem::replace(&mut self.active_this_frame, false);
+        self.active_before_suspension
     }
 
     pub(crate) fn resume(&mut self, was_active: bool) {
@@ -249,6 +253,12 @@ impl A11y {
 
     pub(crate) fn is_active(&self) -> bool {
         self.active_this_frame
+    }
+
+    /// [`Self::is_active`] as the frame this pass stands in for would have it: a pass that
+    /// suspends the tree still has to tell a recording of a presented frame whether it fits.
+    pub(crate) fn is_active_when_presented(&self) -> bool {
+        self.active_this_frame || (self.suspended && self.active_before_suspension)
     }
 
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
