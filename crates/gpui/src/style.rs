@@ -12,7 +12,7 @@ use crate::{
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions, TextWrapStyle,
-    TextRun, Window, OverflowWrap, WordBreak, black, phi, point, px, quad, rems, size,
+    TextRun, Window, OverflowWrap, TextBoxEdge, WordBreak, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use gpui_util::ResultExt;
@@ -684,6 +684,9 @@ pub struct TextStyle {
 
     /// Which breaks a wrapped line gets, as in CSS `text-wrap-style`.
     pub text_wrap_style: TextWrapStyle,
+    /// The edges a text laid out with `text-box-trim` is cut to, as in CSS
+    /// `text-box-edge`. Inherited, unlike the trim itself.
+    pub text_box_edge: TextBoxEdge,
 }
 
 impl Default for TextStyle {
@@ -714,6 +717,7 @@ impl Default for TextStyle {
             word_break: WordBreak::default(),
             overflow_wrap: OverflowWrap::default(),
             text_wrap_style: TextWrapStyle::default(),
+            text_box_edge: TextBoxEdge::default(),
         }
     }
 }

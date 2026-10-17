@@ -3,10 +3,10 @@ use crate::{
     DispatchPhase, Element, ElementId, EndTruncation, GlobalElementId, GlyphInset,
     HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId, MeasuredLeaf,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    SharedString, Size, TextInset, TextLayoutOptions, TextOverflow, TextRun, TextStyle, TooltipId,
-    TruncateFrom,
+    SharedString, Size, TextBoxMetrics, TextBoxTrim, TextInset, TextLayoutOptions, TextOverflow, TextRun,
+    TextStyle, TooltipId, TruncateFrom,
     WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
-    set_tooltip_on_window,
+    point, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -280,6 +280,7 @@ impl Element for &'static str {
             Rc::new(no_insets),
             Rc::default(),
             None,
+            TextBoxTrim::default(),
             window,
             cx,
         );
@@ -362,6 +363,7 @@ impl Element for SharedString {
             Rc::new(no_insets),
             Rc::default(),
             None,
+            TextBoxTrim::default(),
             window,
             cx,
         );
@@ -416,6 +418,7 @@ pub struct StyledText {
     inline_boxes: Vec<InlineBox>,
     atomic_inlines: Vec<AtomicInline>,
     atomics: Option<Rc<RefCell<AtomicInlines>>>,
+    text_box_trim: TextBoxTrim,
     layout: TextLayout,
 }
 
@@ -439,6 +442,7 @@ impl StyledText {
             inline_boxes: Vec::new(),
             atomic_inlines: Vec::new(),
             atomics: None,
+            text_box_trim: TextBoxTrim::default(),
             layout: TextLayout::default(),
         }
     }
@@ -573,6 +577,15 @@ impl StyledText {
         self
     }
 
+    /// Cuts the space above the first line and below the last one down to the
+    /// text style's [`TextBoxEdge`](crate::TextBoxEdge), as CSS `text-box-trim` does for
+    /// the lines of a block container. The text is that much shorter, and its lines
+    /// paint, select and hit-test where they would have been.
+    pub fn with_text_box_trim(mut self, trim: TextBoxTrim) -> Self {
+        self.text_box_trim = trim;
+        self
+    }
+
     /// Adds the advance of `insets` around ranges of the text, as the padding,
     /// border and margin of an inline box would. See [`TextInset`].
     pub fn with_insets(mut self, insets: Vec<TextInset>) -> Self {
@@ -654,6 +667,7 @@ impl Element for StyledText {
             insets,
             Rc::new(mem::take(&mut self.inline_boxes)),
             self.atomics.clone(),
+            self.text_box_trim,
             window,
             cx,
         );
@@ -731,6 +745,11 @@ struct TextLayoutInner {
     /// What the lines were laid out with: a text style can change how the same
     /// text breaks at the same width.
     options: TextLayoutOptions,
+    /// The space `text-box-trim` cut above the first line and below the last. The lines
+    /// start `trim_top` above the top of the bounds, which are as tall as the lines
+    /// less both.
+    trim_top: Pixels,
+    trim_bottom: Pixels,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
@@ -739,6 +758,11 @@ impl TextLayoutInner {
     fn first_baseline(&self) -> Option<Pixels> {
         let line = self.lines.first()?;
         Some(line.rows(self.line_height).first()?.baseline)
+    }
+
+    /// Where the first line starts: above the bounds by the space the trim cut.
+    fn line_origin(&self, bounds: Bounds<Pixels>) -> Point<Pixels> {
+        point(bounds.origin.x, bounds.origin.y - self.trim_top)
     }
 }
 
@@ -750,6 +774,7 @@ impl TextLayout {
         insets: InsetsForWidth,
         inline_boxes: Rc<Vec<InlineBox>>,
         atomics: Option<Rc<RefCell<AtomicInlines>>>,
+        trim: TextBoxTrim,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -798,6 +823,8 @@ impl TextLayout {
                         truncate_width,
                         inset_width: width,
                         options: text_style.layout_options(),
+                        trim_top: Pixels::ZERO,
+                        trim_bottom: Pixels::ZERO,
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -973,6 +1000,25 @@ impl TextLayout {
                     size.height += line_size.height;
                     size.width = size.width.max(line_size.width).ceil();
                 }
+                let (trim_top, trim_bottom) = match (lines.first(), lines.last()) {
+                    (Some(first_line), Some(last_line)) if !trim.is_none() => {
+                        let system = window.text_system();
+                        let font_id = system.resolve_font(&text_style.font());
+                        // The `text` edges are the strut's, which the half-leading was
+                        // computed around: they cut exactly the half-leading.
+                        let metrics = TextBoxMetrics {
+                            ascent: first_line.ascent(),
+                            descent: last_line.descent(),
+                            cap_height: system.cap_height(font_id, font_size),
+                            x_height: system.x_height(font_id, font_size),
+                        };
+                        let first = first_line.rows(line_height).first().copied();
+                        let last = last_line.rows(line_height).last().copied();
+                        trim.amounts(text_style.text_box_edge, first, last, &metrics)
+                    }
+                    _ => (Pixels::ZERO, Pixels::ZERO),
+                };
+                size.height -= trim_top + trim_bottom;
 
                 let inner = TextLayoutInner {
                     lines,
@@ -982,6 +1028,8 @@ impl TextLayout {
                     truncate_width,
                     inset_width: width,
                     options: text_style.layout_options(),
+                    trim_top,
+                    trim_bottom,
                     size: Some(size),
                     bounds: None,
                 };
@@ -1019,7 +1067,7 @@ impl TextLayout {
             .unwrap();
 
         let line_height = element_state.line_height;
-        let mut line_origin = bounds.origin;
+        let mut line_origin = element_state.line_origin(bounds);
         let text_style = window.text_style();
         for line in &element_state.lines {
             line.paint_background(
@@ -1150,7 +1198,7 @@ impl TextLayout {
         }
 
         let line_height = element_state.line_height;
-        let mut line_origin = bounds.origin;
+        let mut line_origin = element_state.line_origin(bounds);
         let mut line_start_ix = 0;
         for line in &element_state.lines {
             let line_bottom = line_origin.y + line.size(line_height).height;
@@ -1180,7 +1228,7 @@ impl TextLayout {
             .expect("prepaint has not been performed");
         let line_height = element_state.line_height;
 
-        let mut line_origin = bounds.origin;
+        let mut line_origin = element_state.line_origin(bounds);
         let mut line_start_ix = 0;
 
         for line in &element_state.lines {
@@ -1200,6 +1248,17 @@ impl TextLayout {
         None
     }
 
+    /// The space `text-box-trim` cut above the first line and below the last, as
+    /// measured. Zero before the text is measured and for an untrimmed text.
+    pub fn text_box_trim_amounts(&self) -> (Pixels, Pixels) {
+        self.0
+            .borrow()
+            .as_ref()
+            .map_or((Pixels::ZERO, Pixels::ZERO), |inner| {
+                (inner.trim_top, inner.trim_bottom)
+            })
+    }
+
     /// The wrapped row that contains the window y coordinate `y`, or `None` when `y`
     /// is above or below the text.
     pub fn row_at_y(&self, y: Pixels) -> Option<TextRow> {
@@ -1212,7 +1271,7 @@ impl TextLayout {
             .expect("prepaint has not been performed");
         let line_height = element_state.line_height;
 
-        let mut line_top = bounds.origin.y;
+        let mut line_top = element_state.line_origin(bounds).y;
         for line in &element_state.lines {
             let line_bottom = line_top + line.size(line_height).height;
             if y >= line_bottom {
@@ -1248,7 +1307,7 @@ impl TextLayout {
             .expect("prepaint has not been performed");
         let line_height = element_state.line_height;
 
-        let mut line_top = bounds.origin.y;
+        let mut line_top = element_state.line_origin(bounds).y;
         let mut line_start_ix = 0;
         for line in &element_state.lines {
             let line_end_ix = line_start_ix + line.len();
@@ -1841,6 +1900,8 @@ mod tests {
                     truncate_width: None,
                     inset_width: None,
                     options: Default::default(),
+                    trim_top: Pixels::ZERO,
+                    trim_bottom: Pixels::ZERO,
                     size: None,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
@@ -1909,6 +1970,8 @@ mod tests {
                     truncate_width: None,
                     inset_width: None,
                     options: Default::default(),
+                    trim_top: Pixels::ZERO,
+                    trim_bottom: Pixels::ZERO,
                     size: None,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
@@ -1971,6 +2034,93 @@ mod tests {
             let scaled = layout.content_extent(3..5, px(40.)).unwrap();
             assert!((f32::from(scaled.0) - f32::from(big.0) * 2.).abs() < 1e-3);
             assert!((f32::from(scaled.1) - f32::from(big.1) * 2.).abs() < 1e-3);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod text_box_trim {
+        use super::*;
+        use crate::{
+            AppContext as _, Context, ParentElement as _, Render, Styled as _, TestAppContext,
+            TextBoxEdge, TextBoxOver, TextBoxUnder, div, font, px,
+        };
+
+        struct Trimmed {
+            trim: TextBoxTrim,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for Trimmed {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let text = StyledText::new("Hello").with_text_box_trim(self.trim);
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let mut container = div()
+                    .w(px(200.))
+                    .font_family(font("Menlo").family)
+                    .text_size(px(16.))
+                    .line_height(px(24.));
+                container.text_style().text_box_edge = Some(TextBoxEdge {
+                    over: TextBoxOver::Cap,
+                    under: TextBoxUnder::Alphabetic,
+                });
+                container.child(text)
+            }
+        }
+
+        fn laid_out(cx: &mut TestAppContext, trim: TextBoxTrim) -> TextLayout {
+            let layout = Rc::new(RefCell::new(None));
+            let window = cx.add_window({
+                let layout = layout.clone();
+                move |_, _| Trimmed { trim, layout }
+            });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            let layout = layout.borrow().clone().unwrap();
+            layout
+        }
+
+        const BOTH: TextBoxTrim = TextBoxTrim {
+            start: true,
+            end: true,
+        };
+
+        #[crate::test]
+        fn a_trimmed_text_is_as_tall_as_the_cap_height_and_its_row_starts_above_its_bounds(
+            cx: &mut TestAppContext,
+        ) {
+            let cap = cx.update(|cx| {
+                let system = cx.text_system();
+                system.cap_height(system.resolve_font(&font("Menlo")), px(16.))
+            });
+
+            let layout = laid_out(cx, BOTH);
+            let line = &layout.line_layouts()[0];
+            let baseline = (px(24.) - line.ascent() - line.descent()) / 2. + line.ascent();
+            let bounds = layout.bounds();
+            assert!(bounds.size.height >= cap && bounds.size.height < cap + px(1.));
+            let (top, bottom) = layout.text_box_trim_amounts();
+            assert_eq!(top, baseline - cap);
+            assert_eq!(bottom, px(24.) - baseline);
+
+            let row = layout.row_for_index(0).unwrap();
+            assert_eq!(row.top, bounds.origin.y - top);
+            assert_eq!(row.height, px(24.));
+            assert_eq!(row.baseline, bounds.origin.y + cap);
+            assert_eq!(layout.position_for_index(0).unwrap().y, row.top);
+        }
+
+        #[crate::test]
+        fn a_point_on_the_glyphs_hits_them_and_an_untrimmed_text_is_a_line(cx: &mut TestAppContext) {
+            let layout = laid_out(cx, BOTH);
+            let bounds = layout.bounds();
+            let on_glyphs = point(bounds.origin.x + px(1.), bounds.origin.y + px(4.));
+            assert_eq!(layout.index_for_position(on_glyphs), Ok(0));
+            assert_eq!(layout.row_at_y(on_glyphs.y).unwrap().top, layout.row_for_index(0).unwrap().top);
+
+            let untrimmed = laid_out(cx, TextBoxTrim::default());
+            assert_eq!(untrimmed.bounds().size.height, px(24.));
+            assert_eq!(untrimmed.text_box_trim_amounts(), (Pixels::ZERO, Pixels::ZERO));
+            assert_eq!(untrimmed.row_for_index(0).unwrap().top, untrimmed.bounds().origin.y);
         }
     }
 
