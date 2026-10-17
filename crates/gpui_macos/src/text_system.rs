@@ -1078,4 +1078,77 @@ mod tests {
         assert_eq!(different.runs[0].glyphs.len(), 2);
         assert_eq!(different.runs[1].glyphs.len(), 2);
     }
+
+    /// The shaper never sees the placeholder of an atomic inline, so the glyphs after it
+    /// follow its advance, whatever CoreText would have made of U+FFFC.
+    #[test]
+    fn test_an_atomic_inline_takes_its_advance_from_the_caller() {
+        use gpui::{
+            AtomicExtent, InlineBox, InlineContent, TextLayoutOptions, TextRun, TextSystem,
+            VerticalAlign, WindowTextSystem,
+        };
+        use std::sync::Arc;
+
+        let text_system = WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(
+            MacTextSystem::new(),
+        ))));
+        let run = |len| TextRun {
+            len,
+            font: font("Menlo"),
+            ..Default::default()
+        };
+        let text = "ab\u{FFFC}cd";
+        let lines = |inline: &[InlineBox]| {
+            text_system
+                .shape_text_inline(
+                    text.into(),
+                    px(20.),
+                    &[run(2), run(3), run(2)],
+                    None,
+                    None,
+                    TextLayoutOptions::default(),
+                    &[],
+                    inline,
+                    px(20.),
+                )
+                .unwrap()
+        };
+        let atomic = InlineBox {
+            range: 2..5,
+            parent: None,
+            align: VerticalAlign::Baseline,
+            line_height: None,
+            content: InlineContent::Atomic(AtomicExtent {
+                advance: px(30.),
+                ascent: px(25.),
+                descent: px(3.),
+            }),
+        };
+        let lines = lines(&[atomic]);
+        let layout: &gpui::WrappedLineLayout = &lines[0];
+        let x = |index| f32::from(layout.unwrapped_layout.x_for_index(index));
+
+        let two_characters = x(2);
+        assert!(two_characters > 20. && two_characters < 30., "{two_characters}");
+        assert!((x(5) - x(2) - 30.).abs() < 0.01);
+        assert!((x(8) - x(5) - two_characters).abs() < 0.01);
+        assert!((f32::from(layout.width()) - x(8)).abs() < 0.01);
+
+        // Nothing was shaped for the placeholder: its glyph is the one of the box.
+        let object_runs: Vec<_> = layout
+            .runs()
+            .iter()
+            .filter(|run| run.inline.object)
+            .collect();
+        assert_eq!(object_runs.len(), 1);
+        assert_eq!(object_runs[0].glyphs.len(), 1);
+        assert_eq!(object_runs[0].glyphs[0].index, 2);
+
+        // 25px above the baseline and the strut below it.
+        let row = layout.rows(px(20.))[0];
+        assert_eq!(row.baseline, px(25.));
+        let position = layout.position_for_index(2, px(20.)).unwrap();
+        assert_eq!(f32::from(position.x), x(2));
+        assert_eq!(position.y, px(0.));
+    }
 }
