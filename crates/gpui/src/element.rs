@@ -158,6 +158,10 @@ pub trait Element: 'static + IntoElement {
     /// its bounds, the sizes and scroll metrics it reports, and its place in the tab order (see
     /// [`Element::paint_culled`]). The default does a full prepaint, which is correct and not
     /// faster.
+    ///
+    /// The accessibility tree is built as for any element: a culled subtree keeps its nodes. An
+    /// element whose [`Element::a11y_synthetic_children`] reads its prepaint state has to return
+    /// what [`Element::prepaint`] would while [`Window::is_a11y_active`].
     fn prepaint_culled(
         &mut self,
         id: Option<&GlobalElementId>,

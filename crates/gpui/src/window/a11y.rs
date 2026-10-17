@@ -316,6 +316,11 @@ impl A11y {
         update
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.debug.last_tree_update()
+    }
+
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
         self.debug.to_json()
     }

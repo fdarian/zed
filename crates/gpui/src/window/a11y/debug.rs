@@ -68,6 +68,11 @@ pub(crate) struct A11yDebug {
 }
 
 impl A11yDebug {
+    #[cfg(test)]
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.last_tree_update.as_ref()
+    }
+
     pub(crate) fn capture(
         &mut self,
         update: &TreeUpdate,
