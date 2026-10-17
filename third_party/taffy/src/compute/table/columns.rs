@@ -120,8 +120,9 @@ pub(super) fn clamp_percentages(columns: &mut [Column]) {
 /// from their percentage, from the width they were given and, last, from their max-content width; between two of
 /// these the columns grow in step. What is left once every column is as wide as it likes goes to the columns without
 /// percentage or width, in proportion to their max-content widths, else to the ones with a width, else to the ones
-/// with a percentage, else to all of them equally.
-pub(super) fn distribute(target: f32, columns: &[Column]) -> Vec<f32> {
+/// with a percentage, else to all of them equally. When `excess_to_fixed` is not set the columns with a width do not
+/// take any, and nothing is left to the others the width of the columns stays where they like it.
+pub(super) fn distribute(target: f32, columns: &[Column], excess_to_fixed: bool) -> Vec<f32> {
     let percent_width = |column: &Column| column.percent.map(|percent| percent * target);
 
     let min_guess: Vec<f32> = columns.iter().map(|column| column.min).collect();
@@ -172,7 +173,10 @@ pub(super) fn distribute(target: f32, columns: &[Column]) -> Vec<f32> {
     let is_fixed = |column: &Column| column.percent.is_none() && column.constrained;
     let is_percent = |column: &Column| column.percent.is_some();
     let receivers: [&dyn Fn(&Column) -> bool; 3] = [&is_auto, &is_fixed, &is_percent];
-    for receives in receivers {
+    for (kind, receives) in receivers.into_iter().enumerate() {
+        if kind == 1 && !excess_to_fixed {
+            continue;
+        }
         let count = columns.iter().filter(|column| receives(column)).count();
         if count == 0 {
             continue;
@@ -187,6 +191,9 @@ pub(super) fn distribute(target: f32, columns: &[Column]) -> Vec<f32> {
                     if total_weight > 0.0 { excess * weight(column) / total_weight } else { excess / count as f32 };
             }
         }
+        return widths;
+    }
+    if !excess_to_fixed {
         return widths;
     }
     let share = excess / widths.len().max(1) as f32;

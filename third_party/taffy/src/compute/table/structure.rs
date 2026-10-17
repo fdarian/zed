@@ -1,6 +1,5 @@
 //! The table grid: which row group, row, column and cell every child of a table is
 use crate::LayoutTableContainer;
-use crate::TraversePartialTree;
 use crate::style::{BoxGenerationMode, CaptionSide, CoreStyle, Position, RowGroupKind, TableItemStyle, TableRole};
 use crate::tree::NodeId;
 use crate::util::sys::Vec;
@@ -38,8 +37,6 @@ pub(super) struct Cell {
 pub(super) struct Row {
     /// The node of the row. `None` for an implicit row
     pub node: Option<NodeId>,
-    /// Index into [`Structure::sections`]
-    pub section: usize,
     /// Index into [`Structure::cells`] of the cells that start in this row, in source order
     pub cells: Vec<usize>,
 }
@@ -352,7 +349,6 @@ impl Structure {
 
     /// Places the cells of the rows of one group, honouring the cells of earlier rows that span into later ones
     fn place_section<Tree: LayoutTableContainer>(&mut self, tree: &Tree, source: SectionSource, is_body: bool) {
-        let section = self.sections.len();
         let first_row = self.rows.len();
         let row_count = source.rows.len();
         // For every column the first row (relative to the group) it is free again
@@ -401,7 +397,7 @@ impl Structure {
                 self.col_count = self.col_count.max(col + col_span);
                 col += col_span;
             }
-            self.rows.push(Row { node: row_node, section, cells });
+            self.rows.push(Row { node: row_node, cells });
         }
         self.sections.push(Section { node: source.node, first_row, row_count, is_body });
     }

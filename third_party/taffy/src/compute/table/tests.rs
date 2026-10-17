@@ -126,10 +126,6 @@ pub(super) fn sides(top: f32, right: f32, bottom: f32, left: f32) -> Rect<Length
     Rect { top: length(top), right: length(right), bottom: length(bottom), left: length(left) }
 }
 
-pub(super) const TOP: VerticalAlign = VerticalAlign::Top;
-pub(super) const MIDDLE: VerticalAlign = VerticalAlign::Middle;
-pub(super) const BOTTOM: VerticalAlign = VerticalAlign::Bottom;
-
 fn measure_words(known: Size<Option<f32>>, available: Size<AvailableSpace>, words: &[f32], line_height: f32) -> Size<f32> {
     let wrap_at = match (known.width, available.width) {
         (Some(width), _) => width,
@@ -240,12 +236,62 @@ pub(super) fn assert_rects(got: Vec<[f32; 4]>, want: &[[f32; 4]]) {
     }
 }
 
+/// Where this implementation differs from Chrome, and has no way of matching it: a node that is not a table part is a cell
+/// of its own, where CSS wraps it (with its neighbours) in an anonymous cell.
+mod deviations {
+    use super::*;
+
+    /// In Chrome the block is inside an anonymous cell, which is as tall as the row, and the block is as tall as its
+    /// content, put on the baseline of the row ([0, 10, 30, 10]). Here the block is the cell, so it is as tall as the row,
+    /// and its content is at the top: only nodes with the role of a cell are aligned in their row.
+    #[test]
+    fn a_child_of_a_row_that_is_not_a_cell_is_a_cell_of_its_own() {
+        let tree = vec![table(
+            |_| {},
+            vec![tr(
+                |_| {},
+                vec![div(|_| {}, vec![boxed(30.0, 10.0)]), td(|_| {}, vec![boxed(20.0, 20.0)])],
+            )],
+        )];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 50.0, 20.0],  // table
+                [0.0, 0.0, 50.0, 20.0],  // tr
+                [0.0, 0.0, 30.0, 20.0],  // div
+                [0.0, 0.0, 30.0, 10.0],  // box, at the top
+                [30.0, 0.0, 20.0, 20.0], // td
+                [30.0, 0.0, 20.0, 20.0], // box
+            ],
+        );
+    }
+
+    /// Neighbours that are not table parts are cells next to each other where CSS stacks them in one anonymous cell.
+    #[test]
+    fn neighbours_that_are_not_table_parts_are_cells_next_to_each_other() {
+        let tree = vec![table(
+            |_| {},
+            vec![tbody(vec![div(|_| {}, vec![boxed(10.0, 10.0)]), div(|_| {}, vec![boxed(10.0, 15.0)])])],
+        )];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 20.0, 15.0], // table
+                [0.0, 0.0, 20.0, 15.0], // tbody
+                [0.0, 0.0, 10.0, 15.0], // div
+                [0.0, 0.0, 10.0, 10.0], // box
+                [10.0, 0.0, 10.0, 15.0], // div
+                [10.0, 0.0, 10.0, 15.0], // box
+            ],
+        );
+    }
+}
+
 // ---- generated from Chrome ----
 
-#[rustfmt::skip]
 mod chrome {
     use super::*;
-    use crate::{AlignItems, AlignSelf, FlexDirection};
+    use crate::FlexDirection;
 
     /// Auto layout: the columns are as wide as their widest cell likes to be when there is room. The first and last
     /// cell hold text (min-content 30 and 20, max-content 120 and 60), the middle one a box.
@@ -2784,6 +2830,178 @@ mod chrome {
                 [22.0, 29.0, 30.0, 10.0], // box
                 [65.0, 29.0, 37.0, 10.0], // td
                 [65.0, 29.0, 30.0, 10.0], // box
+            ],
+        );
+    }
+
+    /// Cells that are children of the table or of a row group, with no row around them, make an implicit row; a row
+    /// after them starts another.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <table>
+    ///   <td>
+    ///     <div style="width:30px;height:10px"></div>
+    ///   </td>
+    ///   <td>
+    ///     <div style="width:20px;height:20px"></div>
+    ///   </td>
+    ///   <tr>
+    ///     <td>
+    ///       <div style="width:10px;height:10px"></div>
+    ///     </td>
+    ///     <td>
+    ///       <div style="width:40px;height:10px"></div>
+    ///     </td>
+    ///   </tr>
+    ///   <tbody>
+    ///     <td>
+    ///       <div style="width:15px;height:5px"></div>
+    ///     </td>
+    ///     <td>
+    ///       <div style="width:25px;height:5px"></div>
+    ///     </td>
+    ///   </tbody>
+    /// </table>
+    /// ```
+    #[test]
+    fn cells_directly_in_a_table_form_a_row() {
+        let tree = vec![
+            table(|_| {}, vec![
+                td(|_| {}, vec![
+                    boxed(30.0, 10.0),
+                ]),
+                td(|_| {}, vec![
+                    boxed(20.0, 20.0),
+                ]),
+                tr(|_| {}, vec![
+                    td(|_| {}, vec![
+                        boxed(10.0, 10.0),
+                    ]),
+                    td(|_| {}, vec![
+                        boxed(40.0, 10.0),
+                    ]),
+                ]),
+                tbody(vec![
+                    td(|_| {}, vec![
+                        boxed(15.0, 5.0),
+                    ]),
+                    td(|_| {}, vec![
+                        boxed(25.0, 5.0),
+                    ]),
+                ]),
+            ]),
+        ];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 70.0, 35.0], // table
+                [0.0, 0.0, 30.0, 20.0], // td
+                [0.0, 10.0, 30.0, 10.0], // box
+                [30.0, 0.0, 40.0, 20.0], // td
+                [30.0, 0.0, 20.0, 20.0], // box
+                [0.0, 20.0, 70.0, 10.0], // tr
+                [0.0, 20.0, 30.0, 10.0], // td
+                [0.0, 20.0, 10.0, 10.0], // box
+                [30.0, 20.0, 40.0, 10.0], // td
+                [30.0, 20.0, 40.0, 10.0], // box
+                [0.0, 30.0, 70.0, 5.0], // tbody
+                [0.0, 30.0, 30.0, 5.0], // td
+                [0.0, 30.0, 15.0, 5.0], // box
+                [30.0, 30.0, 40.0, 5.0], // td
+                [30.0, 30.0, 25.0, 5.0], // box
+            ],
+        );
+    }
+
+    /// display: none parts leave no column, row or cell.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <table>
+    ///   <tr>
+    ///     <td>
+    ///       <div style="width:30px;height:10px"></div>
+    ///     </td>
+    ///     <td style="display:none">
+    ///       <div style="width:20px;height:10px"></div>
+    ///     </td>
+    ///     <td>
+    ///       <div style="width:15px;height:10px"></div>
+    ///     </td>
+    ///   </tr>
+    ///   <tr style="display:none">
+    ///     <td>
+    ///       <div style="width:10px;height:30px"></div>
+    ///     </td>
+    ///   </tr>
+    ///   <tr>
+    ///     <td>
+    ///       <div style="width:30px;height:10px"></div>
+    ///     </td>
+    ///     <td>
+    ///       <div style="width:20px;height:10px"></div>
+    ///     </td>
+    ///     <td>
+    ///       <div style="width:15px;height:10px"></div>
+    ///     </td>
+    ///   </tr>
+    /// </table>
+    /// ```
+    #[test]
+    fn hidden_parts_take_no_space() {
+        let tree = vec![
+            table(|_| {}, vec![
+                tr(|_| {}, vec![
+                    td(|_| {}, vec![
+                        boxed(30.0, 10.0),
+                    ]),
+                    td(|s| { s.display = Display::None; }, vec![
+                        boxed(20.0, 10.0),
+                    ]),
+                    td(|_| {}, vec![
+                        boxed(15.0, 10.0),
+                    ]),
+                ]),
+                tr(|s| { s.display = Display::None; }, vec![
+                    td(|_| {}, vec![
+                        boxed(10.0, 30.0),
+                    ]),
+                ]),
+                tr(|_| {}, vec![
+                    td(|_| {}, vec![
+                        boxed(30.0, 10.0),
+                    ]),
+                    td(|_| {}, vec![
+                        boxed(20.0, 10.0),
+                    ]),
+                    td(|_| {}, vec![
+                        boxed(15.0, 10.0),
+                    ]),
+                ]),
+            ]),
+        ];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 65.0, 20.0], // table
+                [0.0, 0.0, 65.0, 10.0], // tr
+                [0.0, 0.0, 30.0, 10.0], // td
+                [0.0, 0.0, 30.0, 10.0], // box
+                [0.0, 0.0, 0.0, 0.0], // td
+                [0.0, 0.0, 0.0, 0.0], // box
+                [30.0, 0.0, 20.0, 10.0], // td
+                [30.0, 0.0, 15.0, 10.0], // box
+                [0.0, 0.0, 0.0, 0.0], // tr
+                [0.0, 0.0, 0.0, 0.0], // td
+                [0.0, 0.0, 0.0, 0.0], // box
+                [0.0, 10.0, 65.0, 10.0], // tr
+                [0.0, 10.0, 30.0, 10.0], // td
+                [0.0, 10.0, 30.0, 10.0], // box
+                [30.0, 10.0, 20.0, 10.0], // td
+                [30.0, 10.0, 20.0, 10.0], // box
+                [50.0, 10.0, 15.0, 10.0], // td
+                [50.0, 10.0, 15.0, 10.0], // box
             ],
         );
     }
