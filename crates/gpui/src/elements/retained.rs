@@ -23,7 +23,13 @@
 //! A subtree that did something a replay cannot repeat is built every frame instead, see
 //! [`NonReusable`]. The passes that cannot replay are every pass but the first of a draw (a first pass that is
 //! abandoned after it replayed leaves the pass that follows it a frame to build from), the
-//! passes that measure, and any frame while the inspector is on.
+//! passes that paint without presenting, and any frame while the inspector is on.
+//!
+//! A pass that only lays out ([`Window::draw_if_dirty`]) skips the subtrees the last presented frame
+//! recorded as the same, and puts nothing of them into its frame, which is thrown away: it takes
+//! nothing out of the frame that is rendered and records nothing, so that the draw after it can
+//! replay. What the subtree published outside the frame is published again by the
+//! [`Retained::on_replay`] listener, with [`RetainedPhase::Layout`].
 //!
 //! The element must have an element id that is unique among the elements around it. It names the
 //! element's state and is not on the id stack below it: the subtree has the ids it would have
@@ -65,6 +71,11 @@ pub enum RetainedPhase {
     Prepaint,
     /// The subtree's scene, listeners, cursor styles, input handlers and tab stops.
     Paint,
+    /// A pass that only lays out has the subtree where its recording is, and puts none of it into
+    /// the frame. What the listeners of the subtree would have published in it, through
+    /// [`Window::publish_layout`] (their bounds, not what only paint writes), is published here,
+    /// once the whole tree is prepainted.
+    Layout,
 }
 
 type Build = Box<dyn FnOnce(&mut Window, &mut App) -> AnyElement>;
@@ -97,7 +108,8 @@ impl Retained {
     }
 
     /// Runs `listener` every time a phase of the subtree is replayed instead of run, in the place
-    /// of the elements that would have run during it.
+    /// of the elements that would have run during it. (A pass that only lays out has only the
+    /// [`RetainedPhase::Layout`] phase.)
     ///
     /// A subtree whose listeners report to their owner while it prepaints or paints
     /// (`on_painted`, `on_prepainted_layout`, `on_children_prepainted`) is built every frame
@@ -250,6 +262,10 @@ impl Element for Retained {
             );
         }
 
+        if window.is_layout_pass() {
+            return self.request_layout_without_recording(global_id, window, cx);
+        }
+
         let key = self.key;
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             if let Some(mut state) = state
@@ -318,6 +334,9 @@ impl Element for Retained {
     ) -> RetainedPrepaint {
         let global_id = &self.global_id(window);
         match std::mem::replace(request_layout, RetainedLayout::Handed) {
+            RetainedLayout::Skipped if window.is_layout_pass() => {
+                self.prepaint_skipped_without_recording(global_id, bounds, window, cx)
+            }
             RetainedLayout::Skipped => {
                 self.prepaint_skipped(global_id, bounds, window, cx)
             }
@@ -446,6 +465,55 @@ fn request_subtree_layout(
 }
 
 impl Retained {
+    /// [`Element::request_layout`] in a pass that only lays out: the subtree is skipped under the
+    /// conditions of a presented frame, and the state that decides it is read and left as it is,
+    /// for the draw after the pass.
+    fn request_layout_without_recording(
+        &mut self,
+        global_id: &GlobalElementId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, RetainedLayout) {
+        let key = self.key;
+        let skipped = (!window.retained.reference && !window.refreshing)
+            .then(|| {
+                window.peek_element_state(global_id, |state: &RetainedState| {
+                    let fits = state.key == key
+                        && !state
+                            .accessed_entities
+                            .iter()
+                            .any(|entity| window.retained.notified.contains(entity))
+                        && state.engine == window.layout_engine_id()
+                        && window.layout_node_alive(state.root)
+                        && state.recorded.as_ref().is_some_and(|recorded| {
+                            recorded.serial == window.rendered_serial()
+                                && recorded.paint_serial == window.rendered_serial()
+                                && recorded.paint.is_some()
+                        });
+                    fits.then(|| (state.root, state.layout_states.clone()))
+                })
+            })
+            .flatten()
+            .flatten();
+        if let Some((root, layout_states)) = skipped {
+            window.retained.counters.layout_skips += 1;
+            window.keep_states(&layout_states);
+            return (root, RetainedLayout::Skipped);
+        }
+
+        window.retained.counters.layout_builds += 1;
+        let mut element = self.build()(window, cx);
+        let layout_id = request_subtree_layout(&mut element, self.lift_z, window, cx);
+        (
+            layout_id,
+            RetainedLayout::Built {
+                element,
+                unreusable: None,
+                record: false,
+            },
+        )
+    }
+
     /// Prepaint of a subtree that was not built for layout: replay it if it is where it was
     /// recorded, and build it now if not.
     fn prepaint_skipped(
@@ -457,7 +525,6 @@ impl Retained {
     ) -> RetainedPrepaint {
         let key = window.replay_key(bounds);
         let hook = self.on_replay.clone();
-        let lift_z = self.lift_z;
         let replayed = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a skipped subtree has its state");
             let root = state.root;
@@ -483,8 +550,53 @@ impl Retained {
         if replayed {
             return RetainedPrepaint::Replayed;
         }
-
         window.retained.counters.lazy_builds += 1;
+        self.build_skipped(global_id, bounds, key, window, cx)
+    }
+
+    /// [`Self::prepaint_skipped`] in a pass that only lays out: the recording is replayed by
+    /// publishing what it published, and neither moved nor replaced.
+    fn prepaint_skipped_without_recording(
+        &mut self,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RetainedPrepaint {
+        let key = window.replay_key(bounds);
+        let fits = window
+            .peek_element_state(global_id, |state: &RetainedState| {
+                state.recorded.as_ref().is_some_and(|recorded| {
+                    recorded.key == key
+                        && recorded.generation == window.layout_dirty_generation(state.root)
+                })
+            })
+            .expect("a skipped subtree has its state");
+        if !fits {
+            window.retained.counters.layout_builds += 1;
+            return self.build_skipped(global_id, bounds, key, window, cx);
+        }
+        window.retained.counters.layout_replays += 1;
+        if window.retained.verifier.is_some() {
+            window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
+        }
+        if let Some(hook) = self.on_replay.clone() {
+            window.publish_layout(move |window, cx| hook(RetainedPhase::Layout, window, cx));
+        }
+        RetainedPrepaint::Replayed
+    }
+
+    /// Builds a subtree that was skipped for layout and cannot be replayed, onto the layout nodes
+    /// it has, and prepaints it. Records what it left only in a frame that is presented.
+    fn build_skipped(
+        &mut self,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        key: ReplayKey,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RetainedPrepaint {
+        let lift_z = self.lift_z;
         let root = window.with_element_state(global_id, |state: Option<RetainedState>, _| {
             let state = state.expect("a skipped subtree has its state");
             (state.root, state)
@@ -543,6 +655,10 @@ impl Retained {
             };
         }
 
+        if !window.retention_records() {
+            element.prepaint(window, cx);
+            return RetainedPrepaint::Built { element, record: false };
+        }
         let unreusable = unstable.then_some(NonReusable::UnstableLayout);
         let record = self.record_prepaint(global_id, key, unreusable, window, cx, |window, cx| {
             element.prepaint(window, cx);
@@ -1272,8 +1388,32 @@ mod tests {
         assert_eq!(after.hits, replays + 1);
     }
 
+    /// Notifies the root view of the window and lays out, as a read of a bounds does, and
+    /// returns what `inspect` makes of the window right after. (The test app draws a window that
+    /// is dirty once the update that dirtied it is done, so a test that wants to see the window
+    /// as the pass left it looks inside.)
+    fn layout_only<R>(
+        window: AnyWindowHandle,
+        cx: &mut TestAppContext,
+        inspect: impl FnOnce(&mut Window) -> R,
+    ) -> R {
+        cx.update_window(window, |view, window, cx| {
+            let view = view.downcast::<SceneView>().unwrap();
+            view.update(cx, |_, cx| cx.notify());
+            assert!(window.draw_if_dirty(cx), "a pass ran");
+            inspect(window)
+        })
+        .unwrap()
+    }
+
+    fn counters_after_layout_only(window: AnyWindowHandle, cx: &mut TestAppContext) -> RetainedCounters {
+        layout_only(window, cx, |window| window.retained_counters())
+    }
+
     #[gpui::test]
-    fn a_measure_pass_between_frames_builds_and_the_next_frame_still_replays(cx: &mut TestAppContext) {
+    fn a_pass_that_only_lays_out_does_not_build_and_the_next_frame_still_replays(
+        cx: &mut TestAppContext,
+    ) {
         let layout = Layout::new(cx, 3);
         let fixture = &layout.fixture;
         fixture.draw(cx);
@@ -1285,19 +1425,326 @@ mod tests {
             snapshot(fixture.window, cx, &POINTS)
         };
         let builds = fixture.builds.get();
-        cx.update_window(fixture.window, |view, window, cx| {
-            let view = view.downcast::<SceneView>().unwrap();
-            view.update(cx, |_, cx| cx.notify());
-            assert!(window.draw_if_dirty(cx), "a pass ran");
-        })
-        .unwrap();
-        assert_eq!(fixture.builds.get(), builds + 3, "the measure pass builds");
         let before = fixture.counters(cx);
+        let during = counters_after_layout_only(fixture.window, cx);
+        assert_eq!(fixture.builds.get(), builds, "the pass builds none");
+        assert_eq!(during.layout_skips, before.layout_skips + 3);
+        assert_eq!(during.layout_replays, before.layout_replays + 3);
+        assert_eq!(during.layout_builds, before.layout_builds);
+        assert_eq!(during.builds, before.builds);
+        assert_eq!(during.replays, before.replays, "none was put into a frame");
+
+        // The test app draws the dirty window when the update is over, and so does this.
         fixture.draw(cx);
         let after = fixture.counters(cx);
-        assert_eq!(after.replays, before.replays + 3);
-        assert_eq!(fixture.builds.get(), builds + 3, "the draw after it replays");
+        assert_eq!(after.replays, before.replays + 6, "the recordings were left where they were");
+        assert_eq!(fixture.builds.get(), builds);
         assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
+        assert_eq!(after.total_non_reusable(), 0);
+    }
+
+    #[gpui::test]
+    fn a_pass_that_only_lays_out_builds_what_moved_and_leaves_its_recording(cx: &mut TestAppContext) {
+        let layout = Layout::new(cx, 3);
+        let fixture = &layout.fixture;
+        fixture.draw(cx);
+        fixture.draw(cx);
+        let replayed = snapshot(fixture.window, cx, &POINTS);
+        let builds = fixture.builds.get();
+        let before = fixture.counters(cx);
+
+        // The cards move, so what a pass that lays out publishes of them is not what they
+        // published where they were.
+        layout.spacer.set(17.);
+        let (during, built) = layout_only(fixture.window, cx, |window| {
+            (window.retained_counters(), fixture.builds.get())
+        });
+        assert_eq!(during.layout_skips, before.layout_skips + 3);
+        assert_eq!(during.layout_replays, before.layout_replays);
+        assert_eq!(during.layout_builds, before.layout_builds + 3);
+        assert_eq!(during.lazy_builds, before.lazy_builds);
+        assert_eq!(built, builds + 3, "built to be prepainted where they are");
+
+        // The draw finds them moved as well, and records them there.
+        let after = fixture.counters(cx);
+        assert_eq!(after.lazy_builds, before.lazy_builds + 3, "the draw the test app made");
+        fixture.draw(cx);
+        assert_eq!(fixture.counters(cx).replays, after.replays + 3);
+        layout.spacer.set(0.);
+        fixture.draw(cx);
+        fixture.draw(cx);
+        assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
+    }
+
+    /// Cards in retained subtrees whose boxes are published into a registry the way gpuix does
+    /// it: an `on_painted` listener per box, the registry emptied by the first thing a pass
+    /// prepaints, and each subtree's owner republishing what its boxes published.
+    struct Published {
+        window: AnyWindowHandle,
+        spacer: Rc<Cell<f32>>,
+        bar: Rc<Cell<f32>>,
+        builds: Rc<Cell<usize>>,
+        registry: Registry,
+    }
+
+    type Registry = Rc<RefCell<std::collections::BTreeMap<String, Bounds<Pixels>>>>;
+    type Tapes = Rc<RefCell<Vec<Vec<(String, Bounds<Pixels>)>>>>;
+
+    impl Published {
+        const CARDS: usize = 3;
+
+        /// With `rebuild` every frame asks for a key it has not had, so the subtrees are built.
+        fn new(cx: &mut TestAppContext, rebuild: bool) -> Self {
+            let spacer = Rc::new(Cell::new(0.));
+            let bar = Rc::new(Cell::new(10.));
+            let builds = Rc::new(Cell::new(0));
+            let registry = Registry::default();
+            let tapes: Tapes = Rc::new(RefCell::new(vec![Vec::new(); Self::CARDS]));
+            let keys = Rc::new(Cell::new(1));
+            let window = open(cx, {
+                let spacer = spacer.clone();
+                let bar = bar.clone();
+                let builds = builds.clone();
+                let registry = registry.clone();
+                Rc::new(move |_, _| {
+                    let key = if rebuild {
+                        keys.set(keys.get() + 1);
+                        keys.get()
+                    } else {
+                        1
+                    };
+                    let cards = (0..Self::CARDS).map(|index| {
+                        let publisher = |name: &'static str| {
+                            let registry = registry.clone();
+                            let tapes = tapes.clone();
+                            move |bounds: Bounds<Pixels>, window: &mut Window, _: &mut App| {
+                                let name = format!("{name} {index}");
+                                registry.borrow_mut().insert(name.clone(), bounds);
+                                // A pass that lays out records no tape, as it records no subtree.
+                                if !window.is_layout_pass() {
+                                    tapes.borrow_mut()[index].push((name, bounds));
+                                }
+                            }
+                        };
+                        retained(("retained-card", index), key, {
+                            let tapes = tapes.clone();
+                            let builds = builds.clone();
+                            let card = publisher("card");
+                            let inner = publisher("inner");
+                            move |window, _| {
+                                builds.set(builds.get() + 1);
+                                if window.retention_records() {
+                                    tapes.borrow_mut()[index].clear();
+                                }
+                                div()
+                                    .id(("card", index))
+                                    .w(px(100.))
+                                    .h(px(40.))
+                                    .flex_none()
+                                    .bg(crate::red())
+                                    .on_painted(card)
+                                    .child(
+                                        div()
+                                            .id(("inner", index))
+                                            .w(px(60.))
+                                            .h(px(20.))
+                                            .bg(crate::blue())
+                                            .on_painted(inner),
+                                    )
+                                    .into_any_element()
+                            }
+                        })
+                        .on_replay({
+                            let registry = registry.clone();
+                            let tapes = tapes.clone();
+                            move |phase, _, _| {
+                                if phase != RetainedPhase::Prepaint {
+                                    registry.borrow_mut().extend(tapes.borrow()[index].iter().cloned());
+                                }
+                            }
+                        })
+                    });
+                    let reset = {
+                        let for_prepaint = registry.clone();
+                        let for_paint = registry.clone();
+                        crate::canvas(
+                            move |_, window, _| {
+                                if window.is_layout_pass() {
+                                    for_prepaint.borrow_mut().clear();
+                                }
+                            },
+                            move |_, _, _, _| for_paint.borrow_mut().clear(),
+                        )
+                        .absolute()
+                        .w(px(0.))
+                        .h(px(0.))
+                    };
+                    div()
+                        .id("root")
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(reset)
+                        .child(div().id("spacer").flex_none().h(px(spacer.get())).w(px(10.)))
+                        .children(cards)
+                        .child(div().id("bar").flex_none().h(px(bar.get())).w(px(50.)))
+                        .into_any_element()
+                })
+            });
+            draw(window, cx);
+            Self { window, spacer, bar, builds, registry }
+        }
+
+        fn published(&self) -> Vec<String> {
+            self.registry
+                .borrow()
+                .iter()
+                .map(|(name, bounds)| format!("{name} {bounds:?}"))
+                .collect()
+        }
+
+        /// What a pass that lays out publishes, and how many subtrees it built.
+        fn layout_only(&self, cx: &mut TestAppContext) -> (Vec<String>, usize, RetainedCounters) {
+            let builds = self.builds.get();
+            layout_only(self.window, cx, |window| {
+                (self.published(), self.builds.get() - builds, window.retained_counters())
+            })
+        }
+    }
+
+    #[gpui::test]
+    fn a_pass_that_only_lays_out_publishes_the_boxes_a_build_publishes(cx: &mut TestAppContext) {
+        let kept = Published::new(cx, false);
+        let built = Published::new(cx, true);
+        for published in [&kept, &built] {
+            draw(published.window, cx);
+            draw(published.window, cx);
+        }
+        assert_eq!(kept.published().len(), 2 * Published::CARDS);
+        assert_eq!(kept.published(), built.published());
+
+        // The bar changes and the cards stay where they are.
+        for published in [&kept, &built] {
+            published.bar.set(25.);
+        }
+        let (kept_published, kept_builds, counters) = kept.layout_only(cx);
+        let (built_published, built_builds, _) = built.layout_only(cx);
+        assert_eq!(kept_published.len(), 2 * Published::CARDS);
+        assert_eq!(kept_published, built_published);
+        assert_eq!((kept_builds, built_builds), (0, Published::CARDS));
+        assert_eq!(counters.layout_replays, Published::CARDS as u64, "{counters:?}");
+        assert_eq!(counters.layout_builds, 0);
+
+        // The cards move.
+        for published in [&kept, &built] {
+            published.spacer.set(17.);
+        }
+        let (kept_published, kept_builds, counters) = kept.layout_only(cx);
+        let (built_published, _, _) = built.layout_only(cx);
+        assert_eq!(kept_published, built_published);
+        assert_eq!(kept_builds, Published::CARDS, "built where they are now");
+        assert_eq!(counters.layout_builds, Published::CARDS as u64);
+        assert!(kept_published[0].contains("y: 17px"), "{kept_published:?}");
+
+        // And a draw after them is what a draw of the built ones is, then they replay.
+        for published in [&kept, &built] {
+            draw(published.window, cx);
+        }
+        assert_eq!(kept.published(), built.published());
+        let before = self::counters(kept.window, cx);
+        for published in [&kept, &built] {
+            published.bar.set(30.);
+        }
+        let (kept_published, _, _) = kept.layout_only(cx);
+        let (built_published, _, _) = built.layout_only(cx);
+        assert_eq!(kept_published, built_published);
+        draw(kept.window, cx);
+        draw(built.window, cx);
+        assert_eq!(kept.published(), built.published());
+        assert!(self::counters(kept.window, cx).replays >= before.replays + Published::CARDS as u64);
+    }
+
+    #[gpui::test]
+    fn a_pass_that_only_lays_out_and_is_abandoned_leaves_the_recordings(cx: &mut TestAppContext) {
+        let scene = Abandoning::new(cx, 3);
+        let fixture = &scene.fixture;
+        fixture.draw(cx);
+        let replayed = snapshot(fixture.window, cx, &POINTS);
+        let builds = fixture.builds.get();
+        let before = fixture.counters(cx);
+
+        // The first pass skips the cards and asks for another, which builds them as pass that
+        // does not skip does: leaving no recording, and taking nothing.
+        scene.abandon.set(true);
+        let (during, built) = layout_only(fixture.window, cx, |window| {
+            // The draw the test app makes after the update is not an abandoned one.
+            scene.abandon.set(false);
+            (window.retained_counters(), fixture.builds.get())
+        });
+        assert_eq!(during.layout_skips, before.layout_skips + 3);
+        assert_eq!(during.layout_replays, before.layout_replays + 3, "the first pass");
+        assert_eq!(during.builds, before.builds + 3);
+        assert_eq!(built, builds + 3, "the second pass built them");
+
+        let drawn = fixture.counters(cx);
+        fixture.draw(cx);
+        let after = fixture.counters(cx);
+        assert_eq!(after.replays, drawn.replays + 3, "and the draw replays what the last one recorded");
+        assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
+        click(fixture.window, cx, 50., 15.);
+        assert_eq!(*fixture.clicks.borrow(), vec![0]);
+        assert_eq!(tab_order(fixture.window, cx, 3).len(), 3);
+    }
+
+    #[gpui::test]
+    fn a_pass_that_only_lays_out_builds_a_subtree_whose_key_or_entity_changed(cx: &mut TestAppContext) {
+        let number = cx.new(|_| Number(1));
+        let builds = Rc::new(Cell::new(0));
+        let key = Rc::new(Cell::new(1));
+        let window = open(cx, {
+            let number = number.clone();
+            let builds = builds.clone();
+            let key = key.clone();
+            Rc::new(move |_, _| {
+                let number = number.clone();
+                let builds = builds.clone();
+                div()
+                    .id("root")
+                    .child(retained("reading", key.get(), move |_, cx| {
+                        builds.set(builds.get() + 1);
+                        div()
+                            .id("reader")
+                            .child(format!("{}", number.read(cx).0))
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let built = layout_only(window, cx, |_| builds.get());
+        assert_eq!(built, builds.get());
+        let built = builds.get();
+        assert_eq!(layout_only(window, cx, |_| builds.get()), built, "nothing changed");
+
+        key.set(2);
+        assert_eq!(layout_only(window, cx, |_| builds.get()), built + 1, "a new key");
+        draw(window, cx);
+        draw(window, cx);
+        let built = builds.get();
+
+        // The entity is notified and the window is not drawn yet.
+        cx.update_window(window, |view, window, cx| {
+            number.update(cx, |number, cx| {
+                number.0 += 1;
+                cx.notify();
+            });
+            let view = view.downcast::<SceneView>().unwrap();
+            view.update(cx, |_, cx| cx.notify());
+            assert!(window.draw_if_dirty(cx));
+            assert_eq!(builds.get(), built + 1, "what it read is not what it was");
+        })
+        .unwrap();
     }
 
     /// A window with `inner` in a retained subtree, drawn until it has had the chance to be
@@ -2917,6 +3364,17 @@ mod tests {
                         shared.spacer = *[0., 7., 15.].choose(&mut rng).unwrap();
                     }
                 }
+                // A read of a bounds lays the tree out before the frame that shows it, and the test
+                // app draws the dirty window as soon as the pass is over.
+                if rng.random_bool(0.4) {
+                    for window in [retaining, building] {
+                        cx.update_window(window, |view, window, cx| {
+                            view.downcast::<Fuzzed>().unwrap().update(cx, |_, cx| cx.notify());
+                            assert!(window.draw_if_dirty(cx));
+                        })
+                        .unwrap();
+                    }
+                }
                 draw(retaining, cx);
                 draw(building, cx);
                 let (retained, built) = (shown(retaining, cx), shown(building, cx));
@@ -2936,6 +3394,8 @@ mod tests {
             let counters = counters(retaining, cx);
             assert_eq!(self::counters(building, cx).replays, 0, "the control replays nothing");
             assert_eq!(counters.layout_fallbacks, 0, "{counters:?}");
+            assert_eq!(self::counters(building, cx).layout_replays, 0);
+            assert!(counters.layout_replays > 0 && counters.layout_builds > 0, "{counters:?}");
         }
     }
 }

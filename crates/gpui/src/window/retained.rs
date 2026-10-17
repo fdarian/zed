@@ -85,6 +85,14 @@ pub struct RetainedCounters {
     /// Lazy builds that did not map onto the layout nodes the subtree had and laid the subtree
     /// out as a root.
     pub layout_fallbacks: u64,
+    /// Subtrees a pass that only lays out (see [`Window::draw_if_dirty`]) did not build, because
+    /// the last presented frame had them recorded as the same.
+    pub layout_skips: u64,
+    /// Of those, the subtrees that pass published from the recording, instead of building them
+    /// for prepaint as it does the ones that moved.
+    pub layout_replays: u64,
+    /// Subtrees built by a pass that only lays out.
+    pub layout_builds: u64,
     /// Frames that replayed something, built once more with every subtree built, and compared
     /// with that build, see [`Window::set_retention_verifier`].
     pub verified: u64,
@@ -324,17 +332,24 @@ impl Window {
         self.retained.publications = self.retained.publications.wrapping_add(1);
     }
 
-    /// Whether the frame being built can skip and replay retained subtrees. Only in the first pass
-    /// of a draw: a later pass starts over from the frame that is rendered, and builds everything,
-    /// so a replay in a first pass that was then abandoned (see
+    /// Whether the frame being built can skip retained subtrees. Only in the first pass of a
+    /// draw: a later pass starts over from the frame that is rendered, and builds everything, so
+    /// a replay in a first pass that was then abandoned (see
     /// [`Window::request_redraw_before_present`]) takes nothing the later pass needs. Not in a
-    /// measure pass, which may not take the recordings out of the frame it replaces, nor with the
-    /// inspector on, which needs every element asked.
+    /// pass that paints without presenting, which may not take the recordings out of the frame it
+    /// replaces, nor with the inspector on, which needs every element asked.
+    ///
+    /// A pass that only lays out (see [`Window::draw_if_dirty`]) skips subtrees too, but takes
+    /// nothing out of the rendered frame and records nothing, see [`Window::retention_records`].
     pub fn retention_allowed(&self) -> bool {
-        self.draw_pass == 1
-            && !self.measuring
-            && !self.layout_only
-            && !self.inspector_active()
+        self.draw_pass == 1 && (!self.measuring || self.layout_only) && !self.inspector_active()
+    }
+
+    /// Whether the subtrees the frame being built builds leave recordings for the frame after:
+    /// when the frame is a presented one and [`Window::retention_allowed`]. A pass that only lays
+    /// out is thrown away with what it recorded, and not a frame the next draw can replay from.
+    pub fn retention_records(&self) -> bool {
+        self.retention_allowed() && !self.layout_only
     }
 
     fn inspector_active(&self) -> bool {
@@ -357,6 +372,22 @@ impl Window {
     /// The serial of the frame being built.
     pub(crate) fn building_serial(&self) -> u64 {
         self.retained.rendered_serial + 1
+    }
+
+    /// Reads the state of type `S` of the element `global_id`, as the frame being built or else the
+    /// rendered frame has it, without moving it as [`Window::with_element_state`] does.
+    pub(crate) fn peek_element_state<S: 'static, R>(
+        &self,
+        global_id: &GlobalElementId,
+        read: impl FnOnce(&S) -> R,
+    ) -> Option<R> {
+        let key = (global_id.clone(), TypeId::of::<S>());
+        let state = self
+            .next_frame
+            .element_states
+            .get(&key)
+            .or_else(|| self.rendered_frame.element_states.get(&key))?;
+        state.inner.downcast_ref::<Option<S>>()?.as_ref().map(read)
     }
 
     /// Re-adds `states` to the frame being built, so that it keeps them.
@@ -641,7 +672,7 @@ impl Window {
             element_offset: self.element_offset(),
             current_view: self.rendered_entity_stack.last().copied(),
             image_cache: self.image_cache_stack.last().map(AnyImageCache::entity_id),
-            a11y_active: self.a11y.is_active(),
+            a11y_active: self.a11y.is_active_when_presented(),
             culling: self.culling,
             lifting: self.lifting(),
             dom_hit_testing: self.dom_hit_testing,
@@ -737,6 +768,10 @@ impl Window {
     /// What the retained subtrees that replayed in the pass being built left in the frame, by
     /// subtree, as text. The draw order of the scene is not in it: it is the order of the frame.
     pub(crate) fn describe_replayed(&self, subtrees: &[(GlobalElementId, TypeId)]) -> Vec<String> {
+        // A pass that only lays out puts nothing of a subtree into its frame.
+        if self.layout_only {
+            return vec![String::new(); subtrees.len()];
+        }
         subtrees
             .iter()
             .map(|key| {
