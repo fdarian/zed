@@ -412,6 +412,23 @@ pub(crate) struct A11yRecording {
     node_info: Vec<(NodeId, debug::NodeDebugInfo)>,
 }
 
+impl A11yRecording {
+    /// The nodes the subtree gave the tree, as text.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{:?}\nchildren {:?}\nauthors {:?}\nfocusables {:?}\nbounds {:?}\nactions {} focus {:?} {:?}",
+            self.nodes,
+            self.top_children,
+            self.authors,
+            self.focusables,
+            self.bounds,
+            self.actions.len(),
+            self.focus,
+            self.active_descendant,
+        )
+    }
+}
+
 impl A11y {
     /// Starts recording what the nodes pushed from now on, and everything else the tree is
     /// given, until [`Self::end_recording`]. Recordings nest.

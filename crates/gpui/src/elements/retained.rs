@@ -34,8 +34,8 @@
 //! that before the subtree is built.
 
 use crate::{
-    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, NonReusable, PaintRecord, Pixels, PrepaintRecord, ReplayKey, Window,
+    AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, NonReusable, PaintRecord, Pixels, PrepaintRecord, ReplayKey, Window,
 };
 use collections::FxHashSet;
 use std::{any::TypeId, ops::Range, rc::Rc};
@@ -53,6 +53,7 @@ pub fn retained(
         build: Some(Box::new(build)),
         on_replay: None,
         lift_z: None,
+        cull_outset: None,
     }
 }
 
@@ -75,9 +76,18 @@ pub struct Retained {
     build: Option<Build>,
     on_replay: Option<ReplayHook>,
     lift_z: Option<i32>,
+    cull_outset: Option<Edges<Pixels>>,
 }
 
 impl Retained {
+    /// Says how far past its box the subtree draws and is hit, for a parent to skip it when it is
+    /// outside its clip, as it would skip the element the subtree is made of
+    /// ([`Element::cull_outset`]). The owner vouches for the whole subtree, as that asks.
+    pub fn cull_outset(mut self, outset: Option<Edges<Pixels>>) -> Self {
+        self.cull_outset = outset;
+        self
+    }
+
     /// Says that the root of the subtree is positioned with this `z-index`, and so is handed by
     /// its parent to the stacking context around it, as the element it is made of would be.
     pub fn lift_z(mut self, z: i32) -> Self {
@@ -120,7 +130,7 @@ impl IntoElement for Retained {
 }
 
 /// What a retained element keeps from one frame to the next.
-struct RetainedState {
+pub(crate) struct RetainedState {
     key: u64,
     /// The layout engine that made `root`.
     engine: u64,
@@ -131,6 +141,15 @@ struct RetainedState {
     /// Every entity the subtree read, so that a frame that does not build it still observes them.
     accessed_entities: FxHashSet<crate::EntityId>,
     recorded: Option<Recorded>,
+}
+
+impl RetainedState {
+    /// What the last prepaint and paint of the subtree left in the frame being built, as text.
+    pub(crate) fn describe(&self, window: &Window) -> Option<String> {
+        let recorded = self.recorded.as_ref()?;
+        let paint = recorded.paint.as_ref()?;
+        Some(format!("{}\n{}", recorded.prepaint.describe(window), paint.describe(window)))
+    }
 }
 
 /// What the prepaint and paint of the subtree left in the frames `serial` and `paint_serial`,
@@ -183,6 +202,10 @@ impl Element for Retained {
 
     fn lift_z(&self) -> Option<i32> {
         self.lift_z
+    }
+
+    fn cull_outset(&self) -> Option<Edges<Pixels>> {
+        self.cull_outset
     }
 
     fn request_layout(
@@ -428,6 +451,9 @@ impl Retained {
             recorded.serial = window.building_serial();
             window.note_retained_recording((global_id.clone(), TypeId::of::<RetainedState>()));
             window.retained.counters.replays += 1;
+            if window.retained.verifier.is_some() {
+                window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
+            }
             state.recorded = Some(recorded);
             if let Some(hook) = hook {
                 hook(RetainedPhase::Prepaint, window, cx);
@@ -2145,6 +2171,119 @@ mod tests {
         assert_eq!(drawn.scene, built.scene);
         assert_eq!(drawn.a11y, built.a11y);
         assert_eq!(drawn.chains, built.chains);
+    }
+
+    #[gpui::test]
+    fn a_retained_root_that_says_how_far_it_draws_is_culled_outside_the_clip(cx: &mut TestAppContext) {
+        let key = Rc::new(Cell::new(1));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let cullable = Rc::new(Cell::new(true));
+        let window = open(cx, {
+            let key = key.clone();
+            let cullable = cullable.clone();
+            Rc::new(move |_, _| {
+                let rows = (0..5).map(|index| {
+                    let clicks = clicks.clone();
+                    retained(("retained", index), key.get(), move |_, _| card(index, &clicks))
+                        .cull_outset(cullable.get().then(crate::Edges::default))
+                });
+                div()
+                    .id("root")
+                    .always_hitbox()
+                    .size_full()
+                    .child(div().id("clip").overflow_hidden().w(px(100.)).h(px(70.)).children(rows))
+                    .into_any_element()
+            })
+        });
+        let culled = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| window.culled_subtree_count())
+                .unwrap()
+        };
+        for _ in 0..3 {
+            draw(window, cx);
+        }
+        let before = culled(cx);
+        draw(window, cx);
+        assert_eq!(culled(cx) - before, 3, "rows 2 to 4 are below the clip");
+        let culled_frame = snapshot(window, cx, &POINTS);
+
+        // Not saying how far it draws, a root is prepainted and painted as any element is.
+        cullable.set(false);
+        draw(window, cx);
+        draw(window, cx);
+        let before = culled(cx);
+        draw(window, cx);
+        assert_eq!(culled(cx), before);
+        let whole = snapshot(window, cx, &POINTS);
+        assert_eq!(culled_frame.scene, whole.scene, "what is below the clip paints nothing either way");
+        assert_eq!(culled_frame.chains, whole.chains);
+        assert_eq!(culled_frame.a11y, whole.a11y);
+    }
+
+    /// A window of two retained boxes whose color the test sets without telling their keys, with
+    /// the comparison of replayed frames with built ones on.
+    fn verified_boxes(cx: &mut TestAppContext) -> (AnyWindowHandle, Rc<Cell<bool>>) {
+        let blue = Rc::new(Cell::new(false));
+        let window = open(cx, {
+            let blue = blue.clone();
+            Rc::new(move |_, _| {
+                let boxes = (0..2usize).map(|index| {
+                    let blue = blue.clone();
+                    retained(("retained", index), 1, move |_, _| {
+                        div()
+                            .id(("box", index))
+                            .always_hitbox()
+                            .w(px(30.))
+                            .h(px(30.))
+                            .bg(if blue.get() { crate::blue() } else { crate::red() })
+                            .into_any_element()
+                    })
+                });
+                div().id("root").size_full().flex().flex_col().children(boxes).into_any_element()
+            })
+        });
+        cx.update_window(window, |_, window, _| {
+            window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        })
+        .unwrap();
+        (window, blue)
+    }
+
+    #[gpui::test]
+    fn a_replayed_frame_that_is_what_a_build_shows_is_verified(cx: &mut TestAppContext) {
+        let (window, _) = verified_boxes(cx);
+        for _ in 0..4 {
+            draw(window, cx);
+        }
+        let verified = counters(window, cx);
+        assert!(verified.verified >= 2, "{verified:?}");
+        assert_eq!(verified.mismatches, 0);
+        cx.update_window(window, |_, window, _| assert!(window.retention_mismatches().is_empty()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_replayed_frame_that_is_not_what_a_build_shows_is_reported(cx: &mut TestAppContext) {
+        let (window, blue) = verified_boxes(cx);
+        for _ in 0..3 {
+            draw(window, cx);
+        }
+        // The key says nothing changed, the build says another color.
+        blue.set(true);
+        draw(window, cx);
+        let after = counters(window, cx);
+        assert_eq!(after.mismatches, 1, "{after:?}");
+        cx.update_window(window, |_, window, _| {
+            let mismatches = window.retention_mismatches();
+            assert_eq!(mismatches.len(), 1);
+            assert!(mismatches[0].contains("replayed:") && mismatches[0].contains("built:"), "{mismatches:?}");
+        })
+        .unwrap();
+        // The frame that was shown is the one built whole.
+        let shown = cx
+            .update_window(window, |_, window, _| window.rendered_frame.scene.quads[0].background.clone())
+            .unwrap();
+        assert_eq!(shown, crate::blue().into());
     }
 
     #[cfg(any(feature = "inspector", debug_assertions))]

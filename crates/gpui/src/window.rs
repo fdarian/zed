@@ -4247,27 +4247,31 @@ impl Window {
     /// a layout pass is, so `next_frame` holds only the last one.
     fn build_next_frame(&mut self, cx: &mut App) {
         self.draw_pass = 0;
-        // The description of a first pass that replayed, while the pass that is built whole for
-        // comparison runs in its place.
-        let mut shown: Option<String> = None;
+        // What the first pass left of the subtrees it replayed, while the pass that builds every
+        // subtree runs in its place for the comparison.
+        let mut shown: Option<(Vec<(GlobalElementId, TypeId)>, Vec<String>, String)> = None;
         loop {
             if shown.is_none() {
                 self.draw_pass += 1;
             }
             self.redraw_before_present = false;
-            let replays = self.retained.counters.replays;
+            self.retained.replayed.clear();
             if self.build_pass(cx) {
                 match shown.take() {
-                    Some(shown) => {
+                    Some((subtrees, shown, registries)) => {
                         self.retained.reference = false;
-                        self.compare_with_reference(shown);
+                        let built = self.describe_replayed(&subtrees);
+                        let built_registries = self.describe_registries();
+                        self.compare_with_reference(&subtrees, shown, built, registries, built_registries);
                         break;
                     }
                     None if self.draw_pass == 1
                         && self.retained.verifier.is_some()
-                        && self.retained.counters.replays > replays =>
+                        && !self.retained.replayed.is_empty() =>
                     {
-                        shown = Some(self.frame_dump());
+                        let subtrees = std::mem::take(&mut self.retained.replayed);
+                        let described = self.describe_replayed(&subtrees);
+                        shown = Some((subtrees, described, self.describe_registries()));
                         self.discard_pass(cx);
                         self.retained.reference = true;
                         continue;

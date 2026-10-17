@@ -126,6 +126,8 @@ pub(crate) struct RetainedWindow {
     /// The frame being built is the build a replayed one is compared with: every retained
     /// subtree is built.
     pub(crate) reference: bool,
+    /// The subtrees that replayed in the pass being built.
+    pub(crate) replayed: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mismatches: Vec<String>,
     // Counts of what a recording cannot repeat, which move on whenever it happens.
     pub(crate) lifts: u32,
@@ -293,13 +295,20 @@ impl Window {
     }
 
     /// Makes every frame that replayed a retained subtree be built once more, with every subtree
-    /// built, and compared with it: the scene, the hitboxes, the accessibility tree and the cursor
-    /// requests of the two, and what `describe` gives for each (the registries the embedder
-    /// keeps outside the frame, which a replay has to repeat the writes to). The frame that is
-    /// shown is the one built whole. A difference is counted and kept, see
-    /// [`Window::retention_mismatches`]. For tests: every such frame is built twice.
+    /// built, and compares what each subtree that replayed left in the two: its scene, hitboxes,
+    /// cursor requests, listeners and accessibility nodes. `describe` gives what the embedder
+    /// keeps outside the frame, which a replay writes again, in the pass that replayed and then in
+    /// the pass that built (see [`Window::is_retention_reference`]); the two have to be the same
+    /// text. The frame that is shown is the one built whole. A difference is counted and kept,
+    /// see [`Window::retention_mismatches`]. For tests: every such frame is built twice.
     pub fn set_retention_verifier(&mut self, describe: Option<Rc<dyn Fn(&Window) -> String>>) {
         self.retained.verifier = describe;
+    }
+
+    /// Whether the pass being built is the one that builds every retained subtree to compare
+    /// with the pass that replayed, see [`Window::set_retention_verifier`].
+    pub fn is_retention_reference(&self) -> bool {
+        self.retained.reference
     }
 
     /// How the frames that were compared with a build differed from it, newest last.
@@ -620,113 +629,154 @@ impl Window {
     }
 }
 
-impl Window {
-    /// What a frame shows and answers, as text that is equal for two frames that do. Hitbox and
-    /// dispatch ids differ between a replay and a build, so hitboxes are named by their element.
-    pub(crate) fn frame_dump(&self) -> String {
+impl PrepaintRecord {
+    pub(crate) fn describe(&self, window: &Window) -> String {
         use std::fmt::Write as _;
 
-        let frame = &self.next_frame;
-        let mut dump = String::new();
-        let scene = &frame.scene;
-        write!(
-            dump,
-            "{} operations\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{} groups\n",
-            scene.len(),
-            scene.shadows,
-            scene.quads,
-            scene.underlines,
-            scene.monochrome_sprites,
-            scene.subpixel_sprites,
-            scene.polychrome_sprites,
-            scene.paths,
-            scene.surfaces,
-            scene.groups.len(),
-        )
-        .ok();
+        let frame = &window.next_frame;
         let name = |id: HitboxId| {
             frame
                 .hitboxes
                 .iter()
                 .find(|hitbox| hitbox.id == id)
-                .map_or_else(|| "(none)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
+                .map_or_else(|| "(outside)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
         };
-        for hitbox in &frame.hitboxes {
+        let mut out = String::new();
+        let range = self.range.start.hitboxes_index..self.range.end.hitboxes_index;
+        for hitbox in frame.hitboxes.get(range).unwrap_or_default() {
             writeln!(
-                dump,
+                out,
                 "hitbox {:?} {:?} {:?} {:?} {:?} parent {}",
                 hitbox.identity,
                 hitbox.bounds,
                 hitbox.content_mask,
                 hitbox.behavior,
                 hitbox.corner_radii,
-                hitbox.parent.map_or_else(|| "(none)".to_owned(), name),
+                hitbox.parent.map_or_else(|| "(outside)".to_owned(), name),
             )
             .ok();
         }
-        for request in &frame.cursor_styles {
-            writeln!(
-                dump,
-                "cursor {:?} {}",
-                request.style,
-                request.hitbox_id.map_or_else(|| "(window)".to_owned(), name),
-            )
-            .ok();
+        if let Some(a11y) = &self.a11y {
+            writeln!(out, "a11y {}", a11y.describe()).ok();
+        }
+        out
+    }
+}
+
+impl PaintRecord {
+    pub(crate) fn describe(&self, window: &Window) -> String {
+        use std::fmt::Write as _;
+
+        let frame = &window.next_frame;
+        let mut out = frame
+            .scene
+            .describe_operations(self.range.start.scene_index..self.range.end.scene_index);
+        let name = |id: Option<HitboxId>| {
+            id.and_then(|id| frame.hitboxes.iter().find(|hitbox| hitbox.id == id))
+                .map_or_else(|| "(window)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
+        };
+        let cursors = self.range.start.cursor_styles_index..self.range.end.cursor_styles_index;
+        for request in frame.cursor_styles.get(cursors).unwrap_or_default() {
+            writeln!(out, "cursor {:?} {}", request.style, name(request.hitbox_id)).ok();
         }
         writeln!(
-            dump,
-            "listeners {} {} {} handlers {} deferred {} tooltips {} tab stops {}",
-            frame.mouse_listeners.len(),
-            frame.root_key_listeners.len(),
-            frame.window_control_hitboxes.len(),
-            frame.input_handlers.len(),
-            frame.deferred_draws.len(),
-            frame.tooltip_requests.len(),
-            frame.tab_stops.tab_stop_count(),
+            out,
+            "listeners {} {} handlers {} tab stops {:?}",
+            self.range.end.mouse_listeners_index - self.range.start.mouse_listeners_index,
+            self.range.end.root_key_listeners_index - self.range.start.root_key_listeners_index,
+            self.range.end.input_handlers_index - self.range.start.input_handlers_index,
+            self.tab_stops,
         )
         .ok();
-        if let Some(json) = self.a11y.debug_tree_json()
-            && let Ok(mut tree) = serde_json::from_str::<serde_json::Value>(&json)
-        {
-            if let Some(tree) = tree.as_object_mut() {
-                tree.remove("frame");
-            }
-            writeln!(dump, "a11y {tree}").ok();
+        if let Some(a11y) = &self.a11y {
+            writeln!(out, "a11y {}", a11y.describe()).ok();
         }
-        if let Some(describe) = &self.retained.verifier {
-            dump.push_str(&describe(self));
-        }
-        dump
+        out
+    }
+}
+
+impl Window {
+    pub(crate) fn describe_registries(&self) -> String {
+        self.retained.verifier.as_ref().map_or_else(String::new, |describe| describe(self))
     }
 
-    /// Compares the frame built with replays, which `shown` describes, with the one built whole
-    /// that is in `next_frame` now.
-    pub(crate) fn compare_with_reference(&mut self, shown: String) {
-        let reference = self.frame_dump();
+    /// What the retained subtrees that replayed in the pass being built left in the frame, by
+    /// subtree, as text. The draw order of the scene is not in it: it is the order of the frame.
+    pub(crate) fn describe_replayed(&self, subtrees: &[(GlobalElementId, TypeId)]) -> Vec<String> {
+        subtrees
+            .iter()
+            .map(|key| {
+                self.next_frame
+                    .element_states
+                    .get(key)
+                    .and_then(|state| state.inner.downcast_ref::<Option<crate::elements::RetainedState>>())
+                    .and_then(Option::as_ref)
+                    .and_then(|state| state.describe(self))
+                    .map_or_else(String::new, |text| strip_draw_orders(&text))
+            })
+            .collect()
+    }
+
+    /// Compares what the subtrees that replayed left in the frame with what they leave when they
+    /// are built, which `shown` and `built` describe in the same order.
+    pub(crate) fn compare_with_reference(
+        &mut self,
+        subtrees: &[(GlobalElementId, TypeId)],
+        shown: Vec<String>,
+        built: Vec<String>,
+        shown_registries: String,
+        built_registries: String,
+    ) {
         self.retained.counters.verified += 1;
-        if shown == reference {
+        let mut differences = Vec::new();
+        for ((subtree, shown), built) in subtrees.iter().zip(&shown).zip(&built) {
+            // A subtree that could not be recorded when built whole says nothing to compare.
+            if !built.is_empty() && shown != built {
+                differences.push(format!("{:?}\n{}", subtree.0, first_difference(shown, built)));
+            }
+        }
+        if shown_registries != built_registries {
+            differences.push(format!("what the replay wrote outside the frame\n{}", first_difference(&shown_registries, &built_registries)));
+        }
+        if differences.is_empty() {
             return;
         }
         self.retained.counters.mismatches += 1;
-        let (replayed, built): (Vec<&str>, Vec<&str>) = (shown.lines().collect(), reference.lines().collect());
-        let first = replayed
-            .iter()
-            .zip(&built)
-            .position(|(replayed, built)| replayed != built)
-            .unwrap_or_else(|| replayed.len().min(built.len()));
-        let cut = |lines: &[&str]| {
-            lines
-                .get(first)
-                .map_or_else(|| "(nothing)".to_owned(), |line| line.chars().take(600).collect())
-        };
-        let message = format!(
-            "a replayed frame differs from the frame built whole at line {first}\n  replayed: {}\n  built:    {}",
-            cut(&replayed),
-            cut(&built),
-        );
+        let message = format!("a replayed frame differs from the frame built whole in {} places\n{}", differences.len(), differences.join("\n"));
         eprintln!("[retained] {message}");
         if self.retained.mismatches.len() < 32 {
             self.retained.mismatches.push(message);
         }
     }
+}
+
+/// `text` without the `order: N` fields of the primitives.
+fn strip_draw_orders(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("order: ") {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + "order: ".len()..];
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest = &rest[digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Both texts from a little before the first byte where they differ.
+fn first_difference(replayed: &str, built: &str) -> String {
+    let at = replayed
+        .bytes()
+        .zip(built.bytes())
+        .position(|(replayed, built)| replayed != built)
+        .unwrap_or_else(|| replayed.len().min(built.len()));
+    let around = |text: &str| {
+        let mut start = at.saturating_sub(80).min(text.len());
+        while !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        text[start..].chars().take(500).collect::<String>()
+    };
+    format!("  replayed: {}\n  built:    {}", around(replayed), around(built))
 }
