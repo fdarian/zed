@@ -1682,7 +1682,8 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Runs when this element has prepainted its children, with its bounds, so an overlay can
     /// insert hitboxes that sit above them (see [`Self::paint_overlay`]). Only [`Div`] and
-    /// [`crate::List`] run it.
+    /// [`crate::List`] run it. A culled element runs it too, under an empty content mask, so
+    /// whatever it works out for layout and keeps for later frames does not depend on culling.
     fn prepaint_overlay(
         mut self,
         prepainter: impl FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static,
@@ -2413,6 +2414,11 @@ impl Div {
             if let Some(listener) = self.prepaint_listener.as_ref() {
                 window.note_publication();
                 listener(children_bounds, window, cx);
+            }
+            // The mask is empty, so what an overlay inserts is not hit. It still has to run: a
+            // scrollbar works out here whether it takes a gutter and keeps its state.
+            if let Some(prepainter) = overlay_prepainter {
+                prepainter(bounds, window, cx);
             }
             return None;
         }
@@ -10963,6 +10969,35 @@ mod tests {
             assert_eq!(culled(&window, cx), 1);
             assert_eq!(inner.max_offset().y, px(80.));
             assert_eq!(inner.bounds().origin.y, px(3. * ROW));
+        }
+
+        #[gpui::test]
+        fn a_culled_child_runs_its_prepaint_overlay_under_an_empty_mask(cx: &mut TestAppContext) {
+            let ran = Rc::new(RefCell::new(Vec::<(bool, Bounds<Pixels>)>::new()));
+            let window = open_scene(cx, {
+                let ran = ran.clone();
+                move |_| {
+                    let overlay = {
+                        let ran = ran.clone();
+                        row(3, &Seen::default(), Some(Edges::default())).prepaint_overlay(
+                            move |_, window, _| {
+                                ran.borrow_mut()
+                                    .push((window.is_culling(), window.content_mask().bounds));
+                            },
+                        )
+                    };
+                    clip(None)
+                        .children(rows(3, &Seen::default(), None))
+                        .child(overlay)
+                        .into_any_element()
+                }
+            });
+            ran.borrow_mut().clear();
+            assert_eq!(culled(&window, cx), 1);
+            let ran = ran.borrow();
+            assert_eq!(ran.len(), 1, "the overlay of a culled row runs once per frame");
+            assert!(ran[0].0);
+            assert_eq!(ran[0].1.size, Size::default(), "and sees nothing to draw or hit");
         }
 
         #[gpui::test]
