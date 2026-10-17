@@ -188,7 +188,7 @@ impl RetainedState {
 struct Recorded {
     serial: u64,
     paint_serial: u64,
-    /// The dirty generation of the root after layout: layout results of the subtree below
+    /// The layout generation of the root after layout: layout results of the subtree below
     /// are the ones recorded while it has not changed.
     generation: u64,
     key: ReplayKey,
@@ -530,7 +530,7 @@ impl Retained {
             let root = state.root;
             let recorded = state.recorded.take();
             let Some(mut recorded) = recorded.filter(|recorded| {
-                recorded.key == key && recorded.generation == window.layout_dirty_generation(root)
+                recorded.key == key && recorded.generation == window.layout_generation(root)
             }) else {
                 return (false, state);
             };
@@ -568,7 +568,7 @@ impl Retained {
             .peek_element_state(global_id, |state: &RetainedState| {
                 state.recorded.as_ref().is_some_and(|recorded| {
                     recorded.key == key
-                        && recorded.generation == window.layout_dirty_generation(state.root)
+                        && recorded.generation == window.layout_generation(state.root)
                 })
             })
             .expect("a skipped subtree has its state");
@@ -704,7 +704,7 @@ impl Retained {
                     state.recorded = Some(Recorded {
                         serial: window.building_serial(),
                         paint_serial: 0,
-                        generation: window.layout_dirty_generation(root),
+                        generation: window.layout_generation(root),
                         key,
                         prepaint,
                         paint: None,
@@ -3396,6 +3396,76 @@ mod tests {
             assert_eq!(counters.layout_fallbacks, 0, "{counters:?}");
             assert_eq!(self::counters(building, cx).layout_replays, 0);
             assert!(counters.layout_replays > 0 && counters.layout_builds > 0, "{counters:?}");
+        }
+    }
+
+    /// A retained root whose box stays as it is while its parent changes width still lays out what
+    /// is inside it against the new width, when it has a percentage padding.
+    mod parent_width {
+        use super::*;
+        use crate::relative;
+
+        struct ParentWidthView {
+            width: Rc<Cell<f32>>,
+            key: Rc<Cell<u64>>,
+        }
+
+        impl Render for ParentWidthView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let key = self.key.get();
+                div().id("root").size_full().child(
+                    div().id("parent").w(px(self.width.get())).child(retained(
+                        ("card", 0usize),
+                        key,
+                        |_: &mut Window, _: &mut App| -> AnyElement {
+                            div()
+                                .id("card")
+                                .w(px(100.))
+                                .h(px(40.))
+                                .flex_none()
+                                .pl(relative(0.1))
+                                .child(div().id("kid").w(px(20.)).h(px(20.)).bg(crate::red()))
+                                .into_any_element()
+                        },
+                    )),
+                )
+            }
+        }
+
+        fn kid_x(window: &mut Window) -> f32 {
+            let scale_factor = window.scale_factor();
+            let quad = window.rendered_frame.scene.quads.last().expect("the kid is painted");
+            quad.bounds.origin.x.0 / scale_factor
+        }
+
+        #[gpui::test]
+        fn percentage_padding_follows_the_parent_width(cx: &mut TestAppContext) {
+            let width = Rc::new(Cell::new(400.));
+            let key = Rc::new(Cell::new(1));
+            let view = cx.open_window(size(px(400.), px(300.)), {
+                let (width, key) = (width.clone(), key.clone());
+                move |_, _| ParentWidthView { width, key }
+            });
+            let window = AnyWindowHandle::from(view);
+            let draw_kid_x = |cx: &mut TestAppContext| {
+                view.update(cx, |_, _, cx| cx.notify()).unwrap();
+                cx.update_window(window, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    kid_x(window)
+                })
+                .unwrap()
+            };
+            assert_eq!(draw_kid_x(cx), 40.);
+            assert_eq!(draw_kid_x(cx), 40.);
+            let replays = counters(window, cx).replays;
+            assert!(replays > 0, "the second frame replays");
+
+            width.set(200.);
+            let replayed = draw_kid_x(cx);
+            key.set(2);
+            let built = draw_kid_x(cx);
+            assert_eq!(built, 20.);
+            assert_eq!(replayed, built);
         }
     }
 }

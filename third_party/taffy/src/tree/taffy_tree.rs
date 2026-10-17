@@ -226,6 +226,14 @@ struct NodeData {
     /// fdarian fork patch.
     pub(crate) dirty_generation: u64,
 
+    /// Bumped whenever the layout of what is inside the node may have changed: its cache was cleared, or its layout
+    /// was set to one with another size, padding, border, scrollbar or content size. Percentages that resolve
+    /// against the parent (`padding: 10%`) change the padding of a node whose box stays as it was, which is why
+    /// `dirty_generation`, that only follows the cache, is not enough.
+    ///
+    /// fdarian fork patch.
+    pub(crate) layout_generation: u64,
+
     /// The last epoch given to [`TaffyTree::mark_reached`].
     ///
     /// fdarian fork patch.
@@ -244,6 +252,7 @@ impl NodeData {
             style,
             cache: Cache::new(),
             dirty_generation: 0,
+            layout_generation: 0,
             reached: 0,
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
@@ -262,6 +271,7 @@ impl NodeData {
         let state = self.cache.clear();
         if matches!(state, ClearState::Cleared) {
             self.dirty_generation += 1;
+            self.layout_generation += 1;
         }
         state
     }
@@ -536,7 +546,11 @@ where
 
     #[inline(always)]
     fn set_unrounded_layout(&mut self, node_id: NodeId, layout: &Layout) {
-        self.taffy.nodes[node_id.into()].unrounded_layout = *layout;
+        let node = &mut self.taffy.nodes[node_id.into()];
+        if node.unrounded_layout.differs_inside(layout) {
+            node.layout_generation += 1;
+        }
+        node.unrounded_layout = *layout;
     }
 
     #[inline(always)]
@@ -569,7 +583,10 @@ where
     }
 
     fn cache_clear(&mut self, node_id: NodeId) {
-        self.taffy.nodes[node_id.into()].cache.clear();
+        let node = &mut self.taffy.nodes[node_id.into()];
+        if matches!(node.cache.clear(), ClearState::Cleared) {
+            node.layout_generation += 1;
+        }
     }
 }
 
@@ -1125,6 +1142,17 @@ impl<NodeContext> TaffyTree<NodeContext> {
     #[inline]
     pub fn dirty_generation(&self, node: NodeId) -> TaffyResult<u64> {
         Ok(self.nodes[node.into()].dirty_generation)
+    }
+
+    /// How many times the layout of what is inside this node may have changed: its results were thrown away, or the
+    /// node was laid out with another size, padding, border, scrollbar or content size (a percentage of the parent
+    /// moves the padding of a node whose box is the same). A generation equal to one read after a layout means that
+    /// the layout of the subtree is the one it had then. Where the node is in its parent is not part of it.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn layout_generation(&self, node: NodeId) -> TaffyResult<u64> {
+        Ok(self.nodes[node.into()].layout_generation)
     }
 
     /// Indicates whether the layout of this node needs to be recomputed
@@ -1733,6 +1761,42 @@ mod tests {
         taffy.set_style(sibling, Style { display: Display::None, ..Default::default() }).unwrap();
         assert_eq!(taffy.dirty_generation(sibling), Ok(before_hiding[1] + 1));
         assert_eq!(taffy.dirty_generation(root), Ok(before_hiding[2] + 1));
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn the_layout_generation_follows_the_inputs_of_a_nodes_layout() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child_style = Style {
+            size: Size { width: length(100.0), height: length(40.0) },
+            flex_shrink: 0.0,
+            padding: crate::geometry::Rect { left: percent(0.1), right: zero(), top: zero(), bottom: zero() },
+            ..Default::default()
+        };
+        let child = taffy.new_leaf(child_style).unwrap();
+        let sibling = taffy.new_leaf(Style::default()).unwrap();
+        let root_style = |width: f32| Style {
+            display: Display::Flex,
+            size: Size { width: length(width), height: length(100.0) },
+            ..Default::default()
+        };
+        let root = taffy.new_with_children(root_style(400.0), &[child, sibling]).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let first = taffy.layout_generation(child).unwrap();
+        assert_ne!(first, 0);
+
+        // The sibling changes, and the child is asked for the layout it already has.
+        taffy.set_style(sibling, Style { size: Size { width: length(5.0), height: auto() }, ..Default::default() }).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert_eq!(taffy.layout_generation(child), Ok(first));
+
+        // The parent is narrower: the child has the box it had, but its padding is another length.
+        taffy.set_style(root, root_style(200.0)).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert_eq!(taffy.layout(child).unwrap().size, Size { width: 100.0, height: 40.0 });
+        assert_eq!(taffy.layout(child).unwrap().padding.left, 20.0);
+        assert!(taffy.layout_generation(child).unwrap() > first);
+        assert_eq!(taffy.dirty_generation(child), Ok(0));
     }
 
     // fdarian fork patch.

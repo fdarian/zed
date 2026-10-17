@@ -254,6 +254,22 @@ impl Default for Layout {
 }
 
 impl Layout {
+    /// Whether the node's inside is laid out differently under `other`: the box the children are placed in (size,
+    /// padding, border, scrollbars) or how far they reach. Its order, its place in its parent and its margin are
+    /// not part of that.
+    ///
+    /// fdarian fork patch.
+    pub(crate) fn differs_inside(&self, other: &Layout) -> bool {
+        #[cfg(feature = "content_size")]
+        if self.content_size != other.content_size {
+            return true;
+        }
+        self.size != other.size
+            || self.scrollbar_size != other.scrollbar_size
+            || self.border != other.border
+            || self.padding != other.padding
+    }
+
     /// Creates a new zero-[`Layout`].
     ///
     /// The Zero-layout has size and location set to ZERO.
