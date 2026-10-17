@@ -118,9 +118,9 @@ impl TaffyLayoutEngine {
     /// inside it have their widths, which is what makes nested keywords compose.
     ///
     /// Each node costs one or two extra layouts of its whole subtree, every frame, because the
-    /// engine and its caches are rebuilt every frame. Keyword nodes nested in each other
-    /// multiply that, so a keyword belongs on the few nodes that need it, not on every node of
-    /// a deep tree. Nothing runs when no node has a keyword.
+    /// style it is probed and then given changes the node, and with it every node above it.
+    /// Keyword nodes nested in each other multiply that, so a keyword belongs on the few nodes
+    /// that need it, not on every node of a deep tree. Nothing runs when no node has a keyword.
     pub(super) fn resolve_intrinsic_widths(&mut self, window: &mut Window, cx: &mut App) {
         if self.intrinsic_pending.is_empty() {
             return;
@@ -132,7 +132,7 @@ impl TaffyLayoutEngine {
                 .intrinsic
                 .as_deref()
                 .expect("a pending intrinsic node has keywords");
-            let mut requested = self.taffy.style(id.0).expect(EXPECT_MESSAGE).clone();
+            let mut requested = self.requested_style(id).clone();
 
             // A flex basis keyword wins over a basis length set next to it, also where it
             // does not count.
@@ -153,7 +153,7 @@ impl TaffyLayoutEngine {
             // The content is measured without the width it is about to be given.
             let mut probe = requested.clone();
             probe.size.width = Dimension::auto();
-            self.taffy.set_style(id.0, probe).expect(EXPECT_MESSAGE);
+            self.rewrite_style(id, probe);
             let measured = Measured {
                 min_content: node.keywords().any(Keyword::needs_min_content).then(|| {
                     self.measure_width(
@@ -177,9 +177,7 @@ impl TaffyLayoutEngine {
 
             let mut style = requested;
             apply(&node, &measured, &mut self.calcs, &mut style);
-            self.taffy
-                .set_style(id.0, style.clone())
-                .expect(EXPECT_MESSAGE);
+            self.rewrite_style(id, style.clone());
             // The containing block pass starts from the style a node was requested with.
             if let Some(escapable) = self.meta_mut(id).escapable.as_deref_mut() {
                 escapable.original = style;

@@ -5,9 +5,11 @@
 //! compare everything that the engine reports for every node.
 //!
 //! What the tests vary is the engine under test, and only in [`request_node`], which is how a
-//! frame hands a node to the engine. A node has a [`Key`] that is the same in every frame it is
-//! in, however the tree around it changed, for an engine that matches the nodes of a frame with
-//! the ones it kept.
+//! frame hands a node to the engine, and in [`lay_out_frame`], which is how a frame ends. A node
+//! has a [`Key`] that is the same in every frame it is in, however the tree around it changed,
+//! and a scope that the engine matches the nodes of a frame with the ones it kept by: the key
+//! of the node, or the scope of the node around it for a node that has no key of its own to
+//! give, as an element without an id has the id of the nearest ancestor that has one.
 use super::*;
 use crate::{
     AbsoluteLength, DefiniteLength, Display, GridTemplate, GridTemplateMinSize, IntrinsicSize, Length,
@@ -85,6 +87,7 @@ enum Content {
 #[derive(Clone)]
 struct Node {
     key: Key,
+    scope: Key,
     style: Style,
     content: Content,
 }
@@ -205,27 +208,33 @@ impl Generator {
         }
     }
 
-    fn node(&mut self, depth: usize) -> Node {
+    /// `parent_scope` is the scope of the node around it. A quarter of the nodes have none of
+    /// their own.
+    fn node(&mut self, depth: usize, parent_scope: Key) -> Node {
         let key = self.next_key;
         self.next_key += 1;
+        let scope = if self.random.one_in(4) { parent_scope } else { key };
         let style = self.style();
         let content = if depth == 0 || self.random.one_in(3) {
             Content::Text(self.text())
         } else {
             let count = self.random.below(5);
-            Content::Container((0..count).map(|_| self.node(depth - 1)).collect())
+            Content::Container((0..count).map(|_| self.node(depth - 1, scope)).collect())
         };
         Node {
             key,
+            scope,
             style,
             content,
         }
     }
 
     fn root(&mut self) -> Node {
-        let mut root = self.node(4);
+        let mut root = self.node(4, 0);
+        root.scope = root.key;
         if matches!(root.content, Content::Text(_)) {
-            root.content = Content::Container(vec![self.node(2), self.node(2)]);
+            let scope = root.scope;
+            root.content = Content::Container(vec![self.node(2, scope), self.node(2, scope)]);
         }
         root.style.display = Display::Flex;
         root.style.position = Position::Relative;
@@ -278,6 +287,49 @@ fn container_paths(root: &mut Node) -> Vec<Path> {
         .collect()
 }
 
+/// A tree and a second root that the tree sometimes gives a subtree to, and takes back from.
+struct Scene {
+    root: Node,
+    detached: Option<Node>,
+}
+
+fn edit_scene(scene: &mut Scene, generator: &mut Generator) {
+    match generator.random.below(14) {
+        0 => {
+            // A node and its subtree become a root of their own, or a root becomes a child again.
+            match scene.detached.take() {
+                Some(node) => {
+                    let containers = container_paths(&mut scene.root);
+                    let path = &containers[generator.random.below(containers.len())];
+                    let children = children_at(&mut scene.root, path);
+                    let at = generator.random.below(children.len() + 1);
+                    children.insert(at, node);
+                }
+                None => {
+                    let removable: Vec<_> = all_paths(&scene.root)
+                        .into_iter()
+                        .filter(|path| !path.is_empty())
+                        .collect();
+                    if !removable.is_empty() {
+                        let path = &removable[generator.random.below(removable.len())];
+                        let node = children_at(&mut scene.root, &path[..path.len() - 1])
+                            .remove(path[path.len() - 1]);
+                        scene.detached = Some(node);
+                    }
+                }
+            }
+        }
+        1 => {
+            // The scope of a node changes, as it does when an element gains or loses an id.
+            let paths = all_paths(&scene.root);
+            let path = &paths[generator.random.below(paths.len())];
+            let scope = generator.random.below(generator.next_key as usize) as Key;
+            node_at(&mut scene.root, path).scope = scope;
+        }
+        _ => edit(&mut scene.root, generator),
+    }
+}
+
 fn edit(root: &mut Node, generator: &mut Generator) {
     let paths = all_paths(root);
     let pick = |generator: &mut Generator, paths: &[Path]| {
@@ -298,7 +350,7 @@ fn edit(root: &mut Node, generator: &mut Generator) {
         4 | 5 => {
             let containers = container_paths(root);
             let path = pick(generator, &containers);
-            let node = generator.node(2);
+            let node = generator.node(2, node_at(root, &path).scope);
             let children = children_at(root, &path);
             let at = generator.random.below(children.len() + 1);
             children.insert(at, node);
@@ -348,9 +400,13 @@ fn request_node(
     scale_factor: f32,
 ) -> LayoutId {
     match &node.content {
-        Content::Container(_) => {
-            engine.request_layout(node.style.clone(), REM_SIZE, scale_factor, children)
-        }
+        Content::Container(_) => engine.request_keyed_layout(
+            node.scope.into(),
+            node.style.clone(),
+            REM_SIZE,
+            scale_factor,
+            children,
+        ),
         Content::Text(text) => {
             let text = *text;
             engine.request_measured_layout(
@@ -418,27 +474,59 @@ fn observe(
         .collect()
 }
 
-/// One frame: `root` is requested in full, laid out in each of `spaces` in turn, and observed after
-/// each layout. The engine is left as it is at the end of a frame.
+/// Requests both trees of the scene in full.
+fn request_scene(
+    engine: &mut TaffyLayoutEngine,
+    scene: &Scene,
+    scale_factor: f32,
+) -> (Vec<(Key, LayoutId)>, Vec<LayoutId>) {
+    let mut requested = Vec::new();
+    let mut roots = vec![request_tree(engine, &scene.root, scale_factor, &mut requested)];
+    if let Some(detached) = &scene.detached {
+        roots.push(request_tree(engine, detached, scale_factor, &mut requested));
+    }
+    (requested, roots)
+}
+
+/// One frame: the scene is requested in full, laid out in each of `spaces` in turn, and observed
+/// after each layout. The engine is left as it is at the end of a frame.
 fn lay_out_frame(
     engine: &mut TaffyLayoutEngine,
-    root: &Node,
+    scene: &Scene,
     spaces: &[Size<AvailableSpace>],
     window: &mut Window,
     cx: &mut App,
 ) -> Vec<Observation> {
     let scale_factor = window.scale_factor();
-    let mut requested = Vec::new();
-    let root_id = request_tree(engine, root, scale_factor, &mut requested);
+    let (requested, roots) = request_scene(engine, scene, scale_factor);
     let observations = spaces
         .iter()
         .map(|space| {
-            engine.compute_layout(root_id, *space, window, cx);
+            for root in &roots {
+                engine.compute_layout(*root, *space, window, cx);
+            }
             observe(engine, &requested, scale_factor)
         })
         .collect();
     engine.end_frame();
     observations
+}
+
+/// A pass that no frame comes of: the scene is requested, and laid out if `lay_out`.
+fn abandoned_pass(
+    engine: &mut TaffyLayoutEngine,
+    scene: &Scene,
+    lay_out: Option<Size<AvailableSpace>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (_, roots) = request_scene(engine, scene, window.scale_factor());
+    if let Some(space) = lay_out {
+        for root in roots {
+            engine.compute_layout(root, space, window, cx);
+        }
+    }
+    engine.end_pass();
 }
 
 fn available_space(random: &mut Random) -> Size<AvailableSpace> {
@@ -459,26 +547,57 @@ fn available_space(random: &mut Random) -> Size<AvailableSpace> {
 }
 
 /// Lays `seeds` out as described in the module, `steps` edits for each. `reused` is the engine that
-/// lives through a sequence; each frame's reference is a new engine.
+/// lives through a sequence; each frame's reference is a new engine. Before some frames the
+/// engine that lives goes through passes that make no frame: one of the scene before the last
+/// edit, or one of a scene edited some more and never drawn.
 fn assert_reuse_matches_new_engine(
     seeds: std::ops::RangeInclusive<u64>,
     steps: usize,
     window: &mut Window,
     cx: &mut App,
-) {
+) -> LayoutCounters {
+    let mut total = LayoutCounters::default();
     for seed in seeds {
         let mut generator = Generator {
             random: Random::new(seed),
             next_key: 0,
         };
-        let mut root = generator.root();
+        let mut scene = Scene {
+            root: generator.root(),
+            detached: None,
+        };
         let mut reused = TaffyLayoutEngine::new();
+        let mut previous: Option<Scene> = None;
         for step in 0..steps {
             let spaces: Vec<_> = (0..1 + generator.random.below(2))
                 .map(|_| available_space(&mut generator.random))
                 .collect();
-            let kept = lay_out_frame(&mut reused, &root, &spaces, window, cx);
-            let new = lay_out_frame(&mut TaffyLayoutEngine::new(), &root, &spaces, window, cx);
+            if generator.random.one_in(4) {
+                if let Some(previous) = &previous {
+                    let space = generator.random.one_in(2).then(|| available_space(&mut generator.random));
+                    abandoned_pass(&mut reused, previous, space, window, cx);
+                }
+            }
+            if generator.random.one_in(6) {
+                let mut scratch = Scene {
+                    root: scene.root.clone(),
+                    detached: scene.detached.clone(),
+                };
+                for _ in 0..1 + generator.random.below(3) {
+                    edit_scene(&mut scratch, &mut generator);
+                }
+                let space = generator.random.one_in(2).then(|| available_space(&mut generator.random));
+                abandoned_pass(&mut reused, &scratch, space, window, cx);
+            }
+            if generator.random.one_in(6) {
+                // A layout-only pass of the scene about to be drawn.
+                let space = Some(available_space(&mut generator.random));
+                abandoned_pass(&mut reused, &scene, space, window, cx);
+            }
+
+            let kept = lay_out_frame(&mut reused, &scene, &spaces, window, cx);
+            let mut fresh = TaffyLayoutEngine::new();
+            let new = lay_out_frame(&mut fresh, &scene, &spaces, window, cx);
             for (layout, (kept, new)) in kept.iter().zip(&new).enumerate() {
                 assert_eq!(kept.len(), new.len(), "seed {seed}, step {step}, layout {layout}");
                 for (key, kept) in kept {
@@ -490,15 +609,41 @@ fn assert_reuse_matches_new_engine(
                     );
                 }
             }
-            edit(&mut root, &mut generator);
+
+            // What the frame did not ask for is gone, and with it what only it held.
+            let nodes = kept[0].len();
+            assert_eq!(reused.meta.len(), nodes, "seed {seed}, step {step}");
+            assert_eq!(reused.taffy.total_node_count(), nodes, "seed {seed}, step {step}");
+            assert_eq!(reused.keys.len(), fresh.keys.len(), "seed {seed}, step {step}");
+            reused.sweep_calcs();
+            fresh.sweep_calcs();
+            assert_eq!(reused.calcs.len(), fresh.calcs.len(), "seed {seed}, step {step}");
+
+            previous = Some(Scene {
+                root: scene.root.clone(),
+                detached: scene.detached.clone(),
+            });
+            edit_scene(&mut scene, &mut generator);
         }
+        let counters = reused.counters();
+        total.nodes_created += counters.nodes_created;
+        total.nodes_reused += counters.nodes_reused;
+        total.nodes_removed += counters.nodes_removed;
+        total.styles_set += counters.styles_set;
+        total.children_set += counters.children_set;
     }
+    total
 }
 
 #[gpui::test]
 fn an_engine_that_lives_through_edits_lays_out_like_a_new_one(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
-    cx.update(|window, cx| assert_reuse_matches_new_engine(1..=80, 40, window, cx));
+    let counters = cx.update(|window, cx| assert_reuse_matches_new_engine(1..=80, 40, window, cx));
+    // The sequences exercise what they are there to: nodes found again, changed and freed.
+    assert!(counters.nodes_reused > 5000, "{counters:?}");
+    assert!(counters.nodes_removed > 500, "{counters:?}");
+    assert!(counters.styles_set > 500, "{counters:?}");
+    assert!(counters.children_set > 500, "{counters:?}");
 }
 
 #[gpui::test]
@@ -540,15 +685,16 @@ fn the_observation_tells_trees_apart(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     cx.update(|window, cx| {
         let mut generator = Generator {
-            random: Random::new(7),
+            random: Random::new(3),
             next_key: 0,
         };
         let root = generator.root();
         let mut other = root.clone();
         other.style.size.width = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(37.))));
         let spaces = [available_space(&mut generator.random)];
-        let first = lay_out_frame(&mut TaffyLayoutEngine::new(), &root, &spaces, window, cx);
-        let second = lay_out_frame(&mut TaffyLayoutEngine::new(), &other, &spaces, window, cx);
+        let scene = |root| Scene { root, detached: None };
+        let first = lay_out_frame(&mut TaffyLayoutEngine::new(), &scene(root), &spaces, window, cx);
+        let second = lay_out_frame(&mut TaffyLayoutEngine::new(), &scene(other), &spaces, window, cx);
         assert_ne!(first[0], second[0]);
     });
 }
@@ -564,7 +710,7 @@ fn calc_style(position: Position) -> Style {
 }
 
 #[gpui::test]
-fn end_pass_forgets_what_the_pass_computed_and_keeps_the_nodes(cx: &mut TestAppContext) {
+fn end_pass_forgets_what_the_pass_computed_and_asked_for_and_keeps_the_nodes(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     cx.update(|window, cx| {
         let mut engine = TaffyLayoutEngine::new();
@@ -577,6 +723,7 @@ fn end_pass_forgets_what_the_pass_computed_and_keeps_the_nodes(cx: &mut TestAppC
         assert!(!engine.natural_widths.is_empty());
 
         let pending = engine.request_layout(calc_style(Position::Fixed), REM_SIZE, 1., &[]);
+        assert_eq!(engine.escapable_nodes, [pending]);
         engine.end_pass();
         assert!(engine.absolute_layout_bounds.is_empty());
         assert!(engine.absolute_outer_origins.is_empty());
@@ -585,34 +732,53 @@ fn end_pass_forgets_what_the_pass_computed_and_keeps_the_nodes(cx: &mut TestAppC
         assert!(engine.intrinsic_pending.is_empty());
         assert!(engine.natural_pending.is_empty());
 
+        assert!(engine.escapable_nodes.is_empty());
         assert_eq!(engine.taffy.total_node_count(), 2);
-        assert_eq!(engine.escapable_nodes, [pending]);
+        assert!(engine.meta.contains_key(&pending));
         assert_eq!(engine.calcs.len(), 2);
     });
 }
 
 #[gpui::test]
-fn end_frame_frees_the_nodes_their_measure_closures_and_their_calcs(cx: &mut TestAppContext) {
+fn end_frame_frees_the_nodes_no_root_reaches_with_their_measure_closures_and_their_calcs(
+    cx: &mut TestAppContext,
+) {
     let cx = cx.add_empty_window();
     cx.update(|window, cx| {
         let mut engine = TaffyLayoutEngine::new();
         let held = std::rc::Rc::new(());
-        let child = engine.request_measured_layout(Style::default(), REM_SIZE, 1., {
+        let measured = |held: &std::rc::Rc<()>| {
             let held = held.clone();
-            move |_, _, _, _| {
+            move |_: Size<Option<Pixels>>, _: Size<AvailableSpace>, _: &mut Window, _: &mut App| {
                 let _ = &held;
                 MeasuredLeaf::from(Size::default())
             }
-        });
-        let root = engine.request_layout(calc_style(Position::Fixed), REM_SIZE, 1., &[child]);
+        };
+        let child = engine.request_measured_layout(Style::default(), REM_SIZE, 1., measured(&held));
+        let root = engine.request_keyed_layout(1, calc_style(Position::Fixed), REM_SIZE, 1., &[child]);
+        // Requested, and never put in a tree.
+        let orphan_child = engine.request_measured_layout(Style::default(), REM_SIZE, 1., measured(&held));
+        let orphan = engine.request_keyed_layout(2, calc_style(Position::Fixed), REM_SIZE, 1., &[orphan_child]);
         engine.compute_layout(root, available_space(&mut Random::new(1)), window, cx);
-        assert_eq!(std::rc::Rc::strong_count(&held), 2);
+        assert_eq!(std::rc::Rc::strong_count(&held), 3);
 
+        engine.end_frame();
+        assert_eq!(std::rc::Rc::strong_count(&held), 2);
+        assert_eq!(engine.taffy.total_node_count(), 2);
+        assert_eq!(engine.meta.len(), 2);
+        assert!(engine.meta.contains_key(&root) && engine.meta.contains_key(&child));
+        assert!(!engine.meta.contains_key(&orphan));
+        assert_eq!(engine.keys.len(), 1);
+        assert!(engine.escapable_nodes.is_empty());
+        assert_eq!(engine.calcs.len(), 2);
+
+        // The next frame lays out nothing: nothing is left.
         engine.end_frame();
         assert_eq!(std::rc::Rc::strong_count(&held), 1);
         assert_eq!(engine.taffy.total_node_count(), 0);
         assert!(engine.meta.is_empty());
-        assert!(engine.escapable_nodes.is_empty());
+        assert!(engine.keys.is_empty());
+        engine.sweep_calcs();
         assert_eq!(engine.calcs.len(), 0);
     });
 }
@@ -638,5 +804,289 @@ fn sweeping_calcs_keeps_the_ones_nodes_hold_wherever_they_are_held(cx: &mut Test
         // The styles still point at live values.
         engine.compute_layout(root, available_space(&mut Random::new(2)), window, cx);
         engine.layout_bounds(root, 1.);
+    });
+}
+
+/// A tree of containers that each ask with the scope `id`, which a frame requests in full.
+struct Plain {
+    id: u64,
+    style: Style,
+    children: Vec<Plain>,
+}
+
+fn plain_tree(id: &mut u64, depth: usize, fan: usize) -> Plain {
+    let own = *id;
+    *id += 1;
+    let mut style = Style::default();
+    style.display = Display::Flex;
+    style.padding.left = DefiniteLength::Absolute(AbsoluteLength::Pixels(px(2.)));
+    style.size.height = Length::Definite(DefiniteLength::calc(px(3.), 0.5));
+    style.gap.width = DefiniteLength::Absolute(AbsoluteLength::Pixels(px(1.)));
+    let children = if depth == 0 {
+        Vec::new()
+    } else {
+        (0..fan).map(|_| plain_tree(id, depth - 1, fan)).collect()
+    };
+    Plain { id: own, style, children }
+}
+
+fn plain_count(tree: &Plain) -> usize {
+    1 + tree.children.iter().map(plain_count).sum::<usize>()
+}
+
+fn request_plain(engine: &mut TaffyLayoutEngine, tree: &Plain) -> LayoutId {
+    let children: Vec<_> = tree
+        .children
+        .iter()
+        .map(|child| request_plain(engine, child))
+        .collect();
+    engine.request_keyed_layout(tree.id, tree.style.clone(), REM_SIZE, 1., &children)
+}
+
+/// A frame of a window: the root fills the window, as `stretch_auto_size_to_fill` makes it.
+fn plain_frame(
+    engine: &mut TaffyLayoutEngine,
+    tree: &Plain,
+    window: &mut Window,
+    cx: &mut App,
+) -> (LayoutId, LayoutCounters) {
+    let before = engine.counters();
+    let root = request_plain(engine, tree);
+    engine.stretch_auto_size_to_fill(root, size(px(300.), px(200.)), 1.);
+    let after_requests = engine.counters();
+    engine.compute_layout(
+        root,
+        size(AvailableSpace::Definite(px(300.)), AvailableSpace::Definite(px(200.))),
+        window,
+        cx,
+    );
+    engine.end_frame();
+    (root, delta(before, after_requests))
+}
+
+fn delta(before: LayoutCounters, after: LayoutCounters) -> LayoutCounters {
+    LayoutCounters {
+        nodes_created: after.nodes_created - before.nodes_created,
+        nodes_reused: after.nodes_reused - before.nodes_reused,
+        nodes_removed: after.nodes_removed - before.nodes_removed,
+        styles_set: after.styles_set - before.styles_set,
+        children_set: after.children_set - before.children_set,
+    }
+}
+
+#[gpui::test]
+fn an_idle_redraw_of_an_unchanged_tree_sets_no_style_no_children_and_makes_no_node(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        let tree = plain_tree(&mut 0, 3, 3);
+        let nodes = plain_count(&tree) as u64;
+
+        let (root, first) = plain_frame(&mut engine, &tree, window, cx);
+        assert_eq!(first.nodes_created, nodes);
+        assert_eq!(first.nodes_reused, 0);
+        assert_eq!(engine.layout_bounds(root, 1.).size.width, px(300.));
+
+        for _ in 0..3 {
+            let (second_root, idle) = plain_frame(&mut engine, &tree, window, cx);
+            assert_eq!(second_root, root);
+            assert_eq!(
+                idle,
+                LayoutCounters {
+                    nodes_reused: nodes,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(engine.taffy.total_node_count() as u64, nodes);
+        }
+    });
+}
+
+#[gpui::test]
+fn an_idle_redraw_keeps_the_layout_results_of_the_whole_tree(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        let tree = plain_tree(&mut 0, 3, 3);
+        plain_frame(&mut engine, &tree, window, cx);
+
+        let root = request_plain(&mut engine, &tree);
+        engine.stretch_auto_size_to_fill(root, size(px(300.), px(200.)), 1.);
+        assert_eq!(engine.taffy.dirty(root.0), Ok(false));
+        engine.end_frame();
+    });
+}
+
+#[gpui::test]
+fn a_changed_style_or_child_list_is_the_only_thing_set(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        let mut tree = plain_tree(&mut 0, 3, 3);
+        let nodes = plain_count(&tree) as u64;
+        plain_frame(&mut engine, &tree, window, cx);
+
+        // One style.
+        tree.children[1].children[2].style.padding.left =
+            DefiniteLength::Absolute(AbsoluteLength::Pixels(px(7.)));
+        let (_, counters) = plain_frame(&mut engine, &tree, window, cx);
+        assert_eq!(
+            counters,
+            LayoutCounters {
+                nodes_reused: nodes,
+                styles_set: 1,
+                ..Default::default()
+            }
+        );
+
+        // Two siblings swap places: they keep their keys, their parent has a new list.
+        tree.children[0].children.swap(0, 2);
+        let (_, counters) = plain_frame(&mut engine, &tree, window, cx);
+        assert_eq!(
+            counters,
+            LayoutCounters {
+                nodes_reused: nodes,
+                children_set: 1,
+                ..Default::default()
+            }
+        );
+
+        // A subtree moves to another parent: the parent that gains it has a new list.
+        let moved = tree.children[2].children.remove(0);
+        tree.children[1].children.push(moved);
+        let (_, counters) = plain_frame(&mut engine, &tree, window, cx);
+        // The parent asked for first takes the child from the other, which then finds its list
+        // as it wants it.
+        assert_eq!(
+            counters,
+            LayoutCounters {
+                nodes_reused: nodes,
+                children_set: 1,
+                ..Default::default()
+            }
+        );
+
+        // A node goes: its parent has a new list, and nothing else is set. The node and its
+        // subtree are freed at the end of the frame.
+        let gone = tree.children[0].children.remove(1);
+        let gone_nodes = plain_count(&gone) as u64;
+        let before = engine.counters();
+        let (_, counters) = plain_frame(&mut engine, &tree, window, cx);
+        assert_eq!(counters.children_set, 1);
+        assert_eq!(counters.styles_set, 0);
+        assert_eq!(counters.nodes_created, 0);
+        assert_eq!(delta(before, engine.counters()).nodes_removed, gone_nodes);
+        assert_eq!(engine.taffy.total_node_count() as u64, nodes - gone_nodes);
+    });
+}
+
+#[gpui::test]
+fn the_window_root_stretches_again_when_the_window_changes_and_gives_its_style_back(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        let tree = plain_tree(&mut 0, 1, 2);
+        let space = |width: f32| {
+            size(
+                AvailableSpace::Definite(px(width)),
+                AvailableSpace::Definite(px(200.)),
+            )
+        };
+        let frame = |engine: &mut TaffyLayoutEngine, width, stretch: bool, window: &mut Window, cx: &mut App| {
+            let root = request_plain(engine, &tree);
+            if stretch {
+                engine.stretch_auto_size_to_fill(root, size(px(width), px(200.)), 1.);
+            }
+            engine.compute_layout(root, space(width), window, cx);
+            let bounds = engine.layout_bounds(root, 1.);
+            engine.end_frame();
+            bounds.size
+        };
+        assert_eq!(frame(&mut engine, 300., true, window, cx).width, px(300.));
+        assert_eq!(frame(&mut engine, 400., true, window, cx).width, px(400.));
+        // The same node, asked for by a frame that does not make it a window root.
+        assert_ne!(frame(&mut engine, 250., false, window, cx).width, px(400.));
+        assert_eq!(frame(&mut engine, 250., true, window, cx).width, px(250.));
+    });
+}
+
+#[gpui::test]
+fn measured_leaves_are_new_every_frame_until_they_have_keys(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        let frame = |engine: &mut TaffyLayoutEngine, window: &mut Window, cx: &mut App| {
+            let text = engine.request_measured_layout(Style::default(), REM_SIZE, 1., |_, _, _, _| {
+                MeasuredLeaf::from(size(px(10.), px(10.)))
+            });
+            let root = engine.request_keyed_layout(1, Style::default(), REM_SIZE, 1., &[text]);
+            engine.compute_layout(root, size(AvailableSpace::MaxContent, AvailableSpace::MaxContent), window, cx);
+            engine.end_frame();
+        };
+        frame(&mut engine, window, cx);
+        let before = engine.counters();
+        frame(&mut engine, window, cx);
+        let counters = delta(before, engine.counters());
+        assert_eq!(counters.nodes_created, 1);
+        assert_eq!(counters.nodes_removed, 1);
+        assert_eq!(counters.children_set, 1);
+        assert_eq!(engine.taffy.total_node_count(), 2);
+    });
+}
+
+#[gpui::test]
+fn what_an_abandoned_pass_requested_and_the_last_pass_did_not_is_freed_with_the_frame(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        let tree = plain_tree(&mut 0, 2, 3);
+        let nodes = plain_count(&tree);
+        plain_frame(&mut engine, &tree, window, cx);
+
+        // A pass with a different tree is thrown away: its nodes wait for the frame.
+        let abandoned = plain_tree(&mut 100, 2, 2);
+        let root = request_plain(&mut engine, &abandoned);
+        engine.compute_layout(root, size(AvailableSpace::MaxContent, AvailableSpace::MaxContent), window, cx);
+        engine.end_pass();
+        assert_eq!(engine.taffy.total_node_count(), nodes + plain_count(&abandoned));
+
+        plain_frame(&mut engine, &tree, window, cx);
+        assert_eq!(engine.taffy.total_node_count(), nodes);
+        assert_eq!(engine.meta.len(), nodes);
+        assert_eq!(engine.keys.len(), nodes);
+    });
+}
+
+#[gpui::test]
+fn passes_that_make_no_frame_cannot_pile_nodes_up_without_end(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        let frame = |engine: &mut TaffyLayoutEngine, window: &mut Window, cx: &mut App| {
+            let leaves: Vec<_> = (0..64)
+                .map(|_| {
+                    engine.request_measured_layout(Style::default(), REM_SIZE, 1., |_, _, _, _| {
+                        MeasuredLeaf::from(size(px(10.), px(10.)))
+                    })
+                })
+                .collect();
+            let root = engine.request_keyed_layout(1, Style::default(), REM_SIZE, 1., &leaves);
+            engine.compute_layout(root, size(AvailableSpace::MaxContent, AvailableSpace::MaxContent), window, cx);
+            engine.end_pass();
+        };
+        for _ in 0..200 {
+            frame(&mut engine, window, cx);
+        }
+        assert!(
+            engine.meta.len() < 3 * (GARBAGE_SLACK + 65),
+            "{} nodes",
+            engine.meta.len()
+        );
     });
 }

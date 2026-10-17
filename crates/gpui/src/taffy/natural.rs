@@ -77,9 +77,7 @@ impl TaffyLayoutEngine {
             .into_iter()
             .map(|id| {
                 let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE).clone();
-                self.taffy
-                    .set_style(id.0, with_auto_width(&style))
-                    .expect(EXPECT_MESSAGE);
+                self.rewrite_style(id, with_auto_width(&style));
                 let escapable_original = self.meta_mut(id).escapable.as_deref_mut().map(|escapable| {
                     let original = escapable.original.clone();
                     escapable.original = with_auto_width(&original);
@@ -108,9 +106,7 @@ impl TaffyLayoutEngine {
                 .size
                 .width;
             self.natural_widths.insert(node.id, width);
-            self.taffy
-                .set_style(node.id.0, node.style)
-                .expect(EXPECT_MESSAGE);
+            self.set_taffy_style(node.id, node.style);
             if let Some(original) = node.escapable_original {
                 self.meta_mut(node.id)
                     .escapable

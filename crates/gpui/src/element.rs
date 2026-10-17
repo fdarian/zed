@@ -329,6 +329,14 @@ impl GlobalElementId {
     }
 }
 
+impl GlobalElementId {
+    /// A number that is the same for an element in every frame it is in, and almost always
+    /// different between elements.
+    pub(crate) fn scope_hash(&self) -> u64 {
+        self.hash
+    }
+}
+
 impl Default for GlobalElementId {
     fn default() -> Self {
         Self::new(&[])
@@ -480,12 +488,18 @@ impl<E: Element> Drawable<E> {
                     inspector_id = None;
                 }
 
+                let outer_scope = global_id
+                    .as_ref()
+                    .map(|global_id| mem::replace(&mut window.layout_scope, global_id.scope_hash()));
                 let (layout_id, request_layout) = self.element.request_layout(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
                     window,
                     cx,
                 );
+                if let Some(outer_scope) = outer_scope {
+                    window.layout_scope = outer_scope;
+                }
 
                 if global_id.is_some() {
                     window.element_id_stack.pop();
@@ -598,6 +612,9 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
+                let outer_scope = global_id
+                    .as_ref()
+                    .map(|global_id| mem::replace(&mut window.layout_scope, global_id.scope_hash()));
                 let mut prepaint = if culled == Culled::No {
                     self.element.prepaint(
                         global_id.as_ref(),
@@ -617,6 +634,9 @@ impl<E: Element> Drawable<E> {
                         cx,
                     )
                 };
+                if let Some(outer_scope) = outer_scope {
+                    window.layout_scope = outer_scope;
+                }
                 window.next_frame.dispatch_tree.pop_node();
                 if !sticky_offset.is_zero() {
                     window.element_offset_stack.pop();
