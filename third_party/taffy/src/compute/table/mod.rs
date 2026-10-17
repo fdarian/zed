@@ -15,6 +15,8 @@ use crate::{CompactLength, LayoutTableContainer, TraversePartialTree};
 
 mod columns;
 mod structure;
+#[cfg(test)]
+mod tests;
 
 use columns::{Column, Contribution, clamp_percentages, distribute, grid_widths};
 use structure::{Structure, alloc_vec};
