@@ -295,16 +295,12 @@ impl Slot {
             AtomicMeasure::Fit(width) => {
                 let available = (width - margin.left - margin.right).max(px(0.));
                 if available >= max_size.width {
-                    Layout::MaxContent
+                    Layout::Exact(max_size.width)
                 } else {
                     let min_width = self.min_width(window, cx);
                     Layout::Exact(available.max(min_width).min(max_size.width))
                 }
             }
-        };
-        let layout = match layout {
-            Layout::Exact(width) if width == max_size.width => Layout::MaxContent,
-            layout => layout,
         };
         let border_box = self.lay_out(layout, window, cx);
         self.used = Some(layout);
@@ -1280,11 +1276,13 @@ mod tests {
         );
     }
 
-    /// Each box costs about one layout of its subtree a frame: its max-content layout is
-    /// the one it is placed with when it fits, and its min-content width is only measured
+    /// Each box costs two layouts of its subtree a frame when it fits: its max-content
+    /// layout to know the width it wants, and one at that width, which a descendant sized
+    /// in percent needs (its percentage is of the width the box came to, not of the
+    /// unresolved width of the max-content layout). Its min-content width is only measured
     /// when the line is narrower than that.
     #[test]
-    fn a_box_that_fits_is_laid_out_once_and_one_that_does_not_at_most_three_times() {
+    fn a_box_that_fits_is_laid_out_twice_and_one_that_does_not_at_most_three_times() {
         let passes = |width: f32, atomics: usize| {
             lay_out(
                 width,
@@ -1293,8 +1291,8 @@ mod tests {
             );
             LAYOUT_PASSES.with(|passes| passes.get())
         };
-        assert_eq!(passes(400., 1), 1);
-        assert_eq!(passes(400., 3), 3);
+        assert_eq!(passes(400., 1), 2);
+        assert_eq!(passes(400., 3), 6);
         // Narrower than the box wants: the max-content layout, then the min-content
         // width to know how narrow it can go, and the layout at the width it got.
         assert_eq!(passes(80., 1), 3);
