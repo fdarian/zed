@@ -19,7 +19,7 @@
 //! Nothing runs when no node is flagged.
 
 use super::{EXPECT_MESSAGE, LayoutId, TaffyLayoutEngine};
-use crate::{App, AvailableSpace, Pixels, Size, Style, Window};
+use crate::{App, AvailableSpace, Pixels, Size, Window};
 use taffy::style::Dimension;
 
 struct Flagged {
@@ -38,12 +38,6 @@ fn with_auto_width(style: &taffy::style::Style) -> taffy::style::Style {
 }
 
 impl TaffyLayoutEngine {
-    pub(super) fn track_natural_width(&mut self, id: LayoutId, style: &Style) {
-        if style.measure_natural_width {
-            self.natural_pending.push(id);
-        }
-    }
-
     /// The border-box width `id` has when its `width` is `auto`, in logical pixels.
     pub fn layout_natural_width(&self, id: LayoutId, scale_factor: f32) -> Option<Pixels> {
         self.natural_widths
@@ -86,15 +80,11 @@ impl TaffyLayoutEngine {
                 self.taffy
                     .set_style(id.0, with_auto_width(&style))
                     .expect(EXPECT_MESSAGE);
-                let escapable_original = self
-                    .escapable_absolutes
-                    .iter_mut()
-                    .find(|escapable| escapable.id == id)
-                    .map(|escapable| {
-                        let original = escapable.original.clone();
-                        escapable.original = with_auto_width(&original);
-                        original
-                    });
+                let escapable_original = self.meta_mut(id).escapable.as_deref_mut().map(|escapable| {
+                    let original = escapable.original.clone();
+                    escapable.original = with_auto_width(&original);
+                    original
+                });
                 Flagged {
                     id,
                     style,
@@ -122,9 +112,9 @@ impl TaffyLayoutEngine {
                 .set_style(node.id.0, node.style)
                 .expect(EXPECT_MESSAGE);
             if let Some(original) = node.escapable_original {
-                self.escapable_absolutes
-                    .iter_mut()
-                    .find(|escapable| escapable.id == node.id)
+                self.meta_mut(node.id)
+                    .escapable
+                    .as_deref_mut()
                     .expect("an escapable absolute was found when it was flagged")
                     .original = original;
             }

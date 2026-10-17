@@ -33,16 +33,59 @@ impl Keyword {
     }
 }
 
-/// A node with at least one width or flex basis keyword, waiting for its measurements.
-pub(super) struct IntrinsicNode {
-    id: LayoutId,
+/// The width and flex basis keywords of a node that has at least one.
+#[derive(Copy, Clone)]
+pub(super) struct IntrinsicKeywords {
     width: Option<Keyword>,
     min_width: Option<Keyword>,
     max_width: Option<Keyword>,
     flex_basis: Option<Keyword>,
 }
 
-impl IntrinsicNode {
+impl IntrinsicKeywords {
+    pub(super) fn of(
+        style: &Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        calcs: &mut CalcArena,
+    ) -> Option<Box<Self>> {
+        let widths = &style.intrinsic_widths;
+        let (width, min_width, max_width, flex_basis) = (
+            widths.width.flatten(),
+            widths.min_width.flatten(),
+            widths.max_width.flatten(),
+            widths.flex_basis.flatten(),
+        );
+        if width.is_none() && min_width.is_none() && max_width.is_none() && flex_basis.is_none() {
+            return None;
+        }
+        let mut keyword = |size: Option<IntrinsicSize>| {
+            size.map(|size| match size {
+                IntrinsicSize::MinContent => Keyword::MinContent,
+                IntrinsicSize::MaxContent => Keyword::MaxContent,
+                IntrinsicSize::FitContent => Keyword::FitContent,
+                IntrinsicSize::FitContentLimit(limit) => {
+                    Keyword::FitContentLimit(limit.to_taffy(rem_size, scale_factor, calcs))
+                }
+            })
+        };
+        Some(Box::new(IntrinsicKeywords {
+            width: keyword(width),
+            min_width: keyword(min_width),
+            max_width: keyword(max_width),
+            flex_basis: keyword(flex_basis),
+        }))
+    }
+
+    /// Calls `visit` with the lengths of the keywords that hold one.
+    pub(super) fn for_each_length(&self, mut visit: impl FnMut(CompactLength)) {
+        for keyword in self.keywords() {
+            if let Keyword::FitContentLimit(limit) = keyword {
+                visit(limit.into_raw());
+            }
+        }
+    }
+
     fn keywords(&self) -> impl Iterator<Item = Keyword> {
         [self.width, self.min_width, self.max_width, self.flex_basis]
             .into_iter()
@@ -69,44 +112,6 @@ impl Measured {
 }
 
 impl TaffyLayoutEngine {
-    pub(super) fn track_intrinsic_widths(
-        &mut self,
-        id: LayoutId,
-        style: &Style,
-        rem_size: Pixels,
-        scale_factor: f32,
-    ) {
-        let widths = &style.intrinsic_widths;
-        let (width, min_width, max_width, flex_basis) = (
-            widths.width.flatten(),
-            widths.min_width.flatten(),
-            widths.max_width.flatten(),
-            widths.flex_basis.flatten(),
-        );
-        if width.is_none() && min_width.is_none() && max_width.is_none() && flex_basis.is_none() {
-            return;
-        }
-        let mut keyword =
-            |size: Option<IntrinsicSize>| {
-                size.map(|size| match size {
-                    IntrinsicSize::MinContent => Keyword::MinContent,
-                    IntrinsicSize::MaxContent => Keyword::MaxContent,
-                    IntrinsicSize::FitContent => Keyword::FitContent,
-                    IntrinsicSize::FitContentLimit(limit) => Keyword::FitContentLimit(
-                        limit.to_taffy(rem_size, scale_factor, &mut self.calcs),
-                    ),
-                })
-            };
-        let node = IntrinsicNode {
-            id,
-            width: keyword(width),
-            min_width: keyword(min_width),
-            max_width: keyword(max_width),
-            flex_basis: keyword(flex_basis),
-        };
-        self.intrinsic_nodes.push(node);
-    }
-
     /// Replaces the keywords of every node registered since the last call with measured widths.
     ///
     /// Nodes are requested after their children, so a node is measured after the keyword nodes
@@ -117,17 +122,22 @@ impl TaffyLayoutEngine {
     /// multiply that, so a keyword belongs on the few nodes that need it, not on every node of
     /// a deep tree. Nothing runs when no node has a keyword.
     pub(super) fn resolve_intrinsic_widths(&mut self, window: &mut Window, cx: &mut App) {
-        if self.intrinsic_nodes.is_empty() {
+        if self.intrinsic_pending.is_empty() {
             return;
         }
         let scale_factor = window.scale_factor();
-        for mut node in std::mem::take(&mut self.intrinsic_nodes) {
-            let mut requested = self.taffy.style(node.id.0).expect(EXPECT_MESSAGE).clone();
+        for id in std::mem::take(&mut self.intrinsic_pending) {
+            let mut node = *self
+                .meta(id)
+                .intrinsic
+                .as_deref()
+                .expect("a pending intrinsic node has keywords");
+            let mut requested = self.taffy.style(id.0).expect(EXPECT_MESSAGE).clone();
 
             // A flex basis keyword wins over a basis length set next to it, also where it
             // does not count.
             if let Some(keyword) = node.flex_basis {
-                if self.is_row_flex_item(node.id) {
+                if self.is_row_flex_item(id) {
                     // The available space is not known here, and the item shrinks to the
                     // container anyway, so `fit-content` is `max-content`.
                     node.flex_basis = Some(match keyword {
@@ -143,13 +153,11 @@ impl TaffyLayoutEngine {
             // The content is measured without the width it is about to be given.
             let mut probe = requested.clone();
             probe.size.width = Dimension::auto();
-            self.taffy
-                .set_style(node.id.0, probe)
-                .expect(EXPECT_MESSAGE);
+            self.taffy.set_style(id.0, probe).expect(EXPECT_MESSAGE);
             let measured = Measured {
                 min_content: node.keywords().any(Keyword::needs_min_content).then(|| {
                     self.measure_width(
-                        node.id,
+                        id,
                         AvailableSpace::MinContent,
                         scale_factor,
                         window,
@@ -158,7 +166,7 @@ impl TaffyLayoutEngine {
                 }),
                 max_content: node.keywords().any(Keyword::needs_max_content).then(|| {
                     self.measure_width(
-                        node.id,
+                        id,
                         AvailableSpace::MaxContent,
                         scale_factor,
                         window,
@@ -170,14 +178,10 @@ impl TaffyLayoutEngine {
             let mut style = requested;
             apply(&node, &measured, &mut self.calcs, &mut style);
             self.taffy
-                .set_style(node.id.0, style.clone())
+                .set_style(id.0, style.clone())
                 .expect(EXPECT_MESSAGE);
             // The containing block pass starts from the style a node was requested with.
-            if let Some(escapable) = self
-                .escapable_absolutes
-                .iter_mut()
-                .find(|escapable| escapable.id == node.id)
-            {
+            if let Some(escapable) = self.meta_mut(id).escapable.as_deref_mut() {
                 escapable.original = style;
             }
         }
@@ -304,14 +308,14 @@ fn fit_content_bounds(
         )
     } else {
         (
-            Dimension::calc(calcs.alloc_bounded(min_content, floor, ceiling)),
-            Dimension::calc(calcs.alloc_bounded(max_content, floor, ceiling)),
+            Dimension::calc(calcs.intern_bounded(min_content, floor, ceiling)),
+            Dimension::calc(calcs.intern_bounded(max_content, floor, ceiling)),
         )
     }
 }
 
 fn apply(
-    node: &IntrinsicNode,
+    node: &IntrinsicKeywords,
     measured: &Measured,
     calcs: &mut CalcArena,
     style: &mut taffy::style::Style,
