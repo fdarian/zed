@@ -1366,4 +1366,372 @@ mod tests {
             .unwrap();
         assert_eq!(focus, target, "the tree reports the focus inside the replay");
     }
+
+    /// A retained card with an inner retained card in it, and a plain sibling.
+    struct Nested {
+        window: AnyWindowHandle,
+        outer_key: Rc<Cell<u64>>,
+        inner_key: Rc<Cell<u64>>,
+        builds: Rc<Cell<(usize, usize)>>,
+    }
+
+    impl Nested {
+        fn new(cx: &mut TestAppContext) -> Self {
+            let outer_key = Rc::new(Cell::new(1));
+            let inner_key = Rc::new(Cell::new(1));
+            let builds = Rc::new(Cell::new((0, 0)));
+            let clicks = Rc::new(RefCell::new(Vec::new()));
+            let window = open(cx, {
+                let outer_key = outer_key.clone();
+                let inner_key = inner_key.clone();
+                let builds = builds.clone();
+                Rc::new(move |_, _| {
+                    let inner_key = inner_key.clone();
+                    let builds = builds.clone();
+                    let clicks = clicks.clone();
+                    div()
+                        .id("root")
+                        .size_full()
+                        .child(retained("outer", outer_key.get(), {
+                            let builds = builds.clone();
+                            move |_, _| {
+                                builds.set((builds.get().0 + 1, builds.get().1));
+                                div()
+                                    .id("outer-box")
+                                    .w(px(200.))
+                                    .h(px(120.))
+                                    .bg(crate::green())
+                                    .child(retained("inner", inner_key.get(), move |_, _| {
+                                        builds.set((builds.get().0, builds.get().1 + 1));
+                                        card(0, &clicks)
+                                    }))
+                                    .child(div().id("after-inner").w(px(30.)).h(px(10.)).bg(crate::blue()))
+                                    .into_any_element()
+                            }
+                        }))
+                        .into_any_element()
+                })
+            });
+            draw(window, cx);
+            Nested { window, outer_key, inner_key, builds }
+        }
+    }
+
+    #[gpui::test]
+    fn nested_subtrees_replay_together_and_the_inner_one_survives_a_rebuilt_outer(
+        cx: &mut TestAppContext,
+    ) {
+        let nested = Nested::new(cx);
+        draw(nested.window, cx);
+        let replayed = snapshot(nested.window, cx, &POINTS);
+        let before = counters(nested.window, cx);
+        assert!(before.replays >= 1);
+        let builds = nested.builds.get();
+        draw(nested.window, cx);
+        assert_eq!(nested.builds.get(), builds);
+        assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
+
+        // The outer subtree replayed over the inner one, which is not recorded in the frame
+        // before: a new key for the outer subtree builds both.
+        nested.outer_key.set(2);
+        draw(nested.window, cx);
+        assert_eq!(nested.builds.get(), (builds.0 + 1, builds.1 + 1));
+        assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
+
+        // Built in the frame before, the inner one replays inside a subtree that is built, and
+        // the outer one records what it left.
+        let replays = counters(nested.window, cx).replays;
+        nested.outer_key.set(3);
+        draw(nested.window, cx);
+        assert_eq!(nested.builds.get(), (builds.0 + 2, builds.1 + 1));
+        assert_eq!(counters(nested.window, cx).replays, replays + 1, "the inner one");
+        assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
+        draw(nested.window, cx);
+        assert_eq!(nested.builds.get(), (builds.0 + 2, builds.1 + 1));
+        assert_eq!(counters(nested.window, cx).replays, replays + 2, "the outer one");
+        assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
+        click(nested.window, cx, 30., 10.);
+    }
+
+    #[gpui::test]
+    fn a_subtree_that_was_not_prepainted_in_a_frame_is_not_replayed_from_the_one_before(
+        cx: &mut TestAppContext,
+    ) {
+        let hidden = Rc::new(Cell::new(false));
+        let builds = Rc::new(Cell::new(0));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let window = open(cx, {
+            let hidden = hidden.clone();
+            let builds = builds.clone();
+            Rc::new(move |_, _| {
+                let builds = builds.clone();
+                let clicks = clicks.clone();
+                let mut holder = div().id("holder").child(retained("retained", 1, move |_, _| {
+                    builds.set(builds.get() + 1);
+                    card(0, &clicks)
+                }));
+                if hidden.get() {
+                    holder = holder.hidden();
+                }
+                div().id("root").size_full().child(holder).into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let replayed = snapshot(window, cx, &POINTS);
+        let before = counters(window, cx);
+        assert!(before.replays >= 1);
+
+        // The frame in which it has no place keeps its layout nodes and nothing else of it.
+        hidden.set(true);
+        draw(window, cx);
+        let built = builds.get();
+        hidden.set(false);
+        draw(window, cx);
+        let after = counters(window, cx);
+        assert_eq!(builds.get(), built + 1, "built again, not replayed from two frames ago");
+        assert_eq!(after.replays, before.replays);
+        assert_eq!(snapshot(window, cx, &POINTS), replayed);
+        draw(window, cx);
+        assert_eq!(counters(window, cx).replays, before.replays + 1);
+        assert_eq!(snapshot(window, cx, &POINTS), replayed);
+    }
+
+    #[gpui::test]
+    fn a_subtree_that_is_not_what_its_key_says_is_laid_out_where_it_is(cx: &mut TestAppContext) {
+        let width = Rc::new(Cell::new(40.));
+        let before_height = Rc::new(Cell::new(10.));
+        let window = open(cx, {
+            let width = width.clone();
+            let before_height = before_height.clone();
+            Rc::new(move |_, _| {
+                let width = width.clone();
+                div()
+                    .id("root")
+                    .size_full()
+                    .child(div().id("before").w(px(10.)).h(px(before_height.get())))
+                    .child(retained("retained", 1, move |_, _| {
+                        div().id("box").w(px(width.get())).h(px(20.)).bg(crate::red()).into_any_element()
+                    }))
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        assert_eq!(before.layout_fallbacks, 0);
+
+        // The key promised the same subtree, and it moves, so it is built for prepaint.
+        width.set(70.);
+        before_height.set(15.);
+        draw(window, cx);
+        let violated = counters(window, cx);
+        assert_eq!(violated.layout_fallbacks, 1);
+        assert_eq!(violated.non_reusable(NonReusable::LayoutMismatch), 1);
+        let quads = cx
+            .update_window(window, |_, window, _| window.painted_quads())
+            .unwrap();
+        let red = quads
+            .iter()
+            .find(|quad| quad.background.as_solid() == Some(crate::red().into()))
+            .expect("the box is painted");
+        let scale = cx
+            .update_window(window, |_, window, _| window.scale_factor())
+            .unwrap();
+        assert_eq!(red.bounds.size.width.0, 70. * scale, "at its size now");
+        assert_eq!(red.bounds.origin.y.0, 15. * scale, "where layout put it");
+
+        // The next frame builds it for layout, which is what a changed subtree needs.
+        draw(window, cx);
+        draw(window, cx);
+        let settled = counters(window, cx);
+        assert_eq!(settled.layout_fallbacks, 1);
+        assert!(settled.replays > violated.replays);
+    }
+
+    struct Number(usize);
+
+    #[gpui::test]
+    fn the_entities_a_replayed_subtree_read_still_redraw_the_window(cx: &mut TestAppContext) {
+        let number = cx.new(|_| Number(1));
+        let key = Rc::new(Cell::new(1));
+        let window = open(cx, {
+            let number = number.clone();
+            let key = key.clone();
+            Rc::new(move |_, _| {
+                let number = number.clone();
+                div()
+                    .id("root")
+                    .child(retained("reading", key.get(), move |_, cx| {
+                        div()
+                            .id("reader")
+                            .child(format!("{}", number.read(cx).0))
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            })
+        });
+        // The window draws the frames it is dirty for when the app is let to run.
+        let frames = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| window.rendered_serial())
+                .unwrap()
+        };
+        let notify = |cx: &mut TestAppContext| {
+            number.update(cx, |number, cx| {
+                number.0 += 1;
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        draw(window, cx);
+        let frame = frames(cx);
+        notify(cx);
+        assert_eq!(frames(cx), frame + 1, "a built subtree is observed");
+
+        draw(window, cx);
+        let before = counters(window, cx);
+        assert!(before.replays >= 1);
+        let frame = frames(cx);
+        notify(cx);
+        assert_eq!(frames(cx), frame + 1, "a replayed subtree is observed");
+        assert!(counters(window, cx).replays > before.replays, "and was replayed");
+    }
+
+    #[gpui::test]
+    fn a_stacking_context_around_replayed_subtrees_orders_them_as_it_orders_built_ones(
+        cx: &mut TestAppContext,
+    ) {
+        let key = Rc::new(Cell::new(1));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let window = open(cx, {
+            let key = key.clone();
+            Rc::new(move |_, _| {
+                let card_at = |index: usize, key: u64| {
+                    let clicks = clicks.clone();
+                    retained(("retained", index), key, move |_, _| card(index, &clicks))
+                };
+                div()
+                    .id("context")
+                    .stacking_context()
+                    .size_full()
+                    .child(
+                        div()
+                            .id("below")
+                            .always_hitbox()
+                            .absolute()
+                            .z_index(-1)
+                            .left(px(0.))
+                            .top(px(0.))
+                            .w(px(150.))
+                            .h(px(90.))
+                            .bg(crate::green()),
+                    )
+                    .child(card_at(0, key.get()))
+                    .child(
+                        div()
+                            .id("above")
+                            .always_hitbox()
+                            .absolute()
+                            .z_index(3)
+                            .left(px(40.))
+                            .top(px(10.))
+                            .w(px(50.))
+                            .h(px(50.))
+                            .bg(crate::blue()),
+                    )
+                    .child(card_at(1, key.get()))
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let replays = counters(window, cx).replays;
+        draw(window, cx);
+        let replayed = snapshot(window, cx, &POINTS);
+        assert_eq!(counters(window, cx).replays, replays + 2);
+        key.set(2);
+        draw(window, cx);
+        let built = snapshot(window, cx, &POINTS);
+        assert_eq!(counters(window, cx).replays, replays + 2);
+        assert_eq!(replayed.scene, built.scene);
+        assert_eq!(replayed.a11y, built.a11y);
+        assert_eq!(replayed.chains, built.chains);
+        assert!(
+            built.chains[1].contains("context.above Bounds"),
+            "{}",
+            built.chains[1]
+        );
+        // The tab order of a replay is the order after the context moved the tab stops about.
+        draw(window, cx);
+        assert_eq!(counters(window, cx).replays, replays + 4);
+        assert_eq!(snapshot(window, cx, &POINTS), built);
+    }
+
+    #[gpui::test]
+    fn an_ancestor_that_scrolls_or_fades_or_hides_does_not_replay_what_it_changed(
+        cx: &mut TestAppContext,
+    ) {
+        let scroll = crate::ScrollHandle::new();
+        let opacity = Rc::new(Cell::new(1.));
+        let hidden = Rc::new(Cell::new(false));
+        let key = Rc::new(Cell::new(1));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let window = open(cx, {
+            let scroll = scroll.clone();
+            let opacity = opacity.clone();
+            let hidden = hidden.clone();
+            let key = key.clone();
+            Rc::new(move |_, _| {
+                let clicks = clicks.clone();
+                let mut faded = div().id("faded").opacity(opacity.get()).child(
+                    retained("retained", key.get(), move |_, _| card(0, &clicks)),
+                );
+                if hidden.get() {
+                    faded = faded.invisible();
+                }
+                div()
+                    .id("scroller")
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll)
+                    .size_full()
+                    .child(div().id("tall").h(px(1000.)).child(faded))
+                    .into_any_element()
+            })
+        });
+        cx.update_window(window, |_, window, _| window.force_effect_groups()).unwrap();
+        draw(window, cx);
+        draw(window, cx);
+        draw(window, cx);
+        let base = snapshot(window, cx, &POINTS);
+
+        let check = |cx: &mut TestAppContext, replays_expected: bool, change: &dyn Fn()| {
+            let before = counters(window, cx);
+            change();
+            draw(window, cx);
+            let after = counters(window, cx);
+            let drawn = snapshot(window, cx, &POINTS);
+            if replays_expected {
+                assert_eq!(after.replays, before.replays + 1);
+            } else {
+                assert_eq!(after.replays, before.replays);
+                assert_eq!(after.lazy_builds, before.lazy_builds + 1);
+            }
+            key.set(key.get() + 1);
+            draw(window, cx);
+            let built = snapshot(window, cx, &POINTS);
+            assert_eq!(drawn.scene, built.scene);
+            assert_eq!(drawn.a11y, built.a11y);
+            assert_eq!(drawn.chains, built.chains);
+            (before, after)
+        };
+
+        // The opacity is a group the subtree is painted in, which the replay joins.
+        check(cx, true, &|| opacity.set(0.5));
+        check(cx, true, &|| opacity.set(0.25));
+        check(cx, false, &|| hidden.set(true));
+        check(cx, false, &|| hidden.set(false));
+        check(cx, false, &|| scroll.set_offset(point(px(0.), px(-7.))));
+        let after = snapshot(window, cx, &POINTS);
+        assert_ne!(after.scene, base.scene);
+    }
 }
