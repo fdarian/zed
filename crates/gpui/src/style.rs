@@ -945,12 +945,26 @@ impl Style {
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
     ) {
+        self.paint_box_with_effects(bounds, bounds, window, cx, continuation)
+    }
+
+    /// [`Style::paint_with_effects`] with the background, border, shadow and outline surrounding
+    /// `box_bounds` instead of `bounds`, which still decides the effects. They differ for a
+    /// table with captions, whose grid is smaller than the box that holds them.
+    pub fn paint_box_with_effects(
+        &self,
+        bounds: Bounds<Pixels>,
+        box_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
+    ) {
         match self.group_effect(bounds, window, cx) {
             Some(effect) => window.with_effect_group(effect, None, |window| {
-                self.paint(bounds, window, cx, continuation)
+                self.paint(box_bounds, window, cx, continuation)
             }),
             None => window.with_element_opacity(self.opacity, |window| {
-                self.paint(bounds, window, cx, continuation)
+                self.paint(box_bounds, window, cx, continuation)
             }),
         }
     }

@@ -2995,7 +2995,19 @@ impl Interactivity {
                         listener(bounds, layout_id, window, cx);
                     }
 
-                    style.paint_with_effects(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                    let box_bounds = match (style.display, self.layout_id) {
+                        (Display::Table, Some(layout_id)) => {
+                            match window.layout_table_grid_insets(layout_id) {
+                                Some((top, bottom)) => Bounds::new(
+                                    point(bounds.origin.x, bounds.origin.y + top),
+                                    size(bounds.size.width, bounds.size.height - top - bottom),
+                                ),
+                                None => bounds,
+                            }
+                        }
+                        _ => bounds,
+                    };
+                    style.paint_box_with_effects(bounds, box_bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_overflow_clip(
                                 style.overflow_mask(bounds, window.rem_size()),

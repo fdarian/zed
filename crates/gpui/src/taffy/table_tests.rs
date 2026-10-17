@@ -952,3 +952,74 @@ fn a_table_in_a_flex_row_keeps_its_content_width(cx: &mut TestAppContext) {
         ],
     );
 }
+
+/// The background and border of a table surround its grid and not its captions, which the box of the table holds
+/// (Chrome: the table wrapper box holds the captions, the table box the rows). The insets are the heights of the
+/// captions with their margins.
+///
+/// ```html
+/// <!-- container width: 300px -->
+/// <table>
+///   <caption style="margin-bottom:4px"> <div style="width:20px;height:10px"></div> </caption>
+///   <tr><td><div style="width:30px;height:10px"></div></td></tr>
+///   <caption style="caption-side:bottom"> <div style="width:20px;height:6px"></div> </caption>
+/// </table>
+/// ```
+#[gpui::test]
+fn the_grid_of_a_table_starts_after_the_captions_above_and_ends_before_those_below(cx: &mut TestAppContext) {
+    use std::{cell::Cell, rc::Rc};
+    let insets = Rc::new(Cell::new(None));
+    let seen = insets.clone();
+    let plain = Rc::new(Cell::new(Some((px(-1.0), px(-1.0)))));
+    let plain_seen = plain.clone();
+    let cx = laid_out(cx, 300.0, move |_| {
+        let seen = seen.clone();
+        let plain_seen = plain_seen.clone();
+        vec![
+            div()
+                .table()
+                .on_painted_layout(move |_, layout_id, window, _| {
+                    seen.set(window.layout_table_grid_insets(layout_id));
+                })
+                .child(
+                    div()
+                        .table_role(TableRole::Caption(CaptionSide::Top))
+                        .mb(px(4.0))
+                        .child(div().w(px(20.0)).h(px(10.0))),
+                )
+                .child(
+                    div()
+                        .table_role(TableRole::Row)
+                        .child(
+                            div()
+                                .table_role(TableRole::Cell { col_span: 1, row_span: 1 })
+                                .child(div().w(px(30.0)).h(px(10.0))),
+                        ),
+                )
+                .child(
+                    div()
+                        .table_role(TableRole::Caption(CaptionSide::Bottom))
+                        .child(div().w(px(20.0)).h(px(6.0))),
+                )
+                .into_any_element(),
+            div()
+                .table()
+                .on_painted_layout(move |_, layout_id, window, _| {
+                    plain_seen.set(window.layout_table_grid_insets(layout_id));
+                })
+                .child(
+                    div()
+                        .table_role(TableRole::Row)
+                        .child(
+                            div()
+                                .table_role(TableRole::Cell { col_span: 1, row_span: 1 })
+                                .child(div().w(px(30.0)).h(px(10.0))),
+                        ),
+                )
+                .into_any_element(),
+        ]
+    });
+    let _ = cx;
+    assert_eq!(insets.get(), Some((px(14.0), px(6.0))));
+    assert_eq!(plain.get(), None);
+}

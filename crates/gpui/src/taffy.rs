@@ -489,6 +489,52 @@ impl TaffyLayoutEngine {
         bounds
     }
 
+    /// How far the box of a table's grid, which the table's background, border, shadow and outline
+    /// surround, is from the top and from the bottom of the table's own box, which holds the
+    /// captions too. `None` when the node has no caption, so the grid is the whole box.
+    pub fn layout_table_grid_insets(
+        &mut self,
+        id: LayoutId,
+        scale_factor: f32,
+    ) -> Option<(Pixels, Pixels)> {
+        let table_height = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE).size.height;
+        let (mut top, mut bottom) = (0.0f32, 0.0f32);
+        let mut has_caption = false;
+        for child in self.taffy.children(id.0).expect(EXPECT_MESSAGE) {
+            let style = self.taffy.style(child).expect(EXPECT_MESSAGE);
+            let side = match style.table_role {
+                taffy::style::TableRole::Caption(side) => side,
+                _ => continue,
+            };
+            if style.display == taffy::style::Display::None {
+                continue;
+            }
+            has_caption = true;
+            let layout = self.taffy.layout(child).expect(EXPECT_MESSAGE);
+            match side {
+                taffy::style::CaptionSide::Top => {
+                    top = top.max(layout.location.y + layout.size.height + layout.margin.bottom);
+                }
+                taffy::style::CaptionSide::Bottom => {
+                    bottom = bottom.max(table_height - (layout.location.y - layout.margin.top));
+                }
+            }
+        }
+        if !has_caption {
+            return None;
+        }
+        // Snapped like the box itself, from the same absolute origin, so the grid's edges fall
+        // where the rows' do.
+        self.layout_bounds(id, scale_factor);
+        let origin = self.absolute_outer_origins.get(&id).expect("layout_bounds caches the origin").y;
+        let edge = |y: f32| round_half_toward_zero(y);
+        let (near, far) = (edge(origin), edge(origin + table_height));
+        Some((
+            Pixels((edge(origin + top) - near) / scale_factor),
+            Pixels((far - edge(origin + table_height - bottom)) / scale_factor),
+        ))
+    }
+
     /// Where the scrollable overflow of `container` ends: the far corner of the border boxes of
     /// its descendants, in the layout root's coordinates, or `None` if it has none that count.
     ///
