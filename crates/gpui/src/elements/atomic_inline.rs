@@ -331,16 +331,19 @@ mod tests {
     //! the paragraph, which is `<div style="width:...">`.
     use super::*;
     use crate::{
-        Context, FixedMetricsTextSystem, InteractiveElement as _, IntoElement, ParentElement as _,
+        Context, FixedMetricsTextSystem, TextLayout, TextRun, InteractiveElement as _, IntoElement, ParentElement as _,
         Render, Styled as _, StyledText, TestApp, div,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
 
-    /// One atomic inline of a test paragraph.
+    /// One atomic inline of a test paragraph: a box of a size, or a box that holds text.
     #[derive(Clone)]
     pub(super) struct Atomic {
-        pub width: f32,
-        pub height: f32,
+        pub width: Option<f32>,
+        pub height: Option<f32>,
+        pub text: Option<&'static str>,
+        /// Top, right, bottom, left.
+        pub padding: [f32; 4],
         pub align: VerticalAlign,
         /// Top, right, bottom, left.
         pub margin: [f32; 4],
@@ -348,10 +351,23 @@ mod tests {
 
     pub(super) fn atomic(width: f32, height: f32) -> Atomic {
         Atomic {
-            width,
-            height,
+            width: Some(width),
+            height: Some(height),
+            text: None,
+            padding: [0.; 4],
             align: VerticalAlign::Baseline,
             margin: [0.; 4],
+        }
+    }
+
+    /// A box with the text in it and the size of the text, whose baseline is the one of
+    /// its last line.
+    pub(super) fn text_box(text: &'static str) -> Atomic {
+        Atomic {
+            width: None,
+            height: None,
+            text: Some(text),
+            ..atomic(0., 0.)
         }
     }
 
@@ -365,53 +381,144 @@ mod tests {
             self.margin = [top, right, bottom, left];
             self
         }
+
+        pub(super) fn padding(mut self, top: f32, right: f32, bottom: f32, left: f32) -> Self {
+            self.padding = [top, right, bottom, left];
+            self
+        }
+
+        pub(super) fn width(mut self, width: f32) -> Self {
+            self.width = Some(width);
+            self
+        }
+
+        fn inline(&self, index: usize, selector: &'static str) -> AtomicInline {
+            let mut child = div().debug_selector(|| selector.to_string());
+            if let Some(width) = self.width {
+                child = child.w(crate::px(width));
+            }
+            if let Some(height) = self.height {
+                child = child.h(crate::px(height));
+            }
+            let [top, right, bottom, left] = self.padding;
+            child = child
+                .pt(crate::px(top))
+                .pr(crate::px(right))
+                .pb(crate::px(bottom))
+                .pl(crate::px(left));
+            let mut baseline = AtomicBaseline::BottomMarginEdge;
+            if let Some(text) = self.text {
+                let text = StyledText::new(text);
+                let layout = text.layout().clone();
+                child = child.child(text);
+                baseline = AtomicBaseline::Measured(Box::new(move |window, root, _| {
+                    let text_top = window
+                        .layout_bounds(layout.layout_id().expect("the text requested its layout"))
+                        .origin
+                        .y;
+                    Some(text_top - window.layout_bounds(root).origin.y + layout.last_baseline()?)
+                }));
+            }
+            let mut inline = AtomicInline::new(index, child.into_any_element());
+            inline.vertical_align = self.align;
+            inline.baseline = baseline;
+            let [top, right, bottom, left] = self.margin;
+            inline.margin = Edges {
+                top: crate::px(top).into(),
+                right: crate::px(right).into(),
+                bottom: crate::px(bottom).into(),
+                left: crate::px(left).into(),
+            };
+            inline
+        }
     }
 
     pub(super) const OBJECT: char = crate::OBJECT_REPLACEMENT_CHARACTER;
 
+    /// An inline box that holds text, for the vertical alignment of spans.
+    #[derive(Clone)]
+    pub(super) struct Span {
+        pub range: Range<usize>,
+        pub parent: Option<usize>,
+        pub align: VerticalAlign,
+        pub line_height: Option<f32>,
+        pub font_size: f32,
+    }
+
+    #[derive(Clone, Default)]
+    pub(super) struct Setup {
+        pub width: f32,
+        pub text: String,
+        pub atomics: Vec<Atomic>,
+        /// The length of each run of the text and its own line height, if it has one.
+        /// Without runs the text is one.
+        pub runs: Vec<(usize, Option<f32>)>,
+        pub spans: Vec<Span>,
+        pub text_align: Option<crate::TextAlign>,
+    }
+
     struct Paragraph {
-        width: f32,
-        text: String,
-        atomics: Vec<Atomic>,
+        setup: Setup,
+        layout: Rc<RefCell<Option<TextLayout>>>,
     }
 
     impl Render for Paragraph {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let atomics: Vec<AtomicInline> = self
+            let setup = &self.setup;
+            let atomics: Vec<AtomicInline> = setup
                 .text
                 .match_indices(OBJECT)
-                .zip(&self.atomics)
+                .zip(&setup.atomics)
                 .enumerate()
                 .map(|(ix, ((index, _), atomic))| {
                     let selector: &'static str = Box::leak(format!("box{ix}").into_boxed_str());
-                    let mut inline = AtomicInline::new(
-                        index,
-                        div()
-                            .debug_selector(|| selector.to_string())
-                            .w(crate::px(atomic.width))
-                            .h(crate::px(atomic.height))
-                            .into_any_element(),
-                    );
-                    inline.vertical_align = atomic.align;
-                    let [top, right, bottom, left] = atomic.margin;
-                    inline.margin = Edges {
-                        top: crate::px(top).into(),
-                        right: crate::px(right).into(),
-                        bottom: crate::px(bottom).into(),
-                        left: crate::px(left).into(),
-                    };
-                    inline
+                    atomic.inline(index, selector)
                 })
                 .collect();
-            // The window's root fills the window, so the paragraph is a child of one.
-            div().child(
-                div()
-                    .debug_selector(|| "paragraph".into())
-                    .w(crate::px(self.width))
-                    .text_size(crate::px(20.))
-                    .line_height(crate::px(20.))
-                    .child(StyledText::new(self.text.clone()).with_atomic_inlines(atomics)),
-            )
+            let boxes: Vec<InlineBox> = setup
+                .spans
+                .iter()
+                .map(|span| InlineBox {
+                    range: span.range.clone(),
+                    parent: span.parent,
+                    align: span.align,
+                    line_height: span.line_height.map(crate::px),
+                    content: InlineContent::Text {
+                        font: crate::font("Menlo"),
+                        font_size: crate::px(span.font_size),
+                    },
+                })
+                .collect();
+            let mut text = StyledText::new(setup.text.clone())
+                .with_inline_boxes(boxes)
+                .with_atomic_inlines(atomics);
+            if !setup.runs.is_empty() {
+                text = text.with_runs(
+                    setup
+                        .runs
+                        .iter()
+                        .map(|(len, line_height)| TextRun {
+                            len: *len,
+                            font: crate::font("Menlo"),
+                            line_height: line_height.map(crate::px),
+                            ..Default::default()
+                        })
+                        .collect(),
+                );
+            }
+            *self.layout.borrow_mut() = Some(text.layout().clone());
+            let mut paragraph = div()
+                .debug_selector(|| "paragraph".into())
+                .w(crate::px(setup.width))
+                .text_size(crate::px(20.))
+                .line_height(crate::px(20.))
+                .child(text);
+            // CSS's initial `overflow-wrap` and the spaces that hang at the end of a line,
+            // which gpui does not default to.
+            paragraph.text_style().overflow_wrap = Some(crate::OverflowWrap::Normal);
+            paragraph.text_style().hang_trailing_spaces = Some(true);
+            paragraph.text_style().text_align = setup.text_align;
+            div().child(paragraph)
         }
     }
 
@@ -419,21 +526,28 @@ mod tests {
     pub(super) struct Laid {
         pub paragraph: crate::Bounds<Pixels>,
         pub boxes: Vec<crate::Bounds<Pixels>>,
+        pub layout: TextLayout,
     }
 
     pub(super) fn lay_out(width: f32, text: &str, atomics: Vec<Atomic>) -> Laid {
+        lay_out_with(Setup {
+            width,
+            text: text.to_string(),
+            atomics,
+            ..Default::default()
+        })
+    }
+
+    pub(super) fn lay_out_with(setup: Setup) -> Laid {
         let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
-        let count = atomics.len();
+        let count = setup.atomics.len();
+        let layout = Rc::new(RefCell::new(None));
         let mut window = app.open_window({
-            let text = text.to_string();
-            move |_, _| Paragraph {
-                width,
-                text,
-                atomics,
-            }
+            let layout = layout.clone();
+            move |_, _| Paragraph { setup, layout }
         });
         window.draw();
-        window.update(|_, window, _| {
+        let laid = window.update(|_, window, _| {
             let bounds: HashMap<String, crate::Bounds<Pixels>> = window
                 .rendered_frame
                 .debug_bounds
@@ -441,17 +555,23 @@ mod tests {
                 .map(|(key, value)| (key.to_string(), *value))
                 .collect();
             let paragraph = bounds["paragraph"];
-            Laid {
+            (
                 paragraph,
-                boxes: (0..count)
+                (0..count)
                     .map(|ix| {
                         let mut bounds = bounds[&format!("box{ix}")];
                         bounds.origin = bounds.origin - paragraph.origin;
                         bounds
                     })
-                    .collect(),
-            }
-        })
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let layout = layout.borrow().clone().expect("the paragraph was rendered");
+        Laid {
+            paragraph: laid.0,
+            boxes: laid.1,
+            layout,
+        }
     }
 
     pub(super) fn assert_close(actual: Pixels, expected: f32, context: &str) {
@@ -632,5 +752,260 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `<div style="width:150px">` holding `text` and boxes of `width:60px;height:10px`
+    /// (the first of case "a" is `<span class=b>` between "xxxx" and "xxxx"): Chrome's
+    /// height of the div, and the `[x, y]` of each box.
+    #[test]
+    fn a_line_breaks_on_either_side_of_a_box_as_chrome_does() {
+        let b = || atomic(60., 10.);
+        let o = OBJECT;
+        let cases: Vec<(&str, String, Vec<Atomic>, f32, Vec<(f32, f32)>)> = vec![
+            (
+                "text and boxes without spaces",
+                format!("xxxx{o}xxxx{o}xxxx"),
+                vec![b(), b()],
+                60.,
+                vec![(48.17, 7.), (48.17, 27.)],
+            ),
+            (
+                "spaces on both sides of a box",
+                format!("xx {o} xx {o} xx"),
+                vec![b(), b()],
+                40.,
+                vec![(36.13, 7.), (0., 27.)],
+            ),
+            (
+                "a box wider than the line overflows it alone",
+                format!("{o}xx{o}"),
+                vec![atomic(200., 10.), b()],
+                40.,
+                vec![(0., 7.), (24.09, 27.)],
+            ),
+            (
+                "boxes alone fill a line and the next starts a new one",
+                format!("{o}{o}{o}{o}"),
+                vec![b(), b(), b(), b()],
+                40.,
+                vec![(0., 7.), (60., 7.), (0., 27.), (60., 27.)],
+            ),
+            (
+                "a word that overflows is followed by a box on a line of its own",
+                format!("xxxxxxxxxxxxxxxxx{o}"),
+                vec![b()],
+                40.,
+                vec![(0., 27.)],
+            ),
+            (
+                "a trailing space hangs before a box that wraps",
+                format!("xxxxxxxxxxxxx {o}"),
+                vec![b()],
+                40.,
+                vec![(0., 27.)],
+            ),
+        ];
+        for (name, text, boxes, height, origins) in cases {
+            let laid = lay_out(150., &text, boxes);
+            assert_close(laid.paragraph.size.height, height, name);
+            for (ix, (x, y)) in origins.into_iter().enumerate() {
+                assert_close(laid.boxes[ix].origin.x, x, &format!("{name}: x of {ix}"));
+                assert_close(laid.boxes[ix].origin.y, y, &format!("{name}: y of {ix}"));
+            }
+        }
+    }
+
+    /// `<span style="display:inline-block">` holding text, in `<div style="width:Wpx">`:
+    /// Chrome's `[x, y, width, height]` of the box, and of a mark after it when there is
+    /// one. The mark is `width:1px;height:0`, so its y is the baseline of the line.
+    /// gpui measures a text as wide as the next whole pixel, so a width that comes from
+    /// text is Chrome's rounded up (48.17 is 49), and what follows it is that much later.
+    #[test]
+    fn a_box_with_text_takes_its_shrink_to_fit_width_and_its_last_baseline() {
+        let mark = || atomic(1., 0.);
+        let o = OBJECT;
+        struct Case {
+            name: &'static str,
+            width: f32,
+            text: String,
+            boxes: Vec<Atomic>,
+            height: f32,
+            // [x, y, width, height] of each box, in the order of `boxes`.
+            rects: Vec<[f32; 4]>,
+        }
+        let cases = vec![
+            Case {
+                name: "wider than the line: wraps to the width of the line",
+                width: 150.,
+                text: format!("{o}"),
+                boxes: vec![text_box("xxxx xxxx xxxx")],
+                height: 40.,
+                rects: vec![[0., 0., 150., 40.]],
+            },
+            Case {
+                name: "the width of the line, not the rest of it",
+                width: 150.,
+                text: format!("yy{o}"),
+                boxes: vec![text_box("xxxx xxxx xxxx")],
+                height: 60.,
+                rects: vec![[0., 20., 150., 40.]],
+            },
+            Case {
+                name: "narrower than a word: the width of the word",
+                width: 40.,
+                text: format!("{o}"),
+                boxes: vec![text_box("xxxx xxxx")],
+                height: 40.,
+                rects: vec![[0., 0., 49., 40.]],
+            },
+            Case {
+                name: "padding above the text raises the baseline",
+                width: 150.,
+                text: format!("xx{o}{o}"),
+                boxes: vec![text_box("yy zz").padding(10., 0., 0., 0.), mark()],
+                height: 30.,
+                rects: vec![[24.09, 0., 61., 30.], [85.09, 27., 1., 0.]],
+            },
+            Case {
+                name: "the baseline is the last line of the text",
+                width: 150.,
+                text: format!("xx{o}{o}"),
+                boxes: vec![text_box("xxxx xxxx").width(80.), mark()],
+                height: 40.,
+                rects: vec![[24.09, 0., 80., 40.], [104.09, 37., 1., 0.]],
+            },
+            Case {
+                name: "a hard line break and padding below",
+                width: 150.,
+                text: format!("xx{o}{o}"),
+                boxes: vec![text_box("xxxx\nyyyy").padding(0., 0., 6., 0.), mark()],
+                height: 46.,
+                rects: vec![[24.09, 0., 49., 46.], [73.09, 37., 1., 0.]],
+            },
+            Case {
+                name: "a box with no text has its bottom edge for a baseline",
+                width: 150.,
+                text: format!("xx{o}{o}"),
+                boxes: vec![atomic(30., 30.), mark()],
+                height: 33.,
+                rects: vec![[24.09, 0., 30., 30.], [54.09, 30., 1., 0.]],
+            },
+            // border 1px, padding 1px 2px: the same as padding of 2px 3px.
+            Case {
+                name: "margin and padding around the text",
+                width: 150.,
+                text: format!("xx{o}{o}"),
+                boxes: vec![
+                    text_box("xx yy").padding(2., 3., 2., 3.).margin(2., 3., 4., 5.),
+                    mark(),
+                ],
+                height: 30.,
+                rects: vec![[29.09, 2., 67., 24.], [99.09, 21., 1., 0.]],
+            },
+        ];
+        for case in cases {
+            let laid = lay_out(case.width, &case.text, case.boxes);
+            assert_close(laid.paragraph.size.height, case.height, case.name);
+            for (ix, [x, y, width, height]) in case.rects.into_iter().enumerate() {
+                let rect = laid.boxes[ix];
+                let name = format!("{} (box {ix})", case.name);
+                assert_close(rect.origin.x, x, &format!("{name}: x"));
+                assert_close(rect.origin.y, y, &format!("{name}: y"));
+                assert_close(rect.size.width, width, &format!("{name}: width"));
+                assert_close(rect.size.height, height, &format!("{name}: height"));
+            }
+        }
+    }
+
+    /// `<div style="width:400px">xx<span style="vertical-align:...">yy</span>xx<mark></div>`:
+    /// Chrome's height of the div, the baseline of the line (where the mark is) and the
+    /// baseline of the span, from the top of the div.
+    #[test]
+    fn a_span_is_raised_or_lowered_from_the_baseline_as_chrome_does() {
+        let offset = |px: f32, fraction: f32| VerticalAlign::Offset {
+            length: crate::px(px),
+            line_height_fraction: fraction,
+        };
+        // (name, align, line height of the span, [height, baseline, span baseline])
+        let cases: Vec<(&str, VerticalAlign, Option<f32>, [f32; 3])> = vec![
+            ("super", VerticalAlign::Super, None, [27.656, 24.656, 17.]),
+            ("sub", VerticalAlign::Sub, None, [25., 17., 22.]),
+            ("text-top", VerticalAlign::TextTop, None, [22., 19., 17.]),
+            ("text-bottom", VerticalAlign::TextBottom, None, [22., 17., 19.]),
+            ("middle", VerticalAlign::Middle, None, [21.531, 17., 18.531]),
+            ("6px", offset(6., 0.), None, [26., 23., 17.]),
+            ("top", VerticalAlign::Top, None, [20., 17., 17.]),
+            ("bottom with a line height of 40px", VerticalAlign::Bottom, Some(40.), [40., 37., 27.]),
+            ("super with a line height of 40px", VerticalAlign::Super, Some(40.), [40., 34.656, 27.]),
+            ("50% of a line height of 40px", offset(0., 0.5), Some(40.), [50., 47., 27.]),
+        ];
+        for (name, align, line_height, [height, baseline, span_baseline]) in cases {
+            let text = format!("xxyyxx{OBJECT}");
+            let laid = lay_out_with(Setup {
+                width: 400.,
+                text,
+                atomics: vec![atomic(1., 0.)],
+                runs: vec![(2, None), (2, line_height), (2, None), (3, None)],
+                spans: vec![Span {
+                    range: 2..4,
+                    parent: None,
+                    align,
+                    line_height,
+                    font_size: 20.,
+                }],
+                text_align: None,
+            });
+            assert_close(laid.paragraph.size.height, height, name);
+            assert_close(laid.boxes[0].origin.y, baseline, &format!("{name}: baseline"));
+            let span = laid.layout.baseline_for_index(2).expect("the span has glyphs")
+                - laid.paragraph.origin.y;
+            assert_close(span, span_baseline, &format!("{name}: baseline of the span"));
+        }
+    }
+
+    /// A span in a span, both `vertical-align:super`: the raises add up.
+    #[test]
+    fn nested_spans_add_their_baseline_shifts_as_in_chrome() {
+        let span = |parent| Span {
+            range: 2..4,
+            parent,
+            align: VerticalAlign::Super,
+            line_height: None,
+            font_size: 20.,
+        };
+        let laid = lay_out_with(Setup {
+            width: 400.,
+            text: format!("xxyyxx{OBJECT}"),
+            atomics: vec![atomic(1., 0.)],
+            spans: vec![span(None), span(Some(0))],
+            ..Default::default()
+        });
+        assert_close(laid.paragraph.size.height, 35.3125, "height");
+        assert_close(laid.boxes[0].origin.y, 32.313, "baseline");
+        let inner = laid.layout.baseline_for_index(2).unwrap() - laid.paragraph.origin.y;
+        assert_close(inner, 17., "baseline of the inner span");
+    }
+
+    /// `<div style="width:150px;text-align:center">xx<box60x10></div>`, and right
+    /// aligned with `margin-left:7px`: the box is where the aligned line puts it.
+    #[test]
+    fn an_aligned_line_puts_a_box_where_its_placeholder_is() {
+        let o = OBJECT;
+        let laid = lay_out_with(Setup {
+            width: 150.,
+            text: format!("xx{o}"),
+            atomics: vec![atomic(60., 10.)],
+            text_align: Some(crate::TextAlign::Center),
+            ..Default::default()
+        });
+        assert_close(laid.boxes[0].origin.x, 57.05, "centered");
+        let laid = lay_out_with(Setup {
+            width: 150.,
+            text: format!("xx{o}"),
+            atomics: vec![atomic(60., 10.).margin(0., 0., 0., 7.)],
+            text_align: Some(crate::TextAlign::Right),
+            ..Default::default()
+        });
+        assert_close(laid.boxes[0].origin.x, 90., "right aligned");
     }
 }

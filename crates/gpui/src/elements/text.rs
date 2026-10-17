@@ -1059,6 +1059,32 @@ impl TextLayout {
         origins
     }
 
+    /// The distance from the top of the text to the baseline of its first line, or `None`
+    /// for a text with no lines. It needs only the measure, not prepaint.
+    pub fn first_baseline(&self) -> Option<Pixels> {
+        let element_state = self.0.borrow();
+        let element_state = element_state.as_ref()?;
+        let line = element_state.lines.first()?;
+        Some(line.rows(element_state.line_height).first()?.baseline)
+    }
+
+    /// The distance from the top of the text to the baseline of its last line, or
+    /// `None` for a text with no lines. It needs only the measure, not prepaint.
+    pub fn last_baseline(&self) -> Option<Pixels> {
+        let element_state = self.0.borrow();
+        let element_state = element_state.as_ref()?;
+        let (last, earlier) = element_state.lines.split_last()?;
+        let top = earlier.iter().fold(Pixels::ZERO, |top, line| {
+            top + line.size(element_state.line_height).height
+        });
+        let rows = last.rows(element_state.line_height);
+        let last_row = rows.last()?;
+        let row_top = rows[..rows.len() - 1]
+            .iter()
+            .fold(top, |top, row| top + row.height);
+        Some(row_top + last_row.baseline)
+    }
+
     /// The baseline of the run that the glyph at the byte `index` is in, as a y
     /// coordinate in window coordinates, or `None` when no glyph is at or after `index`
     /// on its line. It is the baseline of the row, moved by the vertical alignment of the
