@@ -139,16 +139,19 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
         self.noop.glyph_for_char(font_id, ch)
     }
 
-    fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> anyhow::Result<Bounds<DevicePixels>> {
-        self.noop.glyph_raster_bounds(params)
+    fn glyph_raster_bounds(&self, _: &RenderGlyphParams) -> anyhow::Result<Bounds<DevicePixels>> {
+        Ok(Bounds {
+            origin: Default::default(),
+            size: crate::size(DevicePixels(1), DevicePixels(1)),
+        })
     }
 
     fn rasterize_glyph(
         &self,
-        params: &RenderGlyphParams,
+        _: &RenderGlyphParams,
         raster_bounds: Bounds<DevicePixels>,
     ) -> anyhow::Result<(Size<DevicePixels>, Vec<u8>)> {
-        self.noop.rasterize_glyph(params, raster_bounds)
+        Ok((raster_bounds.size, vec![0; 1]))
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {

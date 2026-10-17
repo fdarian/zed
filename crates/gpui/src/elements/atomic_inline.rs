@@ -226,6 +226,8 @@ impl Slot {
                 }
             };
             window.compute_layout(self.layout_id, space, cx);
+            #[cfg(test)]
+            tests::LAYOUT_PASSES.with(|passes| passes.set(passes.get() + 1));
             self.laid_out_as = Some(layout);
         }
         window.layout_bounds(self.layout_id).size
@@ -331,10 +333,10 @@ mod tests {
     //! the paragraph, which is `<div style="width:...">`.
     use super::*;
     use crate::{
-        Context, FixedMetricsTextSystem, TextLayout, TextRun, InteractiveElement as _, IntoElement, ParentElement as _,
+        Context, FixedMetricsTextSystem, StatefulInteractiveElement as _, TextLayout, TextRun, InteractiveElement as _, IntoElement, ParentElement as _,
         Render, Styled as _, StyledText, TestApp, div,
     };
-    use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
+    use std::{cell::{Cell, RefCell}, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
 
     /// One atomic inline of a test paragraph: a box of a size, or a box that holds text.
     #[derive(Clone)]
@@ -347,6 +349,8 @@ mod tests {
         pub align: VerticalAlign,
         /// Top, right, bottom, left.
         pub margin: [f32; 4],
+        /// Counts the clicks on the box, and gives it a background.
+        pub clicks: Option<Rc<Cell<usize>>>,
     }
 
     pub(super) fn atomic(width: f32, height: f32) -> Atomic {
@@ -357,6 +361,7 @@ mod tests {
             padding: [0.; 4],
             align: VerticalAlign::Baseline,
             margin: [0.; 4],
+            clicks: None,
         }
     }
 
@@ -393,7 +398,14 @@ mod tests {
         }
 
         fn inline(&self, index: usize, selector: &'static str) -> AtomicInline {
-            let mut child = div().debug_selector(|| selector.to_string());
+            let mut child = div()
+                .id(selector)
+                .debug_selector(|| selector.to_string());
+            if let Some(clicks) = self.clicks.clone() {
+                child = child
+                    .bg(crate::red())
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1));
+            }
             if let Some(width) = self.width {
                 child = child.w(crate::px(width));
             }
@@ -433,6 +445,11 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// How many times a box was laid out by its text.
+        pub(super) static LAYOUT_PASSES: Cell<usize> = const { Cell::new(0) };
+    }
+
     pub(super) const OBJECT: char = crate::OBJECT_REPLACEMENT_CHARACTER;
 
     /// An inline box that holds text, for the vertical alignment of spans.
@@ -455,6 +472,9 @@ mod tests {
         pub runs: Vec<(usize, Option<f32>)>,
         pub spans: Vec<Span>,
         pub text_align: Option<crate::TextAlign>,
+        /// The paragraph is the only item of a flex row of this width, and has no width of
+        /// its own.
+        pub flex_row: Option<f32>,
     }
 
     struct Paragraph {
@@ -509,16 +529,21 @@ mod tests {
             *self.layout.borrow_mut() = Some(text.layout().clone());
             let mut paragraph = div()
                 .debug_selector(|| "paragraph".into())
-                .w(crate::px(setup.width))
                 .text_size(crate::px(20.))
                 .line_height(crate::px(20.))
                 .child(text);
+            if setup.flex_row.is_none() {
+                paragraph = paragraph.w(crate::px(setup.width));
+            }
             // CSS's initial `overflow-wrap` and the spaces that hang at the end of a line,
             // which gpui does not default to.
             paragraph.text_style().overflow_wrap = Some(crate::OverflowWrap::Normal);
             paragraph.text_style().hang_trailing_spaces = Some(true);
             paragraph.text_style().text_align = setup.text_align;
-            div().child(paragraph)
+            match setup.flex_row {
+                Some(width) => div().child(div().flex().w(crate::px(width)).child(paragraph)),
+                None => div().child(paragraph),
+            }
         }
     }
 
@@ -546,6 +571,8 @@ mod tests {
             let layout = layout.clone();
             move |_, _| Paragraph { setup, layout }
         });
+        // Opening the window drew a frame already.
+        LAYOUT_PASSES.with(|passes| passes.set(0));
         window.draw();
         let laid = window.update(|_, window, _| {
             let bounds: HashMap<String, crate::Bounds<Pixels>> = window
@@ -954,6 +981,7 @@ mod tests {
                     font_size: 20.,
                 }],
                 text_align: None,
+                flex_row: None,
             });
             assert_close(laid.paragraph.size.height, height, name);
             assert_close(laid.boxes[0].origin.y, baseline, &format!("{name}: baseline"));
@@ -1007,5 +1035,157 @@ mod tests {
             ..Default::default()
         });
         assert_close(laid.boxes[0].origin.x, 90., "right aligned");
+    }
+
+    /// `<div style="display:flex;width:Wpx"><div>xx<box60x10>xx</div></div>`: the item is
+    /// as wide as its content, then as wide as the flex container, and not narrower than
+    /// its longest unbreakable part, as Chrome sizes it: [width, height] of the item.
+    #[test]
+    fn a_flex_item_is_sized_by_the_min_and_max_content_of_its_boxes() {
+        let o = OBJECT;
+        for (container, width, height, box_origin) in [
+            (400., 109., 20., (24.09, 7.)),
+            (80., 80., 60., (0., 27.)),
+            (40., 60., 60., (0., 27.)),
+        ] {
+            let laid = lay_out_with(Setup {
+                text: format!("xx{o}xx"),
+                atomics: vec![atomic(60., 10.)],
+                flex_row: Some(container),
+                ..Default::default()
+            });
+            let name = format!("in a flex row of {container}px");
+            // Chrome's 108.19 is 109 once the text is measured to the next whole pixel.
+            assert_close(laid.paragraph.size.width, width, &format!("{name}: width"));
+            assert_close(laid.paragraph.size.height, height, &format!("{name}: height"));
+            // The box is laid out for the width that was measured last, which is not
+            // the one it is placed for unless it is laid out again.
+            assert_close(laid.boxes[0].origin.x, box_origin.0, &format!("{name}: box x"));
+            assert_close(laid.boxes[0].origin.y, box_origin.1, &format!("{name}: box y"));
+            assert_close(laid.boxes[0].size.width, 60., &format!("{name}: box width"));
+        }
+    }
+
+    /// The box is a real element: it is painted where its placeholder is, it is hit where
+    /// it is painted, and the placeholder paints no glyph.
+    #[test]
+    fn a_box_is_painted_hit_and_hovered_at_its_placeholder() {
+        use crate::{MouseButton, point};
+        let clicks = Rc::new(Cell::new(0));
+        let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+        let mut window = app.open_window({
+            let clicks = clicks.clone();
+            move |_, _| Paragraph {
+                setup: Setup {
+                    width: 400.,
+                    text: format!("xx{OBJECT}xx"),
+                    atomics: vec![Atomic {
+                        clicks: Some(clicks),
+                        ..atomic(30., 30.)
+                    }],
+                    ..Default::default()
+                },
+                layout: Rc::default(),
+            }
+        });
+        window.draw();
+        let (bounds, quads, sprites, scale) = window.update(|_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            (
+                window.rendered_frame.debug_bounds["box0"],
+                scene.quads.iter().map(|quad| quad.bounds).collect::<Vec<_>>(),
+                scene.monochrome_sprites.len(),
+                window.scale_factor(),
+            )
+        });
+        assert!(
+            quads
+                .iter()
+                .any(|quad| quad.origin.x.0 / scale == bounds.origin.x.0
+                    && quad.origin.y.0 / scale == bounds.origin.y.0
+                    && quad.size.width.0 / scale == 30.),
+            "no quad at {bounds:?} in {quads:?}"
+        );
+        assert_eq!(sprites, 4, "one glyph for each of the four characters, none for the box");
+
+        let inside = bounds.center();
+        window.simulate_click(inside, MouseButton::Left);
+        assert_eq!(clicks.get(), 1);
+        window.simulate_click(point(bounds.right() + px(1.), inside.y), MouseButton::Left);
+        window.simulate_click(point(inside.x, bounds.bottom() + px(1.)), MouseButton::Left);
+        assert_eq!(clicks.get(), 1, "a click beside the box is not a click on it");
+    }
+
+    struct Nested;
+
+    impl Render for Nested {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let o = OBJECT;
+            let inner = AtomicInline::new(
+                2,
+                div()
+                    .debug_selector(|| "inner".into())
+                    .w(crate::px(10.))
+                    .h(crate::px(10.))
+                    .into_any_element(),
+            );
+            let middle = AtomicInline::new(
+                2,
+                div()
+                    .debug_selector(|| "middle".into())
+                    .child(StyledText::new(format!("yy{o}")).with_atomic_inlines(vec![inner]))
+                    .into_any_element(),
+            );
+            div().child(
+                div()
+                    .debug_selector(|| "paragraph".into())
+                    .w(crate::px(400.))
+                    .text_size(crate::px(20.))
+                    .line_height(crate::px(20.))
+                    .child(StyledText::new(format!("xx{o}")).with_atomic_inlines(vec![middle])),
+            )
+        }
+    }
+
+    /// An atomic inline holds a text with an atomic inline of its own, and the engines
+    /// of the two do not mix.
+    #[test]
+    fn atomic_inlines_nest() {
+        let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+        let mut window = app.open_window(|_, _| Nested);
+        // A second frame builds all of it again.
+        window.draw();
+        window.draw();
+        let bounds = window.update(|_, window, _| window.rendered_frame.debug_bounds.clone());
+        let [paragraph, middle, inner] = ["paragraph", "middle", "inner"].map(|key| bounds[key]);
+        // "xx" is 24.09px, and "yy" before the inner box too.
+        assert_close(middle.origin.x - paragraph.origin.x, 24.09, "x of the middle box");
+        assert_close(middle.size.width, 35., "width of the middle box");
+        assert_close(inner.origin.x - middle.origin.x, 24.09, "x of the inner box");
+        assert_close(inner.size.width, 10., "width of the inner box");
+        // The middle box has the baseline of its bottom edge, and so has the inner one,
+        // which is on the baseline of the middle box's line.
+        assert_close(middle.size.height, 20., "height of the middle box");
+        assert_close(inner.bottom() - middle.origin.y, 17., "the inner box is on the baseline");
+    }
+
+    /// Each box costs about one layout of its subtree a frame: its max-content layout is
+    /// the one it is placed with when it fits, and its min-content width is only measured
+    /// when the line is narrower than that.
+    #[test]
+    fn a_box_that_fits_is_laid_out_once_and_one_that_does_not_at_most_three_times() {
+        let passes = |width: f32, atomics: usize| {
+            lay_out(
+                width,
+                &format!("xx{}", OBJECT.to_string().repeat(atomics)),
+                (0..atomics).map(|_| text_box("xxxx xxxx")).collect(),
+            );
+            LAYOUT_PASSES.with(|passes| passes.get())
+        };
+        assert_eq!(passes(400., 1), 1);
+        assert_eq!(passes(400., 3), 3);
+        // Narrower than the box wants: the max-content layout, then the min-content
+        // width to know how narrow it can go, and the layout at the width it got.
+        assert_eq!(passes(80., 1), 3);
     }
 }
