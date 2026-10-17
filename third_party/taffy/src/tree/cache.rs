@@ -31,10 +31,6 @@ const BOTH_SIGN_BITS_MASK: u64 = SIGN_BIT_1 | SIGN_BIT_2;
 /// Mask of excluding the sign bits (used when setting/getting the size excluding the packed bits)
 const NON_SIGN_BITS_MASK: u64 = !BOTH_SIGN_BITS_MASK;
 
-/// Mask which includes only the bits which encode the x-axis value that we can use to ignore the
-/// y-axis value when comparing a cache key.
-const X_AXIS_VALUE_MASK: u64 = (u32::MAX as u64) << 32;
-
 /// Pack `Option<f32>` into `u32`
 #[inline(always)]
 fn option_cache_key(input: Option<f32>) -> u32 {
@@ -98,12 +94,6 @@ impl CacheKey {
     fn parent_size(&self) -> u64 {
         self.parent_size & NON_SIGN_BITS_MASK
     }
-
-    /// Return the parent size with the extra bits that encode the requested axis masked out
-    /// And the y-axis value masked out
-    fn x_axis_parent_size(&self) -> u64 {
-        self.parent_size & (X_AXIS_VALUE_MASK & NON_SIGN_BITS_MASK)
-    }
 }
 
 impl From<&LayoutInput> for CacheKey {
@@ -139,7 +129,15 @@ pub struct Cache {
     /// The cache entry for the node's final layout
     final_layout_entry: Option<CacheEntry<LayoutOutput>>,
     /// The cache entries for the node's preliminary size measurements
+    ///
+    /// Fully associative: any entry can hold any key. A key is the node's own sizing inputs *and* the parent size, and the same
+    /// node is measured under several parent sizes (e.g. a stretched flex column child is measured under the container's
+    /// width and again with an unknown parent width), so entries that differ only by parent size must not evict each other.
     measure_entries: [Option<CacheEntry<Size<f32>>>; CACHE_SIZE],
+    /// Second-chance bit per measure entry: set on a hit or store, cleared as the clock hand passes
+    measure_referenced: [bool; CACHE_SIZE],
+    /// The clock hand: the first measure entry considered for eviction
+    measure_hand: usize,
     /// Tracks if all cache entries are empty
     is_empty: bool,
 }
@@ -153,89 +151,25 @@ impl Default for Cache {
 impl Cache {
     /// Create a new empty cache
     pub const fn new() -> Self {
-        Self { final_layout_entry: None, measure_entries: [None; CACHE_SIZE], is_empty: true }
-    }
-
-    /// Return the cache slot to cache the current computed result in
-    ///
-    /// ## Caching Strategy
-    ///
-    /// We need multiple cache slots, because a node's size is often queried by it's parent multiple times in the course of the layout
-    /// process, and we don't want later results to clobber earlier ones.
-    ///
-    /// The two variables that we care about when determining cache slot are:
-    ///
-    ///   - How many "known_dimensions" are set. In the worst case, a node may be called first with neither dimension known, then with one
-    ///     dimension known (either width of height - which doesn't matter for our purposes here), and then with both dimensions known.
-    ///   - Whether unknown dimensions are being sized under a min-content or a max-content available space constraint (definite available space
-    ///     shares a cache slot with max-content because a node will generally be sized under one or the other but not both).
-    ///
-    /// ## Cache slots:
-    ///
-    /// - Slot 0: Both known_dimensions were set
-    /// - Slots 1-4: 1 of 2 known_dimensions were set and:
-    ///   - Slot 1: width but not height known_dimension was set and the other dimension was either a MaxContent or Definite available space constraintraint
-    ///   - Slot 2: width but not height known_dimension was set and the other dimension was a MinContent constraint
-    ///   - Slot 3: height but not width known_dimension was set and the other dimension was either a MaxContent or Definite available space constraintable space constraint
-    ///   - Slot 4: height but not width known_dimension was set and the other dimension was a MinContent constraint
-    /// - Slots 5-8: Neither known_dimensions were set and:
-    ///   - Slot 5: x-axis available space is MaxContent or Definite and y-axis available space is MaxContent or Definite
-    ///   - Slot 6: x-axis available space is MaxContent or Definite and y-axis available space is MinContent
-    ///   - Slot 7: x-axis available space is MinContent and y-axis available space is MaxContent or Definite
-    ///   - Slot 8: x-axis available space is MinContent and y-axis available space is MinContent
-    #[inline]
-    fn compute_cache_slot(known_dimensions: Size<Option<f32>>, available_space: Size<AvailableSpace>) -> usize {
-        use AvailableSpace::{Definite, MaxContent, MinContent};
-
-        let has_known_width = known_dimensions.width.is_some();
-        let has_known_height = known_dimensions.height.is_some();
-
-        // Slot 0: Both known_dimensions were set
-        if has_known_width && has_known_height {
-            return 0;
-        }
-
-        // Slot 1: width but not height known_dimension was set and the other dimension was either a MaxContent or Definite available space constraint
-        // Slot 2: width but not height known_dimension was set and the other dimension was a MinContent constraint
-        if has_known_width && !has_known_height {
-            return 1 + (available_space.height == MinContent) as usize;
-        }
-
-        // Slot 3: height but not width known_dimension was set and the other dimension was either a MaxContent or Definite available space constraint
-        // Slot 4: height but not width known_dimension was set and the other dimension was a MinContent constraint
-        if has_known_height && !has_known_width {
-            return 3 + (available_space.width == MinContent) as usize;
-        }
-
-        // Slots 5-8: Neither known_dimensions were set and:
-        match (available_space.width, available_space.height) {
-            // Slot 5: x-axis available space is MaxContent or Definite and y-axis available space is MaxContent or Definite
-            (MaxContent | Definite(_), MaxContent | Definite(_)) => 5,
-            // Slot 6: x-axis available space is MaxContent or Definite and y-axis available space is MinContent
-            (MaxContent | Definite(_), MinContent) => 6,
-            // Slot 7: x-axis available space is MinContent and y-axis available space is MaxContent or Definite
-            (MinContent, MaxContent | Definite(_)) => 7,
-            // Slot 8: x-axis available space is MinContent and y-axis available space is MinContent
-            (MinContent, MinContent) => 8,
+        Self {
+            final_layout_entry: None,
+            measure_entries: [None; CACHE_SIZE],
+            measure_referenced: [false; CACHE_SIZE],
+            measure_hand: 0,
+            is_empty: true,
         }
     }
 
     /// Try to retrieve a cached result from the cache
     #[inline]
-    pub fn get(&self, input: &LayoutInput) -> Option<LayoutOutput> {
+    pub fn get(&mut self, input: &LayoutInput) -> Option<LayoutOutput> {
         let key = CacheKey::from(input);
         match input.run_mode {
             RunMode::PerformLayout => self.final_layout_entry.filter(|entry| entry.key == key).map(|e| e.content),
             RunMode::ComputeSize => {
-                for entry in self.measure_entries.iter().flatten() {
-                    if entry.key.kd_available_space == key.kd_available_space
-                        && (entry.key.x_axis_parent_size() == key.x_axis_parent_size())
-                    {
-                        return Some(LayoutOutput::from_outer_size(entry.content));
-                    }
-                }
-
-                None
+                let index = self.measure_entries.iter().position(|entry| entry.is_some_and(|entry| entry.key == key))?;
+                self.measure_referenced[index] = true;
+                self.measure_entries[index].map(|entry| LayoutOutput::from_outer_size(entry.content))
             }
             RunMode::PerformHiddenLayout => None,
         }
@@ -251,10 +185,27 @@ impl Cache {
             }
             RunMode::ComputeSize => {
                 self.is_empty = false;
-                let cache_slot = Self::compute_cache_slot(input.known_dimensions, input.available_space);
-                self.measure_entries[cache_slot] = Some(CacheEntry { key, content: layout_output.size });
+                let index = self.measure_slot_for(key);
+                self.measure_entries[index] = Some(CacheEntry { key, content: layout_output.size });
+                self.measure_referenced[index] = true;
             }
             RunMode::PerformHiddenLayout => {}
+        }
+    }
+
+    /// The measure entry to write `key` into: the entry already holding it, else an empty one, else the clock
+    /// (second-chance) victim.
+    fn measure_slot_for(&mut self, key: CacheKey) -> usize {
+        if let Some(index) = self.measure_entries.iter().position(|entry| entry.map_or(true, |entry| entry.key == key)) {
+            return index;
+        }
+        loop {
+            let index = self.measure_hand;
+            self.measure_hand = (index + 1) % CACHE_SIZE;
+            if !self.measure_referenced[index] {
+                return index;
+            }
+            self.measure_referenced[index] = false;
         }
     }
 
@@ -266,6 +217,8 @@ impl Cache {
         self.is_empty = true;
         self.final_layout_entry = None;
         self.measure_entries = [None; CACHE_SIZE];
+        self.measure_referenced = [false; CACHE_SIZE];
+        self.measure_hand = 0;
         ClearState::Cleared
     }
 
