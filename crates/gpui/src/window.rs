@@ -3927,16 +3927,16 @@ impl Window {
     /// outside the content mask for good: its box and the scrollable overflow of what is below
     /// it, inflated by `outset` (and a pixel, for snapping), do not touch the mask.
     ///
-    /// Not while the pointer is captured by an element, which has to keep its hitbox, nor when an
-    /// accessibility tree is built, which holds off-screen content too.
+    /// Not while the pointer is captured by an element, which has to keep its hitbox. An
+    /// accessibility tree does not stop it: a culled subtree still pushes its nodes, as clipped
+    /// content stays in the tree.
     pub(crate) fn lies_outside_the_mask(
         &mut self,
         layout_id: LayoutId,
         bounds: Bounds<Pixels>,
         outset: Edges<Pixels>,
     ) -> bool {
-        if self.a11y.is_active() || self.captured_identity.is_some() || self.captured_hitbox.is_some()
-        {
+        if self.captured_identity.is_some() || self.captured_hitbox.is_some() {
             return false;
         }
         let mask = self.content_mask().bounds;

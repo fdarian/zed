@@ -2867,6 +2867,52 @@ impl Interactivity {
         )
     }
 
+    /// What the accessibility tree learns of this element's focus: that it is focusable, whether
+    /// it holds focus, and whether it names the active descendant of its container. A culled
+    /// element reports it as well, since off-screen content stays in the tree.
+    fn report_a11y_focus(&self, global_id: Option<&GlobalElementId>, window: &mut Window) {
+        if !window.a11y.is_active() {
+            return;
+        }
+        if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
+            if let Some(global_id) = global_id {
+                let node_id = global_id.accesskit_node_id();
+                window.a11y.set_focusable(node_id, focus_handle.id);
+                if focus_handle.is_focused(window) {
+                    window.a11y.set_focus(node_id);
+                }
+            } else if focus_handle.is_focused(window) {
+                // Focusable, but with no element id it can't have an
+                // accessibility node, so screen readers fall back to the
+                // whole window.
+                window
+                    .a11y
+                    .note_focus_without_node(focus_handle.id, "it has no element id");
+            }
+        }
+        if self.report_active_descendant_focus {
+            if let Some(global_id) = global_id {
+                window
+                    .a11y
+                    .set_active_descendant(global_id.accesskit_node_id());
+            }
+        }
+    }
+
+    /// Hands the action listeners of this element to the accessibility tree, which assistive
+    /// technology may invoke on a node that is out of view.
+    fn register_a11y_actions(&mut self, global_id: Option<&GlobalElementId>, window: &mut Window) {
+        if self.a11y_action_listeners.is_empty() || !window.a11y.is_active() {
+            return;
+        }
+        if let Some(global_id) = global_id {
+            let node_id = global_id.accesskit_node_id();
+            for (action, listener) in self.a11y_action_listeners.drain(..) {
+                window.on_a11y_action(node_id, action, listener);
+            }
+        }
+    }
+
     /// Commit the bounds of this element according to this interactivity state's configured styles.
     pub fn prepaint<R>(
         &mut self,
@@ -2901,32 +2947,8 @@ impl Interactivity {
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
-
-            if window.a11y.is_active() {
-                if let Some(global_id) = global_id {
-                    let node_id = global_id.accesskit_node_id();
-                    window.a11y.set_focusable(node_id, focus_handle.id);
-                    if focus_handle.is_focused(window) {
-                        window.a11y.set_focus(node_id);
-                    }
-                } else if focus_handle.is_focused(window) {
-                    // Focusable, but with no element id it can't have an
-                    // accessibility node, so screen readers fall back to the
-                    // whole window.
-                    window
-                        .a11y
-                        .note_focus_without_node(focus_handle.id, "it has no element id");
-                }
-            }
         }
-
-        if self.report_active_descendant_focus && window.a11y.is_active() {
-            if let Some(global_id) = global_id {
-                window
-                    .a11y
-                    .set_active_descendant(global_id.accesskit_node_id());
-            }
-        }
+        self.report_a11y_focus(global_id, window);
         window.with_optional_element_state::<InteractiveElementState, _>(
             global_id,
             |element_state, window| {
@@ -3028,6 +3050,7 @@ impl Interactivity {
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
         }
+        self.report_a11y_focus(global_id, window);
 
         let (display_none, position, visibility, scroll_offset) = if self.scroll_offset.is_some() {
             let style = self.compute_style_internal(None, None, window, cx);
@@ -3046,7 +3069,6 @@ impl Interactivity {
                 Point::default(),
             )
         };
-        let _ = global_id;
         if window.is_layout_pass() {
             self.publish_layout(bounds, visibility, window);
         }
@@ -3060,7 +3082,7 @@ impl Interactivity {
     /// the tab stops of the focusable elements.
     pub(crate) fn paint_culled(
         &mut self,
-        _global_id: Option<&GlobalElementId>,
+        global_id: Option<&GlobalElementId>,
         bounds: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
@@ -3079,6 +3101,9 @@ impl Interactivity {
         }
 
         window.with_visibility(visibility, |window| {
+            if visibility == Visibility::Visible {
+                self.register_a11y_actions(global_id, window);
+            }
             if let Some(listener) = self.paint_bounds_listener.take() {
                 listener(bounds, window, cx);
             }
@@ -3394,19 +3419,8 @@ impl Interactivity {
 
                                         self.paint_keyboard_listeners(window, cx);
 
-                                        if !hidden && window.a11y.is_active() {
-                                            if let Some(global_id) = global_id {
-                                                if !self.a11y_action_listeners.is_empty() {
-                                                    let node_id = global_id.accesskit_node_id();
-                                                    for (action, listener) in
-                                                        self.a11y_action_listeners.drain(..)
-                                                    {
-                                                        window.on_a11y_action(
-                                                            node_id, action, listener,
-                                                        );
-                                                    }
-                                                }
-                                            }
+                                        if !hidden {
+                                            self.register_a11y_actions(global_id, window);
                                         }
 
                                         f(&style, window, cx);
@@ -10602,6 +10616,7 @@ mod tests {
     mod culling {
         use super::*;
         use crate::{Edges, ScrollHandle, red, size};
+        use std::cell::Cell;
 
         const ROW: f32 = 40.;
         const CLIP: f32 = 100.;
@@ -10974,18 +10989,170 @@ mod tests {
             assert_eq!(row4.origin.y, px(4. * ROW));
         }
 
+        /// A scene of five buttons in the clip, with labels, relations, a focusable one, one with
+        /// an action and one with synthetic children, each holding an element of its own with a
+        /// node. Rows 3 and 4 are outside the clip.
+        struct A11yScene {
+            window: AnyWindowHandle,
+            focus: FocusHandle,
+            clicked: Rc<Cell<usize>>,
+            /// Whether the rows can be culled; read when the view renders.
+            cullable: Rc<Cell<bool>>,
+        }
+
+        fn a11y_scene(cx: &mut TestAppContext) -> A11yScene {
+            use crate::A11yRelation;
+            use accesskit::{Action, Node, Role};
+
+            let focus = cx.update(|cx| cx.focus_handle());
+            let clicked = Rc::new(Cell::new(0));
+            let cullable = Rc::new(Cell::new(true));
+            let window = open_scene(cx, {
+                let focus = focus.clone();
+                let clicked = clicked.clone();
+                let cullable = cullable.clone();
+                move |_| {
+                    let seen = Seen::default();
+                    let outset = cullable.get().then(Edges::default);
+                    let rows = (0..5).map(|index| {
+                        let mut row = row(index, &seen, outset)
+                            .role(Role::Button)
+                            .aria_label(format!("Row {index}"))
+                            .accessibility_id(format!("row{index}"))
+                            .child(
+                                div()
+                                    .id(("inner", index))
+                                    .role(Role::Label)
+                                    .aria_value(format!("Inner {index}"))
+                                    .w(px(10.))
+                                    .h(px(10.)),
+                            );
+                        match index {
+                            2 => {
+                                row = row.a11y_synthetic_children(|builder| {
+                                    let mut run = Node::new(Role::TextRun);
+                                    run.set_value("synthetic");
+                                    let id = builder.synthetic_node_id(0);
+                                    builder.push_child(id, run);
+                                });
+                            }
+                            3 => {
+                                row = row
+                                    .track_focus(&focus)
+                                    .a11y_relation(A11yRelation::DescribedBy, ["row4".into()]);
+                            }
+                            4 => {
+                                let clicked = clicked.clone();
+                                row = row
+                                    .a11y_relation(A11yRelation::LabelledBy, ["row0".into()])
+                                    .on_a11y_action(Action::Click, move |_, _, _| {
+                                        clicked.set(clicked.get() + 1)
+                                    });
+                            }
+                            _ => {}
+                        }
+                        row
+                    });
+                    clip(None).children(rows).into_any_element()
+                }
+            });
+            cx.update_window(window, |_, window, cx| {
+                window.set_a11y_active_for_tests(true);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            cx.update_window(window, |_, window, cx| window.focus(&focus, cx))
+                .unwrap();
+            redraw(&window, cx);
+            A11yScene { window, focus, clicked, cullable }
+        }
+
+        /// The tree last sent to the platform, node by node, and the dump of it without what
+        /// changes with every frame.
+        fn a11y_tree(
+            window: &AnyWindowHandle,
+            cx: &mut TestAppContext,
+        ) -> (Vec<(accesskit::NodeId, accesskit::Node)>, serde_json::Value) {
+            cx.update_window(*window, |_, window, _| {
+                let mut nodes = window.a11y.last_tree_update().unwrap().nodes.clone();
+                nodes.sort_by_key(|(id, _)| id.0);
+                let mut dump: serde_json::Value =
+                    serde_json::from_str(&window.debug_a11y_tree_json().unwrap()).unwrap();
+                dump.as_object_mut().unwrap().remove("frame");
+                (nodes, dump)
+            })
+            .unwrap()
+        }
+
         #[gpui::test]
-        fn nothing_is_culled_while_a_screen_reader_is_connected(cx: &mut TestAppContext) {
-            let window = scene(cx, &Seen::default(), Some(Edges::default()));
-            assert_eq!(culled(&window, cx), 2);
+        fn clipped_content_stays_in_the_accessibility_tree(cx: &mut TestAppContext) {
+            let scene = a11y_scene(cx);
+            assert_eq!(culled(&scene.window, cx), 2, "rows 3 and 4 are skipped with a11y on");
+            let (culled_nodes, culled_dump) = a11y_tree(&scene.window, cx);
 
-            cx.update_window(window, |_, window, _| window.set_a11y_active_for_tests(true))
-                .unwrap();
-            assert_eq!(culled(&window, cx), 0);
+            scene.cullable.set(false);
+            cx.update_window(scene.window, |_, window, _| window.refresh()).unwrap();
+            assert_eq!(culled(&scene.window, cx), 0);
+            let (plain_nodes, plain_dump) = a11y_tree(&scene.window, cx);
 
-            cx.update_window(window, |_, window, _| window.set_a11y_active_for_tests(false))
+            // Root, five rows with an inner element each, and the synthetic run.
+            assert_eq!(plain_nodes.len(), 1 + 5 * 2 + 1);
+            assert_eq!(culled_nodes, plain_nodes);
+            assert_eq!(culled_dump, plain_dump);
+
+            let scale = cx
+                .update_window(scene.window, |_, window, _| window.scale_factor())
+                .unwrap() as f64;
+            let row4 = culled_nodes
+                .iter()
+                .map(|(_, node)| node)
+                .find(|node| node.author_id() == Some("row4"))
+                .expect("row 4 is outside the clip and in the tree");
+            let bounds = row4.bounds().unwrap();
+            assert_eq!(bounds.y0, 4. * ROW as f64 * scale);
+            assert_eq!(bounds.y1, 5. * ROW as f64 * scale);
+            assert!(!row4.labelled_by().is_empty(), "relations of a culled node resolve");
+            assert_eq!(
+                culled_dump["gpui_focus"].is_string(),
+                true,
+                "a culled element holds the focus of the tree"
+            );
+        }
+
+        #[gpui::test]
+        fn an_accessibility_action_reaches_a_culled_element(cx: &mut TestAppContext) {
+            let scene = a11y_scene(cx);
+            assert_eq!(culled(&scene.window, cx), 2);
+            let target = cx
+                .update_window(scene.window, |_, window, _| {
+                    window
+                        .a11y
+                        .last_tree_update()
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .find(|(_, node)| node.author_id() == Some("row4"))
+                        .map(|(id, _)| *id)
+                        .unwrap()
+                })
                 .unwrap();
-            assert_eq!(culled(&window, cx), 2);
+            cx.update_window(scene.window, |_, window, cx| {
+                window.handle_a11y_action(
+                    accesskit::ActionRequest {
+                        action: accesskit::Action::Click,
+                        target_tree: accesskit::TreeId::ROOT,
+                        target_node: target,
+                        data: None,
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+            assert_eq!(scene.clicked.get(), 1);
+            let focused = cx
+                .update_window(scene.window, |_, window, _| scene.focus.is_focused(window))
+                .unwrap();
+            assert!(focused, "the focus is still on the culled row");
         }
 
         #[gpui::test]
