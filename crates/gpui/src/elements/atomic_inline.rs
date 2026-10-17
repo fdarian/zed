@@ -10,6 +10,8 @@
 //! baseline is read. In prepaint and paint the text swaps the engine of the box back in,
 //! and prepaints and paints the box where its placeholder is.
 
+use std::{cell::Cell, rc::Rc};
+
 use crate::{
     AbsoluteLength, AnyElement, App, AtomicExtent, AvailableSpace, DefiniteLength, Edges,
     InlineBox, InlineContent, LayoutId, Pixels, Point, Size, TaffyLayoutEngine, VerticalAlign,
@@ -57,8 +59,14 @@ pub struct AtomicInline {
     /// Where the baseline of the box is.
     pub baseline: AtomicBaseline,
     /// How far the box is painted from where the text puts it, like the offsets of
-    /// `position: relative`: nothing else on the line moves with it.
-    pub offset: Point<Pixels>,
+    /// `position: relative`: nothing else on the line moves with it. A fraction in `x` is of
+    /// the width the text is laid out in, and one in `y` of [`Self::containing_height`].
+    pub offset: Point<DefiniteLength>,
+    /// The height the fractions in the `y` of [`Self::offset`] are of: the content height of
+    /// the containing block, written by the owner of the text before the text is prepainted.
+    /// An owner whose containing block has no definite height (CSS then computes the offset
+    /// as `auto`) leaves a fraction out of `offset`.
+    pub containing_height: Rc<Cell<Pixels>>,
 }
 
 impl AtomicInline {
@@ -74,6 +82,7 @@ impl AtomicInline {
             parent: None,
             baseline: AtomicBaseline::BottomMarginEdge,
             offset: Point::default(),
+            containing_height: Rc::default(),
         }
     }
 }
@@ -107,7 +116,8 @@ struct Slot {
     line_height: Option<Pixels>,
     parent: Option<usize>,
     baseline: AtomicBaseline,
-    offset: Point<Pixels>,
+    offset: Point<DefiniteLength>,
+    containing_height: Rc<Cell<Pixels>>,
     /// What the engine holds of the box.
     laid_out_as: Option<Layout>,
     min_width: Option<Pixels>,
@@ -116,6 +126,8 @@ struct Slot {
     used: Option<Layout>,
     /// The margins in px the text shaped with.
     used_margin: Edges<Pixels>,
+    /// The width the text shaped with, which a fraction of the offset is of.
+    used_containing_width: Pixels,
 }
 
 /// The atomic inlines of a text.
@@ -145,11 +157,13 @@ impl AtomicInlines {
                     parent: atomic.parent,
                     baseline: atomic.baseline,
                     offset: atomic.offset,
+                    containing_height: atomic.containing_height,
                     laid_out_as: None,
                     min_width: None,
                     max_size: None,
                     used: None,
                     used_margin: Edges::default(),
+                    used_containing_width: Pixels::ZERO,
                 }
             })
             .collect();
@@ -197,6 +211,7 @@ impl AtomicInlines {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let rem_size = window.rem_size();
         let mut engine = self.engine.take();
         window.with_layout_engine(&mut engine, |window| {
             for slot in &mut self.slots {
@@ -205,9 +220,13 @@ impl AtomicInlines {
                     continue;
                 };
                 slot.restore_layout(window, cx);
+                let offset = crate::point(
+                    slot.offset.x.to_pixels(slot.used_containing_width.into(), rem_size),
+                    slot.offset.y.to_pixels(slot.containing_height.get().into(), rem_size),
+                );
                 let origin = *origin
                     + crate::point(slot.used_margin.left, slot.used_margin.top)
-                    + slot.offset;
+                    + offset;
                 slot.element.prepaint_at(origin, window, cx);
             }
         });
@@ -313,6 +332,7 @@ impl Slot {
         let border_box = self.lay_out(layout, window, cx);
         self.used = Some(layout);
         self.used_margin = margin.clone();
+        self.used_containing_width = containing_width;
 
         let from_top = match &self.baseline {
             AtomicBaseline::BottomMarginEdge => None,
@@ -386,6 +406,10 @@ mod tests {
         pub flex_items: Vec<(f32, f32)>,
         /// Painted this far from where the text puts the box.
         pub offset: (f32, f32),
+        /// Added to `offset`: a fraction of the width of the paragraph and one of
+        /// `containing_height`.
+        pub offset_fraction: (f32, f32),
+        pub containing_height: f32,
     }
 
     pub(super) fn atomic(width: f32, height: f32) -> Atomic {
@@ -400,6 +424,8 @@ mod tests {
             clicks: None,
             flex_items: Vec::new(),
             offset: (0., 0.),
+            containing_height: 0.,
+            offset_fraction: (0., 0.),
         }
     }
 
@@ -416,6 +442,12 @@ mod tests {
     }
 
     impl Atomic {
+        pub(super) fn offset_of(mut self, x: f32, y: f32, containing_height: f32) -> Self {
+            self.offset_fraction = (x, y);
+            self.containing_height = containing_height;
+            self
+        }
+
         pub(super) fn aligned(mut self, align: VerticalAlign) -> Self {
             self.align = align;
             self
@@ -486,7 +518,11 @@ mod tests {
             inline.width = self.width_fraction.map(crate::relative);
             inline.vertical_align = self.align;
             inline.baseline = baseline;
-            inline.offset = crate::point(crate::px(self.offset.0), crate::px(self.offset.1));
+            inline.offset = crate::point(
+                DefiniteLength::calc(crate::px(self.offset.0), self.offset_fraction.0),
+                DefiniteLength::calc(crate::px(self.offset.1), self.offset_fraction.1),
+            );
+            inline.containing_height.set(crate::px(self.containing_height));
             let [top, right, bottom, left] = self.margin;
             inline.margin = Edges {
                 top: crate::px(top).into(),
@@ -1313,6 +1349,22 @@ mod tests {
             f32::from(plain.layout.position_for_index(5).unwrap().x),
             "the text after the box",
         );
+    }
+
+    /// `<div style="width:400px"><span style="display:inline-block;position:relative;left:10%;top:25%;...">`
+    /// in a block 80px tall: Chrome moves the box by a tenth of the width and a quarter of the
+    /// height of the containing block.
+    #[test]
+    fn a_fraction_of_the_offset_is_of_the_width_of_the_text_and_the_containing_height() {
+        let text = format!("xx{OBJECT}yy");
+        let plain = lay_out(400., &text, vec![atomic(30., 10.)]);
+        let moved = lay_out(
+            400.,
+            &text,
+            vec![atomic(30., 10.).offset(4., 0.).offset_of(0.1, 0.25, 80.)],
+        );
+        assert_close(moved.boxes[0].origin.x - plain.boxes[0].origin.x, 44., "x");
+        assert_close(moved.boxes[0].origin.y - plain.boxes[0].origin.y, 20., "y");
     }
 
     /// Each box costs two layouts of its subtree a frame when it fits: its max-content

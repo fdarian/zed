@@ -809,6 +809,8 @@ pub trait InteractiveElement: Sized {
     /// call [`Window::request_redraw_before_present`] when the size it sees invalidates what the
     /// tree was built from (a container query).
     ///
+    /// Every listener added runs, in the order they were added.
+    ///
     /// Unlike `on_painted_layout` this runs in prepaint, so it can ask for the pass to be
     /// abandoned before paint, and it also runs for a prepaint that `List` later rolls back.
     /// Use it for answers that are true of the layout itself (a size), not for anything that
@@ -817,7 +819,9 @@ pub trait InteractiveElement: Sized {
         mut self,
         listener: impl Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.interactivity().prepaint_layout_listener = Some(Box::new(listener));
+        self.interactivity()
+            .prepaint_layout_listeners
+            .push(Box::new(listener));
         self
     }
 
@@ -2554,8 +2558,8 @@ pub struct Interactivity {
     pub(crate) paint_bounds_listener: Option<Box<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>>,
     pub(crate) paint_layout_listener:
         Option<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
-    pub(crate) prepaint_layout_listener:
-        Option<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
+    pub(crate) prepaint_layout_listeners:
+        Vec<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
     pub(crate) layout_id: Option<LayoutId>,
     /// Whether a box inside escaped the clip of this element at the last prepaint, which keeps
     /// the clip from being painted exactly (see [`Window::with_exact_content_mask`]).
@@ -2689,10 +2693,11 @@ impl Interactivity {
     ) -> R {
         self.content_size = content_size;
 
-        if let Some(listener) = self.prepaint_layout_listener.take()
-            && let Some(layout_id) = self.layout_id
-        {
-            listener(bounds, layout_id, window, cx);
+        let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
+        if let Some(layout_id) = self.layout_id {
+            for listener in prepaint_layout_listeners {
+                listener(bounds, layout_id, window, cx);
+            }
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
