@@ -24,9 +24,11 @@
 //! [`NonReusable`]. The passes that cannot replay are every pass but the first of a draw, the
 //! passes that measure, and any frame while the inspector is on.
 //!
-//! The element must have an element id that is unique among the elements around it, and the
-//! root of the subtree it builds must not be lifted into a stacking context or escape its
-//! clip: wrap it in an element that does not.
+//! The element must have an element id that is unique among the elements around it. The root of
+//! the subtree it builds must not escape the clip around it (such a box is laid out by the
+//! engine as one that a frame cannot keep, see [`NonReusable::UnstableLayout`]); if it is
+//! lifted into a stacking context, say so with [`Retained::lift_z`], since the parent decides
+//! that before the subtree is built.
 
 use crate::{
     AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
@@ -47,6 +49,7 @@ pub fn retained(
         key,
         build: Some(Box::new(build)),
         on_replay: None,
+        lift_z: None,
     }
 }
 
@@ -68,9 +71,17 @@ pub struct Retained {
     key: u64,
     build: Option<Build>,
     on_replay: Option<ReplayHook>,
+    lift_z: Option<i32>,
 }
 
 impl Retained {
+    /// Says that the root of the subtree is positioned with this `z-index`, and so is handed by
+    /// its parent to the stacking context around it, as the element it is made of would be.
+    pub fn lift_z(mut self, z: i32) -> Self {
+        self.lift_z = Some(z);
+        self
+    }
+
     /// Runs `listener` every time a phase of the subtree is replayed instead of run, in the place
     /// of the elements that would have run during it.
     ///
@@ -158,6 +169,10 @@ impl Element for Retained {
         None
     }
 
+    fn lift_z(&self) -> Option<i32> {
+        self.lift_z
+    }
+
     fn request_layout(
         &mut self,
         global_id: Option<&GlobalElementId>,
@@ -166,10 +181,11 @@ impl Element for Retained {
         cx: &mut App,
     ) -> (LayoutId, RetainedLayout) {
         let global_id = global_id.expect("a retained element has an id");
+        let lift_z = self.lift_z;
         if !window.retention_allowed() {
             window.retained.counters.builds += 1;
             let mut element = self.build()(window, cx);
-            let layout_id = request_subtree_layout(&mut element, window, cx);
+            let layout_id = request_subtree_layout(&mut element, lift_z, window, cx);
             return (
                 layout_id,
                 RetainedLayout::Built {
@@ -209,7 +225,7 @@ impl Element for Retained {
             let build = self.build();
             let ((element, root), accessed_entities) = cx.detect_accessed_entities(|cx| {
                 let mut element = build(window, cx);
-                let root = request_subtree_layout(&mut element, window, cx);
+                let root = request_subtree_layout(&mut element, lift_z, window, cx);
                 (element, root)
             });
             let unreusable = (window.unstable_layout_requests() != unstable_before)
@@ -355,10 +371,20 @@ impl Element for Retained {
 
 /// Requests the layout of the root of a built subtree, which the engine keeps from one frame to
 /// the next while the node requests stay the same.
-fn request_subtree_layout(element: &mut AnyElement, window: &mut Window, cx: &mut App) -> LayoutId {
+fn request_subtree_layout(
+    element: &mut AnyElement,
+    lift_z: Option<i32>,
+    window: &mut Window,
+    cx: &mut App,
+) -> LayoutId {
+    debug_assert_eq!(
+        element.lift_z(),
+        lift_z,
+        "the root of a retained subtree is lifted as its element says"
+    );
     debug_assert!(
-        element.lift_z().is_none() && element.escapes_to().is_none(),
-        "the root of a retained subtree is neither lifted nor escaping"
+        element.escapes_to().is_none(),
+        "the root of a retained subtree does not escape"
     );
     element.request_layout(window, cx)
 }
@@ -375,6 +401,7 @@ impl Retained {
     ) -> RetainedPrepaint {
         let key = window.replay_key(bounds);
         let hook = self.on_replay.clone();
+        let lift_z = self.lift_z;
         let replayed = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a skipped subtree has its state");
             let root = state.root;
@@ -410,7 +437,7 @@ impl Retained {
         let build = self.build();
         let ((mut element, built_root), accessed_entities) = cx.detect_accessed_entities(|cx| {
             let mut element = build(window, cx);
-            let root = request_subtree_layout(&mut element, window, cx);
+            let root = request_subtree_layout(&mut element, lift_z, window, cx);
             (element, root)
         });
         let layout_states = accessed_states_start..window.accessed_states_len();
@@ -1720,6 +1747,61 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_retained_root_that_is_lifted_is_replayed_where_the_stacking_context_puts_it(
+        cx: &mut TestAppContext,
+    ) {
+        let key = Rc::new(Cell::new(1));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let window = open(cx, {
+            let key = key.clone();
+            Rc::new(move |_, _| {
+                let clicks = clicks.clone();
+                div()
+                    .id("context")
+                    .always_hitbox()
+                    .stacking_context()
+                    .size_full()
+                    .child(card(0, &clicks))
+                    .child(
+                        retained("lifted", key.get(), move |_, _| {
+                            let mut root = div()
+                                .id("lifted-box")
+                                .always_hitbox()
+                                .absolute()
+                                .z_index(4)
+                                .left(px(20.))
+                                .top(px(10.))
+                                .w(px(80.))
+                                .h(px(60.))
+                                .bg(crate::blue())
+                                .child(div().id("inner").always_hitbox().w(px(30.)).h(px(30.)).bg(crate::green()));
+                            root.style().position = Some(Position::Absolute);
+                            root.into_any_element()
+                        })
+                        .lift_z(4),
+                    )
+                    .child(card(1, &Rc::new(RefCell::new(Vec::new()))))
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        assert!(before.replays >= 1, "{before:?}");
+        assert_eq!(before.total_non_reusable(), 0);
+        draw(window, cx);
+        let replayed = snapshot(window, cx, &POINTS);
+        assert_eq!(counters(window, cx).replays, before.replays + 1);
+        key.set(2);
+        draw(window, cx);
+        let built = snapshot(window, cx, &POINTS);
+        assert_eq!(replayed.scene, built.scene);
+        assert_eq!(replayed.a11y, built.a11y);
+        assert_eq!(replayed.chains, built.chains);
+        assert!(built.chains[1].contains("lifted-box"), "{}", built.chains[1]);
     }
 
     #[gpui::test]
