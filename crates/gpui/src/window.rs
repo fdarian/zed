@@ -1196,6 +1196,37 @@ pub(crate) struct PrepaintStateIndex {
     hitbox_parent: Option<HitboxId>,
 }
 
+impl PrepaintStateIndex {
+    /// Where the index `self`, which is inside the range that started at `from`, is once that
+    /// range was copied to `to`.
+    pub(crate) fn moved(&self, from: &Self, to: &Self) -> Self {
+        let moved = |index: usize, from: usize, to: usize| index + to - from;
+        Self {
+            hitboxes_index: moved(self.hitboxes_index, from.hitboxes_index, to.hitboxes_index),
+            tooltips_index: moved(self.tooltips_index, from.tooltips_index, to.tooltips_index),
+            deferred_draws_index: moved(self.deferred_draws_index, from.deferred_draws_index, to.deferred_draws_index),
+            dispatch_tree_index: moved(self.dispatch_tree_index, from.dispatch_tree_index, to.dispatch_tree_index),
+            accessed_element_states_index: moved(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            layout_publications_index: moved(
+                self.layout_publications_index,
+                from.layout_publications_index,
+                to.layout_publications_index,
+            ),
+            retained_recordings_index: moved(
+                self.retained_recordings_index,
+                from.retained_recordings_index,
+                to.retained_recordings_index,
+            ),
+            line_layout_index: self.line_layout_index.moved(&from.line_layout_index, &to.line_layout_index),
+            hitbox_parent: self.hitbox_parent,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
@@ -1208,6 +1239,34 @@ pub(crate) struct PaintIndex {
     #[cfg(any(test, feature = "test-support"))]
     debug_bounds_index: usize,
     line_layout_index: LineLayoutIndex,
+}
+
+impl PaintIndex {
+    /// Where the index `self`, which is inside the range that started at `from`, is once that
+    /// range was copied to `to`.
+    pub(crate) fn moved(&self, from: &Self, to: &Self) -> Self {
+        let moved = |index: usize, from: usize, to: usize| index + to - from;
+        Self {
+            scene_index: moved(self.scene_index, from.scene_index, to.scene_index),
+            mouse_listeners_index: moved(self.mouse_listeners_index, from.mouse_listeners_index, to.mouse_listeners_index),
+            root_key_listeners_index: moved(
+                self.root_key_listeners_index,
+                from.root_key_listeners_index,
+                to.root_key_listeners_index,
+            ),
+            input_handlers_index: moved(self.input_handlers_index, from.input_handlers_index, to.input_handlers_index),
+            cursor_styles_index: moved(self.cursor_styles_index, from.cursor_styles_index, to.cursor_styles_index),
+            accessed_element_states_index: moved(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            tab_handle_index: moved(self.tab_handle_index, from.tab_handle_index, to.tab_handle_index),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_index: moved(self.debug_bounds_index, from.debug_bounds_index, to.debug_bounds_index),
+            line_layout_index: self.line_layout_index.moved(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
 }
 
 /// For each hitbox of a frame, the nearest hitbox enclosing it that has a `clip-path`. Built from

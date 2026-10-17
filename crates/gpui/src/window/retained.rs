@@ -228,6 +228,10 @@ pub(crate) struct PrepaintMark {
 /// it was made in for the one after.
 pub(crate) struct PrepaintRecord {
     pub(crate) range: Range<PrepaintStateIndex>,
+    /// The retained subtrees inside this one that were recorded or replayed while it prepainted.
+    /// Their recordings are of the ranges of the frame this was recorded in, and move with this
+    /// one when it is replayed.
+    pub(crate) nested: Rc<[(GlobalElementId, TypeId)]>,
     hitboxes: Rc<RecordedHitboxes>,
     a11y: Option<Rc<a11y::A11yRecording>>,
     /// A listener that reports to its owner ran, and a replay does not run it again.
@@ -367,6 +371,16 @@ impl Window {
         start..self.next_frame.accessed_element_states.len()
     }
 
+    /// The layout of the subtrees inside one that was not requested again accessed states, which
+    /// moved from `from` to `to` in the frame with the range of the one that holds them.
+    pub(crate) fn move_nested_layout_states(&mut self, nested: &[(GlobalElementId, TypeId)], from: usize, to: usize) {
+        for key in nested {
+            if let Some(state) = self.rendered_state_mut(key) {
+                state.move_layout(from, to);
+            }
+        }
+    }
+
     pub(crate) fn accessed_states_len(&self) -> usize {
         self.next_frame.accessed_element_states.len()
     }
@@ -474,8 +488,12 @@ impl Window {
             .filter(|(_, hitbox)| hitbox.parent == stale_parent)
             .map(|(position, _)| position)
             .collect();
+        let nested = self.next_frame.retained_recordings
+            [mark.index.retained_recordings_index..end.retained_recordings_index]
+            .into();
         Ok(PrepaintRecord {
             range: mark.index..end,
+            nested,
             hitboxes: Rc::new(RecordedHitboxes { hitboxes, roots }),
             a11y: a11y.map(Rc::new),
             has_publications: mark.effects.published(&effects),
@@ -497,7 +515,25 @@ impl Window {
         if record.has_publications {
             self.note_publication();
         }
+        // The subtrees inside are where this one put them, as of this frame.
+        let serial = self.building_serial();
+        for key in record.nested.iter() {
+            if let Some(state) = self.rendered_state_mut(key) {
+                state.move_prepaint(&record.range.start, &start, serial);
+                self.next_frame.retained_recordings.push(key.clone());
+            }
+        }
         start..self.prepaint_index()
+    }
+
+    /// The retained state under `key`, in the rendered frame, if it is still there.
+    fn rendered_state_mut(&mut self, key: &(GlobalElementId, TypeId)) -> Option<&mut crate::elements::RetainedState> {
+        self.rendered_frame
+            .element_states
+            .get_mut(key)?
+            .inner
+            .downcast_mut::<Option<crate::elements::RetainedState>>()?
+            .as_mut()
     }
 
     pub(crate) fn insert_recorded_hitboxes(
@@ -552,7 +588,11 @@ impl Window {
         })
     }
 
-    pub(crate) fn replay_paint(&mut self, record: &PaintRecord) -> Range<PaintIndex> {
+    pub(crate) fn replay_paint(
+        &mut self,
+        record: &PaintRecord,
+        nested: &[(GlobalElementId, TypeId)],
+    ) -> Range<PaintIndex> {
         self.invalidator.debug_assert_paint();
         #[cfg(debug_assertions)]
         debug_assert!(
@@ -566,6 +606,12 @@ impl Window {
         }
         if record.has_publications {
             self.note_publication();
+        }
+        let serial = self.building_serial();
+        for key in nested {
+            if let Some(state) = self.rendered_state_mut(key) {
+                state.move_paint(&record.range.start, &start, serial);
+            }
         }
         start..self.paint_index()
     }
