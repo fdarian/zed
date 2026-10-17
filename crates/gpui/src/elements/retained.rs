@@ -2022,6 +2022,7 @@ mod tests {
         assert_eq!(drawn.chains, built.chains);
     }
 
+    #[cfg(any(feature = "inspector", debug_assertions))]
     #[gpui::test]
     fn the_inspector_makes_every_frame_build_everything(cx: &mut TestAppContext) {
         let fixture = Fixture::new(cx, 2);
