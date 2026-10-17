@@ -535,6 +535,23 @@ impl TaffyLayoutEngine {
         ))
     }
 
+    /// Where the column and row lines of a `display: table` node are, in device pixels from the top
+    /// left of its snapped border box. `None` if the node was not laid out as a table this frame.
+    pub fn layout_table_lines(&mut self, id: LayoutId, scale_factor: f32) -> Option<crate::TableLines> {
+        let info = match self.taffy.detailed_layout_info(id.0) {
+            taffy::DetailedLayoutInfo::Table(info) => info.clone(),
+            _ => return None,
+        };
+        self.layout_bounds(id, scale_factor);
+        let origin = *self.absolute_outer_origins.get(&id).expect("layout_bounds caches the origin");
+        // The box paints on the pixel grid and the lines are where layout put them: their distance.
+        let remainder = origin.map(|edge| edge - round_half_toward_zero(edge));
+        Some(crate::TableLines {
+            columns: info.column_lines.iter().map(|line| line + remainder.x).collect(),
+            rows: info.row_lines.iter().map(|line| line + remainder.y).collect(),
+        })
+    }
+
     /// Where the scrollable overflow of `container` ends: the far corner of the border boxes of
     /// its descendants, in the layout root's coordinates, or `None` if it has none that count.
     ///
@@ -707,16 +724,21 @@ fn snap_measured_size_to_device_pixels(size: Size<Pixels>, scale_factor: f32) ->
     size.map(|d| ceil_to_device_pixel(d.0.max(0.0), scale_factor))
 }
 
+/// `exact` keeps the widths as they are, in device pixels, where the others are whole ones: a
+/// half of a collapsed border is half a pixel when the border is one.
 fn border_widths_to_taffy(
     widths: &Edges<AbsoluteLength>,
     rem_size: Pixels,
     scale_factor: f32,
+    exact: bool,
 ) -> TaffyRect<taffy::style::LengthPercentage> {
     let snap = |w: &AbsoluteLength| {
-        taffy::style::LengthPercentage::length(round_stroke_to_device_pixel(
-            w.to_pixels(rem_size).0,
-            scale_factor,
-        ))
+        let logical = w.to_pixels(rem_size).0;
+        taffy::style::LengthPercentage::length(if exact {
+            logical.max(0.0) * scale_factor
+        } else {
+            round_stroke_to_device_pixel(logical, scale_factor)
+        })
     };
     TaffyRect {
         top: snap(&widths.top),
@@ -923,7 +945,7 @@ impl ToTaffy<taffy::style::Style> for Style {
             contain_block_size: self.contain_block_size,
             margin: self.margin.to_taffy(rem_size, scale_factor, calcs),
             padding: self.padding.to_taffy(rem_size, scale_factor, calcs),
-            border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor),
+            border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor, self.collapsed_border),
             align_items: self.align_items.map(|x| x.into()),
             align_self: self.align_self.map(|x| x.into()),
             align_content: self.align_content.map(|x| x.into()),
@@ -1267,7 +1289,7 @@ mod tests {
             bottom: Pixels(0.5).into(),
             left: Pixels(1.6).into(),
         };
-        let taffy_border = border_widths_to_taffy(&border_widths, Pixels(16.0), 1.0);
+        let taffy_border = border_widths_to_taffy(&border_widths, Pixels(16.0), 1.0, false);
 
         assert_eq!(
             taffy_border.top,

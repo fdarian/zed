@@ -101,6 +101,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Makes the border widths of the element the half widths of the collapsed borders of its table:
+    /// laid out as they are and not painted. See [`Style::collapsed_border`].
+    fn collapsed_border(mut self) -> Self {
+        self.style().collapsed_border = Some(true);
+        self
+    }
+
     /// Sets how the content of a table cell is placed in its row, like CSS `vertical-align`.
     fn cell_vertical_align(mut self, align: CellVerticalAlign) -> Self {
         self.style().cell_vertical_align = Some(align);

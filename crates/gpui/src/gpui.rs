@@ -18,6 +18,7 @@ mod border_style;
 mod bounds_tree;
 mod background_image;
 mod background_layer;
+mod collapsed_borders;
 mod color;
 mod effects;
 /// The default colors used by GPUI.
@@ -108,6 +109,7 @@ pub use asset_cache::*;
 pub use assets::*;
 pub use background_image::*;
 pub use background_layer::*;
+pub use collapsed_borders::*;
 pub use color::*;
 pub use effects::*;
 pub use ctor::ctor;

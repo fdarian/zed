@@ -6588,6 +6588,20 @@ impl Window {
             .layout_table_grid_insets(layout_id, scale_factor)
     }
 
+    /// Where the column and row lines of the given `display: table` layout node are, in device
+    /// pixels from the top left of its border box. `None` unless it was laid out as a table.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_table_lines(&mut self, layout_id: LayoutId) -> Option<crate::TableLines> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .layout_table_lines(layout_id, scale_factor)
+    }
+
     /// The extent of the content of the given layout node, in logical pixels,
     /// measured from its padding-box origin, so it includes padding but not
     /// border. It is the scrollable-overflow extent, so it is independent of how

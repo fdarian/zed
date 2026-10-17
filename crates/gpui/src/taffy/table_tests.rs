@@ -1023,3 +1023,39 @@ fn the_grid_of_a_table_starts_after_the_captions_above_and_ends_before_those_bel
     assert_eq!(insets.get(), Some((px(14.0), px(6.0))));
     assert_eq!(plain.get(), None);
 }
+
+/// The half widths of a collapsed border are laid out as they are. The test window has two device pixels to a
+/// pixel, so an eighth of a pixel is a quarter of a device pixel, which would be a whole one when rounded like other
+/// borders: the table would be 63 wide and 11 tall, not 60.75 and 10.5 (boxes are snapped to device pixels).
+#[gpui::test]
+fn collapsed_half_borders_are_not_rounded_to_whole_pixels(cx: &mut TestAppContext) {
+    fn half(style: &mut StyleRefinement) {
+        style.border_widths = EdgesRefinement {
+            top: Some(px(0.125).into()),
+            right: Some(px(0.125).into()),
+            bottom: Some(px(0.125).into()),
+            left: Some(px(0.125).into()),
+        };
+    }
+    let cell = |name: &'static str| {
+        div()
+            .table_role(TableRole::Cell { col_span: 1, row_span: 1 })
+            .collapsed_border()
+            .tweak(half)
+            .debug_selector(move || name.into())
+            .child(div().w(px(30.0)).h(px(10.0)))
+    };
+    let cx = laid_out(cx, 300.0, move |_| {
+        vec![
+            div()
+                .table()
+                .border_collapse()
+                .collapsed_border()
+                .tweak(half)
+                .debug_selector(|| "t".into())
+                .child(div().table_role(TableRole::Row).child(cell("a")).child(cell("b")))
+                .into_any_element(),
+        ]
+    });
+    assert_boxes(cx, &[("t", [0.0, 0.0, 60.5, 10.5]), ("a", [0.0, 0.0, 30.5, 10.5]), ("b", [30.5, 0.0, 30.0, 10.5])]);
+}

@@ -16,7 +16,8 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, ClipPathValue, DispatchPhase,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, ClipPathValue, CollapsedBorders,
+    DispatchPhase,
     Display, Element, ElementId, Empty, Entity, EntityId, Escape, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
@@ -822,6 +823,14 @@ pub trait InteractiveElement: Sized {
         self.interactivity()
             .prepaint_layout_listeners
             .push(Box::new(listener));
+        self
+    }
+
+    /// Has a `display: table` element paint these collapsed borders after its content, over the
+    /// cells' backgrounds. Its own border and its cells' are the halves the borders leave them,
+    /// see [`Styled::collapsed_border`].
+    fn collapsed_borders(mut self, borders: Arc<CollapsedBorders>) -> Self {
+        self.interactivity().collapsed_borders = Some(borders);
         self
     }
 
@@ -2561,6 +2570,9 @@ pub struct Interactivity {
     pub(crate) prepaint_layout_listeners:
         Vec<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
     pub(crate) layout_id: Option<LayoutId>,
+    /// The borders a `display: table` element paints, once its content is painted, in place of the
+    /// borders of its own. See [`InteractiveElement::collapsed_borders`].
+    pub(crate) collapsed_borders: Option<Arc<CollapsedBorders>>,
     /// Whether a box inside escaped the clip of this element at the last prepaint, which keeps
     /// the clip from being painted exactly (see [`Window::with_exact_content_mask`]).
     pub(crate) escape_inside: bool,
@@ -3007,6 +3019,13 @@ impl Interactivity {
                         }
                         _ => bounds,
                     };
+                    let collapsed = match (&self.collapsed_borders, self.layout_id) {
+                        (Some(borders), Some(layout_id)) if !hidden => window
+                            .layout_table_lines(layout_id)
+                            .filter(|lines| borders.fits(lines))
+                            .map(|lines| (borders.clone(), lines)),
+                        _ => None,
+                    };
                     style.paint_box_with_effects(bounds, box_bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_overflow_clip(
@@ -3107,6 +3126,9 @@ impl Interactivity {
                                 },
                             );
                         });
+                        if let Some((borders, lines)) = &collapsed {
+                            borders.paint(bounds, lines, window);
+                        }
                     });
                 });
 

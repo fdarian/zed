@@ -438,6 +438,11 @@ pub struct Style {
     pub border_collapse: bool,
     /// CSS `vertical-align` of a table cell.
     pub cell_vertical_align: CellVerticalAlign,
+    /// The `border_widths` of this box are half widths of the collapsed borders of its table: the
+    /// table and its cells lay out with them as they are, fractions of a device pixel included
+    /// instead of whole pixels, and do not paint them. The table paints the borders, see
+    /// [`crate::Div::collapsed_borders`].
+    pub collapsed_border: bool,
 
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
@@ -1245,7 +1250,7 @@ impl Style {
 
         continuation(window, cx);
 
-        if self.is_border_visible() {
+        if self.is_border_visible() && !self.collapsed_border {
             let border_widths = self.border_widths.to_pixels(rem_size);
             let mut background = self.border_colors.top;
             background.a = 0.;
@@ -1491,6 +1496,7 @@ impl Default for Style {
             border_spacing: Size::default(),
             border_collapse: false,
             cell_vertical_align: CellVerticalAlign::Baseline,
+            collapsed_border: false,
 
             #[cfg(debug_assertions)]
             debug: false,
