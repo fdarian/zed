@@ -29,8 +29,26 @@ type StackSafe<T> = stacksafe::StackSafe<T>;
 #[cfg(not(feature = "stacker"))]
 type StackSafe<T> = T;
 
+/// What a measured leaf reports to layout.
+pub struct MeasuredLeaf {
+    /// The size of the leaf's content.
+    pub size: Size<Pixels>,
+    /// The distance from the top of the content to the baseline of its first line, for a leaf
+    /// with text. Block, flex, grid and table containers align by it.
+    pub first_baseline: Option<Pixels>,
+}
+
+impl From<Size<Pixels>> for MeasuredLeaf {
+    fn from(size: Size<Pixels>) -> Self {
+        MeasuredLeaf {
+            size,
+            first_baseline: None,
+        }
+    }
+}
+
 type MeasureFn =
-    dyn FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>;
+    dyn FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> MeasuredLeaf;
 type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 
 struct NodeContext {
@@ -156,7 +174,7 @@ impl TaffyLayoutEngine {
             Size<AvailableSpace>,
             &mut Window,
             &mut App,
-        ) -> Size<Pixels>
+        ) -> MeasuredLeaf
         + 'static,
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
@@ -339,12 +357,15 @@ impl TaffyLayoutEngine {
         cx: &mut App,
     ) {
         self.taffy
-            .compute_layout_with_measure(
+            .compute_layout_with_leaf_measure(
                 id.into(),
                 available_space.into(),
                 |known_dimensions, available_space, _id, node_context, _style| {
                     let Some(node_context) = node_context else {
-                        return taffy::geometry::Size::default();
+                        return taffy::MeasuredLeaf {
+                            size: taffy::geometry::Size::default(),
+                            first_baseline: None,
+                        };
                     };
 
                     let known_dimensions = Size {
@@ -365,9 +386,13 @@ impl TaffyLayoutEngine {
                         untransform(available_space.height),
                     );
 
-                    let measured_size: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    let measured = (node_context.measure)(known_dimensions, available_space, window, cx);
+                    taffy::MeasuredLeaf {
+                        size: snap_measured_size_to_device_pixels(measured.size, scale_factor).into(),
+                        first_baseline: measured
+                            .first_baseline
+                            .map(|baseline| baseline.0.max(0.0) * scale_factor),
+                    }
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -1614,6 +1639,8 @@ mod tests {
             text: &'static str,
             style: StyleRefinement,
             bounds: Option<Rc<Cell<Option<Bounds<Pixels>>>>>,
+            /// Where the baseline of the first line is, from its top.
+            baseline: Option<f32>,
         }
 
         fn words(text: &'static str) -> Words {
@@ -1621,6 +1648,7 @@ mod tests {
                 text,
                 style: StyleRefinement::default(),
                 bounds: None,
+                baseline: None,
             }
         }
 
@@ -1680,6 +1708,7 @@ mod tests {
                 let mut style = Style::default();
                 style.refine(&self.style);
                 let text = self.text;
+                let baseline = self.baseline;
                 let layout_id =
                     window.request_measured_layout(style, move |known, available, _window, _cx| {
                         let wrap = known.width.map(|width| width.0).or(match available.width {
@@ -1687,7 +1716,10 @@ mod tests {
                             AvailableSpace::MinContent => Some(0.),
                             AvailableSpace::MaxContent => None,
                         });
-                        measure_words(text, wrap)
+                        crate::MeasuredLeaf {
+                            size: measure_words(text, wrap),
+                            first_baseline: baseline.map(px),
+                        }
                     });
                 (layout_id, ())
             }
@@ -1771,6 +1803,35 @@ mod tests {
 
         const SHORT: &str = "hello world";
         const LONG: &str = "hello wonderful world";
+
+        /// A flex row that aligns its items by their baselines, each a leaf of one line with a baseline of its own.
+        #[gpui::test]
+        fn a_measured_leaf_reports_its_first_baseline_to_the_container(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, SHORT, |_| {
+                let mut first = words("a");
+                first.baseline = Some(8.);
+                let mut second = words("b");
+                second.baseline = Some(12.);
+                second.style.size.height = Some(px(20.).into());
+                div()
+                    .flex()
+                    .items_baseline()
+                    .w(px(400.))
+                    .child(div().debug_selector(|| "first".into()).child(first))
+                    .child(div().debug_selector(|| "second".into()).child(second))
+                    .child(
+                        div()
+                            .debug_selector(|| "third".into())
+                            .child(words("c")),
+                    )
+                    .into_any_element()
+            });
+            // The first sits 12 - 8 below the top; the last has no baseline, so its bottom (10) is
+            // the one that meets 12.
+            assert_eq!(bounds(cx, "first").origin.y, px(4.));
+            assert_eq!(bounds(cx, "second").origin.y, px(0.));
+            assert_eq!(bounds(cx, "third").origin.y, px(2.));
+        }
 
         #[gpui::test]
         fn max_content_is_the_text_on_one_line(cx: &mut TestAppContext) {

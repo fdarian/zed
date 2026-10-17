@@ -87,7 +87,7 @@ pub(super) fn align_and_position_item(
     direction: Direction,
     container_border_box_width: f32,
     container_border: Rect<f32>,
-) -> (Size<f32>, f32, f32) {
+) -> (Size<f32>, f32, f32, Option<f32>) {
     let grid_area_size = Size { width: grid_area.right - grid_area.left, height: grid_area.bottom - grid_area.top };
 
     let style = tree.get_grid_child_style(node);
@@ -324,7 +324,7 @@ pub(super) fn align_and_position_item(
     #[cfg(not(feature = "content_size"))]
     let contribution = Size::ZERO;
 
-    (contribution, y, height)
+    (contribution, y, height, layout_output.first_baselines.y)
 }
 
 /// Align and size a grid item along a single axis

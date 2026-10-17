@@ -490,8 +490,9 @@ fn resolve_item_baselines(
             continue;
         }
 
-        // Compute the baselines of all items in the row
-        for item in row_items.iter_mut() {
+        // Compute the baselines of the items in the row that are aligned to them (fdarian fork patch: an
+        // item with another alignment is not shimmed down to the baseline of the others)
+        for item in row_items.iter_mut().filter(|item| item.align_self == AlignSelf::BASELINE) {
             let measured_size_and_baselines = tree.perform_child_layout(
                 item.node,
                 Size::NONE,
@@ -514,8 +515,8 @@ fn resolve_item_baselines(
         let row_max_baseline =
             row_items.iter().map(|item| item.baseline.unwrap_or(0.0)).max_by(|a, b| a.total_cmp(b)).unwrap();
 
-        // Compute the baseline shim for each item in the row
-        for item in row_items.iter_mut() {
+        // Compute the baseline shim for each baseline-aligned item in the row
+        for item in row_items.iter_mut().filter(|item| item.align_self == AlignSelf::BASELINE) {
             item.baseline_shim = row_max_baseline - item.baseline.unwrap_or(0.0);
         }
     }

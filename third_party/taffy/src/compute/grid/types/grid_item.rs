@@ -89,6 +89,9 @@ pub(in super::super) struct GridItem {
     pub y_position: f32,
     /// Final height. Used to compute baseline alignment for the container.
     pub height: f32,
+    /// The first baseline of the item as it was laid out last, from the top of its border box. Used for the
+    /// baseline of the container.
+    pub final_baseline: Option<f32>,
 }
 
 impl GridItem {
@@ -121,6 +124,7 @@ impl GridItem {
             justify_self: style.justify_self().unwrap_or(parent_justify_items),
             baseline: None,
             baseline_shim: 0.0,
+            final_baseline: None,
             row_indexes: Line { start: 0, end: 0 }, // Properly initialised later
             column_indexes: Line { start: 0, end: 0 }, // Properly initialised later
             crosses_flexible_row: false,            // Properly initialised later

@@ -11,7 +11,7 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragOperation, Edges, Effect, Entity,
     EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
-    Keystroke, KeystrokeEvent, LayoutId, LayoutInsets, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LayoutInsets, LineLayoutIndex, MeasuredLeaf, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, OverlineStyle, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
@@ -6457,13 +6457,13 @@ impl Window {
     /// determine the element's size. One place this is used internally is when measuring text.
     ///
     /// The given closure is invoked at layout time with the known dimensions and available space and
-    /// returns a `Size`.
+    /// returns a `Size`, or a [`MeasuredLeaf`] when the node has text and so a first baseline.
     ///
     /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
-    pub fn request_measured_layout<F>(&mut self, style: Style, measure: F) -> LayoutId
+    pub fn request_measured_layout<F, R>(&mut self, style: Style, measure: F) -> LayoutId
     where
-        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
-            + 'static,
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> R + 'static,
+        R: Into<MeasuredLeaf>,
     {
         self.invalidator.debug_assert_prepaint();
 
@@ -6472,7 +6472,9 @@ impl Window {
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, measure)
+            .request_measured_layout(style, rem_size, scale_factor, move |known, available, window, cx| {
+                measure(known, available, window, cx).into()
+            })
     }
 
     /// Compute the layout for the given id within the given available space.

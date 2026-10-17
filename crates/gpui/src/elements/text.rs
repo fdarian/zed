@@ -1,7 +1,7 @@
 use crate::{
     ActiveTooltip, AnyView, App, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
     DispatchPhase, Element, ElementId, EndTruncation, GlobalElementId, GlyphInset,
-    HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId,
+    HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId, MeasuredLeaf,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     SharedString, Size, TextInset, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom,
     WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
@@ -731,6 +731,13 @@ struct TextLayoutInner {
     bounds: Option<Bounds<Pixels>>,
 }
 
+impl TextLayoutInner {
+    fn first_baseline(&self) -> Option<Pixels> {
+        let line = self.lines.first()?;
+        Some(line.rows(self.line_height).first()?.baseline)
+    }
+}
+
 impl TextLayout {
     fn layout(
         &self,
@@ -789,7 +796,7 @@ impl TextLayout {
                         size: Some(Size::default()),
                         bounds: None,
                     });
-                    Size::default()
+                    MeasuredLeaf::from(Size::default())
                 };
                 let wrap_width = if text_style.white_space == WhiteSpace::Normal {
                     match (known_dimensions.width, available_space.width) {
@@ -845,7 +852,10 @@ impl TextLayout {
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
                 {
-                    return size;
+                    return MeasuredLeaf {
+                        size,
+                        first_baseline: text_layout.first_baseline(),
+                    };
                 }
 
                 let truncated = (|| -> anyhow::Result<_> {
@@ -958,7 +968,7 @@ impl TextLayout {
                     size.width = size.width.max(line_size.width).ceil();
                 }
 
-                element_state.0.borrow_mut().replace(TextLayoutInner {
+                let inner = TextLayoutInner {
                     lines,
                     len,
                     line_height,
@@ -967,9 +977,14 @@ impl TextLayout {
                     inset_width: width,
                     size: Some(size),
                     bounds: None,
-                });
+                };
+                let first_baseline = inner.first_baseline();
+                element_state.0.borrow_mut().replace(inner);
 
-                size
+                MeasuredLeaf {
+                    size,
+                    first_baseline,
+                }
             }
         });
         self.1.set(Some(layout_id));
@@ -1062,10 +1077,7 @@ impl TextLayout {
     /// The distance from the top of the text to the baseline of its first line, or `None`
     /// for a text with no lines. It needs only the measure, not prepaint.
     pub fn first_baseline(&self) -> Option<Pixels> {
-        let element_state = self.0.borrow();
-        let element_state = element_state.as_ref()?;
-        let line = element_state.lines.first()?;
-        Some(line.rows(element_state.line_height).first()?.baseline)
+        self.0.borrow().as_ref()?.first_baseline()
     }
 
     /// The distance from the top of the text to the baseline of its last line, or

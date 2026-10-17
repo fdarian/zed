@@ -40,7 +40,7 @@ pub(crate) mod grid;
 #[cfg(feature = "table_layout")]
 pub(crate) mod table;
 
-pub use leaf::compute_leaf_layout;
+pub use leaf::{compute_leaf_layout, MeasuredLeaf};
 
 #[cfg(feature = "block_layout")]
 pub use self::block::{compute_block_layout, BlockContext, BlockFormattingContext};

@@ -17,8 +17,6 @@
 //!   - Cells and rows with `rowspan`s that leave rows without a cell of their own (and no height) share the height of
 //!     the spanning cell differently in some cases, and percent rows past 100% are not shrunk the way Chrome does.
 //!   - `direction: rtl` is ignored, columns are not mirrored.
-//!   - Leaf nodes that are measured (text) have no baseline, so a cell aligned to the baseline with text in it is
-//!     aligned by the bottom of its content instead of its first line.
 //!   - A table that is a flex item and is given less width than its min-content still reports its min-content width,
 //!     but the flex container positions it for the width it asked for.
 //!   - The max-content width of a table whose percentage columns add up to 100% next to columns without one is
