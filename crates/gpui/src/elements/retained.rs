@@ -1974,6 +1974,40 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn a_new_rem_size_has_the_subtree_laid_out_again(cx: &mut TestAppContext) {
+        let (window, builds, _) = single(cx, false, |_, _| {
+            div()
+                .id("sized")
+                .w(crate::rems(2.))
+                .h(px(20.))
+                .bg(crate::red())
+                .into_any_element()
+        });
+        let width = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| {
+                let scale = window.scale_factor();
+                window.rendered_frame.scene.quads.last().expect("painted").bounds.size.width.0 / scale
+            })
+            .unwrap()
+        };
+        draw(window, cx);
+        draw(window, cx);
+        assert_eq!(width(cx), 32.);
+        let built = builds.get();
+        assert!(counters(window, cx).replays > 0);
+
+        cx.update_window(window, |_, window, _| window.set_rem_size(px(20.))).unwrap();
+        draw(window, cx);
+        assert_eq!(width(cx), 40.);
+        assert!(builds.get() > built, "the subtree is built for the new size");
+        assert_eq!(
+            counters(window, cx).layout_fallbacks,
+            0,
+            "the layout is not found out of date after it was used"
+        );
+    }
+
     struct StillLoading;
 
     impl crate::ImageCache for StillLoading {

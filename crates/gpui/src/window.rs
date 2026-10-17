@@ -3622,8 +3622,15 @@ impl Window {
 
     /// Sets the size of an em for the base font of the application. Adjusting this value allows the
     /// UI to scale, just like zooming a web page.
+    ///
+    /// Everything that was sized in rems is laid out again, also what a retained subtree or a
+    /// cached view would have kept from the last frame.
     pub fn set_rem_size(&mut self, rem_size: impl Into<Pixels>) {
-        self.rem_size = rem_size.into();
+        let rem_size = rem_size.into();
+        if self.rem_size != rem_size {
+            self.rem_size = rem_size;
+            self.refresh();
+        }
     }
 
     /// Acquire a globally unique identifier for the given ElementId.
