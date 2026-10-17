@@ -41,11 +41,14 @@ pub enum NonReusable {
     /// The subtree was built again for a frame in which its layout nodes did not stay as they
     /// were, and was laid out as a root of its own.
     LayoutMismatch,
+    /// A cached view in the subtree was drawn from its own last frame. The ranges of that frame
+    /// it keeps are not moved when the subtree is replayed.
+    CachedView,
 }
 
 impl NonReusable {
     /// Every reason, in the order the first that applies to a recording is the one counted.
-    pub const ALL: [NonReusable; 13] = [
+    pub const ALL: [NonReusable; 14] = [
         NonReusable::Lift,
         NonReusable::Escape,
         NonReusable::DeferredDraw,
@@ -58,6 +61,7 @@ impl NonReusable {
         NonReusable::FrameCallback,
         NonReusable::PendingAsset,
         NonReusable::WindowControl,
+        NonReusable::CachedView,
         NonReusable::Publication,
     ];
 
@@ -143,6 +147,7 @@ pub(crate) struct RetainedWindow {
     pub(crate) redraw_requests: u32,
     pub(crate) autoscroll_requests: u32,
     pub(crate) pending_assets: u32,
+    pub(crate) cached_view_hits: u32,
 }
 
 /// What a recording of a retained subtree could not repeat happened, if the counts differ.
@@ -154,6 +159,7 @@ struct Effects {
     redraw_requests: u32,
     autoscroll_requests: u32,
     pending_assets: u32,
+    cached_view_hits: u32,
     deferred_draws: usize,
     frame_callbacks: usize,
     window_controls: usize,
@@ -201,6 +207,10 @@ impl Effects {
         add(
             self.window_controls != later.window_controls,
             NonReusable::WindowControl,
+        );
+        add(
+            self.cached_view_hits != later.cached_view_hits,
+            NonReusable::CachedView,
         );
         reasons
     }
@@ -471,6 +481,7 @@ impl Window {
             redraw_requests: self.retained.redraw_requests,
             autoscroll_requests: self.retained.autoscroll_requests,
             pending_assets: self.retained.pending_assets,
+            cached_view_hits: self.retained.cached_view_hits,
             deferred_draws: self.next_frame.deferred_draws.len(),
             frame_callbacks: self.next_frame_callbacks.borrow().len(),
             window_controls: self.next_frame.window_control_hitboxes.len(),
