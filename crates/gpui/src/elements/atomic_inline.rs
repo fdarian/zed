@@ -406,6 +406,8 @@ mod tests {
         pub flex_items: Vec<(f32, f32)>,
         /// Painted this far from where the text puts the box.
         pub offset: (f32, f32),
+        /// The index of the span the box is in.
+        pub parent: Option<usize>,
         /// Added to `offset`: a fraction of the width of the paragraph and one of
         /// `containing_height`.
         pub offset_fraction: (f32, f32),
@@ -424,6 +426,7 @@ mod tests {
             clicks: None,
             flex_items: Vec::new(),
             offset: (0., 0.),
+            parent: None,
             containing_height: 0.,
             offset_fraction: (0., 0.),
         }
@@ -442,6 +445,11 @@ mod tests {
     }
 
     impl Atomic {
+        pub(super) fn in_span(mut self, span: usize) -> Self {
+            self.parent = Some(span);
+            self
+        }
+
         pub(super) fn offset_of(mut self, x: f32, y: f32, containing_height: f32) -> Self {
             self.offset_fraction = (x, y);
             self.containing_height = containing_height;
@@ -517,6 +525,7 @@ mod tests {
             let mut inline = AtomicInline::new(index, child.into_any_element());
             inline.width = self.width_fraction.map(crate::relative);
             inline.vertical_align = self.align;
+            inline.parent = self.parent;
             inline.baseline = baseline;
             inline.offset = crate::point(
                 DefiniteLength::calc(crate::px(self.offset.0), self.offset_fraction.0),
@@ -1349,6 +1358,95 @@ mod tests {
             f32::from(plain.layout.position_for_index(5).unwrap().x),
             "the text after the box",
         );
+    }
+
+    /// `<div style="width:400px"><span style="line-height:40px"><span style="display:inline-block;width:30px;height:10px">`
+    /// (and `vertical-align:5px` or `top` on the outer span): Chrome makes the line as tall as the strut of
+    /// the span, 19px of ascent and 5px of descent with 8px of half-leading each side, and the box sits on its
+    /// baseline, whatever the span holds.
+    #[test]
+    fn a_span_with_only_a_box_in_it_has_its_strut_in_the_line() {
+        let span = |align| Span {
+            range: 0..OBJECT.len_utf8(),
+            parent: None,
+            align,
+            line_height: Some(40.),
+            font_size: 20.,
+        };
+        let laid = |align| {
+            lay_out_with(Setup {
+                width: 400.,
+                text: OBJECT.to_string(),
+                atomics: vec![atomic(30., 10.).in_span(0)],
+                spans: vec![span(align)],
+                ..Default::default()
+            })
+        };
+        let offset = |length: f32| VerticalAlign::Offset {
+            length: crate::px(length),
+            line_height_fraction: 0.,
+        };
+        // The strut is 27px above the baseline and 13px below.
+        let plain = laid(VerticalAlign::Baseline);
+        assert_close(plain.paragraph.size.height, 40., "baseline: the line");
+        assert_close(plain.boxes[0].origin.y, 17., "baseline: the box");
+        let raised = laid(offset(5.));
+        assert_close(raised.paragraph.size.height, 40., "raised: the line");
+        // The box is in the span, so it is raised with it: 5px up from a baseline 32px down.
+        assert_close(raised.boxes[0].origin.y, 17., "raised: the box");
+        let lowered = laid(offset(-15.));
+        assert_close(lowered.paragraph.size.height, 45., "lowered: the line");
+        assert_close(lowered.boxes[0].origin.y, 22., "lowered: the box");
+        for align in [VerticalAlign::Top, VerticalAlign::Bottom] {
+            let aligned = laid(align);
+            assert_close(aligned.paragraph.size.height, 40., &format!("{align:?}: the line"));
+            assert_close(aligned.boxes[0].origin.y, 17., &format!("{align:?}: the box"));
+        }
+    }
+
+    /// `<span style="line-height:40px"><span><span style="line-height:10px"><span ib>`: the strut of every
+    /// span around the box is in the line, and the box is on the baseline they share.
+    #[test]
+    fn every_span_around_a_box_has_its_strut_in_the_line() {
+        let len = OBJECT.len_utf8();
+        let span = |parent, line_height| Span {
+            range: 0..len,
+            parent,
+            align: VerticalAlign::Baseline,
+            line_height: Some(line_height),
+            font_size: 20.,
+        };
+        let laid = lay_out_with(Setup {
+            width: 400.,
+            text: OBJECT.to_string(),
+            atomics: vec![atomic(30., 10.).in_span(1)],
+            spans: vec![span(None, 40.), span(Some(0), 10.)],
+            ..Default::default()
+        });
+        assert_close(laid.paragraph.size.height, 40., "the line");
+        assert_close(laid.boxes[0].origin.y, 17., "the box");
+    }
+
+    /// `<span style="line-height:40px">` around a box that wraps to a line of its own after text outside the
+    /// span: that line has the strut of the span.
+    #[test]
+    fn the_line_a_box_wraps_to_has_the_strut_of_the_span_around_it() {
+        let text = format!("xxxxxxxxxx{OBJECT}");
+        let laid = lay_out_with(Setup {
+            width: 140.,
+            text,
+            atomics: vec![atomic(30., 10.).in_span(0)],
+            spans: vec![Span {
+                range: 10..10 + OBJECT.len_utf8(),
+                parent: None,
+                align: VerticalAlign::Baseline,
+                line_height: Some(40.),
+                font_size: 20.,
+            }],
+            ..Default::default()
+        });
+        assert_close(laid.paragraph.size.height, 60., "the lines");
+        assert_close(laid.boxes[0].origin.y, 20. + 17., "the box");
     }
 
     /// `<div style="width:400px"><span style="display:inline-block;position:relative;left:10%;top:25%;...">`

@@ -135,6 +135,28 @@ pub enum RunPlacement {
     Bottom,
 }
 
+/// How far the strut of an inline box reaches above and below its baseline: the ascent and
+/// descent of its font with the half-leading its line height gives it (CSS 2.1 §10.8.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InlineStrut {
+    /// Above the baseline.
+    pub above: Pixels,
+    /// Below the baseline.
+    pub below: Pixels,
+}
+
+impl InlineStrut {
+    fn grown_to(strut: Option<Self>, above: Pixels, below: Pixels) -> Option<Self> {
+        Some(match strut {
+            Some(strut) => Self {
+                above: strut.above.max(above),
+                below: strut.below.max(below),
+            },
+            None => Self { above, below },
+        })
+    }
+}
+
 /// What a [`ShapedRun`] is besides text: how it is placed in its row, and whether it
 /// is the placeholder of an atomic inline.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -144,6 +166,13 @@ pub struct InlineRun {
     /// Whether the run is an atomic inline: one glyph that is never painted, with the
     /// ascent and descent of the box.
     pub object: bool,
+    /// For an atomic inline: the struts of the boxes around it that sit on the baseline of
+    /// its row (raised or lowered with their vertical alignment), which are in the row
+    /// whatever is in them, since every inline box has its strut.
+    pub strut: Option<InlineStrut>,
+    /// For an atomic inline in a box aligned to the top or the bottom of its row: the struts
+    /// of the boxes of that aligned group around it, which are one with the box in the group.
+    pub aligned_strut: Option<InlineStrut>,
 }
 
 impl InlineRun {
@@ -194,6 +223,14 @@ struct Frame {
     placement: RunPlacement,
 }
 
+/// Where a box sits on its line, and how far its own extent reaches around its baseline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResolvedBox {
+    pub placement: RunPlacement,
+    pub above: Pixels,
+    pub below: Pixels,
+}
+
 /// Where each box of `specs` sits on its line, as the baseline shift that CSS 2.1
 /// §10.8.1 gives it relative to the baseline of the line, or `Top` or `Bottom`.
 /// `line_height` is the one the line is laid out with.
@@ -202,7 +239,7 @@ pub(crate) fn resolve_placements(
     line: LineMetrics,
     line_height: Pixels,
     font_metrics: &dyn Fn(FontId) -> FontMetrics,
-) -> Vec<RunPlacement> {
+) -> Vec<ResolvedBox> {
     let root = Frame {
         font_size: line.font_size,
         ascent: line.ascent,
@@ -211,6 +248,7 @@ pub(crate) fn resolve_placements(
         placement: RunPlacement::Baseline,
     };
     let mut frames: Vec<Frame> = Vec::with_capacity(specs.len());
+    let mut extents: Vec<(Pixels, Pixels)> = Vec::with_capacity(specs.len());
     for (ix, spec) in specs.iter().enumerate() {
         let parent = spec
             .parent
@@ -271,6 +309,7 @@ pub(crate) fn resolve_placements(
             }
         };
 
+        extents.push((above, below));
         frames.push(Frame {
             font_size,
             ascent,
@@ -279,7 +318,50 @@ pub(crate) fn resolve_placements(
             placement,
         });
     }
-    frames.into_iter().map(|frame| frame.placement).collect()
+    frames
+        .into_iter()
+        .zip(extents)
+        .map(|(frame, (above, below))| ResolvedBox {
+            placement: frame.placement,
+            above,
+            below,
+        })
+        .collect()
+}
+
+/// The struts of the boxes around the atomic inline `specs[atomic]`, as its run carries
+/// them: those on the baseline of its row, and those of the group aligned to the top or the
+/// bottom of its row that it is in.
+fn struts_around(
+    specs: &[InlineSpec],
+    boxes: &[ResolvedBox],
+    atomic: usize,
+) -> (Option<InlineStrut>, Option<InlineStrut>) {
+    let (mut on_baseline, mut aligned) = (None, None);
+    let mut ancestor = specs[atomic].parent;
+    while let Some(ix) = ancestor {
+        let Some(spec) = specs.get(ix) else { break };
+        if matches!(spec.content, SpecContent::Text { .. }) {
+            let resolved = boxes[ix];
+            match resolved.placement {
+                RunPlacement::Baseline => {
+                    on_baseline = InlineStrut::grown_to(on_baseline, resolved.above, resolved.below);
+                }
+                RunPlacement::Raised(raise) => {
+                    on_baseline = InlineStrut::grown_to(
+                        on_baseline,
+                        resolved.above + raise,
+                        resolved.below - raise,
+                    );
+                }
+                RunPlacement::Top | RunPlacement::Bottom => {
+                    aligned = InlineStrut::grown_to(aligned, resolved.above, resolved.below);
+                }
+            }
+        }
+        ancestor = spec.parent;
+    }
+    (on_baseline, aligned)
 }
 
 /// `layout` with every run split where the innermost box around its glyphs changes,
@@ -287,7 +369,7 @@ pub(crate) fn resolve_placements(
 pub(crate) fn apply_inline(
     layout: &LineLayout,
     specs: &[InlineSpec],
-    placements: &[RunPlacement],
+    boxes: &[ResolvedBox],
 ) -> LineLayout {
     let innermost = |index: usize| -> Option<usize> {
         specs.iter().rposition(|spec| spec.range.contains(&index))
@@ -304,10 +386,20 @@ pub(crate) fn apply_inline(
             runs.push(ShapedRun {
                 glyphs: run.glyphs[start..end].to_vec(),
                 inline: match spec_ix {
-                    Some(ix) => InlineRun {
-                        placement: placements[ix],
-                        object: specs[ix].atomic().is_some(),
-                    },
+                    Some(ix) => {
+                        let object = specs[ix].atomic().is_some();
+                        let (strut, aligned_strut) = if object {
+                            struts_around(specs, boxes, ix)
+                        } else {
+                            (None, None)
+                        };
+                        InlineRun {
+                            placement: boxes[ix].placement,
+                            object,
+                            strut,
+                            aligned_strut,
+                        }
+                    }
                     None => run.inline,
                 },
                 ..run.clone()

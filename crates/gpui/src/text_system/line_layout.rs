@@ -403,6 +403,11 @@ impl LineLayout {
             let run_line_height = run.line_height.unwrap_or(line_height);
             let run_above = run.ascent + (run_line_height - run.ascent - run.descent) / 2.;
             let run_below = run_line_height - run_above;
+            // The boxes of its aligned group around an atomic inline are one with it.
+            let (run_above, run_below) = match run.inline.aligned_strut {
+                Some(strut) => (run_above.max(strut.above), run_below.max(strut.below)),
+                None => (run_above, run_below),
+            };
             let mut last_row = None;
             for glyph_ix in 0..run.glyphs.len() {
                 while wrap_boundaries.get(next_boundary) == Some(&WrapBoundary { run_ix, glyph_ix })
@@ -429,6 +434,11 @@ impl LineLayout {
                     RunPlacement::Bottom => {
                         bottom_height[row_ix] = bottom_height[row_ix].max(run_above + run_below);
                     }
+                }
+                // Every inline box has its strut in its row, even one with nothing but a box in it.
+                if let Some(strut) = run.inline.strut {
+                    above[row_ix] = above[row_ix].max(strut.above);
+                    below[row_ix] = below[row_ix].max(strut.below);
                 }
                 if run.inline.placement != RunPlacement::Baseline {
                     placed.push((row_ix, run_ix, run.inline.placement, run_above, run_below));
@@ -1697,7 +1707,7 @@ impl LineLayoutCache {
                 .font_metrics(run.font_id)
                 .x_height(run.font_size.unwrap_or(font_size))
         });
-        let placements = resolve_placements(
+        let boxes = resolve_placements(
             inline,
             LineMetrics {
                 font_size,
@@ -1708,7 +1718,7 @@ impl LineLayoutCache {
             line_height,
             &|font_id| self.platform_text_system.font_metrics(font_id),
         );
-        Arc::new(apply_inline(&shaped, inline, &placements))
+        Arc::new(apply_inline(&shaped, inline, &boxes))
     }
 
     /// Shapes the text between the atomic inlines of `inline`, which the shaper never
@@ -3797,6 +3807,7 @@ mod tests {
                     inline: InlineRun {
                         placement: RunPlacement::Baseline,
                         object: is_object,
+                        ..Default::default()
                     },
                     ..make_layout(Vec::new()).runs.remove(0)
                 });
@@ -3876,6 +3887,7 @@ mod tests {
                     inline: InlineRun {
                         placement: *placement,
                         object: true,
+                        ..Default::default()
                     },
                     ..make_layout(Vec::new()).runs.remove(0)
                 });
