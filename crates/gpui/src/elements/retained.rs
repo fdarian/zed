@@ -35,7 +35,8 @@
 
 use crate::{
     AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, NonReusable, PaintRecord, Pixels, PrepaintRecord, ReplayKey, Window,
+    IntoElement, LayoutId, NonReusable, PaintIndex, PaintRecord, Pixels, PrepaintRecord,
+    PrepaintStateIndex, ReplayKey, Window,
 };
 use collections::FxHashSet;
 use std::{any::TypeId, ops::Range, rc::Rc};
@@ -144,6 +145,30 @@ pub(crate) struct RetainedState {
 }
 
 impl RetainedState {
+    /// Where the prepaint of the subtree is, now that the range of the frame it was recorded in
+    /// that starts at `from` was copied to `to`, where the frame being built has it.
+    pub(crate) fn move_prepaint(&mut self, from: &PrepaintStateIndex, to: &PrepaintStateIndex, serial: u64) {
+        if let Some(recorded) = self.recorded.as_mut() {
+            let range = &recorded.prepaint.range;
+            recorded.prepaint.range = range.start.moved(from, to)..range.end.moved(from, to);
+            recorded.serial = serial;
+        }
+    }
+
+    pub(crate) fn move_paint(&mut self, from: &PaintIndex, to: &PaintIndex, serial: u64) {
+        if let Some(paint) = self.recorded.as_mut().and_then(|recorded| {
+            recorded.paint_serial = serial;
+            recorded.paint.as_mut()
+        }) {
+            paint.range = paint.range.start.moved(from, to)..paint.range.end.moved(from, to);
+        }
+    }
+
+    /// The same for the accessed states of the layout of the subtree, which `range` is of.
+    pub(crate) fn move_layout(&mut self, from: usize, to: usize) {
+        self.layout_states = self.layout_states.start + to - from..self.layout_states.end + to - from;
+    }
+
     /// What the last prepaint and paint of the subtree left in the frame being built, as text.
     pub(crate) fn describe(&self, window: &Window) -> Option<String> {
         let recorded = self.recorded.as_ref()?;
@@ -250,7 +275,15 @@ impl Element for Retained {
                 })
             {
                 window.retained.counters.hits += 1;
-                state.layout_states = window.reuse_accessed_states(state.layout_states.clone());
+                let layout_states = window.reuse_accessed_states(state.layout_states.clone());
+                if let Some(recorded) = &state.recorded {
+                    window.move_nested_layout_states(
+                        &recorded.prepaint.nested,
+                        state.layout_states.start,
+                        layout_states.start,
+                    );
+                }
+                state.layout_states = layout_states;
                 cx.entities.extend_accessed(&state.accessed_entities);
                 return ((state.root, RetainedLayout::Skipped), state);
             }
@@ -351,11 +384,12 @@ impl Element for Retained {
                         .recorded
                         .as_mut()
                         .expect("a replayed subtree has its recording");
+                    let nested = recorded.prepaint.nested.clone();
                     let paint = recorded
                         .paint
                         .as_mut()
                         .expect("a subtree is skipped only with its paint recorded");
-                    paint.range = window.replay_paint(paint);
+                    paint.range = window.replay_paint(paint, &nested);
                     recorded.paint_serial = window.building_serial();
                     if let Some(hook) = hook {
                         hook(RetainedPhase::Paint, window, cx);
@@ -1640,25 +1674,48 @@ mod tests {
         assert_eq!(nested.builds.get(), builds);
         assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
 
-        // The outer subtree replayed over the inner one, which is not recorded in the frame
-        // before: a new key for the outer subtree builds both.
+        // The outer subtree replayed over the inner one, which went with it: a new key for the
+        // outer subtree builds it, and the inner one is replayed inside it.
+        let replays = counters(nested.window, cx).replays;
         nested.outer_key.set(2);
         draw(nested.window, cx);
-        assert_eq!(nested.builds.get(), (builds.0 + 1, builds.1 + 1));
+        assert_eq!(nested.builds.get(), (builds.0 + 1, builds.1));
+        assert_eq!(counters(nested.window, cx).replays, replays + 1, "the inner one");
         assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
 
-        // Built in the frame before, the inner one replays inside a subtree that is built, and
-        // the outer one records what it left.
+        // Replayed inside a subtree that was built, the inner one is replayed inside one that is
+        // built again, and the outer one records what it left.
         let replays = counters(nested.window, cx).replays;
         nested.outer_key.set(3);
         draw(nested.window, cx);
-        assert_eq!(nested.builds.get(), (builds.0 + 2, builds.1 + 1));
+        assert_eq!(nested.builds.get(), (builds.0 + 2, builds.1));
         assert_eq!(counters(nested.window, cx).replays, replays + 1, "the inner one");
         assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
         draw(nested.window, cx);
-        assert_eq!(nested.builds.get(), (builds.0 + 2, builds.1 + 1));
+        assert_eq!(nested.builds.get(), (builds.0 + 2, builds.1));
         assert_eq!(counters(nested.window, cx).replays, replays + 2, "the outer one");
         assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
+        click(nested.window, cx, 30., 10.);
+    }
+
+    #[gpui::test]
+    fn an_inner_subtree_is_still_replayable_after_the_outer_one_replayed_many_frames(
+        cx: &mut TestAppContext,
+    ) {
+        let nested = Nested::new(cx);
+        for _ in 0..4 {
+            draw(nested.window, cx);
+        }
+        let replayed = snapshot(nested.window, cx, &POINTS);
+        let builds = nested.builds.get();
+        let before = counters(nested.window, cx);
+        nested.outer_key.set(2);
+        draw(nested.window, cx);
+        let after = counters(nested.window, cx);
+        assert_eq!(nested.builds.get(), (builds.0 + 1, builds.1), "only the outer one is built");
+        assert_eq!(after.replays, before.replays + 1);
+        assert_eq!(snapshot(nested.window, cx, &POINTS), replayed);
+        assert_eq!(tab_order(nested.window, cx, 2).len(), 2);
         click(nested.window, cx, 30., 10.);
     }
 
