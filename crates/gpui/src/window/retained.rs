@@ -284,12 +284,14 @@ impl Window {
         self.retained.publications = self.retained.publications.wrapping_add(1);
     }
 
-    /// Whether the frame being built can skip and replay retained subtrees. Not when it is one of
-    /// several passes that are thrown away, or a measure pass: neither may take the recordings out
-    /// of the frame it replaces. Not with the inspector on, which needs every element asked.
+    /// Whether the frame being built can skip and replay retained subtrees. Only in the first pass
+    /// of a draw: a later pass starts over from the frame that is rendered, and builds everything,
+    /// so a replay in a first pass that was then abandoned (see
+    /// [`Window::request_redraw_before_present`]) takes nothing the later pass needs. Not in a
+    /// measure pass, which may not take the recordings out of the frame it replaces, nor with the
+    /// inspector on, which needs every element asked.
     pub(crate) fn retention_allowed(&self) -> bool {
         self.draw_pass == 1
-            && self.max_draw_passes == 1
             && !self.measuring
             && !self.layout_only
             && !self.inspector_active()

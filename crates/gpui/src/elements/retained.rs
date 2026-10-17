@@ -21,7 +21,8 @@
 //! frame built again when one is notified (a view inside the subtree renders again that way).
 //!
 //! A subtree that did something a replay cannot repeat is built every frame instead, see
-//! [`NonReusable`]. The passes that cannot replay are every pass but the first of a draw, the
+//! [`NonReusable`]. The passes that cannot replay are every pass but the first of a draw (a first pass that is
+//! abandoned after it replayed leaves the pass that follows it a frame to build from), the
 //! passes that measure, and any frame while the inspector is on.
 //!
 //! The element must have an element id that is unique among the elements around it. The root of
@@ -1036,29 +1037,140 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_draw_with_several_passes_builds_everything(cx: &mut TestAppContext) {
+    fn a_window_that_allows_several_passes_replays_in_the_first(cx: &mut TestAppContext) {
         let layout = Layout::new(cx, 3);
         let fixture = &layout.fixture;
+        cx.update_window(fixture.window, |_, window, _| window.set_max_draw_passes(4))
+            .unwrap();
         fixture.draw(cx);
         let before = fixture.counters(cx);
-        cx.update_window(fixture.window, |_, window, _| window.set_max_draw_passes(2))
-            .unwrap();
         let builds = fixture.builds.get();
         fixture.draw(cx);
         fixture.draw(cx);
         let after = fixture.counters(cx);
-        assert_eq!(fixture.builds.get(), builds + 6);
-        assert_eq!(after.hits, before.hits);
-        assert_eq!(after.replays, before.replays);
+        assert_eq!(fixture.builds.get(), builds);
+        assert_eq!(after.replays, before.replays + 6);
+        assert_eq!(after.total_non_reusable(), 0);
+    }
 
-        // And a single pass again replays what the passes before it did not record.
-        cx.update_window(fixture.window, |_, window, _| window.set_max_draw_passes(1))
-            .unwrap();
+    /// Cards in retained subtrees, then a canvas that asks for another pass from its prepaint
+    /// while `abandon` is set, which is after the cards have been replayed.
+    struct Abandoning {
+        fixture: Fixture,
+        abandon: Rc<Cell<bool>>,
+    }
+
+    impl Abandoning {
+        fn new(cx: &mut TestAppContext, count: usize) -> Self {
+            let key = Rc::new(Cell::new(1));
+            let builds = Rc::new(Cell::new(0));
+            let clicks = Rc::new(RefCell::new(Vec::new()));
+            let abandon = Rc::new(Cell::new(false));
+            let window = open(cx, {
+                let key = key.clone();
+                let builds = builds.clone();
+                let clicks = clicks.clone();
+                let abandon = abandon.clone();
+                Rc::new(move |_, _| {
+                    let cards = (0..count).map(|index| {
+                        retained(("retained-card", index), key.get(), {
+                            let builds = builds.clone();
+                            let clicks = clicks.clone();
+                            move |_, _| {
+                                builds.set(builds.get() + 1);
+                                card(index, &clicks)
+                            }
+                        })
+                    });
+                    let abandon = abandon.clone();
+                    div()
+                        .id("root")
+                        .always_hitbox()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .children(cards)
+                        .child(
+                            crate::canvas(
+                                move |_, window, _| {
+                                    if abandon.get() && window.draw_pass() == 1 {
+                                        window.request_redraw_before_present();
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .w(px(10.))
+                            .h(px(10.)),
+                        )
+                        .into_any_element()
+                })
+            });
+            cx.update_window(window, |_, window, _| window.set_max_draw_passes(2))
+                .unwrap();
+            draw(window, cx);
+            draw(window, cx);
+            Self { fixture: Fixture { window, key, builds, clicks }, abandon }
+        }
+    }
+
+    #[gpui::test]
+    fn a_pass_abandoned_after_a_replay_is_followed_by_a_pass_that_builds_everything(
+        cx: &mut TestAppContext,
+    ) {
+        let scene = Abandoning::new(cx, 3);
+        let fixture = &scene.fixture;
+        fixture.draw(cx);
+        let replayed = snapshot(fixture.window, cx, &POINTS);
+        let before = fixture.counters(cx);
+        let builds = fixture.builds.get();
+
+        scene.abandon.set(true);
+        fixture.draw(cx);
+        let after = fixture.counters(cx);
+        assert_eq!(after.replays, before.replays + 3, "the first pass replayed");
+        assert_eq!(fixture.builds.get(), builds + 3, "and the second built");
+        assert_eq!(
+            snapshot(fixture.window, cx, &POINTS),
+            replayed,
+            "what was presented is what the replay showed"
+        );
+
+        // Nothing the abandoned pass took out of the frame it replaced is missing from the next.
+        scene.abandon.set(false);
+        click(fixture.window, cx, 50., 15.);
+        assert_eq!(*fixture.clicks.borrow(), vec![0]);
+        assert_eq!(tab_order(fixture.window, cx, 3).len(), 3);
+        cx.update_window(fixture.window, |_, window, _| window.blur()).unwrap();
+        fixture.draw(cx);
+        assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
         fixture.draw(cx);
         fixture.draw(cx);
         let last = fixture.counters(cx);
-        assert_eq!(fixture.builds.get(), builds + 6 + 3);
-        assert_eq!(last.replays, before.replays + 3);
+        assert!(last.replays >= after.replays + 3, "and it replays again: {last:?}");
+        let builds_after = fixture.builds.get();
+        fixture.draw(cx);
+        assert_eq!(fixture.builds.get(), builds_after, "once it has been recorded again");
+        assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
+    }
+
+    #[gpui::test]
+    fn a_draw_that_abandons_every_pass_it_may_shows_the_last_one(cx: &mut TestAppContext) {
+        let scene = Abandoning::new(cx, 3);
+        let fixture = &scene.fixture;
+        fixture.draw(cx);
+        let replayed = snapshot(fixture.window, cx, &POINTS);
+
+        // The pass limit is 2, and the request is only made in the first.
+        scene.abandon.set(true);
+        for _ in 0..3 {
+            fixture.draw(cx);
+            assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
+        }
+        scene.abandon.set(false);
+        fixture.draw(cx);
+        fixture.draw(cx);
+        fixture.draw(cx);
+        assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
     }
 
     #[gpui::test]
@@ -1095,10 +1207,10 @@ mod tests {
         cx.update_window(window, |_, window, _| window.set_max_draw_passes(2))
             .unwrap();
         draw(window, cx);
-        assert_eq!(builds.get(), built + 2, "both passes built it");
+        assert_eq!(builds.get(), built + 1, "the first pass skipped it and the second built it");
         let after = counters(window, cx);
-        assert_eq!(after.replays, replays);
-        assert_eq!(after.hits, replays);
+        assert_eq!(after.replays, replays, "the abandoned pass was thrown away before prepaint");
+        assert_eq!(after.hits, replays + 1);
     }
 
     #[gpui::test]
