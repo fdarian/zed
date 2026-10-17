@@ -780,6 +780,12 @@ impl<NodeContext> TaffyTree<NodeContext> {
         let id = NodeId::from(self.nodes.insert(NodeData::new(layout)));
 
         for child in children {
+            // fdarian fork patch: a child adopted from another parent leaves that parent's list, as in `set_children`.
+            if let Some(previous_parent) = self.parents[(*child).into()].filter(|parent| *parent != id) {
+                if let Some(index) = self.children[previous_parent.into()].iter().position(|n| n == child) {
+                    self.remove_child_at_index(previous_parent, index)?;
+                }
+            }
             self.parents[(*child).into()] = Some(id);
         }
 
@@ -814,8 +820,11 @@ impl<NodeContext> TaffyTree<NodeContext> {
         // fdarian fork patch: a child that moved to another parent since `node` listed it keeps the parent it has.
         if let Some(children) = self.children.get(key) {
             for child in children.iter().copied() {
-                if self.parents[child.into()] == Some(node) {
-                    self.parents[child.into()] = None;
+                // A child that was removed before `node` has no parent entry left.
+                if let Some(parent) = self.parents.get_mut(child.into()) {
+                    if *parent == Some(node) {
+                        *parent = None;
+                    }
                 }
             }
         }
@@ -1764,6 +1773,34 @@ mod tests {
         assert_eq!(taffy.parent(other), Some(first));
         assert_eq!(taffy.children(first).unwrap().as_slice(), &[other]);
         assert!(taffy.children(second).unwrap().is_empty());
+    }
+
+    // fdarian fork patch: upstream leaves the child in the list of the parent it had.
+    #[test]
+    fn new_with_children_takes_a_child_from_its_previous_parent() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child = taffy.new_leaf(Style::default()).unwrap();
+        let first = taffy.new_with_children(Style::default(), &[child]).unwrap();
+        let second = taffy.new_with_children(Style::default(), &[child, child]).unwrap();
+        assert!(taffy.children(first).unwrap().is_empty());
+        assert_eq!(taffy.parent(child), Some(second));
+        assert!(taffy.dirty(first).unwrap());
+    }
+
+    // fdarian fork patch: removing a parent after its child tolerated nothing.
+    #[test]
+    fn remove_tolerates_a_listed_child_that_was_removed_first() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child = taffy.new_leaf(Style::default()).unwrap();
+        let parent = taffy.new_leaf(Style::default()).unwrap();
+        let adopter = taffy.new_leaf(Style::default()).unwrap();
+        // `add_child` does not unlink: `parent` still lists the child that `adopter` has.
+        taffy.add_child(parent, child).unwrap();
+        taffy.add_child(adopter, child).unwrap();
+        taffy.remove(child).unwrap();
+        taffy.remove(parent).unwrap();
+        taffy.remove(adopter).unwrap();
+        assert_eq!(taffy.total_node_count(), 0);
     }
 
     // fdarian fork patch.

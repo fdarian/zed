@@ -198,6 +198,9 @@ impl NodeMeta {
         if let Some(intrinsic) = &self.intrinsic {
             intrinsic.for_each_length(&mut visit);
         }
+        if let Some(unforced_width) = self.unforced_width {
+            visit(unforced_width.into_raw());
+        }
     }
 }
 
@@ -409,7 +412,10 @@ impl TaffyLayoutEngine {
     /// frame (layout-only passes, abandoned ones) has left far more of them than the last
     /// collection did.
     pub fn end_pass(&mut self) {
-        if self.meta.len() > self.alive_after_collection * 2 + GARBAGE_SLACK {
+        // Collecting walks from the roots the pass laid out: with none, nothing would be alive.
+        if !self.computed_layouts.is_empty()
+            && self.meta.len() > self.alive_after_collection * 2 + GARBAGE_SLACK
+        {
             self.collect_garbage();
         }
         self.give_back_stretched_widths(false);
@@ -3830,6 +3836,89 @@ mod tests {
             let (flagged_measures, passes) = measures_of_a_sibling(cx, true);
             assert!(passes > 0 && unflagged_measures > 0);
             assert_eq!(flagged_measures, unflagged_measures);
+        }
+    }
+
+    mod engine_lifetime {
+        use super::*;
+        use crate::{TestAppContext, px};
+
+        const REM: Pixels = Pixels(16.);
+
+        fn flex() -> Style {
+            Style {
+                display: crate::Display::Flex,
+                ..Default::default()
+            }
+        }
+
+        fn space() -> Size<AvailableSpace> {
+            size(
+                AvailableSpace::Definite(px(300.)),
+                AvailableSpace::Definite(px(200.)),
+            )
+        }
+
+        #[gpui::test]
+        fn a_child_adopted_by_a_new_parent_is_garbage_collected_with_its_old_parent(
+            cx: &mut TestAppContext,
+        ) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let c = engine.request_keyed_layout(3, flex(), REM, 1., &[]);
+                let p = engine.request_keyed_layout(2, flex(), REM, 1., &[c]);
+                let r = engine.request_keyed_layout(1, flex(), REM, 1., &[p]);
+                engine.compute_layout(r, space(), window, cx);
+                engine.end_frame();
+
+                // An abandoned pass moves C under a new Q and does not ask for P.
+                let c2 = engine.request_keyed_layout(3, flex(), REM, 1., &[]);
+                assert_eq!(c2, c);
+                let q = engine.request_keyed_layout(4, flex(), REM, 1., &[c2]);
+                let r2 = engine.request_keyed_layout(1, flex(), REM, 1., &[q]);
+                engine.compute_layout(r2, space(), window, cx);
+                engine.end_pass();
+
+                let r3 = engine.request_keyed_layout(1, flex(), REM, 1., &[]);
+                engine.compute_layout(r3, space(), window, cx);
+                engine.end_frame();
+                assert_eq!(engine.taffy.total_node_count(), 1);
+            });
+        }
+
+        #[gpui::test]
+        fn a_pass_that_laid_out_no_root_collects_nothing(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let child = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                let root = engine.request_keyed_layout(1, flex(), REM, 1., &[child]);
+                engine.compute_layout(root, space(), window, cx);
+                engine.end_frame();
+
+                // A pass abandoned before it laid anything out, with more nodes than the valve allows.
+                for _ in 0..GARBAGE_SLACK * 2 {
+                    engine.request_layout(flex(), REM, 1., &[]);
+                }
+                engine.end_pass();
+                assert!(engine.contains(root) && engine.contains(child));
+            });
+        }
+
+        #[gpui::test]
+        fn a_forced_width_that_was_a_calc_survives_a_sweep(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|_, _| {
+                let mut engine = TaffyLayoutEngine::new();
+                let root = engine.request_keyed_layout(1, flex(), REM, 1., &[]);
+                let calc = taffy::style::Dimension::calc(engine.calcs.intern(5., 0.5));
+                engine.meta_mut(root).unforced_width = Some(calc);
+                // Stands in for a layout of the root: only laid out roots are alive.
+                engine.computed_layouts.insert(root);
+                engine.end_frame();
+                assert_eq!(engine.calcs.len(), 1);
+            });
         }
     }
 }
