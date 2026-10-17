@@ -87,6 +87,20 @@ pub struct TaffyLayoutEngine {
     unforced_widths: FxHashMap<LayoutId, taffy::style::Dimension>,
     /// Owns what the `calc()` lengths in the taffy styles point to, so it is cleared with them.
     calcs: CalcArena,
+    /// [`Self::painted_extent`] of the nodes it has been asked about, and of what is below them.
+    painted_extents: FxHashMap<LayoutId, PaintedExtent>,
+}
+
+/// Where the boxes of a subtree reach.
+#[derive(Clone, Copy)]
+struct PaintedExtent {
+    bounds: Bounds<Pixels>,
+    /// A box below is placed by a containing block above the subtree, or by the viewport, or
+    /// belongs to another layer, so it can be anywhere.
+    unbounded: bool,
+    /// An absolutely positioned box below has its containing block above the node, unless the
+    /// node is one itself.
+    open_absolute: bool,
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -112,6 +126,7 @@ impl TaffyLayoutEngine {
             natural_passes: 0,
             unforced_widths: FxHashMap::default(),
             calcs: CalcArena::default(),
+            painted_extents: FxHashMap::default(),
         }
     }
 
@@ -129,6 +144,7 @@ impl TaffyLayoutEngine {
         self.natural_pending.clear();
         self.natural_widths.clear();
         self.unforced_widths.clear();
+        self.painted_extents.clear();
     }
 
     pub fn mark_detached(&mut self, id: LayoutId) {
@@ -698,6 +714,78 @@ impl TaffyLayoutEngine {
                 }
             }
         }
+    }
+
+    /// The rectangle in the layout root's coordinates that holds the border box of `id` and of
+    /// everything below it that can be seen outside a box that clips it: a descendant's border box
+    /// counts, and so do the boxes inside it unless it clips that axis (overflow other than
+    /// `visible`), which then contributes only its own border box. Unlike
+    /// [`Self::layout_scrollable_overflow_end`] it reaches before the origin too, since a box
+    /// paints there; and it keeps `absolute` boxes whose containing block is inside `id`.
+    ///
+    /// `None` when a box below is placed outside what this can say: a `fixed` box, an `absolute`
+    /// one whose containing block is above `id`, or a detached one (a popup or a portal). Such a
+    /// subtree is drawn somewhere else than its parent.
+    pub fn painted_extent(&mut self, id: LayoutId, scale_factor: f32) -> Option<Bounds<Pixels>> {
+        let extent = self.subtree_extent(id, scale_factor);
+        (!extent.unbounded && !extent.open_absolute).then_some(extent.bounds)
+    }
+
+    fn subtree_extent(&mut self, id: LayoutId, scale_factor: f32) -> PaintedExtent {
+        if let Some(extent) = self.painted_extents.get(&id) {
+            return *extent;
+        }
+        let mut extent = PaintedExtent {
+            bounds: self.layout_bounds(id, scale_factor),
+            unbounded: false,
+            open_absolute: false,
+        };
+        let overflow = self.taffy.style(id.0).expect(EXPECT_MESSAGE).overflow;
+        let visible_x = overflow.x == taffy::style::Overflow::Visible;
+        let visible_y = overflow.y == taffy::style::Overflow::Visible;
+        if visible_x || visible_y {
+            for index in 0..self.taffy.child_count(id.0) {
+                let child = LayoutId(self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE));
+                if self.taffy.style(child.0).expect(EXPECT_MESSAGE).display
+                    == taffy::style::Display::None
+                {
+                    continue;
+                }
+                if self.detached.contains(&child) {
+                    extent.unbounded = true;
+                    continue;
+                }
+                match self.escapable_kinds.get(&child) {
+                    Some(containing_block::EscapableKind::Fixed) => {
+                        extent.unbounded = true;
+                        continue;
+                    }
+                    Some(containing_block::EscapableKind::Ancestor) => extent.open_absolute = true,
+                    None => {}
+                }
+                let inner = self.subtree_extent(child, scale_factor);
+                extent.unbounded |= inner.unbounded;
+                extent.open_absolute |= inner.open_absolute;
+                if visible_x {
+                    let left = extent.bounds.left().min(inner.bounds.left());
+                    let right = extent.bounds.right().max(inner.bounds.right());
+                    extent.bounds.origin.x = left;
+                    extent.bounds.size.width = right - left;
+                }
+                if visible_y {
+                    let top = extent.bounds.top().min(inner.bounds.top());
+                    let bottom = extent.bounds.bottom().max(inner.bounds.bottom());
+                    extent.bounds.origin.y = top;
+                    extent.bounds.size.height = bottom - top;
+                }
+            }
+        }
+        // A positioned node is the containing block of the absolute boxes below it.
+        if extent.open_absolute && !self.static_nodes.contains(&id) {
+            extent.open_absolute = false;
+        }
+        self.painted_extents.insert(id, extent);
+        extent
     }
 
     /// The extent of the node's content, measured from its padding-box origin.

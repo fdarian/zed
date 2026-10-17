@@ -690,6 +690,39 @@ impl Element for StyledText {
             atomics.borrow_mut().paint(window, cx);
         }
     }
+
+    // In a culled subtree the glyphs are outside the mask, so they are not painted. The text
+    // still takes its bounds, which selection and the inline boxes read.
+    fn prepaint_culled(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        // The atomic inlines are elements of their own, which are prepainted and painted in place.
+        if self.atomics.is_some() {
+            return self.prepaint(id, inspector_id, bounds, state, window, cx);
+        }
+        self.layout.prepaint(bounds, &self.text);
+    }
+
+    fn paint_culled(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.atomics.is_some() {
+            self.paint(id, inspector_id, bounds, request_layout, prepaint, window, cx);
+        }
+    }
 }
 
 impl IntoElement for StyledText {
