@@ -626,6 +626,40 @@ impl Scene {
         shadows
     }
 
+    /// The operations in `range`, as text without their draw order, for the comparison of two
+    /// frames that painted them at different places in the order.
+    pub(crate) fn describe_operations(&self, range: Range<usize>) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        for operation in self.paint_operations.get(range).unwrap_or_default() {
+            match operation {
+                PaintOperation::Primitive(Primitive::Shadow(shadow)) => write!(out, "{shadow:?}"),
+                PaintOperation::Primitive(Primitive::Quad(quad)) => write!(out, "{quad:?}"),
+                PaintOperation::Primitive(Primitive::Path(path)) => write!(out, "{path:?}"),
+                PaintOperation::Primitive(Primitive::Underline(underline)) => write!(out, "{underline:?}"),
+                PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)) => write!(out, "{sprite:?}"),
+                PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)) => write!(out, "{sprite:?}"),
+                PaintOperation::Primitive(Primitive::PolychromeSprite(sprite)) | PaintOperation::Image(sprite) => {
+                    write!(out, "{sprite:?}")
+                }
+                PaintOperation::Primitive(Primitive::Surface(surface)) => write!(out, "{surface:?}"),
+                PaintOperation::StartLayer(bounds) => write!(out, "layer {bounds:?}"),
+                PaintOperation::EndLayer => write!(out, "end layer"),
+                PaintOperation::StartGroup { content_mask, reserved, .. } => {
+                    write!(out, "group {content_mask:?} {reserved:?}")
+                }
+                PaintOperation::EndGroup => write!(out, "end group"),
+                PaintOperation::WidenGroups(mask) => write!(out, "widen {mask:?}"),
+                PaintOperation::StartTextClip => write!(out, "text clip"),
+                PaintOperation::EndTextClip => write!(out, "end text clip"),
+            }
+            .ok();
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);

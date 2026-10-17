@@ -664,6 +664,20 @@ impl TaffyLayoutEngine {
             return;
         }
         self.counters.children_set += 1;
+        #[cfg(debug_assertions)]
+        {
+            let mut ancestor = Some(id.0);
+            let mut hops = 0;
+            while let Some(node) = ancestor {
+                assert!(
+                    !children.iter().any(|child| child.0 == node),
+                    "layout node {node:?} would become its own ancestor: the parent {id:?} gets children {children:?}"
+                );
+                hops += 1;
+                assert!(hops < 100_000, "the layout tree has a cycle above {id:?}");
+                ancestor = self.taffy.parent(node);
+            }
+        }
         self.taffy
             .set_children(id.0, LayoutId::to_taffy_slice(children))
             .expect(EXPECT_MESSAGE);
