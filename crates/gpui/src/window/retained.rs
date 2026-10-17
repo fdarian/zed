@@ -560,3 +560,17 @@ impl Window {
         }
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+impl Window {
+    /// The elements with an id that the rendered frame has under `position`, topmost first, with
+    /// their hit bounds, as DOM hit testing finds them.
+    pub fn hit_chain_at(&self, position: Point<Pixels>) -> Vec<(GlobalElementId, Bounds<Pixels>)> {
+        self.rendered_frame
+            .hit_test(position, true)
+            .chain
+            .into_iter()
+            .filter_map(|link| Some((link.identity?, link.bounds)))
+            .collect()
+    }
+}
