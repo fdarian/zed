@@ -11,6 +11,8 @@ use std::{fmt::Debug, ops::Range};
 
 mod calc;
 mod containing_block;
+#[cfg(test)]
+mod engine_fuzz_tests;
 mod intrinsic;
 mod natural;
 #[cfg(test)]
