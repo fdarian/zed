@@ -5632,7 +5632,7 @@ impl Window {
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
         let (task, is_first) = cx.fetch_asset::<A>(source);
         task.clone().now_or_never().or_else(|| {
-            self.retained.pending_assets = self.retained.pending_assets.wrapping_add(1);
+            self.note_pending_asset();
             if is_first {
                 let entity_id = self.current_view();
                 self.spawn(cx, {
@@ -5661,9 +5661,15 @@ impl Window {
         let (task, _) = cx.fetch_asset::<A>(source);
         let output = task.now_or_never();
         if output.is_none() {
-            self.retained.pending_assets = self.retained.pending_assets.wrapping_add(1);
+            self.note_pending_asset();
         }
         output
+    }
+
+    /// Says that what is being drawn read an asset that has not loaded, so a retained subtree it is
+    /// in is not final and is built again next frame.
+    pub(crate) fn note_pending_asset(&mut self) {
+        self.retained.pending_assets = self.retained.pending_assets.wrapping_add(1);
     }
     /// Obtain the current element offset. This method should only be called during the
     /// prepaint phase of element drawing.
