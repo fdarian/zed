@@ -225,6 +225,14 @@ impl TaffyLayoutEngine {
         self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
     }
 
+    /// Whether the `min-width` or `max-width` of the node is a percentage, or a `calc()` with one.
+    pub fn has_percent_width_limits(&self, id: LayoutId) -> bool {
+        let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
+        [style.min_size.width, style.max_size.width]
+            .into_iter()
+            .any(|limit| limit.tag() == taffy::style::CompactLength::PERCENT_TAG || limit.into_raw().is_calc())
+    }
+
     /// Makes the border box of the node `width` wide whatever its style says, or gives it back
     /// the width of its style with `None`. For the root of a subtree that is laid out at a width
     /// found by measuring it, such as an atomic inline.
@@ -293,11 +301,24 @@ impl TaffyLayoutEngine {
         Ok(edges)
     }
 
-    #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
     pub fn compute_layout(
         &mut self,
         id: LayoutId,
         available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.compute_layout_in(id, available_space, None, window, cx);
+    }
+
+    /// [`Self::compute_layout`], with the percentages of the root `id` of the width `containing_width`
+    /// (`Some(None)` if it is not known) instead of the available space, when that is `Some`.
+    #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
+    pub(crate) fn compute_layout_in(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        containing_width: Option<Option<Pixels>>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -344,7 +365,8 @@ impl TaffyLayoutEngine {
 
         self.resolve_intrinsic_widths(window, cx);
         self.measure_natural_widths(id, available_space, scale_factor, window, cx);
-        self.run_taffy(id, available_space, scale_factor, window, cx);
+        let containing_width = containing_width.map(|width| width.map(|width| width.0 * scale_factor));
+        self.run_taffy_in(id, available_space, containing_width, scale_factor, window, cx);
         self.settle_containing_blocks(id, available_space, scale_factor, window, cx);
     }
 
@@ -356,10 +378,30 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) {
+        self.run_taffy_in(id, available_space, None, scale_factor, window, cx);
+    }
+
+    /// `containing_width` is in device pixels.
+    fn run_taffy_in(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        containing_width: Option<Option<f32>>,
+        scale_factor: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let available_space: taffy::geometry::Size<taffy::style::AvailableSpace> =
+            available_space.into();
+        let mut parent_size = available_space.into_options();
+        if let Some(width) = containing_width {
+            parent_size.width = width;
+        }
         self.taffy
-            .compute_layout_with_leaf_measure(
+            .compute_layout_with_leaf_measure_in(
                 id.into(),
-                available_space.into(),
+                available_space,
+                parent_size,
                 |known_dimensions, available_space, _id, node_context, _style| {
                     let Some(node_context) = node_context else {
                         return taffy::MeasuredLeaf {
@@ -2221,6 +2263,30 @@ mod tests {
                 fit_widths(cx, parent, positioned, &[Kid::Fixed(120.), Kid::Fill]),
                 [120., 120., 120.]
             );
+        }
+
+        #[gpui::test]
+        fn a_fit_content_layout_root_is_kept_by_the_authors_limits(cx: &mut TestAppContext) {
+            let (_, cx) = probe(cx, "", |_| div().into_any_element());
+            let mut root_width = |content: f32| {
+                cx.draw(
+                    crate::point(px(0.), px(0.)),
+                    size(
+                        AvailableSpace::Definite(px(400.)),
+                        AvailableSpace::Definite(px(300.)),
+                    ),
+                    |_, _| {
+                        div()
+                            .debug_selector(|| "root".into())
+                            .w_fit_content()
+                            .max_w(relative(0.5))
+                            .child(div().w(px(content)).h(px(10.)))
+                    },
+                );
+                bounds(cx, "root").size.width
+            };
+            assert_eq!(root_width(120.), px(120.));
+            assert_eq!(root_width(300.), px(200.));
         }
 
         #[gpui::test]

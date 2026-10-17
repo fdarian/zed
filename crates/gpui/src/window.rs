@@ -6495,6 +6495,29 @@ impl Window {
         self.layout_engine = Some(layout_engine);
     }
 
+    /// Like [`Self::compute_layout`] for a root whose percentages are of `containing_width`, which
+    /// is `None` while that is not known, rather than of the available space. For a box laid out
+    /// at a width of its own, such as an atomic inline, that is not the width it is a percentage of.
+    pub(crate) fn compute_layout_in_containing_width(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        containing_width: Option<Pixels>,
+        cx: &mut App,
+    ) {
+        self.invalidator.debug_assert_prepaint();
+
+        let mut layout_engine = self.layout_engine.take().unwrap();
+        layout_engine.compute_layout_in(
+            layout_id,
+            available_space,
+            Some(containing_width),
+            self,
+            cx,
+        );
+        self.layout_engine = Some(layout_engine);
+    }
+
     /// Runs `f` with `engine` as the layout engine of the window, in place of the one it has or,
     /// during `compute_layout`, the lack of one. The nodes `f` requests are in `engine`, and
     /// their layout ids are only good with it, so an element laid out as a root of its own, such
@@ -6508,6 +6531,14 @@ impl Window {
         let result = f(self);
         *engine = std::mem::replace(&mut self.layout_engine, outer);
         result
+    }
+
+    /// See [`TaffyLayoutEngine::has_percent_width_limits`].
+    pub(crate) fn layout_has_percent_width_limits(&self, layout_id: LayoutId) -> bool {
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .has_percent_width_limits(layout_id)
     }
 
     /// See [`TaffyLayoutEngine::set_forced_width`].

@@ -18,7 +18,8 @@ use crate::util::debug::{debug_log, debug_log_node};
 use crate::util::sys::{new_vec_with_capacity, ChildrenVec, Vec};
 
 use crate::compute::{
-    compute_cached_layout, compute_hidden_layout, compute_leaf_layout, compute_root_layout, round_layout, MeasuredLeaf,
+    compute_cached_layout, compute_hidden_layout, compute_leaf_layout, compute_root_layout_with_parent_size,
+    round_layout, MeasuredLeaf,
 };
 use crate::CacheTree;
 
@@ -1095,9 +1096,25 @@ impl<NodeContext> TaffyTree<NodeContext> {
         MeasureFunction:
             FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> MeasuredLeaf,
     {
+        self.compute_layout_with_leaf_measure_in(node_id, available_space, available_space.into_options(), measure_function)
+    }
+
+    /// Like [`Self::compute_layout_with_leaf_measure`], resolving the percentages of the root against
+    /// `parent_size` instead of the available space. A fork patch; see [`compute_root_layout_with_parent_size`].
+    pub fn compute_layout_with_leaf_measure_in<MeasureFunction>(
+        &mut self,
+        node_id: NodeId,
+        available_space: Size<AvailableSpace>,
+        parent_size: Size<Option<f32>>,
+        measure_function: MeasureFunction,
+    ) -> Result<(), TaffyError>
+    where
+        MeasureFunction:
+            FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style) -> MeasuredLeaf,
+    {
         let use_rounding = self.config.use_rounding;
         let mut taffy_view = TaffyView { taffy: self, measure_function };
-        compute_root_layout(&mut taffy_view, node_id, available_space);
+        compute_root_layout_with_parent_size(&mut taffy_view, node_id, available_space, parent_size);
         if use_rounding {
             round_layout(&mut taffy_view, node_id);
         }
@@ -1584,6 +1601,41 @@ mod tests {
         taffy.set_children(new_parent, &[child]).unwrap();
 
         assert!(taffy.children(old_parent).unwrap().is_empty());
+    }
+
+    // fdarian fork patch: the percentages of a root are of the parent size it is given.
+    #[test]
+    fn a_root_resolves_its_percentages_against_the_parent_size_it_is_given() {
+        let width_of = |parent_width: Option<f32>, max_width: Dimension| {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let root = taffy
+                .new_leaf(Style {
+                    display: crate::style::Display::Block,
+                    size: Size { width: Dimension::auto(), height: length(10.0) },
+                    max_size: Size { width: max_width, height: Dimension::auto() },
+                    padding: crate::geometry::Rect {
+                        left: crate::style::LengthPercentage::percent(0.1),
+                        ..crate::geometry::Rect::zero()
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            taffy
+                .compute_layout_with_leaf_measure_in(
+                    root,
+                    Size { width: AvailableSpace::Definite(300.0), height: AvailableSpace::MaxContent },
+                    Size { width: parent_width, height: None },
+                    |_, _, _, _, _| MeasuredLeaf { size: Size::ZERO, first_baseline: None },
+                )
+                .unwrap();
+            let layout = taffy.layout(root).unwrap();
+            (layout.size.width, layout.padding.left)
+        };
+        // 50% of a 400px containing block, in a 300px space: the root stretches to the space,
+        // under the limit of 200px.
+        assert_eq!(width_of(Some(400.0), Dimension::percent(0.5)), (200.0, 40.0));
+        // No containing width: the percentage is none, and the padding is 0.
+        assert_eq!(width_of(None, Dimension::percent(0.5)), (300.0, 0.0));
     }
 
     // fdarian fork patch: calc values resolve to `length + percent * basis`.

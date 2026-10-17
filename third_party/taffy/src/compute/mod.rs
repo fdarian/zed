@@ -69,13 +69,26 @@ use crate::{CacheTree, MaybeMath, MaybeResolve};
 
 /// Compute layout for the root node in the tree
 pub fn compute_root_layout(tree: &mut impl LayoutPartialTree, root: NodeId, available_space: Size<AvailableSpace>) {
+    compute_root_layout_with_parent_size(tree, root, available_space, available_space.into_options())
+}
+
+/// Compute layout for the root node in the tree, resolving its percentages against `parent_size`
+/// instead of the available space.
+///
+/// fdarian fork patch: a root laid out at a width that is not the width of its containing block, such as an
+/// atomic inline measured at its shrink-to-fit width, still has percentages of that containing block.
+pub fn compute_root_layout_with_parent_size(
+    tree: &mut impl LayoutPartialTree,
+    root: NodeId,
+    available_space: Size<AvailableSpace>,
+    parent_size: Size<Option<f32>>,
+) {
     let mut known_dimensions = Size::NONE;
 
     #[cfg(feature = "block_layout")]
     {
         use crate::BoxSizing;
 
-        let parent_size = available_space.into_options();
         let style = tree.get_core_container_style(root);
 
         if style.is_block() {
@@ -131,18 +144,15 @@ pub fn compute_root_layout(tree: &mut impl LayoutPartialTree, root: NodeId, avai
     let output = tree.perform_child_layout(
         root,
         known_dimensions,
-        available_space.into_options(),
+        parent_size,
         available_space,
         SizingMode::InherentSize,
         Line::FALSE,
     );
     let style = tree.get_core_container_style(root);
-    let padding =
-        style.padding().resolve_or_zero(available_space.width.into_option(), |val, basis| tree.calc(val, basis));
-    let border =
-        style.border().resolve_or_zero(available_space.width.into_option(), |val, basis| tree.calc(val, basis));
-    let margin =
-        style.margin().resolve_or_zero(available_space.width.into_option(), |val, basis| tree.calc(val, basis));
+    let padding = style.padding().resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
+    let border = style.border().resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
+    let margin = style.margin().resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
     let scrollbar_size = Size {
         width: if style.overflow().y == Overflow::Scroll { style.scrollbar_width() } else { 0.0 },
         height: if style.overflow().x == Overflow::Scroll { style.scrollbar_width() } else { 0.0 },

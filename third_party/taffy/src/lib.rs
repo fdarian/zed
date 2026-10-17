@@ -113,7 +113,8 @@ pub use crate::compute::compute_table_layout;
 pub use crate::compute::detailed_info::*;
 #[doc(inline)]
 pub use crate::compute::{
-    compute_cached_layout, compute_hidden_layout, compute_leaf_layout, compute_root_layout, round_layout, MeasuredLeaf,
+    compute_cached_layout, compute_hidden_layout, compute_leaf_layout, compute_root_layout,
+    compute_root_layout_with_parent_size, round_layout, MeasuredLeaf,
 };
 #[doc(inline)]
 pub use crate::style::Style;

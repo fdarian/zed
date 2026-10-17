@@ -98,12 +98,14 @@ pub(crate) enum AtomicMeasure {
     Fit(Pixels),
 }
 
-/// How the root of a box was laid out last.
+/// How the root of a box was laid out last. The second field is the width of the containing block,
+/// which the percentages of the box are of, for a box with percentage limits. A box laid out at a
+/// width of its own cannot tell it from its available space.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Layout {
-    MinContent,
-    MaxContent,
-    Exact(Pixels),
+    MinContent(Option<Pixels>),
+    MaxContent(Option<Pixels>),
+    Exact(Pixels, Option<Pixels>),
 }
 
 struct Slot {
@@ -118,10 +120,15 @@ struct Slot {
     baseline: AtomicBaseline,
     offset: Point<DefiniteLength>,
     containing_height: Rc<Cell<Pixels>>,
+    /// Whether the `min-width` or `max-width` of the box is a percentage, which depends on the
+    /// width of the containing block and so on the width the text is measured at.
+    percent_limits: bool,
     /// What the engine holds of the box.
     laid_out_as: Option<Layout>,
-    min_width: Option<Pixels>,
-    max_size: Option<Size<Pixels>>,
+    /// The min-content width, for the containing width it was measured at.
+    min_width: Option<(Option<Pixels>, Pixels)>,
+    /// The max-content size, for the containing width it was measured at.
+    max_size: Option<(Option<Pixels>, Size<Pixels>)>,
     /// How the box was laid out for the last measure, which is what the text shaped with.
     used: Option<Layout>,
     /// The margins in px the text shaped with.
@@ -143,8 +150,9 @@ impl AtomicInlines {
         let slots = atomics
             .into_iter()
             .map(|mut atomic| {
-                let layout_id = window.with_layout_engine(&mut engine, |window| {
-                    atomic.element.request_layout(window, cx)
+                let (layout_id, percent_limits) = window.with_layout_engine(&mut engine, |window| {
+                    let layout_id = atomic.element.request_layout(window, cx);
+                    (layout_id, window.layout_has_percent_width_limits(layout_id))
                 });
                 Slot {
                     index: atomic.index,
@@ -158,6 +166,7 @@ impl AtomicInlines {
                     baseline: atomic.baseline,
                     offset: atomic.offset,
                     containing_height: atomic.containing_height,
+                    percent_limits,
                     laid_out_as: None,
                     min_width: None,
                     max_size: None,
@@ -243,21 +252,39 @@ impl AtomicInlines {
 impl Slot {
     fn lay_out(&mut self, layout: Layout, window: &mut Window, cx: &mut App) -> Size<Pixels> {
         if self.laid_out_as != Some(layout) {
-            let space = match layout {
-                Layout::MinContent => {
+            let (space, containing_width) = match layout {
+                Layout::MinContent(containing_width) => {
                     window.set_layout_forced_width(self.layout_id, None);
-                    size(AvailableSpace::MinContent, AvailableSpace::MaxContent)
+                    (
+                        size(AvailableSpace::MinContent, AvailableSpace::MaxContent),
+                        containing_width,
+                    )
                 }
-                Layout::MaxContent => {
+                Layout::MaxContent(containing_width) => {
                     window.set_layout_forced_width(self.layout_id, None);
-                    size(AvailableSpace::MaxContent, AvailableSpace::MaxContent)
+                    (
+                        size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                        containing_width,
+                    )
                 }
-                Layout::Exact(width) => {
+                Layout::Exact(width, containing_width) => {
                     window.set_layout_forced_width(self.layout_id, Some(width));
-                    size(AvailableSpace::Definite(width), AvailableSpace::MaxContent)
+                    (
+                        size(AvailableSpace::Definite(width), AvailableSpace::MaxContent),
+                        containing_width,
+                    )
                 }
             };
-            window.compute_layout(self.layout_id, space, cx);
+            if self.percent_limits {
+                window.compute_layout_in_containing_width(
+                    self.layout_id,
+                    space,
+                    containing_width,
+                    cx,
+                );
+            } else {
+                window.compute_layout(self.layout_id, space, cx);
+            }
             #[cfg(test)]
             tests::LAYOUT_PASSES.with(|passes| passes.set(passes.get() + 1));
             self.laid_out_as = Some(layout);
@@ -265,23 +292,35 @@ impl Slot {
         window.layout_bounds(self.layout_id).size
     }
 
-    fn max_size(&mut self, window: &mut Window, cx: &mut App) -> Size<Pixels> {
+    fn max_size(
+        &mut self,
+        containing_width: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels> {
         match self.max_size {
-            Some(max_size) => max_size,
-            None => {
-                let max_size = self.lay_out(Layout::MaxContent, window, cx);
-                self.max_size = Some(max_size);
+            Some((measured_at, max_size)) if measured_at == containing_width => max_size,
+            _ => {
+                let max_size = self.lay_out(Layout::MaxContent(containing_width), window, cx);
+                self.max_size = Some((containing_width, max_size));
                 max_size
             }
         }
     }
 
-    fn min_width(&mut self, window: &mut Window, cx: &mut App) -> Pixels {
+    fn min_width(
+        &mut self,
+        containing_width: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Pixels {
         match self.min_width {
-            Some(min_width) => min_width,
-            None => {
-                let min_width = self.lay_out(Layout::MinContent, window, cx).width;
-                self.min_width = Some(min_width);
+            Some((measured_at, min_width)) if measured_at == containing_width => min_width,
+            _ => {
+                let min_width = self
+                    .lay_out(Layout::MinContent(containing_width), window, cx)
+                    .width;
+                self.min_width = Some((containing_width, min_width));
                 min_width
             }
         }
@@ -303,25 +342,36 @@ impl Slot {
             .margin
             .clone()
             .map(|length| length.to_pixels(AbsoluteLength::Pixels(containing_width), rem_size));
-        let max_size = self.max_size(window, cx);
+        // Only a box with percentage limits can tell the width it is measured at from any other.
+        let limits_width = match measure {
+            AtomicMeasure::Fit(width) if self.percent_limits => Some(width),
+            _ => None,
+        };
+        let max_size = self.max_size(limits_width, window, cx);
         let layout = match measure {
-            AtomicMeasure::MaxContent => Layout::MaxContent,
-            AtomicMeasure::MinContent => Layout::Exact(self.min_width(window, cx)),
+            AtomicMeasure::MaxContent => Layout::MaxContent(limits_width),
+            AtomicMeasure::MinContent => {
+                Layout::Exact(self.min_width(limits_width, window, cx), limits_width)
+            }
             AtomicMeasure::Fit(width) if self.width.is_some() => {
                 let length = self.width.expect("checked above");
                 Layout::Exact(
                     length
                         .to_pixels(AbsoluteLength::Pixels(width), rem_size)
                         .max(px(0.)),
+                    limits_width,
                 )
             }
             AtomicMeasure::Fit(width) => {
                 let available = (width - margin.left - margin.right).max(px(0.));
                 if available >= max_size.width {
-                    Layout::Exact(max_size.width)
+                    Layout::Exact(max_size.width, limits_width)
                 } else {
-                    let min_width = self.min_width(window, cx);
-                    Layout::Exact(available.max(min_width).min(max_size.width))
+                    let min_width = self.min_width(limits_width, window, cx);
+                    Layout::Exact(
+                        available.max(min_width).min(max_size.width),
+                        limits_width,
+                    )
                 }
             }
         };
@@ -388,6 +438,11 @@ mod tests {
         pub width: Option<f32>,
         /// The width as a fraction of the width of the paragraph.
         pub width_fraction: Option<f32>,
+        /// `min-width` and `max-width` as fractions of the width of the paragraph.
+        pub min_width_fraction: Option<f32>,
+        pub max_width_fraction: Option<f32>,
+        /// `width: fit-content`, with the `width` above not set.
+        pub fit_content: bool,
         pub height: Option<f32>,
         pub text: Option<&'static str>,
         /// Top, right, bottom, left.
@@ -414,6 +469,9 @@ mod tests {
         Atomic {
             width: Some(width),
             width_fraction: None,
+            min_width_fraction: None,
+            max_width_fraction: None,
+            fit_content: false,
             height: Some(height),
             text: None,
             padding: [0.; 4],
@@ -486,6 +544,15 @@ mod tests {
             }
             if let Some(width) = self.width {
                 child = child.w(crate::px(width));
+            }
+            if self.fit_content {
+                child = child.w_fit_content();
+            }
+            if let Some(fraction) = self.min_width_fraction {
+                child = child.min_w(crate::relative(fraction));
+            }
+            if let Some(fraction) = self.max_width_fraction {
+                child = child.max_w(crate::relative(fraction));
             }
             if let Some(height) = self.height {
                 child = child.h(crate::px(height));
@@ -1523,6 +1590,38 @@ mod tests {
         // The "yy" after it starts after the trailing padding too.
         let after = laid.layout.position_for_index(6).unwrap();
         assert_close(after.x, 5. + 60. + 7., "the text after the box");
+    }
+
+    /// `<div style="width:400px"><span style="display:inline-block;width:300px;height:10px;max-width:50%">`
+    /// and the same with `width:120px`, with `min-width:50%` instead, and with `width:fit-content`
+    /// around a 300px or 120px child (fixtures/fit-content-oracle.html of the React tests, `ib` cases): a
+    /// percentage limit is of the paragraph, not of the box.
+    #[test]
+    fn percentage_limits_are_of_the_width_of_the_paragraph() {
+        let o = OBJECT;
+        let box_width = |atomic: Atomic| {
+            lay_out(400., &format!("{o}"), vec![atomic]).boxes[0].size.width
+        };
+        let limited = |width: f32| Atomic {
+            max_width_fraction: Some(0.5),
+            ..atomic(width, 10.)
+        };
+        assert_close(box_width(limited(300.)), 200., "max-width under the width");
+        assert_close(box_width(limited(120.)), 120., "max-width over the width");
+        let widened = Atomic {
+            min_width_fraction: Some(0.5),
+            ..atomic(120., 10.)
+        };
+        assert_close(box_width(widened), 200., "min-width");
+        let fit = |content: f32| Atomic {
+            width: None,
+            fit_content: true,
+            max_width_fraction: Some(0.5),
+            flex_items: vec![(content, 10.)],
+            ..atomic(0., 10.)
+        };
+        assert_close(box_width(fit(300.)), 200., "fit-content under max-width");
+        assert_close(box_width(fit(120.)), 120., "fit-content over max-width");
     }
 
     /// `<span style="display:inline-block;width:50%;height:10px">` in a 150px paragraph:
