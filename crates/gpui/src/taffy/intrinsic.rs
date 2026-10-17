@@ -8,9 +8,12 @@
 //! is the same width measured, but only a row flex container's items have the inline axis as
 //! their main axis, so it is resolved where the parent is known, and left `auto` elsewhere.
 
-use super::{EXPECT_MESSAGE, LayoutId, TaffyLayoutEngine, ToTaffy as _};
+use super::{EXPECT_MESSAGE, LayoutId, TaffyLayoutEngine, ToTaffy as _, calc::CalcArena};
 use crate::{App, AvailableSpace, IntrinsicSize, Pixels, Style, Window, size};
-use taffy::style::{CompactLength, Dimension, Display, FlexDirection};
+use taffy::{
+    LinearCalc,
+    style::{CompactLength, Dimension, Display, FlexDirection},
+};
 
 #[derive(Copy, Clone)]
 enum Keyword {
@@ -165,7 +168,7 @@ impl TaffyLayoutEngine {
             };
 
             let mut style = requested;
-            apply(&node, &measured, &mut style);
+            apply(&node, &measured, &mut self.calcs, &mut style);
             self.taffy
                 .set_style(node.id.0, style.clone())
                 .expect(EXPECT_MESSAGE);
@@ -248,27 +251,71 @@ fn bound(keyword: Keyword, slot: Slot, measured: &Measured) -> Dimension {
     }
 }
 
-fn at_least(current: Dimension, bound: f32) -> Dimension {
-    if current.is_auto() {
-        Dimension::length(bound)
-    } else if current.tag() == CompactLength::LENGTH_TAG {
-        Dimension::length(current.value().max(bound))
+/// A width limit as `length + fraction * basis`, `None` for `auto`, which is no limit.
+fn linear(limit: Dimension, calcs: &CalcArena) -> Option<LinearCalc> {
+    if limit.is_auto() {
+        return None;
+    }
+    Some(match limit.tag() {
+        CompactLength::LENGTH_TAG => LinearCalc {
+            length: limit.value(),
+            percent: 0.,
+        },
+        CompactLength::PERCENT_TAG => LinearCalc {
+            length: 0.,
+            percent: limit.value(),
+        },
+        _ => {
+            calcs
+                .get(limit.into_raw())
+                .expect("a width limit is auto, a length, a percentage or a calc")
+                .value
+        }
+    })
+}
+
+/// The `min-width` and `max-width` that make the stretch-fit width of a box the width of
+/// `fit-content`: `min(max-content, max(min-content, stretch))`, then kept between the author's own
+/// `min-width` and `max-width`, `min-width` winning.
+///
+/// Both clamps are one clamp. Clamping to the content sizes and then to the limits is clamping to
+/// the content sizes each kept between the limits, and the limits can be percentages, which only
+/// layout can resolve, against the width of the containing block. So a percentage limit makes the
+/// bounds a calc that keeps the content size between the limits, resolved where layout knows what
+/// the percentage is of.
+fn fit_content_bounds(
+    calcs: &mut CalcArena,
+    min_width: Dimension,
+    max_width: Dimension,
+    min_content: f32,
+    max_content: f32,
+) -> (Dimension, Dimension) {
+    let floor = linear(min_width, calcs);
+    let ceiling = linear(max_width, calcs);
+    let is_length = |limit: &Option<LinearCalc>| limit.is_none_or(|limit| limit.percent == 0.);
+    if is_length(&floor) && is_length(&ceiling) {
+        let kept = |content: f32| {
+            let capped = ceiling.map_or(content, |ceiling| content.min(ceiling.length));
+            floor.map_or(capped, |floor| capped.max(floor.length))
+        };
+        (
+            Dimension::length(kept(min_content)),
+            Dimension::length(kept(max_content)),
+        )
     } else {
-        current
+        (
+            Dimension::calc(calcs.alloc_bounded(min_content, floor, ceiling)),
+            Dimension::calc(calcs.alloc_bounded(max_content, floor, ceiling)),
+        )
     }
 }
 
-fn at_most(current: Dimension, bound: f32) -> Dimension {
-    if current.is_auto() {
-        Dimension::length(bound)
-    } else if current.tag() == CompactLength::LENGTH_TAG {
-        Dimension::length(current.value().min(bound))
-    } else {
-        current
-    }
-}
-
-fn apply(node: &IntrinsicNode, measured: &Measured, style: &mut taffy::style::Style) {
+fn apply(
+    node: &IntrinsicNode,
+    measured: &Measured,
+    calcs: &mut CalcArena,
+    style: &mut taffy::style::Style,
+) {
     if let Some(keyword) = node.flex_basis {
         // `Slot::Max` is the bound whose keyword results are a basis: `fit-content` was turned
         // into `max-content` already.
@@ -293,9 +340,14 @@ fn apply(node: &IntrinsicNode, measured: &Measured, style: &mut taffy::style::St
                 _ => Dimension::auto(),
             };
             // A plain width clamped by these is what `min(max-content, max(min-content, ..))`
-            // means, and an author's own min and max still narrow it further.
-            style.min_size.width = at_least(style.min_size.width, measured.min_content());
-            style.max_size.width = at_most(style.max_size.width, measured.max_content());
+            // means, with an author's own min and max applied after it.
+            (style.min_size.width, style.max_size.width) = fit_content_bounds(
+                calcs,
+                style.min_size.width,
+                style.max_size.width,
+                measured.min_content(),
+                measured.max_content(),
+            );
         }
         None => {}
     }

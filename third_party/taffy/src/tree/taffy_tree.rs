@@ -39,20 +39,59 @@ use crate::compute::grid::DetailedGridInfo;
 use crate::tree::layout::DetailedLayoutInfo;
 
 // fdarian fork patch: upstream `TaffyTree` resolves every `calc()` value to 0.0.
-/// The payload behind a `calc()` pointer: `length + percent * basis`.
-///
-/// This is a fork patch. [`TaffyTree`] evaluates the pointer inside a
-/// [`CompactLength`](crate::style::CompactLength) calc value as a `LinearCalc`.
-/// The pointer must be 8-aligned because `CompactLength` packs its tag in the low
-/// three bits, which `align(8)` guarantees. Taffy does not own the storage: the
-/// owner must keep it alive for as long as any style holding the pointer is laid out.
-#[repr(C, align(8))]
+/// A value that is `length + percent * basis`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinearCalc {
     /// The fixed part, in the same unit as the resolved value.
     pub length: f32,
     /// The part proportional to the basis, as a fraction (0.5 is 50%).
     pub percent: f32,
+}
+
+impl LinearCalc {
+    fn resolve(self, basis: f32) -> f32 {
+        self.length + self.percent * basis
+    }
+}
+
+/// The payload behind a `calc()` pointer: a [`LinearCalc`], kept between a `floor` and a `ceiling`
+/// that are linear in the same basis, the floor winning, as `min-width` wins over `max-width`.
+///
+/// This is a fork patch. [`TaffyTree`] evaluates the pointer inside a
+/// [`CompactLength`](crate::style::CompactLength) calc value as a `Calc`. The bounds are what lets a
+/// width that is a content size clamped by an author's percentage limits (`fit-content` under a
+/// `max-width: 50%`) be resolved against the containing block, which only layout knows.
+/// The pointer must be 8-aligned because `CompactLength` packs its tag in the low
+/// three bits, which `align(8)` guarantees. Taffy does not own the storage: the
+/// owner must keep it alive for as long as any style holding the pointer is laid out.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Calc {
+    /// The value before the bounds are applied.
+    pub value: LinearCalc,
+    /// The lower bound; wins over `ceiling`.
+    pub floor: Option<LinearCalc>,
+    /// The upper bound.
+    pub ceiling: Option<LinearCalc>,
+}
+
+impl Calc {
+    /// `length + percent * basis`, unbounded.
+    pub const fn linear(length: f32, percent: f32) -> Self {
+        Self { value: LinearCalc { length, percent }, floor: None, ceiling: None }
+    }
+
+    /// The value for a basis of `basis`.
+    pub fn resolve(self, basis: f32) -> f32 {
+        let mut value = self.value.resolve(basis);
+        if let Some(ceiling) = self.ceiling {
+            value = value.min(ceiling.resolve(basis));
+        }
+        if let Some(floor) = self.floor {
+            value = value.max(floor.resolve(basis));
+        }
+        value
+    }
 }
 
 /// `inputs` for a node with size containment: a contained axis that layout would size from the
@@ -99,9 +138,9 @@ fn contained_inputs(style: &Style, mut inputs: LayoutInput) -> LayoutInput {
 // fdarian fork patch: upstream returns 0.0.
 #[allow(unsafe_code)]
 fn resolve_linear_calc(val: *const (), basis: f32) -> f32 {
-    // SAFETY: calc pointers handed to this tree point to a live, 8-aligned `LinearCalc`; see its docs.
-    let calc = unsafe { *(val as *const LinearCalc) };
-    calc.length + calc.percent * basis
+    // SAFETY: calc pointers handed to this tree point to a live, 8-aligned `Calc`; see its docs.
+    let calc = unsafe { *(val as *const Calc) };
+    calc.resolve(basis)
 }
 
 /// The error Taffy generates on invalid operations
@@ -1553,13 +1592,13 @@ mod tests {
         use super::*;
         use crate::style::{LengthPercentage, LengthPercentageAuto, Position};
 
-        fn ptr(calc: &LinearCalc) -> *const () {
-            calc as *const LinearCalc as *const ()
+        fn ptr(calc: &Calc) -> *const () {
+            calc as *const Calc as *const ()
         }
 
         #[test]
         fn a_leaf_resolves_its_max_size_calc() {
-            let max_width = LinearCalc { length: 10.0, percent: 0.5 };
+            let max_width = Calc::linear(10.0, 0.5);
 
             let mut taffy: TaffyTree<()> = TaffyTree::new();
             let leaf = taffy
@@ -1583,11 +1622,11 @@ mod tests {
 
         #[test]
         fn resolves_size_padding_margin_and_inset_against_their_basis() {
-            let width = LinearCalc { length: 10.0, percent: 0.5 };
-            let height = LinearCalc { length: 20.0, percent: 0.5 };
-            let padding = LinearCalc { length: 2.0, percent: 0.125 };
-            let margin = LinearCalc { length: 5.0, percent: 0.125 };
-            let inset = LinearCalc { length: 2.0, percent: 0.125 };
+            let width = Calc::linear(10.0, 0.5);
+            let height = Calc::linear(20.0, 0.5);
+            let padding = Calc::linear(2.0, 0.125);
+            let margin = Calc::linear(5.0, 0.125);
+            let inset = Calc::linear(2.0, 0.125);
 
             let mut taffy: TaffyTree<()> = TaffyTree::new();
             let grandchild = taffy
@@ -1641,9 +1680,72 @@ mod tests {
             assert_eq!(grandchild_layout.location.y, 27.0);
         }
 
+        /// A block of 200px with one leaf, whose width the styles decide, and the width it comes to.
+        fn width_in_block(leaf_style: Style) -> f32 {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let leaf = taffy.new_leaf(leaf_style).unwrap();
+            let root = taffy
+                .new_with_children(
+                    Style {
+                        display: crate::style::Display::Block,
+                        size: Size { width: length(200.0), height: length(100.0) },
+                        ..Default::default()
+                    },
+                    &[leaf],
+                )
+                .unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            taffy.layout(leaf).unwrap().size.width
+        }
+
+        fn bounded(value: f32, floor: Option<LinearCalc>, ceiling: Option<LinearCalc>) -> Calc {
+            Calc { value: LinearCalc { length: value, percent: 0.0 }, floor, ceiling }
+        }
+
+        const HALF: Option<LinearCalc> = Some(LinearCalc { length: 0.0, percent: 0.5 });
+
+        #[test]
+        fn a_calc_is_kept_under_its_ceiling() {
+            let max_width = bounded(300.0, None, HALF);
+            let width = width_in_block(Style {
+                size: Size { width: Dimension::calc(ptr(&max_width)), height: length(10.0) },
+                ..Default::default()
+            });
+            assert_eq!(width, 100.0);
+        }
+
+        #[test]
+        fn a_calc_floor_wins_over_its_ceiling() {
+            let min_width = bounded(10.0, Some(LinearCalc { length: 150.0, percent: 0.0 }), HALF);
+            let width = width_in_block(Style {
+                size: Size { width: Dimension::calc(ptr(&min_width)), height: length(10.0) },
+                ..Default::default()
+            });
+            assert_eq!(width, 150.0);
+        }
+
+        #[test]
+        fn bounds_from_calcs_clamp_a_stretching_box_between_content_sizes_kept_under_a_percentage() {
+            // `fit-content` under `max-width: 50%` of a 200px block: the content sizes, each kept
+            // under 100px, are the bounds of the stretch.
+            let at = |min_content: f32, max_content: f32| {
+                let min = bounded(min_content, None, HALF);
+                let max = bounded(max_content, None, HALF);
+                width_in_block(Style {
+                    size: Size { width: Dimension::auto(), height: length(10.0) },
+                    min_size: Size { width: Dimension::calc(ptr(&min)), height: Dimension::auto() },
+                    max_size: Size { width: Dimension::calc(ptr(&max)), height: Dimension::auto() },
+                    ..Default::default()
+                })
+            };
+            assert_eq!(at(150.0, 150.0), 100.0);
+            assert_eq!(at(30.0, 60.0), 60.0);
+            assert_eq!(at(30.0, 300.0), 100.0);
+        }
+
         #[test]
         fn resolves_gap_against_the_container() {
-            let gap = LinearCalc { length: 6.0, percent: 0.125 };
+            let gap = Calc::linear(6.0, 0.125);
 
             let mut taffy: TaffyTree<()> = TaffyTree::new();
             let leaf_style = Style { size: Size { width: length(10.0), height: length(10.0) }, ..Default::default() };

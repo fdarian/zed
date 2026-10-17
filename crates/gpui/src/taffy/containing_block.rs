@@ -203,11 +203,9 @@ impl TaffyLayoutEngine {
     }
 }
 
-/// `length + fraction * basis` for a calc, so it can be measured from the containing block.
+/// The value of a calc for `basis`, so it can be measured from the containing block.
 fn resolve_calc(calcs: &CalcArena, raw: CompactLength, basis: f32) -> Option<f32> {
-    calcs
-        .get(raw)
-        .map(|calc| calc.length + calc.percent * basis)
+    calcs.get(raw).map(|calc| calc.resolve(basis))
 }
 
 fn inset(

@@ -1618,7 +1618,7 @@ mod tests {
             let length: taffy::style::Dimension =
                 calc(10., 0.5).to_taffy(Pixels(16.0), 2.0, &mut arena);
             let value = arena.get(length.into_raw()).expect("a calc");
-            assert_eq!((value.length, value.percent), (20.0, 0.5));
+            assert_eq!((value.value.length, value.value.percent), (20.0, 0.5));
         }
     }
     mod intrinsic_widths {
@@ -2007,6 +2007,219 @@ mod tests {
             assert_eq!(
                 width_in(cx, 400., LONG, |box_| box_.max_w_fit_content_to(px(1000.))),
                 px(210.)
+            );
+        }
+
+        /// A child of a `fit-content` box.
+        #[derive(Clone, Copy)]
+        enum Kid {
+            Fixed(f32),
+            /// Asks for the width of the box.
+            Fill,
+        }
+
+        /// The widths of `style(div())` and of its `kids`, in `parent(div())`, which is 400px
+        /// wide in a window of that width.
+        fn fit_widths(
+            cx: &mut TestAppContext,
+            parent: fn(crate::Div) -> crate::Div,
+            style: impl Fn(crate::Div) -> crate::Div + 'static,
+            kids: &'static [Kid],
+        ) -> Vec<f32> {
+            const NAMES: [&str; 3] = ["kid0", "kid1", "kid2"];
+            let (_, cx) = probe(cx, "", move |_| {
+                let mut box_ = style(div().debug_selector(|| "box".into()));
+                for (index, kid) in kids.iter().enumerate() {
+                    let width = match kid {
+                        Kid::Fixed(width) => px(*width).into(),
+                        Kid::Fill => relative(1.),
+                    };
+                    box_ = box_.child(
+                        div()
+                            .debug_selector(|| NAMES[index].into())
+                            .w(width)
+                            .h(px(10.)),
+                    );
+                }
+                parent(div()).child(box_).into_any_element()
+            });
+            std::iter::once("box")
+                .chain(NAMES.into_iter().take(kids.len()))
+                .map(|selector| bounds(cx, selector).size.width.0)
+                .collect()
+        }
+
+        fn block_parent(parent: crate::Div) -> crate::Div {
+            parent.w(px(400.))
+        }
+
+        fn column_parent(parent: crate::Div) -> crate::Div {
+            parent.flex().flex_col().w(px(400.))
+        }
+
+        fn row_parent(parent: crate::Div) -> crate::Div {
+            parent.flex().w(px(400.))
+        }
+
+        fn grid_parent(parent: crate::Div) -> crate::Div {
+            parent.grid().w(px(400.))
+        }
+
+        const PARENTS: [(&str, fn(crate::Div) -> crate::Div); 4] = [
+            ("block", block_parent),
+            ("flex column", column_parent),
+            ("flex row", row_parent),
+            ("grid", grid_parent),
+        ];
+
+        // The expected widths below are from headless Chrome (fixtures/fit-content-oracle.html in
+        // the React tests has the pages), a 400px parent of each of these kinds.
+
+        #[gpui::test]
+        fn fit_content_under_a_percentage_max_width_hugs_narrower_content(cx: &mut TestAppContext) {
+            for (name, parent) in PARENTS {
+                let limited = |box_: crate::Div| box_.w_fit_content().max_w(relative(0.5));
+                assert_eq!(
+                    fit_widths(cx, parent, limited, &[Kid::Fixed(120.)]),
+                    [120., 120.],
+                    "{name}"
+                );
+                assert_eq!(
+                    fit_widths(cx, parent, limited, &[Kid::Fixed(300.)]),
+                    [200., 300.],
+                    "{name}"
+                );
+            }
+        }
+
+        #[gpui::test]
+        fn fit_content_stops_at_a_max_width_under_its_min_content(cx: &mut TestAppContext) {
+            for (name, parent) in PARENTS {
+                let limited = |box_: crate::Div| box_.w_fit_content().max_w(px(200.));
+                assert_eq!(
+                    fit_widths(cx, parent, limited, &[Kid::Fixed(300.)]),
+                    [200., 300.],
+                    "{name}"
+                );
+                assert_eq!(
+                    fit_widths(cx, parent, limited, &[Kid::Fixed(120.)]),
+                    [120., 120.],
+                    "{name}"
+                );
+            }
+        }
+
+        #[gpui::test]
+        fn fit_content_is_widened_by_min_width_which_wins_over_max_width(cx: &mut TestAppContext) {
+            for (name, parent) in PARENTS {
+                let widened = |box_: crate::Div| box_.w_fit_content().min_w(relative(0.5));
+                assert_eq!(
+                    fit_widths(cx, parent, widened, &[Kid::Fixed(120.)]),
+                    [200., 120.],
+                    "{name}"
+                );
+                let both = |box_: crate::Div| box_.w_fit_content().min_w(px(350.)).max_w(px(200.));
+                assert_eq!(
+                    fit_widths(cx, parent, both, &[Kid::Fixed(100.)]),
+                    [350., 100.],
+                    "{name}"
+                );
+            }
+        }
+
+        #[gpui::test]
+        fn fit_content_is_not_narrowed_below_its_min_content_by_the_available_width(
+            cx: &mut TestAppContext,
+        ) {
+            // A grid column of `auto` width is as wide as its content, so there the available
+            // width a percentage is of is the content.
+            for (name, parent) in PARENTS.into_iter().filter(|(name, _)| *name != "grid") {
+                let capped = |box_: crate::Div| box_.w_fit_content().max_w(relative(1.));
+                assert_eq!(
+                    fit_widths(cx, parent, capped, &[Kid::Fixed(500.)]),
+                    [400., 500.],
+                    "{name}"
+                );
+                let plain = |box_: crate::Div| box_.w_fit_content();
+                assert_eq!(
+                    fit_widths(cx, parent, plain, &[Kid::Fixed(500.)]),
+                    [500., 500.],
+                    "{name}"
+                );
+            }
+        }
+
+        #[gpui::test]
+        fn a_child_asking_for_the_whole_box_does_not_widen_it(cx: &mut TestAppContext) {
+            for (name, parent) in PARENTS {
+                let plain = |box_: crate::Div| box_.w_fit_content();
+                assert_eq!(
+                    fit_widths(cx, parent, plain, &[Kid::Fixed(120.), Kid::Fill]),
+                    [120., 120., 120.],
+                    "{name}"
+                );
+                let limited = |box_: crate::Div| box_.w_fit_content().max_w(relative(0.5));
+                assert_eq!(
+                    fit_widths(cx, parent, limited, &[Kid::Fixed(120.), Kid::Fill]),
+                    [120., 120., 120.],
+                    "{name} under a percentage max-width"
+                );
+                assert_eq!(
+                    fit_widths(cx, parent, limited, &[Kid::Fixed(300.), Kid::Fill]),
+                    [200., 300., 200.],
+                    "{name} over a percentage max-width"
+                );
+                assert_eq!(
+                    fit_widths(cx, parent, plain, &[Kid::Fill]),
+                    [0., 0.],
+                    "{name} alone"
+                );
+            }
+        }
+
+        #[gpui::test]
+        fn a_fit_content_limit_is_kept_between_the_authors_limits(cx: &mut TestAppContext) {
+            let (name, parent) = PARENTS[0];
+            let capped = |box_: crate::Div| box_.w_fit_content_to(px(100.)).max_w(relative(0.5));
+            assert_eq!(
+                fit_widths(cx, parent, capped, &[Kid::Fixed(300.)]),
+                [200., 300.],
+                "{name}"
+            );
+            let wide = |box_: crate::Div| box_.w_fit_content_to(px(300.)).max_w(relative(0.5));
+            assert_eq!(
+                fit_widths(cx, parent, wide, &[Kid::Fixed(120.)]),
+                [120., 120.],
+                "{name}"
+            );
+            let proportional =
+                |box_: crate::Div| box_.w_fit_content_to(relative(0.5)).max_w(relative(1.));
+            assert_eq!(
+                fit_widths(cx, parent, proportional, &[Kid::Fixed(500.)]),
+                [400., 500.],
+                "{name}"
+            );
+        }
+
+        #[gpui::test]
+        fn an_absolute_fit_content_box_is_kept_by_a_percentage_of_its_containing_block(
+            cx: &mut TestAppContext,
+        ) {
+            let parent: fn(crate::Div) -> crate::Div =
+                |parent| parent.relative().w(px(400.)).h(px(60.));
+            let positioned = |box_: crate::Div| {
+                box_.absolute()
+                    .left(px(0.))
+                    .w_fit_content()
+                    .max_w(relative(0.5))
+            };
+            assert_eq!(
+                fit_widths(cx, parent, positioned, &[Kid::Fixed(300.)]),
+                [200., 300.]
+            );
+            assert_eq!(
+                fit_widths(cx, parent, positioned, &[Kid::Fixed(120.), Kid::Fill]),
+                [120., 120., 120.]
             );
         }
 

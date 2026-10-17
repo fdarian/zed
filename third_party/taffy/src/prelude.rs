@@ -28,4 +28,4 @@ pub use crate::style_helpers::{
 };
 
 #[cfg(feature = "taffy_tree")]
-pub use crate::{LinearCalc, TaffyTree};
+pub use crate::{Calc, LinearCalc, TaffyTree};
