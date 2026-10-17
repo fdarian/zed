@@ -247,6 +247,113 @@ impl Element for Retained {
         cx: &mut App,
     ) -> (LayoutId, RetainedLayout) {
         let global_id = &self.global_id(window);
+        // The layout requests of the subtree are numbered under the scope of this element and not
+        // under the one around it: a frame that skips the subtree makes none of them, and the
+        // elements without an id that follow it must keep the numbers they had.
+        let outer_scope = std::mem::replace(&mut window.layout_scope, global_id.scope_hash());
+        let result = self.request_layout_in_scope(global_id, window, cx);
+        window.layout_scope = outer_scope;
+        result
+    }
+
+    fn prepaint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut RetainedLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RetainedPrepaint {
+        let global_id = &self.global_id(window);
+        let outer_scope = std::mem::replace(&mut window.layout_scope, global_id.scope_hash());
+        let result = self.prepaint_in_scope(global_id, bounds, request_layout, window, cx);
+        window.layout_scope = outer_scope;
+        result
+    }
+
+    fn paint(
+        &mut self,
+        _global_id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut RetainedLayout,
+        prepaint: &mut RetainedPrepaint,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let global_id = &self.global_id(window);
+        match prepaint {
+            RetainedPrepaint::Replayed => {
+                let hook = self.on_replay.clone();
+                window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+                    let mut state = state.expect("a replayed subtree has its state");
+                    let recorded = state
+                        .recorded
+                        .as_mut()
+                        .expect("a replayed subtree has its recording");
+                    let nested = recorded.prepaint.nested.clone();
+                    let paint = recorded
+                        .paint
+                        .as_mut()
+                        .expect("a subtree is skipped only with its paint recorded");
+                    paint.range = window.replay_paint(paint, &nested);
+                    recorded.paint_serial = window.building_serial();
+                    if let Some(hook) = hook {
+                        hook(RetainedPhase::Paint, window, cx);
+                    }
+                    ((), state)
+                });
+            }
+            RetainedPrepaint::Built { element, record } => {
+                if !*record {
+                    element.paint(window, cx);
+                    return;
+                }
+                let mark = window.begin_paint_recording();
+                let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
+                    element.paint(window, cx);
+                });
+                let publishes = self.on_replay.is_some();
+                window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+                    let mut state = state.expect("a built subtree has its state");
+                    state.accessed_entities.extend(accessed_entities);
+                    let recorded = window
+                        .finish_paint_recording(mark)
+                        .and_then(|paint| {
+                            if paint.has_publications && !publishes {
+                                Err(NonReusable::Publication)
+                            } else {
+                                Ok(paint)
+                            }
+                        });
+                    match recorded {
+                        Ok(paint) => {
+                            if let Some(recorded) = state.recorded.as_mut() {
+                                recorded.paint = Some(paint);
+                                recorded.paint_serial = window.building_serial();
+                            }
+                        }
+                        Err(reason) => {
+                            if state.recorded.take().is_some() {
+                                window.retained.counters.count_non_reusable(reason);
+                            }
+                        }
+                    }
+                    ((), state)
+                });
+            }
+        }
+    }
+}
+
+impl Retained {
+    fn request_layout_in_scope(
+        &mut self,
+        global_id: &GlobalElementId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, RetainedLayout) {
         let lift_z = self.lift_z;
         if !window.retention_allowed() {
             window.retained.counters.builds += 1;
@@ -323,16 +430,14 @@ impl Element for Retained {
         })
     }
 
-    fn prepaint(
+    fn prepaint_in_scope(
         &mut self,
-        _global_id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
+        global_id: &GlobalElementId,
         bounds: Bounds<Pixels>,
         request_layout: &mut RetainedLayout,
         window: &mut Window,
         cx: &mut App,
     ) -> RetainedPrepaint {
-        let global_id = &self.global_id(window);
         match std::mem::replace(request_layout, RetainedLayout::Handed) {
             RetainedLayout::Skipped if window.is_layout_pass() => {
                 self.prepaint_skipped_without_recording(global_id, bounds, window, cx)
@@ -366,80 +471,6 @@ impl Element for Retained {
                 RetainedPrepaint::Built { element, record }
             }
             RetainedLayout::Handed => unreachable!("a retained element is prepainted once"),
-        }
-    }
-
-    fn paint(
-        &mut self,
-        _global_id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut RetainedLayout,
-        prepaint: &mut RetainedPrepaint,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let global_id = &self.global_id(window);
-        match prepaint {
-            RetainedPrepaint::Replayed => {
-                let hook = self.on_replay.clone();
-                window.with_element_state(global_id, |state: Option<RetainedState>, window| {
-                    let mut state = state.expect("a replayed subtree has its state");
-                    let recorded = state
-                        .recorded
-                        .as_mut()
-                        .expect("a replayed subtree has its recording");
-                    let nested = recorded.prepaint.nested.clone();
-                    let paint = recorded
-                        .paint
-                        .as_mut()
-                        .expect("a subtree is skipped only with its paint recorded");
-                    paint.range = window.replay_paint(paint, &nested);
-                    recorded.paint_serial = window.building_serial();
-                    if let Some(hook) = hook {
-                        hook(RetainedPhase::Paint, window, cx);
-                    }
-                    ((), state)
-                });
-            }
-            RetainedPrepaint::Built { element, record } => {
-                if !*record {
-                    element.paint(window, cx);
-                    return;
-                }
-                let mark = window.begin_paint_recording();
-                let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
-                    element.paint(window, cx);
-                });
-                let publishes = self.on_replay.is_some();
-                window.with_element_state(global_id, |state: Option<RetainedState>, window| {
-                    let mut state = state.expect("a built subtree has its state");
-                    state.accessed_entities.extend(accessed_entities);
-                    let recorded = window
-                        .finish_paint_recording(mark)
-                        .and_then(|paint| {
-                            if paint.has_publications && !publishes {
-                                Err(NonReusable::Publication)
-                            } else {
-                                Ok(paint)
-                            }
-                        });
-                    match recorded {
-                        Ok(paint) => {
-                            if let Some(recorded) = state.recorded.as_mut() {
-                                recorded.paint = Some(paint);
-                                recorded.paint_serial = window.building_serial();
-                            }
-                        }
-                        Err(reason) => {
-                            if state.recorded.take().is_some() {
-                                window.retained.counters.count_non_reusable(reason);
-                            }
-                        }
-                    }
-                    ((), state)
-                });
-            }
         }
     }
 }
@@ -2343,6 +2374,43 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(builds.clone().map(|count| count.get()), built.map(|count| count + 1));
+    }
+
+    #[gpui::test]
+    fn skipping_a_root_without_an_id_leaves_the_layout_nodes_of_its_siblings_alone(
+        cx: &mut TestAppContext,
+    ) {
+        let builds = Rc::new(Cell::new(0));
+        let window = open(cx, {
+            let builds = builds.clone();
+            Rc::new(move |_, _| {
+                let builds = builds.clone();
+                div()
+                    .id("root")
+                    .child(div().w(px(30.)).h(px(10.)).child(div().w(px(10.)).h(px(10.))))
+                    .child(retained("skipped", 1, move |_, _| {
+                        builds.set(builds.get() + 1);
+                        div().w(px(50.)).h(px(20.)).child(div().w(px(20.)).h(px(20.))).into_any_element()
+                    }))
+                    .child(div().w(px(70.)).h(px(30.)).child(div().w(px(10.)).h(px(10.))))
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let layout_counters = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| window.layout_counters()).unwrap()
+        };
+        let built = builds.get();
+        let before = layout_counters(cx);
+        let replays = counters(window, cx).replays;
+
+        draw(window, cx);
+        let after = layout_counters(cx);
+        assert!(counters(window, cx).replays > replays && builds.get() == built, "the subtree is skipped: {:?} {:?}", counters(window, cx), after);
+        assert_eq!(after.styles_set, before.styles_set, "a sibling took the layout node of the skipped root");
+        assert_eq!(after.nodes_created, before.nodes_created);
+        assert_eq!(after.children_set, before.children_set);
     }
 
     struct Counter {
