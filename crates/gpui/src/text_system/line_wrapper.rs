@@ -685,7 +685,7 @@ mod tests {
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
     use crate::{
-        OverflowWrap, TabSize, TextInset, TextLayoutOptions, TextRun, WindowTextSystem, WordBreak,
+        OverflowWrap, TabSize, TextInset, TextLayoutOptions, TextRun, TextWrapStyle, WindowTextSystem, WordBreak,
         WrapBoundary, WrappedLine, point,
     };
 
@@ -1665,6 +1665,7 @@ mod tests {
         break_spaces: false,
         word_break: WordBreak::Normal,
         overflow_wrap: OverflowWrap::BreakWord,
+        text_wrap_style: TextWrapStyle::Auto,
     };
 
     #[cfg(target_os = "macos")]
@@ -1674,6 +1675,7 @@ mod tests {
         break_spaces: true,
         word_break: WordBreak::Normal,
         overflow_wrap: OverflowWrap::BreakWord,
+        text_wrap_style: TextWrapStyle::Auto,
     };
 
     #[cfg(target_os = "macos")]

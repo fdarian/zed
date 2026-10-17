@@ -11,7 +11,7 @@ use crate::{
     CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
-    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions,
+    Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions, TextWrapStyle,
     TextRun, Window, OverflowWrap, WordBreak, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
@@ -681,6 +681,9 @@ pub struct TextStyle {
     /// line breaks anyway, as in CSS `overflow-wrap`. Defaults to `BreakWord`, which
     /// is not CSS's initial value: it is how text has always wrapped here.
     pub overflow_wrap: OverflowWrap,
+
+    /// Which breaks a wrapped line gets, as in CSS `text-wrap-style`.
+    pub text_wrap_style: TextWrapStyle,
 }
 
 impl Default for TextStyle {
@@ -710,6 +713,7 @@ impl Default for TextStyle {
             break_spaces: false,
             word_break: WordBreak::default(),
             overflow_wrap: OverflowWrap::default(),
+            text_wrap_style: TextWrapStyle::default(),
         }
     }
 }
@@ -788,6 +792,7 @@ impl TextStyle {
             break_spaces: self.break_spaces,
             word_break: self.word_break,
             overflow_wrap: self.overflow_wrap,
+            text_wrap_style: self.text_wrap_style,
         }
     }
 

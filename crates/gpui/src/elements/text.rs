@@ -3,7 +3,8 @@ use crate::{
     DispatchPhase, Element, ElementId, EndTruncation, GlobalElementId, GlyphInset,
     HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId, MeasuredLeaf,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    SharedString, Size, TextInset, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom,
+    SharedString, Size, TextInset, TextLayoutOptions, TextOverflow, TextRun, TextStyle, TooltipId,
+    TruncateFrom,
     WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
     set_tooltip_on_window,
 };
@@ -727,6 +728,9 @@ struct TextLayoutInner {
     truncate_width: Option<Pixels>,
     /// The width the insets were asked for.
     inset_width: Option<Pixels>,
+    /// What the lines were laid out with: a text style can change how the same
+    /// text breaks at the same width.
+    options: TextLayoutOptions,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
@@ -793,6 +797,7 @@ impl TextLayout {
                         wrap_width,
                         truncate_width,
                         inset_width: width,
+                        options: text_style.layout_options(),
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -849,6 +854,7 @@ impl TextLayout {
                     && let Some(size) = text_layout.size
                     && wrap_width == text_layout.wrap_width
                     && width == text_layout.inset_width
+                    && text_style.layout_options() == text_layout.options
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
                 {
@@ -975,6 +981,7 @@ impl TextLayout {
                     wrap_width,
                     truncate_width,
                     inset_width: width,
+                    options: text_style.layout_options(),
                     size: Some(size),
                     bounds: None,
                 };
@@ -1833,6 +1840,7 @@ mod tests {
                     wrap_width: None,
                     truncate_width: None,
                     inset_width: None,
+                    options: Default::default(),
                     size: None,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
@@ -1900,6 +1908,7 @@ mod tests {
                     wrap_width: Some(px(60.)),
                     truncate_width: None,
                     inset_width: None,
+                    options: Default::default(),
                     size: None,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),

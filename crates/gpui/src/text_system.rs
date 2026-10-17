@@ -5,6 +5,7 @@ mod line;
 mod line_layout;
 mod line_truncation;
 mod line_wrapper;
+mod text_wrap;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
@@ -13,6 +14,7 @@ pub use line::*;
 pub use line_layout::*;
 pub(crate) use line_truncation::EndTruncation;
 pub use line_wrapper::*;
+pub use text_wrap::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
