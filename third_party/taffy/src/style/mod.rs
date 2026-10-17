@@ -12,6 +12,7 @@ mod flex;
 mod float;
 #[cfg(feature = "grid")]
 mod grid;
+mod table;
 
 pub use self::alignment::{
     AlignContent, AlignContentKeyword, AlignItems, AlignItemsKeyword, AlignSelf, AlignmentSafety, JustifyContent,
@@ -28,6 +29,9 @@ pub use self::block::{BlockContainerStyle, BlockItemStyle, TextAlign};
 pub use self::flex::{FlexDirection, FlexWrap, FlexboxContainerStyle, FlexboxItemStyle};
 #[cfg(feature = "float_layout")]
 pub use self::float::{Clear, Float, FloatDirection};
+pub use self::table::{
+    CaptionSide, RowGroupKind, TableContainerStyle, TableItemStyle, TableLayout, TableRole, VerticalAlign,
+};
 #[cfg(feature = "grid")]
 pub use self::grid::{
     GenericGridPlacement, GenericGridTemplateComponent, GenericRepetition, GridAutoFlow, GridAutoTracks,
@@ -198,6 +202,9 @@ pub enum Display {
     /// The children will follow the CSS Grid layout algorithm
     #[cfg(feature = "grid")]
     Grid,
+    /// The children will follow the CSS table layout algorithm
+    #[cfg(feature = "table_layout")]
+    Table,
     /// The node is hidden, and it's children will also be hidden
     None,
 }
@@ -237,6 +244,8 @@ crate::util::parse::impl_parse_for_keyword_enum!(Display,
     "block" => Block,
     #[cfg(feature = "block_layout")]
     "flow-root" => FlowRoot,
+    #[cfg(feature = "table_layout")]
+    "table" => Table,
 );
 
 impl core::fmt::Display for Display {
@@ -251,6 +260,8 @@ impl core::fmt::Display for Display {
             Display::Flex => write!(f, "FLEX"),
             #[cfg(feature = "grid")]
             Display::Grid => write!(f, "GRID"),
+            #[cfg(feature = "table_layout")]
+            Display::Table => write!(f, "TABLE"),
         }
     }
 }
@@ -448,7 +459,7 @@ pub struct Style<S: CheapCloneStr = DefaultCheapStr> {
     /// What layout strategy should be used?
     pub display: Display,
     /// Whether a child is display:table or not. This affects children of block layouts.
-    /// This should really be part of `Display`, but it is currently seperate because table layout isn't implemented
+    /// A node with `Display::Table` is always taken as a table, this is for an engine that does its own table layout.
     pub item_is_table: bool,
     /// Is it a replaced element like an image or form field?
     /// <https://drafts.csswg.org/css-sizing-3/#min-content-zero>
@@ -476,6 +487,19 @@ pub struct Style<S: CheapCloneStr = DefaultCheapStr> {
     #[cfg(feature = "float_layout")]
     /// Should the box clear floats
     pub clear: Clear,
+
+    // Table properties
+    /// What part of a table the node is, as seen from the table (or row group, or row) it is a child of
+    pub table_role: TableRole,
+    /// Which algorithm sizes the columns of a `Display::Table` node
+    pub table_layout: TableLayout,
+    /// The gap between the cells of a `Display::Table` node, and between the cells and its edges
+    pub border_spacing: Size<f32>,
+    /// Whether the borders of a `Display::Table` node and its cells are collapsed: spacing is 0 then, and the `border`
+    /// of the table and of its cells is already the half width of the collapsed border
+    pub border_collapse: bool,
+    /// How the content of a table cell is aligned in the row
+    pub vertical_align: VerticalAlign,
 
     // Position properties
     /// What should the `position` value of this struct use as a base offset?
@@ -618,6 +642,11 @@ impl<S: CheapCloneStr> Style<S> {
         float: Float::None,
         #[cfg(feature = "float_layout")]
         clear: Clear::None,
+        table_role: TableRole::None,
+        table_layout: TableLayout::Auto,
+        border_spacing: Size::ZERO,
+        border_collapse: false,
+        vertical_align: VerticalAlign::Baseline,
         position: Position::Relative,
         inset: Rect::auto(),
         margin: Rect::zero(),
@@ -837,6 +866,16 @@ impl<S: CheapCloneStr> BlockContainerStyle for Style<S> {
 
     #[inline(always)]
     fn align_content(&self) -> Option<AlignContent> {
+        // The content of a table cell is placed in the block axis by the table, which hands the cell a height that
+        // leaves exactly the offset it wants as free space (see `compute::table`): `vertical-align` is `align-content`
+        // here, and `baseline` is `end` over a height that holds the cell's content and the distance to the baseline.
+        if let TableRole::Cell { .. } = self.table_role {
+            return Some(match self.vertical_align {
+                VerticalAlign::Top => AlignContent::SAFE_START,
+                VerticalAlign::Middle => AlignContent::SAFE_CENTER,
+                VerticalAlign::Baseline | VerticalAlign::Bottom => AlignContent::SAFE_END,
+            });
+        }
         self.align_content
     }
 }
@@ -858,6 +897,10 @@ impl<T: BlockContainerStyle> BlockContainerStyle for &'_ T {
 impl<S: CheapCloneStr> BlockItemStyle for Style<S> {
     #[inline(always)]
     fn is_table(&self) -> bool {
+        #[cfg(feature = "table_layout")]
+        if self.display == Display::Table {
+            return true;
+        }
         self.item_is_table
     }
 
@@ -891,6 +934,58 @@ impl<T: BlockItemStyle> BlockItemStyle for &'_ T {
     #[inline(always)]
     fn clear(&self) -> Clear {
         (*self).clear()
+    }
+}
+
+impl<S: CheapCloneStr> TableContainerStyle for Style<S> {
+    #[inline(always)]
+    fn table_layout(&self) -> TableLayout {
+        self.table_layout
+    }
+    #[inline(always)]
+    fn border_spacing(&self) -> Size<f32> {
+        self.border_spacing
+    }
+    #[inline(always)]
+    fn border_collapse(&self) -> bool {
+        self.border_collapse
+    }
+}
+
+impl<T: TableContainerStyle> TableContainerStyle for &'_ T {
+    #[inline(always)]
+    fn table_layout(&self) -> TableLayout {
+        (*self).table_layout()
+    }
+    #[inline(always)]
+    fn border_spacing(&self) -> Size<f32> {
+        (*self).border_spacing()
+    }
+    #[inline(always)]
+    fn border_collapse(&self) -> bool {
+        (*self).border_collapse()
+    }
+}
+
+impl<S: CheapCloneStr> TableItemStyle for Style<S> {
+    #[inline(always)]
+    fn table_role(&self) -> TableRole {
+        self.table_role
+    }
+    #[inline(always)]
+    fn vertical_align(&self) -> VerticalAlign {
+        self.vertical_align
+    }
+}
+
+impl<T: TableItemStyle> TableItemStyle for &'_ T {
+    #[inline(always)]
+    fn table_role(&self) -> TableRole {
+        (*self).table_role()
+    }
+    #[inline(always)]
+    fn vertical_align(&self) -> VerticalAlign {
+        (*self).vertical_align()
     }
 }
 
@@ -1252,6 +1347,11 @@ mod tests {
             float: Default::default(),
             #[cfg(feature = "float_layout")]
             clear: Default::default(),
+            table_role: Default::default(),
+            table_layout: Default::default(),
+            border_spacing: Size::ZERO,
+            border_collapse: false,
+            vertical_align: Default::default(),
             direction: Default::default(),
             overflow: Default::default(),
             scrollbar_width: 0.0,
@@ -1346,6 +1446,11 @@ mod tests {
         assert_type_size::<Position>(1);
         assert_type_size::<Overflow>(1);
 
+        // Table
+        assert_type_size::<TableRole>(6);
+        assert_type_size::<TableLayout>(1);
+        assert_type_size::<VerticalAlign>(1);
+
         // Dimensions and aggregations of Dimensions
         assert_type_size::<f32>(4);
         assert_type_size::<LengthPercentage>(8);
@@ -1385,12 +1490,12 @@ mod tests {
         assert_type_size::<GridTemplateComponent<String>>(56);
         assert_type_size::<GridPlacement<String>>(32);
         assert_type_size::<Line<GridPlacement<String>>>(64);
-        assert_type_size::<Style<String>>(552);
+        assert_type_size::<Style<String>>(568);
 
         // String-type dependent (Arc<str>)
         assert_type_size::<GridTemplateComponent<Arc<str>>>(56);
         assert_type_size::<GridPlacement<Arc<str>>>(24);
         assert_type_size::<Line<GridPlacement<Arc<str>>>>(48);
-        assert_type_size::<Style<Arc<str>>>(520);
+        assert_type_size::<Style<Arc<str>>>(536);
     }
 }

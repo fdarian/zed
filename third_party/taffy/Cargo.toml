@@ -68,6 +68,7 @@ default = [
     "grid",
     "block_layout",
     "float_layout",
+    "table_layout",
     "calc",
     "content_size",
     "detailed_layout_info",
@@ -91,6 +92,7 @@ std = [
     "slotmap?/std",
 ]
 strict_provenance = []
+table_layout = ["alloc"]
 taffy_tree = ["dep:slotmap"]
 
 [lib]
