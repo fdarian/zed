@@ -116,8 +116,13 @@ use std::sync::{
 pub(crate) const ROOT_NODE_ID: NodeId = NodeId(0);
 
 /// A listener for an accessibility action on a specific node.
-pub(crate) type A11yActionListener =
-    Box<dyn FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static>;
+///
+/// Shared so that a retained subtree can hand the listeners it recorded to a later frame.
+pub(crate) type A11yActionListener = std::rc::Rc<
+    std::cell::RefCell<
+        dyn FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
+    >,
+>;
 
 /// Per-window accessibility state.
 ///
@@ -153,6 +158,8 @@ pub(crate) struct A11y {
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    /// What the maps above were given while a retained subtree recorded, see [`A11yMark`].
+    journal: A11yJournal,
     /// The window's title, used to label the root node so assistive
     /// technology can tell windows apart.
     window_title: Option<SharedString>,
@@ -182,6 +189,7 @@ impl A11y {
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
+            journal: A11yJournal::default(),
             window_title,
             last_focus_without_node: None,
             debug: debug::A11yDebug::default(),
@@ -244,7 +252,34 @@ impl A11y {
     }
 
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
+        if self.journal.depth > 0 {
+            self.journal.focusables.push((node_id, focus_id));
+        }
         self.focus_ids.insert(node_id, focus_id);
+    }
+
+    pub(crate) fn set_node_bounds(&mut self, node_id: NodeId, bounds: Bounds<Pixels>) {
+        if self.journal.depth > 0 {
+            self.journal.bounds.push((node_id, bounds));
+        }
+        self.node_bounds.insert(node_id, bounds);
+    }
+
+    pub(crate) fn add_action_listener(
+        &mut self,
+        node_id: NodeId,
+        action: Action,
+        listener: A11yActionListener,
+    ) {
+        if self.journal.depth > 0 {
+            self.journal
+                .actions
+                .push((node_id, action, listener.clone()));
+        }
+        self.action_listeners
+            .entry(node_id)
+            .or_default()
+            .push((action, listener));
     }
 
     /// Report `node_id` as the currently-focused node, if it is present in the
@@ -298,6 +333,7 @@ impl A11y {
         self.focus_ids.clear();
         self.node_bounds.clear();
         self.action_listeners.clear();
+        self.journal.clear();
         self.nodes.begin_frame(self.window_title.as_ref());
     }
 
@@ -323,6 +359,159 @@ impl A11y {
 
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
         self.debug.to_json()
+    }
+}
+
+/// What [`A11y`] was given while a retained subtree recorded, for the maps that nothing else
+/// tells apart the subtree's entries in. Cleared with the maps.
+#[derive(Default)]
+struct A11yJournal {
+    depth: u32,
+    focusables: Vec<(NodeId, FocusId)>,
+    bounds: Vec<(NodeId, Bounds<Pixels>)>,
+    actions: Vec<(NodeId, Action, A11yActionListener)>,
+}
+
+impl A11yJournal {
+    fn clear(&mut self) {
+        self.depth = 0;
+        self.focusables.clear();
+        self.bounds.clear();
+        self.actions.clear();
+    }
+}
+
+/// Where the accessibility tree was when a retained subtree started to prepaint: the subtree's
+/// share of the tree is what was added after.
+pub(crate) struct A11yMark {
+    all_nodes: usize,
+    relations: usize,
+    authors: usize,
+    focusables: usize,
+    bounds: usize,
+    actions: usize,
+    stack_depth: usize,
+    parent_children: usize,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
+}
+
+/// The share of the accessibility tree that a retained subtree prepainted: its nodes, how they
+/// hang off the node that was on top of the stack when it started, and every claim it made.
+pub(crate) struct A11yRecording {
+    nodes: Vec<(NodeId, accesskit::Node)>,
+    top_children: Vec<NodeId>,
+    relations: Vec<PendingRelation>,
+    authors: Vec<(String, NodeId)>,
+    focusables: Vec<(NodeId, FocusId)>,
+    bounds: Vec<(NodeId, Bounds<Pixels>)>,
+    actions: Vec<(NodeId, Action, A11yActionListener)>,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
+    #[cfg(debug_assertions)]
+    node_info: Vec<(NodeId, debug::NodeDebugInfo)>,
+}
+
+impl A11y {
+    /// Starts recording what the nodes pushed from now on, and everything else the tree is
+    /// given, until [`Self::end_recording`]. Recordings nest.
+    pub(crate) fn begin_recording(&mut self) -> A11yMark {
+        self.journal.depth += 1;
+        self.nodes.journal_depth += 1;
+        A11yMark {
+            all_nodes: self.nodes.all_nodes.len(),
+            relations: self.nodes.pending_relations.len(),
+            authors: self.nodes.author_log.len(),
+            focusables: self.journal.focusables.len(),
+            bounds: self.journal.bounds.len(),
+            actions: self.journal.actions.len(),
+            stack_depth: self.nodes.ids_stack.len(),
+            parent_children: self
+                .nodes
+                .nodes_stack
+                .last()
+                .map_or(0, |parent| parent.children().len()),
+            focus: self.nodes.focus,
+            active_descendant: self.nodes.active_descendant,
+        }
+    }
+
+    pub(crate) fn end_recording(&mut self, mark: A11yMark) -> A11yRecording {
+        self.journal.depth -= 1;
+        self.nodes.journal_depth -= 1;
+        debug_assert_eq!(
+            self.nodes.ids_stack.len(),
+            mark.stack_depth,
+            "a retained subtree leaves the accessibility stack as it found it"
+        );
+        let nodes = self.nodes.all_nodes[mark.all_nodes..].to_vec();
+        let top_children = self
+            .nodes
+            .nodes_stack
+            .last()
+            .map(|parent| parent.children()[mark.parent_children..].to_vec())
+            .unwrap_or_default();
+        #[cfg(debug_assertions)]
+        let node_info = nodes
+            .iter()
+            .filter_map(|(id, _)| Some((*id, self.nodes.node_info.get(id)?.clone())))
+            .collect();
+        A11yRecording {
+            nodes,
+            top_children,
+            relations: self.nodes.pending_relations[mark.relations..].to_vec(),
+            authors: self.nodes.author_log[mark.authors..].to_vec(),
+            focusables: self.journal.focusables[mark.focusables..].to_vec(),
+            bounds: self.journal.bounds[mark.bounds..].to_vec(),
+            actions: self.journal.actions[mark.actions..].to_vec(),
+            focus: self.nodes.focus.filter(|_| mark.focus.is_none()),
+            active_descendant: self
+                .nodes
+                .active_descendant
+                .filter(|id| mark.active_descendant != Some(*id)),
+            #[cfg(debug_assertions)]
+            node_info,
+        }
+    }
+
+    /// Gives the tree what the subtree gave it when it was recorded, at the place the node on
+    /// top of the stack now has for it.
+    pub(crate) fn replay(&mut self, recording: &A11yRecording) {
+        if let Some(parent) = self.nodes.nodes_stack.last_mut() {
+            for child in &recording.top_children {
+                parent.push_child(*child);
+            }
+        }
+        for (id, node) in &recording.nodes {
+            let claimed = self.nodes.seen_ids.insert(*id);
+            debug_assert!(claimed, "Duplicate a11y node id: {id:?}");
+            self.nodes.all_nodes.push((*id, node.clone()));
+        }
+        for (author_id, id) in &recording.authors {
+            self.nodes.claim_author_id(author_id.clone(), *id);
+        }
+        self.nodes
+            .pending_relations
+            .extend(recording.relations.iter().cloned());
+        for (node_id, focus_id) in &recording.focusables {
+            self.set_focusable(*node_id, *focus_id);
+        }
+        for (node_id, bounds) in &recording.bounds {
+            self.set_node_bounds(*node_id, *bounds);
+        }
+        for (node_id, action, listener) in &recording.actions {
+            self.add_action_listener(*node_id, *action, listener.clone());
+        }
+        if let Some(focus) = recording.focus {
+            self.set_focus(focus);
+        }
+        if let Some(active_descendant) = recording.active_descendant {
+            self.nodes.set_active_descendant(active_descendant);
+        }
+        #[cfg(debug_assertions)]
+        for (id, info) in &recording.node_info {
+            self.nodes.record_node_info(*id, info.clone());
+        }
     }
 }
 
@@ -358,6 +547,7 @@ pub enum A11yRelation {
 
 /// Unresolved targets of one relation, recorded in prepaint and resolved in
 /// [`A11yNodeBuilder::finalize`].
+#[derive(Clone)]
 struct PendingRelation {
     node: NodeId,
     relation: A11yRelation,
@@ -452,6 +642,9 @@ pub(crate) struct A11yNodeBuilder {
     /// id owns it, as with a DOM `id`.
     author_ids: FxHashMap<String, NodeId>,
     pending_relations: Vec<PendingRelation>,
+    /// The author ids claimed while a retained subtree records (`journal_depth` above zero).
+    author_log: Vec<(String, NodeId)>,
+    journal_depth: u32,
     #[cfg(debug_assertions)]
     node_info: FxHashMap<NodeId, debug::NodeDebugInfo>,
 }
@@ -467,6 +660,8 @@ impl A11yNodeBuilder {
             active_descendant: None,
             author_ids: FxHashMap::default(),
             pending_relations: Vec::new(),
+            author_log: Vec::new(),
+            journal_depth: 0,
             #[cfg(debug_assertions)]
             node_info: FxHashMap::default(),
         }
@@ -531,7 +726,18 @@ impl A11yNodeBuilder {
 
     fn record_author_id(&mut self, id: NodeId, node: &accesskit::Node) {
         if let Some(author_id) = node.author_id() {
-            self.author_ids.entry(author_id.to_string()).or_insert(id);
+            self.claim_author_id(author_id.to_string(), id);
+        }
+    }
+
+    fn claim_author_id(&mut self, author_id: String, id: NodeId) {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.author_ids.entry(author_id)
+        {
+            if self.journal_depth > 0 {
+                self.author_log.push((entry.key().clone(), id));
+            }
+            entry.insert(id);
         }
     }
 
@@ -575,6 +781,8 @@ impl A11yNodeBuilder {
         self.seen_ids.clear();
         self.author_ids.clear();
         self.pending_relations.clear();
+        self.author_log.clear();
+        self.journal_depth = 0;
         #[cfg(debug_assertions)]
         self.node_info.clear();
         let mut root_node = accesskit::Node::new(accesskit::Role::Window);

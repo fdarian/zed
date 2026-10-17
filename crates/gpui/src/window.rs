@@ -66,13 +66,18 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod prompts;
+mod retained;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
+pub use retained::{NonReusable, RetainedCounters};
+pub(crate) use retained::{
+    PaintRecord, PrepaintRecord, RecordedHitboxes, ReplayKey, RetainedWindow,
+};
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
-use crate::tab_stop::{LiftedMarker, LiftedTabStops};
+use crate::tab_stop::{LiftedMarker, LiftedTabStops, TabStopOperation};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -1162,8 +1167,14 @@ pub(crate) struct Frame {
     /// What a layout-only pass publishes once the whole tree is prepainted. See
     /// [`Window::publish_layout`].
     layout_publications: Vec<LayoutPublication>,
+    /// The element states of the retained subtrees (see [`crate::retained`]) recorded this
+    /// frame, so that a rolled-back prepaint can drop the recordings it made.
+    retained_recordings: Vec<(GlobalElementId, TypeId)>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
+    /// Every insertion into `debug_bounds`, in order, for a replay to repeat.
+    #[cfg(any(test, feature = "test-support"))]
+    debug_bounds_log: Vec<(String, Bounds<Pixels>)>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1179,6 +1190,7 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     layout_publications_index: usize,
+    retained_recordings_index: usize,
     line_layout_index: LineLayoutIndex,
     /// The innermost enclosing hitbox when the snapshot was taken.
     hitbox_parent: Option<HitboxId>,
@@ -1193,6 +1205,8 @@ pub(crate) struct PaintIndex {
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    debug_bounds_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -1264,9 +1278,13 @@ impl Frame {
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
             layout_publications: Vec::new(),
+            retained_recordings: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
+
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_log: Vec::new(),
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             next_inspector_instance_ids: FxHashMap::default(),
@@ -1288,6 +1306,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.layout_publications.clear();
+        self.retained_recordings.clear();
         self.hitboxes.clear();
         self.hitboxes_changed();
         self.window_control_hitboxes.clear();
@@ -1298,6 +1317,7 @@ impl Frame {
         #[cfg(any(test, feature = "test-support"))]
         {
             self.debug_bounds.clear();
+            self.debug_bounds_log.clear();
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1305,6 +1325,12 @@ impl Frame {
             self.next_inspector_instance_ids.clear();
             self.inspector_hitboxes.clear();
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn insert_debug_bounds(&mut self, selector: String, bounds: Bounds<Pixels>) {
+        self.debug_bounds_log.push((selector.clone(), bounds));
+        self.debug_bounds.insert(selector, bounds);
     }
 
     pub(crate) fn cursor_style(&self, window: &Window) -> Option<CursorStyle> {
@@ -1625,6 +1651,7 @@ pub struct Window {
     #[cfg(feature = "profiler")]
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
+    pub(crate) retained: RetainedWindow,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2337,6 +2364,7 @@ impl Window {
                 accessibility_force_disabled,
                 initial_window_title,
             ),
+            retained: RetainedWindow::default(),
         })
     }
 
@@ -2737,6 +2765,7 @@ impl Window {
     /// `render` and prepaint publish outside the frame is published by every pass, so it has to
     /// be idempotent.
     pub fn request_redraw_before_present(&mut self) {
+        self.retained.redraw_requests = self.retained.redraw_requests.wrapping_add(1);
         self.redraw_before_present = true;
     }
 
@@ -4000,6 +4029,7 @@ impl Window {
     /// takes what the rolled-back rows queued with it.
     pub fn publish_layout(&mut self, publish: impl FnOnce(&mut Window, &mut App) + 'static) {
         if self.layout_only {
+            self.note_publication();
             self.next_frame.layout_publications.push(Box::new(publish));
         }
     }
@@ -4138,6 +4168,7 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.retained.rendered_serial += 1;
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
@@ -4751,29 +4782,44 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             layout_publications_index: self.next_frame.layout_publications.len(),
+            retained_recordings_index: self.next_frame.retained_recordings.len(),
             line_layout_index: self.text_system.layout_index(),
             hitbox_parent: self.hitbox_parent_stack.last().copied(),
         }
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        self.reuse_prepaint_with(range, None);
+    }
+
+    /// [`Self::reuse_prepaint`], taking the hitboxes from `recorded` instead of from the range of
+    /// the rendered frame when it is `Some`: a recording that must outlive the frame's reordering
+    /// of its hitboxes holds them by value.
+    pub(crate) fn reuse_prepaint_with(
+        &mut self,
+        range: Range<PrepaintStateIndex>,
+        recorded: Option<&RecordedHitboxes>,
+    ) {
         // Hitboxes keep their ids across frames but the enclosing hitbox is re-inserted, with a
         // new id, every time its element prepaints. The reused hitboxes that hung off the old
         // enclosing hitbox move to the current one.
         let current_parent = self.hitbox_parent_stack.last().copied();
         let stale_parent = range.start.hitbox_parent;
         self.next_frame.hitboxes_changed();
-        self.next_frame.hitboxes.extend(
-            self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
-                .iter()
-                .cloned()
-                .map(|mut hitbox| {
-                    if hitbox.parent == stale_parent {
-                        hitbox.parent = current_parent;
-                    }
-                    hitbox
-                }),
-        );
+        match recorded {
+            Some(recorded) => self.insert_recorded_hitboxes(recorded, current_parent),
+            None => self.next_frame.hitboxes.extend(
+                self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                    .iter()
+                    .cloned()
+                    .map(|mut hitbox| {
+                        if hitbox.parent == stale_parent {
+                            hitbox.parent = current_parent;
+                        }
+                        hitbox
+                    }),
+            ),
+        }
         self.next_frame.tooltip_requests.extend(
             self.rendered_frame.tooltip_requests
                 [range.start.tooltips_index..range.end.tooltips_index]
@@ -4826,11 +4872,24 @@ impl Window {
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_index: self.next_frame.debug_bounds_log.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.reuse_paint_with(range, None);
+    }
+
+    /// [`Self::reuse_paint`], taking the tab stops from `recorded` instead of from the range of
+    /// the rendered frame when it is `Some`: the stacking context that holds a recording moves
+    /// the tab stops it painted about once it is done.
+    pub(crate) fn reuse_paint_with(
+        &mut self,
+        range: Range<PaintIndex>,
+        recorded_tab_stops: Option<&[TabStopOperation]>,
+    ) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -4861,10 +4920,19 @@ impl Window {
                 .iter()
                 .map(|(id, type_id)| (id.clone(), *type_id)),
         );
-        self.next_frame.tab_stops.replay(
-            &self.rendered_frame.tab_stops.insertion_history
-                [range.start.tab_handle_index..range.end.tab_handle_index],
-        );
+        self.next_frame.tab_stops.replay(match recorded_tab_stops {
+            Some(operations) => operations,
+            None => {
+                &self.rendered_frame.tab_stops.insertion_history
+                    [range.start.tab_handle_index..range.end.tab_handle_index]
+            }
+        });
+        #[cfg(any(test, feature = "test-support"))]
+        for (selector, bounds) in
+            &self.rendered_frame.debug_bounds_log[range.start.debug_bounds_index..range.end.debug_bounds_index]
+        {
+            self.next_frame.insert_debug_bounds(selector.clone(), *bounds);
+        }
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
@@ -5199,6 +5267,7 @@ impl Window {
     /// that it counts in tree order before the elements inside it.
     pub(crate) fn begin_lift(&mut self) -> LiftTicket {
         self.invalidator.debug_assert_prepaint();
+        self.retained.lifts = self.retained.lifts.wrapping_add(1);
         let list = match self.lift_lists.last_mut() {
             Some(Some(list)) => list,
             _ => panic!("begin_lift outside a stacking context"),
@@ -5444,6 +5513,14 @@ impl Window {
             self.next_frame
                 .layout_publications
                 .truncate(index.layout_publications_index);
+            // What a retained subtree recorded in the attempt indexes the vectors truncated above.
+            for key in self
+                .next_frame
+                .retained_recordings
+                .drain(index.retained_recordings_index..)
+            {
+                self.next_frame.element_states.remove(&key);
+            }
             self.text_system.truncate_layouts(index.line_layout_index);
         }
         result
@@ -5456,6 +5533,7 @@ impl Window {
     /// called during the prepaint phase of element drawing.
     pub fn request_autoscroll(&mut self, bounds: Bounds<Pixels>) {
         self.invalidator.debug_assert_prepaint();
+        self.retained.autoscroll_requests = self.retained.autoscroll_requests.wrapping_add(1);
         self.requested_autoscroll = Some(bounds);
     }
 
@@ -5474,6 +5552,7 @@ impl Window {
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
         let (task, is_first) = cx.fetch_asset::<A>(source);
         task.clone().now_or_never().or_else(|| {
+            self.retained.pending_assets = self.retained.pending_assets.wrapping_add(1);
             if is_first {
                 let entity_id = self.current_view();
                 self.spawn(cx, {
@@ -5500,7 +5579,11 @@ impl Window {
     /// time.
     pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
         let (task, _) = cx.fetch_asset::<A>(source);
-        task.now_or_never()
+        let output = task.now_or_never();
+        if output.is_none() {
+            self.retained.pending_assets = self.retained.pending_assets.wrapping_add(1);
+        }
+        output
     }
     /// Obtain the current element offset. This method should only be called during the
     /// prepaint phase of element drawing.
@@ -8720,32 +8803,34 @@ impl Window {
         action: accesskit::Action,
         listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
     ) {
-        self.a11y
-            .action_listeners
-            .entry(node_id)
-            .or_default()
-            .push((action, Box::new(listener)));
+        self.a11y.add_action_listener(
+            node_id,
+            action,
+            Rc::new(RefCell::new(listener)),
+        );
     }
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
-        // Take listeners out temporarily so the closures can borrow Window
-        // mutably, then restore them afterward.
-        if let Some(mut listeners) = self.a11y.action_listeners.remove(&request.target_node) {
+        // The listeners are cloned out of the map so the closures can borrow Window mutably.
+        let matching: SmallVec<[a11y::A11yActionListener; 1]> = self
+            .a11y
+            .action_listeners
+            .get(&request.target_node)
+            .into_iter()
+            .flatten()
+            .filter(|(action, _)| *action == request.action)
+            .map(|(_, listener)| listener.clone())
+            .collect();
+        if !matching.is_empty() {
             let extra_data = request.data.as_ref();
-            let mut matched = false;
-            for (action, listener) in &mut listeners {
-                if *action == request.action {
+            for listener in matching {
+                // A listener that is running has the request that reached it handled.
+                if let Ok(mut listener) = listener.try_borrow_mut() {
                     listener(extra_data, self, cx);
-                    matched = true;
                 }
             }
-            self.a11y
-                .action_listeners
-                .insert(request.target_node, listeners);
-            if matched {
-                return;
-            }
+            return;
         }
 
         // Fall back to built-in action handling.

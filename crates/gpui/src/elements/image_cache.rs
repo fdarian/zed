@@ -1,5 +1,6 @@
 use crate::{
     AnyElement, AnyEntity, App, AppContext, Asset, AssetLogger, Bounds, Element, ElementId, Entity,
+    EntityId,
     GlobalElementId, ImageAssetLoader, ImageCacheError, InspectorElementId, IntoElement, LayoutId,
     ParentElement, Pixels, Position, RenderImage, Resource, Style, StyleRefinement, Styled, Task, Window,
     hash,
@@ -30,6 +31,12 @@ pub struct AnyImageCache {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>>,
+}
+
+impl AnyImageCache {
+    pub(crate) fn entity_id(&self) -> EntityId {
+        self.image_cache.entity_id()
+    }
 }
 
 impl<I: ImageCache> From<Entity<I>> for AnyImageCache {
