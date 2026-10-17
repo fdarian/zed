@@ -9,7 +9,7 @@ use crate::{
     BackgroundLayer, BackgroundTag, MaskLayer, MaskMode,
     BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, CornerRadii,
     CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridAutoFlow, GridLocation, ImageKey,
+    FontFallbacks, FontFeatures, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions, TextWrapStyle,
     TextRun, Window, OverflowWrap, TextBoxEdge, WordBreak, black, phi, point, px, quad, rems, size,
@@ -615,6 +615,9 @@ pub struct TextStyle {
     /// The font features to use
     pub font_features: FontFeatures,
 
+    /// The variation axes of a variable font to set
+    pub font_variations: FontVariations,
+
     /// The fallback fonts to use
     pub font_fallbacks: Option<FontFallbacks>,
 
@@ -696,6 +699,7 @@ impl Default for TextStyle {
             // todo(linux) make this configurable or choose better default
             font_family: ".SystemUIFont".into(),
             font_features: FontFeatures::default(),
+            font_variations: FontVariations::default(),
             font_fallbacks: None,
             font_size: rems(1.).into(),
             line_height: phi(),
@@ -805,6 +809,7 @@ impl TextStyle {
         Font {
             family: self.font_family.clone(),
             features: self.font_features.clone(),
+            variations: self.font_variations.clone(),
             fallbacks: self.font_fallbacks.clone(),
             weight: self.font_weight,
             style: self.font_style,
@@ -823,6 +828,7 @@ impl TextStyle {
             font: Font {
                 family: self.font_family.clone(),
                 features: self.font_features.clone(),
+                variations: self.font_variations.clone(),
                 fallbacks: self.font_fallbacks.clone(),
                 weight: self.font_weight,
                 style: self.font_style,

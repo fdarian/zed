@@ -2,6 +2,7 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle,
     CellVerticalAlign, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
+    FontVariations,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
     JustifyContent, Length, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
     StyleRefinement, TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow,
@@ -959,11 +960,18 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the variation axes of this element and its children.
+    fn font_variations(mut self, variations: FontVariations) -> Self {
+        self.text_style().font_variations = Some(variations);
+        self
+    }
+
     /// Sets the font of this element and its children.
     fn font(mut self, font: Font) -> Self {
         let Font {
             family,
             features,
+            variations,
             fallbacks,
             weight,
             style,
@@ -972,6 +980,7 @@ pub trait Styled: Sized {
         let text_style = self.text_style();
         text_style.font_family = Some(family);
         text_style.font_features = Some(features);
+        text_style.font_variations = Some(variations);
         text_style.font_weight = Some(weight);
         text_style.font_style = Some(style);
         text_style.font_fallbacks = fallbacks;

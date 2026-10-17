@@ -35,7 +35,7 @@ use font_kit::{
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontStyle, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
+    FontStyle, FontVariations, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
     Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
@@ -48,7 +48,9 @@ use pathfinder_geometry::{
 use smallvec::SmallVec;
 use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
 
-use crate::open_type::apply_features_and_fallbacks;
+use crate::open_type::{
+    apply_features_and_fallbacks, apply_variations, current_variations, variation_axes,
+};
 
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
@@ -71,6 +73,10 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    /// The faces made from another by setting variation axes, by that face and the
+    /// axes set. They are not in `font_ids_by_postscript_name`: they keep the name
+    /// of the face they were made from.
+    varied_fonts: HashMap<(FontId, FontVariations), FontId>,
 }
 
 impl MacTextSystem {
@@ -84,6 +90,7 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            varied_fonts: HashMap::default(),
         }))
     }
 }
@@ -168,6 +175,7 @@ impl PlatformTextSystem for MacTextSystem {
             )?;
 
             let font_id = candidates[ix];
+            let font_id = lock.varied_font(font_id, font.weight, &font.variations);
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
         }
@@ -382,6 +390,55 @@ impl MacTextSystemState {
         Ok(font_ids)
     }
 
+    /// `font_id` with the axes it has set to `variations`, and to `weight` on `wght`
+    /// unless `variations` names it, as CSS font matching does for a variable font.
+    /// An axis the face does not have is ignored. `font_id` itself when that changes
+    /// nothing, as for a face that already has those values.
+    fn varied_font(
+        &mut self,
+        font_id: FontId,
+        weight: FontWeight,
+        variations: &FontVariations,
+    ) -> FontId {
+        let axes = variation_axes(&self.fonts[font_id.0]);
+        if axes.is_empty() {
+            return font_id;
+        }
+        let weight_tag = FontVariations::tag(*b"wght");
+        let automatic = [(weight_tag, weight.0)];
+        let automatic = (variations.get(weight_tag).is_none()).then_some(automatic.as_slice());
+        let current = current_variations(&self.fonts[font_id.0], &axes);
+        let wanted = variations
+            .tag_value_list()
+            .iter()
+            .chain(automatic.unwrap_or_default())
+            .filter_map(|(tag, value)| {
+                let axis = axes.iter().find(|axis| axis.tag == *tag)?;
+                let value = value.clamp(axis.min, axis.max);
+                let has = current.iter().find(|(current, _)| current == tag)?.1;
+                (has != value).then_some((*tag, value))
+            })
+            .collect::<Vec<_>>();
+        if wanted.is_empty() {
+            return font_id;
+        }
+        let wanted = FontVariations::new(wanted);
+        let key = (font_id, wanted);
+        if let Some(varied) = self.varied_fonts.get(&key) {
+            return *varied;
+        }
+        let mut font = self.fonts[font_id.0].clone();
+        apply_variations(&mut font, key.1.tag_value_list(), &axes);
+        let varied = FontId(self.fonts.len());
+        self.fonts.push(font);
+        if let Some(postscript_name) = self.postscript_names_by_font_id.get(&font_id).cloned() {
+            self.postscript_names_by_font_id
+                .insert(varied, postscript_name);
+        }
+        self.varied_fonts.insert(key, varied);
+        varied
+    }
+
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
         Ok(size_from_vector2f(
             self.fonts[font_id.0].advance(glyph_id.0)?,
@@ -559,25 +616,23 @@ impl MacTextSystemState {
 
                 let run_font_size = run.font_size.unwrap_or(font_size);
                 let run_scale = f32::from(run_font_size) / font_metrics.units_per_em as f32;
+                let ct_font_size = if break_ligature {
+                    px(f32::from(run_font_size).next_up())
+                } else {
+                    run_font_size
+                };
+                let ct_font = font.native_font().clone_with_font_size(ct_font_size.into());
                 input_runs.push(InputRun {
+                    font_id: run.font_id,
+                    postscript_name: ct_font.postscript_name(),
                     utf16_start,
                     font_size: run_font_size,
                     ascent: px(font_metrics.ascent * run_scale),
                     descent: px(-font_metrics.descent * run_scale),
                     line_height: run.line_height,
                 });
-
-                let ct_font_size = if break_ligature {
-                    px(f32::from(run_font_size).next_up())
-                } else {
-                    run_font_size
-                };
                 unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(ct_font_size.into()),
-                    );
+                    string.set_attribute(cf_range, kCTFontAttributeName, &ct_font);
                 }
                 break_ligature = !break_ligature;
             }
@@ -595,7 +650,6 @@ impl MacTextSystemState {
                     .downcast::<CTFont>()
                     .unwrap()
             };
-            let font_id = self.id_for_native_font(font);
 
             // The CTFont's point size is perturbed by the ligature hack and its font can be
             // a fallback, so the run's size comes from the input run it was shaped from.
@@ -605,6 +659,15 @@ impl MacTextSystemState {
             };
             let input_run = &input_runs
                 [input_runs.partition_point(|input| input.utf16_start <= first_utf16_ix) - 1];
+
+            // A face with features set has the PostScript name of the one it was made from,
+            // so the name cannot tell which of them shaped the run. When CoreText kept the
+            // font it was given, the run is in the font it asked for.
+            let font_id = if input_run.postscript_name == font.postscript_name() {
+                input_run.font_id
+            } else {
+                self.id_for_native_font(font)
+            };
 
             let glyphs = match runs.last_mut() {
                 Some(run)
@@ -661,6 +724,9 @@ impl MacTextSystemState {
 
 /// What the shaper needs to know about an input `FontRun` once the glyphs come back.
 struct InputRun {
+    font_id: FontId,
+    /// The name CoreText gives the font the run is asked to be shaped in.
+    postscript_name: String,
     utf16_start: CFIndex,
     font_size: Pixels,
     ascent: Pixels,
@@ -807,7 +873,11 @@ mod lenient_font_attributes {
 #[cfg(test)]
 mod tests {
     use crate::MacTextSystem;
-    use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+    use gpui::{
+        Font, FontFeatures, FontRun, FontVariations, FontWeight, GlyphId, PlatformTextSystem,
+        RenderGlyphParams, font, px,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn test_layout_line_bom_char() {
@@ -1150,5 +1220,233 @@ mod tests {
         let position = layout.position_for_index(2, px(20.)).unwrap();
         assert_eq!(f32::from(position.x), x(2));
         assert_eq!(position.y, px(0.));
+    }
+
+    fn weight_variations(weight: f32) -> FontVariations {
+        FontVariations::new([(FontVariations::tag(*b"wght"), weight)])
+    }
+
+    /// The system font is variable on every macOS this builds for, and its named
+    /// instances each carry every axis.
+    fn system_font(weight: f32, variations: FontVariations) -> Font {
+        Font {
+            weight: FontWeight(weight),
+            variations,
+            ..font(".SystemUIFont")
+        }
+    }
+
+    fn width(fonts: &MacTextSystem, font: &Font, text: &str) -> f32 {
+        let font_id = fonts.font_id(font).unwrap();
+        let run = FontRun {
+            font_id,
+            len: text.len(),
+            font_size: None,
+            line_height: None,
+        };
+        f32::from(fonts.layout_line(text, px(40.), &[run]).width)
+    }
+
+    #[test]
+    fn test_a_wght_variation_changes_the_advances() {
+        let fonts = MacTextSystem::new();
+        let at = |wght| width(&fonts, &system_font(400., weight_variations(wght)), "Wave");
+        let (light, regular, heavy) = (at(100.), at(400.), at(900.));
+        assert!(
+            light < regular && regular < heavy,
+            "{light} {regular} {heavy}"
+        );
+        assert!(at(650.) > at(600.) && at(650.) < at(700.));
+        // 400 is the default of the axis, which the regular face already has.
+        assert_eq!(
+            fonts
+                .font_id(&system_font(400., weight_variations(400.)))
+                .unwrap(),
+            fonts
+                .font_id(&system_font(400., FontVariations::default()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_font_weight_is_the_wght_of_a_variable_font() {
+        let fonts = MacTextSystem::new();
+        let at = |weight| {
+            width(
+                &fonts,
+                &system_font(weight, FontVariations::default()),
+                "Wave",
+            )
+        };
+        // The faces of the family are named instances; 650 is none of them.
+        assert!(
+            at(600.) < at(650.) && at(650.) < at(700.),
+            "{} {} {}",
+            at(600.),
+            at(650.),
+            at(700.)
+        );
+        // `font-variation-settings` wins over `font-weight`.
+        assert_eq!(
+            width(&fonts, &system_font(700., weight_variations(400.)), "Wave"),
+            at(400.)
+        );
+        // An instance whose weight is asked for exactly is used as it is.
+        assert_eq!(
+            fonts
+                .font_id(&system_font(700., FontVariations::default()))
+                .unwrap(),
+            fonts
+                .font_id(&system_font(700., weight_variations(700.)))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_an_axis_the_font_does_not_have_is_ignored() {
+        let fonts = MacTextSystem::new();
+        let unknown = FontVariations::new([(FontVariations::tag(*b"ZZZZ"), 5.)]);
+        assert_eq!(
+            fonts.font_id(&system_font(400., unknown)).unwrap(),
+            fonts
+                .font_id(&system_font(400., FontVariations::default()))
+                .unwrap()
+        );
+        // A font that is not variable at all.
+        let helvetica = Font {
+            variations: weight_variations(900.),
+            ..font("Helvetica")
+        };
+        assert_eq!(
+            fonts.font_id(&helvetica).unwrap(),
+            fonts.font_id(&font("Helvetica")).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_runs_of_one_family_keep_their_own_variations() {
+        let fonts = MacTextSystem::new();
+        let light = fonts
+            .font_id(&system_font(400., weight_variations(100.)))
+            .unwrap();
+        let heavy = fonts
+            .font_id(&system_font(400., weight_variations(900.)))
+            .unwrap();
+        assert_ne!(light, heavy);
+
+        let layout = fonts.layout_line(
+            "WW",
+            px(40.),
+            &[
+                FontRun {
+                    font_id: light,
+                    len: 1,
+                    font_size: None,
+                    line_height: None,
+                },
+                FontRun {
+                    font_id: heavy,
+                    len: 1,
+                    font_size: None,
+                    line_height: None,
+                },
+            ],
+        );
+        // They share a PostScript name, and each run still comes back in its own face.
+        assert_eq!(
+            layout
+                .runs
+                .iter()
+                .map(|run| run.font_id)
+                .collect::<Vec<_>>(),
+            [light, heavy]
+        );
+        let glyph = |id| fonts.glyph_for_char(id, 'W').unwrap();
+        assert_ne!(
+            fonts.advance(light, glyph(light)).unwrap(),
+            fonts.advance(heavy, glyph(heavy)).unwrap()
+        );
+        let alone = fonts.layout_line(
+            "W",
+            px(40.),
+            &[FontRun {
+                font_id: light,
+                len: 1,
+                font_size: None,
+                line_height: None,
+            }],
+        );
+        assert_eq!(layout.runs[1].glyphs[0].position.x, alone.width);
+
+        let bounds = |font_id| {
+            fonts
+                .glyph_raster_bounds(&RenderGlyphParams {
+                    font_id,
+                    glyph_id: glyph(font_id),
+                    font_size: px(40.),
+                    subpixel_variant: Default::default(),
+                    scale_factor: 1.,
+                    is_emoji: false,
+                    subpixel_rendering: false,
+                    dilation: 0,
+                })
+                .unwrap()
+                .size
+                .width
+        };
+        assert!(bounds(light) < bounds(heavy));
+    }
+
+    #[test]
+    fn test_runs_of_one_family_keep_their_own_features() {
+        let fonts = MacTextSystem::new();
+        let tabular = Font {
+            features: FontFeatures(Arc::new(vec![("tnum".into(), 1)])),
+            ..font(".SystemUIFont")
+        };
+        let plain = font(".SystemUIFont");
+        let (tabular_id, plain_id) = (
+            fonts.font_id(&tabular).unwrap(),
+            fonts.font_id(&plain).unwrap(),
+        );
+        assert_ne!(tabular_id, plain_id);
+        let layout = fonts.layout_line(
+            "11",
+            px(40.),
+            &[
+                FontRun {
+                    font_id: tabular_id,
+                    len: 1,
+                    font_size: None,
+                    line_height: None,
+                },
+                FontRun {
+                    font_id: plain_id,
+                    len: 1,
+                    font_size: None,
+                    line_height: None,
+                },
+            ],
+        );
+        assert_eq!(
+            layout
+                .runs
+                .iter()
+                .map(|run| run.font_id)
+                .collect::<Vec<_>>(),
+            [tabular_id, plain_id]
+        );
+    }
+
+    #[test]
+    fn test_variations_compose_with_features() {
+        let fonts = MacTextSystem::new();
+        let tabular = |wght| Font {
+            features: FontFeatures(Arc::new(vec![("tnum".into(), 1)])),
+            ..system_font(400., weight_variations(wght))
+        };
+        let digits = |wght, text| width(&fonts, &tabular(wght), text);
+        assert!((digits(700., "1111") - digits(700., "0000")).abs() < 0.01);
+        assert!(digits(700., "1111") > digits(400., "1111"));
     }
 }

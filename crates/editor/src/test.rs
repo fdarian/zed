@@ -52,6 +52,7 @@ pub fn marked_display_snapshot(
     let font = Font {
         family: ".ZedMono".into(),
         features: FontFeatures::default(),
+        variations: Default::default(),
         fallbacks: None,
         weight: FontWeight::default(),
         style: FontStyle::default(),

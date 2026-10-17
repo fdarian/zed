@@ -1,6 +1,7 @@
 mod font_fallbacks;
 mod font_features;
 mod inline;
+mod font_variations;
 mod line;
 mod line_layout;
 mod line_truncation;
@@ -11,6 +12,7 @@ mod text_box;
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use inline::*;
+pub use font_variations::*;
 pub use line::*;
 pub use line_layout::*;
 pub(crate) use line_truncation::EndTruncation;
@@ -1365,6 +1367,9 @@ pub struct Font {
     /// The font features to use.
     pub features: FontFeatures,
 
+    /// The variation axes of a variable font to set.
+    pub variations: FontVariations,
+
     /// The fallbacks fonts to use.
     pub fallbacks: Option<FontFallbacks>,
 
@@ -1386,6 +1391,7 @@ pub fn font(family: impl Into<SharedString>) -> Font {
     Font {
         family: family.into(),
         features: FontFeatures::default(),
+        variations: FontVariations::default(),
         weight: FontWeight::default(),
         style: FontStyle::default(),
         fallbacks: None,

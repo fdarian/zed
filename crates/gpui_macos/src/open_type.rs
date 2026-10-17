@@ -6,7 +6,7 @@ use core_foundation::{
         CFArray, CFArrayAppendArray, CFArrayAppendValue, CFArrayCreateMutable, CFArrayGetCount,
         CFArrayGetValueAtIndex, CFArrayRef, CFMutableArrayRef, kCFTypeArrayCallBacks,
     },
-    base::{CFRelease, TCFType, kCFAllocatorDefault},
+    base::{CFRelease, CFType, TCFType, kCFAllocatorDefault},
     dictionary::{
         CFDictionaryCreate, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
     },
@@ -25,6 +25,7 @@ use core_text::{
         CTFontDescriptor, CTFontDescriptorCopyAttributes, CTFontDescriptorCreateCopyWithFeature,
         CTFontDescriptorCreateWithAttributes, CTFontDescriptorCreateWithNameAndSize,
         CTFontDescriptorRef, kCTFontCascadeListAttribute, kCTFontFeatureSettingsAttribute,
+        kCTFontVariationAttribute,
     },
 };
 use font_kit::font::Font as FontKitFont;
@@ -173,10 +174,118 @@ fn append_system_fallbacks(fallback_array: CFMutableArrayRef, font_ref: CTFontRe
     }
 }
 
+/// An axis of a variable font.
+#[derive(Clone, Copy, Debug)]
+pub struct VariationAxis {
+    pub tag: u32,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+}
+
+/// The axes of `font`, none for a font that is not variable.
+pub fn variation_axes(font: &FontKitFont) -> Vec<VariationAxis> {
+    let Some(axes) = font.native_font().get_variation_axes() else {
+        return Vec::new();
+    };
+    let number = |axis: &CFDictionary<CFString, CFType>, key: CFStringRef| {
+        axis.find(unsafe { CFString::wrap_under_get_rule(key) })
+            .and_then(|value| value.downcast::<CFNumber>())
+            .and_then(|value| value.to_f64())
+    };
+    axes.iter()
+        .filter_map(|axis| unsafe {
+            Some(VariationAxis {
+                tag: number(&axis, kCTFontVariationAxisIdentifierKey)? as u32,
+                min: number(&axis, kCTFontVariationAxisMinimumValueKey)? as f32,
+                max: number(&axis, kCTFontVariationAxisMaximumValueKey)? as f32,
+                default: number(&axis, kCTFontVariationAxisDefaultValueKey)? as f32,
+            })
+        })
+        .collect()
+}
+
+/// What `font` has set on each of its `axes`.
+pub fn current_variations(font: &FontKitFont, axes: &[VariationAxis]) -> Vec<(u32, f32)> {
+    let dictionary = unsafe {
+        let dictionary = CTFontCopyVariation(font.native_font().as_concrete_TypeRef());
+        // A font with no variation set has none, and then every axis is at its default.
+        (!dictionary.is_null())
+            .then(|| CFDictionary::<CFType, CFType>::wrap_under_create_rule(dictionary))
+    };
+    axes.iter()
+        .map(|axis| {
+            let set = dictionary.as_ref().and_then(|dictionary| {
+                dictionary
+                    .find(CFNumber::from(axis.tag as i64).as_CFType())
+                    .and_then(|value| value.downcast::<CFNumber>())
+                    .and_then(|value| value.to_f64())
+            });
+            (axis.tag, set.map_or(axis.default, |value| value as f32))
+        })
+        .collect()
+}
+
+/// Replaces `font` with a copy set to `variations`, a value per axis in `axes`.
+/// The axes not named stay as `font` has them.
+///
+/// CoreText drops an axis set to its default from the copy's variation, and then
+/// the copy has that axis as the face it was made from does: asking a
+/// semibold instance for `wght` 400 gives a semibold. A value at the default is
+/// moved one step off it, which is below what any rasteriser can show.
+pub fn apply_variations(font: &mut FontKitFont, variations: &[(u32, f32)], axes: &[VariationAxis]) {
+    let values = CFDictionary::from_CFType_pairs(
+        &variations
+            .iter()
+            .map(|(tag, value)| {
+                let default = axes
+                    .iter()
+                    .find(|axis| axis.tag == *tag)
+                    .map(|axis| (axis.default, axis.max));
+                let value = match default {
+                    Some((default, max)) if *value == default => {
+                        if default < max {
+                            value.next_up()
+                        } else {
+                            value.next_down()
+                        }
+                    }
+                    _ => *value,
+                };
+                (CFNumber::from(*tag as i64), CFNumber::from(value as f64))
+            })
+            .collect::<Vec<_>>(),
+    );
+    let attributes = CFDictionary::from_CFType_pairs(&[(
+        unsafe { CFString::wrap_under_get_rule(kCTFontVariationAttribute) },
+        values.as_CFType(),
+    )]);
+    let descriptor = unsafe {
+        CTFontDescriptor::wrap_under_create_rule(CTFontDescriptorCreateWithAttributes(
+            attributes.as_concrete_TypeRef(),
+        ))
+    };
+    let new_font = unsafe {
+        CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
+            font.native_font().as_concrete_TypeRef(),
+            0.0,
+            std::ptr::null(),
+            descriptor.as_concrete_TypeRef(),
+        ))
+    };
+    *font = unsafe { FontKitFont::from_native_font(&new_font) };
+}
+
 #[link(name = "CoreText", kind = "framework")]
 unsafe extern "C" {
     static kCTFontOpenTypeFeatureTag: CFStringRef;
     static kCTFontOpenTypeFeatureValue: CFStringRef;
+    static kCTFontVariationAxisIdentifierKey: CFStringRef;
+    static kCTFontVariationAxisMinimumValueKey: CFStringRef;
+    static kCTFontVariationAxisMaximumValueKey: CFStringRef;
+    static kCTFontVariationAxisDefaultValueKey: CFStringRef;
+
+    fn CTFontCopyVariation(font: CTFontRef) -> core_foundation::dictionary::CFDictionaryRef;
 
     fn CTFontCreateCopyWithAttributes(
         font: CTFontRef,

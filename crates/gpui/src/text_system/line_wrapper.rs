@@ -704,6 +704,7 @@ mod tests {
                 font: Font {
                     family: "Dummy".into(),
                     features: FontFeatures::default(),
+                    variations: Default::default(),
                     fallbacks: None,
                     weight: FontWeight::default(),
                     style: FontStyle::Normal,
