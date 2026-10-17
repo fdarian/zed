@@ -475,6 +475,7 @@ mod tests {
         /// The paragraph is the only item of a flex row of this width, and has no width of
         /// its own.
         pub flex_row: Option<f32>,
+        pub insets: Vec<crate::TextInset>,
     }
 
     struct Paragraph {
@@ -510,6 +511,7 @@ mod tests {
                 })
                 .collect();
             let mut text = StyledText::new(setup.text.clone())
+                .with_insets(setup.insets.clone())
                 .with_inline_boxes(boxes)
                 .with_atomic_inlines(atomics);
             if !setup.runs.is_empty() {
@@ -982,6 +984,7 @@ mod tests {
                 }],
                 text_align: None,
                 flex_row: None,
+                insets: Vec::new(),
             });
             assert_close(laid.paragraph.size.height, height, name);
             assert_close(laid.boxes[0].origin.y, baseline, &format!("{name}: baseline"));
@@ -1187,5 +1190,30 @@ mod tests {
         // Narrower than the box wants: the max-content layout, then the min-content
         // width to know how narrow it can go, and the layout at the width it got.
         assert_eq!(passes(80., 1), 3);
+    }
+
+    /// A hard line break puts a box on the second line, with the bytes of the first
+    /// counted, and the padding of a `<span>` around a box is before and after it.
+    #[test]
+    fn boxes_follow_hard_line_breaks_and_the_insets_around_them() {
+        let o = OBJECT;
+        // <div style="width:400px">xx<br><span style="padding:0 7px 0 5px"><box60x10></span>yy</div>
+        let laid = lay_out_with(Setup {
+            width: 400.,
+            text: format!("xx\n{o}yy"),
+            atomics: vec![atomic(60., 10.)],
+            insets: vec![crate::TextInset {
+                range: 3..6,
+                leading: px(5.),
+                trailing: px(7.),
+            }],
+            ..Default::default()
+        });
+        assert_close(laid.paragraph.size.height, 40., "two lines");
+        assert_close(laid.boxes[0].origin.x, 5., "x after the leading padding");
+        assert_close(laid.boxes[0].origin.y, 27., "y on the second line");
+        // The "yy" after it starts after the trailing padding too.
+        let after = laid.layout.position_for_index(6).unwrap();
+        assert_close(after.x, 5. + 60. + 7., "the text after the box");
     }
 }

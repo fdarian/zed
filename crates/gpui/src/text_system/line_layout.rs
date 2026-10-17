@@ -3779,4 +3779,146 @@ mod tests {
             assert_px(descent, plain.descent / 2.);
         }
     }
+
+    /// `text` as ten pixel wide characters, with the placeholder of an atomic inline
+    /// wherever there is a U+FFFC: it is `object_width` wide and in a run of its own.
+    fn object_line(
+        text: &str,
+        object_width: f32,
+        wrap_width: Option<f32>,
+        options: TextLayoutOptions,
+    ) -> WrappedLineLayout {
+        let mut runs: Vec<ShapedRun> = Vec::new();
+        let mut x = 0.;
+        for (index, character) in text.char_indices() {
+            let is_object = character == crate::OBJECT_REPLACEMENT_CHARACTER;
+            if is_object || runs.last().is_none_or(|run| run.inline.object) {
+                runs.push(ShapedRun {
+                    inline: InlineRun {
+                        placement: RunPlacement::Baseline,
+                        object: is_object,
+                    },
+                    ..make_layout(Vec::new()).runs.remove(0)
+                });
+            }
+            runs.last_mut().unwrap().glyphs.push(glyph_at(x, index));
+            x += if is_object { object_width } else { 10. };
+        }
+        let shaped = LineLayout {
+            width: px(x),
+            len: text.len(),
+            runs,
+            ..make_layout(Vec::new())
+        };
+        let computation = shaped.compute_wrap_boundaries(
+            text,
+            wrap_width.map(px),
+            None,
+            options,
+            None,
+            &[],
+        );
+        WrappedLineLayout {
+            unwrapped_layout: Arc::new(shaped),
+            wrap_boundaries: computation.boundaries,
+            wrap_width: wrap_width.map(px),
+            hanging_widths: computation.hanging_widths,
+            insets: computation.glyph_insets,
+        }
+    }
+
+    #[test]
+    fn test_a_line_breaks_before_and_after_an_atomic_inline() {
+        let normal = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            ..Default::default()
+        };
+        // "aaaa" ends at 40, the box at 80, and the "b"s at 90 and 100: with 90 to fill,
+        // the second "b" overflows, and the line breaks after the box where it can.
+        let text = "aaaa\u{FFFC}bbbb";
+        let layout = object_line(text, 40., Some(90.), normal);
+        assert_eq!(boundary_indices(&layout), vec![7]);
+        // A box that does not fit moves down with no letter before it to break at.
+        let layout = object_line("aaaa\u{FFFC}", 60., Some(90.), normal);
+        assert_eq!(boundary_indices(&layout), vec![4]);
+        // And one wider than the line overflows it from the start.
+        let layout = object_line("\u{FFFC}aa", 100., Some(90.), normal);
+        assert_eq!(boundary_indices(&layout), vec![3]);
+        // Several boxes break between any two.
+        let layout = object_line("\u{FFFC}\u{FFFC}\u{FFFC}", 40., Some(90.), normal);
+        assert_eq!(boundary_indices(&layout), vec![6]);
+    }
+
+    #[test]
+    fn test_a_space_before_an_atomic_inline_hangs_when_the_box_wraps() {
+        let options = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            hang_trailing_spaces: true,
+            ..Default::default()
+        };
+        let layout = object_line("aaaa \u{FFFC}", 60., Some(90.), options);
+        assert_eq!(boundary_indices(&layout), vec![5]);
+        assert_eq!(layout.hanging_widths.first(), Some(&px(10.)));
+    }
+
+    #[test]
+    fn test_a_run_aligned_to_the_top_or_bottom_grows_the_row_the_way_the_taller_one_says() {
+        let rows = |placements: &[(RunPlacement, f32, f32)]| {
+            let mut layout = make_layout(Vec::new());
+            // The strut: a font of ascent 12 and descent 4 in a line height of 16.
+            layout.runs.clear();
+            for (ix, (placement, ascent, descent)) in placements.iter().enumerate() {
+                layout.runs.push(ShapedRun {
+                    ascent: px(*ascent),
+                    descent: px(*descent),
+                    line_height: Some(px(ascent + descent)),
+                    glyphs: vec![glyph_at(ix as f32, ix)],
+                    inline: InlineRun {
+                        placement: *placement,
+                        object: true,
+                    },
+                    ..make_layout(Vec::new()).runs.remove(0)
+                });
+            }
+            layout.rows(&[], px(16.))[0]
+        };
+        // Baseline runs: the strut is 12 above and 4 below.
+        assert_eq!(
+            rows(&[(RunPlacement::Baseline, 20., 0.)]),
+            RowMetrics { height: px(24.), baseline: px(20.) }
+        );
+        // A taller top run grows the row down, a taller bottom one up.
+        assert_eq!(
+            rows(&[(RunPlacement::Top, 30., 0.)]),
+            RowMetrics { height: px(30.), baseline: px(12.) }
+        );
+        assert_eq!(
+            rows(&[(RunPlacement::Bottom, 30., 0.)]),
+            RowMetrics { height: px(30.), baseline: px(26.) }
+        );
+        // The taller of the two decides, and the top one when they are as tall.
+        assert_eq!(
+            rows(&[(RunPlacement::Top, 20., 0.), (RunPlacement::Bottom, 30., 0.)]),
+            RowMetrics { height: px(30.), baseline: px(26.) }
+        );
+        assert_eq!(
+            rows(&[(RunPlacement::Top, 30., 0.), (RunPlacement::Bottom, 20., 0.)]),
+            RowMetrics { height: px(30.), baseline: px(12.) }
+        );
+        assert_eq!(
+            rows(&[(RunPlacement::Top, 30., 0.), (RunPlacement::Bottom, 30., 0.)]),
+            RowMetrics { height: px(30.), baseline: px(12.) }
+        );
+        // A raised run is 5px higher: 15 above the baseline, and the strut still has 4
+        // below it.
+        assert_eq!(
+            rows(&[(RunPlacement::Raised(px(5.)), 10., 2.)]),
+            RowMetrics { height: px(19.), baseline: px(15.) }
+        );
+        // A lowered one has 7 below it, and the strut 12 above.
+        assert_eq!(
+            rows(&[(RunPlacement::Raised(px(-5.)), 10., 2.)]),
+            RowMetrics { height: px(19.), baseline: px(12.) }
+        );
+    }
 }
