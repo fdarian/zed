@@ -56,6 +56,9 @@ pub struct AtomicInline {
     pub parent: Option<usize>,
     /// Where the baseline of the box is.
     pub baseline: AtomicBaseline,
+    /// How far the box is painted from where the text puts it, like the offsets of
+    /// `position: relative`: nothing else on the line moves with it.
+    pub offset: Point<Pixels>,
 }
 
 impl AtomicInline {
@@ -70,6 +73,7 @@ impl AtomicInline {
             line_height: None,
             parent: None,
             baseline: AtomicBaseline::BottomMarginEdge,
+            offset: Point::default(),
         }
     }
 }
@@ -103,6 +107,7 @@ struct Slot {
     line_height: Option<Pixels>,
     parent: Option<usize>,
     baseline: AtomicBaseline,
+    offset: Point<Pixels>,
     /// What the engine holds of the box.
     laid_out_as: Option<Layout>,
     min_width: Option<Pixels>,
@@ -139,6 +144,7 @@ impl AtomicInlines {
                     line_height: atomic.line_height,
                     parent: atomic.parent,
                     baseline: atomic.baseline,
+                    offset: atomic.offset,
                     laid_out_as: None,
                     min_width: None,
                     max_size: None,
@@ -199,7 +205,9 @@ impl AtomicInlines {
                     continue;
                 };
                 slot.restore_layout(window, cx);
-                let origin = *origin + crate::point(slot.used_margin.left, slot.used_margin.top);
+                let origin = *origin
+                    + crate::point(slot.used_margin.left, slot.used_margin.top)
+                    + slot.offset;
                 slot.element.prepaint_at(origin, window, cx);
             }
         });
@@ -376,6 +384,8 @@ mod tests {
         /// The box is a flex row of boxes of these sizes, and its baseline is the bottom of
         /// the first of them, as the first baseline of a flex container is.
         pub flex_items: Vec<(f32, f32)>,
+        /// Painted this far from where the text puts the box.
+        pub offset: (f32, f32),
     }
 
     pub(super) fn atomic(width: f32, height: f32) -> Atomic {
@@ -389,6 +399,7 @@ mod tests {
             margin: [0.; 4],
             clicks: None,
             flex_items: Vec::new(),
+            offset: (0., 0.),
         }
     }
 
@@ -412,6 +423,11 @@ mod tests {
 
         pub(super) fn margin(mut self, top: f32, right: f32, bottom: f32, left: f32) -> Self {
             self.margin = [top, right, bottom, left];
+            self
+        }
+
+        pub(super) fn offset(mut self, x: f32, y: f32) -> Self {
+            self.offset = (x, y);
             self
         }
 
@@ -470,6 +486,7 @@ mod tests {
             inline.width = self.width_fraction.map(crate::relative);
             inline.vertical_align = self.align;
             inline.baseline = baseline;
+            inline.offset = crate::point(crate::px(self.offset.0), crate::px(self.offset.1));
             let [top, right, bottom, left] = self.margin;
             inline.margin = Edges {
                 top: crate::px(top).into(),
@@ -1273,6 +1290,28 @@ mod tests {
             inner.bottom() - middle.origin.y,
             17.,
             "the inner box is on the baseline",
+        );
+    }
+
+    /// `<span style="display:inline-block;position:relative;left:7px;top:5px;width:30px;height:10px">`:
+    /// Chrome paints the box 7px right and 5px down of where it sits, and the text after it is where it
+    /// was.
+    #[test]
+    fn an_offset_moves_the_box_and_nothing_else() {
+        let text = format!("xx{OBJECT}yy");
+        let plain = lay_out(400., &text, vec![atomic(30., 10.)]);
+        let moved = lay_out(400., &text, vec![atomic(30., 10.).offset(7., 5.)]);
+        assert_close(moved.boxes[0].origin.x - plain.boxes[0].origin.x, 7., "x");
+        assert_close(moved.boxes[0].origin.y - plain.boxes[0].origin.y, 5., "y");
+        assert_close(
+            moved.paragraph.size.height,
+            f32::from(plain.paragraph.size.height),
+            "the line",
+        );
+        assert_close(
+            moved.layout.position_for_index(5).unwrap().x,
+            f32::from(plain.layout.position_for_index(5).unwrap().x),
+            "the text after the box",
         );
     }
 
