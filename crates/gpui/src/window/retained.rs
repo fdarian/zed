@@ -439,6 +439,22 @@ impl Window {
         self.layout_engine().id()
     }
 
+    /// Runs `callback` and returns the entities it read, but for the view that is rendering: that
+    /// view being notified is what draws the frame, and the key of a retained element says
+    /// whether the subtree changed with it. The entities of views rendered inside the callback are
+    /// among them.
+    pub(crate) fn detect_observed_entities<R>(
+        &mut self,
+        cx: &mut App,
+        callback: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> (R, FxHashSet<EntityId>) {
+        let (result, mut entities) = cx.detect_accessed_entities(|cx| callback(self, cx));
+        if let Some(view) = self.rendered_entity_stack.last() {
+            entities.remove(view);
+        }
+        (result, entities)
+    }
+
     pub(crate) fn layout_node_alive(&self, id: LayoutId) -> bool {
         self.layout_engine().contains(id)
     }

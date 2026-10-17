@@ -311,7 +311,7 @@ impl Element for Retained {
                     return;
                 }
                 let mark = window.begin_paint_recording();
-                let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
+                let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
                     element.paint(window, cx);
                 });
                 let publishes = self.on_replay.is_some();
@@ -401,7 +401,7 @@ impl Retained {
             let accessed_states_start = window.accessed_states_len();
             let unstable_before = window.unstable_layout_requests();
             let build = self.build();
-            let ((element, root), accessed_entities) = cx.detect_accessed_entities(|cx| {
+            let ((element, root), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
                 let mut element = build(window, cx);
                 let root = request_subtree_layout(&mut element, lift_z, window, cx);
                 (element, root)
@@ -637,7 +637,7 @@ impl Retained {
         let unstable_before = window.unstable_layout_requests();
         let accessed_states_start = window.accessed_states_len();
         let build = self.build();
-        let ((mut element, built_root), accessed_entities) = cx.detect_accessed_entities(|cx| {
+        let ((mut element, built_root), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
             let mut element = build(window, cx);
             let root = request_subtree_layout(&mut element, lift_z, window, cx);
             (element, root)
@@ -672,7 +672,7 @@ impl Retained {
             window.detach_layout_for_relayout(built_root);
             window.stretch_layout_root(built_root, bounds.size);
             element.layout_as_root(bounds.size.into(), window, cx);
-            let ((), accessed_entities) = cx.detect_accessed_entities(|cx| {
+            let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
                 element.prepaint_at(bounds.origin, window, cx);
             });
             window.with_element_state(global_id, |state: Option<RetainedState>, _| {
@@ -710,7 +710,7 @@ impl Retained {
     ) -> bool {
         let publishes = self.on_replay.is_some();
         let mark = window.begin_prepaint_recording();
-        let ((), accessed_entities) = cx.detect_accessed_entities(|cx| prepaint(window, cx));
+        let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| prepaint(window, cx));
         let recording = window.finish_prepaint_recording(mark);
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a built subtree has its state");
