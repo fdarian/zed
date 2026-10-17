@@ -4300,6 +4300,8 @@ impl Window {
 
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
+        self.retained.notified.clear();
+        self.retained.notified.extend(views.iter().copied());
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }

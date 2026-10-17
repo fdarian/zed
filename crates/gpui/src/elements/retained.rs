@@ -15,9 +15,10 @@
 //!
 //! What the owner promises with the key is that the subtree draws, lays out and reacts the same
 //! for equal keys. That includes what the elements inside read without the owner passing it to
-//! them: whether they are hovered, focused or pressed, the state of entities they read, the
-//! animations they run. Only what gpui owns is checked for it: where the subtree is, the
-//! clip, text style, visibility, scale and rem size around it, the layout results below it.
+//! them: whether they are hovered, focused or pressed, the animations they run. Only what gpui
+//! owns is checked for it: where the subtree is, the clip, text style, visibility, scale and
+//! rem size around it, the layout results below it, and the entities it read, which have the
+//! frame built again when one is notified (a view inside the subtree renders again that way).
 //!
 //! A subtree that did something a replay cannot repeat is built every frame instead, see
 //! [`NonReusable`]. The passes that cannot replay are every pass but the first of a draw, the
@@ -103,7 +104,7 @@ struct RetainedState {
     key: u64,
     /// The layout engine that made `root`.
     engine: u64,
-    root: Option<LayoutId>,
+    root: LayoutId,
     /// The element states the subtree accessed while it requested its layout, as positions in
     /// the accessed states of the frame it was recorded in.
     layout_states: Range<usize>,
@@ -182,11 +183,14 @@ impl Element for Retained {
         let key = self.key;
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             if let Some(mut state) = state
-                && let Some(root) = state.root
                 && state.key == key
                 && !window.refreshing
+                && !state
+                    .accessed_entities
+                    .iter()
+                    .any(|entity| window.retained.notified.contains(entity))
                 && state.engine == window.layout_engine_id()
-                && window.layout_node_alive(root)
+                && window.layout_node_alive(state.root)
                 && state.recorded.as_ref().is_some_and(|recorded| {
                     recorded.serial == window.rendered_serial()
                         && recorded.paint_serial == window.rendered_serial()
@@ -196,7 +200,7 @@ impl Element for Retained {
                 window.retained.counters.hits += 1;
                 state.layout_states = window.reuse_accessed_states(state.layout_states.clone());
                 cx.entities.extend_accessed(&state.accessed_entities);
-                return ((root, RetainedLayout::Skipped), state);
+                return ((state.root, RetainedLayout::Skipped), state);
             }
 
             window.retained.counters.builds += 1;
@@ -213,7 +217,7 @@ impl Element for Retained {
             let state = RetainedState {
                 key,
                 engine: window.layout_engine_id(),
-                root: Some(root),
+                root,
                 layout_states: accessed_states_start..window.accessed_states_len(),
                 accessed_entities,
                 recorded: None,
@@ -373,7 +377,7 @@ impl Retained {
         let hook = self.on_replay.clone();
         let replayed = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a skipped subtree has its state");
-            let root = state.root.expect("a skipped subtree has its root");
+            let root = state.root;
             let recorded = state.recorded.take();
             let Some(mut recorded) = recorded.filter(|recorded| {
                 recorded.key == key && recorded.generation == window.layout_dirty_generation(root)
@@ -397,7 +401,7 @@ impl Retained {
         window.retained.counters.lazy_builds += 1;
         let root = window.with_element_state(global_id, |state: Option<RetainedState>, _| {
             let state = state.expect("a skipped subtree has its state");
-            (state.root.expect("a skipped subtree has its root"), state)
+            (state.root, state)
         });
         let generation_before = window.layout_dirty_generation(root);
         let counters_before = window.engine_counters();
@@ -422,7 +426,7 @@ impl Retained {
             let mut state = state.expect("a skipped subtree has its state");
             state.layout_states = layout_states;
             state.accessed_entities.extend(accessed_entities);
-            state.root = Some(built_root);
+            state.root = built_root;
             ((), state)
         });
 
@@ -478,7 +482,7 @@ impl Retained {
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a built subtree has its state");
             state.accessed_entities.extend(accessed_entities);
-            let root = state.root.expect("a built subtree has its root");
+            let root = state.root;
             let reason = match recording {
                 Ok(prepaint) => {
                     if let Some(reason) = unreusable {
@@ -1402,22 +1406,18 @@ mod tests {
     struct Nested {
         window: AnyWindowHandle,
         outer_key: Rc<Cell<u64>>,
-        inner_key: Rc<Cell<u64>>,
         builds: Rc<Cell<(usize, usize)>>,
     }
 
     impl Nested {
         fn new(cx: &mut TestAppContext) -> Self {
             let outer_key = Rc::new(Cell::new(1));
-            let inner_key = Rc::new(Cell::new(1));
             let builds = Rc::new(Cell::new((0, 0)));
             let clicks = Rc::new(RefCell::new(Vec::new()));
             let window = open(cx, {
                 let outer_key = outer_key.clone();
-                let inner_key = inner_key.clone();
                 let builds = builds.clone();
                 Rc::new(move |_, _| {
-                    let inner_key = inner_key.clone();
                     let builds = builds.clone();
                     let clicks = clicks.clone();
                     div()
@@ -1432,7 +1432,7 @@ mod tests {
                                     .w(px(200.))
                                     .h(px(120.))
                                     .bg(crate::green())
-                                    .child(retained("inner", inner_key.get(), move |_, _| {
+                                    .child(retained("inner", 1, move |_, _| {
                                         builds.set((builds.get().0, builds.get().1 + 1));
                                         card(0, &clicks)
                                     }))
@@ -1444,7 +1444,7 @@ mod tests {
                 })
             });
             draw(window, cx);
-            Nested { window, outer_key, inner_key, builds }
+            Nested { window, outer_key, builds }
         }
     }
 
@@ -1564,7 +1564,7 @@ mod tests {
             .unwrap();
         let red = quads
             .iter()
-            .find(|quad| quad.background.as_solid() == Some(crate::red().into()))
+            .find(|quad| quad.background.as_solid() == Some(crate::red()))
             .expect("the box is painted");
         let scale = cx
             .update_window(window, |_, window, _| window.scale_factor())
@@ -1583,17 +1583,19 @@ mod tests {
     struct Number(usize);
 
     #[gpui::test]
-    fn the_entities_a_replayed_subtree_read_still_redraw_the_window(cx: &mut TestAppContext) {
+    fn an_entity_a_subtree_read_that_changes_has_the_subtree_built(cx: &mut TestAppContext) {
         let number = cx.new(|_| Number(1));
-        let key = Rc::new(Cell::new(1));
+        let builds = Rc::new(Cell::new(0));
         let window = open(cx, {
             let number = number.clone();
-            let key = key.clone();
+            let builds = builds.clone();
             Rc::new(move |_, _| {
                 let number = number.clone();
+                let builds = builds.clone();
                 div()
                     .id("root")
-                    .child(retained("reading", key.get(), move |_, cx| {
+                    .child(retained("reading", 1, move |_, cx| {
+                        builds.set(builds.get() + 1);
                         div()
                             .id("reader")
                             .child(format!("{}", number.read(cx).0))
@@ -1615,17 +1617,109 @@ mod tests {
             cx.run_until_parked();
         };
         draw(window, cx);
-        let frame = frames(cx);
-        notify(cx);
-        assert_eq!(frames(cx), frame + 1, "a built subtree is observed");
-
         draw(window, cx);
         let before = counters(window, cx);
         assert!(before.replays >= 1);
+        let built = builds.get();
         let frame = frames(cx);
+
+        // The window is observing the subtree's entity through the replays, and the subtree
+        // it shows is built again, since what it read is not what it was.
         notify(cx);
-        assert_eq!(frames(cx), frame + 1, "a replayed subtree is observed");
-        assert!(counters(window, cx).replays > before.replays, "and was replayed");
+        assert_eq!(frames(cx), frame + 1);
+        assert_eq!(builds.get(), built + 1);
+        assert_eq!(counters(window, cx).hits, before.hits);
+
+        draw(window, cx);
+        assert_eq!(builds.get(), built + 1);
+        assert!(counters(window, cx).replays > before.replays);
+    }
+
+    struct Counter {
+        value: usize,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for Counter {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div().id("counter").child(format!("{}", self.value))
+        }
+    }
+
+    #[gpui::test]
+    fn a_view_inside_a_subtree_that_notifies_is_rendered_again(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let counter = cx.new(|_| Counter { value: 0, renders: renders.clone() });
+        let window = open(cx, {
+            let counter = counter.clone();
+            Rc::new(move |_, _| {
+                let counter = counter.clone();
+                div()
+                    .id("root")
+                    .child(retained("holder", 1, move |_, _| {
+                        div().id("holder-box").child(counter).into_any_element()
+                    }))
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        assert!(before.replays >= 1);
+        let rendered = renders.get();
+        draw(window, cx);
+        assert_eq!(renders.get(), rendered, "a replay does not render the view");
+
+        counter.update(cx, |counter, cx| {
+            counter.value += 1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(renders.get(), rendered + 1, "the view that changed is rendered");
+        assert_eq!(counters(window, cx).hits, before.hits + 1, "and not replayed with a stale one");
+    }
+
+    #[gpui::test]
+    fn a_pointer_captured_by_an_element_in_a_replayed_subtree_follows_its_new_hitbox(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = single(cx, false, |_, _| {
+            div()
+                .id("slider")
+                .w(px(100.))
+                .h(px(40.))
+                .bg(crate::red())
+                .capture_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .into_any_element()
+        });
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(20.), px(20.)),
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            assert!(window.captured_hitbox().is_some());
+        })
+        .unwrap();
+        let before = counters(window, cx);
+        draw(window, cx);
+        draw(window, cx);
+        assert_eq!(counters(window, cx).replays, before.replays + 2);
+        cx.update_window(window, |_, window, _| {
+            let captured = window.captured_hitbox().expect("still captured");
+            assert!(
+                window.rendered_frame.hitboxes.iter().any(|hitbox| hitbox.id == captured),
+                "by a hitbox of the frame"
+            );
+        })
+        .unwrap();
     }
 
     #[gpui::test]
@@ -1871,7 +1965,6 @@ mod tests {
     struct Retry {
         first: Rc<dyn Fn() -> AnyElement>,
         second: Rc<dyn Fn() -> AnyElement>,
-        elements: Option<(AnyElement, AnyElement)>,
     }
 
     impl IntoElement for Retry {
@@ -1964,7 +2057,7 @@ mod tests {
                     Rc::new(|| div().id("plain").w(px(20.)).h(px(20.)).into_any_element());
                 div()
                     .id("root")
-                    .child(Retry { first, second, elements: None })
+                    .child(Retry { first, second })
                     .into_any_element()
             })
         });
