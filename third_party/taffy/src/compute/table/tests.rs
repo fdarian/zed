@@ -2988,6 +2988,87 @@ mod chrome {
         );
     }
 
+    /// Cells with no row around them are placed in the group or the table, wherever their implicit row is, with
+    /// spacing, padding and border around.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <div style="display:table;border-spacing:3px;border-width:2px;padding:1px">
+    ///   <div style="display:table-row">
+    ///     <div style="display:table-cell">
+    ///       <div style="width:10px;height:10px"></div>
+    ///     </div>
+    ///   </div>
+    ///   <div style="display:table-cell">
+    ///     <div style="width:20px;height:5px"></div>
+    ///   </div>
+    ///   <div style="display:table-cell">
+    ///     <div style="width:30px;height:5px"></div>
+    ///   </div>
+    ///   <div style="display:table-row-group">
+    ///     <div style="display:table-row">
+    ///       <div style="display:table-cell">
+    ///         <div style="width:10px;height:10px"></div>
+    ///       </div>
+    ///     </div>
+    ///     <div style="display:table-cell">
+    ///       <div style="width:10px;height:6px"></div>
+    ///     </div>
+    ///   </div>
+    /// </div>
+    /// ```
+    #[test]
+    fn an_implicit_row_after_another_row_is_placed_below_it() {
+        let tree = vec![
+            table(|s| {
+                s.border = sides(2.0, 2.0, 2.0, 2.0);
+                s.padding = sides(1.0, 1.0, 1.0, 1.0);
+                s.border_spacing = Size { width: 3.0, height: 3.0 };
+            }, vec![
+                tr(|_| {}, vec![
+                    td(|_| {}, vec![
+                        boxed(10.0, 10.0),
+                    ]),
+                ]),
+                td(|_| {}, vec![
+                    boxed(20.0, 5.0),
+                ]),
+                td(|_| {}, vec![
+                    boxed(30.0, 5.0),
+                ]),
+                tbody(vec![
+                    tr(|_| {}, vec![
+                        td(|_| {}, vec![
+                            boxed(10.0, 10.0),
+                        ]),
+                    ]),
+                    td(|_| {}, vec![
+                        boxed(10.0, 6.0),
+                    ]),
+                ]),
+            ]),
+        ];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 65.0, 52.0], // table
+                [6.0, 6.0, 53.0, 10.0], // tr
+                [6.0, 6.0, 20.0, 10.0], // td
+                [6.0, 6.0, 10.0, 10.0], // box
+                [6.0, 19.0, 20.0, 5.0], // td
+                [6.0, 19.0, 20.0, 5.0], // box
+                [29.0, 19.0, 30.0, 5.0], // td
+                [29.0, 19.0, 30.0, 5.0], // box
+                [6.0, 27.0, 53.0, 19.0], // tbody
+                [6.0, 27.0, 53.0, 10.0], // tr
+                [6.0, 27.0, 20.0, 10.0], // td
+                [6.0, 27.0, 10.0, 10.0], // box
+                [6.0, 40.0, 20.0, 6.0], // td
+                [6.0, 40.0, 10.0, 6.0], // box
+            ],
+        );
+    }
+
     /// display: none parts leave no column, row or cell.
     ///
     /// ```html

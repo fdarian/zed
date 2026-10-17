@@ -174,7 +174,12 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                         SizingMode::InherentSize,
                         Line::FALSE,
                     );
-                    let location = self.relatively(cell.node, Point { x: column_x[cell.col] - grid_left, y: 0.0 });
+                    // A cell is placed in its row; the cells of an implicit row are placed in the group or the table
+                    let in_row = if row.node.is_some() { Point::ZERO } else { row_location };
+                    let location = self.relatively(
+                        cell.node,
+                        Point { x: in_row.x + column_x[cell.col] - grid_left, y: in_row.y },
+                    );
                     self.tree.set_unrounded_layout(
                         cell.node,
                         &Layout {
