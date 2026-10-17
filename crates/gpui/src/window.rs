@@ -4247,11 +4247,36 @@ impl Window {
     /// a layout pass is, so `next_frame` holds only the last one.
     fn build_next_frame(&mut self, cx: &mut App) {
         self.draw_pass = 0;
+        // The description of a first pass that replayed, while the pass that is built whole for
+        // comparison runs in its place.
+        let mut shown: Option<String> = None;
         loop {
-            self.draw_pass += 1;
+            if shown.is_none() {
+                self.draw_pass += 1;
+            }
             self.redraw_before_present = false;
+            let replays = self.retained.counters.replays;
             if self.build_pass(cx) {
-                break;
+                match shown.take() {
+                    Some(shown) => {
+                        self.retained.reference = false;
+                        self.compare_with_reference(shown);
+                        break;
+                    }
+                    None if self.draw_pass == 1
+                        && self.retained.verifier.is_some()
+                        && self.retained.counters.replays > replays =>
+                    {
+                        shown = Some(self.frame_dump());
+                        self.discard_pass(cx);
+                        self.retained.reference = true;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            if shown.take().is_some() {
+                self.retained.reference = false;
             }
             self.discard_pass(cx);
         }

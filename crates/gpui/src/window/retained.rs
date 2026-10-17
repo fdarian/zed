@@ -85,6 +85,11 @@ pub struct RetainedCounters {
     /// Lazy builds that did not map onto the layout nodes the subtree had and laid the subtree
     /// out as a root.
     pub layout_fallbacks: u64,
+    /// Frames that replayed something, built once more with every subtree built, and compared
+    /// with that build, see [`Window::set_retention_verifier`].
+    pub verified: u64,
+    /// Of those, the frames that were not the same as the build.
+    pub mismatches: u64,
     /// Recordings that cannot be replayed, by their first reason: index with
     /// [`RetainedCounters::non_reusable`].
     non_reusable: [u64; NonReusable::ALL.len()],
@@ -115,6 +120,13 @@ pub(crate) struct RetainedWindow {
     pub(crate) rendered_serial: u64,
     /// The entities notified since the draw before, while a draw builds.
     pub(crate) notified: FxHashSet<EntityId>,
+    /// What the embedder keeps outside the frame, as text, for the comparison of a replayed frame
+    /// with a built one.
+    pub(crate) verifier: Option<Rc<dyn Fn(&Window) -> String>>,
+    /// The frame being built is the build a replayed one is compared with: every retained
+    /// subtree is built.
+    pub(crate) reference: bool,
+    pub(crate) mismatches: Vec<String>,
     // Counts of what a recording cannot repeat, which move on whenever it happens.
     pub(crate) lifts: u32,
     pub(crate) publications: u32,
@@ -280,6 +292,21 @@ impl Window {
         self.retained.counters
     }
 
+    /// Makes every frame that replayed a retained subtree be built once more, with every subtree
+    /// built, and compared with it: the scene, the hitboxes, the accessibility tree and the cursor
+    /// requests of the two, and what `describe` gives for each (the registries the embedder
+    /// keeps outside the frame, which a replay has to repeat the writes to). The frame that is
+    /// shown is the one built whole. A difference is counted and kept, see
+    /// [`Window::retention_mismatches`]. For tests: every such frame is built twice.
+    pub fn set_retention_verifier(&mut self, describe: Option<Rc<dyn Fn(&Window) -> String>>) {
+        self.retained.verifier = describe;
+    }
+
+    /// How the frames that were compared with a build differed from it, newest last.
+    pub fn retention_mismatches(&self) -> &[String] {
+        &self.retained.mismatches
+    }
+
     pub(crate) fn note_publication(&mut self) {
         self.retained.publications = self.retained.publications.wrapping_add(1);
     }
@@ -290,7 +317,7 @@ impl Window {
     /// [`Window::request_redraw_before_present`]) takes nothing the later pass needs. Not in a
     /// measure pass, which may not take the recordings out of the frame it replaces, nor with the
     /// inspector on, which needs every element asked.
-    pub(crate) fn retention_allowed(&self) -> bool {
+    pub fn retention_allowed(&self) -> bool {
         self.draw_pass == 1
             && !self.measuring
             && !self.layout_only
@@ -590,5 +617,116 @@ impl Window {
             .into_iter()
             .filter_map(|link| Some((link.identity?, link.bounds)))
             .collect()
+    }
+}
+
+impl Window {
+    /// What a frame shows and answers, as text that is equal for two frames that do. Hitbox and
+    /// dispatch ids differ between a replay and a build, so hitboxes are named by their element.
+    pub(crate) fn frame_dump(&self) -> String {
+        use std::fmt::Write as _;
+
+        let frame = &self.next_frame;
+        let mut dump = String::new();
+        let scene = &frame.scene;
+        write!(
+            dump,
+            "{} operations\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{} groups\n",
+            scene.len(),
+            scene.shadows,
+            scene.quads,
+            scene.underlines,
+            scene.monochrome_sprites,
+            scene.subpixel_sprites,
+            scene.polychrome_sprites,
+            scene.paths,
+            scene.surfaces,
+            scene.groups.len(),
+        )
+        .ok();
+        let name = |id: HitboxId| {
+            frame
+                .hitboxes
+                .iter()
+                .find(|hitbox| hitbox.id == id)
+                .map_or_else(|| "(none)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
+        };
+        for hitbox in &frame.hitboxes {
+            writeln!(
+                dump,
+                "hitbox {:?} {:?} {:?} {:?} {:?} parent {}",
+                hitbox.identity,
+                hitbox.bounds,
+                hitbox.content_mask,
+                hitbox.behavior,
+                hitbox.corner_radii,
+                hitbox.parent.map_or_else(|| "(none)".to_owned(), name),
+            )
+            .ok();
+        }
+        for request in &frame.cursor_styles {
+            writeln!(
+                dump,
+                "cursor {:?} {}",
+                request.style,
+                request.hitbox_id.map_or_else(|| "(window)".to_owned(), name),
+            )
+            .ok();
+        }
+        writeln!(
+            dump,
+            "listeners {} {} {} handlers {} deferred {} tooltips {} tab stops {}",
+            frame.mouse_listeners.len(),
+            frame.root_key_listeners.len(),
+            frame.window_control_hitboxes.len(),
+            frame.input_handlers.len(),
+            frame.deferred_draws.len(),
+            frame.tooltip_requests.len(),
+            frame.tab_stops.tab_stop_count(),
+        )
+        .ok();
+        if let Some(json) = self.a11y.debug_tree_json()
+            && let Ok(mut tree) = serde_json::from_str::<serde_json::Value>(&json)
+        {
+            if let Some(tree) = tree.as_object_mut() {
+                tree.remove("frame");
+            }
+            writeln!(dump, "a11y {tree}").ok();
+        }
+        if let Some(describe) = &self.retained.verifier {
+            dump.push_str(&describe(self));
+        }
+        dump
+    }
+
+    /// Compares the frame built with replays, which `shown` describes, with the one built whole
+    /// that is in `next_frame` now.
+    pub(crate) fn compare_with_reference(&mut self, shown: String) {
+        let reference = self.frame_dump();
+        self.retained.counters.verified += 1;
+        if shown == reference {
+            return;
+        }
+        self.retained.counters.mismatches += 1;
+        let (replayed, built): (Vec<&str>, Vec<&str>) = (shown.lines().collect(), reference.lines().collect());
+        let first = replayed
+            .iter()
+            .zip(&built)
+            .position(|(replayed, built)| replayed != built)
+            .unwrap_or_else(|| replayed.len().min(built.len()));
+        let cut = |lines: &[&str]| {
+            lines
+                .get(first)
+                .map_or_else(|| "(nothing)".to_owned(), |line| line.chars().take(600).collect())
+        };
+        let message = format!(
+            "a replayed frame differs from the frame built whole at line {first}\n  replayed: {}\n  built:    {}",
+            cut(&replayed),
+            cut(&built),
+        );
+        eprintln!("[retained] {message}");
+        if self.retained.mismatches.len() < 32 {
+            self.retained.mismatches.push(message);
+        }
     }
 }
