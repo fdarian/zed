@@ -171,6 +171,8 @@ pub fn compute_flexbox_layout(
     inputs: LayoutInput,
 ) -> LayoutOutput {
     let LayoutInput { known_dimensions, parent_size, run_mode, .. } = inputs;
+    #[cfg(test)]
+    tests::FLEX_CALLS.with(|calls| calls.set(calls.get() + 1));
     let style = tree.get_flexbox_container_style(node);
 
     // Pull these out earlier to avoid borrowing issues
@@ -2635,5 +2637,43 @@ fn sum_axis_gaps(gap: f32, num_items: usize) -> f32 {
     } else {
         // ...otherwise there are (num_items - 1) gaps
         gap * (num_items - 1) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static FLEX_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn nested_auto_width_columns_flex_calls(depth: usize) -> usize {
+        let column = || Style { display: Display::Flex, flex_direction: FlexDirection::Column, ..Default::default() };
+        let mut tree: TaffyTree<()> = TaffyTree::new();
+        let mut inner = tree
+            .new_leaf(Style { size: Size { width: length(20.0), height: length(20.0) }, ..Default::default() })
+            .unwrap();
+        for _ in 0..depth {
+            inner = tree.new_with_children(column(), &[inner]).unwrap();
+        }
+        let root = tree
+            .new_with_children(Style { size: Size { width: length(800.0), height: length(600.0) }, ..column() }, &[inner])
+            .unwrap();
+
+        FLEX_CALLS.with(|calls| calls.set(0));
+        tree.compute_layout(root, Size { width: AvailableSpace::Definite(800.0), height: AvailableSpace::Definite(600.0) })
+            .unwrap();
+        FLEX_CALLS.with(|calls| calls.get())
+    }
+
+    /// A stretched column child is measured under both the container's width and an unknown parent width. When those
+    /// two measurements evicted each other from the node's cache, every level doubled the work of the level below
+    /// it (gpuix#36): 98271 calls at depth 14 against 96 once they are cached side by side.
+    #[test]
+    fn nested_auto_width_columns_layout_cost_is_linear_in_depth() {
+        let calls = nested_auto_width_columns_flex_calls(14);
+        assert!(calls < 14 * 10, "layout of 14 nested auto-width columns took {calls} flexbox computations");
     }
 }
