@@ -424,9 +424,9 @@ impl TaffyLayoutEngine {
         );
         self.counters.nodes_reused += 1;
         let meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
+        self.register(id, &meta);
         self.reuse_node(id, meta, taffy_style);
         self.set_children_if_changed(id, children);
-        self.register(id, &style);
         id
     }
 
@@ -457,8 +457,8 @@ impl TaffyLayoutEngine {
         if let Some(key) = key {
             self.keys.insert(key, id);
         }
+        self.register(id, &meta);
         self.meta.insert(id, meta);
-        self.register(id, style);
         id
     }
 
@@ -489,9 +489,8 @@ impl TaffyLayoutEngine {
         } else if rewriters_changed {
             self.restore_requested_style(id);
         }
-        let meta = self.meta_mut(id);
-        if meta.escapable.is_some() && meta.requested.is_none() {
-            meta.requested = escapable_requested;
+        if let Some(escapable_requested) = escapable_requested {
+            self.meta_mut(id).requested.get_or_insert(escapable_requested);
         }
     }
 
@@ -535,8 +534,8 @@ impl TaffyLayoutEngine {
             .new_leaf_with_context(taffy_style, NodeContext { measure })
             .expect(EXPECT_MESSAGE)
             .into();
+        self.register(id, &meta);
         self.meta.insert(id, meta);
-        self.register(id, &style);
         id
     }
 
@@ -568,16 +567,14 @@ impl TaffyLayoutEngine {
     }
 
     /// Queues the node for what layout does to the nodes of a pass that ask for it.
-    fn register(&mut self, id: LayoutId, style: &Style) {
-        let meta = self.meta(id);
-        let (escapable, intrinsic) = (meta.escapable.is_some(), meta.intrinsic.is_some());
-        if escapable {
+    fn register(&mut self, id: LayoutId, meta: &NodeMeta) {
+        if meta.escapable.is_some() {
             self.escapable_nodes.push(id);
         }
-        if intrinsic {
+        if meta.intrinsic.is_some() {
             self.intrinsic_pending.push(id);
         }
-        if style.measure_natural_width {
+        if meta.natural {
             self.natural_pending.push(id);
         }
     }
