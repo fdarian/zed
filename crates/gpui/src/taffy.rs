@@ -202,6 +202,9 @@ impl NodeMeta {
 }
 
 pub struct TaffyLayoutEngine {
+    /// Tells this engine from every other one in the process, for the layout ids that outlive a
+    /// frame to know whose they are.
+    id: u64,
     taffy: TaffyTree<NodeContext>,
     /// One for every node of `taffy`.
     meta: FxHashMap<LayoutId, NodeMeta>,
@@ -251,6 +254,10 @@ pub struct TaffyLayoutEngine {
     run: u64,
     /// The keyed measured leaves the run under way called the measure function of.
     probed: Vec<LayoutId>,
+    /// How many requests were made that a later frame cannot count on getting the same answer
+    /// for: nodes no frame keeps, and nodes whose style or size layout rewrites. See
+    /// [`Self::unstable_requests`].
+    unstable_requests: u64,
 }
 
 /// Where the boxes of a subtree reach.
@@ -275,7 +282,9 @@ impl TaffyLayoutEngine {
     pub fn new() -> Self {
         let mut taffy = TaffyTree::new();
         taffy.disable_rounding();
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         TaffyLayoutEngine {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             taffy,
             meta: FxHashMap::default(),
             absolute_layout_bounds: FxHashMap::default(),
@@ -301,11 +310,75 @@ impl TaffyLayoutEngine {
             counters: LayoutCounters::default(),
             run: 0,
             probed: Vec::new(),
+            unstable_requests: 0,
         }
     }
 
     pub fn counters(&self) -> LayoutCounters {
         self.counters
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// How many times `compute_layout` ran since the engine was made.
+    pub(crate) fn runs(&self) -> u64 {
+        self.run
+    }
+
+    /// How many requests since the engine was made were of a node that is new every frame (no
+    /// key), or that layout rewrites after the request (`escapable`, width keywords, natural
+    /// width). A subtree whose request raised this holds nodes that a frame which does not
+    /// request them again cannot keep laid out.
+    pub(crate) fn unstable_requests(&self) -> u64 {
+        self.unstable_requests
+    }
+
+    /// Whether `id` is a node of the engine, and so a node an earlier frame's request made that
+    /// no collection freed since.
+    pub(crate) fn contains(&self, id: LayoutId) -> bool {
+        self.meta.contains_key(&id)
+    }
+
+    /// How many times the layout results of the node were thrown away, by a change to it or under
+    /// it. See [`taffy::TaffyTree::dirty_generation`].
+    pub(crate) fn dirty_generation(&self, id: LayoutId) -> u64 {
+        self.taffy.dirty_generation(id.0).expect(EXPECT_MESSAGE)
+    }
+
+    /// Whether the node holds no layout result, which is the case for a node nothing laid out
+    /// and for one under `display: none`.
+    pub(crate) fn is_dirty(&self, id: LayoutId) -> bool {
+        self.taffy.dirty(id.0).expect(EXPECT_MESSAGE)
+    }
+
+    /// Makes the node the root of a tree of its own: it leaves the children of its parent, and
+    /// the absolute bounds the pass cached for it and for what is below it are forgotten, so
+    /// that a layout of the node as a root is what they are computed from.
+    pub(crate) fn detach_for_relayout(&mut self, id: LayoutId) {
+        if let Some(parent) = self.taffy.parent(id.0) {
+            let index = (0..self.taffy.child_count(parent))
+                .find(|index| self.taffy.child_at_index(parent, *index) == Ok(id.0));
+            if let Some(index) = index {
+                self.taffy
+                    .remove_child_at_index(parent, index)
+                    .expect(EXPECT_MESSAGE);
+            }
+        }
+        let stack = &mut self.layout_bounds_scratch_space;
+        stack.push(id);
+        while let Some(id) = stack.pop() {
+            self.absolute_layout_bounds.remove(&id);
+            self.absolute_outer_origins.remove(&id);
+            stack.extend(
+                self.taffy
+                    .children(id.into())
+                    .expect(EXPECT_MESSAGE)
+                    .into_iter()
+                    .map(LayoutId::from),
+            );
+        }
     }
 
     /// Whether layout has placed the keyed measured leaf, with its measure function or from its
@@ -522,6 +595,9 @@ impl TaffyLayoutEngine {
         let mut meta = self.node_meta(style, &taffy_style, rem_size, scale_factor);
         meta.key = key;
         self.counters.nodes_created += 1;
+        if key.is_none() {
+            self.unstable_requests += 1;
+        }
         let id: LayoutId = if children.is_empty() {
             self.taffy
                 .new_leaf(taffy_style)
@@ -717,6 +793,9 @@ impl TaffyLayoutEngine {
         meta.key = key;
         meta.measured = true;
         self.counters.nodes_created += 1;
+        if key.is_none() {
+            self.unstable_requests += 1;
+        }
         let id: LayoutId = self
             .taffy
             .new_leaf_with_context(taffy_style, context)
@@ -761,12 +840,15 @@ impl TaffyLayoutEngine {
     fn register(&mut self, id: LayoutId, meta: &NodeMeta) {
         if meta.escapable.is_some() {
             self.escapable_nodes.push(id);
+            self.unstable_requests += 1;
         }
         if meta.intrinsic.is_some() {
             self.intrinsic_pending.push(id);
+            self.unstable_requests += 1;
         }
         if meta.natural {
             self.natural_pending.push(id);
+            self.unstable_requests += 1;
         }
     }
 

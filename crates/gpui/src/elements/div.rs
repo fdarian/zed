@@ -1622,7 +1622,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     ) -> Self {
         self.interactivity()
             .a11y_action_listeners
-            .push((action, Box::new(listener)));
+            .push((action, std::rc::Rc::new(std::cell::RefCell::new(listener))));
         self
     }
 
@@ -2411,6 +2411,7 @@ impl Div {
                 },
             );
             if let Some(listener) = self.prepaint_listener.as_ref() {
+                window.note_publication();
                 listener(children_bounds, window, cx);
             }
             return None;
@@ -2512,6 +2513,7 @@ impl Div {
                     });
 
                     if let Some(listener) = self.prepaint_listener.as_ref() {
+                        window.note_publication();
                         listener(children_bounds, window, cx);
                     }
                     if let Some(prepainter) = overlay_prepainter {
@@ -2908,7 +2910,7 @@ impl Interactivity {
         if let Some(global_id) = global_id {
             let node_id = global_id.accesskit_node_id();
             for (action, listener) in self.a11y_action_listeners.drain(..) {
-                window.on_a11y_action(node_id, action, listener);
+                window.a11y.add_action_listener(node_id, action, listener);
             }
         }
     }
@@ -2929,6 +2931,7 @@ impl Interactivity {
         let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
         if let Some(layout_id) = self.layout_id {
             for listener in prepaint_layout_listeners {
+                window.note_publication();
                 listener(bounds, layout_id, window, cx);
             }
         }
@@ -3042,6 +3045,7 @@ impl Interactivity {
         let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
         if let Some(layout_id) = self.layout_id {
             for listener in prepaint_layout_listeners {
+                window.note_publication();
                 listener(bounds, layout_id, window, cx);
             }
         }
@@ -3094,10 +3098,7 @@ impl Interactivity {
 
         #[cfg(any(feature = "test-support", test))]
         if let Some(debug_selector) = &self.debug_selector {
-            window
-                .next_frame
-                .debug_bounds
-                .insert(debug_selector.clone(), bounds);
+            window.next_frame.insert_debug_bounds(debug_selector.clone(), bounds);
         }
 
         window.with_visibility(visibility, |window| {
@@ -3105,11 +3106,13 @@ impl Interactivity {
                 self.register_a11y_actions(global_id, window);
             }
             if let Some(listener) = self.paint_bounds_listener.take() {
+                window.note_publication();
                 listener(bounds, window, cx);
             }
             if let Some(listener) = self.paint_layout_listener.take()
                 && let Some(layout_id) = self.layout_id
             {
+                window.note_publication();
                 listener(bounds, layout_id, window, cx);
             }
             window.with_tab_group(tab_group, |window| {
@@ -3301,10 +3304,7 @@ impl Interactivity {
 
                 #[cfg(any(feature = "test-support", test))]
                 if let Some(debug_selector) = &self.debug_selector {
-                    window
-                        .next_frame
-                        .debug_bounds
-                        .insert(debug_selector.clone(), bounds);
+                    window.next_frame.insert_debug_bounds(debug_selector.clone(), bounds);
                 }
 
                 self.paint_hover_group_handler(window, cx);
@@ -3325,11 +3325,13 @@ impl Interactivity {
                     // The listeners see the element's own visibility, and run for a hidden
                     // element: it has no paint, but it has its box.
                     if let Some(listener) = self.paint_bounds_listener.take() {
+                        window.note_publication();
                         listener(bounds, window, cx);
                     }
                     if let Some(listener) = self.paint_layout_listener.take()
                         && let Some(layout_id) = self.layout_id
                     {
+                        window.note_publication();
                         listener(bounds, layout_id, window, cx);
                     }
 
