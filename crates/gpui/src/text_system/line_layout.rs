@@ -1095,12 +1095,12 @@ impl WrappedLineLayout {
             .reduce(|first, second| (first.0.max(second.0), first.1.max(second.1)))
     }
 
-    /// The runs that have a glyph in `bytes`.
+    /// The runs of text that have a glyph in `bytes`. The placeholder of an atomic inline
+    /// is not one: it is not part of the content area of the inline box around it.
     pub fn runs_in(&self, bytes: Range<usize>) -> impl Iterator<Item = &ShapedRun> {
-        self.unwrapped_layout
-            .runs
-            .iter()
-            .filter(move |run| run.glyphs.iter().any(|glyph| bytes.contains(&glyph.index)))
+        self.unwrapped_layout.runs.iter().filter(move |run| {
+            !run.inline.object && run.glyphs.iter().any(|glyph| bytes.contains(&glyph.index))
+        })
     }
 
     /// The ascent and descent of the font of an inline box with the font size

@@ -41,6 +41,12 @@ pub struct AtomicInline {
     /// The margin of the box, which the element must not have itself. A percentage is of
     /// the width the text is laid out in, and of nothing while that is not known.
     pub margin: Edges<DefiniteLength>,
+    /// The `width` of the box when it is a percentage of the width the text is laid out in
+    /// (or a `calc()` with one), which the element cannot resolve as the root of a layout
+    /// of its own: the element must have an `auto` width then. While the text has no width
+    /// to resolve it against, as when it is measured for its min-content or max-content,
+    /// the box is `auto`, which is what CSS makes of it.
+    pub width: Option<DefiniteLength>,
     /// How the box is aligned on its line.
     pub vertical_align: VerticalAlign,
     /// The `line-height` of the element, which a percentage `vertical_align` is of.
@@ -59,6 +65,7 @@ impl AtomicInline {
             index,
             element,
             margin: Edges::default(),
+            width: None,
             vertical_align: VerticalAlign::Baseline,
             line_height: None,
             parent: None,
@@ -91,6 +98,7 @@ struct Slot {
     element: AnyElement,
     layout_id: LayoutId,
     margin: Edges<DefiniteLength>,
+    width: Option<DefiniteLength>,
     align: VerticalAlign,
     line_height: Option<Pixels>,
     parent: Option<usize>,
@@ -126,6 +134,7 @@ impl AtomicInlines {
                     element: atomic.element,
                     layout_id,
                     margin: atomic.margin,
+                    width: atomic.width,
                     align: atomic.vertical_align,
                     line_height: atomic.line_height,
                     parent: atomic.parent,
@@ -275,6 +284,14 @@ impl Slot {
         let layout = match measure {
             AtomicMeasure::MaxContent => Layout::MaxContent,
             AtomicMeasure::MinContent => Layout::Exact(self.min_width(window, cx)),
+            AtomicMeasure::Fit(width) if self.width.is_some() => {
+                let length = self.width.expect("checked above");
+                Layout::Exact(
+                    length
+                        .to_pixels(AbsoluteLength::Pixels(width), rem_size)
+                        .max(px(0.)),
+                )
+            }
             AtomicMeasure::Fit(width) => {
                 let available = (width - margin.left - margin.right).max(px(0.));
                 if available >= max_size.width {
@@ -333,15 +350,24 @@ mod tests {
     //! the paragraph, which is `<div style="width:...">`.
     use super::*;
     use crate::{
-        Context, FixedMetricsTextSystem, StatefulInteractiveElement as _, TextLayout, TextRun, InteractiveElement as _, IntoElement, ParentElement as _,
-        Render, Styled as _, StyledText, TestApp, div,
+        Context, FixedMetricsTextSystem, InteractiveElement as _, IntoElement, ParentElement as _,
+        Render, StatefulInteractiveElement as _, Styled as _, StyledText, TestApp, TextLayout,
+        TextRun, div,
     };
-    use std::{cell::{Cell, RefCell}, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::HashMap,
+        ops::Range,
+        rc::Rc,
+        sync::Arc,
+    };
 
     /// One atomic inline of a test paragraph: a box of a size, or a box that holds text.
     #[derive(Clone)]
     pub(super) struct Atomic {
         pub width: Option<f32>,
+        /// The width as a fraction of the width of the paragraph.
+        pub width_fraction: Option<f32>,
         pub height: Option<f32>,
         pub text: Option<&'static str>,
         /// Top, right, bottom, left.
@@ -356,6 +382,7 @@ mod tests {
     pub(super) fn atomic(width: f32, height: f32) -> Atomic {
         Atomic {
             width: Some(width),
+            width_fraction: None,
             height: Some(height),
             text: None,
             padding: [0.; 4],
@@ -370,6 +397,7 @@ mod tests {
     pub(super) fn text_box(text: &'static str) -> Atomic {
         Atomic {
             width: None,
+            width_fraction: None,
             height: None,
             text: Some(text),
             ..atomic(0., 0.)
@@ -398,9 +426,7 @@ mod tests {
         }
 
         fn inline(&self, index: usize, selector: &'static str) -> AtomicInline {
-            let mut child = div()
-                .id(selector)
-                .debug_selector(|| selector.to_string());
+            let mut child = div().id(selector).debug_selector(|| selector.to_string());
             if let Some(clicks) = self.clicks.clone() {
                 child = child
                     .bg(crate::red())
@@ -432,6 +458,7 @@ mod tests {
                 }));
             }
             let mut inline = AtomicInline::new(index, child.into_any_element());
+            inline.width = self.width_fraction.map(crate::relative);
             inline.vertical_align = self.align;
             inline.baseline = baseline;
             let [top, right, bottom, left] = self.margin;
@@ -925,7 +952,9 @@ mod tests {
                 width: 150.,
                 text: format!("xx{o}{o}"),
                 boxes: vec![
-                    text_box("xx yy").padding(2., 3., 2., 3.).margin(2., 3., 4., 5.),
+                    text_box("xx yy")
+                        .padding(2., 3., 2., 3.)
+                        .margin(2., 3., 4., 5.),
                     mark(),
                 ],
                 height: 30.,
@@ -960,13 +989,33 @@ mod tests {
             ("super", VerticalAlign::Super, None, [27.656, 24.656, 17.]),
             ("sub", VerticalAlign::Sub, None, [25., 17., 22.]),
             ("text-top", VerticalAlign::TextTop, None, [22., 19., 17.]),
-            ("text-bottom", VerticalAlign::TextBottom, None, [22., 17., 19.]),
+            (
+                "text-bottom",
+                VerticalAlign::TextBottom,
+                None,
+                [22., 17., 19.],
+            ),
             ("middle", VerticalAlign::Middle, None, [21.531, 17., 18.531]),
             ("6px", offset(6., 0.), None, [26., 23., 17.]),
             ("top", VerticalAlign::Top, None, [20., 17., 17.]),
-            ("bottom with a line height of 40px", VerticalAlign::Bottom, Some(40.), [40., 37., 27.]),
-            ("super with a line height of 40px", VerticalAlign::Super, Some(40.), [40., 34.656, 27.]),
-            ("50% of a line height of 40px", offset(0., 0.5), Some(40.), [50., 47., 27.]),
+            (
+                "bottom with a line height of 40px",
+                VerticalAlign::Bottom,
+                Some(40.),
+                [40., 37., 27.],
+            ),
+            (
+                "super with a line height of 40px",
+                VerticalAlign::Super,
+                Some(40.),
+                [40., 34.656, 27.],
+            ),
+            (
+                "50% of a line height of 40px",
+                offset(0., 0.5),
+                Some(40.),
+                [50., 47., 27.],
+            ),
         ];
         for (name, align, line_height, [height, baseline, span_baseline]) in cases {
             let text = format!("xxyyxx{OBJECT}");
@@ -987,10 +1036,21 @@ mod tests {
                 insets: Vec::new(),
             });
             assert_close(laid.paragraph.size.height, height, name);
-            assert_close(laid.boxes[0].origin.y, baseline, &format!("{name}: baseline"));
-            let span = laid.layout.baseline_for_index(2).expect("the span has glyphs")
+            assert_close(
+                laid.boxes[0].origin.y,
+                baseline,
+                &format!("{name}: baseline"),
+            );
+            let span = laid
+                .layout
+                .baseline_for_index(2)
+                .expect("the span has glyphs")
                 - laid.paragraph.origin.y;
-            assert_close(span, span_baseline, &format!("{name}: baseline of the span"));
+            assert_close(
+                span,
+                span_baseline,
+                &format!("{name}: baseline of the span"),
+            );
         }
     }
 
@@ -1060,11 +1120,23 @@ mod tests {
             let name = format!("in a flex row of {container}px");
             // Chrome's 108.19 is 109 once the text is measured to the next whole pixel.
             assert_close(laid.paragraph.size.width, width, &format!("{name}: width"));
-            assert_close(laid.paragraph.size.height, height, &format!("{name}: height"));
+            assert_close(
+                laid.paragraph.size.height,
+                height,
+                &format!("{name}: height"),
+            );
             // The box is laid out for the width that was measured last, which is not
             // the one it is placed for unless it is laid out again.
-            assert_close(laid.boxes[0].origin.x, box_origin.0, &format!("{name}: box x"));
-            assert_close(laid.boxes[0].origin.y, box_origin.1, &format!("{name}: box y"));
+            assert_close(
+                laid.boxes[0].origin.x,
+                box_origin.0,
+                &format!("{name}: box x"),
+            );
+            assert_close(
+                laid.boxes[0].origin.y,
+                box_origin.1,
+                &format!("{name}: box y"),
+            );
             assert_close(laid.boxes[0].size.width, 60., &format!("{name}: box width"));
         }
     }
@@ -1096,7 +1168,11 @@ mod tests {
             let scene = &window.rendered_frame.scene;
             (
                 window.rendered_frame.debug_bounds["box0"],
-                scene.quads.iter().map(|quad| quad.bounds).collect::<Vec<_>>(),
+                scene
+                    .quads
+                    .iter()
+                    .map(|quad| quad.bounds)
+                    .collect::<Vec<_>>(),
                 scene.monochrome_sprites.len(),
                 window.scale_factor(),
             )
@@ -1109,14 +1185,21 @@ mod tests {
                     && quad.size.width.0 / scale == 30.),
             "no quad at {bounds:?} in {quads:?}"
         );
-        assert_eq!(sprites, 4, "one glyph for each of the four characters, none for the box");
+        assert_eq!(
+            sprites, 4,
+            "one glyph for each of the four characters, none for the box"
+        );
 
         let inside = bounds.center();
         window.simulate_click(inside, MouseButton::Left);
         assert_eq!(clicks.get(), 1);
         window.simulate_click(point(bounds.right() + px(1.), inside.y), MouseButton::Left);
         window.simulate_click(point(inside.x, bounds.bottom() + px(1.)), MouseButton::Left);
-        assert_eq!(clicks.get(), 1, "a click beside the box is not a click on it");
+        assert_eq!(
+            clicks.get(),
+            1,
+            "a click beside the box is not a click on it"
+        );
     }
 
     struct Nested;
@@ -1162,14 +1245,26 @@ mod tests {
         let bounds = window.update(|_, window, _| window.rendered_frame.debug_bounds.clone());
         let [paragraph, middle, inner] = ["paragraph", "middle", "inner"].map(|key| bounds[key]);
         // "xx" is 24.09px, and "yy" before the inner box too.
-        assert_close(middle.origin.x - paragraph.origin.x, 24.09, "x of the middle box");
+        assert_close(
+            middle.origin.x - paragraph.origin.x,
+            24.09,
+            "x of the middle box",
+        );
         assert_close(middle.size.width, 35., "width of the middle box");
-        assert_close(inner.origin.x - middle.origin.x, 24.09, "x of the inner box");
+        assert_close(
+            inner.origin.x - middle.origin.x,
+            24.09,
+            "x of the inner box",
+        );
         assert_close(inner.size.width, 10., "width of the inner box");
         // The middle box has the baseline of its bottom edge, and so has the inner one,
         // which is on the baseline of the middle box's line.
         assert_close(middle.size.height, 20., "height of the middle box");
-        assert_close(inner.bottom() - middle.origin.y, 17., "the inner box is on the baseline");
+        assert_close(
+            inner.bottom() - middle.origin.y,
+            17.,
+            "the inner box is on the baseline",
+        );
     }
 
     /// Each box costs about one layout of its subtree a frame: its max-content layout is
@@ -1215,5 +1310,42 @@ mod tests {
         // The "yy" after it starts after the trailing padding too.
         let after = laid.layout.position_for_index(6).unwrap();
         assert_close(after.x, 5. + 60. + 7., "the text after the box");
+    }
+
+    /// `<span style="display:inline-block;width:50%;height:10px">` in a 150px paragraph:
+    /// a percentage is of the width of the paragraph, whatever is on the line with it.
+    #[test]
+    fn a_percentage_width_is_of_the_width_of_the_paragraph() {
+        let o = OBJECT;
+        let laid = lay_out(
+            150.,
+            &format!("xx{o}{o}"),
+            vec![
+                Atomic {
+                    width: None,
+                    width_fraction: Some(0.5),
+                    ..atomic(0., 10.)
+                },
+                Atomic {
+                    width: None,
+                    width_fraction: Some(1.),
+                    ..atomic(0., 10.)
+                },
+            ],
+        );
+        assert_close(laid.boxes[0].size.width, 75., "50%");
+        assert_close(laid.boxes[1].size.width, 150., "100%");
+        // 24px of text and 75px of box fit on the line, and the 150px one is alone.
+        assert_close(
+            laid.boxes[0].origin.y,
+            7.,
+            "the first box is on the first line",
+        );
+        assert_close(laid.boxes[1].origin.x, 0., "the second box starts a line");
+        assert_close(
+            laid.boxes[1].origin.y,
+            27.,
+            "the second box is on the second line",
+        );
     }
 }
