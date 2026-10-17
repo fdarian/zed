@@ -631,6 +631,7 @@ fn assert_reuse_matches_new_engine(
         total.nodes_removed += counters.nodes_removed;
         total.styles_set += counters.styles_set;
         total.children_set += counters.children_set;
+        total.passes += counters.passes;
     }
     total
 }
@@ -871,6 +872,7 @@ fn delta(before: LayoutCounters, after: LayoutCounters) -> LayoutCounters {
         nodes_removed: after.nodes_removed - before.nodes_removed,
         styles_set: after.styles_set - before.styles_set,
         children_set: after.children_set - before.children_set,
+        passes: after.passes - before.passes,
     }
 }
 

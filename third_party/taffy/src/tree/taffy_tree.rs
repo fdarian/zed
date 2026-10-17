@@ -226,6 +226,11 @@ struct NodeData {
     /// fdarian fork patch.
     pub(crate) dirty_generation: u64,
 
+    /// The last epoch given to [`TaffyTree::mark_reached`].
+    ///
+    /// fdarian fork patch.
+    pub(crate) reached: u32,
+
     /// The computation result from layout algorithm
     #[cfg(feature = "detailed_layout_info")]
     pub(crate) detailed_layout_info: DetailedLayoutInfo,
@@ -239,6 +244,7 @@ impl NodeData {
             style,
             cache: Cache::new(),
             dirty_generation: 0,
+            reached: 0,
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             has_context: false,
@@ -1003,6 +1009,23 @@ impl<NodeContext> TaffyTree<NodeContext> {
         Ok(self.children[parent_key][child_index])
     }
 
+    /// Marks the node as reached in `epoch` (a number that was not used for a mark before, except zero, which
+    /// no node is marked with at first), and returns whether it was not marked in it already. A garbage collection
+    /// that marks the nodes it can reach and then asks for [`Self::unreached_nodes`] needs no map of its own.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn mark_reached(&mut self, node: NodeId, epoch: u32) -> bool {
+        std::mem::replace(&mut self.nodes[node.into()].reached, epoch) != epoch
+    }
+
+    /// The nodes not marked in `epoch` by [`Self::mark_reached`].
+    ///
+    /// fdarian fork patch.
+    pub fn unreached_nodes(&self, epoch: u32) -> Vec<NodeId> {
+        self.nodes.iter().filter(|(_, node)| node.reached != epoch).map(|(key, _)| NodeId::from(key)).collect()
+    }
+
     /// Returns the total number of nodes in the tree
     #[inline]
     pub fn total_node_count(&self) -> usize {
@@ -1730,6 +1753,26 @@ mod tests {
         assert_eq!(taffy.parent(other), Some(first));
         assert_eq!(taffy.children(first).unwrap().as_slice(), &[other]);
         assert!(taffy.children(second).unwrap().is_empty());
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn unreached_nodes_are_the_ones_not_marked_in_the_epoch() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let leaf = taffy.new_leaf(Style::default()).unwrap();
+        let root = taffy.new_with_children(Style::default(), &[leaf]).unwrap();
+        let stray = taffy.new_leaf(Style::default()).unwrap();
+
+        assert!(taffy.mark_reached(root, 1));
+        assert!(!taffy.mark_reached(root, 1));
+        assert!(taffy.mark_reached(leaf, 1));
+        assert_eq!(taffy.unreached_nodes(1), vec![stray]);
+
+        // A new epoch starts with nothing reached.
+        assert!(taffy.mark_reached(root, 2));
+        let mut unreached = taffy.unreached_nodes(2);
+        unreached.sort_by_key(|node| u64::from(*node));
+        assert_eq!(unreached.len(), 2);
     }
 
     // fdarian fork patch.
