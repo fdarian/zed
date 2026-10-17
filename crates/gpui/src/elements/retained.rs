@@ -2303,6 +2303,48 @@ mod tests {
         assert!(counters(window, cx).replays > before.replays);
     }
 
+    #[gpui::test]
+    fn every_subtree_that_read_an_entity_is_built_again_when_it_changes(cx: &mut TestAppContext) {
+        let number = cx.new(|_| Number(1));
+        let builds = [Rc::new(Cell::new(0)), Rc::new(Cell::new(0))];
+        let window = open(cx, {
+            let number = number.clone();
+            let builds = builds.clone();
+            Rc::new(move |_, cx| {
+                // Read before either subtree is built, so that their reads are of an entity the draw
+                // has accessed already.
+                let first = number.read(cx).0;
+                let subtree = |index: usize| {
+                    let number = number.clone();
+                    let builds = builds[index].clone();
+                    retained(("reading", index), 1, move |_, cx| {
+                        builds.set(builds.get() + 1);
+                        div()
+                            .id(("reader", index))
+                            .child(format!("{}", number.read(cx).0))
+                            .into_any_element()
+                    })
+                };
+                div()
+                    .id("root")
+                    .child(format!("{first}"))
+                    .child(subtree(0))
+                    .child(subtree(1))
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let built = builds.clone().map(|count| count.get());
+
+        number.update(cx, |number, cx| {
+            number.0 += 1;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(builds.clone().map(|count| count.get()), built.map(|count| count + 1));
+    }
+
     struct Counter {
         value: usize,
         renders: Rc<Cell<usize>>,

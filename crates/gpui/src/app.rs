@@ -1120,20 +1120,21 @@ impl App {
         })
     }
 
+    /// Runs `callback` and returns the entities it read, including the ones that were read before it
+    /// in the same draw: the result stands for the callback alone, as the frame that skips it
+    /// observes the same entities.
     pub(crate) fn detect_accessed_entities<R>(
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
     ) -> (R, FxHashSet<EntityId>) {
-        let accessed_entities_start = self.entities.accessed_entities.get_mut().clone();
+        let accessed_before = std::mem::take(self.entities.accessed_entities.get_mut());
         let result = callback(self);
-        let entities_accessed_in_callback = self
-            .entities
-            .accessed_entities
-            .get_mut()
-            .difference(&accessed_entities_start)
-            .copied()
-            .collect::<FxHashSet<EntityId>>();
-        (result, entities_accessed_in_callback)
+        let accessed_in_callback = std::mem::replace(
+            self.entities.accessed_entities.get_mut(),
+            accessed_before,
+        );
+        self.entities.extend_accessed(&accessed_in_callback);
+        (result, accessed_in_callback)
     }
 
     pub(crate) fn record_entities_accessed(
