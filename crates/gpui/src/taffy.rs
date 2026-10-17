@@ -13,6 +13,8 @@ mod calc;
 mod containing_block;
 mod intrinsic;
 mod natural;
+#[cfg(test)]
+mod table_tests;
 use calc::CalcArena;
 use taffy::{
     TaffyTree, TraversePartialTree as _,
@@ -888,6 +890,14 @@ impl ToTaffy<taffy::style::Style> for Style {
             flex_shrink: self.flex_shrink,
             justify_items: self.justify_items.map(|x| x.into()),
             justify_self: self.justify_self.map(|x| x.into()),
+            table_role: self.table_role.into(),
+            table_layout: self.table_layout.into(),
+            border_spacing: taffy::geometry::Size {
+                width: self.border_spacing.width.to_taffy(rem_size, scale_factor, calcs),
+                height: self.border_spacing.height.to_taffy(rem_size, scale_factor, calcs),
+            },
+            border_collapse: self.border_collapse,
+            vertical_align: self.cell_vertical_align.into(),
             grid_template_rows,
             grid_template_columns,
             grid_template_row_names,

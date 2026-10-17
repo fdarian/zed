@@ -424,6 +424,21 @@ pub struct Style {
     /// CSS `justify-self`: how this item aligns itself along the inline axis
     pub justify_self: Option<AlignSelf>,
 
+    // Table properties
+    /// What part of a table this element is, as seen from the table, row group or row it is in.
+    pub table_role: TableRole,
+    /// CSS `table-layout` of a [`Display::Table`] element.
+    pub table_layout: TableLayout,
+    /// CSS `border-spacing` of a [`Display::Table`] element: the gap between cells, and between
+    /// cells and the edge of the table. It is 0 with `border_collapse`.
+    #[refineable]
+    pub border_spacing: Size<AbsoluteLength>,
+    /// CSS `border-collapse: collapse` on a [`Display::Table`] element. The `border_widths` of the
+    /// table and of its cells are then taken to be the half widths of the collapsed borders.
+    pub border_collapse: bool,
+    /// CSS `vertical-align` of a table cell.
+    pub cell_vertical_align: CellVerticalAlign,
+
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
     pub debug: bool,
@@ -1457,6 +1472,11 @@ impl Default for Style {
             grid_template_areas: None,
             justify_items: None,
             justify_self: None,
+            table_role: TableRole::None,
+            table_layout: TableLayout::Auto,
+            border_spacing: Size::default(),
+            border_collapse: false,
+            cell_vertical_align: CellVerticalAlign::Baseline,
 
             #[cfg(debug_assertions)]
             debug: false,
@@ -1824,8 +1844,109 @@ pub enum Display {
     Flex,
     /// The children will follow the CSS Grid layout algorithm
     Grid,
+    /// The children will follow the CSS table layout algorithm. The children that are table parts
+    /// say which part with [`Style::table_role`].
+    Table,
     /// The children will not be laid out, and will follow absolute positioning
     None,
+}
+
+/// Which algorithm sizes the columns of a table.
+///
+/// [Specification](https://www.w3.org/TR/css-tables-3/#table-layout-property)
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum TableLayout {
+    /// Columns are sized by the content of all their cells.
+    #[default]
+    Auto,
+    /// Columns are sized by the `<col>`s and the cells of the first row. It needs a definite table
+    /// width, a table with an `auto` width is laid out as [`TableLayout::Auto`].
+    Fixed,
+}
+
+/// Which kind of row group an element is. The first header group goes before the other row groups
+/// and the first footer group after them, wherever they are in the table.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum RowGroupKind {
+    /// `display: table-header-group`
+    Header,
+    /// `display: table-row-group`
+    #[default]
+    Body,
+    /// `display: table-footer-group`
+    Footer,
+}
+
+/// The side of the table a caption is on.
+///
+/// [Specification](https://www.w3.org/TR/css-tables-3/#caption-side)
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum CaptionSide {
+    /// Above the rows
+    #[default]
+    Top,
+    /// Below the rows
+    Bottom,
+}
+
+/// How the content of a table cell is placed in its row. The other values of CSS `vertical-align`
+/// (`sub`, `super`, `text-top`, `text-bottom`, a length or a percentage) behave as `baseline` on a
+/// table cell.
+///
+/// [Specification](https://www.w3.org/TR/css-tables-3/#cell-vertical-align)
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum CellVerticalAlign {
+    /// The first baseline of the cell is aligned with the baseline of the row.
+    #[default]
+    Baseline,
+    /// The content starts at the top of the cell.
+    Top,
+    /// The content is centred in the cell.
+    Middle,
+    /// The content ends at the bottom of the cell.
+    Bottom,
+}
+
+/// What part of a table an element is, as seen from the table, row group or row it is a child of.
+///
+/// The structure is repaired while laying out, without creating elements: cells that are children
+/// of a table or a row group form an implicit row, and a child of a table, row group or row that
+/// is not a table part acts as a cell of its own, as does a child of a row that is not a cell.
+/// Unlike CSS, neighbouring ones do not share an anonymous cell.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum TableRole {
+    /// Not a table part.
+    #[default]
+    None,
+    /// `display: table-row-group`, `table-header-group` or `table-footer-group`.
+    RowGroup(RowGroupKind),
+    /// `display: table-row`.
+    Row,
+    /// `display: table-cell`. A `row_span` of 0 reaches the last row of the row group.
+    Cell {
+        /// How many columns the cell covers (`colspan`).
+        col_span: u16,
+        /// How many rows the cell covers (`rowspan`).
+        row_span: u16,
+    },
+    /// `display: table-caption`.
+    Caption(CaptionSide),
+    /// `display: table-column`. Takes no space, its width is the width of the columns it spans.
+    Column {
+        /// How many columns the element stands for (`span`).
+        span: u16,
+    },
+    /// `display: table-column-group`. Its `Column` children define its columns, `span` only counts
+    /// when it has none.
+    ColumnGroup {
+        /// How many columns the element stands for when it has no column children (`span`).
+        span: u16,
+    },
 }
 
 /// Controls whether flex items are forced onto one line or can wrap onto multiple lines.
@@ -1986,7 +2107,61 @@ impl From<Display> for taffy::style::Display {
             Display::Block => Self::Block,
             Display::Flex => Self::Flex,
             Display::Grid => Self::Grid,
+            Display::Table => Self::Table,
             Display::None => Self::None,
+        }
+    }
+}
+
+impl From<TableLayout> for taffy::style::TableLayout {
+    fn from(value: TableLayout) -> Self {
+        match value {
+            TableLayout::Auto => Self::Auto,
+            TableLayout::Fixed => Self::Fixed,
+        }
+    }
+}
+
+impl From<RowGroupKind> for taffy::style::RowGroupKind {
+    fn from(value: RowGroupKind) -> Self {
+        match value {
+            RowGroupKind::Header => Self::Header,
+            RowGroupKind::Body => Self::Body,
+            RowGroupKind::Footer => Self::Footer,
+        }
+    }
+}
+
+impl From<CaptionSide> for taffy::style::CaptionSide {
+    fn from(value: CaptionSide) -> Self {
+        match value {
+            CaptionSide::Top => Self::Top,
+            CaptionSide::Bottom => Self::Bottom,
+        }
+    }
+}
+
+impl From<CellVerticalAlign> for taffy::style::VerticalAlign {
+    fn from(value: CellVerticalAlign) -> Self {
+        match value {
+            CellVerticalAlign::Baseline => Self::Baseline,
+            CellVerticalAlign::Top => Self::Top,
+            CellVerticalAlign::Middle => Self::Middle,
+            CellVerticalAlign::Bottom => Self::Bottom,
+        }
+    }
+}
+
+impl From<TableRole> for taffy::style::TableRole {
+    fn from(value: TableRole) -> Self {
+        match value {
+            TableRole::None => Self::None,
+            TableRole::RowGroup(kind) => Self::RowGroup(kind.into()),
+            TableRole::Row => Self::Row,
+            TableRole::Cell { col_span, row_span } => Self::Cell { col_span, row_span },
+            TableRole::Caption(side) => Self::Caption(side.into()),
+            TableRole::Column { span } => Self::Column { span },
+            TableRole::ColumnGroup { span } => Self::ColumnGroup { span },
         }
     }
 }

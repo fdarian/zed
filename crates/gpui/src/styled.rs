@@ -1,9 +1,10 @@
 use crate::{
-    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
+    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle,
+    CellVerticalAlign, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
     JustifyContent, Length, OverlineStyle, SharedString, StrikethroughStyle, StyleRefinement,
-    TextAlign, TextDecorationStyle, TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace,
+    TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace,
     px, relative, rems,
 };
 pub use gpui_macros::{
@@ -59,6 +60,50 @@ pub trait Styled: Sized {
     /// [Docs](https://tailwindcss.com/docs/display)
     fn grid(mut self) -> Self {
         self.style().display = Some(Display::Grid);
+        self
+    }
+
+    /// Sets the display type of the element to `table`. Its children say what part of the table
+    /// they are with [`Styled::table_role`].
+    /// [Docs](https://tailwindcss.com/docs/display)
+    fn table(mut self) -> Self {
+        self.style().display = Some(Display::Table);
+        self
+    }
+
+    /// Sets what part of a table the element is, as seen from the table, row group or row it is in.
+    fn table_role(mut self, role: TableRole) -> Self {
+        self.style().table_role = Some(role);
+        self
+    }
+
+    /// Sets how the columns of a table are sized, like CSS `table-layout`.
+    fn table_layout(mut self, layout: TableLayout) -> Self {
+        self.style().table_layout = Some(layout);
+        self
+    }
+
+    /// Sets the gap between the cells of a table, like CSS `border-spacing`.
+    fn border_spacing(
+        mut self,
+        horizontal: impl Into<AbsoluteLength>,
+        vertical: impl Into<AbsoluteLength>,
+    ) -> Self {
+        let spacing = &mut self.style().border_spacing;
+        spacing.width = Some(horizontal.into());
+        spacing.height = Some(vertical.into());
+        self
+    }
+
+    /// Collapses the borders of a table and its cells, like CSS `border-collapse: collapse`.
+    fn border_collapse(mut self) -> Self {
+        self.style().border_collapse = Some(true);
+        self
+    }
+
+    /// Sets how the content of a table cell is placed in its row, like CSS `vertical-align`.
+    fn cell_vertical_align(mut self, align: CellVerticalAlign) -> Self {
+        self.style().cell_vertical_align = Some(align);
         self
     }
 
