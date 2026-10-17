@@ -377,6 +377,9 @@ mod tests {
         pub margin: [f32; 4],
         /// Counts the clicks on the box, and gives it a background.
         pub clicks: Option<Rc<Cell<usize>>>,
+        /// The box is a flex row of boxes of these sizes, and its baseline is the bottom of
+        /// the first of them, as the first baseline of a flex container is.
+        pub flex_items: Vec<(f32, f32)>,
     }
 
     pub(super) fn atomic(width: f32, height: f32) -> Atomic {
@@ -389,6 +392,7 @@ mod tests {
             align: VerticalAlign::Baseline,
             margin: [0.; 4],
             clicks: None,
+            flex_items: Vec::new(),
         }
     }
 
@@ -445,6 +449,15 @@ mod tests {
                 .pb(crate::px(bottom))
                 .pl(crate::px(left));
             let mut baseline = AtomicBaseline::BottomMarginEdge;
+            if let Some((_, first_height)) = self.flex_items.first().copied() {
+                child = child.flex();
+                for (width, height) in &self.flex_items {
+                    child = child.child(div().w(crate::px(*width)).h(crate::px(*height)));
+                }
+                baseline = AtomicBaseline::Measured(Box::new(move |_, _, _| {
+                    Some(crate::px(first_height))
+                }));
+            }
             if let Some(text) = self.text {
                 let text = StyledText::new(text);
                 let layout = text.layout().clone();
@@ -1347,5 +1360,33 @@ mod tests {
             27.,
             "the second box is on the second line",
         );
+    }
+
+    /// `<span style="display:inline-flex">` of a 30x10 and a 20x15 box: it is as wide as its
+    /// items, wherever the line is, and its baseline is the first item's.
+    #[test]
+    fn a_flex_box_is_as_wide_as_its_items() {
+        let o = OBJECT;
+        let flex = || Atomic {
+            width: None,
+            height: None,
+            flex_items: vec![(30., 10.), (20., 15.)],
+            ..atomic(0., 0.)
+        };
+        for (width, height, rects) in [
+            (400., 22., [[24.09, 7., 50., 15.], [74.09, 17., 1., 0.]]),
+            (40., 62., [[0., 27., 50., 15.], [0., 59., 1., 0.]]),
+        ] {
+            let laid = lay_out(width, &format!("xx{o}{o}"), vec![flex(), atomic(1., 0.)]);
+            let name = format!("in {width}px");
+            assert_close(laid.paragraph.size.height, height, &format!("{name}: height"));
+            for (ix, [x, y, w, h]) in rects.into_iter().enumerate() {
+                let rect = laid.boxes[ix];
+                assert_close(rect.origin.x, x, &format!("{name}: x of {ix}"));
+                assert_close(rect.origin.y, y, &format!("{name}: y of {ix}"));
+                assert_close(rect.size.width, w, &format!("{name}: width of {ix}"));
+                assert_close(rect.size.height, h, &format!("{name}: height of {ix}"));
+            }
+        }
     }
 }
