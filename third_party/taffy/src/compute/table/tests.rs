@@ -1732,6 +1732,37 @@ mod chrome {
         );
     }
 
+    /// A caption's `height` is its height, and its box is that tall with nothing in it.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <table>
+    ///   <caption style="height:12px"></caption>
+    ///   <tr><td><div style="width:30px;height:10px"></div></td></tr>
+    ///   <caption style="caption-side:bottom;height:8px"><div style="width:4px;height:3px"></div></caption>
+    /// </table>
+    /// ```
+    #[test]
+    fn a_caption_has_its_height() {
+        let tree = vec![table(|_| {}, vec![
+            part("caption", TableRole::Caption(CaptionSide::Top), |s| s.size.height = length(12.0), vec![]),
+            tr(|_| {}, vec![td(|_| {}, vec![boxed(30.0, 10.0)])]),
+            part("caption", TableRole::Caption(CaptionSide::Bottom), |s| s.size.height = length(8.0), vec![boxed(4.0, 3.0)]),
+        ])];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 30.0, 30.0], // table
+                [0.0, 0.0, 30.0, 12.0], // caption
+                [0.0, 12.0, 30.0, 10.0], // tr
+                [0.0, 12.0, 30.0, 10.0], // td
+                [0.0, 12.0, 30.0, 10.0], // box
+                [0.0, 22.0, 30.0, 8.0], // caption
+                [0.0, 22.0, 4.0, 3.0], // box
+            ],
+        );
+    }
+
     /// `position: relative` moves a caption, a row group, a row and a cell, and what is in them. `left` beats `right`,
     /// a percentage `left` is of the table's width and a percentage `top` is `auto`.
     ///
@@ -3435,5 +3466,36 @@ mod collapsed {
         );
         assert_eq!(info.column_lines, vec![0.0, 20.0, 25.0]);
         assert_eq!(info.row_lines, vec![7.0, 19.0]);
+    }
+
+    /// The first baseline is that of the first row, below the caption, border, padding and spacing, and the bottom of
+    /// the row when none of its cells is on the baseline. It is the baseline an `inline-table` sits on.
+    #[test]
+    fn the_first_baseline_is_that_of_the_first_row() {
+        let with = |first_row: Vec<Spec>| {
+            lines_of(
+                table(
+                    |s| {
+                        s.border = sides(2.0, 2.0, 2.0, 2.0);
+                        s.padding = sides(1.0, 1.0, 1.0, 1.0);
+                        s.border_spacing = Size { width: 3.0, height: 3.0 };
+                    },
+                    vec![
+                        caption(CaptionSide::Top, vec![boxed(10.0, 12.0)]),
+                        tr(|_| {}, first_row),
+                        tr(|_| {}, vec![td(|_| {}, vec![boxed(5.0, 40.0)])]),
+                    ],
+                ),
+                300.0,
+            )
+            .first_baseline
+        };
+        // caption 12 + border 2 + padding 1 + spacing 3, then the row: the baseline is the bottom of the box of the cell on
+        // the baseline, 10 below the top of the row
+        let bottom = |s: &mut Style| s.vertical_align = VerticalAlign::Bottom;
+        assert_eq!(with(vec![td(|_| {}, vec![boxed(20.0, 10.0)]), td(bottom, vec![boxed(5.0, 20.0)])]), Some(18.0 + 10.0));
+        // none is: the bottom of the row
+        let top = |s: &mut Style| s.vertical_align = VerticalAlign::Top;
+        assert_eq!(with(vec![td(top, vec![boxed(20.0, 10.0)]), td(top, vec![boxed(5.0, 20.0)])]), Some(18.0 + 20.0));
     }
 }

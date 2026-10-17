@@ -55,6 +55,9 @@ pub struct DetailedTableInfo {
     /// The y of the top edge of every row and then of the bottom edge of the last one, relative to the top of the
     /// border box of the table, captions above the rows included. One more than there are rows
     pub row_lines: Vec<f32>,
+    /// The y of the first baseline of the table, relative to the top of its border box: the baseline of its first row, or
+    /// that row's bottom when none of its cells is aligned to the baseline. `None` for a table with no rows
+    pub first_baseline: Option<f32>,
 }
 
 /// A size style of a cell or a column that is not `auto`
@@ -310,6 +313,7 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
         padding_border,
         border,
         captions_top,
+        first_baseline,
     });
     table.layout_hidden_and_absolute(table_size, border);
 
@@ -338,6 +342,8 @@ struct Sizes<'a> {
     border: Rect<f32>,
     /// The height of the captions above the rows
     captions_top: f32,
+    /// The first baseline of the table
+    first_baseline: Option<f32>,
 }
 
 /// A caption once its height is known

@@ -6602,6 +6602,21 @@ impl Window {
             .layout_table_lines(layout_id, scale_factor)
     }
 
+    /// The first baseline of the given `display: table` layout node, in logical pixels from the top of
+    /// its border box, see [`TaffyLayoutEngine::layout_table_first_baseline`]. `None` unless it was
+    /// laid out as a table with rows.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_table_first_baseline(&mut self, layout_id: LayoutId) -> Option<Pixels> {
+        self.invalidator.debug_assert_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .layout_table_first_baseline(layout_id, scale_factor)
+    }
+
     /// The extent of the content of the given layout node, in logical pixels,
     /// measured from its padding-box origin, so it includes padding but not
     /// border. It is the scrollable-overflow extent, so it is independent of how

@@ -101,6 +101,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 super::DetailedTableInfo {
                     column_lines: lines(&column_x, &mut column_widths.iter().copied(), grid_left),
                     row_lines: lines(&row_y, &mut rows.iter().map(|row| row.height), grid_top),
+                    first_baseline: sizes.first_baseline,
                 },
             );
         }

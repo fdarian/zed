@@ -552,6 +552,16 @@ impl TaffyLayoutEngine {
         })
     }
 
+    /// The first baseline of a `display: table` node, in logical pixels from the top of its border box: the
+    /// baseline of its first row, or that row's bottom when none of its cells sits on the baseline. `None` if the
+    /// node was not laid out as a table this frame or has no rows.
+    pub fn layout_table_first_baseline(&mut self, id: LayoutId, scale_factor: f32) -> Option<Pixels> {
+        match self.taffy.detailed_layout_info(id.0) {
+            taffy::DetailedLayoutInfo::Table(info) => info.first_baseline.map(|y| Pixels(y / scale_factor)),
+            _ => None,
+        }
+    }
+
     /// Where the scrollable overflow of `container` ends: the far corner of the border boxes of
     /// its descendants, in the layout root's coordinates, or `None` if it has none that count.
     ///
