@@ -1732,6 +1732,80 @@ mod chrome {
         );
     }
 
+    /// `position: relative` moves a caption, a row group, a row and a cell, and what is in them. `left` beats `right`,
+    /// a percentage `left` is of the table's width and a percentage `top` is `auto`.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <table>
+    ///   <caption style="position:relative;left:5px;top:2px">
+    ///     <div style="width:20px;height:10px"></div>
+    ///   </caption>
+    ///   <tbody style="position:relative;left:1px;top:3px">
+    ///     <tr style="position:relative;left:2px;top:4px">
+    ///       <td style="position:relative;left:10px;top:6px;right:50px;bottom:50px">
+    ///         <div style="width:30px;height:10px"></div>
+    ///       </td>
+    ///       <td style="position:relative;right:7px;bottom:8px">
+    ///         <div style="width:50px;height:20px"></div>
+    ///       </td>
+    ///       <td style="position:relative;left:10%;top:10%">
+    ///         <div style="width:20px;height:20px"></div>
+    ///       </td>
+    ///     </tr>
+    ///   </tbody>
+    /// </table>
+    /// ```
+    #[test]
+    fn relative_positioning_moves_the_parts() {
+        let relative = |left: Option<f32>, right: Option<f32>, top: Option<f32>, bottom: Option<f32>| {
+            move |s: &mut Style| {
+                s.position = Position::Relative;
+                let inset = |value: Option<f32>| value.map_or(auto(), length);
+                s.inset = Rect { left: inset(left), right: inset(right), top: inset(top), bottom: inset(bottom) };
+            }
+        };
+        let tree = vec![
+            table(|_| {}, vec![
+                part("caption", TableRole::Caption(CaptionSide::Top), relative(Some(5.0), None, Some(2.0), None), vec![
+                    boxed(20.0, 10.0),
+                ]),
+                part("tbody", TableRole::RowGroup(RowGroupKind::Body), relative(Some(1.0), None, Some(3.0), None), vec![
+                    tr(relative(Some(2.0), None, Some(4.0), None), vec![
+                        td(relative(Some(10.0), Some(50.0), Some(6.0), Some(50.0)), vec![
+                            boxed(30.0, 10.0),
+                        ]),
+                        td(relative(None, Some(7.0), None, Some(8.0)), vec![
+                            boxed(50.0, 20.0),
+                        ]),
+                        td(|s| {
+                            s.position = Position::Relative;
+                            s.inset = Rect { left: percent(0.1), right: auto(), top: percent(0.1), bottom: auto() };
+                        }, vec![
+                            boxed(20.0, 20.0),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 100.0, 30.0], // table
+                [5.0, 2.0, 100.0, 10.0], // caption
+                [5.0, 2.0, 20.0, 10.0], // box
+                [1.0, 13.0, 100.0, 20.0], // tbody
+                [3.0, 17.0, 100.0, 20.0], // tr
+                [13.0, 23.0, 30.0, 20.0], // td
+                [13.0, 33.0, 30.0, 10.0], // box
+                [26.0, 9.0, 50.0, 20.0], // td
+                [26.0, 9.0, 50.0, 20.0], // box
+                [93.0, 17.0, 20.0, 20.0], // td
+                [93.0, 17.0, 20.0, 20.0], // box
+            ],
+        );
+    }
+
     /// The min-content width of a caption is the least width of the table.
     ///
     /// ```html

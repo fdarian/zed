@@ -2,7 +2,7 @@
 //! take no part in the grid
 use super::{Sizes, Table};
 use crate::geometry::{Line, Point, Rect, Size};
-use crate::style::{AvailableSpace, BoxSizing, CaptionSide, CoreStyle};
+use crate::style::{AvailableSpace, BoxSizing, CaptionSide, CoreStyle, Position};
 use crate::tree::{Layout, LayoutPartialTreeExt, NodeId, SizingMode};
 use crate::style_helpers::TaffyMaxContent;
 use crate::util::sys::{Vec, f32_max};
@@ -36,7 +36,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 CaptionSide::Top => &mut top_y,
                 CaptionSide::Bottom => &mut bottom_y,
             };
-            let location = Point { x: size.margin.left, y: *y + size.margin.top };
+            let location = self.relatively(*node, Point { x: size.margin.left, y: *y + size.margin.top });
             *y += size.outer_height;
             let output = self.tree.perform_child_layout(
                 *node,
@@ -126,12 +126,8 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 row_y[last] + rows[last].height - section_top
             };
             if let Some(node) = section.node {
-                self.set_plain_layout(
-                    node,
-                    next_order(),
-                    Point { x: grid_left, y: section_top },
-                    Size { width: grid_width, height: section_height },
-                );
+                let location = self.relatively(node, Point { x: grid_left, y: section_top });
+                self.set_plain_layout(node, next_order(), location, Size { width: grid_width, height: section_height });
             }
             for row_index in section.first_row..section.first_row + section.row_count {
                 let row = &structure.rows[row_index];
@@ -141,10 +137,11 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                     Point { x: grid_left, y: row_y[row_index] }
                 };
                 if let Some(node) = row.node {
+                    let location = self.relatively(node, row_location);
                     self.set_plain_layout(
                         node,
                         next_order(),
-                        row_location,
+                        location,
                         Size { width: grid_width, height: rows[row_index].height },
                     );
                 }
@@ -177,7 +174,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                         SizingMode::InherentSize,
                         Line::FALSE,
                     );
-                    let location = Point { x: column_x[cell.col] - grid_left, y: 0.0 };
+                    let location = self.relatively(cell.node, Point { x: column_x[cell.col] - grid_left, y: 0.0 });
                     self.tree.set_unrounded_layout(
                         cell.node,
                         &Layout {
@@ -218,6 +215,29 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
             height: table_size.height - captions_top - border.top - border.bottom,
         });
         content_size
+    }
+
+    /// How far `position: relative` moves a part of the table. A percentage of the width is of the table's, and one of
+    /// the height is `auto`, as in Chrome
+    fn relative_offset(&self, node: NodeId) -> Point<f32> {
+        let style = self.tree.get_table_item_style(node);
+        if style.position() != Position::Relative {
+            return Point::ZERO;
+        }
+        let inset = style.inset();
+        let resolve_x =
+            |value| MaybeResolve::maybe_resolve(value, self.inner_width_hint, |val, basis| self.tree.calc(val, basis));
+        let resolve_y = |value| MaybeResolve::maybe_resolve(value, None, |val, basis| self.tree.calc(val, basis));
+        Point {
+            x: resolve_x(inset.left).or(resolve_x(inset.right).map(|right| -right)).unwrap_or(0.0),
+            y: resolve_y(inset.top).or(resolve_y(inset.bottom).map(|bottom| -bottom)).unwrap_or(0.0),
+        }
+    }
+
+    /// `location` moved by the `position: relative` of the node
+    fn relatively(&self, node: NodeId, location: Point<f32>) -> Point<f32> {
+        let offset = self.relative_offset(node);
+        Point { x: location.x + offset.x, y: location.y + offset.y }
     }
 
     /// Sets the layout of a node that is not laid out by an algorithm of its own
