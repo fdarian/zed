@@ -350,6 +350,13 @@ impl TaffyLayoutEngine {
         self.taffy.dirty_generation(id.0).expect(EXPECT_MESSAGE)
     }
 
+    /// Changes whenever the layout of the node and of what is below it may be other than it was:
+    /// the results were thrown away, or the node was laid out again for other inputs, such as the
+    /// size of its parent that its percentages are of. See [`taffy::TaffyTree::layout_generation`].
+    pub(crate) fn layout_generation(&self, id: LayoutId) -> u64 {
+        self.taffy.layout_generation(id.0).expect(EXPECT_MESSAGE)
+    }
+
     /// Whether the node holds no layout result, which is the case for a node nothing laid out
     /// and for one under `display: none`.
     pub(crate) fn is_dirty(&self, id: LayoutId) -> bool {

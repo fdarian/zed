@@ -433,6 +433,10 @@ impl Window {
         self.layout_engine().contains(id)
     }
 
+    pub(crate) fn layout_generation(&self, id: LayoutId) -> u64 {
+        self.layout_engine().layout_generation(id)
+    }
+
     pub(crate) fn layout_dirty_generation(&self, id: LayoutId) -> u64 {
         self.layout_engine().dirty_generation(id)
     }
