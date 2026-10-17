@@ -35,12 +35,23 @@ impl EscapableKind {
     }
 }
 
-pub(super) struct EscapableAbsolute {
-    pub(super) id: LayoutId,
+/// A node whose containing block may not be its taffy parent.
+pub(super) struct Escapable {
     pub(super) kind: EscapableKind,
     /// The style as requested, so a node that is no longer escaped (or is rebased
     /// again after its containing block moved) starts from the author's values.
     pub(super) original: taffy::style::Style,
+}
+
+impl Escapable {
+    pub(super) fn of(position: Position, taffy_style: &taffy::style::Style) -> Option<Box<Self>> {
+        EscapableKind::of(position).map(|kind| {
+            Box::new(Escapable {
+                kind,
+                original: taffy_style.clone(),
+            })
+        })
+    }
 }
 
 /// Padding box of a node, in the coordinates of the layout tree root.
@@ -50,22 +61,6 @@ struct PaddingBox {
 }
 
 impl TaffyLayoutEngine {
-    pub(super) fn track_position(
-        &mut self,
-        id: LayoutId,
-        position: Position,
-        escapable: Option<(EscapableKind, taffy::style::Style)>,
-    ) {
-        if position == Position::Static {
-            self.static_nodes.insert(id);
-        }
-        if let Some((kind, original)) = escapable {
-            self.escapable_kinds.insert(id, kind);
-            self.escapable_absolutes
-                .push(EscapableAbsolute { id, kind, original });
-        }
-    }
-
     /// Re-lays out `root` until every escapable absolute node is resolved against
     /// its containing block. Costs nothing when the tree has none.
     pub(super) fn settle_containing_blocks(
@@ -76,7 +71,7 @@ impl TaffyLayoutEngine {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if self.escapable_absolutes.is_empty() {
+        if self.escapable_nodes.is_empty() {
             return;
         }
         for _ in 0..MAX_PASSES {
@@ -89,9 +84,10 @@ impl TaffyLayoutEngine {
 
     fn retarget_escapable_absolutes(&mut self, root: LayoutId) -> bool {
         let mut changed = false;
-        for index in 0..self.escapable_absolutes.len() {
-            let id = self.escapable_absolutes[index].id;
-            let kind = self.escapable_absolutes[index].kind;
+        for index in 0..self.escapable_nodes.len() {
+            let id = self.escapable_nodes[index];
+            let escapable = self.meta(id).escapable();
+            let kind = escapable.kind;
             let Some(parent) = self.taffy.parent(id.0) else {
                 continue;
             };
@@ -100,7 +96,7 @@ impl TaffyLayoutEngine {
                 continue;
             };
 
-            let mut desired = self.escapable_absolutes[index].original.clone();
+            let mut desired = escapable.original.clone();
             if containing != parent {
                 self.rebase_onto(&mut desired, parent, containing, root);
             }
@@ -122,7 +118,7 @@ impl TaffyLayoutEngine {
         let mut nearest_positioned = None;
         let mut current = parent;
         loop {
-            if nearest_positioned.is_none() && !self.static_nodes.contains(&current) {
+            if nearest_positioned.is_none() && !self.meta(current).is_static {
                 nearest_positioned = Some(current);
             }
             if current == root {

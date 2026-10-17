@@ -4030,7 +4030,7 @@ impl Window {
         self.captured_hitbox = captured_hitbox;
         self.mouse_hit_test = mouse_hit_test;
 
-        self.layout_engine.as_mut().unwrap().clear();
+        self.layout_engine.as_mut().unwrap().end_frame();
         // An element's state was moved out of `rendered_frame` when the pass reached it. Hand
         // it back, updated, or the next draw would find it gone and start the element over.
         for (key, state) in self.next_frame.element_states.drain() {
@@ -4107,7 +4107,7 @@ impl Window {
             self.platform_window.set_input_handler(input_handler);
         }
 
-        self.layout_engine.as_mut().unwrap().clear();
+        self.layout_engine.as_mut().unwrap().end_frame();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
@@ -4236,7 +4236,7 @@ impl Window {
     /// Throws an abandoned pass away so the next one starts from what the frame before it left.
     /// What a pass publishes outside the frame stays published.
     fn discard_pass(&mut self, cx: &mut App) {
-        self.layout_engine.as_mut().unwrap().clear();
+        self.layout_engine.as_mut().unwrap().end_frame();
         // An element's state was moved out of `rendered_frame` when the pass reached it. Hand
         // it back, updated, or the next pass would find it gone and start the element over.
         for (key, state) in self.next_frame.element_states.drain() {

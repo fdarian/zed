@@ -54,28 +54,58 @@ type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 struct NodeContext {
     measure: NodeMeasureFn,
 }
+/// What the engine knows about a node besides what taffy does. It lives as long as the node.
+#[derive(Default)]
+struct NodeMeta {
+    /// The node is [`crate::Position::Static`]. It lays out as taffy `Relative` but is not a
+    /// containing block, which taffy has no way to say.
+    is_static: bool,
+    /// The node's subtree belongs to another layer (deferred and anchored elements), so it is
+    /// not part of the scrollable overflow of the scrollers it sits in.
+    detached: bool,
+    /// Set for a node whose containing block may not be its taffy parent. Taffy always resolves
+    /// an absolute node against its parent, so `compute_layout` rewrites these styles to where
+    /// the real containing block is.
+    escapable: Option<Box<containing_block::Escapable>>,
+    /// Set for a node with a width keyword (`min-content`, `max-content`, `fit-content`), which
+    /// `compute_layout` replaces with what it measured.
+    intrinsic: Option<Box<intrinsic::IntrinsicKeywords>>,
+    /// The `width` that the node had before [`TaffyLayoutEngine::set_forced_width`] replaced it.
+    unforced_width: Option<taffy::style::Dimension>,
+}
+
+impl NodeMeta {
+    fn escapable(&self) -> &containing_block::Escapable {
+        self.escapable
+            .as_deref()
+            .expect("a node in the escapable list is escapable")
+    }
+
+    /// Calls `visit` with every calc that the node holds besides the ones in its taffy style.
+    fn for_each_length(&self, mut visit: impl FnMut(taffy::style::CompactLength)) {
+        if let Some(escapable) = &self.escapable {
+            calc::for_each_length(&escapable.original, &mut visit);
+        }
+        if let Some(intrinsic) = &self.intrinsic {
+            intrinsic.for_each_length(&mut visit);
+        }
+    }
+}
+
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
+    /// One for every node of `taffy`.
+    meta: FxHashMap<LayoutId, NodeMeta>,
+
+    // What a pass computes: dropped by `end_pass`.
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
-    /// Nodes with [`crate::Position::Static`]. They lay out as taffy `Relative` but are not
-    /// containing blocks, which taffy has no way to say.
-    static_nodes: FxHashSet<LayoutId>,
-    /// Nodes whose containing block may not be their taffy parent, with the style they were
-    /// requested with. Taffy always resolves an absolute node against its parent, so
-    /// `compute_layout` rewrites these styles to where the real containing block is.
-    escapable_absolutes: Vec<containing_block::EscapableAbsolute>,
-    /// The kind of each node in `escapable_absolutes`, for lookups while walking the tree.
-    escapable_kinds: FxHashMap<LayoutId, containing_block::EscapableKind>,
-    /// Nodes whose subtree belongs to another layer (deferred and anchored elements), so it is
-    /// not part of the scrollable overflow of the scrollers it sits in.
-    detached: FxHashSet<LayoutId>,
-    /// Nodes with a width keyword (`min-content`, `max-content`, `fit-content`) that
-    /// `compute_layout` has not measured yet, in the order they were requested.
-    intrinsic_nodes: Vec<intrinsic::IntrinsicNode>,
+    /// Nodes with a width keyword that `compute_layout` has not measured yet, in the order they
+    /// were requested.
+    intrinsic_pending: Vec<LayoutId>,
     /// Nodes asking for their natural width that no `compute_layout` has measured yet.
     natural_pending: Vec<LayoutId>,
     /// The measured natural width of each node, in device pixels, unrounded.
@@ -83,9 +113,10 @@ pub struct TaffyLayoutEngine {
     /// How many extra layouts of a whole tree `compute_layout` ran for natural widths.
     #[cfg(test)]
     natural_passes: usize,
-    /// The `width` that nodes had before [`Self::set_forced_width`] replaced it.
-    unforced_widths: FxHashMap<LayoutId, taffy::style::Dimension>,
-    /// Owns what the `calc()` lengths in the taffy styles point to, so it is cleared with them.
+
+    /// The nodes with `NodeMeta::escapable`, in the order they were requested.
+    escapable_nodes: Vec<LayoutId>,
+    /// Owns what the `calc()` lengths in the taffy styles point to.
     calcs: CalcArena,
     /// [`Self::painted_extent`] of the nodes it has been asked about, and of what is below them.
     painted_extents: FxHashMap<LayoutId, PaintedExtent>,
@@ -111,44 +142,70 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            meta: FxHashMap::default(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
-            static_nodes: FxHashSet::default(),
-            escapable_absolutes: Vec::new(),
-            escapable_kinds: FxHashMap::default(),
-            detached: FxHashSet::default(),
-            intrinsic_nodes: Vec::new(),
+            intrinsic_pending: Vec::new(),
             natural_pending: Vec::new(),
             natural_widths: FxHashMap::default(),
             #[cfg(test)]
             natural_passes: 0,
-            unforced_widths: FxHashMap::default(),
+            escapable_nodes: Vec::new(),
             calcs: CalcArena::default(),
             painted_extents: FxHashMap::default(),
         }
     }
 
-    pub fn clear(&mut self) {
-        self.taffy.clear();
-        self.calcs.clear();
+    fn meta(&self, id: LayoutId) -> &NodeMeta {
+        self.meta
+            .get(&id)
+            .expect("a layout id is of a node of the engine that made it")
+    }
+
+    fn meta_mut(&mut self, id: LayoutId) -> &mut NodeMeta {
+        self.meta
+            .get_mut(&id)
+            .expect("a layout id is of a node of the engine that made it")
+    }
+
+    /// Ends a pass over the tree, whether or not a frame came of it: forgets what the pass
+    /// computed and what it asked layout for. The nodes stay.
+    pub fn end_pass(&mut self) {
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
-        self.static_nodes.clear();
-        self.escapable_absolutes.clear();
-        self.escapable_kinds.clear();
-        self.detached.clear();
-        self.intrinsic_nodes.clear();
+        self.intrinsic_pending.clear();
         self.natural_pending.clear();
         self.natural_widths.clear();
-        self.unforced_widths.clear();
         self.painted_extents.clear();
     }
 
+    /// Ends a pass and frees the nodes that nothing needs anymore, along with their calcs.
+    ///
+    /// Every node is built anew by every pass, so none is needed: freeing is dropping all of
+    /// them.
+    pub fn end_frame(&mut self) {
+        self.end_pass();
+        self.taffy.clear();
+        self.meta.clear();
+        self.escapable_nodes.clear();
+        self.sweep_calcs();
+    }
+
+    /// Frees the calcs that no node holds, which are all of them when no node is left.
+    fn sweep_calcs(&mut self) {
+        for (id, meta) in &self.meta {
+            let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
+            calc::for_each_length(style, |length| self.calcs.mark(length));
+            meta.for_each_length(|length| self.calcs.mark(length));
+        }
+        self.calcs.sweep();
+    }
+
     pub fn mark_detached(&mut self, id: LayoutId) {
-        self.detached.insert(id);
+        self.meta_mut(id).detached = true;
     }
 
     pub fn request_layout(
@@ -159,8 +216,7 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
-        let escapable = containing_block::EscapableKind::of(style.position)
-            .map(|kind| (kind, taffy_style.clone()));
+        let meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
 
         let id: LayoutId = if children.is_empty() {
             self.taffy
@@ -174,9 +230,7 @@ impl TaffyLayoutEngine {
                 .expect(EXPECT_MESSAGE)
                 .into()
         };
-        self.track_position(id, style.position, escapable);
-        self.track_intrinsic_widths(id, &style, rem_size, scale_factor);
-        self.track_natural_width(id, &style);
+        self.register(id, &style, meta);
         id
     }
 
@@ -194,8 +248,7 @@ impl TaffyLayoutEngine {
         + 'static,
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
-        let escapable = containing_block::EscapableKind::of(style.position)
-            .map(|kind| (kind, taffy_style.clone()));
+        let meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
@@ -205,10 +258,41 @@ impl TaffyLayoutEngine {
             .new_leaf_with_context(taffy_style, NodeContext { measure })
             .expect(EXPECT_MESSAGE)
             .into();
-        self.track_position(id, style.position, escapable);
-        self.track_intrinsic_widths(id, &style, rem_size, scale_factor);
-        self.track_natural_width(id, &style);
+        self.register(id, &style, meta);
         id
+    }
+
+    fn node_meta(
+        &mut self,
+        style: &Style,
+        taffy_style: &taffy::style::Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+    ) -> NodeMeta {
+        NodeMeta {
+            is_static: style.position == crate::Position::Static,
+            escapable: containing_block::Escapable::of(style.position, taffy_style),
+            intrinsic: intrinsic::IntrinsicKeywords::of(
+                style,
+                rem_size,
+                scale_factor,
+                &mut self.calcs,
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn register(&mut self, id: LayoutId, style: &Style, meta: NodeMeta) {
+        if meta.escapable.is_some() {
+            self.escapable_nodes.push(id);
+        }
+        if meta.intrinsic.is_some() {
+            self.intrinsic_pending.push(id);
+        }
+        if style.measure_natural_width {
+            self.natural_pending.push(id);
+        }
+        self.meta.insert(id, meta);
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -256,13 +340,13 @@ impl TaffyLayoutEngine {
         let mut style = self.taffy.style(id.0).expect(EXPECT_MESSAGE).clone();
         match width {
             Some(width) => {
-                self.unforced_widths
-                    .entry(id)
-                    .or_insert(style.size.width);
+                self.meta_mut(id)
+                    .unforced_width
+                    .get_or_insert(style.size.width);
                 style.size.width =
                     taffy::style::Dimension::length(round_to_device_pixel(width.0, scale_factor));
             }
-            None => match self.unforced_widths.remove(&id) {
+            None => match self.meta_mut(id).unforced_width.take() {
                 Some(unforced) => style.size.width = unforced,
                 None => return,
             },
@@ -664,7 +748,7 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
     ) -> Option<Point<Pixels>> {
         let mut end = Point::new(Pixels::MIN, Pixels::MIN);
-        let positioned = !self.static_nodes.contains(&container);
+        let positioned = !self.meta(container).is_static;
         self.extend_scrollable_overflow(container, positioned, scale_factor, &mut end);
         (end.x != Pixels::MIN).then_some(end)
     }
@@ -685,11 +769,12 @@ impl TaffyLayoutEngine {
                     .expect(EXPECT_MESSAGE),
             );
             let style = self.taffy.style(child.0).expect(EXPECT_MESSAGE);
-            if style.display == taffy::style::Display::None || self.detached.contains(&child) {
+            let meta = self.meta(child);
+            if style.display == taffy::style::Display::None || meta.detached {
                 continue;
             }
             let overflow = style.overflow;
-            match self.escapable_kinds.get(&child) {
+            match meta.escapable.as_deref().map(|escapable| escapable.kind) {
                 Some(containing_block::EscapableKind::Fixed) => continue,
                 Some(containing_block::EscapableKind::Ancestor) if !positioned => continue,
                 Some(containing_block::EscapableKind::Ancestor) | None => {}
@@ -704,7 +789,7 @@ impl TaffyLayoutEngine {
             let visible_y = overflow.y == taffy::style::Overflow::Visible;
             if visible_x || visible_y {
                 let mut inner = Point::new(Pixels::MIN, Pixels::MIN);
-                let child_positioned = positioned || !self.static_nodes.contains(&child);
+                let child_positioned = positioned || !self.meta(child).is_static;
                 self.extend_scrollable_overflow(child, child_positioned, scale_factor, &mut inner);
                 if visible_x {
                     end.x = end.x.max(inner.x);
@@ -751,11 +836,12 @@ impl TaffyLayoutEngine {
                 {
                     continue;
                 }
-                if self.detached.contains(&child) {
+                let meta = self.meta(child);
+                if meta.detached {
                     extent.unbounded = true;
                     continue;
                 }
-                match self.escapable_kinds.get(&child) {
+                match meta.escapable.as_deref().map(|escapable| escapable.kind) {
                     Some(containing_block::EscapableKind::Fixed) => {
                         extent.unbounded = true;
                         continue;
@@ -781,7 +867,7 @@ impl TaffyLayoutEngine {
             }
         }
         // A positioned node is the containing block of the absolute boxes below it.
-        if extent.open_absolute && !self.static_nodes.contains(&id) {
+        if extent.open_absolute && !self.meta(id).is_static {
             extent.open_absolute = false;
         }
         self.painted_extents.insert(id, extent);
@@ -923,7 +1009,7 @@ fn to_taffy_track_size_min(
     match size {
         Length(value) => Min::length(value * scale_factor),
         Percent(value) => Min::percent(value),
-        Calc { length, fraction } => Min::calc(calcs.alloc(length * scale_factor, fraction)),
+        Calc { length, fraction } => Min::calc(calcs.intern(length * scale_factor, fraction)),
         MinContent => Min::min_content(),
         MaxContent => Min::max_content(),
         // `auto`, and the maximum-only sizes, which a parser never puts in a minimum
@@ -941,7 +1027,7 @@ fn to_taffy_track_size_max(
     match size {
         Length(value) => Max::length(value * scale_factor),
         Percent(value) => Max::percent(value),
-        Calc { length, fraction } => Max::calc(calcs.alloc(length * scale_factor, fraction)),
+        Calc { length, fraction } => Max::calc(calcs.intern(length * scale_factor, fraction)),
         Fr(value) => Max::fr(value),
         Auto => Max::auto(),
         MinContent => Max::min_content(),
@@ -1206,7 +1292,7 @@ fn calc_pointer(
     calcs: &mut CalcArena,
 ) -> *const () {
     let length: f32 = length.to_taffy(rem_size, scale_factor, calcs);
-    calcs.alloc(length, fraction)
+    calcs.intern(length, fraction)
 }
 
 impl ToTaffy<taffy::style::LengthPercentage> for DefiniteLength {
