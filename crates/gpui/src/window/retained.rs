@@ -222,12 +222,15 @@ pub(crate) struct PrepaintRecord {
 pub(crate) struct PaintMark {
     index: PaintIndex,
     effects: Effects,
+    a11y: Option<a11y::A11yMark>,
 }
 
 /// What the paint of a retained subtree left in the frame.
 pub(crate) struct PaintRecord {
     pub(crate) range: Range<PaintIndex>,
     tab_stops: Rc<[TabStopOperation]>,
+    /// What paint gives the accessibility tree: the action listeners of the nodes.
+    a11y: Option<Rc<a11y::A11yRecording>>,
     pub(crate) has_publications: bool,
     #[cfg(debug_assertions)]
     ambient: PaintAmbient,
@@ -474,11 +477,12 @@ impl Window {
 
     /// Starts recording the paint of a retained subtree. Pair with
     /// [`Self::finish_paint_recording`].
-    pub(crate) fn begin_paint_recording(&self) -> PaintMark {
+    pub(crate) fn begin_paint_recording(&mut self) -> PaintMark {
         self.invalidator.debug_assert_paint();
         PaintMark {
             index: self.paint_index(),
             effects: self.effects(),
+            a11y: self.a11y.is_active().then(|| self.a11y.begin_recording()),
         }
     }
 
@@ -488,6 +492,7 @@ impl Window {
     ) -> Result<PaintRecord, NonReusable> {
         let end = self.paint_index();
         let effects = self.effects();
+        let a11y = mark.a11y.map(|mark| self.a11y.end_recording(mark));
         if let Some(reason) = first_reason(mark.effects.reasons(&effects)) {
             return Err(reason);
         }
@@ -497,6 +502,7 @@ impl Window {
         Ok(PaintRecord {
             range: mark.index..end,
             tab_stops,
+            a11y: a11y.map(Rc::new),
             has_publications: mark.effects.published(&effects),
             #[cfg(debug_assertions)]
             ambient: self.paint_ambient(),
@@ -512,6 +518,9 @@ impl Window {
         );
         let start = self.paint_index();
         self.reuse_paint_with(record.range.clone(), Some(&record.tab_stops));
+        if let Some(a11y) = &record.a11y {
+            self.a11y.replay(a11y);
+        }
         if record.has_publications {
             self.note_publication();
         }
