@@ -220,6 +220,12 @@ struct NodeData {
     /// The cached results of the layout computation
     pub(crate) cache: Cache,
 
+    /// Bumped whenever `cache` goes from holding results to empty, so a caller that read the generation after a layout
+    /// can tell later whether the node (or something under it) was changed since.
+    ///
+    /// fdarian fork patch.
+    pub(crate) dirty_generation: u64,
+
     /// The computation result from layout algorithm
     #[cfg(feature = "detailed_layout_info")]
     pub(crate) detailed_layout_info: DetailedLayoutInfo,
@@ -232,6 +238,7 @@ impl NodeData {
         Self {
             style,
             cache: Cache::new(),
+            dirty_generation: 0,
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             has_context: false,
@@ -246,7 +253,11 @@ impl NodeData {
     /// If the node was already marked as dirty, returns true
     #[inline]
     pub fn mark_dirty(&mut self) -> ClearState {
-        self.cache.clear()
+        let state = self.cache.clear();
+        if matches!(state, ClearState::Cleared) {
+            self.dirty_generation += 1;
+        }
+        state
     }
 }
 
@@ -329,7 +340,7 @@ impl<NodeContext> CacheTree for TaffyTree<NodeContext> {
     }
 
     fn cache_clear(&mut self, node_id: NodeId) {
-        self.nodes[node_id.into()].cache.clear();
+        self.nodes[node_id.into()].mark_dirty();
     }
 }
 
@@ -777,6 +788,8 @@ impl<NodeContext> TaffyTree<NodeContext> {
         self.nodes.clear();
         self.children.clear();
         self.parents.clear();
+        // fdarian fork patch: a measure context outlived the nodes it belonged to.
+        self.node_context_data.clear();
     }
 
     /// Remove a specific node from the tree and drop it
@@ -800,6 +813,8 @@ impl<NodeContext> TaffyTree<NodeContext> {
         let _ = self.children.remove(key);
         let _ = self.parents.remove(key);
         let _ = self.nodes.remove(key);
+        // fdarian fork patch: a measure context outlived the node it belonged to.
+        let _ = self.node_context_data.remove(key);
 
         Ok(node)
     }
@@ -869,19 +884,27 @@ impl<NodeContext> TaffyTree<NodeContext> {
     }
 
     /// Directly sets the `children` of the supplied `parent`
+    ///
+    /// fdarian fork patch: parent pointers that no longer match the child lists are tolerated in both directions. A
+    /// child that was moved to another parent since `parent` listed it keeps the parent it has, and a previous parent
+    /// that does not list the child (a child given twice, or one added through `new_with_children`) is not an error.
     pub fn set_children(&mut self, parent: NodeId, children: &[NodeId]) -> TaffyResult<()> {
         let parent_key = parent.into();
 
         // Remove node as parent from all its current children.
         for child in &self.children[parent_key] {
-            self.parents[(*child).into()] = None;
+            if self.parents[(*child).into()] == Some(parent) {
+                self.parents[(*child).into()] = None;
+            }
         }
 
         // Build up relation node <-> child
         for &child in children {
             // Remove child from previous parent
             if let Some(previous_parent) = self.parents[child.into()] {
-                self.remove_child(previous_parent, child).unwrap();
+                if let Some(index) = self.children[previous_parent.into()].iter().position(|n| *n == child) {
+                    self.remove_child_at_index(previous_parent, index)?;
+                }
             }
             self.parents[child.into()] = Some(parent);
         }
@@ -997,8 +1020,14 @@ impl<NodeContext> TaffyTree<NodeContext> {
     }
 
     /// Sets the [`Style`] of the provided `node`
+    ///
+    /// fdarian fork patch: a style equal to the one the node has changes nothing, so the node keeps its cache and so
+    /// do its ancestors.
     #[inline]
     pub fn set_style(&mut self, node: NodeId, style: Style) -> TaffyResult<()> {
+        if self.nodes[node.into()].style == style {
+            return Ok(());
+        }
         self.nodes[node.into()].style = style;
         self.mark_dirty(node)?;
         Ok(())
@@ -1037,29 +1066,29 @@ impl<NodeContext> TaffyTree<NodeContext> {
     }
 
     /// Marks the layout of this node and its ancestors as outdated
+    ///
+    /// fdarian fork patch: every ancestor is visited, where upstream stops at a node whose cache is already empty. A
+    /// node under a `display: none` node is laid out hidden, which stores nothing, so its cache is empty while the
+    /// caches above it are not, and stopping there leaves the ancestors with a layout that does not know about the
+    /// change.
     pub fn mark_dirty(&mut self, node: NodeId) -> TaffyResult<()> {
-        fn mark_dirty_recursive(
-            nodes: &mut SlotMap<DefaultKey, NodeData>,
-            parents: &SlotMap<DefaultKey, Option<NodeId>>,
-            node_key: DefaultKey,
-        ) {
-            match nodes[node_key].mark_dirty() {
-                ClearState::AlreadyEmpty => {
-                    // Node was already marked as dirty.
-                    // No need to visit ancestors
-                    // as they should be marked as dirty already.
-                }
-                ClearState::Cleared => {
-                    if let Some(Some(node)) = parents.get(node_key) {
-                        mark_dirty_recursive(nodes, parents, (*node).into());
-                    }
-                }
-            }
+        let mut current = Some(node);
+        while let Some(node) = current {
+            let key = node.into();
+            self.nodes[key].mark_dirty();
+            current = self.parents[key];
         }
 
-        mark_dirty_recursive(&mut self.nodes, &self.parents, node.into());
-
         Ok(())
+    }
+
+    /// How many times the layout results of this node were thrown away, by a change to it or under it. A
+    /// generation equal to one read after a layout means that layout is still current.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn dirty_generation(&self, node: NodeId) -> TaffyResult<u64> {
+        Ok(self.nodes[node.into()].dirty_generation)
     }
 
     /// Indicates whether the layout of this node needs to be recomputed
@@ -1603,6 +1632,120 @@ mod tests {
         assert!(taffy.children(old_parent).unwrap().is_empty());
     }
 
+    // fdarian fork patch: a node keeps its layout results when it is given the style it has.
+    #[test]
+    fn set_style_to_an_equal_style_keeps_the_cache_of_the_node_and_its_ancestors() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let style = Style { size: Size::from_lengths(40.0, 10.0), ..Default::default() };
+        let leaf = taffy.new_leaf(style.clone()).unwrap();
+        let root = taffy.new_with_children(Style::default(), &[leaf]).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let (leaf_generation, root_generation) =
+            (taffy.dirty_generation(leaf).unwrap(), taffy.dirty_generation(root).unwrap());
+
+        taffy.set_style(leaf, style).unwrap();
+        assert_eq!(taffy.dirty(leaf), Ok(false));
+        assert_eq!(taffy.dirty(root), Ok(false));
+        assert_eq!(taffy.dirty_generation(leaf), Ok(leaf_generation));
+        assert_eq!(taffy.dirty_generation(root), Ok(root_generation));
+
+        taffy.set_style(leaf, Style { size: Size::from_lengths(41.0, 10.0), ..Default::default() }).unwrap();
+        assert_eq!(taffy.dirty(leaf), Ok(true));
+        assert_eq!(taffy.dirty(root), Ok(true));
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn the_dirty_generation_is_bumped_when_results_are_thrown_away() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let leaf = taffy.new_leaf(Style::default()).unwrap();
+        let sibling = taffy.new_leaf(Style::default()).unwrap();
+        let root = taffy.new_with_children(Style::default(), &[leaf, sibling]).unwrap();
+        let generations = |taffy: &TaffyTree<()>| {
+            [leaf, sibling, root].map(|node| taffy.dirty_generation(node).unwrap())
+        };
+
+        // Nothing was computed, so there are no results to throw away.
+        let never_computed = generations(&taffy);
+        taffy.mark_dirty(leaf).unwrap();
+        assert_eq!(generations(&taffy), never_computed);
+
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let computed = generations(&taffy);
+        taffy.mark_dirty(leaf).unwrap();
+        let after = generations(&taffy);
+        assert_eq!([after[0], after[1], after[2]], [computed[0] + 1, computed[1], computed[2] + 1]);
+
+        // A second change before the next layout throws nothing away.
+        taffy.mark_dirty(leaf).unwrap();
+        assert_eq!(generations(&taffy), after);
+
+        // The hidden layout of a `display: none` node clears its cache too.
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let before_hiding = generations(&taffy);
+        taffy.set_style(sibling, Style { display: Display::None, ..Default::default() }).unwrap();
+        assert_eq!(taffy.dirty_generation(sibling), Ok(before_hiding[1] + 1));
+        assert_eq!(taffy.dirty_generation(root), Ok(before_hiding[2] + 1));
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn remove_and_clear_drop_the_measure_context_of_the_nodes() {
+        use std::rc::Rc;
+        let context = Rc::new(());
+        let mut taffy: TaffyTree<Rc<()>> = TaffyTree::new();
+        let removed = taffy.new_leaf_with_context(Style::default(), context.clone()).unwrap();
+        taffy.new_leaf_with_context(Style::default(), context.clone()).unwrap();
+        assert_eq!(Rc::strong_count(&context), 3);
+
+        taffy.remove(removed).unwrap();
+        assert_eq!(Rc::strong_count(&context), 2);
+
+        taffy.clear();
+        assert_eq!(Rc::strong_count(&context), 1);
+    }
+
+    // fdarian fork patch: upstream unwraps the position of the child in its previous parent.
+    #[test]
+    fn set_children_tolerates_a_previous_parent_that_does_not_list_the_child() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child = taffy.new_leaf(Style::default()).unwrap();
+        let other = taffy.new_leaf(Style::default()).unwrap();
+        let parent = taffy.new_leaf(Style::default()).unwrap();
+
+        // A child given twice is the child of the parent being set before it is listed.
+        taffy.set_children(parent, &[child, other, child]).unwrap();
+        assert_eq!(taffy.parent(child), Some(parent));
+        assert_eq!(taffy.parent(other), Some(parent));
+
+        // `new_with_children` does not take the child from the parent it had: that parent still lists it, while the
+        // child names the new one. Setting the children of the first parent must not panic over it.
+        let first = taffy.new_with_children(Style::default(), &[other]).unwrap();
+        let second = taffy.new_with_children(Style::default(), &[other]).unwrap();
+        taffy.set_children(first, &[other]).unwrap();
+        assert_eq!(taffy.parent(other), Some(first));
+        assert_eq!(taffy.children(first).unwrap().as_slice(), &[other]);
+        assert!(taffy.children(second).unwrap().is_empty());
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn set_children_leaves_a_child_that_moved_to_another_parent_with_that_parent() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child = taffy.new_leaf(Style::default()).unwrap();
+        let kept = taffy.new_leaf(Style::default()).unwrap();
+        let old_parent = taffy.new_with_children(Style::default(), &[child, kept]).unwrap();
+        let new_parent = taffy.new_leaf(Style::default()).unwrap();
+
+        taffy.set_children(new_parent, &[child]).unwrap();
+        // `old_parent` is rebuilt afterwards, as a frame that moved `child` and then reached `old_parent` does.
+        taffy.set_children(old_parent, &[kept]).unwrap();
+
+        assert_eq!(taffy.parent(child), Some(new_parent));
+        assert_eq!(taffy.children(new_parent).unwrap().as_slice(), &[child]);
+        assert_eq!(taffy.parent(kept), Some(old_parent));
+    }
+
     // fdarian fork patch: the percentages of a root are of the parent size it is given.
     #[test]
     fn a_root_resolves_its_percentages_against_the_parent_size_it_is_given() {
@@ -1818,6 +1961,300 @@ mod tests {
 
             // 10 wide first item, then a gap of 6 + 12.5% of 200
             assert_eq!(taffy.layout(second).unwrap().location.x, 10.0 + 31.0);
+        }
+    }
+
+    // fdarian fork patch: a tree that is edited and laid out again lays out like a new one built from the same
+    // description. This is what `mark_dirty` stopping at a node whose cache is empty has to keep true.
+    mod persistent_tree {
+        use super::*;
+        use crate::style::{LengthPercentage, LengthPercentageAuto, Overflow, Position};
+        use crate::Layout;
+
+        const NODES: usize = 14;
+
+        struct Random(u64);
+
+        impl Random {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, bound: usize) -> usize {
+                (self.next() % bound as u64) as usize
+            }
+            fn chance(&mut self, one_in: usize) -> bool {
+                self.below(one_in) == 0
+            }
+            fn length(&mut self) -> f32 {
+                (self.below(40) * 5) as f32
+            }
+        }
+
+        /// A leaf that wraps like text: `width` of content in lines of at most the space it has.
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        struct Text {
+            width: f32,
+            line_height: f32,
+        }
+
+        fn measure(
+            known: Size<Option<f32>>,
+            available: Size<AvailableSpace>,
+            _node: NodeId,
+            text: Option<&mut Text>,
+            _style: &Style,
+        ) -> Size<f32> {
+            let Some(text) = text else { return Size::ZERO };
+            let width = known.width.unwrap_or(match available.width {
+                AvailableSpace::Definite(space) => text.width.min(space),
+                AvailableSpace::MinContent => text.width.min(20.0),
+                AvailableSpace::MaxContent => text.width,
+            });
+            let lines = if width > 0.0 { (text.width / width).ceil() } else { 1.0 };
+            Size { width, height: known.height.unwrap_or(lines * text.line_height) }
+        }
+
+        fn calcs() -> &'static [Calc; 3] {
+            static CALCS: [Calc; 3] = [Calc::linear(10.0, 0.25), Calc::linear(-5.0, 0.5), Calc::linear(0.0, 0.75)];
+            &CALCS
+        }
+
+        #[derive(Clone)]
+        struct Description {
+            styles: Vec<Style>,
+            texts: Vec<Option<Text>>,
+            children: Vec<Vec<usize>>,
+        }
+
+        fn random_style(random: &mut Random) -> Style {
+            let calc = |random: &mut Random| &calcs()[random.below(3)] as *const Calc as *const ();
+            let mut dimension = |random: &mut Random| match random.below(5) {
+                0 | 1 => Dimension::auto(),
+                2 => Dimension::length(random.length()),
+                3 => Dimension::percent(random.below(5) as f32 * 0.25),
+                _ => Dimension::calc(calc(random)),
+            };
+            let mut padding = |random: &mut Random| match random.below(4) {
+                0 => LengthPercentage::percent(0.1),
+                1 => LengthPercentage::calc(calc(random)),
+                _ => LengthPercentage::length((random.below(4) * 3) as f32),
+            };
+            let mut style = Style {
+                display: match random.below(8) {
+                    0 => Display::None,
+                    1 | 2 => Display::Block,
+                    3 => Display::Grid,
+                    _ => Display::Flex,
+                },
+                flex_direction: if random.chance(2) { FlexDirection::Row } else { FlexDirection::Column },
+                flex_wrap: if random.chance(4) { crate::style::FlexWrap::Wrap } else { crate::style::FlexWrap::NoWrap },
+                flex_grow: random.below(3) as f32,
+                flex_shrink: random.below(2) as f32,
+                ..Default::default()
+            };
+            style.size = Size { width: dimension(random), height: dimension(random) };
+            if random.chance(3) {
+                style.min_size = Size { width: dimension(random), height: Dimension::auto() };
+            }
+            if random.chance(3) {
+                style.max_size = Size { width: Dimension::auto(), height: dimension(random) };
+            }
+            style.padding = crate::geometry::Rect {
+                left: padding(random),
+                right: padding(random),
+                top: LengthPercentage::length(0.0),
+                bottom: padding(random),
+            };
+            style.gap = Size { width: padding(random), height: LengthPercentage::length(random.below(3) as f32) };
+            if random.chance(4) {
+                style.margin = crate::geometry::Rect {
+                    left: LengthPercentageAuto::length(random.below(8) as f32),
+                    right: LengthPercentageAuto::auto(),
+                    top: LengthPercentageAuto::percent(0.05),
+                    bottom: LengthPercentageAuto::length(0.0),
+                };
+            }
+            if random.chance(5) {
+                style.position = Position::Absolute;
+                style.inset = crate::geometry::Rect {
+                    left: LengthPercentageAuto::length(random.below(20) as f32),
+                    top: LengthPercentageAuto::percent(0.1),
+                    right: LengthPercentageAuto::auto(),
+                    bottom: LengthPercentageAuto::auto(),
+                };
+            }
+            if random.chance(5) {
+                style.overflow = crate::geometry::Point { x: Overflow::Scroll, y: Overflow::Hidden };
+            }
+            if style.display == Display::Grid {
+                style.grid_template_columns = vec![
+                    crate::style_helpers::fr(1.0),
+                    crate::style_helpers::length(random.length() + 5.0),
+                ];
+            }
+            style
+        }
+
+        fn random_text(random: &mut Random) -> Option<Text> {
+            random
+                .chance(2)
+                .then(|| Text { width: random.length() + 10.0, line_height: (random.below(3) * 4 + 8) as f32 })
+        }
+
+        fn random_description(random: &mut Random) -> Description {
+            let mut description = Description {
+                styles: (0..NODES).map(|_| random_style(random)).collect(),
+                texts: (0..NODES).map(|_| random_text(random)).collect(),
+                children: vec![Vec::new(); NODES],
+            };
+            for node in 1..NODES {
+                if !random.chance(6) {
+                    attach(&mut description, random.below(node), node, random);
+                }
+            }
+            description
+        }
+
+        /// Makes `child` a child of `parent` at a random place, taking it from the parent it had. Only a node with a
+        /// lower index can be the parent, so there are no cycles.
+        fn attach(description: &mut Description, parent: usize, child: usize, random: &mut Random) {
+            for children in description.children.iter_mut() {
+                children.retain(|existing| *existing != child);
+            }
+            let at = random.below(description.children[parent].len() + 1);
+            description.children[parent].insert(at, child);
+        }
+
+        fn detach(description: &mut Description, child: usize) {
+            for children in description.children.iter_mut() {
+                children.retain(|existing| *existing != child);
+            }
+        }
+
+        fn build(description: &Description) -> (TaffyTree<Text>, Vec<NodeId>) {
+            let mut taffy: TaffyTree<Text> = TaffyTree::new();
+            taffy.disable_rounding();
+            let ids: Vec<NodeId> = (0..NODES)
+                .map(|node| match description.texts[node] {
+                    Some(text) => taffy.new_leaf_with_context(description.styles[node].clone(), text).unwrap(),
+                    None => taffy.new_leaf(description.styles[node].clone()).unwrap(),
+                })
+                .collect();
+            for (node, children) in description.children.iter().enumerate() {
+                let children: Vec<NodeId> = children.iter().map(|child| ids[*child]).collect();
+                taffy.set_children(ids[node], &children).unwrap();
+            }
+            (taffy, ids)
+        }
+
+        fn reachable(description: &Description) -> Vec<usize> {
+            let mut order = vec![0];
+            let mut index = 0;
+            while index < order.len() {
+                order.extend(description.children[order[index]].iter().copied());
+                index += 1;
+            }
+            order
+        }
+
+        fn layout_all(taffy: &mut TaffyTree<Text>, root: NodeId, space: Size<AvailableSpace>) {
+            taffy
+                .compute_layout_with_measure(root, space, measure)
+                .unwrap();
+        }
+
+        fn layouts(taffy: &TaffyTree<Text>, ids: &[NodeId], description: &Description) -> Vec<(usize, Layout)> {
+            reachable(description)
+                .into_iter()
+                .map(|node| {
+                    let mut layout = *taffy.unrounded_layout(ids[node]);
+                    // A flex container gives its `display: none` child the index as the order, and the hidden layout of
+                    // the child, which runs only when it has no results cached, puts it back to zero.
+                    if description.styles[node].display == Display::None {
+                        layout.order = 0;
+                    }
+                    (node, layout)
+                })
+                .collect()
+        }
+
+        fn edit(
+            description: &mut Description,
+            persistent: &mut TaffyTree<Text>,
+            ids: &[NodeId],
+            random: &mut Random,
+        ) {
+            match random.below(6) {
+                0 | 1 => {
+                    let node = random.below(NODES);
+                    description.styles[node] = random_style(random);
+                    persistent.set_style(ids[node], description.styles[node].clone()).unwrap();
+                }
+                2 => {
+                    // The same style again, which must change nothing.
+                    let node = random.below(NODES);
+                    persistent.set_style(ids[node], description.styles[node].clone()).unwrap();
+                }
+                3 => {
+                    let node = random.below(NODES);
+                    description.texts[node] = random_text(random);
+                    persistent.set_node_context(ids[node], description.texts[node]).unwrap();
+                }
+                _ => {
+                    // Move a node, maybe out of the tree, then rebuild the child lists that changed in either order.
+                    let child = 1 + random.below(NODES - 1);
+                    let before = description.children.clone();
+                    if random.chance(4) {
+                        detach(description, child);
+                    } else {
+                        attach(description, random.below(child), child, random);
+                    }
+                    let mut changed: Vec<usize> =
+                        (0..NODES).filter(|node| before[*node] != description.children[*node]).collect();
+                    if random.chance(2) {
+                        changed.reverse();
+                    }
+                    for node in changed {
+                        let children: Vec<NodeId> = description.children[node].iter().map(|child| ids[*child]).collect();
+                        persistent.set_children(ids[node], &children).unwrap();
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_tree_edited_in_place_lays_out_like_a_new_one() {
+            for seed in 1..=60u64 {
+                let mut random = Random(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let mut description = random_description(&mut random);
+                let (mut persistent, ids) = build(&description);
+                for step in 0..40 {
+                    let space = match random.below(3) {
+                        0 => Size::MAX_CONTENT,
+                        1 => Size::MIN_CONTENT,
+                        _ => Size {
+                            width: AvailableSpace::Definite((100 + random.below(8) * 50) as f32),
+                            height: AvailableSpace::Definite(300.0),
+                        },
+                    };
+                    layout_all(&mut persistent, ids[0], space);
+                    let (mut fresh, fresh_ids) = build(&description);
+                    layout_all(&mut fresh, fresh_ids[0], space);
+                    let (persistent_layouts, fresh_layouts) =
+                        (layouts(&persistent, &ids, &description), layouts(&fresh, &fresh_ids, &description));
+                    for (kept, new) in persistent_layouts.iter().zip(&fresh_layouts) {
+                        assert_eq!(
+                            kept, new,
+                            "seed {seed} step {step}: node {} differs; the tree is {:?}; displays {:?}",
+                            kept.0, description.children, description.styles.iter().map(|s| s.display).collect::<Vec<_>>()
+                        );
+                    }
+                    edit(&mut description, &mut persistent, &ids, &mut random);
+                }
+            }
         }
     }
 }
