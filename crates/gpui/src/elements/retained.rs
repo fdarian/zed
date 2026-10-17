@@ -112,9 +112,11 @@ struct RetainedState {
     recorded: Option<Recorded>,
 }
 
-/// What the prepaint and paint of the subtree left in the frame `serial`.
+/// What the prepaint and paint of the subtree left in the frames `serial` and `paint_serial`,
+/// which are one when both ran in the last frame that drew the subtree.
 struct Recorded {
     serial: u64,
+    paint_serial: u64,
     /// The dirty generation of the root after layout: layout results of the subtree below
     /// are the ones recorded while it has not changed.
     generation: u64,
@@ -186,7 +188,9 @@ impl Element for Retained {
                 && state.engine == window.layout_engine_id()
                 && window.layout_node_alive(root)
                 && state.recorded.as_ref().is_some_and(|recorded| {
-                    recorded.serial == window.rendered_serial() && recorded.paint.is_some()
+                    recorded.serial == window.rendered_serial()
+                        && recorded.paint_serial == window.rendered_serial()
+                        && recorded.paint.is_some()
                 })
             {
                 window.retained.counters.hits += 1;
@@ -296,6 +300,7 @@ impl Element for Retained {
                         .as_mut()
                         .expect("a subtree is skipped only with its paint recorded");
                     paint.range = window.replay_paint(paint);
+                    recorded.paint_serial = window.building_serial();
                     if let Some(hook) = hook {
                         hook(RetainedPhase::Paint, window, cx);
                     }
@@ -328,6 +333,7 @@ impl Element for Retained {
                         Ok(paint) => {
                             if let Some(recorded) = state.recorded.as_mut() {
                                 recorded.paint = Some(paint);
+                                recorded.paint_serial = window.building_serial();
                             }
                         }
                         Err(reason) => {
@@ -491,6 +497,7 @@ impl Retained {
                 Ok(prepaint) => {
                     state.recorded = Some(Recorded {
                         serial: window.building_serial(),
+                        paint_serial: 0,
                         generation: window.layout_dirty_generation(root),
                         key,
                         prepaint,
@@ -969,6 +976,7 @@ mod tests {
         let layout = Layout::new(cx, 5);
         layout.fixture.draw(cx);
         let before = layout.fixture.counters(cx);
+        let layout_before = layout_counters(layout.fixture.window, cx);
         let builds = layout.fixture.builds.get();
         for frame in 0..10 {
             // The bar, which is after the cards, grows with each frame.
@@ -980,6 +988,20 @@ mod tests {
         assert_eq!(after.builds, before.builds);
         assert_eq!(after.replays, before.replays + 50);
         assert_eq!(after.lazy_builds, before.lazy_builds);
+        // What layout does for a frame of replays: nothing is requested of the cards, and the
+        // only style that is set is the one of the bar, which has the size of the frame (the
+        // first frame has the size it had).
+        let layout_after = layout_counters(layout.fixture.window, cx);
+        assert_eq!(layout_after.nodes_created, layout_before.nodes_created);
+        assert_eq!(layout_after.nodes_removed, layout_before.nodes_removed);
+        assert_eq!(layout_after.measures, layout_before.measures);
+        assert_eq!(layout_after.children_set, layout_before.children_set);
+        assert_eq!(layout_after.styles_set, layout_before.styles_set + 9, "the bar's");
+    }
+
+    fn layout_counters(window: AnyWindowHandle, cx: &mut TestAppContext) -> crate::LayoutCounters {
+        cx.update_window(window, |_, window, _| window.layout_counters())
+            .unwrap()
     }
 
     #[gpui::test]
@@ -1742,6 +1764,334 @@ mod tests {
         check(cx, false, &|| scroll.set_offset(point(px(0.), px(-7.))));
         let after = snapshot(window, cx, &POINTS);
         assert_ne!(after.scene, base.scene);
+    }
+
+    #[gpui::test]
+    fn subtrees_in_culled_rows_are_replayed_under_the_empty_mask_and_built_when_they_come_into_view(
+        cx: &mut TestAppContext,
+    ) {
+        let height = Rc::new(Cell::new(70.));
+        let key = Rc::new(Cell::new(1));
+        let builds = Rc::new(Cell::new(0));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let window = open(cx, {
+            let height = height.clone();
+            let key = key.clone();
+            let builds = builds.clone();
+            Rc::new(move |_, _| {
+                let rows = (0..5).map(|index| {
+                    let builds = builds.clone();
+                    let clicks = clicks.clone();
+                    div()
+                        .id(("row", index))
+                        .cullable(crate::Edges::default())
+                        .flex_none()
+                        .w(px(100.))
+                        .h(px(40.))
+                        .child(retained(("retained", index), key.get(), move |_, _| {
+                            builds.set(builds.get() + 1);
+                            card(index, &clicks)
+                        }))
+                });
+                div()
+                    .id("root")
+                    .always_hitbox()
+                    .size_full()
+                    .child(
+                        div()
+                            .id("clip")
+                            .overflow_hidden()
+                            .w(px(100.))
+                            .h(px(height.get()))
+                            .children(rows),
+                    )
+                    .into_any_element()
+            })
+        });
+        let culled = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| window.culled_subtree_count())
+                .unwrap()
+        };
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        let culled_before = culled(cx);
+        draw(window, cx);
+        assert_eq!(culled(cx) - culled_before, 3, "rows 2 to 4 are below the clip");
+        let replayed = snapshot(window, cx, &POINTS);
+        assert_eq!(counters(window, cx).replays, before.replays + 5);
+        key.set(2);
+        draw(window, cx);
+        let built = snapshot(window, cx, &POINTS);
+        assert_eq!(replayed.scene, built.scene);
+        assert_eq!(replayed.a11y, built.a11y);
+        assert_eq!(replayed.chains, built.chains);
+        assert!(built.a11y.contains("Button 4"), "culled rows stay in the tree");
+
+        // The clip grows, which is the content mask of every row, and two more rows are in view.
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        height.set(150.);
+        draw(window, cx);
+        let after = counters(window, cx);
+        assert_eq!(after.replays, before.replays + 1, "row 4 is culled as it was");
+        assert_eq!(after.lazy_builds, before.lazy_builds + 4);
+        let drawn = snapshot(window, cx, &POINTS);
+        key.set(3);
+        draw(window, cx);
+        let built = snapshot(window, cx, &POINTS);
+        assert_eq!(drawn.scene, built.scene);
+        assert_eq!(drawn.a11y, built.a11y);
+        assert_eq!(drawn.chains, built.chains);
+    }
+
+    #[gpui::test]
+    fn the_inspector_makes_every_frame_build_everything(cx: &mut TestAppContext) {
+        let fixture = Fixture::new(cx, 2);
+        fixture.draw(cx);
+        let before = fixture.counters(cx);
+        assert!(before.replays >= 2);
+        cx.update_window(fixture.window, |_, window, cx| window.toggle_inspector(cx))
+            .unwrap();
+        fixture.draw(cx);
+        fixture.draw(cx);
+        let builds = fixture.builds.get();
+        fixture.draw(cx);
+        assert_eq!(fixture.counters(cx).replays, before.replays, "no replay with it on");
+        assert_eq!(fixture.builds.get(), builds + 2);
+        cx.update_window(fixture.window, |_, window, cx| window.toggle_inspector(cx))
+            .unwrap();
+        fixture.draw(cx);
+        fixture.draw(cx);
+        assert!(fixture.counters(cx).replays > before.replays, "and again without it");
+    }
+
+    /// An element that prepaints a child in an attempt it rolls back, and another after it.
+    struct Retry {
+        first: Rc<dyn Fn() -> AnyElement>,
+        second: Rc<dyn Fn() -> AnyElement>,
+        elements: Option<(AnyElement, AnyElement)>,
+    }
+
+    impl IntoElement for Retry {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for Retry {
+        type RequestLayoutState = Option<AnyElement>;
+        type PrepaintState = Option<AnyElement>;
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Option<AnyElement>) {
+            let mut first = (self.first)();
+            let layout_id = first.request_layout(window, cx);
+            (layout_id, Some(first))
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            first: &mut Option<AnyElement>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Option<AnyElement> {
+            let mut first = first.take().expect("requested");
+            let rolled_back: Result<(), ()> = window.transact(|window| {
+                first.prepaint(window, cx);
+                Err(())
+            });
+            assert!(rolled_back.is_err());
+            let mut second = (self.second)();
+            second.request_layout(window, cx);
+            second.prepaint(window, cx);
+            Some(second)
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut Option<AnyElement>,
+            second: &mut Option<AnyElement>,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            second.as_mut().expect("prepainted").paint(window, cx);
+        }
+    }
+
+    #[gpui::test]
+    fn a_recording_made_in_a_prepaint_that_was_rolled_back_is_not_replayed(
+        cx: &mut TestAppContext,
+    ) {
+        let builds = Rc::new(Cell::new(0));
+        let window = open(cx, {
+            let builds = builds.clone();
+            Rc::new(move |_, _| {
+                let builds = builds.clone();
+                let first: Rc<dyn Fn() -> AnyElement> = Rc::new(move || {
+                    let builds = builds.clone();
+                    div()
+                        .id("holder")
+                        .child(retained("retained", 1, move |_, _| {
+                            builds.set(builds.get() + 1);
+                            div().id("inside").w(px(20.)).h(px(20.)).bg(crate::red()).into_any_element()
+                        }))
+                        .into_any_element()
+                });
+                let second: Rc<dyn Fn() -> AnyElement> =
+                    Rc::new(|| div().id("plain").w(px(20.)).h(px(20.)).into_any_element());
+                div()
+                    .id("root")
+                    .child(Retry { first, second, elements: None })
+                    .into_any_element()
+            })
+        });
+        for _ in 0..4 {
+            draw(window, cx);
+        }
+        // What the rolled back attempt recorded indexes vectors that were cut back, and the
+        // element is asked for again with the same key.
+        let counters = counters(window, cx);
+        assert_eq!(counters.hits, 0, "{counters:?}");
+        assert_eq!(counters.replays, 0);
+        assert!(builds.get() >= 4);
+    }
+
+    /// An element that prepaints its child every frame and paints it only when told to.
+    struct Unpainted {
+        child: Option<AnyElement>,
+        paint: Rc<Cell<bool>>,
+    }
+
+    impl IntoElement for Unpainted {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for Unpainted {
+        type RequestLayoutState = AnyElement;
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, AnyElement) {
+            let mut child = self.child.take().expect("built with a child");
+            let layout_id = child.request_layout(window, cx);
+            (layout_id, child)
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            child: &mut AnyElement,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            child.prepaint(window, cx);
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            child: &mut AnyElement,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            if self.paint.get() {
+                child.paint(window, cx);
+            } else {
+                // A prepainted element that is not painted must be painted by nothing else.
+                let _ = child;
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn a_subtree_that_was_prepainted_and_not_painted_is_not_replayed_from_the_frame_before(
+        cx: &mut TestAppContext,
+    ) {
+        let paint = Rc::new(Cell::new(true));
+        let builds = Rc::new(Cell::new(0));
+        let window = open(cx, {
+            let paint = paint.clone();
+            let builds = builds.clone();
+            Rc::new(move |_, _| {
+                let builds = builds.clone();
+                let child = retained("retained", 1, move |_, _| {
+                    builds.set(builds.get() + 1);
+                    div().id("inside").w(px(20.)).h(px(20.)).bg(crate::red()).into_any_element()
+                })
+                .into_any_element();
+                div()
+                    .id("root")
+                    .child(Unpainted { child: Some(child), paint: paint.clone() })
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        assert!(before.replays >= 1);
+        let red = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| window.painted_quads().len())
+                .unwrap()
+        };
+        assert_eq!(red(cx), 1);
+
+        // Replayed in prepaint, and not painted.
+        paint.set(false);
+        draw(window, cx);
+        assert_eq!(red(cx), 0);
+        assert_eq!(counters(window, cx).replays, before.replays + 1);
+        // The ranges of paint it has are of the frame before that, and are not used.
+        paint.set(true);
+        let builds_before = builds.get();
+        draw(window, cx);
+        assert_eq!(counters(window, cx).replays, before.replays + 1);
+        assert_eq!(builds.get(), builds_before + 1);
+        assert_eq!(red(cx), 1);
     }
 
     mod fuzz {
