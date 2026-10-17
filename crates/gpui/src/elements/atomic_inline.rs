@@ -1423,6 +1423,23 @@ mod tests {
         assert_close(laid.boxes[0].origin.y, 17., "the box");
     }
 
+    /// `<div style="width:140px">xxxxxxxxxx<span style="display:inline-block;width:30px;height:10px"></span></div>`:
+    /// the box wraps to the second row, and the byte of its placeholder is a wrap boundary, which
+    /// is the end of the row above like any other index there. Text before the box ends at the
+    /// end of its own row, not at the start of the box's.
+    #[test]
+    fn the_placeholder_of_a_box_that_wrapped_is_the_end_of_the_row_above() {
+        let text = format!("xxxxxxxxxx{OBJECT}");
+        let laid = lay_out(140., &text, vec![atomic(30., 10.)]);
+        assert_close(laid.paragraph.size.height, 40., "two rows");
+        assert_close(laid.boxes[0].origin.y, 20. + 7., "the box is on the second row");
+        let end = laid.layout.position_for_index(10).unwrap();
+        let before = laid.layout.position_for_index(9).unwrap();
+        assert_eq!(end.y, before.y, "on the row of the text");
+        assert!(end.x > before.x, "after the last glyph of the row");
+        assert_eq!(laid.layout.row_for_index(10).unwrap().top, end.y);
+    }
+
     /// `<span style="line-height:40px">` around a box that wraps to a line of its own after text outside the
     /// span: that line has the strut of the span.
     #[test]

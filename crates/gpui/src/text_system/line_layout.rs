@@ -1262,13 +1262,16 @@ impl WrappedLineLayout {
     }
 
     /// Returns the pixel position for the given byte index. For the placeholder of an
-    /// atomic inline it is where the top left corner of the box's margin box is.
+    /// atomic inline it is where the top left corner of the box's margin box is, unless the
+    /// box wrapped to the next row: the placeholder is then at a wrap boundary, which is
+    /// the end of the row above for every index (see [`Self::row_for_index`]), and a range
+    /// of the text before the box ends there.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
         let (row_ix, x) = self.row_and_x_for_index(index)?;
         if let Some(object) = self
             .objects(line_height)
             .into_iter()
-            .find(|object| object.index == index)
+            .find(|object| object.index == index && object.row_ix == row_ix)
         {
             return Some(point(object.x, object.y));
         }
