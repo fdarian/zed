@@ -560,6 +560,7 @@ mod tests {
     fn card(index: usize, clicks: &Rc<RefCell<Vec<usize>>>) -> AnyElement {
         div()
             .id(("card", index))
+            .always_hitbox()
             .w(px(100.))
             .h(px(40.))
             .flex_none()
@@ -614,6 +615,7 @@ mod tests {
                     });
                     div()
                         .id("root")
+                        .always_hitbox()
                         .size_full()
                         .flex()
                         .flex_col()
@@ -769,7 +771,13 @@ mod tests {
         assert_eq!(replayed.a11y, built.a11y);
         assert_eq!(replayed.chains, built.chains);
         assert!(built.a11y.contains("Button 2"));
-        assert!(built.chains[1].contains("button"), "{}", built.chains[1]);
+        // From the button up to the window, through the boundary of the subtree.
+        let links: Vec<&str> = built.chains[1].split(" > ").collect();
+        assert_eq!(links.len(), 3, "{}", built.chains[1]);
+        assert!(links[0].contains(".card-0.button-0 "), "{}", links[0]);
+        assert!(links[1].contains(".retained-card-0.card-0 "), "{}", links[1]);
+        assert!(links[2].contains(".root "), "{}", links[2]);
+        assert!(built.chains[2].contains("card-0"), "{}", built.chains[2]);
 
         // A replay of a replay is the same again.
         fixture.draw(cx);
@@ -858,6 +866,7 @@ mod tests {
                     });
                     div()
                         .id("root")
+                        .always_hitbox()
                         .size_full()
                         .child(
                             div()
@@ -1733,5 +1742,367 @@ mod tests {
         check(cx, false, &|| scroll.set_offset(point(px(0.), px(-7.))));
         let after = snapshot(window, cx, &POINTS);
         assert_ne!(after.scene, base.scene);
+    }
+
+    mod fuzz {
+        use super::*;
+        use crate::{Position, hsla};
+        use rand::{Rng as _, rngs::StdRng, seq::IndexedRandom as _};
+        use std::hash::{Hash, Hasher};
+
+        const SIZES: [u32; 6] = [0, 14, 22, 36, 60, 100];
+        const WORDS: [&str; 4] = ["a", "retained", "two words", "qq"];
+
+        #[derive(Clone, Hash)]
+        struct Node {
+            id: usize,
+            width: u32,
+            height: u32,
+            color: u8,
+            row: bool,
+            padding: u8,
+            clip: bool,
+            fade: bool,
+            text: Option<u8>,
+            clickable: bool,
+            /// The node is in the accessibility tree, and may take the focus.
+            labelled: bool,
+            focusable: bool,
+            retain: bool,
+            /// Offset of an absolutely positioned node, and its z-index.
+            absolute: Option<(u8, u8, i8)>,
+            stacking: bool,
+            /// An absolutely positioned node is placed by an ancestor that clips.
+            escaping: bool,
+            children: Vec<Node>,
+        }
+
+        impl Node {
+            fn random(rng: &mut StdRng, ids: &mut usize, depth: usize) -> Node {
+                let id = *ids;
+                *ids += 1;
+                let children = if depth < 3 {
+                    (0..rng.random_range(0..4))
+                        .map(|_| Node::random(rng, ids, depth + 1))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Node {
+                    id,
+                    width: *SIZES.choose(rng).unwrap(),
+                    height: *SIZES.choose(rng).unwrap(),
+                    color: rng.random_range(0..6),
+                    row: rng.random_bool(0.5),
+                    padding: rng.random_range(0..4) * 2,
+                    clip: rng.random_bool(0.2),
+                    fade: rng.random_bool(0.15),
+                    text: rng.random_bool(0.2).then(|| rng.random_range(0..WORDS.len() as u8)),
+                    clickable: rng.random_bool(0.3),
+                    labelled: rng.random_bool(0.3),
+                    focusable: rng.random_bool(0.15),
+                    retain: rng.random_bool(0.35),
+                    absolute: (depth > 0 && rng.random_bool(0.08)).then(|| {
+                        (rng.random_range(0..40), rng.random_range(0..40), rng.random_range(-1..3))
+                    }),
+                    stacking: rng.random_bool(0.1),
+                    escaping: rng.random_bool(0.4),
+                    children,
+                }
+            }
+
+            fn key(&self) -> u64 {
+                let mut hasher = std::hash::DefaultHasher::new();
+                self.hash(&mut hasher);
+                hasher.finish()
+            }
+
+            fn count(&self) -> usize {
+                1 + self.children.iter().map(Node::count).sum::<usize>()
+            }
+
+            /// The node with this number in tree order.
+            fn nth_mut(&mut self, mut n: usize) -> &mut Node {
+                if n == 0 {
+                    return self;
+                }
+                n -= 1;
+                for child in &mut self.children {
+                    let count = child.count();
+                    if n < count {
+                        return child.nth_mut(n);
+                    }
+                    n -= count;
+                }
+                unreachable!("n is below the count");
+            }
+
+            fn edit(&mut self, rng: &mut StdRng, ids: &mut usize) {
+                let n = rng.random_range(0..self.count());
+                let node = self.nth_mut(n);
+                match rng.random_range(0..14) {
+                    0 => node.width = *SIZES.choose(rng).unwrap(),
+                    1 => node.height = *SIZES.choose(rng).unwrap(),
+                    2 => node.color = rng.random_range(0..6),
+                    3 => node.row = !node.row,
+                    4 => node.padding = rng.random_range(0..4) * 2,
+                    5 => node.clip = !node.clip,
+                    6 => node.fade = !node.fade,
+                    7 => {
+                        node.text = match node.text {
+                            None => Some(rng.random_range(0..WORDS.len() as u8)),
+                            Some(_) => None,
+                        }
+                    }
+                    8 => node.clickable = !node.clickable,
+                    9 => node.retain = !node.retain,
+                    10 => node.stacking = !node.stacking,
+                    12 if node.focusable || node.labelled => {
+                        node.focusable = !node.focusable;
+                        node.labelled = !node.labelled;
+                    }
+                    11 if node.children.len() < 4 => {
+                        node.children.push(Node::random(rng, ids, 3));
+                    }
+                    _ => {
+                        node.children.pop();
+                    }
+                }
+            }
+        }
+
+        /// Whether the subtrees are retained, or wrapped in the same elements with a key that no
+        /// frame has had before.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mode {
+            Retain,
+            Rebuild,
+        }
+
+        thread_local! {
+            static REBUILDS: Cell<u64> = const { Cell::new(0) };
+        }
+
+        fn element(node: &Node, mode: Mode) -> AnyElement {
+            let mut element = div().id(("node", node.id)).flex();
+            element = if node.row { element.flex_row() } else { element.flex_col() };
+            if node.width > 0 {
+                element = element.w(px(node.width as f32));
+            }
+            if node.height > 0 {
+                element = element.h(px(node.height as f32));
+            }
+            element = element
+                .flex_none()
+                .bg(hsla(node.color as f32 / 6., 1., 0.5, 1.))
+                .p(px(node.padding as f32));
+            if node.clip {
+                element = element.overflow_hidden();
+            }
+            if node.fade {
+                element = element.opacity(0.5);
+            }
+            if node.clickable {
+                element = element.always_hitbox();
+            }
+            if node.labelled {
+                element = element
+                    .role(Role::Group)
+                    .aria_label(format!("node {}", node.id));
+            }
+            if node.focusable {
+                element = element.focusable().tab_stop(true);
+            }
+            if node.stacking {
+                element = element.stacking_context();
+            }
+            if let Some((left, top, z)) = node.absolute {
+                element = element
+                    .absolute()
+                    .left(px(left as f32))
+                    .top(px(top as f32))
+                    .z_index(z as i32);
+                if node.escaping {
+                    element.style().position = Some(Position::AbsoluteInAncestor);
+                }
+            }
+            if let Some(word) = node.text {
+                element = element.child(WORDS[word as usize]);
+            }
+            for child in &node.children {
+                element = element.child(child_element(child, mode));
+            }
+            element.into_any_element()
+        }
+
+        fn child_element(node: &Node, mode: Mode) -> AnyElement {
+            if node.retain && node.absolute.is_none() {
+                let content = node.clone();
+                let key = match mode {
+                    Mode::Retain => node.key(),
+                    Mode::Rebuild => REBUILDS.with(|rebuilds| {
+                        rebuilds.set(rebuilds.get() + 1);
+                        rebuilds.get()
+                    }),
+                };
+                retained(("retained", node.id), key, move |_, _| element(&content, mode))
+                    .into_any_element()
+            } else {
+                element(node, mode)
+            }
+        }
+
+        struct Shared {
+            tree: Node,
+            spacer: f32,
+        }
+
+        struct Fuzzed {
+            shared: Rc<RefCell<Shared>>,
+            mode: Mode,
+        }
+
+        impl Render for Fuzzed {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let shared = self.shared.borrow();
+                div()
+                    .id("root")
+                    .always_hitbox()
+                    .size_full()
+                    .child(div().id("spacer").flex_none().h(px(shared.spacer)))
+                    // The root of the tree is retained like any node of it, but is never lifted.
+                    .child(child_element(&shared.tree, self.mode))
+            }
+        }
+
+        fn open_fuzzed(cx: &mut TestAppContext, shared: &Rc<RefCell<Shared>>, mode: Mode) -> AnyWindowHandle {
+            let shared = shared.clone();
+            let window = cx.open_window(size(px(400.), px(300.)), move |_, _| Fuzzed { shared, mode });
+            let window = AnyWindowHandle::from(window);
+            cx.update_window(window, |_, window, cx| {
+                window.set_dom_hit_testing(true);
+                window.force_effect_groups();
+                window.set_a11y_active_for_tests(true);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            window
+        }
+
+        /// What a frame paints and what is hit where, without what the windows number by
+        /// themselves: their atlas tiles and their ids.
+        fn shown(window: AnyWindowHandle, cx: &mut TestAppContext) -> String {
+            cx.update_window(window, |_, window, _| {
+                let scene = &window.rendered_frame.scene;
+                let mut out = format!(
+                    "{} operations\n{:#?}\n{:#?}\n{:#?}\n",
+                    scene.len(),
+                    scene.shadows,
+                    scene.quads,
+                    scene.underlines
+                );
+                for sprite in &scene.monochrome_sprites {
+                    out += &format!(
+                        "{:?} {:?} {:?} {:?}\n",
+                        sprite.order, sprite.bounds, sprite.content_mask, sprite.color
+                    );
+                }
+                for group in &scene.groups {
+                    out += &format!("{:?} {:?}\n", group.order, group.bounds);
+                }
+                // The windows have views of their own, which the node ids are made from.
+                let update = window.a11y.last_tree_update().expect("a11y is on");
+                let name = |id: &accesskit::NodeId| {
+                    update
+                        .nodes
+                        .iter()
+                        .find(|(node, _)| node == id)
+                        .map(|(_, node)| node.label().unwrap_or("window").to_string())
+                        .expect("a node in the update")
+                };
+                let mut nodes: Vec<String> = update
+                    .nodes
+                    .iter()
+                    .map(|(_, node)| {
+                        format!(
+                            "{:?} {:?} {:?} children {:?} focusable {}",
+                            node.role(),
+                            node.label(),
+                            node.bounds(),
+                            node.children().iter().map(&name).collect::<Vec<_>>(),
+                            node.supports_action(accesskit::Action::Focus),
+                        )
+                    })
+                    .collect();
+                nodes.sort();
+                out += &nodes.join("\n");
+                out += &format!("\nfocus {}\n", name(&update.focus));
+                for y in (5..300).step_by(37) {
+                    for x in (5..400).step_by(41) {
+                        let chain = window.hit_chain_at(point(px(x as f32), px(y as f32)));
+                        let names: Vec<String> = chain
+                            .iter()
+                            .map(|(id, bounds)| {
+                                let id = id.to_string();
+                                let path = id.split_once('.').map_or(id.as_str(), |(_, path)| path);
+                                format!("{path} {bounds:?}")
+                            })
+                            .collect();
+                        out += &format!("({x}, {y}): {}\n", names.join(" > "));
+                    }
+                }
+                out
+            })
+            .unwrap()
+        }
+
+        #[gpui::test(iterations = 20)]
+        fn retained_subtrees_show_what_the_same_tree_built_shows(
+            mut rng: StdRng,
+            cx: &mut TestAppContext,
+        ) {
+            let mut ids = 0;
+            let mut tree = Node::random(&mut rng, &mut ids, 0);
+            // The tree is a column of three, so that it is more than one retained subtree.
+            tree.children
+                .extend((0..3).map(|_| Node::random(&mut rng, &mut ids, 1)));
+            tree.absolute = None;
+            let shared = Rc::new(RefCell::new(Shared { tree, spacer: 0. }));
+            let retaining = open_fuzzed(cx, &shared, Mode::Retain);
+            let building = open_fuzzed(cx, &shared, Mode::Rebuild);
+
+            for step in 0..30 {
+                {
+                    let mut shared = shared.borrow_mut();
+                    for _ in 0..rng.random_range(0..3) {
+                        let mut next_id = ids;
+                        shared.tree.edit(&mut rng, &mut next_id);
+                        ids = next_id;
+                    }
+                    shared.tree.absolute = None;
+                    if rng.random_bool(0.15) {
+                        shared.spacer = *[0., 7., 15.].choose(&mut rng).unwrap();
+                    }
+                }
+                draw(retaining, cx);
+                draw(building, cx);
+                let (retained, built) = (shown(retaining, cx), shown(building, cx));
+                if retained != built {
+                    let (a, b): (Vec<&str>, Vec<&str>) =
+                        (retained.lines().collect(), built.lines().collect());
+                    let first = a.iter().zip(&b).position(|(a, b)| a != b).unwrap_or(a.len().min(b.len()));
+                    let from = first.saturating_sub(12);
+                    panic!(
+                        "step {step}, line {first}\nretained:\n{}\nbuilt:\n{}\ncounters {:?}",
+                        a[from..(first + 12).min(a.len())].join("\n"),
+                        b[from..(first + 12).min(b.len())].join("\n"),
+                        self::counters(retaining, cx)
+                    );
+                }
+            }
+            let counters = counters(retaining, cx);
+            assert_eq!(self::counters(building, cx).replays, 0, "the control replays nothing");
+            assert_eq!(counters.layout_fallbacks, 0, "{counters:?}");
+        }
     }
 }
