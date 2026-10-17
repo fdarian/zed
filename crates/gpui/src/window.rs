@@ -6493,6 +6493,30 @@ impl Window {
         self.layout_engine = Some(layout_engine);
     }
 
+    /// Runs `f` with `engine` as the layout engine of the window, in place of the one it has or,
+    /// during `compute_layout`, the lack of one. The nodes `f` requests are in `engine`, and
+    /// their layout ids are only good with it, so an element laid out as a root of its own, such
+    /// as an atomic inline, keeps its engine and swaps it in for everything it does.
+    pub(crate) fn with_layout_engine<R>(
+        &mut self,
+        engine: &mut Option<TaffyLayoutEngine>,
+        f: impl FnOnce(&mut Window) -> R,
+    ) -> R {
+        let outer = std::mem::replace(&mut self.layout_engine, engine.take());
+        let result = f(self);
+        *engine = std::mem::replace(&mut self.layout_engine, outer);
+        result
+    }
+
+    /// See [`TaffyLayoutEngine::set_forced_width`].
+    pub(crate) fn set_layout_forced_width(&mut self, layout_id: LayoutId, width: Option<Pixels>) {
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .set_forced_width(layout_id, width, scale_factor);
+    }
+
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
     /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
     ///

@@ -1,5 +1,6 @@
 mod anchored;
 mod animation;
+mod atomic_inline;
 mod canvas;
 mod container_query;
 mod deferred;
@@ -14,6 +15,8 @@ mod uniform_list;
 
 pub use anchored::*;
 pub use animation::*;
+pub use atomic_inline::{AtomicBaseline, AtomicInline};
+pub(crate) use atomic_inline::{AtomicInlines, AtomicMeasure};
 pub use canvas::*;
 pub use container_query::*;
 pub use deferred::*;

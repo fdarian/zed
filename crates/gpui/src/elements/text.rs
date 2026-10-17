@@ -1,7 +1,8 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, EndTruncation,
-    GlobalElementId, GlyphInset, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId,
-    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ActiveTooltip, AnyView, App, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
+    DispatchPhase, Element, ElementId, EndTruncation, GlobalElementId, GlyphInset,
+    HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     SharedString, Size, TextInset, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom,
     WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
     set_tooltip_on_window,
@@ -276,6 +277,8 @@ impl Element for &'static str {
             SharedString::from(*self),
             None,
             Rc::new(no_insets),
+            Rc::default(),
+            None,
             window,
             cx,
         );
@@ -352,7 +355,15 @@ impl Element for SharedString {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextLayout::default();
-        let layout_id = state.layout(self.clone(), None, Rc::new(no_insets), window, cx);
+        let layout_id = state.layout(
+            self.clone(),
+            None,
+            Rc::new(no_insets),
+            Rc::default(),
+            None,
+            window,
+            cx,
+        );
         (layout_id, state)
     }
 
@@ -401,6 +412,9 @@ pub struct StyledText {
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
     insets: InsetsForWidth,
+    inline_boxes: Vec<InlineBox>,
+    atomic_inlines: Vec<AtomicInline>,
+    atomics: Option<Rc<RefCell<AtomicInlines>>>,
     layout: TextLayout,
 }
 
@@ -421,6 +435,9 @@ impl StyledText {
             delayed_highlights: None,
             delayed_font_family_overrides: None,
             insets: Rc::new(no_insets),
+            inline_boxes: Vec::new(),
+            atomic_inlines: Vec::new(),
+            atomics: None,
             layout: TextLayout::default(),
         }
     }
@@ -562,6 +579,26 @@ impl StyledText {
         self
     }
 
+    /// Aligns inline boxes of the text on their lines, as CSS `vertical-align` does. See
+    /// [`InlineBox`].
+    pub fn with_inline_boxes(mut self, inline_boxes: Vec<InlineBox>) -> Self {
+        self.inline_boxes = inline_boxes;
+        self
+    }
+
+    /// Puts elements in the text in place of U+FFFC characters, like CSS `inline-block`
+    /// boxes: each takes its shrink-to-fit width, wraps with the text, and is laid out,
+    /// prepainted and painted where its placeholder is, in the same frame. The text owns
+    /// the elements. See [`AtomicInline`].
+    ///
+    /// The atomic inlines and their parents among [`Self::with_inline_boxes`] are one
+    /// list: the boxes come first, so that `parent` of an atomic inline is an index into
+    /// them.
+    pub fn with_atomic_inlines(mut self, atomic_inlines: Vec<AtomicInline>) -> Self {
+        self.atomic_inlines = atomic_inlines;
+        self
+    }
+
     /// Like [`Self::with_insets`], for insets that depend on the width the text is laid
     /// out in, such as a padding in percent of it. `insets` is called each time the text
     /// is measured, with the width it is measured at, or `None` when it has no width yet.
@@ -607,9 +644,18 @@ impl Element for StyledText {
         }
 
         let insets = mem::replace(&mut self.insets, Rc::new(no_insets));
-        let layout_id = self
-            .layout
-            .layout(self.text.clone(), runs, insets, window, cx);
+        let atomic_inlines = mem::take(&mut self.atomic_inlines);
+        self.atomics = (!atomic_inlines.is_empty())
+            .then(|| Rc::new(RefCell::new(AtomicInlines::new(atomic_inlines, window, cx))));
+        let layout_id = self.layout.layout(
+            self.text.clone(),
+            runs,
+            insets,
+            Rc::new(mem::take(&mut self.inline_boxes)),
+            self.atomics.clone(),
+            window,
+            cx,
+        );
         (layout_id, ())
     }
 
@@ -619,10 +665,14 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text)
+        self.layout.prepaint(bounds, &self.text);
+        if let Some(atomics) = &self.atomics {
+            let origins = self.layout.atomic_origins(window.text_style().text_align);
+            atomics.borrow_mut().prepaint(&origins, window, cx);
+        }
     }
 
     fn paint(
@@ -635,7 +685,10 @@ impl Element for StyledText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.layout.paint(&self.text, window, cx)
+        self.layout.paint(&self.text, window, cx);
+        if let Some(atomics) = &self.atomics {
+            atomics.borrow_mut().paint(window, cx);
+        }
     }
 }
 
@@ -660,7 +713,11 @@ pub struct TextRow {
 
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
-pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+pub struct TextLayout(
+    Rc<RefCell<Option<TextLayoutInner>>>,
+    /// The layout node of the text, once it is requested.
+    Rc<Cell<Option<LayoutId>>>,
+);
 
 struct TextLayoutInner {
     len: usize,
@@ -680,6 +737,8 @@ impl TextLayout {
         text: SharedString,
         runs: Option<Vec<TextRun>>,
         insets: InsetsForWidth,
+        inline_boxes: Rc<Vec<InlineBox>>,
+        atomics: Option<Rc<RefCell<AtomicInlines>>>,
         window: &mut Window,
         _: &mut App,
     ) -> LayoutId {
@@ -696,7 +755,7 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
+        let layout_id = window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {
@@ -705,6 +764,20 @@ impl TextLayout {
                     _ => None,
                 });
                 let insets = insets(width);
+                // The atomic inlines are measured before the text is shaped, since their
+                // widths are what the lines are shaped with.
+                let inline: Vec<InlineBox> = match &atomics {
+                    Some(atomics) => {
+                        let measure = match (width, available_space.width) {
+                            (Some(width), _) => AtomicMeasure::Fit(width),
+                            (None, crate::AvailableSpace::MinContent) => AtomicMeasure::MinContent,
+                            (None, _) => AtomicMeasure::MaxContent,
+                        };
+                        let atomic_boxes = atomics.borrow_mut().measure(measure, window, cx);
+                        inline_boxes.iter().cloned().chain(atomic_boxes).collect()
+                    }
+                    None => inline_boxes.to_vec(),
+                };
                 let unmeasurable = |wrap_width, truncate_width| {
                     element_state.0.borrow_mut().replace(TextLayoutInner {
                         lines: Default::default(),
@@ -727,12 +800,14 @@ impl TextLayout {
                         (None, crate::AvailableSpace::MinContent) => {
                             // Laid out at the width the real pass will give the node, which
                             // is the measured width rounded up.
-                            match window.text_system().min_content_width(
+                            match window.text_system().min_content_width_inline(
                                 text.clone(),
                                 font_size,
                                 &runs,
                                 text_style.layout_options(),
                                 &insets,
+                                &inline,
+                                line_height,
                             ) {
                                 Ok(width) => Some(width.ceil()),
                                 Err(error) => {
@@ -745,7 +820,13 @@ impl TextLayout {
                 } else {
                     None
                 };
-                let truncation = text_style.text_overflow.as_ref().zip(width);
+                // Truncation cuts the text and with it the placeholders the boxes take the
+                // place of, so a text with atomic inlines overflows instead.
+                let truncation = text_style
+                    .text_overflow
+                    .as_ref()
+                    .zip(width)
+                    .filter(|_| atomics.is_none());
                 let truncate_width = truncation.map(|(_, width)| width);
 
                 // Only use cached layout if:
@@ -804,7 +885,7 @@ impl TextLayout {
                                 }
                                 _ => (TruncateFrom::Middle, width),
                             };
-                            let unclipped = window.text_system().shape_text_with_insets(
+                            let unclipped = window.text_system().shape_text_inline(
                                 text.clone(),
                                 font_size,
                                 &runs,
@@ -812,6 +893,8 @@ impl TextLayout {
                                 None,
                                 text_style.layout_options(),
                                 &insets,
+                                &inline,
+                                line_height,
                             )?;
                             if unclipped
                                 .iter()
@@ -847,9 +930,10 @@ impl TextLayout {
                     } else {
                         &[]
                     };
+                    let inline: &[InlineBox] = if truncated_text == text { &inline } else { &[] };
                     window
                         .text_system()
-                        .shape_text_with_insets(
+                        .shape_text_inline(
                             truncated_text,
                             font_size,
                             &runs,
@@ -857,6 +941,8 @@ impl TextLayout {
                             text_style.line_clamp, // Limit the number of lines if line_clamp is set.
                             text_style.layout_options(),
                             insets,
+                            inline,
+                            line_height,
                         )
                         .log_err()
                         .map(|lines| (len, lines))
@@ -885,7 +971,9 @@ impl TextLayout {
 
                 size
             }
-        })
+        });
+        self.1.set(Some(layout_id));
+        layout_id
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
@@ -932,6 +1020,74 @@ impl TextLayout {
             .log_err();
             line_origin.y += line.size(line_height).height;
         }
+    }
+
+    /// The layout node of the text, once it has requested its layout. It is the node whose
+    /// bounds `Window::layout_bounds` gives while the text is prepainted or painted, which
+    /// the baseline callback of an [`AtomicInline`] needs for the text it holds.
+    pub fn layout_id(&self) -> Option<LayoutId> {
+        self.1.get()
+    }
+
+    /// Where the top left corner of the margin box of each atomic inline is, in window
+    /// coordinates, with the byte of its placeholder. `align` is the text alignment the
+    /// text is painted with.
+    pub fn atomic_origins(
+        &self,
+        align: crate::TextAlign,
+    ) -> SmallVec<[(usize, Point<Pixels>); 2]> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+        let line_height = element_state.line_height;
+
+        let mut origins = SmallVec::new();
+        let mut line_origin = bounds.origin;
+        let mut line_start_ix = 0;
+        for line in &element_state.lines {
+            for (index, origin) in line.object_origins(line_origin, line_height, align, Some(bounds))
+            {
+                origins.push((line_start_ix + index, origin));
+            }
+            line_origin.y += line.size(line_height).height;
+            line_start_ix += line.len() + 1;
+        }
+        origins
+    }
+
+    /// The baseline of the run that the glyph at the byte `index` is in, as a y
+    /// coordinate in window coordinates, or `None` when no glyph is at or after `index`
+    /// on its line. It is the baseline of the row, moved by the vertical alignment of the
+    /// run.
+    pub fn baseline_for_index(&self, index: usize) -> Option<Pixels> {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+        let line_height = element_state.line_height;
+
+        let mut line_top = bounds.origin.y;
+        let mut line_start_ix = 0;
+        for line in &element_state.lines {
+            let line_end_ix = line_start_ix + line.len();
+            if index > line_end_ix {
+                line_top += line.size(line_height).height;
+                line_start_ix = line_end_ix + 1;
+                continue;
+            }
+            return line
+                .baseline_for_index(index.saturating_sub(line_start_ix), line_height)
+                .map(|baseline| line_top + baseline);
+        }
+
+        None
     }
 
     /// Get the byte index into the input of the pixel position.

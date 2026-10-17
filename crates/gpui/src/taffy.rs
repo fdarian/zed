@@ -63,6 +63,8 @@ pub struct TaffyLayoutEngine {
     /// How many extra layouts of a whole tree `compute_layout` ran for natural widths.
     #[cfg(test)]
     natural_passes: usize,
+    /// The `width` that nodes had before [`Self::set_forced_width`] replaced it.
+    unforced_widths: FxHashMap<LayoutId, taffy::style::Dimension>,
     /// Owns what the `calc()` lengths in the taffy styles point to, so it is cleared with them.
     calcs: CalcArena,
 }
@@ -88,6 +90,7 @@ impl TaffyLayoutEngine {
             natural_widths: FxHashMap::default(),
             #[cfg(test)]
             natural_passes: 0,
+            unforced_widths: FxHashMap::default(),
             calcs: CalcArena::default(),
         }
     }
@@ -105,6 +108,7 @@ impl TaffyLayoutEngine {
         self.intrinsic_nodes.clear();
         self.natural_pending.clear();
         self.natural_widths.clear();
+        self.unforced_widths.clear();
     }
 
     pub fn mark_detached(&mut self, id: LayoutId) {
@@ -197,6 +201,27 @@ impl TaffyLayoutEngine {
         if stretch_height {
             style.size.height =
                 taffy::style::Dimension::length(round_to_device_pixel(size.height.0, scale_factor));
+        }
+        self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
+    }
+
+    /// Makes the border box of the node `width` wide whatever its style says, or gives it back
+    /// the width of its style with `None`. For the root of a subtree that is laid out at a width
+    /// found by measuring it, such as an atomic inline.
+    pub fn set_forced_width(&mut self, id: LayoutId, width: Option<Pixels>, scale_factor: f32) {
+        let mut style = self.taffy.style(id.0).expect(EXPECT_MESSAGE).clone();
+        match width {
+            Some(width) => {
+                self.unforced_widths
+                    .entry(id)
+                    .or_insert(style.size.width);
+                style.size.width =
+                    taffy::style::Dimension::length(round_to_device_pixel(width.0, scale_factor));
+            }
+            None => match self.unforced_widths.remove(&id) {
+                Some(unforced) => style.size.width = unforced,
+                None => return,
+            },
         }
         self.taffy.set_style(id.0, style).expect(EXPECT_MESSAGE);
     }
