@@ -113,6 +113,8 @@ pub(crate) struct RetainedWindow {
     /// Counts the frames that were drawn. A recording indexes the vectors of the frame it was
     /// made in, which is the rendered frame only in the draw that follows.
     pub(crate) rendered_serial: u64,
+    /// The entities notified since the draw before, while a draw builds.
+    pub(crate) notified: FxHashSet<EntityId>,
     // Counts of what a recording cannot repeat, which move on whenever it happens.
     pub(crate) lifts: u32,
     pub(crate) publications: u32,
