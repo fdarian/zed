@@ -267,6 +267,9 @@ pub(crate) struct ReplayKey {
     image_cache: Option<EntityId>,
     a11y_active: bool,
     culling: bool,
+    /// A stacking context takes the positioned boxes of the subtree.
+    lifting: bool,
+    dom_hit_testing: bool,
 }
 
 impl Window {
@@ -566,6 +569,8 @@ impl Window {
             image_cache: self.image_cache_stack.last().map(AnyImageCache::entity_id),
             a11y_active: self.a11y.is_active(),
             culling: self.culling,
+            lifting: self.lifting(),
+            dom_hit_testing: self.dom_hit_testing,
         }
     }
 }
