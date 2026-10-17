@@ -43,6 +43,9 @@ const SHORT_LINE_DENOMINATOR: f32 = 3.;
 /// costs (`kOrphansPenalty`).
 const ORPHAN_PENALTY: f32 = 10_000.;
 
+/// Two ways to break that differ by less than this, in square pixels, cost the same.
+const TIE_TOLERANCE: f32 = 0.5;
+
 /// A line wider than its wrap width by no more than this still fits: glyph
 /// positions are floats.
 const FIT_TOLERANCE: f32 = 1. / 256.;
@@ -173,7 +176,9 @@ fn cheapest_breaks(
                     continue;
                 };
                 let total = before + line;
-                if cheapest[k][to].is_none_or(|(best, _)| total < best) {
+                // Ties go to the shortest last line, so the earlier lines stay as
+                // full as greedy makes them. Float error must not decide a tie.
+                if cheapest[k][to].is_none_or(|(best, _)| total < best - TIE_TOLERANCE) {
                     cheapest[k][to] = Some((total, from));
                 }
             }
