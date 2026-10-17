@@ -78,7 +78,7 @@ pub struct AtomicExtent {
 }
 
 /// What an [`InlineBox`] is.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum InlineContent {
     /// An inline box that holds text, such as a `<span>`. Its text is shaped with the
     /// runs of the text as usual. The font and size are those of the box itself: they
@@ -106,7 +106,7 @@ pub enum InlineContent {
 ///
 /// Inside a box that is aligned to `top` or `bottom` nothing can be aligned
 /// separately: what it holds stays with it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub struct InlineBox {
     /// The bytes of the text this box covers.
     pub range: Range<usize>,

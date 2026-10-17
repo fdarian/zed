@@ -15,6 +15,7 @@ use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
+    hash::{DefaultHasher, Hash as _, Hasher as _},
     mem,
     ops::{Deref, DerefMut, Range},
     rc::Rc,
@@ -278,6 +279,7 @@ impl Element for &'static str {
             SharedString::from(*self),
             None,
             Rc::new(no_insets),
+            Some(0),
             Rc::default(),
             None,
             TextBoxTrim::default(),
@@ -361,6 +363,7 @@ impl Element for SharedString {
             self.clone(),
             None,
             Rc::new(no_insets),
+            Some(0),
             Rc::default(),
             None,
             TextBoxTrim::default(),
@@ -415,6 +418,8 @@ pub struct StyledText {
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     delayed_font_family_overrides: Option<Vec<(Range<usize>, SharedString)>>,
     insets: InsetsForWidth,
+    /// A number that stands for what `insets` returns, or `None` for insets that depend on the width.
+    insets_key: Option<u64>,
     inline_boxes: Vec<InlineBox>,
     atomic_inlines: Vec<AtomicInline>,
     atomics: Option<Rc<RefCell<AtomicInlines>>>,
@@ -439,6 +444,7 @@ impl StyledText {
             delayed_highlights: None,
             delayed_font_family_overrides: None,
             insets: Rc::new(no_insets),
+            insets_key: Some(0),
             inline_boxes: Vec::new(),
             atomic_inlines: Vec::new(),
             atomics: None,
@@ -589,6 +595,9 @@ impl StyledText {
     /// Adds the advance of `insets` around ranges of the text, as the padding,
     /// border and margin of an inline box would. See [`TextInset`].
     pub fn with_insets(mut self, insets: Vec<TextInset>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        insets.hash(&mut hasher);
+        self.insets_key = Some(hasher.finish());
         self.insets = Rc::new(move |_| insets.clone());
         self
     }
@@ -620,6 +629,7 @@ impl StyledText {
         mut self,
         insets: impl Fn(Option<Pixels>) -> Vec<TextInset> + 'static,
     ) -> Self {
+        self.insets_key = None;
         self.insets = Rc::new(insets);
         self
     }
@@ -665,6 +675,7 @@ impl Element for StyledText {
             self.text.clone(),
             runs,
             insets,
+            mem::replace(&mut self.insets_key, Some(0)),
             Rc::new(mem::take(&mut self.inline_boxes)),
             self.atomics.clone(),
             self.text_box_trim,
@@ -767,9 +778,12 @@ pub struct TextLayout(
     Rc<Cell<Option<LayoutId>>>,
 );
 
+#[derive(Clone)]
 struct TextLayoutInner {
     len: usize,
-    lines: SmallVec<[WrappedLine; 1]>,
+    /// Shared with the layout of the text before it when a layout node keeps its measures from one
+    /// frame to the next.
+    lines: Rc<SmallVec<[WrappedLine; 1]>>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
     truncate_width: Option<Pixels>,
@@ -800,11 +814,15 @@ impl TextLayoutInner {
 }
 
 impl TextLayout {
+    /// `insets_key` stands for what `insets` returns at every width, or is `None` when it cannot be
+    /// said. Layout can keep the measures of a text from one frame to the next when it is `Some`
+    /// and the text has no atomic inlines.
     fn layout(
         &self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
         insets: InsetsForWidth,
+        insets_key: Option<u64>,
         inline_boxes: Rc<Vec<InlineBox>>,
         atomics: Option<Rc<RefCell<AtomicInlines>>>,
         trim: TextBoxTrim,
@@ -824,10 +842,34 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        let layout_id = window.request_measured_layout(Default::default(), {
+        let measure_key = insets_key.filter(|_| atomics.is_none()).map(|insets_key| {
+            let mut hasher = DefaultHasher::new();
+            text.hash(&mut hasher);
+            runs.hash(&mut hasher);
+            font_size.hash(&mut hasher);
+            line_height.hash(&mut hasher);
+            text_style.white_space.hash(&mut hasher);
+            text_style.text_overflow.hash(&mut hasher);
+            text_style.line_clamp.hash(&mut hasher);
+            text_style.layout_options().hash(&mut hasher);
+            trim.hash(&mut hasher);
+            text_style.text_box_edge.hash(&mut hasher);
+            if text_style.text_overflow.is_some() {
+                // Truncation measures with the font of the style and not with the runs.
+                text_style.font().hash(&mut hasher);
+            }
+            inline_boxes.hash(&mut hasher);
+            insets_key.hash(&mut hasher);
+            window.text_system().font_generation().hash(&mut hasher);
+            hasher.finish()
+        });
+        let measure = {
             let element_state = self.clone();
 
-            move |known_dimensions, available_space, window, cx| {
+            move |known_dimensions: Size<Option<Pixels>>,
+                  available_space: Size<crate::AvailableSpace>,
+                  window: &mut Window,
+                  cx: &mut App| {
                 let width = known_dimensions.width.or(match available_space.width {
                     crate::AvailableSpace::Definite(x) => Some(x),
                     _ => None,
@@ -1054,7 +1096,7 @@ impl TextLayout {
                 size.height -= trim_top + trim_bottom;
 
                 let inner = TextLayoutInner {
-                    lines,
+                    lines: Rc::new(lines),
                     len,
                     line_height,
                     wrap_width,
@@ -1074,9 +1116,33 @@ impl TextLayout {
                     first_baseline,
                 }
             }
-        });
+        };
+        let layout_id = match measure_key {
+            Some(measure_key) => {
+                let (layout_id, previous) =
+                    window.request_keyed_measured_layout(measure_key, Default::default(), self.clone(), measure);
+                if let Some(previous) = previous {
+                    self.take_over_measure_of(&previous);
+                }
+                layout_id
+            }
+            None => window.request_measured_layout(Default::default(), measure),
+        };
         self.1.set(Some(layout_id));
         layout_id
+    }
+
+    /// Holds what `previous` measured: the layout node did not measure the text again because
+    /// the same text was measured before.
+    fn take_over_measure_of(&self, previous: &TextLayout) {
+        if Rc::ptr_eq(&self.0, &previous.0) {
+            return;
+        }
+        let mut measured = previous.0.borrow().clone();
+        if let Some(measured) = &mut measured {
+            measured.bounds = None;
+        }
+        *self.0.borrow_mut() = measured;
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
@@ -1102,7 +1168,7 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = element_state.line_origin(bounds);
         let text_style = window.text_style();
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             line.paint_background(
                 line_origin,
                 line_height,
@@ -1151,7 +1217,7 @@ impl TextLayout {
         let mut origins = SmallVec::new();
         let mut line_origin = bounds.origin;
         let mut line_start_ix = 0;
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             for (index, origin) in line.object_origins(line_origin, line_height, align, Some(bounds))
             {
                 origins.push((line_start_ix + index, origin));
@@ -1201,7 +1267,7 @@ impl TextLayout {
 
         let mut line_top = bounds.origin.y;
         let mut line_start_ix = 0;
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if index > line_end_ix {
                 line_top += line.size(line_height).height;
@@ -1233,7 +1299,7 @@ impl TextLayout {
         let line_height = element_state.line_height;
         let mut line_origin = element_state.line_origin(bounds);
         let mut line_start_ix = 0;
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_bottom = line_origin.y + line.size(line_height).height;
             if position.y > line_bottom {
                 line_origin.y = line_bottom;
@@ -1264,7 +1330,7 @@ impl TextLayout {
         let mut line_origin = element_state.line_origin(bounds);
         let mut line_start_ix = 0;
 
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if index < line_start_ix {
                 break;
@@ -1305,7 +1371,7 @@ impl TextLayout {
         let line_height = element_state.line_height;
 
         let mut line_top = element_state.line_origin(bounds).y;
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_bottom = line_top + line.size(line_height).height;
             if y >= line_bottom {
                 line_top = line_bottom;
@@ -1342,7 +1408,7 @@ impl TextLayout {
 
         let mut line_top = element_state.line_origin(bounds).y;
         let mut line_start_ix = 0;
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if index < line_start_ix {
                 break;
@@ -1376,7 +1442,7 @@ impl TextLayout {
 
         let mut line_start_ix = 0;
         let mut extent: Option<(Pixels, Pixels)> = None;
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if range.end <= line_start_ix {
                 break;
@@ -1415,7 +1481,7 @@ impl TextLayout {
 
         let mut line_start_ix = 0;
         let mut runs = Vec::new();
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if range.end <= line_start_ix {
                 break;
@@ -1439,7 +1505,7 @@ impl TextLayout {
             .expect("measurement has not been performed");
         let mut line_start_ix = 0;
 
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if index < line_start_ix {
                 break;
@@ -1475,7 +1541,7 @@ impl TextLayout {
             .expect("measurement has not been performed");
         let mut line_start_ix = 0;
 
-        for line in &element_state.lines {
+        for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
             if index > line_end_ix {
                 line_start_ix = line_end_ix + 1;
@@ -1927,7 +1993,7 @@ mod tests {
                 let layout = TextLayout::default();
                 layout.0.replace(Some(TextLayoutInner {
                     len: 5,
-                    lines,
+                    lines: Rc::new(lines),
                     line_height: px(30.),
                     wrap_width: None,
                     truncate_width: None,
@@ -1997,7 +2063,7 @@ mod tests {
                 let layout = TextLayout::default();
                 layout.0.replace(Some(TextLayoutInner {
                     len: text.len(),
-                    lines,
+                    lines: Rc::new(lines),
                     line_height: px(30.),
                     wrap_width: Some(px(60.)),
                     truncate_width: None,
@@ -2290,6 +2356,279 @@ mod tests {
                 let measured = layout.line_layouts()[0].unwrapped_layout.width;
                 assert!(measured <= width, "{text} is {measured:?} wide");
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod keyed_measures {
+        use super::*;
+        use crate::{
+            AppContext as _, Context, InteractiveElement as _, LayoutCounters, ParentElement as _,
+            Render, Styled as _, TestAppContext, TextBoxEdge, TextBoxOver, TextBoxUnder,
+            WindowHandle, div, font, px,
+        };
+
+        const PARAGRAPHS: [&str; 4] = [
+            "the quick brown fox jumps over the lazy dog and keeps running",
+            "pack my box with five dozen liquor jugs before the sun goes down",
+            "short",
+            "how vexingly quick daft zebras jump over a fence of tall reeds",
+        ];
+
+        struct Paragraphs {
+            width: Pixels,
+            font_size: Pixels,
+            family: SharedString,
+            texts: Vec<SharedString>,
+            layouts: Rc<RefCell<Vec<TextLayout>>>,
+        }
+
+        impl Render for Paragraphs {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut layouts = self.layouts.borrow_mut();
+                layouts.clear();
+                let mut column = div()
+                    .id("column")
+                    .w(self.width)
+                    .font_family(self.family.clone())
+                    .text_size(self.font_size);
+                for (index, text) in self.texts.iter().enumerate() {
+                    let text = StyledText::new(text.clone());
+                    layouts.push(text.layout().clone());
+                    column = column.child(div().id(index).child(text));
+                }
+                column
+            }
+        }
+
+        struct Scene {
+            window: WindowHandle<Paragraphs>,
+            layouts: Rc<RefCell<Vec<TextLayout>>>,
+        }
+
+        fn scene(cx: &mut TestAppContext, width: Pixels, font_size: Pixels, repeat: usize) -> Scene {
+            let layouts = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let layouts = layouts.clone();
+                move |_, _| Paragraphs {
+                    width,
+                    font_size,
+                    family: font("Menlo").family,
+                    texts: (0..repeat)
+                        .flat_map(|_| PARAGRAPHS.map(SharedString::from))
+                        .collect(),
+                    layouts,
+                }
+            });
+            Scene { window, layouts }
+        }
+
+        impl Scene {
+            fn draw(&self, cx: &mut TestAppContext) -> LayoutCounters {
+                cx.update_window(self.window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.layout_counters()
+                })
+                .unwrap()
+            }
+
+            fn edit(&self, cx: &mut TestAppContext, edit: impl FnOnce(&mut Paragraphs)) {
+                self.window
+                    .update(cx, |paragraphs, _, cx| {
+                        edit(paragraphs);
+                        cx.notify();
+                    })
+                    .unwrap();
+            }
+
+            /// What each text looks like on screen: its lines and its box.
+            fn shapes(&self) -> Vec<(String, Bounds<Pixels>)> {
+                self.layouts
+                    .borrow()
+                    .iter()
+                    .map(|layout| (layout.wrapped_text(), layout.bounds()))
+                    .collect()
+            }
+        }
+
+        /// What a window that draws the state `edit` makes for the first time shows.
+        fn fresh_shapes(
+            cx: &mut TestAppContext,
+            edit: impl FnOnce(&mut Paragraphs),
+        ) -> Vec<(String, Bounds<Pixels>)> {
+            let fresh = scene(cx, px(240.), px(14.), 1);
+            fresh.edit(cx, edit);
+            fresh.draw(cx);
+            fresh.shapes()
+        }
+
+        fn since(before: LayoutCounters, after: LayoutCounters) -> LayoutCounters {
+            LayoutCounters {
+                nodes_created: after.nodes_created - before.nodes_created,
+                nodes_reused: after.nodes_reused - before.nodes_reused,
+                nodes_removed: after.nodes_removed - before.nodes_removed,
+                styles_set: after.styles_set - before.styles_set,
+                children_set: after.children_set - before.children_set,
+                passes: after.passes - before.passes,
+                measures: after.measures - before.measures,
+            }
+        }
+
+        #[crate::test]
+        fn an_idle_redraw_of_a_text_heavy_tree_makes_no_node_sets_no_child_list_and_measures_nothing(
+            cx: &mut TestAppContext,
+        ) {
+            let scene = scene(cx, px(240.), px(14.), 20);
+            let first = scene.draw(cx);
+            assert!(first.measures >= 80, "{first:?}");
+            let shapes = scene.shapes();
+            assert_eq!(shapes.len(), 80);
+            assert!(shapes.iter().any(|(wrapped, _)| wrapped.contains('\n')));
+            // The second frame is the first to find the nodes of a frame before.
+            scene.draw(cx);
+
+            let before = scene.draw(cx);
+            let after = scene.draw(cx);
+            let idle = since(before, after);
+            assert_eq!(idle.nodes_created, 0, "{idle:?}");
+            assert_eq!(idle.children_set, 0, "{idle:?}");
+            assert_eq!(idle.styles_set, 0, "{idle:?}");
+            assert_eq!(idle.measures, 0, "{idle:?}");
+            assert!(idle.nodes_reused >= 80, "{idle:?}");
+            // The new elements show what the nodes were measured as.
+            assert_eq!(scene.shapes(), shapes);
+        }
+
+        #[crate::test]
+        fn an_edited_text_is_measured_and_the_texts_around_it_are_not(cx: &mut TestAppContext) {
+            let scene = scene(cx, px(240.), px(14.), 5);
+            scene.draw(cx);
+            let before = scene.draw(cx);
+
+            scene.edit(cx, |paragraphs| {
+                paragraphs.texts[7] =
+                    "an edit that is long enough to wrap onto a second line or two".into();
+            });
+            let after = scene.draw(cx);
+            let edit = since(before, after);
+            assert_eq!(edit.nodes_created, 0, "{edit:?}");
+            assert_eq!(edit.children_set, 0, "{edit:?}");
+            assert!(edit.measures > 0 && edit.measures < 5, "{edit:?}");
+            let idle = since(after, scene.draw(cx));
+            assert_eq!(idle.measures, 0, "{idle:?}");
+
+            let expected = fresh_shapes(cx, |_| {});
+            let shapes = scene.shapes();
+            assert_eq!(shapes.len(), 20);
+            // Everything but the edited text looks as it does in a window that never edited it.
+            for index in (0..20).filter(|index| *index != 7) {
+                assert_eq!(shapes[index].0, expected[index % 4].0, "text {index}");
+            }
+            assert!(shapes[7].0.starts_with("an edit"), "{}", shapes[7].0);
+        }
+
+        #[crate::test]
+        fn a_new_width_font_size_or_font_lays_the_texts_out_like_a_window_that_never_had_the_old_one(
+            cx: &mut TestAppContext,
+        ) {
+            let scene = scene(cx, px(240.), px(14.), 1);
+            scene.draw(cx);
+            scene.draw(cx);
+            let changes: [(&str, fn(&mut Paragraphs)); 7] = [
+                ("narrower", |paragraphs| paragraphs.width = px(120.)),
+                ("larger text", |paragraphs| paragraphs.font_size = px(20.)),
+                ("wider", |paragraphs| paragraphs.width = px(400.)),
+                ("another family", |paragraphs| paragraphs.family = font("Monaco").family),
+                ("the first width again", |paragraphs| paragraphs.width = px(240.)),
+                ("the first size again", |paragraphs| paragraphs.font_size = px(14.)),
+                ("the first family again", |paragraphs| paragraphs.family = font("Menlo").family),
+            ];
+            let mut applied: Vec<fn(&mut Paragraphs)> = Vec::new();
+            for (name, change) in changes {
+                applied.push(change);
+                scene.edit(cx, change);
+                // The frame of the change, and one that finds the nodes it left.
+                scene.draw(cx);
+                let drawn = scene.shapes();
+                scene.draw(cx);
+                assert_eq!(scene.shapes(), drawn, "{name}: a redraw changed the texts");
+
+                let expected = fresh_shapes(cx, |paragraphs| {
+                    for change in &applied {
+                        change(paragraphs);
+                    }
+                });
+                assert_eq!(drawn, expected, "{name}");
+            }
+        }
+
+        struct Trimmable {
+            trim: TextBoxTrim,
+            edge: TextBoxEdge,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for Trimmable {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let text = StyledText::new("Hello").with_text_box_trim(self.trim);
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let mut container = div()
+                    .id("container")
+                    .w(px(200.))
+                    .font_family(font("Menlo").family)
+                    .text_size(px(16.))
+                    .line_height(px(24.));
+                container.text_style().text_box_edge = Some(self.edge);
+                container.child(text)
+            }
+        }
+
+        #[crate::test]
+        fn a_new_text_box_trim_or_edge_measures_the_text_again(cx: &mut TestAppContext) {
+            let layout = Rc::new(RefCell::new(None));
+            let trim = |start, end| TextBoxTrim { start, end };
+            let edge = |over| TextBoxEdge { over, under: TextBoxUnder::Alphabetic };
+            let window = cx.add_window({
+                let layout = layout.clone();
+                move |_, _| Trimmable {
+                    trim: trim(false, false),
+                    edge: edge(TextBoxOver::Cap),
+                    layout,
+                }
+            });
+            let draw = |cx: &mut TestAppContext| {
+                cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+                let height = layout.borrow().as_ref().unwrap().bounds().size.height;
+                height
+            };
+            let set = |cx: &mut TestAppContext, new_trim, new_edge| {
+                window
+                    .update(cx, |view, _, cx| {
+                        view.trim = new_trim;
+                        view.edge = new_edge;
+                        cx.notify();
+                    })
+                    .unwrap();
+            };
+
+            draw(cx);
+            let untrimmed = draw(cx);
+            assert_eq!(untrimmed, px(24.));
+
+            set(cx, trim(true, true), edge(TextBoxOver::Cap));
+            draw(cx);
+            let cap_trimmed = draw(cx);
+            assert!(cap_trimmed < untrimmed, "{cap_trimmed:?}");
+
+            set(cx, trim(true, true), edge(TextBoxOver::Ex));
+            draw(cx);
+            let ex_trimmed = draw(cx);
+            assert!(ex_trimmed < cap_trimmed, "{ex_trimmed:?} {cap_trimmed:?}");
+
+            set(cx, trim(false, false), edge(TextBoxOver::Ex));
+            draw(cx);
+            assert_eq!(draw(cx), untrimmed);
         }
     }
 

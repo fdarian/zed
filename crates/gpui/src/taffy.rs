@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use collections::{FxHashMap, FxHashSet};
-use std::{fmt::Debug, ops::Range};
+use std::{any::Any, fmt::Debug, ops::Range};
 
 mod calc;
 mod containing_block;
@@ -55,6 +55,61 @@ type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 
 struct NodeContext {
     measure: NodeMeasureFn,
+    /// Set for the nodes of keyed measured requests.
+    keyed: Option<Box<KeyedMeasure>>,
+}
+
+/// What the key of a keyed measured request says the measure function reads. A request that finds
+/// the node of a frame before with an equal one has the measure results that node kept.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct MeasureFingerprint {
+    key: u64,
+    /// What the measure function may read from the window besides what its element hashed.
+    rem_size: u32,
+    scale_factor: u32,
+}
+
+/// What taffy asked a measure function, in device pixels.
+#[derive(Copy, Clone, PartialEq, Debug)]
+struct MeasureCall {
+    known: TaffySize<Option<f32>>,
+    available: TaffySize<TaffyAvailableSpace>,
+}
+
+/// The call that placed a leaf in the layout it has now.
+#[derive(Copy, Clone, Debug)]
+struct Placement {
+    call: MeasureCall,
+    /// The run of `compute_layout` the placement was made in.
+    run: u64,
+    /// The dirty generation of the node at the end of that run. The placement is the one the
+    /// node's cache would answer with while the node has not been dirtied since.
+    generation: Option<u64>,
+}
+
+impl KeyedMeasure {
+    fn new<S: 'static>(fingerprint: MeasureFingerprint, state: S) -> Self {
+        KeyedMeasure {
+            fingerprint,
+            state: Box::new(state),
+            last_call: None,
+            placement: None,
+            probed_in_run: 0,
+        }
+    }
+}
+
+/// What a keyed measured node keeps from one frame to the next.
+struct KeyedMeasure {
+    fingerprint: MeasureFingerprint,
+    /// The state handle of the element that asked last (an `S` of [`TaffyLayoutEngine::request_keyed_measured_layout`]).
+    state: Box<dyn Any>,
+    /// The last call to the measure function. A measure function that keeps what it measured
+    /// holds the answer to this one.
+    last_call: Option<MeasureCall>,
+    placement: Option<Placement>,
+    /// The run of `compute_layout` that last called the measure function.
+    probed_in_run: u64,
 }
 /// Which node of a frame a request is, for the engine to give it the node it kept from the frame
 /// before: the requests under one scope (the hash of the [`crate::GlobalElementId`] of the element
@@ -85,6 +140,8 @@ pub struct LayoutCounters {
     pub children_set: u64,
     /// Passes over the tree that ended, with a frame or without.
     pub passes: u64,
+    /// Calls to the measure functions of leaves.
+    pub measures: u64,
 }
 
 /// What the engine knows about a node besides what taffy does. It lives as long as the node.
@@ -102,6 +159,8 @@ struct NodeMeta {
     requested: Option<Box<taffy::style::Style>>,
     /// The node asks for its natural width ([`Style::measure_natural_width`]).
     natural: bool,
+    /// The node is a leaf that layout measures.
+    measured: bool,
     /// The pass that last gave the node a width to fill the window with, if any.
     stretched_in_pass: u64,
     /// The node is [`crate::Position::Static`]. It lays out as taffy `Relative` but is not a
@@ -188,6 +247,10 @@ pub struct TaffyLayoutEngine {
     alive_after_collection: usize,
     scratch_stack: Vec<LayoutId>,
     counters: LayoutCounters,
+    /// How many times `compute_layout` ran.
+    run: u64,
+    /// The keyed measured leaves the run under way called the measure function of.
+    probed: Vec<LayoutId>,
 }
 
 /// Where the boxes of a subtree reach.
@@ -236,11 +299,23 @@ impl TaffyLayoutEngine {
             alive_after_collection: 0,
             scratch_stack: Vec::new(),
             counters: LayoutCounters::default(),
+            run: 0,
+            probed: Vec::new(),
         }
     }
 
     pub fn counters(&self) -> LayoutCounters {
         self.counters
+    }
+
+    /// Whether layout has placed the keyed measured leaf, with its measure function or from its
+    /// cache.
+    #[cfg(test)]
+    fn is_placed(&self, id: LayoutId) -> bool {
+        self.taffy
+            .get_node_context(id.0)
+            .and_then(|context| context.keyed.as_deref())
+            .is_some_and(|keyed| keyed.placement.is_some())
     }
 
     fn meta(&self, id: LayoutId) -> &NodeMeta {
@@ -407,27 +482,32 @@ impl TaffyLayoutEngine {
         children: &[LayoutId],
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
+        let key = self.next_key(scope);
+
+        let Some(id) = self.keys.get(&key).copied() else {
+            return self.new_node(Some(key), &style, taffy_style, rem_size, scale_factor, children);
+        };
+        self.counters.nodes_reused += 1;
+        let meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
+        self.register(id, &meta);
+        let was_measured = self.reuse_node(id, meta, taffy_style);
+        if was_measured {
+            // The measure function of a leaf that this node used to be would answer for it.
+            self.taffy.set_node_context(id.0, None).expect(EXPECT_MESSAGE);
+        }
+        self.set_children_if_changed(id, children);
+        id
+    }
+
+    /// The key of the next keyed request under `scope`.
+    fn next_key(&mut self, scope: u64) -> NodeKey {
         let ordinal = self.ordinals.entry(scope).or_default();
         let key = NodeKey {
             scope,
             ordinal: *ordinal,
         };
         *ordinal += 1;
-
-        let Some(id) = self.keys.get(&key).copied() else {
-            return self.new_node(Some(key), &style, taffy_style, rem_size, scale_factor, children);
-        };
-        debug_assert_ne!(
-            self.meta(id).requested_in_pass,
-            self.pass,
-            "a key is given to one request of a pass"
-        );
-        self.counters.nodes_reused += 1;
-        let meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
-        self.register(id, &meta);
-        self.reuse_node(id, meta, taffy_style);
-        self.set_children_if_changed(id, children);
-        id
+        key
     }
 
     fn new_node(
@@ -464,8 +544,11 @@ impl TaffyLayoutEngine {
 
     /// Makes the node the one that a request with `meta` and `taffy_style` describes, changing
     /// what differs and nothing else.
-    fn reuse_node(&mut self, id: LayoutId, mut meta: NodeMeta, taffy_style: taffy::style::Style) {
+    ///
+    /// Says whether the node was a measured leaf before the request, and `meta` says it is not.
+    fn reuse_node(&mut self, id: LayoutId, mut meta: NodeMeta, taffy_style: taffy::style::Style) -> bool {
         let old = self.meta.get_mut(&id).expect("a key leads to a node of the engine");
+        let was_measured = old.measured && !meta.measured;
         let differs = old
             .requested
             .as_deref()
@@ -492,6 +575,7 @@ impl TaffyLayoutEngine {
         if let Some(escapable_requested) = escapable_requested {
             self.meta_mut(id).requested.get_or_insert(escapable_requested);
         }
+        was_measured
     }
 
     fn set_children_if_changed(&mut self, id: LayoutId, children: &[LayoutId]) {
@@ -509,6 +593,8 @@ impl TaffyLayoutEngine {
             .expect(EXPECT_MESSAGE);
     }
 
+    /// A request of a leaf that layout measures with `measure`, which no frame keeps: the node is
+    /// new every time.
     pub fn request_measured_layout(
         &mut self,
         style: Style,
@@ -523,17 +609,122 @@ impl TaffyLayoutEngine {
         + 'static,
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
-        let meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
+        let context = NodeContext {
+            measure: Self::box_measure(measure),
+            keyed: None,
+        };
+        self.new_measured_node(None, &style, taffy_style, rem_size, scale_factor, context)
+    }
+
+    /// [`Self::request_keyed_layout`] for a leaf that layout measures with `measure`.
+    ///
+    /// `measure_key` says what `measure` reads: two requests that give it equal, with equal styles,
+    /// have equal answers to every call, so the node of the frame before keeps the measures that
+    /// layout cached for it. The request then has `measure` and `state` take the place of the ones
+    /// the node has, and gets back the `state` of the request before it: whatever `measure` leaves
+    /// in the state it holds, the previous state still holds for the node, and it is the new
+    /// state's to take over because `measure` will not run when the node does not change.
+    ///
+    /// A request with another key has the node measure again, and gets no state back.
+    pub fn request_keyed_measured_layout<S: 'static>(
+        &mut self,
+        scope: u64,
+        measure_key: u64,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        state: S,
+        measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut Window,
+            &mut App,
+        ) -> MeasuredLeaf
+        + 'static,
+    ) -> (LayoutId, Option<S>) {
+        let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
+        let key = self.next_key(scope);
+        let fingerprint = MeasureFingerprint {
+            key: measure_key,
+            rem_size: rem_size.0.to_bits(),
+            scale_factor: scale_factor.to_bits(),
+        };
+        let measure = Self::box_measure(measure);
+
+        let Some(id) = self.keys.get(&key).copied() else {
+            let context = NodeContext {
+                measure,
+                keyed: Some(Box::new(KeyedMeasure::new(fingerprint, state))),
+            };
+            let id = self.new_measured_node(Some(key), &style, taffy_style, rem_size, scale_factor, context);
+            return (id, None);
+        };
+        self.counters.nodes_reused += 1;
+        let mut meta = self.node_meta(&style, &taffy_style, rem_size, scale_factor);
+        meta.measured = true;
+        self.register(id, &meta);
+        self.reuse_node(id, meta, taffy_style);
+        self.set_children_if_changed(id, &[]);
+
+        let kept = self
+            .taffy
+            .get_node_context_mut(id.0)
+            .and_then(|context| {
+                let keyed = context.keyed.as_deref_mut()?;
+                if keyed.fingerprint != fingerprint {
+                    return None;
+                }
+                let kept = keyed.state.downcast_mut::<S>()?;
+                Some((&mut context.measure, kept))
+            });
+        match kept {
+            Some((kept_measure, kept_state)) => {
+                *kept_measure = measure;
+                (id, Some(std::mem::replace(kept_state, state)))
+            }
+            None => {
+                let context = NodeContext {
+                    measure,
+                    keyed: Some(Box::new(KeyedMeasure::new(fingerprint, state))),
+                };
+                // Setting a context marks the node and the ones above it dirty.
+                self.taffy.set_node_context(id.0, Some(context)).expect(EXPECT_MESSAGE);
+                (id, None)
+            }
+        }
+    }
+
+    fn box_measure(
+        measure: impl FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> MeasuredLeaf
+        + 'static,
+    ) -> NodeMeasureFn {
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
+        measure
+    }
 
+    fn new_measured_node(
+        &mut self,
+        key: Option<NodeKey>,
+        style: &Style,
+        taffy_style: taffy::style::Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        context: NodeContext,
+    ) -> LayoutId {
+        let mut meta = self.node_meta(style, &taffy_style, rem_size, scale_factor);
+        meta.key = key;
+        meta.measured = true;
         self.counters.nodes_created += 1;
         let id: LayoutId = self
             .taffy
-            .new_leaf_with_context(taffy_style, NodeContext { measure })
+            .new_leaf_with_context(taffy_style, context)
             .expect(EXPECT_MESSAGE)
             .into();
+        if let Some(key) = key {
+            self.keys.insert(key, id);
+        }
         self.register(id, &meta);
         self.meta.insert(id, meta);
         id
@@ -827,47 +1018,87 @@ impl TaffyLayoutEngine {
         if let Some(width) = containing_width {
             parent_size.width = width;
         }
+        self.run += 1;
+        let run = self.run;
+        let probed = &mut self.probed;
+        let measures = &mut self.counters.measures;
         self.taffy
             .compute_layout_with_leaf_measure_in(
                 id.into(),
                 available_space,
                 parent_size,
-                |known_dimensions, available_space, _id, node_context, _style| {
+                |known_dimensions, available_space, node, node_context, _style, run_mode| {
                     let Some(node_context) = node_context else {
                         return taffy::MeasuredLeaf {
                             size: taffy::geometry::Size::default(),
                             first_baseline: None,
                         };
                     };
-
-                    let known_dimensions = Size {
-                        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
+                    *measures += 1;
+                    let call = MeasureCall {
+                        known: known_dimensions,
+                        available: available_space,
                     };
-
-                    let available_space: Size<AvailableSpace> = available_space.into();
-                    let untransform = |ev: AvailableSpace| match ev {
-                        AvailableSpace::Definite(pixels) => {
-                            AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
+                    if let Some(keyed) = node_context.keyed.as_deref_mut() {
+                        if std::mem::replace(&mut keyed.probed_in_run, run) != run {
+                            probed.push(LayoutId(node));
                         }
-                        AvailableSpace::MinContent => AvailableSpace::MinContent,
-                        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-                    };
-                    let available_space = size(
-                        untransform(available_space.width),
-                        untransform(available_space.height),
-                    );
-
-                    let measured = (node_context.measure)(known_dimensions, available_space, window, cx);
-                    taffy::MeasuredLeaf {
-                        size: snap_measured_size_to_device_pixels(measured.size, scale_factor).into(),
-                        first_baseline: measured
-                            .first_baseline
-                            .map(|baseline| baseline.0.max(0.0) * scale_factor),
+                        keyed.last_call = Some(call);
+                        if run_mode == taffy::tree::RunMode::PerformLayout {
+                            keyed.placement = Some(Placement {
+                                call,
+                                run,
+                                generation: None,
+                            });
+                        }
                     }
+                    measure_leaf(node_context, call, scale_factor, window, cx)
                 },
             )
             .expect(EXPECT_MESSAGE);
+        self.restore_placed_measures(run, scale_factor, window, cx);
+    }
+
+    /// Makes what the keyed measured leaves that this run called the measure function of hold the
+    /// answer to the call that placed them. A leaf can be asked about sizes it does not end up
+    /// with, and then be placed from its cache with no call: what the measure function kept
+    /// would be that of the last question and not that of the layout.
+    fn restore_placed_measures(
+        &mut self,
+        run: u64,
+        scale_factor: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let mut probed = std::mem::take(&mut self.probed);
+        for id in probed.drain(..) {
+            let generation = self.taffy.dirty_generation(id.0).expect(EXPECT_MESSAGE);
+            let context = self
+                .taffy
+                .get_node_context_mut(id.0)
+                .expect("a node that was measured has its context");
+            let keyed = context
+                .keyed
+                .as_deref_mut()
+                .expect("only keyed measured nodes are listed");
+            if let Some(placement) = &mut keyed.placement {
+                if placement.run == run {
+                    placement.generation = Some(generation);
+                } else if placement.generation != Some(generation) {
+                    // The node changed since: its cache does not hold the placement anymore.
+                    keyed.placement = None;
+                }
+            }
+            let Some(placement) = keyed.placement else {
+                continue;
+            };
+            if keyed.last_call != Some(placement.call) {
+                keyed.last_call = Some(placement.call);
+                self.counters.measures += 1;
+                measure_leaf(context, placement.call, scale_factor, window, cx);
+            }
+        }
+        self.probed = probed;
     }
 
     // Pixel snapping
@@ -1298,6 +1529,46 @@ impl From<NodeId> for LayoutId {
 impl From<LayoutId> for NodeId {
     fn from(layout_id: LayoutId) -> NodeId {
         layout_id.0
+    }
+}
+
+/// The key of a keyed measured request for a measure function that reads the values of `key`.
+pub(crate) fn hash_measure_key(key: impl std::hash::Hash) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    key.hash(&mut hasher);
+    std::hash::Hasher::finish(&hasher)
+}
+
+/// Asks the measure function of a leaf what taffy asked, with the sizes in logical pixels.
+fn measure_leaf(
+    node_context: &mut NodeContext,
+    call: MeasureCall,
+    scale_factor: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> taffy::MeasuredLeaf {
+    let known_dimensions = Size {
+        width: call.known.width.map(|e| Pixels(e / scale_factor)),
+        height: call.known.height.map(|e| Pixels(e / scale_factor)),
+    };
+
+    let available_space: Size<AvailableSpace> = call.available.into();
+    let untransform = |ev: AvailableSpace| match ev {
+        AvailableSpace::Definite(pixels) => AvailableSpace::Definite(Pixels(pixels.0 / scale_factor)),
+        AvailableSpace::MinContent => AvailableSpace::MinContent,
+        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
+    };
+    let available_space = size(
+        untransform(available_space.width),
+        untransform(available_space.height),
+    );
+
+    let measured = (node_context.measure)(known_dimensions, available_space, window, cx);
+    taffy::MeasuredLeaf {
+        size: snap_measured_size_to_device_pixels(measured.size, scale_factor).into(),
+        first_baseline: measured
+            .first_baseline
+            .map(|baseline| baseline.0.max(0.0) * scale_factor),
     }
 }
 

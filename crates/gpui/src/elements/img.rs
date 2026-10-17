@@ -1,3 +1,4 @@
+use crate::taffy::hash_measure_key;
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, Element, ElementId,
     Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
@@ -429,17 +430,24 @@ impl Element for Img {
 
                     match intrinsic {
                         Some((image_size, ratio)) => {
-                            window.request_measured_layout(style, move |known, _, _, _| {
-                                match (known.width, known.height) {
-                                    (Some(width), Some(height)) => size(width, height),
-                                    (Some(width), None) => size(width, width / ratio),
-                                    (None, Some(height)) => size(height * ratio, height),
-                                    // Height 0: taffy raises it to `width / aspect_ratio` after
-                                    // `max_width` and `min_width` clamped the width, so a clamped
-                                    // image keeps its proportions.
-                                    (None, None) => size(image_size.width, px(0.)),
-                                }
-                            })
+                            let measure_key = hash_measure_key((
+                                image_size.width.0.to_bits(),
+                                image_size.height.0.to_bits(),
+                                ratio.to_bits(),
+                            ));
+                            window
+                                .request_keyed_measured_layout(measure_key, style, (), move |known, _, _, _| {
+                                    match (known.width, known.height) {
+                                        (Some(width), Some(height)) => size(width, height),
+                                        (Some(width), None) => size(width, width / ratio),
+                                        (None, Some(height)) => size(height * ratio, height),
+                                        // Height 0: taffy raises it to `width / aspect_ratio` after
+                                        // `max_width` and `min_width` clamped the width, so a clamped
+                                        // image keeps its proportions.
+                                        (None, None) => size(image_size.width, px(0.)),
+                                    }
+                                })
+                                .0
                         }
                         None => window.request_layout(style, replacement_id, cx),
                     }

@@ -6682,6 +6682,46 @@ impl Window {
             })
     }
 
+    /// [`Self::request_measured_layout`] for a node that the next frame's request with the same
+    /// place can find again, as [`Self::request_layout`] does for a node with children, so that the
+    /// layout results of the node survive from one frame to the next while nothing changes.
+    ///
+    /// `measure_key` must be equal between two requests whenever `measure` would give the same
+    /// answer to every call with the same arguments: hash everything it reads that is not the
+    /// window's scale factor and rem size, which the layout engine adds. When the previous
+    /// frame's request had an equal key the node is not measured again for the sizes it was
+    /// measured for, so `measure` does not run, and what it would have left in `state` is not
+    /// there. In that case this returns the state of the previous request, which holds it, for
+    /// the caller to take over.
+    ///
+    /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
+    pub fn request_keyed_measured_layout<F, R, S>(
+        &mut self,
+        measure_key: u64,
+        style: Style,
+        state: S,
+        measure: F,
+    ) -> (LayoutId, Option<S>)
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> R + 'static,
+        R: Into<MeasuredLeaf>,
+        S: 'static,
+    {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine.as_mut().unwrap().request_keyed_measured_layout(
+            self.layout_scope,
+            measure_key,
+            style,
+            rem_size,
+            scale_factor,
+            state,
+            move |known, available, window, cx| measure(known, available, window, cx).into(),
+        )
+    }
+
     /// Compute the layout for the given id within the given available space.
     /// This method is called for its side effect, typically by the framework prior to painting.
     /// After calling it, you can request the bounds of the given layout node id or any descendant.
