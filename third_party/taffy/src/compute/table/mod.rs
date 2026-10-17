@@ -44,6 +44,19 @@ mod widths;
 use columns::{clamp_percentages, distribute, grid_widths};
 use structure::Structure;
 
+/// Where the grid of a table is, once it is laid out. A line is the edge between two columns (or rows), and the edge of
+/// the first and the last
+#[cfg(feature = "detailed_layout_info")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailedTableInfo {
+    /// The x of the left edge of every column and then of the right edge of the last one, relative to the left of the
+    /// border box of the table. One more than there are columns
+    pub column_lines: Vec<f32>,
+    /// The y of the top edge of every row and then of the bottom edge of the last one, relative to the top of the
+    /// border box of the table, captions above the rows included. One more than there are rows
+    pub row_lines: Vec<f32>,
+}
+
 /// A size style of a cell or a column that is not `auto`
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum Specified {
@@ -287,6 +300,7 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
 
     // 8. Layout
     let content_size = table.layout_parts(&Sizes {
+        node,
         captions: &captions,
         caption_sizes: &caption_sizes,
         column_widths: &column_widths,
@@ -304,6 +318,8 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
 
 /// What the layout of the parts of a table needs to know of the sizes of the table
 struct Sizes<'a> {
+    /// The table
+    node: NodeId,
     /// The captions and their sides
     captions: &'a [(NodeId, CaptionSide)],
     /// The sizes of the captions

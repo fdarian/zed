@@ -31,6 +31,8 @@ use crate::{compute::compute_grid_layout, LayoutGridContainer};
 #[cfg(feature = "table_layout")]
 use crate::{compute::compute_table_layout, LayoutTableContainer};
 
+#[cfg(all(feature = "detailed_layout_info", feature = "table_layout"))]
+use crate::compute::table::DetailedTableInfo;
 #[cfg(all(feature = "detailed_layout_info", feature = "grid"))]
 use crate::compute::grid::DetailedGridInfo;
 #[cfg(feature = "detailed_layout_info")]
@@ -631,6 +633,12 @@ where
     #[inline(always)]
     fn get_table_item_style(&self, node_id: NodeId) -> Self::TableItemStyle<'_> {
         &self.taffy.nodes[node_id.into()].style
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "detailed_layout_info")]
+    fn set_detailed_table_info(&mut self, node_id: NodeId, detailed_table_info: DetailedTableInfo) {
+        self.taffy.nodes[node_id.into()].detailed_layout_info = DetailedLayoutInfo::Table(Box::new(detailed_table_info));
     }
 }
 

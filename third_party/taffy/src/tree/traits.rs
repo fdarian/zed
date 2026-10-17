@@ -143,6 +143,8 @@ use crate::{TableContainerStyle, TableItemStyle};
 
 #[cfg(all(feature = "grid", feature = "detailed_layout_info"))]
 use crate::compute::grid::DetailedGridInfo;
+#[cfg(all(feature = "table_layout", feature = "detailed_layout_info"))]
+use crate::compute::table::DetailedTableInfo;
 
 /// Taffy's abstraction for downward tree traversal.
 ///
@@ -333,6 +335,14 @@ pub trait LayoutTableContainer: LayoutPartialTree {
 
     /// Get the styles of a node below the table: a child, a child of a row group or row, or a child of a column group
     fn get_table_item_style(&self, node_id: NodeId) -> Self::TableItemStyle<'_>;
+
+    /// Set the node's detailed table information: where the grid lines are
+    ///
+    /// Implementing this method is optional.
+    #[cfg(feature = "detailed_layout_info")]
+    fn set_detailed_table_info(&mut self, _node_id: NodeId, _detailed_table_info: DetailedTableInfo) {
+        debug_log!("LayoutTableContainer::set_detailed_table_info called");
+    }
 }
 
 // --- PRIVATE TRAITS

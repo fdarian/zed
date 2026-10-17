@@ -86,6 +86,25 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
         }
         let grid_height = if rows.is_empty() { 0.0 } else { y - spacing.height - grid_top };
 
+        #[cfg(feature = "detailed_layout_info")]
+        {
+            let lines = |starts: &[f32], sizes: &mut dyn Iterator<Item = f32>, origin: f32| -> Vec<f32> {
+                let mut lines = starts.to_vec();
+                lines.push(match (starts.last(), sizes.last()) {
+                    (Some(last), Some(size)) => last + size,
+                    _ => origin,
+                });
+                lines
+            };
+            self.tree.set_detailed_table_info(
+                sizes.node,
+                super::DetailedTableInfo {
+                    column_lines: lines(&column_x, &mut column_widths.iter().copied(), grid_left),
+                    row_lines: lines(&row_y, &mut rows.iter().map(|row| row.height), grid_top),
+                },
+            );
+        }
+
         // Column nodes take no space, they only know where their columns are. One whose columns were merged into
         // another column has no width.
         let column_extent = |first_col: usize, span: usize| -> (f32, f32) {

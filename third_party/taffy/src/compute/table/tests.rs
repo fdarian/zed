@@ -3346,3 +3346,94 @@ mod chrome {
         );
     }
 }
+
+/// Collapsed borders: the layout only sees the half widths of the borders, as the border widths of the table and of its
+/// cells, with no spacing. `detailed_layout_info` has the lines the borders are centred on.
+#[cfg(feature = "detailed_layout_info")]
+mod collapsed {
+    use super::*;
+    use crate::compute::table::DetailedTableInfo;
+
+    fn lines_of(spec: Spec, width: f32) -> DetailedTableInfo {
+        let mut tree: TaffyTree<(Vec<f32>, f32)> = TaffyTree::new();
+        tree.disable_rounding();
+        let mut order = Vec::new();
+        let table = build(&mut tree, spec, &mut order);
+        let root = tree
+            .new_with_children(Style { size: Size { width: length(width), height: auto() }, ..block() }, &[table])
+            .unwrap();
+        tree.compute_layout(root, Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent }).unwrap();
+        match tree.detailed_layout_info(table) {
+            crate::DetailedLayoutInfo::Table(info) => (**info).clone(),
+            other => panic!("not a table: {other:?}"),
+        }
+    }
+
+    /// Two rows of two cells with a 4px table border, a 5px border on b and different borders on the others. The halves
+    /// are what the conflict of each edge leaves (the wider of the two borders, halved).
+    ///
+    /// ```html
+    /// <table id="t" style="border-collapse:collapse;border:4px solid black">
+    ///   <tr><td id="a" style="border:3px solid red"><div style="width:30px;height:10px"></div></td>
+    ///       <td id="b" style="border:5px solid blue"><div style="width:30px;height:10px"></div></td></tr>
+    ///   <tr><td id="c" style="border:1px solid green"><div style="width:30px;height:10px"></div></td>
+    ///       <td id="d" style="border:2px solid orange"><div style="width:30px;height:10px"></div></td></tr>
+    /// </table>
+    /// ```
+    fn grid() -> Spec {
+        let cell = |halves: [f32; 4]| td(move |s| s.border = sides(halves[0], halves[1], halves[2], halves[3]), vec![boxed(30.0, 10.0)]);
+        table(
+            |s| {
+                s.border_collapse = true;
+                s.border = sides(2.5, 2.5, 2.0, 2.0);
+            },
+            vec![
+                tr(|_| {}, vec![cell([2.0, 2.5, 1.5, 2.0]), cell([2.5, 2.5, 2.5, 2.5])]),
+                tr(|_| {}, vec![cell([1.5, 1.0, 2.0, 2.0]), cell([2.5, 2.0, 2.0, 1.0])]),
+            ],
+        )
+    }
+
+    #[test]
+    fn half_widths_lay_out_as_chrome_does() {
+        assert_rects(
+            rects(vec![grid()], 300.0),
+            &[
+                [0.0, 0.0, 74.0, 34.0],    // t
+                [2.0, 2.5, 69.5, 15.0],    // r1
+                [2.0, 2.5, 34.5, 15.0],    // a
+                [4.0, 5.0, 30.0, 10.0],    // box
+                [36.5, 2.5, 35.0, 15.0],   // b
+                [39.0, 5.0, 30.0, 10.0],   // box
+                [2.0, 17.5, 69.5, 14.5],   // r2
+                [2.0, 17.5, 34.5, 14.5],   // c
+                [4.0, 20.0, 30.0, 10.0],   // box
+                [36.5, 17.5, 35.0, 14.5],  // d
+                [37.5, 20.0, 30.0, 10.0],  // box
+            ],
+        );
+    }
+
+    #[test]
+    fn the_lines_are_where_the_cells_meet() {
+        let info = lines_of(grid(), 300.0);
+        assert_eq!(info.column_lines, vec![2.0, 36.5, 71.5]);
+        assert_eq!(info.row_lines, vec![2.5, 17.5, 32.0]);
+    }
+
+    #[test]
+    fn the_lines_of_a_table_with_a_caption_start_below_it() {
+        let info = lines_of(
+            table(
+                |_| {},
+                vec![
+                    caption(CaptionSide::Top, vec![boxed(10.0, 7.0)]),
+                    tr(|_| {}, vec![td(|_| {}, vec![boxed(20.0, 10.0)]), td(|_| {}, vec![boxed(5.0, 12.0)])]),
+                ],
+            ),
+            300.0,
+        );
+        assert_eq!(info.column_lines, vec![0.0, 20.0, 25.0]);
+        assert_eq!(info.row_lines, vec![7.0, 19.0]);
+    }
+}
