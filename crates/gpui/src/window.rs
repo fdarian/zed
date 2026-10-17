@@ -1137,6 +1137,8 @@ pub(crate) struct DeferredDraw {
     paint_range: Range<PaintIndex>,
 }
 
+type LayoutPublication = Box<dyn FnOnce(&mut Window, &mut App)>;
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -1156,6 +1158,9 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
+    /// What a layout-only pass publishes once the whole tree is prepainted. See
+    /// [`Window::publish_layout`].
+    layout_publications: Vec<LayoutPublication>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1172,6 +1177,7 @@ pub(crate) struct PrepaintStateIndex {
     deferred_draws_index: usize,
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
+    layout_publications_index: usize,
     line_layout_index: LineLayoutIndex,
     /// The innermost enclosing hitbox when the snapshot was taken.
     hitbox_parent: Option<HitboxId>,
@@ -1256,6 +1262,7 @@ impl Frame {
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
+            layout_publications: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -1279,6 +1286,7 @@ impl Frame {
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
+        self.layout_publications.clear();
         self.hitboxes.clear();
         self.hitboxes_changed();
         self.window_control_hitboxes.clear();
@@ -1561,17 +1569,20 @@ pub struct Window {
     keyboard_modality_mouse_origin: Point<Pixels>,
     pub(crate) refreshing: bool,
     /// Counts the input events being dispatched, which is more than one only when a handler
-    /// causes another. While it is not zero, [`Window::draw_if_dirty`] measures instead of
-    /// drawing: see [`Window::measure`].
+    /// causes another. While it is not zero, [`Window::paint_if_dirty`] runs a layout pass instead
+    /// of drawing: see [`Window::layout_pass`].
     dispatch_depth: Rc<Cell<usize>>,
     /// Counts the events dispatched, so that a listener registered by many elements can tell one
     /// event from the next.
     dispatch_serial: u64,
-    /// The invalidator's update count after the last measure pass, so that a window nothing
-    /// invalidated since is not measured again. Reset by every draw.
-    measured_at: Option<usize>,
-    /// A measure pass is running, so a view must not read or write the frame caches.
+    /// The invalidator's update count after the last layout pass, and whether it painted, so
+    /// that a window nothing invalidated since is not laid out again. Reset by every draw.
+    measured_at: Option<(usize, bool)>,
+    /// A layout pass is running, so a view must not read or write the frame caches.
     pub(crate) measuring: bool,
+    /// The pass running is one that does not paint: see [`Window::draw_if_dirty`].
+    layout_only: bool,
+    layout_passes: u64,
     /// How many times one draw may build the frame before it presents. See
     /// [`Window::set_max_draw_passes`].
     pub(crate) max_draw_passes: usize,
@@ -2285,6 +2296,8 @@ impl Window {
             dispatch_serial: 0,
             measured_at: None,
             measuring: false,
+            layout_only: false,
+            layout_passes: 0,
             max_draw_passes: 1,
             draw_pass: 0,
             redraw_before_present: false,
@@ -3795,8 +3808,33 @@ impl Window {
         self.capslock
     }
 
-    /// Draws now if the window has pending changes, so a caller that needs
-    /// current layout (a bounds query) does not read the previous frame.
+    /// Lays out the pending changes now, so a caller that needs current layout (a bounds or
+    /// scroll query) does not read the previous frame. Like a browser forcing layout, this
+    /// never paints.
+    ///
+    /// Renders the views, computes layout and prepaints, which is where scroll positions are
+    /// clamped, sticky offsets resolved and the sizes elements report produced. What element
+    /// listeners publish from their painted bounds (`on_painted`,
+    /// `on_painted_layout`) is published from prepaint during this pass,
+    /// see [`Window::publish_layout`]. The frame is thrown away and the window stays dirty, so
+    /// the next frame draws and presents once, however many reads came before it.
+    ///
+    /// Returns true if a pass ran, and false without running one when the window is clean (the
+    /// last draw is current), when nothing was invalidated since the previous pass, or when a
+    /// draw is already running on this thread.
+    ///
+    /// The pass does not swap frames, so it is safe while an input event is being dispatched:
+    /// the dispatch is reading the rendered frame, and a swap would pull it out from under
+    /// the handlers. See [`Window::layout_pass`].
+    pub fn draw_if_dirty(&mut self, cx: &mut App) -> bool {
+        if !self.invalidator.is_dirty() || draw_in_progress() {
+            return false;
+        }
+        self.layout_pass(cx, false)
+    }
+
+    /// Draws now if the window has pending changes, for a caller that needs what a frame
+    /// paints (the painted text of a test) and not only where things are.
     ///
     /// Does not present: `needs_present` is set and the platform's next frame
     /// request presents what this drew, without drawing again. Returns false
@@ -3804,17 +3842,15 @@ impl Window {
     /// on this thread.
     ///
     /// While an input event is being dispatched this lays out and paints the
-    /// current tree without swapping frames (see [`Window::measure`]): the
-    /// dispatch is reading the rendered frame, and a swap would pull it out
-    /// from under the handlers. Bounds and scroll metrics are still current
-    /// afterwards, and the window stays dirty for the next real draw. Returns
-    /// false there too when nothing was invalidated since the last measure.
-    pub fn draw_if_dirty(&mut self, cx: &mut App) -> bool {
+    /// current tree without swapping frames (see [`Window::layout_pass`]), and the window stays
+    /// dirty for the next real draw. Returns false there too when nothing was invalidated
+    /// since the last such pass.
+    pub fn paint_if_dirty(&mut self, cx: &mut App) -> bool {
         if !self.invalidator.is_dirty() || draw_in_progress() {
             return false;
         }
         if self.dispatch_depth.get() > 0 {
-            return self.measure(cx);
+            return self.layout_pass(cx, true);
         }
         self.draw(cx).clear(cx);
         // The frame request that was waiting on the dirty flag may already have
@@ -3823,12 +3859,37 @@ impl Window {
         true
     }
 
-    /// Lays out, prepaints and paints the current tree into `next_frame` and throws the frame
-    /// away, so that what layout and paint publish outside the frame (painted bounds, scroll
-    /// handle metrics, element states) is current while `rendered_frame` stays exactly as the
-    /// input being dispatched found it: its dispatch tree, listeners, hitboxes, cursor styles
-    /// and input handlers, and the hit test, pointer capture and tooltip that were taken from
-    /// it.
+    /// How many layout-only passes this window has run, see [`Window::draw_if_dirty`].
+    pub fn layout_pass_count(&self) -> u64 {
+        self.layout_passes
+    }
+
+    /// Whether the pass being built is a layout-only one, whose frame is thrown away without
+    /// painting. An element that publishes something from paint publishes it from
+    /// prepaint in such a pass: see [`Window::publish_layout`].
+    pub fn is_layout_pass(&self) -> bool {
+        self.layout_only
+    }
+
+    /// In a layout-only pass, runs `publish` once the whole tree is prepainted: layout is final
+    /// and every text and element has its bounds, which an element's own prepaint may not yet
+    /// have for what comes after it. Does nothing in a pass that paints, where paint publishes.
+    ///
+    /// What a listener queued here sees is what paint would have shown it, minus the content
+    /// mask, which is gone by then. A `List` that prepaints a row range and rolls it back
+    /// takes what the rolled-back rows queued with it.
+    pub fn publish_layout(&mut self, publish: impl FnOnce(&mut Window, &mut App) + 'static) {
+        if self.layout_only {
+            self.next_frame.layout_publications.push(Box::new(publish));
+        }
+    }
+
+    /// Lays out and prepaints the current tree into `next_frame`, and paints it when `paint`
+    /// is set, then throws the frame away, so that what layout publishes outside the frame
+    /// (painted bounds, scroll handle metrics, element states) is current while
+    /// `rendered_frame` stays exactly as the input being dispatched found it: its dispatch
+    /// tree, listeners, hitboxes, cursor styles and input handlers, and the hit test, pointer
+    /// capture and tooltip that were taken from it.
     ///
     /// What the pass leaves undone is what only a presented frame needs, and the next draw
     /// does it: the window stays dirty, and views stay marked dirty and are not recorded as
@@ -3836,12 +3897,15 @@ impl Window {
     /// their last prepaint and paint, which would move listeners out of `rendered_frame`, and
     /// the element states a view cache keeps point into the frame they were made for. Neither
     /// the focus path nor the input handler is touched, and no accessibility tree is built.
-    fn measure(&mut self, cx: &mut App) -> bool {
+    fn layout_pass(&mut self, cx: &mut App, paint: bool) -> bool {
         if cx.mode.skip_drawing() {
             return false;
         }
         let invalidations = self.invalidator.update_count();
-        if self.measured_at == Some(invalidations) {
+        if self
+            .measured_at
+            .is_some_and(|(count, painted)| count == invalidations && (painted || !paint))
+        {
             return false;
         }
 
@@ -3856,10 +3920,12 @@ impl Window {
         let tooltip_bounds = self.tooltip_bounds.take();
         let a11y_was_active = self.a11y.suspend();
         self.measuring = true;
+        self.layout_only = !paint;
 
         self.build_next_frame(cx);
 
         self.measuring = false;
+        self.layout_only = false;
         self.redraw_unsettled = false;
         self.a11y.resume(a11y_was_active);
         self.tooltip_bounds = tooltip_bounds;
@@ -3875,7 +3941,10 @@ impl Window {
         }
         self.next_frame.clear();
         self.invalidator.set_phase(DrawPhase::None);
-        self.measured_at = Some(self.invalidator.update_count());
+        self.measured_at = Some((self.invalidator.update_count(), paint));
+        if !paint {
+            self.layout_passes += 1;
+        }
 
         arena_scope.exit(&cx.element_arena).clear(cx);
         true
@@ -4019,12 +4088,12 @@ impl Window {
         arena_scope.exit(&cx.element_arena)
     }
 
-    /// Fills `next_frame` from the root view: [`Window::draw`] and [`Window::measure`] differ in
+    /// Fills `next_frame` from the root view: [`Window::draw`] and [`Window::layout_pass`] differ in
     /// what they do with it afterwards.
     ///
     /// Builds again, up to [`Window::set_max_draw_passes`] times, while a pass asks for it with
     /// [`Window::request_redraw_before_present`]. A pass that is built again is discarded the way
-    /// a measure pass is, so `next_frame` holds only the last one.
+    /// a layout pass is, so `next_frame` holds only the last one.
     fn build_next_frame(&mut self, cx: &mut App) {
         self.draw_pass = 0;
         loop {
@@ -4058,7 +4127,7 @@ impl Window {
             self.captured_identity = None;
         }
         #[cfg(feature = "profiler")]
-        {
+        if !self.layout_only {
             let viewport_size = self.viewport_size;
             let scale_factor = self.scale_factor();
             self.debug_frame_overlay
@@ -4268,6 +4337,13 @@ impl Window {
         // assumed. Nothing has been painted, so nothing needs to be unpainted.
         if self.pass_is_abandoned() {
             return self.abandon_roots();
+        }
+
+        if self.layout_only {
+            for publish in mem::take(&mut self.next_frame.layout_publications) {
+                publish(self, cx);
+            }
+            return true;
         }
 
         self.mouse_hit_test = if self.pointer_outside {
@@ -4554,6 +4630,7 @@ impl Window {
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
+            layout_publications_index: self.next_frame.layout_publications.len(),
             line_layout_index: self.text_system.layout_index(),
             hitbox_parent: self.hitbox_parent_stack.last().copied(),
         }
@@ -5244,6 +5321,9 @@ impl Window {
             self.next_frame
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
+            self.next_frame
+                .layout_publications
+                .truncate(index.layout_publications_index);
             self.text_system.truncate_layouts(index.line_layout_index);
         }
         result
@@ -10294,6 +10374,7 @@ mod tests {
     }
 
     struct HoverProbe {
+        prepaints: Rc<Cell<usize>>,
         paints: Rc<Cell<usize>>,
         on_capture: Rc<dyn Fn(&mut Window, &mut App)>,
         bubbled_hovered: Rc<RefCell<Vec<bool>>>,
@@ -10301,12 +10382,16 @@ mod tests {
 
     impl Render for HoverProbe {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let prepaints = self.prepaints.clone();
             let paints = self.paints.clone();
             let on_capture = self.on_capture.clone();
             let bubbled_hovered = self.bubbled_hovered.clone();
             div().size_full().child(
                 canvas(
-                    |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    move |bounds, window, _| {
+                        prepaints.set(prepaints.get() + 1);
+                        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+                    },
                     move |_, hitbox, window, _| {
                         paints.set(paints.get() + 1);
                         let on_capture = on_capture.clone();
@@ -10325,16 +10410,24 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct Probed {
+        prepaints: Rc<Cell<usize>>,
+        paints: Rc<Cell<usize>>,
+    }
+
     fn hover_probe<'a>(
         cx: &'a mut TestAppContext,
-        paints: &Rc<Cell<usize>>,
+        probed: &Probed,
         on_capture: impl Fn(&mut Window, &mut App) + 'static,
     ) -> (Rc<RefCell<Vec<bool>>>, &'a mut crate::VisualTestContext) {
         let bubbled_hovered = Rc::new(RefCell::new(Vec::new()));
         let (_view, cx) = cx.add_window_view({
-            let paints = paints.clone();
+            let prepaints = probed.prepaints.clone();
+            let paints = probed.paints.clone();
             let bubbled_hovered = bubbled_hovered.clone();
             move |_, _| HoverProbe {
+                prepaints,
                 paints,
                 on_capture: Rc::new(on_capture),
                 bubbled_hovered,
@@ -10346,33 +10439,39 @@ mod tests {
     /// A capture-phase listener that draws mid-dispatch must leave the bubble phase what the
     /// frame the event started on gave it: the hover it hit, and the listeners themselves,
     /// which dispatch holds out of the frame and writes back when it is done.
-    #[gpui::test]
-    fn test_mouse_dispatch_survives_a_draw_requested_by_a_capture_listener(
+    fn capture_listener_draws_mid_dispatch(
         cx: &mut TestAppContext,
+        draw: impl Fn(&mut Window, &mut App) + 'static,
+        painted_by_the_draw: bool,
     ) {
         let draws = Rc::new(Cell::new(true));
-        let paints = Rc::new(Cell::new(0));
-        let (bubbled_hovered, cx) = hover_probe(cx, &paints, {
+        let probed = Probed::default();
+        let (bubbled_hovered, cx) = hover_probe(cx, &probed, {
             let draws = draws.clone();
             move |window, cx| {
                 if draws.get() {
                     window.refresh();
-                    window.draw_if_dirty(cx);
+                    draw(window, cx);
                 }
             }
         });
         let position = point(px(10.), px(10.));
         cx.simulate_mouse_move(position, None, crate::Modifiers::default());
         let listeners_before = cx.update(|window, _| window.rendered_frame.mouse_listeners.len());
-        let paints_before = paints.get();
+        let prepaints_before = probed.prepaints.get();
+        let paints_before = probed.paints.get();
 
         cx.simulate_mouse_down(position, MouseButton::Left, crate::Modifiers::default());
 
         assert_eq!(*bubbled_hovered.borrow(), vec![true]);
         assert!(
-            paints.get() > paints_before,
-            "the capture listener's draw painted"
+            probed.prepaints.get() > prepaints_before,
+            "the capture listener's draw laid out"
         );
+        // The test app draws the window dirtied by the press when the press's update ends, which
+        // paints once. A draw that painted mid-dispatch paints one more time.
+        let painted_mid_dispatch = probed.paints.get() - paints_before > 1;
+        assert_eq!(painted_mid_dispatch, painted_by_the_draw);
         cx.update(|window, _| {
             assert_eq!(
                 window.rendered_frame.mouse_listeners.len(),
@@ -10394,46 +10493,143 @@ mod tests {
         assert_eq!(*bubbled_hovered.borrow(), vec![true, true]);
     }
 
-    /// Reads that follow one another with nothing invalidated in between share one measure, and
-    /// the window stays due for a real draw that swaps the frames.
     #[gpui::test]
-    fn test_draws_requested_during_dispatch_measure_once_per_invalidation(cx: &mut TestAppContext) {
-        let paints = Rc::new(Cell::new(0));
+    fn test_mouse_dispatch_survives_a_layout_requested_by_a_capture_listener(
+        cx: &mut TestAppContext,
+    ) {
+        capture_listener_draws_mid_dispatch(
+            cx,
+            |window, cx| {
+                window.draw_if_dirty(cx);
+            },
+            false,
+        );
+    }
+
+    #[gpui::test]
+    fn test_mouse_dispatch_survives_a_draw_requested_by_a_capture_listener(
+        cx: &mut TestAppContext,
+    ) {
+        capture_listener_draws_mid_dispatch(
+            cx,
+            |window, cx| {
+                window.paint_if_dirty(cx);
+            },
+            true,
+        );
+    }
+
+    /// Reads that follow one another with nothing invalidated in between share one layout pass,
+    /// which paints nothing, and the window stays due for a real draw that swaps the frames.
+    #[gpui::test]
+    fn test_reads_during_dispatch_lay_out_once_per_invalidation(cx: &mut TestAppContext) {
+        let probed = Probed::default();
         let observed = Rc::new(RefCell::new(None));
-        let (_, cx) = hover_probe(cx, &paints, {
-            let paints = paints.clone();
+        let (_, cx) = hover_probe(cx, &probed, {
+            let prepaints = probed.prepaints.clone();
+            let paints = probed.paints.clone();
             let observed = observed.clone();
             move |window, cx| {
-                let before = paints.get();
+                let before = prepaints.get();
+                let paints_before = paints.get();
                 window.refresh();
                 let reads = [(); 3].map(|_| window.draw_if_dirty(cx));
-                let paints_after_reads = paints.get() - before;
+                let prepaints_after_reads = prepaints.get() - before;
                 window.refresh();
                 let read_after_invalidation = window.draw_if_dirty(cx);
                 *observed.borrow_mut() = Some((
                     reads,
-                    paints_after_reads,
+                    prepaints_after_reads,
                     read_after_invalidation,
-                    paints.get() - before,
+                    prepaints.get() - before,
+                    paints.get() - paints_before,
                     window.invalidator.is_dirty(),
                 ));
             }
         });
         let position = point(px(10.), px(10.));
         cx.simulate_mouse_move(position, None, crate::Modifiers::default());
-        let paints_before_press = paints.get();
+        let paints_before_press = probed.paints.get();
 
         cx.simulate_mouse_down(position, MouseButton::Left, crate::Modifiers::default());
 
         assert_eq!(
             *observed.borrow(),
-            Some(([true, false, false], 1, true, 2, true)),
-            "one measure per invalidation, and the window is still dirty"
+            Some(([true, false, false], 1, true, 2, 0, true)),
+            "one layout pass per invalidation, none of them painted, and the window is still dirty"
         );
-        // The test app draws a dirty window when the press's update ends: the measures left
-        // it dirty, and that draw is the real one.
-        assert_eq!(paints.get() - paints_before_press, 3);
+        // The test app draws a dirty window when the press's update ends: the passes left
+        // it dirty, and that draw is the real one, and the only one to paint.
+        assert_eq!(probed.paints.get() - paints_before_press, 1);
         assert!(!cx.update(|window, _| window.invalidator.is_dirty()));
+        assert_eq!(cx.update(|window, _| window.layout_pass_count()), 2);
+    }
+
+    /// A read on a clean window has nothing to lay out.
+    #[gpui::test]
+    fn test_a_read_on_a_clean_window_does_not_lay_out(cx: &mut TestAppContext) {
+        let probed = Probed::default();
+        let (_, cx) = hover_probe(cx, &probed, |_, _| {});
+        let prepaints = probed.prepaints.get();
+
+        let ran = cx.update(|window, cx| window.draw_if_dirty(cx));
+
+        assert!(!ran);
+        assert_eq!(probed.prepaints.get(), prepaints);
+        assert_eq!(cx.update(|window, _| window.layout_pass_count()), 0);
+    }
+
+    /// A read after a change sees the changed layout without a paint, outside dispatch too.
+    #[gpui::test]
+    fn test_a_read_after_a_change_sees_the_new_layout_without_painting(cx: &mut TestAppContext) {
+        struct Resized {
+            height: Pixels,
+            seen: Rc<Cell<Bounds<Pixels>>>,
+            paints: Rc<Cell<usize>>,
+        }
+        impl Render for Resized {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let seen = self.seen.clone();
+                let paints = self.paints.clone();
+                div().size_full().child(
+                    div()
+                        .w(px(100.))
+                        .h(self.height)
+                        .on_painted(move |bounds, window, _| {
+                            if !window.is_layout_pass() {
+                                paints.set(paints.get() + 1);
+                            }
+                            seen.set(bounds);
+                        }),
+                )
+            }
+        }
+        let seen = Rc::new(Cell::new(Bounds::default()));
+        let paints = Rc::new(Cell::new(0));
+        let (view, cx) = cx.add_window_view({
+            let seen = seen.clone();
+            let paints = paints.clone();
+            move |_, _| Resized {
+                height: px(20.),
+                seen,
+                paints,
+            }
+        });
+        assert_eq!(seen.get().size.height, px(20.));
+        let paints_before = paints.get();
+
+        // `update` on the view only marks the window dirty: the test app draws when the
+        // effects flush, so suspend that by reading inside the same update.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.height = px(70.);
+                cx.notify();
+            });
+            assert!(window.draw_if_dirty(cx));
+            assert_eq!(seen.get().size.height, px(70.));
+            assert_eq!(paints.get(), paints_before, "the read did not paint");
+            assert!(window.invalidator.is_dirty());
+        });
     }
 
     struct TestHitbox {

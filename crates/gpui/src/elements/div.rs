@@ -784,11 +784,16 @@ pub trait InteractiveElement: Sized {
     /// A listener that ran in prepaint would keep the bounds of a row that is not
     /// on screen. It fires for a hidden element too, which paints nothing but keeps its box;
     /// [`Window::visibility`] tells the listener which it is.
+    ///
+    /// A pass that lays out without painting ([`Window::draw_if_dirty`]) has no paint to
+    /// report from. There the listener runs after the whole tree is prepainted, through
+    /// [`Window::publish_layout`], which a rolled-back prepaint takes its listeners out of
+    /// again; [`Window::is_layout_pass`] tells the listener which it is.
     fn on_painted(
         mut self,
         listener: impl Fn(Bounds<Pixels>, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.interactivity().paint_bounds_listener = Some(Box::new(listener));
+        self.interactivity().paint_bounds_listener = Some(Rc::new(listener));
         self
     }
 
@@ -801,7 +806,7 @@ pub trait InteractiveElement: Sized {
         mut self,
         listener: impl Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.interactivity().paint_layout_listener = Some(Box::new(listener));
+        self.interactivity().paint_layout_listener = Some(Rc::new(listener));
         self
     }
 
@@ -2564,9 +2569,9 @@ pub struct Interactivity {
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) tooltip_show_delay: Option<Duration>,
     pub(crate) window_control: Option<WindowRegion>,
-    pub(crate) paint_bounds_listener: Option<Box<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>>,
+    pub(crate) paint_bounds_listener: Option<Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>>,
     pub(crate) paint_layout_listener:
-        Option<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
+        Option<Rc<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
     pub(crate) prepaint_layout_listeners:
         Vec<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
     pub(crate) layout_id: Option<LayoutId>,
@@ -2780,6 +2785,9 @@ impl Interactivity {
                 }
 
                 let visibility = style.visibility.unwrap_or(window.visibility());
+                if window.is_layout_pass() {
+                    self.publish_layout(bounds, visibility, window);
+                }
                 // A hidden element is never the target of the pointer. It stays in the chain of
                 // a visible descendant, as an ancestor with `pointer-events: none` does.
                 let hitbox_behavior = match visibility {
@@ -2819,6 +2827,28 @@ impl Interactivity {
                 })
             },
         )
+    }
+
+    /// What paint reports to the listeners, for a pass that does not paint.
+    fn publish_layout(&self, bounds: Bounds<Pixels>, visibility: Visibility, window: &mut Window) {
+        let bounds_listener = self.paint_bounds_listener.clone();
+        let layout_listener = self
+            .paint_layout_listener
+            .clone()
+            .zip(self.layout_id);
+        if bounds_listener.is_none() && layout_listener.is_none() {
+            return;
+        }
+        window.publish_layout(move |window, cx| {
+            window.with_visibility(visibility, |window| {
+                if let Some(listener) = &bounds_listener {
+                    listener(bounds, window, cx);
+                }
+                if let Some((listener, layout_id)) = &layout_listener {
+                    listener(bounds, *layout_id, window, cx);
+                }
+            });
+        });
     }
 
     fn should_insert_hitbox(&self, style: &Style, window: &Window, cx: &App) -> bool {
