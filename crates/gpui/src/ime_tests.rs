@@ -132,7 +132,7 @@ fn focused_composer(
     cx.update(|window, cx| {
         let focus = composer.read(cx).focus.clone();
         window.focus(&focus, cx);
-        window.draw_if_dirty(cx);
+        window.paint_if_dirty(cx);
     });
     (composer, cx)
 }

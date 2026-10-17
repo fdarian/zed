@@ -648,6 +648,9 @@ pub(crate) enum GpuiMode {
     #[cfg(any(test, feature = "test-support"))]
     Test {
         skip_drawing: bool,
+        /// Whether `flush_effects` draws a dirty window, as a display link would not.
+        /// See [`App::set_draws_inline`].
+        draws_inline: bool,
     },
     Production,
 }
@@ -657,6 +660,7 @@ impl GpuiMode {
     pub fn test() -> Self {
         GpuiMode::Test {
             skip_drawing: false,
+            draws_inline: true,
         }
     }
 
@@ -669,7 +673,7 @@ impl GpuiMode {
     pub(crate) fn skip_drawing(&self) -> bool {
         match self {
             #[cfg(any(test, feature = "test-support"))]
-            GpuiMode::Test { skip_drawing } => *skip_drawing,
+            GpuiMode::Test { skip_drawing, .. } => *skip_drawing,
             GpuiMode::Production => false,
         }
     }
@@ -1653,6 +1657,18 @@ impl App {
         self.quit_mode = mode;
     }
 
+    /// Whether a test app draws a dirty window whenever its effects flush, which is every
+    /// update and every simulated input. On by default, so a test sees the result of what it
+    /// just did; a real window is drawn by the display link, once per frame however much
+    /// happened in it. A test that counts draws turns it off and draws the frame itself with
+    /// [`Window::paint_if_dirty`]. Does nothing outside a test app.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_draws_inline(&mut self, enabled: bool) {
+        if let GpuiMode::Test { draws_inline, .. } = &mut self.mode {
+            *draws_inline = enabled;
+        }
+    }
+
     /// Returns the SVG renderer used by the application.
     pub fn svg_renderer(&self) -> SvgRenderer {
         self.svg_renderer.clone()
@@ -1720,7 +1736,7 @@ impl App {
                 // the platform's frame callback; drawing inline as well would
                 // cost a full draw on every input event and every update.
                 #[cfg(any(test, feature = "test-support", feature = "bench"))]
-                if self.mode.is_test() {
+                if matches!(self.mode, GpuiMode::Test { draws_inline: true, .. }) {
                     for window in self
                         .windows
                         .values()
