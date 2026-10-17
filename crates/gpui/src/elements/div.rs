@@ -804,6 +804,23 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Observe this element's own layout node and bounds every time it is prepainted, which is
+    /// as soon as layout has produced them and before anything is painted. The listener may
+    /// call [`Window::request_redraw_before_present`] when the size it sees invalidates what the
+    /// tree was built from (a container query).
+    ///
+    /// Unlike `on_painted_layout` this runs in prepaint, so it can ask for the pass to be
+    /// abandoned before paint, and it also runs for a prepaint that `List` later rolls back.
+    /// Use it for answers that are true of the layout itself (a size), not for anything that
+    /// must describe what reached the screen.
+    fn on_prepainted_layout(
+        mut self,
+        listener: impl Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().prepaint_layout_listener = Some(Box::new(listener));
+        self
+    }
+
     /// Track the focus state of the given focus handle on this element.
     /// If the focus handle is focused by the application, this element will
     /// apply its focused styles.
@@ -2537,6 +2554,8 @@ pub struct Interactivity {
     pub(crate) paint_bounds_listener: Option<Box<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>>,
     pub(crate) paint_layout_listener:
         Option<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
+    pub(crate) prepaint_layout_listener:
+        Option<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
     pub(crate) layout_id: Option<LayoutId>,
     /// Whether a box inside escaped the clip of this element at the last prepaint, which keeps
     /// the clip from being painted exactly (see [`Window::with_exact_content_mask`]).
@@ -2669,6 +2688,12 @@ impl Interactivity {
         f: impl FnOnce(&Style, Point<Pixels>, Option<Hitbox>, &mut Window, &mut App) -> R,
     ) -> R {
         self.content_size = content_size;
+
+        if let Some(listener) = self.prepaint_layout_listener.take()
+            && let Some(layout_id) = self.layout_id
+        {
+            listener(bounds, layout_id, window, cx);
+        }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         window.with_inspector_state(
@@ -5397,6 +5422,93 @@ mod tests {
         assert_eq!(insets.border.left, px(3.));
         assert_eq!(insets.border.bottom, px(2.));
         assert_eq!(insets.border.top, px(0.));
+    }
+
+    struct RedrawView {
+        renders: Rc<Cell<usize>>,
+        painted: Rc<Cell<usize>>,
+        /// Passes that ask for another one.
+        asking: Rc<Cell<usize>>,
+    }
+
+    impl Render for RedrawView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let asking = self.asking.clone();
+            let painted = self.painted.clone();
+            div().w(px(100.)).h(px(100.)).child(
+                div()
+                    .w(px(10.))
+                    .h(px(10.))
+                    .on_prepainted_layout(move |bounds, _, window, _| {
+                        assert_eq!(bounds.size, size(px(10.), px(10.)));
+                        if window.draw_pass() <= asking.get() {
+                            window.request_redraw_before_present();
+                            // The test app draws a dirty window again at once; the pass that asks
+                            // last lets the next draw settle.
+                            if window.draw_pass() == asking.get() {
+                                asking.set(0);
+                            }
+                        }
+                    })
+                    .on_painted(move |_, _, _| painted.set(painted.get() + 1)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_draw_builds_again_before_it_paints_while_a_pass_asks(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let painted = Rc::new(Cell::new(0));
+        let asking = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let (renders, painted, asking) = (renders.clone(), painted.clone(), asking.clone());
+            move |_, _| RedrawView { renders, painted, asking }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        cx.update_window(any_window, |_, window, _| window.set_max_draw_passes(4))
+            .unwrap();
+        asking.set(2);
+        renders.set(0);
+        painted.set(0);
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap()
+        };
+
+        // Passes 1 and 2 ask; pass 3 settles and is the only one painted.
+        draw(cx);
+        assert_eq!((renders.get(), painted.get()), (3, 1));
+
+        // Nothing asks: one build, one paint.
+        asking.set(0);
+        draw(cx);
+        assert_eq!((renders.get(), painted.get()), (4, 2));
+
+        // Every pass up to the limit asks: the fourth is painted and presented anyway, and the
+        // window draws again (here at once, in the test app) from the sizes it produced.
+        asking.set(4);
+        draw(cx);
+        assert_eq!((renders.get(), painted.get()), (4 + 4 + 1, 2 + 1 + 1));
+    }
+
+    #[gpui::test]
+    fn one_pass_is_the_default_and_a_request_waits_for_the_next_frame(cx: &mut TestAppContext) {
+        let renders = Rc::new(Cell::new(0));
+        let painted = Rc::new(Cell::new(0));
+        let asking = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let (renders, painted, asking) = (renders.clone(), painted.clone(), asking.clone());
+            move |_, _| RedrawView { renders, painted, asking }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        asking.set(1);
+        renders.set(0);
+        painted.set(0);
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        // The request is not honoured before present: it painted, and the window drew again.
+        assert_eq!((renders.get(), painted.get()), (2, 2));
     }
 
     struct HoverProbeView {

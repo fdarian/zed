@@ -325,7 +325,9 @@ impl<V: View> Element for ViewElement<V> {
         if let Some(entity_id) = self.entity_id {
             // Stateful path: create a reactive boundary.
             window.with_rendered_view(entity_id, |window| {
-                let caching_disabled = window.measuring || window.is_inspector_picking(cx);
+                let caching_disabled = window.measuring
+                    || window.max_draw_passes > 1
+                    || window.is_inspector_picking(cx);
                 match self.cached_style.as_ref() {
                     Some(style) if !caching_disabled => {
                         let mut root_style = Style::default();
@@ -469,7 +471,9 @@ impl<V: View> Element for ViewElement<V> {
         if let Some(entity_id) = self.entity_id {
             // Stateful path.
             window.with_rendered_view(entity_id, |window| {
-                let caching_disabled = window.measuring || window.is_inspector_picking(cx);
+                let caching_disabled = window.measuring
+                    || window.max_draw_passes > 1
+                    || window.is_inspector_picking(cx);
                 if self.cached_style.is_some() && !caching_disabled {
                     window.with_element_state::<ViewElementState, _>(
                         global_id.unwrap(),

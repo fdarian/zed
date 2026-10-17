@@ -1572,6 +1572,16 @@ pub struct Window {
     measured_at: Option<usize>,
     /// A measure pass is running, so a view must not read or write the frame caches.
     pub(crate) measuring: bool,
+    /// How many times one draw may build the frame before it presents. See
+    /// [`Window::set_max_draw_passes`].
+    pub(crate) max_draw_passes: usize,
+    /// The pass being built, from 1, or 0 outside a build.
+    draw_pass: usize,
+    /// Set during a pass by [`Window::request_redraw_before_present`].
+    redraw_before_present: bool,
+    /// The last pass was the one the cap allows and still asked for another: it was presented,
+    /// and the window draws again right after.
+    redraw_unsettled: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2275,6 +2285,10 @@ impl Window {
             dispatch_serial: 0,
             measured_at: None,
             measuring: false,
+            max_draw_passes: 1,
+            draw_pass: 0,
+            redraw_before_present: false,
+            redraw_unsettled: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -2669,6 +2683,40 @@ impl Window {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
         }
+    }
+
+    /// Lets one [`Window::draw`] build the frame up to `passes` times before presenting, for a
+    /// tree whose content depends on the layout it produces (a container query). 1, the default,
+    /// builds once and makes [`Window::request_redraw_before_present`] a request for a following
+    /// frame.
+    ///
+    /// More than 1 turns the view cache off for the window: a pass that is thrown away must not
+    /// have taken the cached prepaint and paint of a view out of the frame it replaces.
+    pub fn set_max_draw_passes(&mut self, passes: usize) {
+        self.max_draw_passes = passes.max(1);
+    }
+
+    /// Asks for the frame being built to be built again before anything is presented, because
+    /// what it was built from no longer matches what layout produced. Call it while the frame is
+    /// built, laid out or prepainted (an element's prepaint listener, a view's `render`).
+    ///
+    /// The pass is abandoned as soon as layout and prepaint are over, or as soon as the root has
+    /// requested its layout when the request came from `render`: it paints nothing, its
+    /// hitboxes, listeners, a11y updates and scene are dropped, and `render` runs again. Nothing
+    /// is presented from an abandoned pass. After [`Window::set_max_draw_passes`] passes the last
+    /// one is painted and presented anyway, and the window draws once more.
+    ///
+    /// Everything that paint reports is therefore reported by the presented pass only. What
+    /// `render` and prepaint publish outside the frame is published by every pass, so it has to
+    /// be idempotent.
+    pub fn request_redraw_before_present(&mut self) {
+        self.redraw_before_present = true;
+    }
+
+    /// The pass the frame is being built in, counted from 1, or 0 outside a draw. A request made
+    /// in the last pass the window allows is not honoured before present.
+    pub fn draw_pass(&self) -> usize {
+        self.draw_pass
     }
 
     /// Close this window.
@@ -3812,6 +3860,7 @@ impl Window {
         self.build_next_frame(cx);
 
         self.measuring = false;
+        self.redraw_unsettled = false;
         self.a11y.resume(a11y_was_active);
         self.tooltip_bounds = tooltip_bounds;
         self.captured_identity = captured_identity;
@@ -3943,6 +3992,11 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+        // The pass limit was reached with the tree still out of step with its layout. What was
+        // built is presented, and the next frame builds from the sizes it produced.
+        if mem::take(&mut self.redraw_unsettled) {
+            self.refresh();
+        }
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
@@ -3967,13 +4021,39 @@ impl Window {
 
     /// Fills `next_frame` from the root view: [`Window::draw`] and [`Window::measure`] differ in
     /// what they do with it afterwards.
+    ///
+    /// Builds again, up to [`Window::set_max_draw_passes`] times, while a pass asks for it with
+    /// [`Window::request_redraw_before_present`]. A pass that is built again is discarded the way
+    /// a measure pass is, so `next_frame` holds only the last one.
     fn build_next_frame(&mut self, cx: &mut App) {
+        self.draw_pass = 0;
+        loop {
+            self.draw_pass += 1;
+            self.redraw_before_present = false;
+            if self.build_pass(cx) {
+                break;
+            }
+            self.discard_pass(cx);
+        }
+        self.redraw_unsettled = mem::take(&mut self.redraw_before_present);
+        self.draw_pass = 0;
+    }
+
+    /// Whether the pass being built is thrown away and built again.
+    fn pass_is_abandoned(&self) -> bool {
+        self.redraw_before_present && self.draw_pass < self.max_draw_passes
+    }
+
+    /// One build of `next_frame`. Returns false when the pass was abandoned before paint.
+    fn build_pass(&mut self, cx: &mut App) -> bool {
         self.captured_hitbox = None;
         let effect_groups = self.platform_window.supports_effect_groups() || self.effect_groups_forced();
         self.next_frame
             .scene
             .set_effect_groups_enabled(effect_groups);
-        self.draw_roots(cx);
+        if !self.draw_roots(cx) {
+            return false;
+        }
         if self.captured_identity.is_some() && self.captured_hitbox.is_none() {
             self.captured_identity = None;
         }
@@ -3984,6 +4064,23 @@ impl Window {
             self.debug_frame_overlay
                 .paint(&mut self.next_frame.scene, viewport_size, scale_factor);
         }
+        true
+    }
+
+    /// Throws an abandoned pass away so the next one starts from what the frame before it left.
+    /// What a pass publishes outside the frame stays published.
+    fn discard_pass(&mut self, cx: &mut App) {
+        self.layout_engine.as_mut().unwrap().clear();
+        // An element's state was moved out of `rendered_frame` when the pass reached it. Hand
+        // it back, updated, or the next pass would find it gone and start the element over.
+        for (key, state) in self.next_frame.element_states.drain() {
+            self.rendered_frame.element_states.insert(key, state);
+        }
+        self.next_frame.clear();
+        self.tooltip_bounds.take();
+        self.requested_autoscroll = None;
+        cx.entities.clear_accessed();
+        self.invalidator.set_phase(DrawPhase::None);
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
@@ -4092,7 +4189,9 @@ impl Window {
         self.debug_frame_overlay.stats()
     }
 
-    fn draw_roots(&mut self, cx: &mut App) {
+    /// Returns false when the pass was abandoned before paint (see
+    /// [`Window::request_redraw_before_present`]).
+    fn draw_roots(&mut self, cx: &mut App) -> bool {
         debug_assert!(self.lift_lists.is_empty());
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
@@ -4126,6 +4225,11 @@ impl Window {
         let scale_factor = self.scale_factor();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
+        // The root view's `render` has run: a request it made means the layout about to be
+        // computed would be of a tree that is already out of date.
+        if self.pass_is_abandoned() {
+            return self.abandon_roots();
+        }
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -4158,6 +4262,12 @@ impl Window {
             cx.active_drag = Some(active_drag);
         } else {
             tooltip_element = self.prepaint_tooltip(cx);
+        }
+
+        // Layout and prepaint have produced the sizes a tree built from earlier ones may have
+        // assumed. Nothing has been painted, so nothing needs to be unpainted.
+        if self.pass_is_abandoned() {
+            return self.abandon_roots();
         }
 
         self.mouse_hit_test = if self.pointer_outside {
@@ -4213,6 +4323,21 @@ impl Window {
                 self.platform_window.a11y_tree_update(tree_update);
             }
         }
+        true
+    }
+
+    /// Ends an abandoned pass of [`Window::draw_roots`]: the a11y builder is closed and its
+    /// update dropped, since the pass it describes is not the frame.
+    fn abandon_roots(&mut self) -> bool {
+        if self.a11y.is_active() {
+            let frame_info = crate::window::a11y::debug::FrameDebugInfo {
+                viewport_size: self.viewport_size,
+                scale_factor: self.scale_factor,
+                tab_stop_count: self.next_frame.tab_stops.tab_stop_count(),
+            };
+            drop(self.a11y.end_frame(frame_info));
+        }
+        false
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
