@@ -515,7 +515,7 @@ impl Retained {
 mod tests {
     use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Context, FocusHandle, InteractiveElement, MouseButton,
+        AnyWindowHandle, AppContext as _, Context, FocusHandle, Position, InteractiveElement, MouseButton,
         MouseDownEvent, MouseUpEvent, Modifiers, ParentElement, PlatformInput, Render,
         RetainedCounters, StatefulInteractiveElement, Styled, TestAppContext, div, point, px, size,
     };
@@ -1065,5 +1065,305 @@ mod tests {
         assert_eq!(after.replays, before.replays + 3);
         assert_eq!(fixture.builds.get(), builds + 3, "the draw after it replays");
         assert_eq!(snapshot(fixture.window, cx, &POINTS), replayed);
+    }
+
+    /// A window with `inner` in a retained subtree, drawn until it has had the chance to be
+    /// replayed. Returns the window and how many times `inner` was built.
+    fn single(
+        cx: &mut TestAppContext,
+        hook: bool,
+        inner: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> (AnyWindowHandle, Rc<Cell<usize>>, Rc<RefCell<Vec<RetainedPhase>>>) {
+        let builds = Rc::new(Cell::new(0));
+        let phases = Rc::new(RefCell::new(Vec::new()));
+        let inner: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement> = Rc::new(inner);
+        let window = open(cx, {
+            let builds = builds.clone();
+            let phases = phases.clone();
+            Rc::new(move |_, _| {
+                let mut subtree = retained("retained", 1, {
+                    let builds = builds.clone();
+                    let inner = inner.clone();
+                    move |window, cx| {
+                        builds.set(builds.get() + 1);
+                        inner(window, cx)
+                    }
+                });
+                if hook {
+                    let phases = phases.clone();
+                    subtree = subtree.on_replay(move |phase, _, _| phases.borrow_mut().push(phase));
+                }
+                div().id("root").size_full().child(subtree).into_any_element()
+            })
+        });
+        for _ in 0..3 {
+            draw(window, cx);
+        }
+        (window, builds, phases)
+    }
+
+    /// Draws `inner` in a retained subtree for a few frames and expects that it was built every
+    /// one, counting `reason` for each.
+    fn never_replayed(
+        cx: &mut TestAppContext,
+        reason: NonReusable,
+        inner: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) {
+        let (window, builds, _) = single(cx, false, inner);
+        let before = counters(window, cx);
+        let built = builds.get();
+        for _ in 0..4 {
+            draw(window, cx);
+        }
+        let after = counters(window, cx);
+        assert_eq!(after.replays, 0, "nothing was replayed");
+        // A subtree that asks for another frame makes the window draw more than the four.
+        let drawn = builds.get() - built;
+        assert!(drawn >= 4, "every frame built it");
+        assert_eq!(after.non_reusable(reason), before.non_reusable(reason) + drawn as u64);
+        assert_eq!(
+            after.total_non_reusable(),
+            before.total_non_reusable() + drawn as u64,
+            "{after:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_subtree_that_lifts_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed(cx, NonReusable::Lift, |_, _| {
+            div()
+                .id("context")
+                .stacking_context()
+                .w(px(100.))
+                .h(px(100.))
+                .child(
+                    div()
+                        .id("lifted")
+                        .absolute()
+                        .z_index(2)
+                        .w(px(20.))
+                        .h(px(20.))
+                        .bg(crate::red()),
+                )
+                .child(div().id("below").w(px(30.)).h(px(30.)).bg(crate::blue()))
+                .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn a_subtree_with_a_box_outside_its_clip_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed(cx, NonReusable::Escape, |_, _| {
+            let mut clip = div()
+                .id("clip")
+                .overflow_hidden()
+                .w(px(50.))
+                .h(px(50.));
+            clip.style().position = Some(Position::Static);
+            let mut escaping = div()
+                .id("escaping")
+                .absolute()
+                .left(px(100.))
+                .top(px(0.))
+                .w(px(30.))
+                .h(px(30.))
+                .bg(crate::red());
+            escaping.style().position = Some(Position::AbsoluteInAncestor);
+            clip.child(escaping).into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn a_subtree_with_a_deferred_draw_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed(cx, NonReusable::DeferredDraw, |_, _| {
+            div()
+                .id("outer")
+                .w(px(50.))
+                .h(px(50.))
+                .child(crate::deferred(div().id("deferred").w(px(20.)).h(px(20.)).bg(crate::red())))
+                .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn a_subtree_whose_listener_reports_bounds_is_never_replayed_unless_its_owner_republishes(
+        cx: &mut TestAppContext,
+    ) {
+        let reported = Rc::new(Cell::new(0));
+        let inner = {
+            let reported = reported.clone();
+            move |_: &mut Window, _: &mut App| {
+                let reported = reported.clone();
+                div()
+                    .id("reporting")
+                    .w(px(20.))
+                    .h(px(20.))
+                    .on_painted(move |_, _, _| reported.set(reported.get() + 1))
+                    .into_any_element()
+            }
+        };
+        never_replayed(cx, NonReusable::Publication, inner.clone());
+
+        let (window, builds, phases) = single(cx, true, inner);
+        let built = builds.get();
+        let before = counters(window, cx);
+        phases.borrow_mut().clear();
+        draw(window, cx);
+        draw(window, cx);
+        let after = counters(window, cx);
+        assert_eq!(builds.get(), built, "the owner takes the reports");
+        assert_eq!(after.replays, before.replays + 2);
+        assert_eq!(
+            *phases.borrow(),
+            [
+                RetainedPhase::Prepaint,
+                RetainedPhase::Paint,
+                RetainedPhase::Prepaint,
+                RetainedPhase::Paint
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_subtree_that_asks_for_a_frame_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed(cx, NonReusable::FrameCallback, |_, _| {
+            crate::canvas(
+                |_, _, _| (),
+                |_, _, window, _| window.on_next_frame(|_, _| {}),
+            )
+            .w(px(20.))
+            .h(px(20.))
+            .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn a_subtree_that_asks_for_another_pass_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed(cx, NonReusable::RedrawRequest, |_, _| {
+            crate::canvas(
+                |_, window, _| window.request_redraw_before_present(),
+                |_, _, _, _| {},
+            )
+            .w(px(20.))
+            .h(px(20.))
+            .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn a_subtree_that_lays_out_a_tree_of_its_own_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed(cx, NonReusable::NestedLayout, |_, _| {
+            crate::uniform_list("rows", 3, |range, _, _| {
+                range
+                    .map(|index| div().id(("row", index)).h(px(10.)).w(px(40.)))
+                    .collect()
+            })
+            .w(px(100.))
+            .h(px(100.))
+            .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn a_subtree_with_a_width_keyword_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed(cx, NonReusable::UnstableLayout, |_, _| {
+            div()
+                .id("keyword")
+                .w_min_content()
+                .h(px(20.))
+                .child("text")
+                .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn cursor_key_and_accessibility_listeners_of_a_replayed_subtree_answer(cx: &mut TestAppContext) {
+        let keys = Rc::new(Cell::new(0));
+        let actions = Rc::new(Cell::new(0));
+        let (window, _, _) = single(cx, false, {
+            let keys = keys.clone();
+            let actions = actions.clone();
+            move |_, _| {
+                let keys = keys.clone();
+                let actions = actions.clone();
+                div()
+                    .id("rich")
+                    .w(px(100.))
+                    .h(px(40.))
+                    .bg(crate::red())
+                    .cursor_pointer()
+                    .role(Role::Button)
+                    .aria_label("Rich")
+                    .focusable()
+                    .tab_stop(true)
+                    .on_key_down(move |_, _, _| keys.set(keys.get() + 1))
+                    .on_a11y_action(accesskit::Action::Increment, move |_, _, _| {
+                        actions.set(actions.get() + 1)
+                    })
+                    .into_any_element()
+            }
+        });
+        let replaying = |cx: &mut TestAppContext| {
+            // A change of hover or focus draws everything once; the draws after it replay.
+            draw(window, cx);
+            let before = counters(window, cx).replays;
+            draw(window, cx);
+            assert_eq!(counters(window, cx).replays, before + 1);
+        };
+        let cursor = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| window.pointer_cursor_style())
+                .unwrap()
+        };
+
+        cx.update_window(window, |_, window, cx| {
+            window.simulate_mouse_move(point(px(20.), px(20.)), cx)
+        })
+        .unwrap();
+        replaying(cx);
+        assert_eq!(cursor(cx), crate::CursorStyle::PointingHand);
+
+        let target = cx
+            .update_window(window, |_, window, _| {
+                window
+                    .a11y
+                    .last_tree_update()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some("Rich"))
+                    .map(|(id, _)| *id)
+                    .expect("the replayed frame has the node")
+            })
+            .unwrap();
+        let request = |action| accesskit::ActionRequest {
+            action,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: target,
+            data: None,
+        };
+        cx.update_window(window, |_, window, cx| {
+            window.handle_a11y_action(request(accesskit::Action::Increment), cx)
+        })
+        .unwrap();
+        assert_eq!(actions.get(), 1);
+
+        // Focus it through the accessibility tree, as a screen reader does.
+        cx.update_window(window, |_, window, cx| {
+            window.handle_a11y_action(request(accesskit::Action::Focus), cx)
+        })
+        .unwrap();
+        replaying(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.handle_a11y_action(request(accesskit::Action::Increment), cx)
+        })
+        .unwrap();
+        assert_eq!(actions.get(), 2, "the listener moved with the replay");
+        cx.dispatch_keystroke(window, crate::Keystroke::parse("a").unwrap());
+        assert_eq!(keys.get(), 1, "the focused element of a replay gets the keys");
+        let focus = cx
+            .update_window(window, |_, window, _| {
+                window.a11y.last_tree_update().unwrap().focus
+            })
+            .unwrap();
+        assert_eq!(focus, target, "the tree reports the focus inside the replay");
     }
 }
