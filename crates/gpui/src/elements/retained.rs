@@ -764,7 +764,7 @@ mod tests {
         RetainedCounters, StatefulInteractiveElement, Styled, TestAppContext, div, point, px, size,
     };
     use accesskit::Role;
-    use std::cell::{Cell, RefCell};
+    use std::{cell::{Cell, RefCell}, sync::Arc};
 
     type BuildScene = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
@@ -1971,6 +1971,43 @@ mod tests {
             .w(px(100.))
             .h(px(100.))
             .into_any_element()
+        });
+    }
+
+    struct StillLoading;
+
+    impl crate::ImageCache for StillLoading {
+        fn load(
+            &mut self,
+            _: &crate::Resource,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Result<Arc<crate::RenderImage>, crate::ImageCacheError>> {
+            None
+        }
+    }
+
+    #[gpui::test]
+    fn a_subtree_with_an_image_still_loading_in_a_custom_source_is_never_replayed(
+        cx: &mut TestAppContext,
+    ) {
+        never_replayed(cx, NonReusable::PendingAsset, |_, _| {
+            crate::img(|_: &mut Window, _: &mut App| None)
+                .w(px(20.))
+                .h(px(20.))
+                .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn a_subtree_with_an_image_still_loading_in_a_cache_is_never_replayed(cx: &mut TestAppContext) {
+        let cache = cx.new(|_| StillLoading);
+        never_replayed(cx, NonReusable::PendingAsset, move |_, _| {
+            crate::img("assets/missing.png")
+                .image_cache(&cache)
+                .w(px(20.))
+                .h(px(20.))
+                .into_any_element()
         });
     }
 

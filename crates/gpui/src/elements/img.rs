@@ -561,6 +561,18 @@ impl IntoElement for Img {
 impl StatefulInteractiveElement for Img {}
 
 impl ImageSource {
+    /// The sources that do not go through the asset system report that they are still loading the
+    /// way it does, for a retained subtree not to keep what it drew meanwhile.
+    fn pending_until_loaded(
+        data: Option<Result<Arc<RenderImage>, ImageCacheError>>,
+        window: &mut Window,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        if data.is_none() {
+            window.note_pending_asset();
+        }
+        data
+    }
+
     pub(crate) fn use_data(
         &self,
         cache: Option<AnyImageCache>,
@@ -570,12 +582,14 @@ impl ImageSource {
         match self {
             ImageSource::Resource(resource) => {
                 if let Some(cache) = cache {
-                    cache.load(resource, window, cx)
+                    Self::pending_until_loaded(cache.load(resource, window, cx), window)
                 } else {
                     window.use_asset::<ImgResourceLoader>(resource, cx)
                 }
             }
-            ImageSource::Custom(loading_fn) => loading_fn(window, cx),
+            ImageSource::Custom(loading_fn) => {
+                Self::pending_until_loaded(loading_fn(window, cx), window)
+            }
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
             ImageSource::Image(data) => window.use_asset::<AssetLogger<ImageDecoder>>(data, cx),
         }
@@ -590,12 +604,14 @@ impl ImageSource {
         match self {
             ImageSource::Resource(resource) => {
                 if let Some(cache) = cache {
-                    cache.load(resource, window, cx)
+                    Self::pending_until_loaded(cache.load(resource, window, cx), window)
                 } else {
                     window.get_asset::<ImgResourceLoader>(resource, cx)
                 }
             }
-            ImageSource::Custom(loading_fn) => loading_fn(window, cx),
+            ImageSource::Custom(loading_fn) => {
+                Self::pending_until_loaded(loading_fn(window, cx), window)
+            }
             ImageSource::Render(data) => Some(Ok(data.to_owned())),
             ImageSource::Image(data) => window.get_asset::<AssetLogger<ImageDecoder>>(data, cx),
         }
