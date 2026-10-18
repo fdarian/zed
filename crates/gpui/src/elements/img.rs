@@ -378,11 +378,25 @@ impl Element for Img {
                             // percentage width has no pixel value yet, and the box must
                             // not take the bitmap's height next to it.
                             if image_size.width.0 > 0.0 && image_size.height.0 > 0.0 {
-                                let ratio = *style
-                                    .aspect_ratio
-                                    .get_or_insert(image_size.width.0 / image_size.height.0);
+                                // Size containment (a `container-type`) takes the natural size away
+                                // on the contained axes, and the natural aspect ratio with it: a
+                                // contained image has no ratio of its own to fill the other axis by.
+                                let contained = style.contain_inline_size || style.contain_block_size;
+                                let ratio = if contained {
+                                    style.aspect_ratio
+                                } else {
+                                    Some(
+                                        *style
+                                            .aspect_ratio
+                                            .get_or_insert(image_size.width.0 / image_size.height.0),
+                                    )
+                                };
                                 style.item_is_replaced = true;
-                                intrinsic = Some((image_size, ratio));
+                                let natural = size(
+                                    if style.contain_inline_size { px(0.) } else { image_size.width },
+                                    if style.contain_block_size { px(0.) } else { image_size.height },
+                                );
+                                intrinsic = Some((natural, ratio));
                             }
 
                             if global_id.is_some()
@@ -433,18 +447,21 @@ impl Element for Img {
                             let measure_key = hash_measure_key((
                                 image_size.width.0.to_bits(),
                                 image_size.height.0.to_bits(),
-                                ratio.to_bits(),
+                                ratio.map(f32::to_bits),
                             ));
                             window
                                 .request_keyed_measured_layout(measure_key, style, (), move |known, _, _, _| {
-                                    match (known.width, known.height) {
-                                        (Some(width), Some(height)) => size(width, height),
-                                        (Some(width), None) => size(width, width / ratio),
-                                        (None, Some(height)) => size(height * ratio, height),
+                                    match (known.width, known.height, ratio) {
+                                        (Some(width), Some(height), _) => size(width, height),
+                                        (Some(width), None, Some(ratio)) => size(width, width / ratio),
+                                        (Some(width), None, None) => size(width, image_size.height),
+                                        (None, Some(height), Some(ratio)) => size(height * ratio, height),
+                                        (None, Some(height), None) => size(image_size.width, height),
                                         // Height 0: taffy raises it to `width / aspect_ratio` after
                                         // `max_width` and `min_width` clamped the width, so a clamped
                                         // image keeps its proportions.
-                                        (None, None) => size(image_size.width, px(0.)),
+                                        (None, None, Some(_)) => size(image_size.width, px(0.)),
+                                        (None, None, None) => image_size,
                                     }
                                 })
                                 .0

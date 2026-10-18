@@ -1630,6 +1630,7 @@ impl Element for List {
                 })
             }
         };
+        self.interactivity.layout_id = Some(layout_id);
         (layout_id, ())
     }
 
@@ -1700,6 +1701,14 @@ impl Element for List {
         state.last_padding = Some(padding);
         // The overlay reads the list state, which must not be borrowed meanwhile.
         drop(state_guard);
+        // After the rows: they are built here, not before layout, and a listener that asks whether
+        // what they were built from still holds (a container query) has to see what they read.
+        let prepaint_layout_listeners = std::mem::take(&mut self.interactivity.prepaint_layout_listeners);
+        if let Some(layout_id) = self.interactivity.layout_id {
+            for listener in prepaint_layout_listeners {
+                listener(bounds, layout_id, window, cx);
+            }
+        }
         if let Some(prepainter) = self.interactivity.overlay_prepainter.take() {
             window.with_hitbox_parent(&hitbox, |window| prepainter(bounds, window, cx));
         }
