@@ -16,7 +16,7 @@ const VIEW_WIDTH: f32 = 300.;
 const VIEW_HEIGHT: f32 = 220.;
 const OVERSCAN: f32 = 100.;
 
-type BuildScene = Rc<dyn Fn() -> AnyElement>;
+type BuildScene = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
 fn app() -> TestApp {
     TestApp::with_text_system(Arc::new(RasterizingTextSystem::with_ink_in_the_box()))
@@ -45,8 +45,8 @@ struct SceneView {
 }
 
 impl Render for SceneView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        (self.build)()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        (self.build)(window, cx)
     }
 }
 
@@ -80,6 +80,38 @@ enum Kind {
     Escaping,
     /// Has a box placed by the viewport.
     Fixed,
+    /// Has a retained subtree of its own, which is built every frame the row is.
+    Retained,
+    /// Has a view that caches what it draws.
+    CachedView,
+}
+
+fn inner_box(index: usize) -> AnyElement {
+    div()
+        .id(("inner-retained", index))
+        .always_hitbox()
+        .w(px(50.))
+        .h(px(12.))
+        .bg(crate::red())
+        .child(format!("r{index}"))
+        .into_any_element()
+}
+
+/// A view in a row.
+struct Badge {
+    index: usize,
+}
+
+impl Render for Badge {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("badge", self.index))
+            .always_hitbox()
+            .w(px(40.))
+            .h(px(10.))
+            .bg(crate::green())
+            .child(format!("b{}", self.index))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,9 +125,12 @@ struct RowSpec {
 struct Handles {
     texts: RefCell<BTreeMap<usize, TextLayout>>,
     trackers: RefCell<BTreeMap<usize, ScrollHandle>>,
+    badges: RefCell<BTreeMap<usize, crate::Entity<Badge>>>,
+    /// Whether a row that has a retained subtree of its own retains it: the plain window does not.
+    retains: bool,
 }
 
-fn row_element(index: usize, spec: RowSpec, handles: &Handles) -> AnyElement {
+fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> AnyElement {
     let text = StyledText::new(format!("Row {index} with enough words to be seen in the scene"));
     handles.texts.borrow_mut().insert(index, text.layout().clone());
     let colors = [crate::red(), crate::green(), crate::blue(), crate::yellow()];
@@ -195,6 +230,26 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles) -> AnyElement {
                     .bg(crate::black()),
             );
         }
+        Kind::Retained => {
+            let inner = if handles.retains {
+                retained(("inner-retained-root", index), 1, move |_, _| inner_box(index))
+                    .into_any_element()
+            } else {
+                inner_box(index)
+            };
+            row = row.child(text).child(inner);
+        }
+        Kind::CachedView => {
+            let badge = handles
+                .badges
+                .borrow_mut()
+                .entry(index)
+                .or_insert_with(|| crate::AppContext::new(cx, |_| Badge { index }))
+                .clone();
+            row = row
+                .child(text)
+                .child(badge.cached(crate::StyleRefinement::default().w(px(40.)).h(px(10.))));
+        }
         Kind::Nested => {
             row = row.p(px(2.)).child(
                 div()
@@ -270,13 +325,14 @@ fn page(
     scroll: &ScrollHandle,
     retained_rows: bool,
     rounded: bool,
+    cx: &mut App,
 ) -> AnyElement {
     let rows = specs.iter().enumerate().map(|(index, spec)| {
         let spec = *spec;
         if retained_rows {
             let handles = handles.clone();
-            let mut row = retained(("retained-row", index), 1, move |_, _| {
-                row_element(index, spec, &handles)
+            let mut row = retained(("retained-row", index), 1, move |_, cx| {
+                row_element(index, spec, &handles, cx)
             })
             .relocatable(px(OVERSCAN));
             // A box placed by something else than the row is outside the extent its owner can
@@ -290,7 +346,7 @@ fn page(
             }
             row.into_any_element()
         } else {
-            row_element(index, spec, handles)
+            row_element(index, spec, handles, cx)
         }
     });
     let mut scroller = div()
@@ -326,12 +382,15 @@ impl Pair {
         let specs = Rc::new(specs);
         let open = |cx: &mut TestApp, retained_rows: bool| {
             let scroll = ScrollHandle::new();
-            let handles = Rc::new(Handles::default());
+            let handles = Rc::new(Handles {
+                retains: retained_rows,
+                ..Handles::default()
+            });
             let build: BuildScene = {
                 let specs = specs.clone();
                 let handles = handles.clone();
                 let scroll = scroll.clone();
-                Rc::new(move || page(&specs, &handles, &scroll, retained_rows, rounded))
+                Rc::new(move |_, cx| page(&specs, &handles, &scroll, retained_rows, rounded, cx))
             };
             let window = cx.open_window_with_options(
                 WindowOptions {
@@ -706,6 +765,7 @@ fn mixed(count: usize) -> Vec<RowSpec> {
         Kind::Faded,
         Kind::ClipPath,
         Kind::Nested,
+        Kind::Retained,
         Kind::Absolute,
     ];
     (0..count)
@@ -925,6 +985,20 @@ fn a_read_of_bounds_after_a_scroll_sees_the_rows_where_the_scroll_put_them() {
 }
 
 #[test]
+fn a_view_that_caches_what_it_draws_keeps_its_row_from_being_replayed() {
+    let cx = &mut app();
+    let pair = Pair::new(cx, rows(24, 40., Kind::CachedView), 1., false);
+    pair.draw(cx);
+    let before = pair.counters(cx);
+    scroll_through(&pair, cx, &[3., 12., 40., 41.5, 7., 0.]);
+    pair.draw(cx);
+    pair.assert_same(cx, "a frame with no scroll");
+    let after = pair.counters(cx);
+    assert_eq!(after.relocations, before.relocations, "{after:?}");
+    assert!(after.non_reusable(NonReusable::NestedLayout) > 0, "{after:?}");
+}
+
+#[test]
 fn a_scale_factor_that_is_not_a_power_of_two_builds_the_rows() {
     let cx = &mut app();
     let pair = Pair::new(cx, mixed(30), 1.5, false);
@@ -1011,6 +1085,8 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
         Kind::ClipPath,
         Kind::Nested,
         Kind::Nested,
+        Kind::Retained,
+        Kind::CachedView,
         Kind::Absolute,
         Kind::Absolute,
         Kind::Positioned,
@@ -1025,16 +1101,21 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
     for seed in 0..seeds {
         let mut rng = StdRng::seed_from_u64(seed);
         let count = rng.random_range(12..50);
+        let verified = rng.random_bool(0.5);
         let specs = (0..count)
-            .map(|_| RowSpec {
-                kind: kinds[rng.random_range(0..kinds.len())],
-                height: rng.random_range(18..90) as f32,
+            .map(|_| {
+                let kind = kinds[rng.random_range(0..kinds.len())];
+                RowSpec {
+                    // A cached view that a retained subtree holds draws from a frame the
+                    // comparison build replaced.
+                    kind: if verified && kind == Kind::CachedView { Kind::Plain } else { kind },
+                    height: rng.random_range(18..90) as f32,
+                }
             })
             .collect();
         let scale_factor = if rng.random_bool(0.5) { 1. } else { 2. };
         let rounded = rng.random_bool(0.25);
         let pair = Pair::new(cx, specs, scale_factor, rounded);
-        let verified = rng.random_bool(0.5);
         if verified {
             cx.update_window(pair.retained, |_, window, _| {
                 window.set_retention_verifier(Some(Rc::new(|_| String::new())));

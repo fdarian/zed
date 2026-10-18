@@ -396,6 +396,7 @@ impl<V: View> Element for ViewElement<V> {
                             && element_state.cache_key.text_style == text_style
                             && element_state.cache_key.visibility == visibility
                             && element_state.reusable
+                            && !window.is_recording_relocatably()
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
                         {
