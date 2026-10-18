@@ -424,6 +424,11 @@ pub struct Style {
     /// CSS `justify-self`: how this item aligns itself along the inline axis
     pub justify_self: Option<AlignSelf>,
 
+    /// CSS `direction`: which way the inline axis runs. It mirrors the main axis of a row flex
+    /// container, the columns of a grid and a table, and the side a block's scrollbar is on.
+    /// Not inherited here: an app that wants CSS's inheritance sets it on every element.
+    pub direction: Direction,
+
     // Table properties
     /// What part of a table this element is, as seen from the table, row group or row it is in.
     pub table_role: TableRole,
@@ -1545,6 +1550,7 @@ impl Default for Style {
             justify_items: None,
             justify_self: None,
             table_role: TableRole::None,
+            direction: Direction::Ltr,
             table_layout: TableLayout::Auto,
             border_spacing: Size::default(),
             border_collapse: false,
@@ -1948,6 +1954,28 @@ pub enum Display {
     Table,
     /// The children will not be laid out, and will follow absolute positioning
     None,
+}
+
+/// CSS `direction`: the direction of the inline axis.
+///
+/// [Specification](https://www.w3.org/TR/css-writing-modes-3/#direction)
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum Direction {
+    /// Left to right
+    #[default]
+    Ltr,
+    /// Right to left
+    Rtl,
+}
+
+impl From<Direction> for taffy::style::Direction {
+    fn from(value: Direction) -> Self {
+        match value {
+            Direction::Ltr => Self::Ltr,
+            Direction::Rtl => Self::Rtl,
+        }
+    }
 }
 
 /// Which algorithm sizes the columns of a table.

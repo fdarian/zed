@@ -16,6 +16,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
         let (fits, rows) = (sizes.fits, sizes.rows);
         let (table_size, padding_border, border, captions_top) =
             (sizes.table_size, sizes.padding_border, sizes.border, sizes.captions_top);
+        let rtl = sizes.rtl;
         let structure = self.structure;
         let spacing = self.spacing;
         let mut order = 0u32;
@@ -36,7 +37,8 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 CaptionSide::Top => &mut top_y,
                 CaptionSide::Bottom => &mut bottom_y,
             };
-            let location = self.relatively(*node, Point { x: size.margin.left, y: *y + size.margin.top });
+            let x = if rtl { table_size.width - size.margin.right - size.width } else { size.margin.left };
+            let location = self.relatively(*node, Point { x, y: *y + size.margin.top }, rtl);
             *y += size.outer_height;
             let output = self.tree.perform_child_layout(
                 *node,
@@ -71,6 +73,8 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
         // Where the columns and rows are, relative to the border box of the table
         let grid_left = padding_border.left + spacing.width;
         let grid_top = captions_top + padding_border.top + spacing.height;
+        // The left edge of every column. A table that runs right to left lays the columns out as one that runs left to
+        // right and mirrors them in its border box, where the padding and border on the right are the ones it starts at
         let mut column_x: Vec<f32> = Vec::with_capacity(column_widths.len());
         let mut x = grid_left;
         for width in column_widths {
@@ -78,6 +82,13 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
             x += width + spacing.width;
         }
         let grid_width = if column_widths.is_empty() { 0.0 } else { x - spacing.width - grid_left };
+        if rtl {
+            for (column, width) in column_x.iter_mut().zip(column_widths) {
+                *column = table_size.width - *column - width;
+            }
+        }
+        // Where a cell that starts in a column and spans `span` of them has its left edge
+        let cell_column = |col: usize, span: usize| if rtl { col + span - 1 } else { col };
         let mut row_y: Vec<f32> = Vec::with_capacity(rows.len());
         let mut y = grid_top;
         for row in rows {
@@ -96,10 +107,15 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 });
                 lines
             };
+            let (lines_x, lines_widths): (Vec<f32>, Vec<f32>) = if rtl {
+                (column_x.iter().rev().copied().collect(), column_widths.iter().rev().copied().collect())
+            } else {
+                (column_x.clone(), column_widths.to_vec())
+            };
             self.tree.set_detailed_table_info(
                 sizes.node,
                 super::DetailedTableInfo {
-                    column_lines: lines(&column_x, &mut column_widths.iter().copied(), grid_left),
+                    column_lines: lines(&lines_x, &mut lines_widths.iter().copied(), grid_left),
                     row_lines: lines(&row_y, &mut rows.iter().map(|row| row.height), grid_top),
                     first_baseline: sizes.first_baseline,
                 },
@@ -114,7 +130,11 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 return (x, 0.0);
             }
             let last = first_col + span - 1;
-            (column_x[first_col], column_x[last] + column_widths[last] - column_x[first_col])
+            if rtl {
+                (column_x[last], column_x[first_col] + column_widths[first_col] - column_x[last])
+            } else {
+                (column_x[first_col], column_x[last] + column_widths[last] - column_x[first_col])
+            }
         };
         for group in &structure.column_groups {
             let (x, width) = column_extent(group.first_col, group.span);
@@ -129,7 +149,8 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
             let (mut x, width) = column_extent(node.first_col, node.span);
             let mut y = grid_top;
             if let Some(group) = node.group {
-                let (group_x, _) = column_extent(structure.column_groups[group].first_col, 1);
+                let group = &structure.column_groups[group];
+                let (group_x, _) = column_extent(group.first_col, group.span);
                 x -= group_x;
                 y = 0.0;
             }
@@ -146,7 +167,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 row_y[last] + rows[last].height - section_top
             };
             if let Some(node) = section.node {
-                let location = self.relatively(node, Point { x: grid_left, y: section_top });
+                let location = self.relatively(node, Point { x: grid_left, y: section_top }, rtl);
                 self.set_plain_layout(node, next_order(), location, Size { width: grid_width, height: section_height });
             }
             for row_index in section.first_row..section.first_row + section.row_count {
@@ -157,7 +178,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                     Point { x: grid_left, y: row_y[row_index] }
                 };
                 if let Some(node) = row.node {
-                    let location = self.relatively(node, row_location);
+                    let location = self.relatively(node, row_location, rtl);
                     self.set_plain_layout(
                         node,
                         next_order(),
@@ -196,10 +217,8 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                     );
                     // A cell is placed in its row; the cells of an implicit row are placed in the group or the table
                     let in_row = if row.node.is_some() { Point::ZERO } else { row_location };
-                    let location = self.relatively(
-                        cell.node,
-                        Point { x: in_row.x + column_x[cell.col] - grid_left, y: in_row.y },
-                    );
+                    let cell_x = column_x[cell_column(cell.col, cell.col_span)];
+                    let location = self.relatively(cell.node, Point { x: in_row.x + cell_x - grid_left, y: in_row.y }, rtl);
                     self.tree.set_unrounded_layout(
                         cell.node,
                         &Layout {
@@ -219,7 +238,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                         let overflow = self.tree.get_table_item_style(cell.node).overflow();
                         // Relative to the padding box of the table
                         let origin = Point {
-                            x: column_x[cell.col] - border.left,
+                            x: cell_x - border.left,
                             y: row_y[cell.row] - captions_top - border.top,
                         };
                         content_size = content_size.f32_max(
@@ -244,7 +263,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
 
     /// How far `position: relative` moves a part of the table. A percentage of the width is of the table's, and one of
     /// the height is `auto`, as in Chrome
-    fn relative_offset(&self, node: NodeId) -> Point<f32> {
+    fn relative_offset(&self, node: NodeId, rtl: bool) -> Point<f32> {
         let style = self.tree.get_table_item_style(node);
         if style.position() != Position::Relative {
             return Point::ZERO;
@@ -254,14 +273,18 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
             |value| MaybeResolve::maybe_resolve(value, self.inner_width_hint, |val, basis| self.tree.calc(val, basis));
         let resolve_y = |value| MaybeResolve::maybe_resolve(value, None, |val, basis| self.tree.calc(val, basis));
         Point {
-            x: resolve_x(inset.left).or(resolve_x(inset.right).map(|right| -right)).unwrap_or(0.0),
+            x: if rtl {
+                resolve_x(inset.right).map(|right| -right).or(resolve_x(inset.left)).unwrap_or(0.0)
+            } else {
+                resolve_x(inset.left).or(resolve_x(inset.right).map(|right| -right)).unwrap_or(0.0)
+            },
             y: resolve_y(inset.top).or(resolve_y(inset.bottom).map(|bottom| -bottom)).unwrap_or(0.0),
         }
     }
 
     /// `location` moved by the `position: relative` of the node
-    fn relatively(&self, node: NodeId, location: Point<f32>) -> Point<f32> {
-        let offset = self.relative_offset(node);
+    fn relatively(&self, node: NodeId, location: Point<f32>, rtl: bool) -> Point<f32> {
+        let offset = self.relative_offset(node, rtl);
         Point { x: location.x + offset.x, y: location.y + offset.y }
     }
 
@@ -284,7 +307,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
     }
 
     /// Hides the children that generate no box and places the absolutely positioned children of the table
-    pub(super) fn layout_hidden_and_absolute(&mut self, table_size: Size<f32>, border: Rect<f32>) {
+    pub(super) fn layout_hidden_and_absolute(&mut self, table_size: Size<f32>, border: Rect<f32>, rtl: bool) {
         let structure = self.structure;
         for &node in &structure.hidden {
             self.tree.set_unrounded_layout(node, &Layout::with_order(0));
@@ -362,9 +385,12 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 top: margin.top.unwrap_or(0.0),
                 bottom: margin.bottom.unwrap_or(0.0),
             };
+            let from_right = area.width - size.width - margin.right;
             let x = match (inset.left, inset.right) {
+                (Some(_), Some(right)) if rtl => from_right - right,
                 (Some(left), _) => left + margin.left,
-                (None, Some(right)) => area.width - size.width - right - margin.right,
+                (None, Some(right)) => from_right - right,
+                (None, None) if rtl => from_right,
                 (None, None) => margin.left,
             };
             let y = match (top, bottom) {

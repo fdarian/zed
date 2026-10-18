@@ -5,6 +5,11 @@
 //! relative to their parent, so the layouts of a table's subtree nest like the nodes do: a row group is placed in the
 //! table, a row in its row group (or in the table, when it has none), a cell in its row.
 //!
+//! With `direction: rtl` the first column is the rightmost: the columns are laid out as in a left to right table and
+//! mirrored in the border box of the table, so padding, border and spacing stay on the physical sides and the lines of
+//! [`DetailedTableInfo`] are still in order from the left. A cell that spans columns is where its columns are, so its
+//! left edge is that of its last column.
+//!
 //! A cell is told its whole box, the width of its columns and the height of its rows, and puts its content where its
 //! `vertical-align` says by being given a height that leaves exactly the offset as free space, see
 //! [`BlockContainerStyle::align_content`](crate::BlockContainerStyle) of [`Style`](crate::Style).
@@ -15,7 +20,6 @@
 //!     role of a cell are aligned in their row.
 //!   - Cells and rows with `rowspan`s that leave rows without a cell of their own (and no height) share the height of
 //!     the spanning cell differently in some cases.
-//!   - `direction: rtl` is ignored, columns are not mirrored.
 //!   - A table that is a flex item and is given less width than its min-content still reports its min-content width,
 //!     but the flex container positions it for the width it asked for.
 //!   - The max-content width of a table whose percentage columns add up to 100% next to columns without one is
@@ -47,7 +51,8 @@ use structure::Structure;
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetailedTableInfo {
     /// The x of the left edge of every column and then of the right edge of the last one, relative to the left of the
-    /// border box of the table. One more than there are columns
+    /// border box of the table, from the left whichever way the table runs: the first of a `direction: rtl` table's
+    /// columns is the last of the lines. One more than there are columns
     pub column_lines: Vec<f32>,
     /// The y of the top edge of every row and then of the bottom edge of the last one, relative to the top of the
     /// border box of the table, captions above the rows included. One more than there are rows
@@ -176,6 +181,7 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
     };
     let spacing = if style.border_collapse() { Size::ZERO } else { style.border_spacing() };
     let fixed_layout = style.table_layout() == TableLayout::Fixed;
+    let rtl = style.direction().is_rtl();
     drop(style);
 
     // The width asked for, which a fixed layout needs to be definite
@@ -327,8 +333,9 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
         border,
         captions_top,
         first_baseline,
+        rtl,
     });
-    table.layout_hidden_and_absolute(table_size, border);
+    table.layout_hidden_and_absolute(table_size, border, rtl);
 
     LayoutOutput::from_sizes_and_baselines(table_size, content_size, Point { x: None, y: first_baseline })
 }
@@ -357,6 +364,8 @@ struct Sizes<'a> {
     captions_top: f32,
     /// The first baseline of the table
     first_baseline: Option<f32>,
+    /// Whether the table is `direction: rtl`: its first column is the rightmost
+    rtl: bool,
 }
 
 /// A caption once its height is known

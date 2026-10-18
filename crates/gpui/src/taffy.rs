@@ -2035,6 +2035,7 @@ impl ToTaffy<taffy::style::Style> for Style {
             flex_shrink: self.flex_shrink,
             justify_items: self.justify_items.map(|x| x.into()),
             justify_self: self.justify_self.map(|x| x.into()),
+            direction: self.direction.into(),
             table_role: self.table_role.into(),
             table_layout: self.table_layout.into(),
             border_spacing: taffy::geometry::Size {

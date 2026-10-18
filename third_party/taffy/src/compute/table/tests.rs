@@ -3593,6 +3593,136 @@ mod percent_heights {
     }
 }
 
+/// `direction: rtl`, against the boxes Chrome gives (the pages are in `packages/react/src/__tests__/fixtures/direction-oracle.html`):
+/// a table in a `direction: rtl` block of 300px, with the cells rtl as they inherit it. Boxes of 30px or less in a cell
+/// that is wider sit at the right of it.
+mod rtl {
+    use super::*;
+    use crate::Direction;
+
+    fn to_left(s: &mut Style) {
+        s.direction = Direction::Rtl;
+    }
+
+    fn cell(width: f32, height: f32) -> Spec {
+        td(to_left, vec![boxed(width, height)])
+    }
+
+    fn cell_spanning(col_span: u16, row_span: u16, width: f32, height: f32) -> Spec {
+        td_span(col_span, row_span, to_left, vec![boxed(width, height)])
+    }
+
+    /// The first column is the rightmost, the spacing is between them and around.
+    ///
+    /// ```html
+    /// <div style="direction:rtl;width:300px">
+    ///   <table style="border-spacing:5px 3px">
+    ///     <tr>
+    ///       <td><div style="width:30px;height:10px"></div></td>
+    ///       <td><div style="width:50px;height:20px"></div></td>
+    ///     </tr>
+    ///     <tr>
+    ///       <td><div style="width:40px;height:10px"></div></td>
+    ///       <td><div style="width:10px;height:10px"></div></td>
+    ///     </tr>
+    ///   </table>
+    /// </div>
+    /// ```
+    #[test]
+    fn columns_run_from_the_right() {
+        let tree = vec![div(
+            to_left,
+            vec![table(
+                |s| {
+                    s.direction = Direction::Rtl;
+                    s.border_spacing = Size { width: 5.0, height: 3.0 };
+                },
+                vec![
+                    tr(|_| {}, vec![cell(30.0, 10.0), cell(50.0, 20.0)]),
+                    tr(|_| {}, vec![cell(40.0, 10.0), cell(10.0, 10.0)]),
+                ],
+            )],
+        )];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 300.0, 39.0],    // div
+                [195.0, 0.0, 105.0, 39.0],  // table
+                [200.0, 3.0, 95.0, 20.0],   // tr
+                [255.0, 3.0, 40.0, 20.0],   // td
+                [265.0, 13.0, 30.0, 10.0],  // box
+                [200.0, 3.0, 50.0, 20.0],   // td
+                [200.0, 3.0, 50.0, 20.0],   // box
+                [200.0, 26.0, 95.0, 10.0],  // tr
+                [255.0, 26.0, 40.0, 10.0],  // td
+                [255.0, 26.0, 40.0, 10.0],  // box
+                [200.0, 26.0, 50.0, 10.0],  // td
+                [240.0, 26.0, 10.0, 10.0],  // box
+            ],
+        );
+    }
+
+    /// A cell that spans columns is at its last column, and one that spans rows keeps its column.
+    ///
+    /// ```html
+    /// <div style="direction:rtl;width:300px">
+    ///   <table>
+    ///     <tr>
+    ///       <td colspan="2"><div style="width:60px;height:10px"></div></td>
+    ///       <td rowspan="2"><div style="width:30px;height:30px"></div></td>
+    ///     </tr>
+    ///     <tr>
+    ///       <td><div style="width:40px;height:10px"></div></td>
+    ///       <td><div style="width:50px;height:20px"></div></td>
+    ///     </tr>
+    ///     <tr>
+    ///       <td><div style="width:20px;height:10px"></div></td>
+    ///       <td><div style="width:20px;height:10px"></div></td>
+    ///       <td><div style="width:20px;height:10px"></div></td>
+    ///     </tr>
+    ///   </table>
+    /// </div>
+    /// ```
+    #[test]
+    fn spans_are_where_their_columns_are() {
+        let tree = vec![div(
+            to_left,
+            vec![table(
+                to_left,
+                vec![
+                    tr(|_| {}, vec![cell_spanning(2, 1, 60.0, 10.0), cell_spanning(1, 2, 30.0, 30.0)]),
+                    tr(|_| {}, vec![cell(40.0, 10.0), cell(50.0, 20.0)]),
+                    tr(|_| {}, vec![cell(20.0, 10.0), cell(20.0, 10.0), cell(20.0, 10.0)]),
+                ],
+            )],
+        )];
+        assert_rects(
+            rects(tree, 300.0),
+            &[
+                [0.0, 0.0, 300.0, 60.0],   // div
+                [180.0, 0.0, 120.0, 60.0], // table
+                [180.0, 0.0, 120.0, 30.0], // tr
+                [210.0, 0.0, 90.0, 30.0],  // td
+                [240.0, 20.0, 60.0, 10.0], // box
+                [180.0, 0.0, 30.0, 50.0],  // td
+                [180.0, 0.0, 30.0, 30.0],  // box
+                [180.0, 30.0, 120.0, 20.0], // tr
+                [260.0, 30.0, 40.0, 20.0], // td
+                [260.0, 40.0, 40.0, 10.0], // box
+                [210.0, 30.0, 50.0, 20.0], // td
+                [210.0, 30.0, 50.0, 20.0], // box
+                [180.0, 50.0, 120.0, 10.0], // tr
+                [260.0, 50.0, 40.0, 10.0], // td
+                [280.0, 50.0, 20.0, 10.0], // box
+                [210.0, 50.0, 50.0, 10.0], // td
+                [240.0, 50.0, 20.0, 10.0], // box
+                [180.0, 50.0, 30.0, 10.0], // td
+                [190.0, 50.0, 20.0, 10.0], // box
+            ],
+        );
+    }
+}
+
 mod collapsed {
     use super::*;
     use crate::compute::table::DetailedTableInfo;

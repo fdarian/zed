@@ -1,7 +1,7 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle,
     CellVerticalAlign, CursorStyle,
-    DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
+    DefiniteLength, Direction, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontVariations,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
     JustifyContent, Length, LineHeight, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
@@ -76,6 +76,12 @@ pub trait Styled: Sized {
     /// Sets what part of a table the element is, as seen from the table, row group or row it is in.
     fn table_role(mut self, role: TableRole) -> Self {
         self.style().table_role = Some(role);
+        self
+    }
+
+    /// Sets the direction of the inline axis of the element, like CSS `direction`.
+    fn direction(mut self, direction: Direction) -> Self {
+        self.style().direction = Some(direction);
         self
     }
 
