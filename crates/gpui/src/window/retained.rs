@@ -310,6 +310,19 @@ pub(crate) struct ReplayKey {
     dom_hit_testing: bool,
 }
 
+impl ReplayKey {
+    /// Whether what the layout of the subtree reads of the elements around it is what it was when
+    /// the recording was made: the nodes the engine kept are the ones the subtree would ask for
+    /// again. The rest of the key is checked in prepaint, where the subtree is built late, but
+    /// by then layout is done, and a text that wraps or is cut differently has changed the size
+    /// that the boxes around it were placed by.
+    pub(crate) fn shapes_layout_like(&self, window: &Window) -> bool {
+        self.rem_size == window.rem_size()
+            && self.scale_factor == window.scale_factor
+            && self.text_style == window.text_style()
+    }
+}
+
 impl Window {
     /// What retained subtrees did in this window since it was made.
     pub fn retained_counters(&self) -> RetainedCounters {

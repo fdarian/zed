@@ -389,6 +389,7 @@ impl Retained {
                     recorded.serial == window.rendered_serial()
                         && recorded.paint_serial == window.rendered_serial()
                         && recorded.paint.is_some()
+                        && recorded.key.shapes_layout_like(window)
                 })
             {
                 window.retained.counters.hits += 1;
@@ -520,6 +521,7 @@ impl Retained {
                             recorded.serial == window.rendered_serial()
                                 && recorded.paint_serial == window.rendered_serial()
                                 && recorded.paint.is_some()
+                                && recorded.key.shapes_layout_like(window)
                         });
                     fits.then(|| (state.root, state.layout_states.clone()))
                 })
@@ -2371,6 +2373,78 @@ mod tests {
         let settled = counters(window, cx);
         assert_eq!(settled.layout_fallbacks, 1);
         assert!(settled.replays > violated.replays);
+    }
+
+    /// A box of wrapping text under a parent whose text style the test sets, then a bar after it.
+    fn text_under_a_style(
+        cx: &mut TestAppContext,
+        nowrap: &Rc<Cell<bool>>,
+    ) -> (AnyWindowHandle, Rc<Cell<usize>>) {
+        let builds = Rc::new(Cell::new(0));
+        let window = open(cx, {
+            let nowrap = nowrap.clone();
+            let builds = builds.clone();
+            Rc::new(move |_, _| {
+                let builds = builds.clone();
+                let parent = div().id("parent").w(px(60.)).flex().flex_col();
+                let parent = if nowrap.get() { parent.whitespace_nowrap() } else { parent };
+                div()
+                    .id("root")
+                    .size_full()
+                    .child(
+                        parent
+                            .child(retained("retained", 1, move |_, _| {
+                                builds.set(builds.get() + 1);
+                                div().id("text").bg(crate::red()).child("aaaa bbbb cccc dddd").into_any_element()
+                            }))
+                            .child(div().id("bar").flex_none().h(px(10.)).w(px(50.)).bg(crate::green())),
+                    )
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        (window, builds)
+    }
+
+    #[gpui::test]
+    fn a_text_style_around_a_subtree_that_changes_its_size_has_it_built_for_layout(cx: &mut TestAppContext) {
+        let nowrap = Rc::new(Cell::new(false));
+        let (window, builds) = text_under_a_style(cx, &nowrap);
+        let bar_y = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| {
+                let scale = window.scale_factor();
+                window
+                    .painted_quads()
+                    .iter()
+                    .find(|quad| quad.background.as_solid() == Some(crate::green()))
+                    .expect("the bar is painted")
+                    .bounds
+                    .origin
+                    .y
+                    .0
+                    / scale
+            })
+            .unwrap()
+        };
+        let wrapped = bar_y(cx);
+        let built = builds.get();
+        assert!(counters(window, cx).replays > 0, "the text is replayed while its style is the same");
+
+        nowrap.set(true);
+        draw(window, cx);
+        let unwrapped = bar_y(cx);
+        assert!(unwrapped < wrapped, "one line is shorter than several, in the frame that changes the style");
+        assert!(builds.get() > built);
+        assert_eq!(
+            counters(window, cx).layout_fallbacks,
+            0,
+            "layout was not found out of date after the bar was placed by it"
+        );
+
+        nowrap.set(false);
+        draw(window, cx);
+        assert_eq!(bar_y(cx), wrapped);
     }
 
     struct Number(usize);
