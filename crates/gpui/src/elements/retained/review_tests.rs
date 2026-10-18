@@ -38,6 +38,7 @@ struct Node {
     relative: Option<i8>,
     grouped: bool,
     relocatable: bool,
+    cullable: bool,
     children: Vec<Node>,
 }
 
@@ -74,6 +75,7 @@ impl Node {
             relative: (depth > 0 && rng.random_bool(0.15)).then(|| rng.random_range(-1..3)),
             grouped: rng.random_bool(0.1),
             relocatable: false,
+            cullable: std::env::var("REVIEW_CULL").is_ok() && rng.random_bool(0.2),
             children,
         }
     }
@@ -206,6 +208,9 @@ fn element(node: &Node, mode: Mode) -> AnyElement {
     }
     if node.fade {
         element = element.opacity(0.5);
+    }
+    if node.cullable {
+        element = element.cullable(Edges::all(px(400.)));
     }
     if node.clickable {
         let log = CLICKS.with(|log| log.borrow().clone());
@@ -995,13 +1000,19 @@ impl Render for Leaky {
         let build = move |_: &mut Window, _: &mut App| -> AnyElement {
             let mut child = div().id("lifted").always_hitbox().w(px(40.)).h(px(150.)).bg(crate::red());
             child = match lifted {
-                0 | 2 => child.relative().z_index(1),
+                0 | 2 | 3 => child.relative().z_index(1),
                 _ => child.absolute().left(px(10.)).top(px(60.)).z_index(1),
             };
             let mut row = div().id("row");
             if lifted == 2 {
                 row = row.stacking_context();
             }
+            let child = if lifted == 3 {
+                // A stacking context in the row that is not the row.
+                div().id("ctx").stacking_context().child(child).into_any_element()
+            } else {
+                child.into_any_element()
+            };
             row
                 .always_hitbox()
                 .w(px(300.))
@@ -1103,14 +1114,19 @@ fn review_lifted_box_of_a_relocatable_row_is_cut_by_the_page(cx: &mut TestAppCon
 #[gpui::test]
 fn review_internal_lift_of_a_relocatable_row_is_cut_by_the_page_when_replayed(cx: &mut TestAppContext) {
     // The row is a stacking context that holds the lifted box itself, so the row can be replayed.
-    let [retained, built] = leaky_run(cx, 2, &[0., 0., 0.]);
+    let failures: Vec<String> = [2u8, 3].into_iter().filter_map(|lifted| internal_lift_is_cut(cx, lifted)).collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn internal_lift_is_cut(cx: &mut TestAppContext, lifted: u8) -> Option<String> {
+    let [retained, built] = leaky_run(cx, lifted, &[0., 0., 0.]);
     let differing: Vec<String> = retained
         .lines()
         .zip(built.lines())
         .filter(|(a, b)| a != b && !a.starts_with('('))
         .map(|(a, b)| format!("retained {}\nbuilt    {}", &a[..a.len().min(260)], &b[..b.len().min(260)]))
         .collect();
-    assert!(differing.is_empty(), "{} lines differ\n{}", differing.len(), differing.join("\n"));
+    (!differing.is_empty()).then(|| format!("lifted {lifted}: {} lines differ\n{}", differing.len(), differing.join("\n")))
 }
 
 /// W (retained) > H (absolute, z -1, rounded, retained: a hole) > F (absolute, plain, stacking
@@ -1382,6 +1398,7 @@ fn plain(id: usize, width: u32, height: u32) -> Node {
         relative: None,
         grouped: false,
         relocatable: false,
+        cullable: false,
         children: Vec::new(),
     }
 }
