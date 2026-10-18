@@ -854,8 +854,9 @@ impl TextLayout {
             text_style.layout_options().hash(&mut hasher);
             trim.hash(&mut hasher);
             text_style.text_box_edge.hash(&mut hasher);
-            if text_style.text_overflow.is_some() {
-                // Truncation measures with the font of the style and not with the runs.
+            if text_style.text_overflow.is_some() || !trim.is_none() {
+                // Truncation measures with the font of the style and not with the runs, and the
+                // edges of a trim are metrics of it (cap height, x-height).
                 text_style.font().hash(&mut hasher);
             }
             inline_boxes.hash(&mut hasher);
@@ -2629,6 +2630,75 @@ mod tests {
             set(cx, trim(false, false), edge(TextBoxOver::Ex));
             draw(cx);
             assert_eq!(draw(cx), untrimmed);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod trim_font {
+        use super::*;
+        use crate::{
+            AppContext as _, Context, InteractiveElement as _, ParentElement as _, Render, Styled as _,
+            TestAppContext, TextBoxEdge, TextBoxOver, TextBoxTrim, TextBoxUnder, div, font, px,
+        };
+
+        struct Trimmed {
+            family: &'static str,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for Trimmed {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                // The runs name their font, so only the style around them is another.
+                let mut style = window.text_style();
+                style.font_family = font("Menlo").family;
+                style.font_size = px(16.).into();
+                let text = StyledText::new("Hello")
+                    .with_runs(vec![style.to_run(5)])
+                    .with_text_box_trim(TextBoxTrim { start: true, end: true });
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let mut container = div()
+                    .id("container")
+                    .w(px(200.))
+                    .font_family(font(self.family).family)
+                    .text_size(px(16.))
+                    .line_height(px(24.));
+                container.text_style().text_box_edge = Some(TextBoxEdge {
+                    over: TextBoxOver::Cap,
+                    under: TextBoxUnder::Alphabetic,
+                });
+                container.child(text)
+            }
+        }
+
+        #[crate::test]
+        fn a_font_around_runs_that_name_theirs_measures_a_trimmed_text_again(cx: &mut TestAppContext) {
+            let layout = Rc::new(RefCell::new(None));
+            let window = cx.add_window({
+                let layout = layout.clone();
+                move |_, _| Trimmed { family: "Menlo", layout }
+            });
+            // A window draws when an effect flushes too, so the count spans the change and the draw.
+            let measures = |cx: &mut TestAppContext, family: &'static str| {
+                let before = cx
+                    .update_window(window.into(), |_, window, _| window.layout_counters().measures)
+                    .unwrap();
+                window
+                    .update(cx, |view, _, cx| {
+                        view.family = family;
+                        cx.notify();
+                    })
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, _| window.layout_counters().measures)
+                    .unwrap()
+                    - before
+            };
+            measures(cx, "Menlo");
+            assert_eq!(measures(cx, "Menlo"), 0, "an idle frame measures nothing");
+            // The runs are the same; the cap height and x-height that cut the box are the style's.
+            assert!(measures(cx, "Monaco") > 0, "the text is measured with the font around it");
+            assert_eq!(measures(cx, "Monaco"), 0);
         }
     }
 
