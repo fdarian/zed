@@ -741,9 +741,14 @@ fn paint_line(
                 };
 
                 let content_mask = window.content_mask();
+                // The box of the font starts at the top of the row, and a line taller than the font
+                // puts the glyphs lower in it: a descender can show under the mask that the box is
+                // over. A glyph that shows is painted, whatever mask a recording of it was made
+                // under, so this only leaves out what is a font away from the mask.
+                let reach = max_glyph_size.width.max(max_glyph_size.height);
                 // The placeholder of an atomic inline is not a glyph: the element in
                 // its place paints itself.
-                if !run.inline.object && max_glyph_bounds.intersects(&content_mask.bounds) {
+                if !run.inline.object && max_glyph_bounds.dilate(reach).intersects(&content_mask.bounds) {
                     let baseline_offset = point(px(0.0), run_baseline);
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
