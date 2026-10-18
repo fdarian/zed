@@ -2200,7 +2200,7 @@ impl Window {
         let frame = &self.next_frame;
         let mut out = if relocated {
             let marked = strip_draw_orders(&frame.scene.describe_operations(0..frame.scene.paint_operations.len(), true));
-            strip_empty_groups(&strip_empty_replaced(&marked))
+            strip_what_holds_nothing(&marked)
                 .lines()
                 .filter(|line| *line != "replaced" && *line != "end replaced")
                 .map(|line| format!("{line}\n"))
@@ -2272,7 +2272,7 @@ impl Window {
                     .and_then(|state| state.inner.downcast_ref::<Option<crate::elements::RetainedState>>())
                     .and_then(Option::as_ref)
                     .and_then(|state| state.describe(self))
-                    .map_or_else(String::new, |text| strip_empty_groups(&strip_empty_replaced(&strip_draw_orders(&text))))
+                    .map_or_else(String::new, |text| strip_what_holds_nothing(&strip_draw_orders(&text)))
             })
             .collect()
     }
@@ -2322,6 +2322,18 @@ impl Window {
         if self.retained.mismatches.len() < 32 {
             self.retained.mismatches.push(message);
         }
+    }
+}
+
+/// `text` without the groups and the replaced masks that hold nothing, one inside the other.
+fn strip_what_holds_nothing(text: &str) -> String {
+    let mut text = text.to_owned();
+    loop {
+        let stripped = strip_empty_groups(&strip_empty_replaced(&text));
+        if stripped == text {
+            return text;
+        }
+        text = stripped;
     }
 }
 
