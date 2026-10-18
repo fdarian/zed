@@ -503,7 +503,10 @@ impl A11y {
 
     /// Gives the tree what the subtree gave it when it was recorded, at the place the node on
     /// top of the stack now has for it.
-    pub(crate) fn replay(&mut self, recording: &A11yRecording) {
+    ///
+    /// `delta` is how far the subtree was moved from where it was recorded, which moves the
+    /// bounds of its nodes, at `scale_factor` device pixels to a pixel.
+    pub(crate) fn replay(&mut self, recording: &A11yRecording, delta: Point<Pixels>, scale_factor: f32) {
         if let Some(parent) = self.nodes.nodes_stack.last_mut() {
             for child in &recording.top_children {
                 parent.push_child(*child);
@@ -512,7 +515,22 @@ impl A11y {
         for (id, node) in &recording.nodes {
             let claimed = self.nodes.seen_ids.insert(*id);
             debug_assert!(claimed, "Duplicate a11y node id: {id:?}");
-            self.nodes.all_nodes.push((*id, node.clone()));
+            let mut node = node.clone();
+            if !delta.is_zero()
+                && let Some(rect) = node.bounds()
+            {
+                let (dx, dy) = (
+                    f64::from(delta.x.0 * scale_factor),
+                    f64::from(delta.y.0 * scale_factor),
+                );
+                node.set_bounds(accesskit::Rect {
+                    x0: rect.x0 + dx,
+                    y0: rect.y0 + dy,
+                    x1: rect.x1 + dx,
+                    y1: rect.y1 + dy,
+                });
+            }
+            self.nodes.all_nodes.push((*id, node));
         }
         for (author_id, id) in &recording.authors {
             self.nodes.claim_author_id(author_id.clone(), *id);
@@ -524,7 +542,7 @@ impl A11y {
             self.set_focusable(*node_id, *focus_id);
         }
         for (node_id, bounds) in &recording.bounds {
-            self.set_node_bounds(*node_id, *bounds);
+            self.set_node_bounds(*node_id, Bounds::new(bounds.origin + delta, bounds.size));
         }
         for (node_id, action, listener) in &recording.actions {
             self.add_action_listener(*node_id, *action, listener.clone());

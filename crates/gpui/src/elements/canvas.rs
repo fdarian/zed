@@ -76,6 +76,8 @@ impl<T: 'static> Element for Canvas<T> {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<T> {
+        // The closures are the caller's, and may keep where the canvas is.
+        window.note_positioned_capture();
         Some(self.prepaint.take().unwrap()(bounds, window, cx))
     }
 

@@ -295,10 +295,10 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self)
+        text_layout.prepaint(bounds, self, window)
     }
 
     fn paint(
@@ -379,10 +379,10 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self.as_ref())
+        text_layout.prepaint(bounds, self.as_ref(), window)
     }
 
     fn paint(
@@ -694,7 +694,7 @@ impl Element for StyledText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text);
+        self.layout.prepaint(bounds, &self.text, window);
         if let Some(atomics) = &self.atomics {
             let origins = self.layout.atomic_origins(window.text_style().text_align);
             atomics.borrow_mut().prepaint(&origins, window, cx);
@@ -732,7 +732,7 @@ impl Element for StyledText {
         if self.atomics.is_some() {
             return self.prepaint(id, inspector_id, bounds, state, window, cx);
         }
-        self.layout.prepaint(bounds, &self.text);
+        self.layout.prepaint(bounds, &self.text, window);
     }
 
     fn paint_culled(
@@ -1146,13 +1146,32 @@ impl TextLayout {
         *self.0.borrow_mut() = measured;
     }
 
-    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
-        let mut element_state = self.0.borrow_mut();
-        let element_state = element_state
-            .as_mut()
-            .with_context(|| format!("measurement has not been performed on {text}"))
-            .unwrap();
-        element_state.bounds = Some(bounds);
+    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, window: &mut Window) {
+        {
+            let mut element_state = self.0.borrow_mut();
+            let element_state = element_state
+                .as_mut()
+                .with_context(|| format!("measurement has not been performed on {text}"))
+                .unwrap();
+            element_state.bounds = Some(bounds);
+        }
+        if window.tracks_relocation() {
+            let target = self.0.clone();
+            let described = self.0.clone();
+            window.note_relocated(
+                move |delta| {
+                    if let Some(inner) = target.borrow_mut().as_mut() {
+                        inner.bounds = Some(Bounds::new(bounds.origin + delta, bounds.size));
+                    }
+                },
+                move || {
+                    format!(
+                        "text bounds {:?}",
+                        described.borrow().as_ref().and_then(|inner| inner.bounds)
+                    )
+                },
+            );
+        }
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
@@ -1875,6 +1894,7 @@ impl Element for InteractiveText {
                     });
 
                     // Use bounds instead of testing hitbox since this is called during prepaint.
+                    window.note_positioned_capture();
                     let check_is_hovered_during_prepaint = Rc::new({
                         let source_bounds = hitbox.bounds;
                         let text_layout = text_layout.clone();

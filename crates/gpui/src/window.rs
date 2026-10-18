@@ -69,9 +69,10 @@ mod prompts;
 mod retained;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
-pub use retained::{NonReusable, RetainedCounters};
+pub use retained::{NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub(crate) use retained::{
-    PaintRecord, PrepaintRecord, RecordedHitboxes, ReplayKey, RetainedWindow,
+    PaintRecord, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey, RetainedWindow,
+    blocker_bit, first_blocker,
 };
 
 use self::a11y::A11y;
@@ -882,12 +883,86 @@ pub struct Hitbox {
 struct ExactClips {
     mask: ContentMask<Pixels>,
     outer: Option<Rc<ExactClips>>,
+    /// The mask is the one the clips started from, which the surroundings of a recorded subtree
+    /// replace when it is put elsewhere, see [`Hitbox::relocated`].
+    from_surroundings: bool,
 }
 
 impl ExactClips {
     fn contains(&self, position: Point<Pixels>) -> bool {
         self.mask.contains(&position)
             && self.outer.as_ref().is_none_or(|outer| outer.contains(position))
+    }
+
+    fn relocated(&self, delta: Point<Pixels>, surroundings: &ContentMask<Pixels>) -> ExactClips {
+        let mut mask = self.mask.translated(delta);
+        if self.from_surroundings {
+            mask = mask.intersect(surroundings);
+        }
+        ExactClips {
+            mask,
+            outer: self
+                .outer
+                .as_ref()
+                .map(|outer| Rc::new(outer.relocated(delta, surroundings))),
+            from_surroundings: self.from_surroundings,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match &self.outer {
+            Some(outer) => format!("{:?} in {}", self.mask, outer.describe()),
+            None => format!("{:?}", self.mask),
+        }
+    }
+}
+
+impl Hitbox {
+    /// The hitbox of a subtree that was recorded in a region and is put `delta` away from where it
+    /// was recorded, inside `surroundings`: moved, and cut by the content mask around it, which
+    /// the region stood in for when it was recorded.
+    pub(crate) fn relocated(&self, delta: Point<Pixels>, surroundings: &ContentMask<Pixels>) -> Hitbox {
+        let mut bounds = self.bounds;
+        bounds.origin += delta;
+        let clip = self.clip.as_ref().map(|clip| {
+            let mut clip = (**clip).clone();
+            clip.translate(point(delta.x.0, delta.y.0));
+            Rc::new(clip)
+        });
+        Hitbox {
+            id: self.id,
+            bounds,
+            content_mask: self.content_mask.translated(delta).intersect(surroundings),
+            behavior: self.behavior,
+            corner_radii: self.corner_radii,
+            identity: self.identity.clone(),
+            parent: self.parent,
+            clip,
+            exact_clips: self
+                .exact_clips
+                .as_ref()
+                .map(|clips| Rc::new(clips.relocated(delta, surroundings))),
+        }
+    }
+
+    /// The hitbox as text, for comparing the frames of two builds of the same subtree.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?} {:?} clip {:?} exact {}",
+            self.identity,
+            self.bounds,
+            self.content_mask,
+            self.behavior,
+            self.corner_radii,
+            self.clip,
+            self.exact_clips.as_ref().map_or_else(String::new, |clips| clips.describe()),
+        )
+    }
+
+    /// Whether the pointer can be on the hitbox anywhere, which a hitbox cut away by its mask
+    /// cannot.
+    pub(crate) fn is_reachable(&self) -> bool {
+        !self.bounds.intersect(&self.content_mask.bounds).is_empty()
     }
 }
 
@@ -2487,6 +2562,14 @@ impl ContentMask<Pixels> {
         }
     }
 
+    /// The mask moved by `delta`.
+    pub(crate) fn translated(&self, delta: Point<Pixels>) -> Self {
+        ContentMask {
+            bounds: Bounds::new(self.bounds.origin + delta, self.bounds.size),
+            ..*self
+        }
+    }
+
     /// The radii of the rounded corners.
     pub fn radii(&self) -> CornerRadii<Pixels> {
         CornerRadii {
@@ -2513,7 +2596,7 @@ impl ContentMask<Pixels> {
         CornerRadii::new(self.corner_radii, self.corner_radii_y, self.bounds.size)
     }
 
-    fn is_rounded(&self) -> bool {
+    pub(crate) fn is_rounded(&self) -> bool {
         let radii = &self.corner_radii;
         [radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left]
             .iter()
@@ -4905,7 +4988,7 @@ impl Window {
     pub(crate) fn reuse_prepaint_with(
         &mut self,
         range: Range<PrepaintStateIndex>,
-        recorded: Option<&RecordedHitboxes>,
+        recorded: Option<(&RecordedHitboxes, Option<&(Point<Pixels>, ContentMask<Pixels>)>)>,
     ) {
         // Hitboxes keep their ids across frames but the enclosing hitbox is re-inserted, with a
         // new id, every time its element prepaints. The reused hitboxes that hung off the old
@@ -4914,7 +4997,9 @@ impl Window {
         let stale_parent = range.start.hitbox_parent;
         self.next_frame.hitboxes_changed();
         match recorded {
-            Some(recorded) => self.insert_recorded_hitboxes(recorded, current_parent),
+            Some((recorded, relocated)) => {
+                self.insert_recorded_hitboxes(recorded, current_parent, relocated)
+            }
             None => self.next_frame.hitboxes.extend(
                 self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                     .iter()
@@ -4986,7 +5071,7 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
-        self.reuse_paint_with(range, None);
+        self.reuse_paint_with(range, None, true);
     }
 
     /// [`Self::reuse_paint`], taking the tab stops from `recorded` instead of from the range of
@@ -4996,6 +5081,7 @@ impl Window {
         &mut self,
         range: Range<PaintIndex>,
         recorded_tab_stops: Option<&[TabStopOperation]>,
+        from_scene: bool,
     ) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
@@ -5035,18 +5121,22 @@ impl Window {
             }
         });
         #[cfg(any(test, feature = "test-support"))]
-        for (selector, bounds) in
-            &self.rendered_frame.debug_bounds_log[range.start.debug_bounds_index..range.end.debug_bounds_index]
-        {
-            self.next_frame.insert_debug_bounds(selector.clone(), *bounds);
+        if from_scene {
+            for (selector, bounds) in &self.rendered_frame.debug_bounds_log
+                [range.start.debug_bounds_index..range.end.debug_bounds_index]
+            {
+                self.next_frame.insert_debug_bounds(selector.clone(), *bounds);
+            }
         }
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
-        self.next_frame.scene.replay(
-            range.start.scene_index..range.end.scene_index,
-            &self.rendered_frame.scene,
-        );
+        if from_scene {
+            self.next_frame.scene.replay(
+                range.start.scene_index..range.end.scene_index,
+                &self.rendered_frame.scene,
+            );
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -5138,6 +5228,9 @@ impl Window {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
             let mask = mask.intersect(&self.content_mask());
+            if mask.is_rounded() && self.retained.relocation.is_some() {
+                self.note_rounded_mask(mask);
+            }
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -5172,9 +5265,8 @@ impl Window {
         let Some(mask) = mask else {
             return f(self);
         };
-        if !self.next_frame.scene.effect_groups_enabled()
-            || mask.intersection_is_exact(&self.content_mask())
-        {
+        let current = self.content_mask();
+        if !self.next_frame.scene.effect_groups_enabled() || self.clip_is_exact(&mask, &current) {
             return self.with_content_mask(Some(mask), f);
         }
         let effect = GroupEffect {
@@ -5203,7 +5295,7 @@ impl Window {
         let current = self.content_mask();
         // Inside an inexact clip the approximate mask of a hitbox is not consulted for its
         // corners, so every clip that rounds one has to be in the list from there on.
-        let exact = self.exact_clips.is_none() && mask.intersection_is_exact(&current);
+        let exact = self.exact_clips.is_none() && self.clip_is_exact(&mask, &current);
         if exact {
             return self.with_content_mask(Some(mask), f);
         }
@@ -5213,9 +5305,14 @@ impl Window {
             None => Some(Rc::new(ExactClips {
                 mask: current,
                 outer: None,
+                from_surroundings: true,
             })),
         };
-        self.exact_clips = Some(Rc::new(ExactClips { mask, outer }));
+        self.exact_clips = Some(Rc::new(ExactClips {
+            mask,
+            outer,
+            from_surroundings: false,
+        }));
         let result = self.with_content_mask(Some(mask), f);
         self.exact_clips = previous;
         result
@@ -5303,6 +5400,7 @@ impl Window {
 
     /// The content mask and element offset a box that escapes to `escape` is drawn with.
     pub(crate) fn escape_frame(&self, escape: Escape) -> (ContentMask<Pixels>, Point<Pixels>) {
+        self.note_escape_frame(escape);
         let viewport = ContentMask::from_bounds(Bounds::new(Point::default(), self.viewport_size));
         match escape {
             Escape::Viewport => (viewport, Point::default()),

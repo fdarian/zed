@@ -267,6 +267,7 @@ impl Interactivity {
         &mut self,
         listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) {
+        self.listens_by_bounds = true;
         self.mouse_down_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Capture
@@ -344,6 +345,7 @@ impl Interactivity {
     ) where
         T: 'static,
     {
+        self.listens_by_bounds = true;
         self.mouse_move_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Capture
@@ -2245,6 +2247,8 @@ impl Element for Div {
         if !insets.any() {
             return Point::default();
         }
+        // Where a sticky box is depends on the viewport and not on the subtree it is in.
+        window.note_sticky();
         let viewport = Bounds::new(Point::default(), window.viewport_size());
         sticky::offset(layout_bounds, insets, viewport)
     }
@@ -2329,6 +2333,7 @@ impl Div {
         let mut child_max = bounds.origin;
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
+            window.note_positioned_capture();
         }
         let mut child_min = point(Pixels::MAX, Pixels::MAX);
         let content_size = if request_layout.child_layout_ids.is_empty() {
@@ -2342,6 +2347,9 @@ impl Div {
                 child_max = child_max.max(&child_bounds.bottom_right());
                 state.child_bounds.push(child_bounds);
             }
+            let child_bounds = state.child_bounds.clone();
+            drop(state);
+            note_scroll_children(scroll_handle, child_bounds, window);
             (child_max - child_min).into()
         } else {
             for child_layout_id in &request_layout.child_layout_ids {
@@ -2759,6 +2767,9 @@ pub struct Interactivity {
     pub(crate) escape_inside: bool,
     pub(crate) hitbox_behavior: HitboxBehavior,
     pub(crate) capture_pointer: bool,
+    /// A listener reads the bounds of the element's hitbox when it runs, which a retained subtree
+    /// replayed elsewhere would leave where they were.
+    pub(crate) listens_by_bounds: bool,
     pub(crate) always_hitbox: bool,
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
@@ -3273,7 +3284,15 @@ impl Interactivity {
                     ),
                 );
             }
+            if let Some(handle) = self.tracked_scroll_handle.as_ref() {
+                note_scroll_bounds(handle, window);
+            }
 
+            // A scroller that is scrolled puts its children where its own offset says, which the
+            // subtree around it cannot move.
+            if !scroll_offset.is_zero() {
+                window.note_nested_scroll();
+            }
             *scroll_offset
         } else {
             Point::default()
@@ -3589,6 +3608,15 @@ impl Interactivity {
             .as_ref()
             .map(|handle| handle.is_focused(window))
             .unwrap_or(false);
+
+        // The listeners that read where the element is when they run read the hitbox they hold.
+        if self.listens_by_bounds
+            || self.drag_listener.is_some()
+            || self.tooltip_builder.is_some()
+            || (is_focused && !self.click_listeners.is_empty())
+        {
+            window.note_positioned_capture();
+        }
 
         // If this element can be focused, register a mouse down listener
         // that will automatically transfer focus when hitting the element.
@@ -5114,6 +5142,49 @@ impl ScrollAnchor {
             this.handle.set_offset(viewport_bounds.origin - self_bounds);
         });
     }
+}
+
+/// Says that the bounds a scroll handle holds are the ones of a subtree that is recorded to be
+/// put elsewhere, which moves them with it.
+fn note_scroll_bounds(handle: &ScrollHandle, window: &mut Window) {
+    if !window.tracks_relocation() {
+        return;
+    }
+    let (bounds, padding_box) = {
+        let state = handle.0.borrow();
+        (state.bounds, state.padding_box)
+    };
+    let target = handle.0.clone();
+    let described = handle.0.clone();
+    window.note_relocated(
+        move |delta| {
+            let mut state = target.borrow_mut();
+            state.bounds = Bounds::new(bounds.origin + delta, bounds.size);
+            state.padding_box = Bounds::new(padding_box.origin + delta, padding_box.size);
+        },
+        move || {
+            let state = described.borrow();
+            format!("scroll bounds {:?} padding box {:?}", state.bounds, state.padding_box)
+        },
+    );
+}
+
+/// Likewise for the bounds of the children a scroll handle holds.
+fn note_scroll_children(handle: &ScrollHandle, children: Vec<Bounds<Pixels>>, window: &mut Window) {
+    if !window.tracks_relocation() {
+        return;
+    }
+    let target = handle.0.clone();
+    let described = handle.0.clone();
+    window.note_relocated(
+        move |delta| {
+            target.borrow_mut().child_bounds = children
+                .iter()
+                .map(|bounds| Bounds::new(bounds.origin + delta, bounds.size))
+                .collect();
+        },
+        move || format!("scroll children {:?}", described.borrow().child_bounds),
+    );
 }
 
 #[derive(Default, Debug)]

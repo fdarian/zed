@@ -165,6 +165,21 @@ impl Scene {
         self.current_mut().layer_stack.pop();
     }
 
+    /// A scene to record the operations of a painter in, instead of this one: it renders as this
+    /// one would, and is hidden when this one is.
+    pub(crate) fn recorder(&self) -> Scene {
+        Scene {
+            effect_groups_enabled: self.effect_groups_enabled,
+            hidden: self.hidden,
+            ..Scene::default()
+        }
+    }
+
+    /// The operations that were recorded, to be put into another scene.
+    pub(crate) fn into_operations(self) -> Vec<PaintOperation> {
+        self.paint_operations
+    }
+
     /// While hidden, primitives are dropped (`visibility: hidden`): the element keeps its box in
     /// the layout, and effect groups and layers still open and close around nothing.
     pub fn set_hidden(&mut self, hidden: bool) {

@@ -3,7 +3,9 @@
 //! puts a recording into the frame being built.
 
 use super::*;
+use crate::scene::{PaintOperation, ReplayClip};
 use crate::LayoutCounters;
+use std::cell::Cell;
 
 /// Why the recording of a retained subtree cannot be replayed, so the subtree is built again
 /// every frame it is asked for.
@@ -73,6 +75,78 @@ impl NonReusable {
     }
 }
 
+/// Why the recording of a [relocatable](crate::Retained::relocatable) retained subtree can be
+/// replayed where it was recorded and not where its surroundings moved it by a whole number of
+/// device pixels, as a scroller moves its content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NonRelocatable {
+    /// A box in the subtree is sticky, which is placed by the viewport and not by the subtree.
+    Sticky,
+    /// A box in the subtree escapes to a containing block outside the subtree, or to the
+    /// viewport: it stays where it is when the subtree moves.
+    Escape,
+    /// Something kept a position of the subtree to read it later (a drag, a keyboard click, a
+    /// tooltip), see [`Window::note_positioned_capture`].
+    PositionedCapture,
+    /// The subtree registered an input handler.
+    InputHandler,
+    /// A box in the subtree is a scroller that is scrolled.
+    NestedScroll,
+    /// A listener reports to its owner, who takes the translation of a replay, see
+    /// [`crate::Retained::on_replay_translated`], when it is relocatable.
+    Publication,
+    /// A rounded clip in the subtree is cut by the content mask around it, which painting does
+    /// not do exactly.
+    Clip,
+    /// The scale factor of the window is not a power of two, where the shifted positions are not
+    /// the positions shifted.
+    Scale,
+}
+
+impl NonRelocatable {
+    /// Every reason, in the order the first that applies to a recording is the one counted.
+    pub const ALL: [NonRelocatable; 8] = [
+        NonRelocatable::Scale,
+        NonRelocatable::Sticky,
+        NonRelocatable::Escape,
+        NonRelocatable::PositionedCapture,
+        NonRelocatable::InputHandler,
+        NonRelocatable::NestedScroll,
+        NonRelocatable::Publication,
+        NonRelocatable::Clip,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|reason| *reason == self)
+            .expect("every reason is listed in ALL")
+    }
+}
+
+/// Why a relocatable subtree was built again instead of being replayed where its surroundings
+/// had moved it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RelocationMiss {
+    /// What the subtree reads of its surroundings differs in more than where it is.
+    Place,
+    /// The part of the subtree that shows now was not recorded: it is past the region that was.
+    Region,
+    /// A rounded clip in the subtree meets the content mask around it differently than when it
+    /// was recorded.
+    Clip,
+}
+
+impl RelocationMiss {
+    /// Every reason.
+    pub const ALL: [RelocationMiss; 3] =
+        [RelocationMiss::Place, RelocationMiss::Region, RelocationMiss::Clip];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// What retained subtrees did in a window, since it was made.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedCounters {
@@ -102,9 +176,18 @@ pub struct RetainedCounters {
     pub verified: u64,
     /// Of those, the frames that were not the same as the build.
     pub mismatches: u64,
+    /// Replays of a relocatable subtree where its surroundings had moved it, which is a build
+    /// that was not made.
+    pub relocations: u64,
     /// Recordings that cannot be replayed, by their first reason: index with
     /// [`RetainedCounters::non_reusable`].
     non_reusable: [u64; NonReusable::ALL.len()],
+    /// Recordings of relocatable subtrees that cannot be replayed elsewhere, by their first
+    /// reason: index with [`RetainedCounters::non_relocatable`].
+    non_relocatable: [u64; NonRelocatable::ALL.len()],
+    /// Subtrees that were built again, though they were recorded relocatably and the same but for
+    /// where they are, by the reason: index with [`RetainedCounters::relocation_misses`].
+    relocation_misses: [u64; RelocationMiss::ALL.len()],
 }
 
 impl RetainedCounters {
@@ -120,6 +203,26 @@ impl RetainedCounters {
 
     pub(crate) fn count_non_reusable(&mut self, reason: NonReusable) {
         self.non_reusable[reason.index()] += 1;
+    }
+
+    /// How many recordings could not be replayed elsewhere than where they were made, for
+    /// `reason`, it being the first that applied.
+    pub fn non_relocatable(&self, reason: NonRelocatable) -> u64 {
+        self.non_relocatable[reason.index()]
+    }
+
+    /// How many subtrees recorded relocatably were built again for `reason` though only their
+    /// place differed.
+    pub fn relocation_misses(&self, reason: RelocationMiss) -> u64 {
+        self.relocation_misses[reason.index()]
+    }
+
+    pub(crate) fn count_non_relocatable(&mut self, reason: NonRelocatable) {
+        self.non_relocatable[reason.index()] += 1;
+    }
+
+    pub(crate) fn count_relocation_miss(&mut self, reason: RelocationMiss) {
+        self.relocation_misses[reason.index()] += 1;
     }
 }
 
@@ -148,6 +251,14 @@ pub(crate) struct RetainedWindow {
     pub(crate) autoscroll_requests: u32,
     pub(crate) pending_assets: u32,
     pub(crate) cached_view_hits: u32,
+    /// The subtree being recorded so that it can be put elsewhere, see [`Relocation`].
+    pub(crate) relocation: Option<Relocation>,
+    // Counts of what a recording cannot move, which tick through a shared reference: they are
+    // noted where the window is only read.
+    pub(crate) sticky: Cell<u32>,
+    pub(crate) unframed_escapes: Cell<u32>,
+    pub(crate) positioned_captures: Cell<u32>,
+    pub(crate) nested_scrolls: Cell<u32>,
 }
 
 /// What a recording of a retained subtree could not repeat happened, if the counts differ.
@@ -165,9 +276,34 @@ struct Effects {
     window_controls: usize,
     layout_runs: u64,
     unstable_requests: u64,
+    sticky: u32,
+    unframed_escapes: u32,
+    positioned_captures: u32,
+    nested_scrolls: u32,
+    input_handlers: usize,
 }
 
 impl Effects {
+    /// The reasons the subtree cannot be put elsewhere, that happened between `self` and `later`,
+    /// as a set of [`NonRelocatable`] indices.
+    fn blockers(&self, later: &Effects) -> u16 {
+        let mut reasons = 0u16;
+        let mut add = |differs: bool, reason: NonRelocatable| {
+            if differs {
+                reasons |= 1 << reason.index();
+            }
+        };
+        add(self.sticky != later.sticky, NonRelocatable::Sticky);
+        add(self.unframed_escapes != later.unframed_escapes, NonRelocatable::Escape);
+        add(
+            self.positioned_captures != later.positioned_captures,
+            NonRelocatable::PositionedCapture,
+        );
+        add(self.input_handlers != later.input_handlers, NonRelocatable::InputHandler);
+        add(self.nested_scrolls != later.nested_scrolls, NonRelocatable::NestedScroll);
+        reasons
+    }
+
     /// The reasons the counts of `self` and `later` differ in, as a set of [`NonReusable`]
     /// indices.
     fn reasons(&self, later: &Effects) -> u16 {
@@ -226,6 +362,17 @@ fn first_reason(reasons: u16) -> Option<NonReusable> {
         .find(|reason| reasons & (1 << reason.index()) != 0)
 }
 
+/// The first of the reasons in `reasons`, a set of [`NonRelocatable`] indices.
+pub(crate) fn first_blocker(reasons: u16) -> Option<NonRelocatable> {
+    NonRelocatable::ALL
+        .into_iter()
+        .find(|reason| reasons & (1 << reason.index()) != 0)
+}
+
+pub(crate) fn blocker_bit(reason: NonRelocatable) -> u16 {
+    1 << reason.index()
+}
+
 /// The hitboxes a retained subtree inserted, by value: a stacking context around the subtree
 /// moves the hitboxes of a frame about once it has them all.
 pub(crate) struct RecordedHitboxes {
@@ -254,6 +401,8 @@ pub(crate) struct PrepaintRecord {
     a11y: Option<Rc<a11y::A11yRecording>>,
     /// A listener that reports to its owner ran, and a replay does not run it again.
     pub(crate) has_publications: bool,
+    /// The reasons the prepaint cannot be put elsewhere, as [`Effects::blockers`] gives them.
+    pub(crate) blockers: u16,
 }
 
 /// Where the state of the frame was when the paint of a retained subtree started.
@@ -270,6 +419,14 @@ pub(crate) struct PaintRecord {
     /// What paint gives the accessibility tree: the action listeners of the nodes.
     a11y: Option<Rc<a11y::A11yRecording>>,
     pub(crate) has_publications: bool,
+    /// The reasons the paint cannot be put elsewhere, as [`Effects::blockers`] gives them.
+    pub(crate) blockers: u16,
+    /// What the paint of a relocatable subtree put into the scene, as it was recorded: the
+    /// scene of the frame has it moved and cut by the content mask it was put in.
+    pub(crate) operations: Option<Rc<[PaintOperation]>>,
+    /// The bounds the paint named for the tests, as they were recorded.
+    #[cfg(any(test, feature = "test-support"))]
+    debug_bounds: Rc<[(String, Bounds<Pixels>)]>,
     #[cfg(debug_assertions)]
     ambient: PaintAmbient,
 }
@@ -286,8 +443,22 @@ struct PaintAmbient {
     rem_size: Pixels,
 }
 
+#[cfg(debug_assertions)]
+impl PaintAmbient {
+    /// Whether `later` is what this was, but for the content mask if the recording is made to be
+    /// put under another.
+    fn matches(&self, later: &PaintAmbient, any_mask: bool) -> bool {
+        (any_mask || self.content_mask == later.content_mask)
+            && self.text_style == later.text_style
+            && self.visibility == later.visibility
+            && self.element_opacity == later.element_opacity
+            && self.rem_size == later.rem_size
+    }
+}
+
 /// What the prepaint of a retained subtree reads of the elements around it. A recording is
-/// replayed only where this is what it was recorded with.
+/// replayed only where this is what it was recorded with, or for a relocatable subtree where it
+/// is that but for a whole number of device pixels along, see [`ReplayKey::relocation`].
 #[derive(PartialEq)]
 pub(crate) struct ReplayKey {
     bounds: Bounds<Pixels>,
@@ -301,6 +472,12 @@ pub(crate) struct ReplayKey {
     viewport_size: Size<Pixels>,
     positioned_frame: Option<(ContentMask<Pixels>, Point<Pixels>)>,
     element_offset: Point<Pixels>,
+    /// Where the layout engine puts the root, before the element offset moves it.
+    layout_origin: Point<Pixels>,
+    /// [`ReplayKey::element_offset`] and the one of the positioned frame snapped to the device
+    /// pixel, which is how far everything laid out moves with them.
+    snapped_offset: Point<Pixels>,
+    snapped_frame_offset: Option<Point<Pixels>>,
     current_view: Option<EntityId>,
     image_cache: Option<EntityId>,
     a11y_active: bool,
@@ -320,6 +497,203 @@ impl ReplayKey {
         self.rem_size == window.rem_size()
             && self.scale_factor == window.scale_factor
             && self.text_style == window.text_style()
+    }
+
+    /// How far the surroundings of `later` have moved the subtree from where this key recorded
+    /// it, if that is all that differs: the same layout, the same everything the subtree reads,
+    /// and the offset of the elements around it (a scroll) moved by a whole number of device
+    /// pixels. The content mask around the subtree is allowed to differ, see
+    /// [`Relocation::fits`] for what it has to be.
+    ///
+    /// Needs a scale factor that is a power of two, where a position shifted by a whole number of
+    /// device pixels is exactly the shifted position, and an ambient content mask that has no
+    /// rounded corners and is not cut by an exact clip.
+    pub(crate) fn relocation(&self, later: &ReplayKey) -> Option<Point<Pixels>> {
+        let power_of_two = self.scale_factor > 0. && self.scale_factor.to_bits() & 0x007f_ffff == 0;
+        if !power_of_two
+            || !self.exact_clips.is_empty()
+            || !later.exact_clips.is_empty()
+            || self.content_mask.is_rounded()
+            || later.content_mask.is_rounded()
+            || self.layout_origin != later.layout_origin
+            || self.bounds.size != later.bounds.size
+            || self.text_style != later.text_style
+            || self.visibility != later.visibility
+            || self.element_opacity != later.element_opacity
+            || self.rem_size != later.rem_size
+            || self.scale_factor != later.scale_factor
+            || self.viewport_size != later.viewport_size
+            || self.current_view != later.current_view
+            || self.image_cache != later.image_cache
+            || self.a11y_active != later.a11y_active
+            || self.culling != later.culling
+            || self.lifting != later.lifting
+            || self.dom_hit_testing != later.dom_hit_testing
+        {
+            return None;
+        }
+        let delta = later.snapped_offset - self.snapped_offset;
+        if self.bounds.origin + delta != later.bounds.origin {
+            return None;
+        }
+        match (self.snapped_frame_offset, later.snapped_frame_offset) {
+            (None, None) => {}
+            (Some(before), Some(after)) if after - before == delta => {}
+            _ => return None,
+        }
+        Some(delta)
+    }
+}
+
+/// What a recording of a relocatable subtree needs to be put elsewhere: where it was recorded,
+/// and what painting decided about the clips in it that depends on the content mask around.
+#[derive(Clone)]
+pub(crate) struct RelocationInfo {
+    /// The bounds the subtree was prepainted and painted in, instead of the content mask around
+    /// it: what that shows of it plus what scrolling could soon show. The part of its extent
+    /// outside this was left out.
+    region: Bounds<Pixels>,
+    /// Where the subtree can draw and be hit, if its owner says: the root's box and the
+    /// outset it vouches for.
+    extent: Option<Bounds<Pixels>>,
+    /// The rounded content masks the subtree painted and hit under.
+    rounded: Vec<ContentMask<Pixels>>,
+    decisions: Vec<ClipDecision>,
+}
+
+/// Whether a clip that painting or hit testing makes exactly (see
+/// [`Window::with_exact_content_mask`]) was found exact against the mask around, which decides
+/// whether it is made with a group or with a mask.
+#[derive(Clone)]
+struct ClipDecision {
+    mask: ContentMask<Pixels>,
+    /// The content mask the clip was made inside, which holds the region.
+    outer: ContentMask<Pixels>,
+    exact: bool,
+}
+
+impl RelocationInfo {
+    /// Whether the subtree recorded here is what painting it `delta` away, inside `ambient`,
+    /// would make. The part of it that is visible there must be inside what was recorded, and no
+    /// rounded clip may be cut by `ambient`, or cut differently than painting under `ambient`
+    /// at the place it was recorded cut it.
+    pub(crate) fn fits(
+        &self,
+        delta: Point<Pixels>,
+        ambient: &ContentMask<Pixels>,
+    ) -> Result<(), RelocationMiss> {
+        let region = Bounds::new(self.region.origin + delta, self.region.size);
+        let visible = match self.extent {
+            Some(extent) => ambient
+                .bounds
+                .intersect(&Bounds::new(extent.origin + delta, extent.size)),
+            None => ambient.bounds,
+        };
+        if !covers(&region, &visible) {
+            return Err(RelocationMiss::Region);
+        }
+        let ambient = ContentMask::from_bounds(ambient.bounds);
+        let clips_fit = self
+            .rounded
+            .iter()
+            .all(|mask| mask.translated(delta).intersection_is_exact(&ambient))
+            && self.decisions.iter().all(|decision| {
+                let outer = decision.outer.translated(delta).intersect(&ambient);
+                decision.mask.translated(delta).intersection_is_exact(&outer) == decision.exact
+            });
+        if !clips_fit {
+            return Err(RelocationMiss::Clip);
+        }
+        Ok(())
+    }
+}
+
+/// Whether `outer` contains all of `inner`.
+fn covers(outer: &Bounds<Pixels>, inner: &Bounds<Pixels>) -> bool {
+    inner.is_empty()
+        || (outer.left() <= inner.left()
+            && outer.top() <= inner.top()
+            && outer.right() >= inner.right()
+            && outer.bottom() >= inner.bottom())
+}
+
+/// Something a subtree holds outside the frame that is moved with it, such as the bounds of a text
+/// that a handle outside the frame reads.
+#[derive(Clone)]
+pub(crate) struct Relocated {
+    /// Sets it to what it was when the subtree was recorded, moved by `delta`.
+    apply: Rc<dyn Fn(Point<Pixels>)>,
+    /// What it is now, as text.
+    describe: Rc<dyn Fn() -> String>,
+}
+
+/// A subtree recorded so that it can be put elsewhere: the part of the recording that is not in
+/// the frame.
+pub(crate) struct Relocation {
+    pub(crate) info: RelocationInfo,
+    pub(crate) handles: Vec<Relocated>,
+    /// The content mask around the subtree when it was recorded.
+    pub(crate) ambient: ContentMask<Pixels>,
+    /// Nothing is recorded in a scene of its own and the content mask around is the one used:
+    /// the subtree is built as a replay of it would be, to compare with, and only what it holds
+    /// outside the frame is noted.
+    pub(crate) direct: bool,
+    /// How many positioned frames the surroundings had.
+    frames_below: usize,
+    saved_exact_clips: Option<Rc<ExactClips>>,
+    saved_scene: Option<Scene>,
+}
+
+impl Relocation {
+    /// A recording of a subtree whose box is `bounds`, in a region that reaches `overscan` past
+    /// the content mask `ambient` around it. `outset` is how far the subtree draws and is hit
+    /// outside its box, when its owner says.
+    pub(crate) fn new(
+        ambient: ContentMask<Pixels>,
+        overscan: Pixels,
+        bounds: Bounds<Pixels>,
+        outset: Option<Edges<Pixels>>,
+        direct: bool,
+    ) -> Self {
+        let extent = outset.map(|outset| {
+            Bounds::from_corners(
+                point(bounds.left() - outset.left, bounds.top() - outset.top),
+                point(bounds.right() + outset.right, bounds.bottom() + outset.bottom),
+            )
+        });
+        let mut region = ambient.bounds.dilate(overscan);
+        if let Some(extent) = extent {
+            region = region.intersect(&extent);
+        }
+        Self {
+            info: RelocationInfo {
+                region,
+                extent,
+                rounded: Vec::new(),
+                decisions: Vec::new(),
+            },
+            handles: Vec::new(),
+            ambient,
+            direct,
+            frames_below: 0,
+            saved_exact_clips: None,
+            saved_scene: None,
+        }
+    }
+
+    /// Moves what the subtree holds outside the frame to where `delta` from the recording puts it.
+    pub(crate) fn apply(&self, delta: Point<Pixels>) {
+        for handle in &self.handles {
+            (handle.apply)(delta);
+        }
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        self.handles
+            .iter()
+            .map(|handle| (handle.describe)())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -516,6 +890,11 @@ impl Window {
             window_controls: self.next_frame.window_control_hitboxes.len(),
             layout_runs: engine.runs(),
             unstable_requests: engine.unstable_requests(),
+            sticky: self.retained.sticky.get(),
+            unframed_escapes: self.retained.unframed_escapes.get(),
+            positioned_captures: self.retained.positioned_captures.get(),
+            nested_scrolls: self.retained.nested_scrolls.get(),
+            input_handlers: self.next_frame.input_handlers.len(),
         }
     }
 
@@ -531,20 +910,31 @@ impl Window {
     }
 
     /// Ends the recording, and returns it unless something in the subtree could not be repeated.
+    ///
+    /// `surroundings` is the content mask around the subtree when it was recorded in a region of
+    /// its own (see [`Relocation`]): the hitboxes it inserted are recorded as they were, with
+    /// the region as their mask, and the ones in the frame are cut by `surroundings` as they
+    /// would have been had the subtree been prepainted under it.
     pub(crate) fn finish_prepaint_recording(
         &mut self,
         mark: PrepaintMark,
+        surroundings: Option<&ContentMask<Pixels>>,
     ) -> Result<PrepaintRecord, NonReusable> {
         let end = self.prepaint_index();
         let effects = self.effects();
         let a11y = mark.a11y.map(|mark| self.a11y.end_recording(mark));
+        let hitbox_range = mark.index.hitboxes_index..end.hitboxes_index;
         if let Some(reason) = first_reason(mark.effects.reasons(&effects)) {
+            if let Some(surroundings) = surroundings {
+                self.relocate_hitboxes_in_place(hitbox_range, surroundings);
+            }
             return Err(reason);
         }
         let stale_parent = mark.index.hitbox_parent;
-        let hitboxes = self.next_frame.hitboxes
-            [mark.index.hitboxes_index..end.hitboxes_index]
-            .to_vec();
+        let hitboxes = self.next_frame.hitboxes[hitbox_range.clone()].to_vec();
+        if let Some(surroundings) = surroundings {
+            self.relocate_hitboxes_in_place(hitbox_range, surroundings);
+        }
         let roots = hitboxes
             .iter()
             .enumerate()
@@ -560,20 +950,32 @@ impl Window {
             hitboxes: Rc::new(RecordedHitboxes { hitboxes, roots }),
             a11y: a11y.map(Rc::new),
             has_publications: mark.effects.published(&effects),
+            blockers: mark.effects.blockers(&effects),
         })
     }
 
+    fn relocate_hitboxes_in_place(&mut self, range: Range<usize>, surroundings: &ContentMask<Pixels>) {
+        for hitbox in &mut self.next_frame.hitboxes[range] {
+            *hitbox = hitbox.relocated(Point::default(), surroundings);
+        }
+        self.next_frame.hitboxes_changed();
+    }
+
     /// Puts what the prepaint of the subtree left in the frame before into the frame being
-    /// built, and returns where it is now.
+    /// built, and returns where it is now. A subtree recorded to be put elsewhere is put
+    /// `delta` from where it was recorded, inside the content mask that is around now.
     pub(crate) fn replay_prepaint(
         &mut self,
         record: &PrepaintRecord,
+        delta: Option<Point<Pixels>>,
     ) -> Range<PrepaintStateIndex> {
         self.invalidator.debug_assert_prepaint();
         let start = self.prepaint_index();
-        self.reuse_prepaint_with(record.range.clone(), Some(&record.hitboxes));
+        let relocated = delta.map(|delta| (delta, self.content_mask()));
+        self.reuse_prepaint_with(record.range.clone(), Some((&record.hitboxes, relocated.as_ref())));
         if let Some(a11y) = &record.a11y {
-            self.a11y.replay(a11y);
+            let scale_factor = self.scale_factor;
+            self.a11y.replay(a11y, delta.unwrap_or_default(), scale_factor);
         }
         if record.has_publications {
             self.note_publication();
@@ -603,10 +1005,14 @@ impl Window {
         &mut self,
         recorded: &RecordedHitboxes,
         parent: Option<HitboxId>,
+        relocated: Option<&(Point<Pixels>, ContentMask<Pixels>)>,
     ) {
         let mut roots = recorded.roots.iter().copied().peekable();
         for (position, hitbox) in recorded.hitboxes.iter().enumerate() {
-            let mut hitbox = hitbox.clone();
+            let mut hitbox = match relocated {
+                Some((delta, surroundings)) => hitbox.relocated(*delta, surroundings),
+                None => hitbox.clone(),
+            };
             if roots.next_if_eq(&position).is_some() {
                 hitbox.parent = parent;
             }
@@ -628,9 +1034,12 @@ impl Window {
         }
     }
 
+    /// Ends the recording of the paint. `operations` are what a relocatable subtree put into the
+    /// scene, which the frame has moved and cut, see [`Window::emit_relocated`].
     pub(crate) fn finish_paint_recording(
         &mut self,
         mark: PaintMark,
+        operations: Option<Rc<[PaintOperation]>>,
     ) -> Result<PaintRecord, NonReusable> {
         let end = self.paint_index();
         let effects = self.effects();
@@ -641,31 +1050,59 @@ impl Window {
         let tab_stops = self.next_frame.tab_stops.insertion_history
             [mark.index.tab_handle_index..end.tab_handle_index]
             .into();
+        #[cfg(any(test, feature = "test-support"))]
+        let debug_bounds = if operations.is_some() {
+            self.next_frame.debug_bounds_log
+                [mark.index.debug_bounds_index..end.debug_bounds_index]
+                .into()
+        } else {
+            Rc::default()
+        };
         Ok(PaintRecord {
             range: mark.index..end,
             tab_stops,
             a11y: a11y.map(Rc::new),
             has_publications: mark.effects.published(&effects),
+            blockers: mark.effects.blockers(&effects),
+            operations,
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds,
             #[cfg(debug_assertions)]
             ambient: self.paint_ambient(),
         })
     }
 
+    /// Puts what the paint of the subtree left in the frame before into the frame being built.
+    /// A subtree recorded to be put elsewhere puts its operations `delta` from where they were
+    /// recorded, inside the content mask that is around now.
     pub(crate) fn replay_paint(
         &mut self,
         record: &PaintRecord,
         nested: &[(GlobalElementId, TypeId)],
+        delta: Point<Pixels>,
     ) -> Range<PaintIndex> {
         self.invalidator.debug_assert_paint();
         #[cfg(debug_assertions)]
         debug_assert!(
-            record.ambient == self.paint_ambient(),
+            record.ambient.matches(&self.paint_ambient(), record.operations.is_some()),
             "a retained subtree is painted where its recording was painted"
         );
         let start = self.paint_index();
-        self.reuse_paint_with(record.range.clone(), Some(&record.tab_stops));
+        self.reuse_paint_with(
+            record.range.clone(),
+            Some(&record.tab_stops),
+            record.operations.is_none(),
+        );
+        if let Some(operations) = &record.operations {
+            self.emit_relocated(operations, delta);
+            #[cfg(any(test, feature = "test-support"))]
+            for (selector, bounds) in record.debug_bounds.iter() {
+                let bounds = Bounds::new(bounds.origin + delta, bounds.size);
+                self.next_frame.insert_debug_bounds(selector.clone(), bounds);
+            }
+        }
         if let Some(a11y) = &record.a11y {
-            self.a11y.replay(a11y);
+            self.a11y.replay(a11y, Point::default(), self.scale_factor);
         }
         if record.has_publications {
             self.note_publication();
@@ -690,8 +1127,9 @@ impl Window {
         }
     }
 
-    /// What a recording made at `bounds` here is good for.
-    pub(crate) fn replay_key(&self, bounds: Bounds<Pixels>) -> ReplayKey {
+    /// What a recording made at `bounds` here is good for. `root` is the layout node of the
+    /// subtree.
+    pub(crate) fn replay_key(&mut self, bounds: Bounds<Pixels>, root: LayoutId) -> ReplayKey {
         self.invalidator.debug_assert_prepaint();
         let mut exact_clips = Vec::new();
         let mut clips = self.exact_clips.as_deref();
@@ -699,6 +1137,11 @@ impl Window {
             exact_clips.push(clip.mask);
             clips = clip.outer.as_deref();
         }
+        let layout_origin = self.layout_bounds_unshifted(root).origin;
+        let positioned_frame = self
+            .positioned_frames
+            .last()
+            .map(|frame| (frame.content_mask, frame.element_offset));
         ReplayKey {
             bounds,
             content_mask: self.content_mask(),
@@ -709,17 +1152,187 @@ impl Window {
             rem_size: self.rem_size(),
             scale_factor: self.scale_factor,
             viewport_size: self.viewport_size,
-            positioned_frame: self
-                .positioned_frames
-                .last()
-                .map(|frame| (frame.content_mask, frame.element_offset)),
+            snapped_frame_offset: positioned_frame
+                .map(|(_, offset)| self.pixel_snap_point(offset)),
+            positioned_frame,
             element_offset: self.element_offset(),
+            layout_origin,
+            snapped_offset: self.pixel_snap_point(self.element_offset()),
             current_view: self.rendered_entity_stack.last().copied(),
             image_cache: self.image_cache_stack.last().map(AnyImageCache::entity_id),
             a11y_active: self.a11y.is_active_when_presented(),
             culling: self.culling,
             lifting: self.lifting(),
             dom_hit_testing: self.dom_hit_testing,
+        }
+    }
+
+    /// Where the layout engine puts the layout node `layout_id`, relative to the window but for
+    /// the element offset: the bounds that [`Window::layout_bounds`] gives the node anywhere its
+    /// surroundings are scrolled to.
+    pub(crate) fn layout_bounds_unshifted(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
+        self.invalidator.debug_assert_prepaint();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .expect("the layout engine is in the window outside layout")
+            .layout_bounds(layout_id, scale_factor)
+            .map(Into::into)
+    }
+}
+
+impl Window {
+    /// Says that something being drawn kept a position of the element it is in, to read it after
+    /// the frame (a drag that starts at the element, a keyboard click that tells where it was, a
+    /// tooltip that tests the pointer against the element's bounds). A retained subtree that is
+    /// [relocatable](crate::Retained::relocatable) is replayed only where it was recorded then,
+    /// since the position would be where the subtree was.
+    pub fn note_positioned_capture(&self) {
+        self.retained.positioned_captures.set(self.retained.positioned_captures.get().wrapping_add(1));
+    }
+
+    pub(crate) fn note_sticky(&self) {
+        self.retained.sticky.set(self.retained.sticky.get().wrapping_add(1));
+    }
+
+    /// Whether a subtree is being recorded, and what it holds outside the frame is worth noting.
+    pub(crate) fn tracks_relocation(&self) -> bool {
+        self.retained.relocation.is_some()
+    }
+
+    pub(crate) fn note_nested_scroll(&self) {
+        self.retained.nested_scrolls.set(self.retained.nested_scrolls.get().wrapping_add(1));
+    }
+
+    /// Says that a handle outside the frame holds a position of the subtree being recorded:
+    /// `apply` sets it to what it was when recorded, moved by the delta it is given, and
+    /// `describe` says what it is now. Does nothing outside such a recording.
+    pub(crate) fn note_relocated(
+        &mut self,
+        apply: impl Fn(Point<Pixels>) + 'static,
+        describe: impl Fn() -> String + 'static,
+    ) {
+        if let Some(relocation) = self.retained.relocation.as_mut() {
+            relocation.handles.push(Relocated {
+                apply: Rc::new(apply),
+                describe: Rc::new(describe),
+            });
+        }
+    }
+
+    /// Whether a subtree is being recorded in a region of its own, which what is drawn in it
+    /// must not keep the position it has in, or cache.
+    pub(crate) fn is_recording_relocatably(&self) -> bool {
+        self.retained
+            .relocation
+            .as_ref()
+            .is_some_and(|relocation| !relocation.direct)
+    }
+
+    /// Whether a subtree that is relocatable can be recorded in a region of its own here: the
+    /// content mask around has no rounded corners and is not cut by an exact clip, and the scale
+    /// factor makes device pixels exact.
+    pub(crate) fn relocation_blocker_here(&self) -> Option<NonRelocatable> {
+        if !self.scale_factor.is_finite() || self.scale_factor.to_bits() & 0x007f_ffff != 0 {
+            return Some(NonRelocatable::Scale);
+        }
+        if self.exact_clips.is_some() || self.content_mask().is_rounded() {
+            return Some(NonRelocatable::Clip);
+        }
+        None
+    }
+
+    /// Starts the prepaint or the paint of the subtree that `relocation` records. Until
+    /// [`Self::end_relocation`], the content mask is the region, and unless the recording is
+    /// `direct` a paint goes to a scene of its own.
+    pub(crate) fn begin_relocation(&mut self, mut relocation: Relocation, paint: bool) {
+        debug_assert!(self.retained.relocation.is_none(), "relocatable subtrees do not nest");
+        if !relocation.direct {
+            self.content_mask_stack
+                .push(ContentMask::from_bounds(relocation.info.region));
+            relocation.saved_exact_clips = self.exact_clips.take();
+            relocation.frames_below = self.positioned_frames.len();
+            if paint {
+                let recorder = self.next_frame.scene.recorder();
+                relocation.saved_scene = Some(mem::replace(&mut self.next_frame.scene, recorder));
+            }
+        }
+        self.retained.relocation = Some(relocation);
+    }
+
+    /// Ends what [`Self::begin_relocation`] started, and returns the recording with what the
+    /// prepaint or the paint noted, and, for a paint, what was painted.
+    pub(crate) fn end_relocation(&mut self) -> (Relocation, Option<Rc<[PaintOperation]>>) {
+        let mut relocation = self
+            .retained
+            .relocation
+            .take()
+            .expect("a relocation is ended after it began");
+        let mut operations = None;
+        if !relocation.direct {
+            self.content_mask_stack.pop();
+            self.exact_clips = relocation.saved_exact_clips.take();
+            if let Some(scene) = relocation.saved_scene.take() {
+                let recorder = mem::replace(&mut self.next_frame.scene, scene);
+                operations = Some(recorder.into_operations().into());
+            }
+        }
+        (relocation, operations)
+    }
+
+    /// Puts the `operations` a relocatable subtree recorded into the scene, `delta` away from where
+    /// they were recorded, inside the content mask that is around now.
+    pub(crate) fn emit_relocated(&mut self, operations: &[PaintOperation], delta: Point<Pixels>) {
+        let scale_factor = self.scale_factor;
+        let ambient = self.content_mask();
+        let clip = ReplayClip {
+            snapped: self.cover_bounds(ambient.bounds),
+            plain: ambient.bounds.scale(scale_factor),
+        };
+        self.next_frame
+            .scene
+            .replay_translated(operations, delta.scale(scale_factor), &clip);
+    }
+
+    /// Notes that a rounded content mask was pushed while a subtree is recorded in a region of its
+    /// own.
+    pub(crate) fn note_rounded_mask(&mut self, mask: ContentMask<Pixels>) {
+        if let Some(relocation) = self.retained.relocation.as_mut()
+            && !relocation.direct
+            && !relocation.info.rounded.contains(&mask)
+        {
+            relocation.info.rounded.push(mask);
+        }
+    }
+
+    /// Whether `mask` is cut exactly by `outer`, the content mask a clip is made inside, and
+    /// notes the answer if a subtree is being recorded in a region of its own: the region is not
+    /// what the clip will be cut by, the content mask around the region is.
+    pub(crate) fn clip_is_exact(&mut self, mask: &ContentMask<Pixels>, outer: &ContentMask<Pixels>) -> bool {
+        let Some(relocation) = self.retained.relocation.as_mut().filter(|relocation| !relocation.direct) else {
+            return mask.intersection_is_exact(outer);
+        };
+        let ambient = ContentMask::from_bounds(relocation.ambient.bounds);
+        let exact = mask.intersection_is_exact(&outer.intersect(&ambient));
+        relocation.info.decisions.push(ClipDecision {
+            mask: *mask,
+            outer: *outer,
+            exact,
+        });
+        exact
+    }
+
+    /// Notes that a box escapes to a containing block (or the viewport) for a subtree being
+    /// recorded, if that one is outside of it.
+    pub(crate) fn note_escape_frame(&self, escape: Escape) {
+        let Some(relocation) = self.retained.relocation.as_ref() else {
+            return;
+        };
+        let own_frame = self.positioned_frames.len() > relocation.frames_below;
+        if escape == Escape::Viewport || !own_frame {
+            self.retained
+                .unframed_escapes
+                .set(self.retained.unframed_escapes.get().wrapping_add(1));
         }
     }
 }
@@ -739,7 +1352,10 @@ impl Window {
 }
 
 impl PrepaintRecord {
-    pub(crate) fn describe(&self, window: &Window) -> String {
+    /// What the prepaint left in the frame being built, as text. `loose` leaves out what cannot be
+    /// reached by the pointer, which a subtree recorded in a region has more of than a build under
+    /// the content mask around it.
+    pub(crate) fn describe(&self, window: &Window, loose: bool) -> String {
         use std::fmt::Write as _;
 
         let frame = &window.next_frame;
@@ -753,14 +1369,13 @@ impl PrepaintRecord {
         let mut out = String::new();
         let range = self.range.start.hitboxes_index..self.range.end.hitboxes_index;
         for hitbox in frame.hitboxes.get(range).unwrap_or_default() {
+            if loose && !hitbox.is_reachable() {
+                continue;
+            }
             writeln!(
                 out,
-                "hitbox {:?} {:?} {:?} {:?} {:?} parent {}",
-                hitbox.identity,
-                hitbox.bounds,
-                hitbox.content_mask,
-                hitbox.behavior,
-                hitbox.corner_radii,
+                "hitbox {} parent {}",
+                hitbox.describe(),
                 hitbox.parent.map_or_else(|| "(outside)".to_owned(), name),
             )
             .ok();
@@ -773,30 +1388,41 @@ impl PrepaintRecord {
 }
 
 impl PaintRecord {
-    pub(crate) fn describe(&self, window: &Window) -> String {
+    /// What the paint left in the frame being built, as text. `loose` leaves out what only a hitbox
+    /// that cannot be reached has, see [`PrepaintRecord::describe`].
+    pub(crate) fn describe(&self, window: &Window, loose: bool) -> String {
         use std::fmt::Write as _;
 
         let frame = &window.next_frame;
         let mut out = frame
             .scene
             .describe_operations(self.range.start.scene_index..self.range.end.scene_index);
+        let reachable = |id: Option<HitboxId>| {
+            id.and_then(|id| frame.hitboxes.iter().find(|hitbox| hitbox.id == id))
+                .is_none_or(Hitbox::is_reachable)
+        };
         let name = |id: Option<HitboxId>| {
             id.and_then(|id| frame.hitboxes.iter().find(|hitbox| hitbox.id == id))
                 .map_or_else(|| "(window)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
         };
         let cursors = self.range.start.cursor_styles_index..self.range.end.cursor_styles_index;
         for request in frame.cursor_styles.get(cursors).unwrap_or_default() {
+            if loose && !reachable(request.hitbox_id) {
+                continue;
+            }
             writeln!(out, "cursor {:?} {}", request.style, name(request.hitbox_id)).ok();
         }
-        writeln!(
-            out,
-            "listeners {} {} handlers {} tab stops {:?}",
-            self.range.end.mouse_listeners_index - self.range.start.mouse_listeners_index,
-            self.range.end.root_key_listeners_index - self.range.start.root_key_listeners_index,
-            self.range.end.input_handlers_index - self.range.start.input_handlers_index,
-            self.tab_stops,
-        )
-        .ok();
+        if !loose {
+            writeln!(
+                out,
+                "listeners {} {} handlers {}",
+                self.range.end.mouse_listeners_index - self.range.start.mouse_listeners_index,
+                self.range.end.root_key_listeners_index - self.range.start.root_key_listeners_index,
+                self.range.end.input_handlers_index - self.range.start.input_handlers_index,
+            )
+            .ok();
+        }
+        writeln!(out, "tab stops {:?}", self.tab_stops).ok();
         if let Some(a11y) = &self.a11y {
             writeln!(out, "a11y {}", a11y.describe()).ok();
         }

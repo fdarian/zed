@@ -41,8 +41,9 @@
 
 use crate::{
     AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, NonReusable, PaintIndex, PaintRecord, Pixels, PrepaintRecord,
-    PrepaintStateIndex, ReplayKey, Window,
+    IntoElement, LayoutId, NonReusable, PaintIndex, PaintRecord, Pixels, Point, PrepaintRecord,
+    PrepaintStateIndex, Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
+    blocker_bit, first_blocker, IsZero,
 };
 use collections::FxHashSet;
 use std::{any::TypeId, rc::Rc};
@@ -59,8 +60,10 @@ pub fn retained(
         key,
         build: Some(Box::new(build)),
         on_replay: None,
+        translates: false,
         lift_z: None,
         cull_outset: None,
+        overscan: None,
     }
 }
 
@@ -79,7 +82,7 @@ pub enum RetainedPhase {
 }
 
 type Build = Box<dyn FnOnce(&mut Window, &mut App) -> AnyElement>;
-type ReplayHook = Rc<dyn Fn(RetainedPhase, &mut Window, &mut App)>;
+type ReplayHook = Rc<dyn Fn(RetainedPhase, Point<Pixels>, &mut Window, &mut App)>;
 
 /// An element made by [`retained`].
 pub struct Retained {
@@ -87,8 +90,11 @@ pub struct Retained {
     key: u64,
     build: Option<Build>,
     on_replay: Option<ReplayHook>,
+    /// The listener of `on_replay` takes the translation of a replay.
+    translates: bool,
     lift_z: Option<i32>,
     cull_outset: Option<Edges<Pixels>>,
+    overscan: Option<Pixels>,
 }
 
 impl Retained {
@@ -119,7 +125,48 @@ impl Retained {
         mut self,
         listener: impl Fn(RetainedPhase, &mut Window, &mut App) + 'static,
     ) -> Self {
+        self.on_replay = Some(Rc::new(move |phase, _, window, cx| listener(phase, window, cx)));
+        self.translates = false;
+        self
+    }
+
+    /// [`Retained::on_replay`] for a listener that knows where the subtree is: it is given how
+    /// far a replay put the subtree from where it was recorded (zero when it is where it was
+    /// recorded), counted from the recording and not from the replay before, so that running it
+    /// again for the same place does the same. Whatever it publishes of the subtree's geometry
+    /// is its owner's to move by that, as the frame moves its own.
+    ///
+    /// A subtree that is [relocatable](Self::relocatable) and whose listeners report to their
+    /// owner is only put elsewhere if the owner takes the translation this way.
+    pub fn on_replay_translated(
+        mut self,
+        listener: impl Fn(RetainedPhase, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_replay = Some(Rc::new(listener));
+        self.translates = true;
+        self
+    }
+
+    /// Records the subtree so that a frame can put it elsewhere than it was recorded, by a whole
+    /// number of device pixels: the way a scroller moves its content. The subtree is prepainted
+    /// and painted in a region that reaches `overscan` past the clip around it, so that what
+    /// scrolling brings into view soon is recorded too. It is replayed at the place the key says
+    /// without being built when the surroundings are the same but for that and for the clip
+    /// around it, the part of it that shows now was recorded, and no rounded clip in it is cut by
+    /// that clip differently than painting it there would cut it (see
+    /// [`RetainedCounters::relocations`]).
+    ///
+    /// The owner vouches that the subtree is built the same wherever it is: that it asks no
+    /// position of the window that it keeps, which are counted by
+    /// [`Window::note_positioned_capture`]. What gpui can tell about the subtree it checks, see
+    /// [`NonRelocatable`]; such a subtree is replayed where it was recorded, as any other. For
+    /// the parents of the subtree to keep it while it is within `overscan` of their clip,
+    /// [`Retained::cull_outset`] has to be set.
+    ///
+    /// Two subtrees that nest are not both relocatable: the one inside is built every frame
+    /// that builds the one around it.
+    pub fn relocatable(mut self, overscan: Pixels) -> Self {
+        self.overscan = Some(overscan);
         self
     }
 
@@ -179,7 +226,19 @@ impl RetainedState {
     pub(crate) fn describe(&self, window: &Window) -> Option<String> {
         let recorded = self.recorded.as_ref()?;
         let paint = recorded.paint.as_ref()?;
-        Some(format!("{}\n{}", recorded.prepaint.describe(window), paint.describe(window)))
+        // A subtree recorded in a region prepaints and paints what lies between the content mask
+        // around it and the region too, which a build under the mask leaves out: what cannot be
+        // seen or hit is not compared.
+        let loose = recorded.relocation.is_some();
+        let mut text = format!(
+            "{}\n{}",
+            recorded.prepaint.describe(window, loose),
+            paint.describe(window, loose)
+        );
+        if let Some(relocation) = &recorded.relocation {
+            text.push_str(&relocation.describe());
+        }
+        Some(text)
     }
 }
 
@@ -194,6 +253,24 @@ struct Recorded {
     key: ReplayKey,
     prepaint: PrepaintRecord,
     paint: Option<PaintRecord>,
+    /// What a subtree recorded to be put elsewhere holds outside the frame, and what puts it
+    /// there. A `direct` one is a recording of the build that is compared with, and replays as
+    /// any other.
+    relocation: Option<Relocation>,
+    /// Whether the recording can be put elsewhere than where it was recorded.
+    movable: bool,
+    /// Why not, if it was already known when the recording began.
+    unmovable_at_start: Option<NonRelocatable>,
+    /// How far from the recording the last replay put the subtree.
+    delta: Point<Pixels>,
+}
+
+impl Recorded {
+    /// Whether the recording keeps its geometry as it was in a region and not as it was in the
+    /// frame, so that every replay puts it in the frame, also where it was recorded.
+    fn is_regional(&self) -> bool {
+        self.relocation.as_ref().is_some_and(|relocation| !relocation.direct)
+    }
 }
 
 #[doc(hidden)]
@@ -236,7 +313,12 @@ impl Element for Retained {
     }
 
     fn cull_outset(&self) -> Option<Edges<Pixels>> {
-        self.cull_outset
+        // A relocatable subtree is kept while it is within its overscan of the clip around it, so
+        // that it is recorded before it shows.
+        match (self.cull_outset, self.overscan) {
+            (Some(outset), Some(overscan)) => Some(outset.map(|edge| *edge + overscan)),
+            (outset, _) => outset,
+        }
     }
 
     fn request_layout(
@@ -293,14 +375,15 @@ impl Element for Retained {
                         .as_mut()
                         .expect("a replayed subtree has its recording");
                     let nested = recorded.prepaint.nested.clone();
+                    let delta = recorded.delta;
                     let paint = recorded
                         .paint
                         .as_mut()
                         .expect("a subtree is skipped only with its paint recorded");
-                    paint.range = window.replay_paint(paint, &nested);
+                    paint.range = window.replay_paint(paint, &nested, delta);
                     recorded.paint_serial = window.building_serial();
                     if let Some(hook) = hook {
-                        hook(RetainedPhase::Paint, window, cx);
+                        hook(RetainedPhase::Paint, delta, window, cx);
                     }
                     ((), state)
                 });
@@ -311,15 +394,44 @@ impl Element for Retained {
                     return;
                 }
                 let mark = window.begin_paint_recording();
+                let relocation = window.with_element_state(global_id, |state: Option<RetainedState>, _| {
+                    let mut state = state.expect("a built subtree has its state");
+                    let relocation = state
+                        .recorded
+                        .as_mut()
+                        .and_then(|recorded| recorded.relocation.take());
+                    (relocation, state)
+                });
+                let regional = relocation.as_ref().is_some_and(|relocation| !relocation.direct);
+                let relocating = relocation.is_some();
+                if let Some(relocation) = relocation {
+                    window.begin_relocation(relocation, true);
+                }
                 let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
                     element.paint(window, cx);
                 });
+                let (relocation, operations) = if relocating {
+                    let (relocation, operations) = window.end_relocation();
+                    (Some(relocation), operations)
+                } else {
+                    (None, None)
+                };
+                // What was painted in a region is put into the scene as a replay at the place it
+                // was recorded would.
+                if regional {
+                    let operations = operations
+                        .as_ref()
+                        .expect("a subtree recorded in a region painted into a scene of its own");
+                    window.emit_relocated(operations, Point::default());
+                }
                 let publishes = self.on_replay.is_some();
+                let translates = self.translates;
+                let relocatable = self.overscan.is_some();
                 window.with_element_state(global_id, |state: Option<RetainedState>, window| {
                     let mut state = state.expect("a built subtree has its state");
                     state.accessed_entities.extend(accessed_entities);
                     let recorded = window
-                        .finish_paint_recording(mark)
+                        .finish_paint_recording(mark, operations)
                         .and_then(|paint| {
                             if paint.has_publications && !publishes {
                                 Err(NonReusable::Publication)
@@ -330,6 +442,8 @@ impl Element for Retained {
                     match recorded {
                         Ok(paint) => {
                             if let Some(recorded) = state.recorded.as_mut() {
+                                recorded.relocation = relocation;
+                                recorded.settle_movability(&paint, translates, relocatable, window);
                                 recorded.paint = Some(paint);
                                 recorded.paint_serial = window.building_serial();
                             }
@@ -443,6 +557,11 @@ impl Retained {
             RetainedLayout::Skipped if window.is_layout_pass() => {
                 self.prepaint_skipped_without_recording(global_id, bounds, window, cx)
             }
+            RetainedLayout::Skipped if window.is_recording_relocatably() => {
+                let root = self.root(global_id, window);
+                let key = window.replay_key(bounds, root);
+                self.build_skipped(global_id, bounds, key, window, cx)
+            }
             RetainedLayout::Skipped => {
                 self.prepaint_skipped(global_id, bounds, window, cx)
             }
@@ -451,18 +570,22 @@ impl Retained {
                 unreusable,
                 record,
             } => {
-                if !record {
+                // A subtree inside one that is recorded in a region cannot keep a recording of its
+                // own: what it paints goes to a scene that is gone when the frame is.
+                if !record || window.is_recording_relocatably() {
                     element.prepaint(window, cx);
                     return RetainedPrepaint::Built {
                         element,
                         record: false,
                     };
                 }
-                let key = window.replay_key(bounds);
+                let root = self.root(global_id, window);
+                let key = window.replay_key(bounds, root);
                 let record = self.record_prepaint(
                     global_id,
                     key,
                     unreusable,
+                    bounds,
                     window,
                     cx,
                     |window, cx| {
@@ -547,8 +670,15 @@ impl Retained {
         )
     }
 
+    /// The layout node of the subtree, which a frame that skipped it kept.
+    fn root(&self, global_id: &GlobalElementId, window: &mut Window) -> LayoutId {
+        window
+            .peek_element_state(global_id, |state: &RetainedState| state.root)
+            .expect("a subtree being prepainted has its state")
+    }
+
     /// Prepaint of a subtree that was not built for layout: replay it if it is where it was
-    /// recorded, and build it now if not.
+    /// recorded, or where it can be put from there, and build it now if not.
     fn prepaint_skipped(
         &mut self,
         global_id: &GlobalElementId,
@@ -556,27 +686,39 @@ impl Retained {
         window: &mut Window,
         cx: &mut App,
     ) -> RetainedPrepaint {
-        let key = window.replay_key(bounds);
+        let root = self.root(global_id, window);
+        let key = window.replay_key(bounds, root);
         let hook = self.on_replay.clone();
+        let ambient = window.content_mask();
         let replayed = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a skipped subtree has its state");
             let root = state.root;
             let recorded = state.recorded.take();
-            let Some(mut recorded) = recorded.filter(|recorded| {
-                recorded.key == key && recorded.generation == window.layout_generation(root)
-            }) else {
+            let Some(mut recorded) = recorded.filter(|recorded| recorded.generation == window.layout_generation(root))
+            else {
                 return (false, state);
             };
-            recorded.prepaint.range = window.replay_prepaint(&recorded.prepaint);
+            let Some(delta) = recorded.place(&key, &ambient, window) else {
+                return (false, state);
+            };
+            recorded.delta = delta;
+            recorded.prepaint.range =
+                window.replay_prepaint(&recorded.prepaint, recorded.is_regional().then_some(delta));
+            if let Some(relocation) = &recorded.relocation {
+                relocation.apply(delta);
+            }
             recorded.serial = window.building_serial();
             window.note_retained_recording((global_id.clone(), TypeId::of::<RetainedState>()));
             window.retained.counters.replays += 1;
+            if !delta.is_zero() {
+                window.retained.counters.relocations += 1;
+            }
             if window.retained.verifier.is_some() {
                 window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
             }
             state.recorded = Some(recorded);
             if let Some(hook) = hook {
-                hook(RetainedPhase::Prepaint, window, cx);
+                hook(RetainedPhase::Prepaint, delta, window, cx);
             }
             (true, state)
         });
@@ -596,25 +738,45 @@ impl Retained {
         window: &mut Window,
         cx: &mut App,
     ) -> RetainedPrepaint {
-        let key = window.replay_key(bounds);
-        let fits = window
+        let root = self.root(global_id, window);
+        let key = window.replay_key(bounds, root);
+        let ambient = window.content_mask();
+        let placed = window
             .peek_element_state(global_id, |state: &RetainedState| {
-                state.recorded.as_ref().is_some_and(|recorded| {
-                    recorded.key == key
-                        && recorded.generation == window.layout_generation(state.root)
-                })
+                let generation = window.layout_generation(state.root);
+                state
+                    .recorded
+                    .as_ref()
+                    .filter(|recorded| recorded.generation == generation)
+                    .map(|recorded| recorded.peek_place(&key, &ambient))
             })
             .expect("a skipped subtree has its state");
-        if !fits {
+        let Some(placed) = placed else {
             window.retained.counters.layout_builds += 1;
             return self.build_skipped(global_id, bounds, key, window, cx);
-        }
+        };
+        let delta = match placed {
+            Ok(delta) => delta,
+            Err(miss) => {
+                if let Some(miss) = miss {
+                    window.retained.counters.count_relocation_miss(miss);
+                }
+                window.retained.counters.layout_builds += 1;
+                return self.build_skipped(global_id, bounds, key, window, cx);
+            }
+        };
         window.retained.counters.layout_replays += 1;
         if window.retained.verifier.is_some() {
             window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
         }
+        // What the subtree holds outside the frame is where the frame being thrown away puts it.
+        window.peek_element_state(global_id, |state: &RetainedState| {
+            if let Some(relocation) = state.recorded.as_ref().and_then(|recorded| recorded.relocation.as_ref()) {
+                relocation.apply(delta);
+            }
+        });
         if let Some(hook) = self.on_replay.clone() {
-            window.publish_layout(move |window, cx| hook(RetainedPhase::Layout, window, cx));
+            window.publish_layout(move |window, cx| hook(RetainedPhase::Layout, delta, window, cx));
         }
         RetainedPrepaint::Replayed
     }
@@ -688,12 +850,12 @@ impl Retained {
             };
         }
 
-        if !window.retention_records() {
+        if !window.retention_records() || window.is_recording_relocatably() {
             element.prepaint(window, cx);
             return RetainedPrepaint::Built { element, record: false };
         }
         let unreusable = unstable.then_some(NonReusable::UnstableLayout);
-        let record = self.record_prepaint(global_id, key, unreusable, window, cx, |window, cx| {
+        let record = self.record_prepaint(global_id, key, unreusable, bounds, window, cx, |window, cx| {
             element.prepaint(window, cx);
         });
         RetainedPrepaint::Built { element, record }
@@ -706,14 +868,25 @@ impl Retained {
         global_id: &GlobalElementId,
         key: ReplayKey,
         unreusable: Option<NonReusable>,
+        bounds: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
         prepaint: impl FnOnce(&mut Window, &mut App),
     ) -> bool {
         let publishes = self.on_replay.is_some();
+        let (relocation, unmovable_at_start) = self.plan_relocation(bounds, window);
+        let surroundings = relocation
+            .as_ref()
+            .filter(|relocation| !relocation.direct)
+            .map(|relocation| relocation.ambient);
         let mark = window.begin_prepaint_recording();
+        let relocating = relocation.is_some();
+        if let Some(relocation) = relocation {
+            window.begin_relocation(relocation, false);
+        }
         let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| prepaint(window, cx));
-        let recording = window.finish_prepaint_recording(mark);
+        let relocation = relocating.then(|| window.end_relocation().0);
+        let recording = window.finish_prepaint_recording(mark, surroundings.as_ref());
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a built subtree has its state");
             state.accessed_entities.extend(accessed_entities);
@@ -741,6 +914,10 @@ impl Retained {
                         key,
                         prepaint,
                         paint: None,
+                        relocation,
+                        movable: false,
+                        unmovable_at_start,
+                        delta: Point::default(),
                     });
                     window
                         .note_retained_recording((global_id.clone(), TypeId::of::<RetainedState>()));
@@ -754,6 +931,103 @@ impl Retained {
             };
             (record, state)
         })
+    }
+
+    /// How the prepaint and the paint of the subtree that `bounds` is the box of are recorded to
+    /// be put elsewhere, if its owner says they can, and, if they cannot be here, why.
+    fn plan_relocation(
+        &self,
+        bounds: Bounds<Pixels>,
+        window: &Window,
+    ) -> (Option<Relocation>, Option<NonRelocatable>) {
+        let Some(overscan) = self.overscan else {
+            return (None, None);
+        };
+        if let Some(reason) = window.relocation_blocker_here() {
+            return (None, Some(reason));
+        }
+        let relocation = Relocation::new(
+            window.content_mask(),
+            overscan,
+            bounds,
+            self.cull_outset,
+            window.retained.reference,
+        );
+        (Some(relocation), None)
+    }
+}
+
+impl Recorded {
+    /// How far from where this was recorded `key` puts the subtree, if it is a place the
+    /// recording can be replayed at, and the miss that says otherwise, when it was one worth
+    /// counting.
+    fn peek_place(
+        &self,
+        key: &ReplayKey,
+        ambient: &crate::ContentMask<Pixels>,
+    ) -> Result<Point<Pixels>, Option<RelocationMiss>> {
+        if self.key == *key {
+            return Ok(Point::default());
+        }
+        if !self.movable {
+            return Err(None);
+        }
+        let Some(delta) = self.key.relocation(key) else {
+            return Err(Some(RelocationMiss::Place));
+        };
+        let relocation = self
+            .relocation
+            .as_ref()
+            .expect("a recording that can be moved has its relocation");
+        relocation.info.fits(delta, ambient).map(|()| delta).map_err(Some)
+    }
+
+    /// [`Self::peek_place`], counting a miss.
+    fn place(
+        &self,
+        key: &ReplayKey,
+        ambient: &crate::ContentMask<Pixels>,
+        window: &mut Window,
+    ) -> Option<Point<Pixels>> {
+        match self.peek_place(key, ambient) {
+            Ok(delta) => Some(delta),
+            Err(miss) => {
+                if let Some(miss) = miss {
+                    window.retained.counters.count_relocation_miss(miss);
+                }
+                None
+            }
+        }
+    }
+
+    /// Says whether the recording can be put elsewhere, once the paint is recorded too, and counts
+    /// why not when it cannot.
+    fn settle_movability(
+        &mut self,
+        paint: &PaintRecord,
+        translates: bool,
+        relocatable: bool,
+        window: &mut Window,
+    ) {
+        let regional = self.is_regional();
+        let mut blockers = self.prepaint.blockers | paint.blockers;
+        if let Some(reason) = self.unmovable_at_start {
+            blockers |= blocker_bit(reason);
+        }
+        if (self.prepaint.has_publications || paint.has_publications) && !translates {
+            blockers |= blocker_bit(NonRelocatable::Publication);
+        }
+        if let Some(relocation) = self.relocation.as_ref().filter(|relocation| !relocation.direct)
+            && relocation.info.fits(Point::default(), &relocation.ambient).is_err()
+        {
+            blockers |= blocker_bit(NonRelocatable::Clip);
+        }
+        self.movable = regional && blockers == 0;
+        if relocatable && !window.retained.reference {
+            if let Some(reason) = first_blocker(blockers) {
+                window.retained.counters.count_non_relocatable(reason);
+            }
+        }
     }
 }
 

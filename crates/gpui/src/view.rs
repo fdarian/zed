@@ -412,7 +412,9 @@ impl<V: View> Element for ViewElement<V> {
                             return (None, element_state);
                         }
 
-                        let reusable = !window.in_stacking_context();
+                        // What a view in a subtree recorded in a region paints goes to a scene that is
+                        // gone with the frame, so its ranges are of no use to a later one.
+                        let reusable = !window.in_stacking_context() && !window.is_recording_relocatably();
                         let refreshing = mem::replace(&mut window.refreshing, true);
                         let prepaint_start = window.prepaint_index();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
@@ -476,7 +478,7 @@ impl<V: View> Element for ViewElement<V> {
                 let caching_disabled = window.measuring
                     || window.max_draw_passes > 1
                     || window.is_inspector_picking(cx);
-                if self.cached_style.is_some() && !caching_disabled {
+                if self.cached_style.is_some() && !caching_disabled && !window.is_recording_relocatably() {
                     window.with_element_state::<ViewElementState, _>(
                         global_id.unwrap(),
                         |element_state, window| {
