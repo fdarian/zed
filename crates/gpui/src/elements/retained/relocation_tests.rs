@@ -84,6 +84,10 @@ enum Kind {
     Retained,
     /// Has a view that caches what it draws.
     CachedView,
+    /// Reports its bounds to its owner, who moves them with a replay.
+    Reports,
+    /// Reports its bounds to its owner, who does not know a replay can move them.
+    ReportsBlind,
 }
 
 fn inner_box(index: usize) -> AnyElement {
@@ -126,6 +130,11 @@ struct Handles {
     texts: RefCell<BTreeMap<usize, TextLayout>>,
     trackers: RefCell<BTreeMap<usize, ScrollHandle>>,
     badges: RefCell<BTreeMap<usize, crate::Entity<Badge>>>,
+    /// What rows reported of their bounds, and the bounds they reported when they were built.
+    reported: Rc<RefCell<BTreeMap<usize, Bounds<crate::Pixels>>>>,
+    built_at: Rc<RefCell<BTreeMap<usize, Bounds<crate::Pixels>>>>,
+    /// The offsets of the replays the rows' owner was told of, by phase.
+    replays: Rc<RefCell<Vec<(RetainedPhase, crate::Point<crate::Pixels>)>>>,
     /// Whether a row that has a retained subtree of its own retains it: the plain window does not.
     retains: bool,
 }
@@ -239,6 +248,14 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> 
             };
             row = row.child(text).child(inner);
         }
+        Kind::Reports | Kind::ReportsBlind => {
+            let reported = handles.reported.clone();
+            let built_at = handles.built_at.clone();
+            row = row.child(text).on_painted(move |bounds, _, _| {
+                reported.borrow_mut().insert(index, bounds);
+                built_at.borrow_mut().insert(index, bounds);
+            });
+        }
         Kind::CachedView => {
             let badge = handles
                 .badges
@@ -330,15 +347,35 @@ fn page(
     let rows = specs.iter().enumerate().map(|(index, spec)| {
         let spec = *spec;
         if retained_rows {
-            let handles = handles.clone();
-            let mut row = retained(("retained-row", index), 1, move |_, cx| {
-                row_element(index, spec, &handles, cx)
+            let mut row = retained(("retained-row", index), 1, {
+                let handles = handles.clone();
+                move |_, cx| row_element(index, spec, &handles, cx)
             })
             .relocatable(px(OVERSCAN));
             // A box placed by something else than the row is outside the extent its owner can
             // vouch for, so such a row is not culled.
             if !matches!(spec.kind, Kind::Positioned | Kind::Escaping | Kind::Fixed) {
                 row = row.cull_outset(Some(Edges::all(px(12.))));
+            }
+            match spec.kind {
+                Kind::Reports => {
+                    let reported = handles.reported.clone();
+                    let built_at = handles.built_at.clone();
+                    let replays = handles.replays.clone();
+                    row = row.on_replay_translated(move |phase, delta, _, _| {
+                        replays.borrow_mut().push((phase, delta));
+                        let base = built_at.borrow().get(&index).copied();
+                        if let Some(base) = base {
+                            reported
+                                .borrow_mut()
+                                .insert(index, Bounds::new(base.origin + delta, base.size));
+                        }
+                    });
+                }
+                Kind::ReportsBlind => {
+                    row = row.on_replay(|_, _, _| {});
+                }
+                _ => {}
             }
             // A positioned box is the child of a stacking context where there is one.
             if matches!(spec.kind, Kind::Positioned | Kind::Absolute) {
@@ -606,6 +643,7 @@ fn describe_handles(handles: &Handles, scroll: &ScrollHandle) -> (String, String
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let texts = format!("{texts}\nreported {:?}", handles.reported.borrow());
     let mut scrolls = format!(
         "page {:?} {:?} {:?}\n",
         scroll.bounds(),
@@ -766,6 +804,7 @@ fn mixed(count: usize) -> Vec<RowSpec> {
         Kind::ClipPath,
         Kind::Nested,
         Kind::Retained,
+        Kind::Reports,
         Kind::Absolute,
     ];
     (0..count)
@@ -999,6 +1038,52 @@ fn a_view_that_caches_what_it_draws_keeps_its_row_from_being_replayed() {
 }
 
 #[test]
+fn the_owner_of_a_row_that_reports_its_bounds_is_told_how_far_a_replay_moved_it() {
+    let cx = &mut app();
+    let pair = Pair::new(cx, rows(24, 40., Kind::Reports), 1., false);
+    pair.draw(cx);
+    let before = pair.counters(cx);
+    pair.handles.replays.borrow_mut().clear();
+    scroll_through(&pair, cx, &[3., 12., 40.5, 41., 7., 0.]);
+    let after = pair.counters(cx);
+    assert!(after.relocations > before.relocations, "{after:?}");
+    let replays = pair.handles.replays.borrow().clone();
+    assert!(
+        replays
+            .iter()
+            .any(|(phase, delta)| *phase == RetainedPhase::Prepaint && delta.y != crate::px(0.)),
+        "{replays:?}"
+    );
+    assert!(
+        replays
+            .iter()
+            .any(|(phase, delta)| *phase == RetainedPhase::Paint && delta.y != crate::px(0.)),
+        "{replays:?}"
+    );
+    // And after a read.
+    pair.handles.replays.borrow_mut().clear();
+    bounds_read_after_a_scroll(&pair, cx, 33.);
+    assert!(pair
+        .handles
+        .replays
+        .borrow()
+        .iter()
+        .any(|(phase, delta)| *phase == RetainedPhase::Layout && delta.y != crate::px(0.)));
+}
+
+#[test]
+fn a_row_whose_owner_does_not_take_the_offset_of_a_replay_is_not_moved() {
+    let cx = &mut app();
+    let pair = Pair::new(cx, rows(24, 40., Kind::ReportsBlind), 1., false);
+    pair.draw(cx);
+    let before = pair.counters(cx);
+    scroll_through(&pair, cx, &[3., 12., 40.5, 41., 7., 0.]);
+    let after = pair.counters(cx);
+    assert_eq!(after.relocations, before.relocations, "{after:?}");
+    assert!(after.non_relocatable(NonRelocatable::Publication) > 0, "{after:?}");
+}
+
+#[test]
 fn a_scale_factor_that_is_not_a_power_of_two_builds_the_rows() {
     let cx = &mut app();
     let pair = Pair::new(cx, mixed(30), 1.5, false);
@@ -1087,6 +1172,8 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
         Kind::Nested,
         Kind::Retained,
         Kind::CachedView,
+        Kind::Reports,
+        Kind::ReportsBlind,
         Kind::Absolute,
         Kind::Absolute,
         Kind::Positioned,
