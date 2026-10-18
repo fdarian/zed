@@ -452,19 +452,15 @@ fn a_hole_in_a_stacking_context_inside_the_wrapper_is_part_of_the_wrapper(cx: &m
 }
 
 #[gpui::test]
-fn a_box_handed_to_the_stacking_context_that_is_not_a_hole_still_makes_the_wrapper_unreusable(
+fn a_box_handed_to_the_stacking_context_that_is_not_a_hole_is_replayed_with_the_wrapper(
     cx: &mut TestAppContext,
 ) {
     let holes = Holes::new(cx, Shape::PlainLift);
+    holes.verify(cx);
     holes.epoch.set(holes.epoch.get() + 1);
-    holes.settle(cx);
-    let before = holes.counters(cx);
-    holes.settle(cx);
+    holes.replays_as_built(cx);
     let after = holes.counters(cx);
-    // The hole is replayed in the wrapper that is built, as a retained subtree is anywhere.
-    assert_eq!(after.replays - before.replays, after.hits - before.hits);
-    assert!(after.hits - before.hits <= 3, "{after:?}");
-    assert!(after.non_reusable(NonReusable::Lift) > before.non_reusable(NonReusable::Lift), "{after:?}");
+    assert_eq!(after.non_reusable(NonReusable::Lift), 0, "{after:?}");
 }
 
 #[gpui::test]

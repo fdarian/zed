@@ -1568,6 +1568,17 @@ pub(crate) struct LineLayoutIndex {
 }
 
 impl LineLayoutIndex {
+    /// Whether the range `inner` is inside `outer`.
+    pub(crate) fn range_is_within(inner: &Range<Self>, outer: &Range<Self>) -> bool {
+        let axis = |index: fn(&Self) -> usize| {
+            index(&inner.start) >= index(&outer.start) && index(&inner.end) <= index(&outer.end)
+        };
+        axis(|index| index.lines_index)
+            && axis(|index| index.wrapped_lines_index)
+            && axis(|index| index.lines_by_hash_index)
+            && axis(|index| index.wrapped_lines_by_hash_index)
+    }
+
     /// Where the index `self`, which is inside the range that started at `from`, is once that
     /// range was copied to `to`.
     pub(crate) fn moved(&self, from: &Self, to: &Self) -> Self {

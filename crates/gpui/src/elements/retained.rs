@@ -44,8 +44,11 @@
 //! in the recording of a subtree around it: that recording keeps where the context takes the root
 //! (its place among what the context was handed, its hitboxes, what it captured of the tree around
 //! it), and the context paints the root from the recording of its own, when it paints it. Any other
-//! box a subtree hands to a stacking context outside it makes the subtree unfit to replay, see
-//! [`NonReusable::Lift`].
+//! box a subtree hands to a stacking context outside it is a stub of the same kind: the recording
+//! keeps where the context takes it, and the context records what it paints the first time, to put
+//! the same into the frame when it paints the replayed subtree. (Not while the subtree is
+//! recorded in a region of its own, see [`NonReusable::Lift`].) A subtree that does either is not
+//! put elsewhere than where it was recorded.
 //!
 //! The element must have an element id that is unique among the elements around it. It names the
 //! element's state and is not on the id stack below it: the subtree has the ids it would have
@@ -62,7 +65,7 @@ use crate::{
     blocker_bit, first_blocker, IsZero,
 };
 use collections::FxHashSet;
-use std::{any::TypeId, rc::Rc};
+use std::{any::TypeId, ops::Range, rc::Rc};
 
 /// Wraps the subtree that `build` makes, so that a frame which asks for the same `key` as the
 /// frame before need not build it. See the [module documentation](self).
@@ -245,12 +248,22 @@ impl RetainedState {
         }
     }
 
-    pub(crate) fn move_paint(&mut self, from: &PaintIndex, to: &PaintIndex, serial: u64) {
-        if let Some(paint) = self.recorded.as_mut().and_then(|recorded| {
-            recorded.paint_serial = serial;
-            recorded.paint.as_mut()
-        }) {
-            paint.range = paint.range.start.moved(from, to)..paint.range.end.moved(from, to);
+    /// Where the paint of the subtree is, now that the range `from` of the frame `rendered`, which
+    /// holds it, was copied to start at `to` in the frame `serial`. The elements the subtree handed to a
+    /// stacking context were painted by it, and so are in the range only when that context was
+    /// being painted inside it.
+    pub(crate) fn move_paint(&mut self, from: &Range<PaintIndex>, rendered: u64, to: &PaintIndex, serial: u64) {
+        let Some(recorded) = self.recorded.as_mut() else {
+            return;
+        };
+        recorded.paint_serial = serial;
+        if let Some(paint) = recorded.paint.as_mut() {
+            paint.range = paint.range.start.moved(&from.start, to)..paint.range.end.moved(&from.start, to);
+        }
+        if let Some(lifts) = &recorded.prepaint.lifts {
+            for cell in lifts.cells() {
+                cell.move_within(from, rendered, to, serial);
+            }
         }
     }
 
@@ -290,6 +303,11 @@ impl RetainedState {
             recorded.prepaint.describe(window, loose, recorded.delta),
             paint.describe(window, loose)
         );
+        if let Some(lifts) = &recorded.prepaint.lifts {
+            for cell in lifts.cells() {
+                text.push_str(&cell.describe(window, loose));
+            }
+        }
         if let Some(relocation) = &recorded.relocation {
             text.push_str(&relocation.describe());
         }
@@ -324,9 +342,9 @@ struct Recorded {
 }
 
 impl Recorded {
-    /// Whether every subtree this one handed to the stacking context around it can paint itself
-    /// from its recording, which a replay of this one leaves it to do.
-    fn holes_paint_from_their_recordings(&self, window: &Window) -> bool {
+    /// Whether every subtree and every element this one handed to the stacking context around it
+    /// can paint itself from its recording, which a replay of this one leaves it to do.
+    fn lifted_paint_from_recordings(&self, window: &Window) -> bool {
         self.prepaint.lifts.as_ref().is_none_or(|lifts| {
             lifts.holes().all(|hole| {
                 window
@@ -334,7 +352,7 @@ impl Recorded {
                         state.paints_from_its_recording(window.rendered_serial())
                     })
                     .unwrap_or(false)
-            })
+            }) && lifts.cells().all(|cell| cell.paints_from_its_recording(window))
         })
     }
 
@@ -532,6 +550,7 @@ impl Element for Retained {
                                 recorded.settle_movability(&paint, translates, relocatable, window);
                                 recorded.paint = Some(paint);
                                 recorded.paint_serial = window.building_serial();
+                                window.log_painted_subtree(global_id);
                             }
                         }
                         Err(reason) => {
@@ -560,7 +579,7 @@ fn replay_recorded_paint(
             .recorded
             .as_mut()
             .expect("a replayed subtree has its recording");
-        let nested = recorded.prepaint.paint_nested.clone();
+        let nested = recorded.prepaint.paint_nested(window);
         let delta = recorded.delta;
         let lift_base = recorded.lift_base;
         debug_assert!(
@@ -574,6 +593,7 @@ fn replay_recorded_paint(
             .expect("a subtree is skipped only with its paint recorded");
         paint.range = window.replay_paint(paint, &nested, delta, lift_base);
         recorded.paint_serial = window.building_serial();
+        window.log_painted_subtree(global_id);
         if let Some(hook) = hook {
             hook(RetainedPhase::Paint, delta, window, cx);
         }
@@ -630,7 +650,7 @@ impl Retained {
                         && recorded.paint_serial == window.rendered_serial()
                         && recorded.paint.is_some()
                         && recorded.key.shapes_layout_like(window)
-                        && recorded.holes_paint_from_their_recordings(window)
+                        && recorded.lifted_paint_from_recordings(window)
                 })
             {
                 window.retained.counters.hits += 1;
@@ -778,7 +798,7 @@ impl Retained {
                                 && recorded.paint_serial == window.rendered_serial()
                                 && recorded.paint.is_some()
                                 && recorded.key.shapes_layout_like(window)
-                                && recorded.holes_paint_from_their_recordings(window)
+                                && recorded.lifted_paint_from_recordings(window)
                         });
                     fits.then(|| (state.root, state.layout_states.clone()))
                 })
@@ -837,7 +857,7 @@ impl Retained {
             };
             recorded.delta = delta;
             (recorded.prepaint.range, recorded.lift_base) =
-                window.replay_prepaint(&recorded.prepaint, recorded.is_regional().then_some(delta));
+                window.replay_prepaint(&recorded.prepaint, recorded.is_regional().then_some(delta), hook.as_ref());
             if let Some(relocation) = &recorded.relocation {
                 relocation.apply(delta);
             }
@@ -2306,8 +2326,8 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_subtree_that_lifts_into_the_context_around_it_is_never_replayed(cx: &mut TestAppContext) {
-        never_replayed_under(cx, NonReusable::Lift, true, |_, _| {
+    fn a_subtree_that_lifts_into_the_context_around_it_is_replayed_as_it_is_built(cx: &mut TestAppContext) {
+        let (window, _, _) = single_under(cx, false, true, |_, _| {
             div()
                 .id("plain")
                 .w(px(100.))
@@ -2324,6 +2344,20 @@ mod tests {
                 .child(div().id("below").w(px(30.)).h(px(30.)).bg(crate::blue()))
                 .into_any_element()
         });
+        cx.update_window(window, |_, window, _| {
+            window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        })
+        .unwrap();
+        // The frames that are verified build the subtree once more.
+        let before = counters(window, cx);
+        for _ in 0..3 {
+            draw(window, cx);
+        }
+        let after = counters(window, cx);
+        assert_eq!(after.replays, before.replays + 3);
+        assert_eq!(after.total_non_reusable(), 0, "{after:?}");
+        assert_eq!(after.verified, before.verified + 3);
+        assert_eq!(after.mismatches, 0, "{after:?}");
     }
 
     /// A stacking context with lifted boxes, some below its content and some above, and a

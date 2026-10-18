@@ -1351,6 +1351,26 @@ pub(crate) struct PaintIndex {
 }
 
 impl PaintIndex {
+    /// Whether the range `inner` is inside `outer`, in every vector that a paint writes to the
+    /// frame but the ones only a test reads.
+    pub(crate) fn range_is_within(inner: &Range<Self>, outer: &Range<Self>) -> bool {
+        let within = |inner: &Range<usize>, outer: &Range<usize>| inner.start >= outer.start && inner.end <= outer.end;
+        let axis = |index: fn(&Self) -> usize| {
+            within(&(index(&inner.start)..index(&inner.end)), &(index(&outer.start)..index(&outer.end)))
+        };
+        axis(|index| index.scene_index)
+            && axis(|index| index.mouse_listeners_index)
+            && axis(|index| index.root_key_listeners_index)
+            && axis(|index| index.input_handlers_index)
+            && axis(|index| index.cursor_styles_index)
+            && axis(|index| index.accessed_element_states_index)
+            && axis(|index| index.tab_handle_index)
+            && LineLayoutIndex::range_is_within(
+                &(inner.start.line_layout_index.clone()..inner.end.line_layout_index.clone()),
+                &(outer.start.line_layout_index.clone()..outer.end.line_layout_index.clone()),
+            )
+    }
+
     /// Where the index `self`, which is inside the range that started at `from`, is once that
     /// range was copied to `to`.
     pub(crate) fn moved(&self, from: &Self, to: &Self) -> Self {
