@@ -1443,28 +1443,34 @@ impl WrappedLineLayout {
         self._index_for_position(position, line_height, true)
     }
 
+    /// The wrapped row of the line that `y`, from the top of the line, is on. Past the last row it is one
+    /// more than there are rows.
+    pub(crate) fn row_at_y(&self, y: Pixels, line_height: Pixels) -> usize {
+        let rows = self
+            .unwrapped_layout
+            .has_styled_runs()
+            .then(|| self.rows(line_height));
+        match &rows {
+            None => (y / line_height) as usize,
+            Some(rows) => {
+                let mut bottom = Pixels::ZERO;
+                rows.iter()
+                    .position(|row| {
+                        bottom += row.height;
+                        y < bottom
+                    })
+                    .unwrap_or(rows.len())
+            }
+        }
+    }
+
     fn _index_for_position(
         &self,
         mut position: Point<Pixels>,
         line_height: Pixels,
         closest: bool,
     ) -> Result<usize, usize> {
-        let rows = self
-            .unwrapped_layout
-            .has_styled_runs()
-            .then(|| self.rows(line_height));
-        let wrapped_line_ix = match &rows {
-            None => (position.y / line_height) as usize,
-            Some(rows) => {
-                let mut bottom = Pixels::ZERO;
-                rows.iter()
-                    .position(|row| {
-                        bottom += row.height;
-                        position.y < bottom
-                    })
-                    .unwrap_or(rows.len())
-            }
-        };
+        let wrapped_line_ix = self.row_at_y(position.y, line_height);
 
         let wrapped_line_start_index;
         let wrapped_line_start_x;

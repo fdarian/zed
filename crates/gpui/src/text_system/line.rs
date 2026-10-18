@@ -404,6 +404,58 @@ impl WrappedLine {
         )
     }
 
+    /// How far right of the left edge of `align_width` the wrapped row `row_ix` of this line starts
+    /// when it is painted with `align`.
+    pub fn row_offset(&self, row_ix: usize, align: TextAlign, align_width: Pixels) -> Pixels {
+        let layout = &self.layout.unwrapped_layout;
+        let row_start = match row_ix.checked_sub(1) {
+            Some(previous) => {
+                let boundary = self.wrap_boundaries[previous];
+                layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].position.x
+            }
+            None => Pixels::ZERO,
+        };
+        aligned_origin_x(
+            Point::default(),
+            align_width,
+            row_start,
+            &align,
+            layout,
+            self.wrap_boundaries.get(row_ix).as_ref(),
+            hanging_width(&self.hanging_widths, row_ix),
+        )
+    }
+
+    /// [`WrappedLineLayout::position_for_index`] of a line painted with `align` in `align_width`.
+    pub fn aligned_position_for_index(
+        &self,
+        index: usize,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Pixels,
+    ) -> Option<Point<Pixels>> {
+        let mut position = self.layout.position_for_index(index, line_height)?;
+        if let Some(row_ix) = self.layout.row_for_index(index) {
+            position.x += self.row_offset(row_ix, align, align_width);
+        }
+        Some(position)
+    }
+
+    /// [`WrappedLineLayout::index_for_position`] of a line painted with `align` in `align_width`.
+    pub fn aligned_index_for_position(
+        &self,
+        mut position: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Pixels,
+    ) -> Result<usize, usize> {
+        let row_ix = self.layout.row_at_y(position.y, line_height);
+        if row_ix <= self.wrap_boundaries.len() {
+            position.x -= self.row_offset(row_ix, align, align_width);
+        }
+        self.layout.index_for_position(position, line_height)
+    }
+
     /// Where the atomic inlines of this line are in the window, as the top left corners
     /// of their margin boxes, when the line is painted at `origin` with `align` in
     /// `bounds`: the byte of each one's placeholder and its position.

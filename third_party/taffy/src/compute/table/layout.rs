@@ -74,7 +74,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
         let grid_left = padding_border.left + spacing.width;
         let grid_top = captions_top + padding_border.top + spacing.height;
         // The left edge of every column. A table that runs right to left lays the columns out as one that runs left to
-        // right and mirrors them in its border box, where the padding and border on the right are the ones it starts at
+        // right and mirrors them in the grid, which keeps the padding, border and spacing on their sides
         let mut column_x: Vec<f32> = Vec::with_capacity(column_widths.len());
         let mut x = grid_left;
         for width in column_widths {
@@ -84,7 +84,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
         let grid_width = if column_widths.is_empty() { 0.0 } else { x - spacing.width - grid_left };
         if rtl {
             for (column, width) in column_x.iter_mut().zip(column_widths) {
-                *column = table_size.width - *column - width;
+                *column = 2.0 * grid_left + grid_width - *column - width;
             }
         }
         // Where a cell that starts in a column and spans `span` of them has its left edge

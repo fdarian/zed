@@ -816,6 +816,8 @@ struct TextLayoutInner {
     /// less both.
     trim_top: Pixels,
     trim_bottom: Pixels,
+    /// The alignment the lines are painted with, which the positions of the text are of.
+    align: crate::TextAlign,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
 }
@@ -860,6 +862,7 @@ impl TextLayout {
         let line_height = floor_to_layout_unit(
             window.text_system().line_height(&text_style, window.rem_size()),
         );
+        let text_align = text_style.text_align;
         let mut options = text_style.layout_options(window.text_system());
         // A box that wraps in text that does not makes lines, and the spaces at the end
         // of them hang as they do in text that wraps.
@@ -941,6 +944,7 @@ impl TextLayout {
                         options,
                         trim_top: Pixels::ZERO,
                         trim_bottom: Pixels::ZERO,
+                        align: text_align,
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -1152,6 +1156,7 @@ impl TextLayout {
                     options,
                     trim_top,
                     trim_bottom,
+                    align: text_align,
                     size: Some(size),
                     bounds: None,
                 };
@@ -1408,7 +1413,12 @@ impl TextLayout {
                 line_start_ix += line.len() + 1;
             } else {
                 let position_within_line = position - line_origin;
-                match line.index_for_position(position_within_line, line_height) {
+                match line.aligned_index_for_position(
+                    position_within_line,
+                    line_height,
+                    element_state.align,
+                    bounds.size.width,
+                ) {
                     Ok(index_within_line) => return Ok(line_start_ix + index_within_line),
                     Err(index_within_line) => return Err(line_start_ix + index_within_line),
                 }
@@ -1442,11 +1452,44 @@ impl TextLayout {
                 continue;
             } else {
                 let ix_within_line = index - line_start_ix;
-                return Some(line_origin + line.position_for_index(ix_within_line, line_height)?);
+                return Some(
+                    line_origin
+                        + line.aligned_position_for_index(
+                            ix_within_line,
+                            line_height,
+                            element_state.align,
+                            bounds.size.width,
+                        )?,
+                );
             }
         }
 
         None
+    }
+
+    /// How far text alignment moves the wrapped row the byte `index` is on from the left edge of the
+    /// bounds of the text: 0 for left aligned text.
+    pub fn align_offset_at(&self, index: usize) -> Pixels {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let bounds = element_state
+            .bounds
+            .expect("prepaint has not been performed");
+        let mut line_start_ix = 0;
+        for line in element_state.lines.iter() {
+            let line_end_ix = line_start_ix + line.len();
+            if index > line_end_ix {
+                line_start_ix = line_end_ix + 1;
+                continue;
+            }
+            return match line.layout.row_for_index(index.saturating_sub(line_start_ix)) {
+                Some(row_ix) => line.row_offset(row_ix, element_state.align, bounds.size.width),
+                None => Pixels::ZERO,
+            };
+        }
+        Pixels::ZERO
     }
 
     /// The space `text-box-trim` cut above the first line and below the last, as
@@ -2105,6 +2148,7 @@ mod tests {
                     options: Default::default(),
                     trim_top: Pixels::ZERO,
                     trim_bottom: Pixels::ZERO,
+                    align: Default::default(),
                     size: None,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
@@ -2176,6 +2220,7 @@ mod tests {
                     options: Default::default(),
                     trim_top: Pixels::ZERO,
                     trim_bottom: Pixels::ZERO,
+                    align: Default::default(),
                     size: None,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
@@ -2196,6 +2241,30 @@ mod tests {
             }
             assert!(heights.len() >= 2, "rows of one height: {heights:?}");
             assert_eq!(layout.row_for_index(text.len() + 1), None);
+        }
+
+        #[crate::test]
+        fn aligned_text_is_found_where_it_is_painted(cx: &mut TestAppContext) {
+            use crate::TextAlign;
+            let layout = two_lines(cx);
+            let left = layout.position_for_index(1).unwrap();
+            let line_width = layout.position_for_index(2).unwrap().x - layout.position_for_index(0).unwrap().x;
+            assert!(line_width > px(0.) && line_width < px(100.));
+            for (align, offset) in [
+                (TextAlign::Left, px(0.)),
+                (TextAlign::Right, px(100.) - line_width),
+                (TextAlign::Center, (px(100.) - line_width) / 2.),
+            ] {
+                layout.0.borrow_mut().as_mut().unwrap().align = align;
+                let at = layout.position_for_index(1).unwrap();
+                assert_eq!(at.x, left.x + offset, "{align:?}");
+                assert_eq!(layout.align_offset_at(1), offset, "{align:?}");
+                // A point on the aligned glyph is that glyph, and where it would be without the alignment is not.
+                assert_eq!(layout.index_for_position(point(at.x + px(1.), px(110.))), Ok(1), "{align:?}");
+                if offset > px(0.) {
+                    assert_eq!(layout.index_for_position(point(left.x + px(1.), px(110.))), Err(0), "{align:?}");
+                }
+            }
         }
 
         #[crate::test]

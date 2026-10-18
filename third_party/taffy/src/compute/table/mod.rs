@@ -6,7 +6,7 @@
 //! table, a row in its row group (or in the table, when it has none), a cell in its row.
 //!
 //! With `direction: rtl` the first column is the rightmost: the columns are laid out as in a left to right table and
-//! mirrored in the border box of the table, so padding, border and spacing stay on the physical sides and the lines of
+//! mirrored in the grid, so padding, border and spacing stay on the physical sides and the lines of
 //! [`DetailedTableInfo`] are still in order from the left. A cell that spans columns is where its columns are, so its
 //! left edge is that of its last column.
 //!
