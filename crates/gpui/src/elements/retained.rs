@@ -298,13 +298,15 @@ impl RetainedState {
     }
 
     /// Whether a frame that is built from the rendered one can have this subtree paint itself from
-    /// its recording alone.
-    fn paints_from_its_recording(&self, rendered_serial: u64) -> bool {
-        self.recorded.as_ref().is_some_and(|recorded| {
-            recorded.serial == rendered_serial
-                && recorded.paint_serial == rendered_serial
-                && recorded.paint.is_some()
-        })
+    /// its recording alone: nothing it read, also while it painted, has changed.
+    fn paints_from_its_recording(&self, window: &Window) -> bool {
+        let rendered_serial = window.rendered_serial();
+        !self.accessed_entities.iter().any(|entity| window.retained.notified.contains(entity))
+            && self.recorded.as_ref().is_some_and(|recorded| {
+                recorded.serial == rendered_serial
+                    && recorded.paint_serial == rendered_serial
+                    && recorded.paint.is_some()
+            })
     }
 
     /// What the last prepaint and paint of the subtree left in the frame being built, as text.
@@ -373,9 +375,7 @@ impl Recorded {
         self.prepaint.lifts.as_ref().is_none_or(|lifts| {
             lifts.holes().all(|hole| {
                 window
-                    .peek_element_state(hole, |state: &RetainedState| {
-                        state.paints_from_its_recording(window.rendered_serial())
-                    })
+                    .peek_element_state(hole, |state: &RetainedState| state.paints_from_its_recording(window))
                     .unwrap_or(false)
             }) && lifts.cells().all(|cell| cell.paints_from_its_recording(window))
         })
@@ -600,6 +600,9 @@ fn replay_recorded_paint(
 ) {
     window.with_element_state(global_id, |state: Option<RetainedState>, window| {
         let mut state = state.expect("a replayed subtree has its state");
+        // What the subtree read while it painted is read again by its replay: the layout of a
+        // wrapper that holds it as a hole is skipped, and its entities are not observed otherwise.
+        cx.entities.extend_accessed(&state.accessed_entities);
         let recorded = state
             .recorded
             .as_mut()
