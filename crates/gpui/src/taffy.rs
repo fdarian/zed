@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use collections::{FxHashMap, FxHashSet};
-use std::{any::Any, fmt::Debug, ops::Range};
+use std::{any::Any, cell::RefCell, fmt::Debug, ops::Range, rc::Rc};
 
 mod calc;
 mod containing_block;
@@ -215,6 +215,11 @@ impl NodeMeta {
         }
     }
 }
+
+/// A layout engine that an element lays itself out in, which the window swaps in while it works
+/// and which what the element queues for later has to swap in again: see
+/// [`Window::with_layout_engine`](crate::Window).
+pub(crate) type SharedLayoutEngine = Rc<RefCell<Option<TaffyLayoutEngine>>>;
 
 pub struct TaffyLayoutEngine {
     /// Tells this engine from every other one in the process, for the layout ids that outlive a

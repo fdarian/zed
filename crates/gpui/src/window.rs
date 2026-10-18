@@ -19,7 +19,7 @@ use crate::{
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedClipPath, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
+    SharedLayoutEngine, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     DecorationThickness, TextDecorationStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle, Visibility,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
@@ -1254,6 +1254,8 @@ pub(crate) struct DeferredDraw {
     positioned_frame: Option<PositionedFrame>,
     content_mask: Option<ContentMask<Pixels>>,
     element: Option<AnyElement>,
+    /// The engine the element's layout ids are in, when it is not the window's own.
+    layout_engine: Option<SharedLayoutEngine>,
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
@@ -1716,6 +1718,9 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
+    /// The handle of `layout_engine` while an element's own engine is swapped in for the window's,
+    /// see [`Window::with_layout_engine`].
+    borrowed_layout_engine: Option<SharedLayoutEngine>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     /// [`GlobalElementId::scope_hash`] of the element being drawn, or of the nearest ancestor of
@@ -2477,6 +2482,7 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
+            borrowed_layout_engine: None,
             root: None,
             element_id_stack: SmallVec::default(),
             layout_scope: 0,
@@ -4248,10 +4254,20 @@ impl Window {
     /// What a listener queued here sees is what paint would have shown it, minus the content
     /// mask, which is gone by then. A `List` that prepaints a row range and rolls it back
     /// takes what the rolled-back rows queued with it.
+    ///
+    /// A layout id is only good under the layout engine it was requested in, so `publish` runs
+    /// under the one that was current when it was queued, which is not the window's own inside
+    /// an atomic inline.
     pub fn publish_layout(&mut self, publish: impl FnOnce(&mut Window, &mut App) + 'static) {
         if self.layout_only {
             self.note_publication();
-            self.next_frame.layout_publications.push(Box::new(publish));
+            let publication: LayoutPublication = match self.borrowed_layout_engine.clone() {
+                Some(engine) => Box::new(move |window, cx| {
+                    window.with_layout_engine(&engine, |window| publish(window, cx));
+                }),
+                None => Box::new(publish),
+            };
+            self.next_frame.layout_publications.push(publication);
         }
     }
 
@@ -4956,6 +4972,7 @@ impl Window {
                     positioned_frame,
                     prepaint_range,
                     visibility,
+                    layout_engine,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -4971,6 +4988,7 @@ impl Window {
                         deferred_draw.positioned_frame,
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.context.visibility,
+                        deferred_draw.layout_engine.clone(),
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
@@ -4979,11 +4997,13 @@ impl Window {
                 if let Some(mut element) = element {
                     debug_assert!(self.positioned_frames.is_empty());
                     self.positioned_frames.extend(positioned_frame);
-                    self.with_rendered_view(current_view, |window| {
-                        window.with_visibility(visibility, |window| {
-                            window.with_rem_size(Some(rem_size), |window| {
-                                window.with_absolute_element_offset(absolute_offset, |window| {
-                                    element.prepaint(window, cx);
+                    self.with_layout_engine_if(layout_engine.as_ref(), |window| {
+                        window.with_rendered_view(current_view, |window| {
+                            window.with_visibility(visibility, |window| {
+                                window.with_rem_size(Some(rem_size), |window| {
+                                    window.with_absolute_element_offset(absolute_offset, |window| {
+                                        element.prepaint(window, cx);
+                                    });
                                 });
                             });
                         });
@@ -5026,12 +5046,14 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.context.current_view, |window| {
-                    window.with_visibility(deferred_draw.context.visibility, |window| {
-                        window.with_content_mask(content_mask, |window| {
-                            window.with_rem_size(Some(deferred_draw.context.rem_size), |window| {
-                                element.paint(window, cx);
-                            });
+                self.with_layout_engine_if(deferred_draw.layout_engine.as_ref(), |window| {
+                    window.with_rendered_view(deferred_draw.context.current_view, |window| {
+                        window.with_visibility(deferred_draw.context.visibility, |window| {
+                            window.with_content_mask(content_mask, |window| {
+                                window.with_rem_size(Some(deferred_draw.context.rem_size), |window| {
+                                    element.paint(window, cx);
+                                });
+                            })
                         })
                     })
                 })
@@ -5136,6 +5158,7 @@ impl Window {
                     content_mask: deferred_draw.content_mask,
                     priority: deferred_draw.priority,
                     element: None,
+                    layout_engine: deferred_draw.layout_engine.clone(),
                     absolute_offset: deferred_draw.absolute_offset,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
@@ -6201,6 +6224,9 @@ impl Window {
     /// [`Hitbox::parent`], so under [`Window::set_dom_hit_testing`] the chain of a hit inside it
     /// does not include the hitboxes around this call.
     ///
+    /// The element is prepainted and painted under the layout engine that is current here, so
+    /// inside an atomic inline it reads its layout from the engine of the inline.
+    ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn defer_draw(
         &mut self,
@@ -6218,6 +6244,7 @@ impl Window {
             content_mask,
             priority,
             element: Some(element),
+            layout_engine: self.borrowed_layout_engine.clone(),
             absolute_offset,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -7137,15 +7164,31 @@ impl Window {
     /// during `compute_layout`, the lack of one. The nodes `f` requests are in `engine`, and
     /// their layout ids are only good with it, so an element laid out as a root of its own, such
     /// as an atomic inline, keeps its engine and swaps it in for everything it does.
+    ///
+    /// What `f` queues for later, a publication or a deferred draw, is run under `engine` again:
+    /// they remember the engine that was current when they were queued.
     pub(crate) fn with_layout_engine<R>(
         &mut self,
-        engine: &mut Option<TaffyLayoutEngine>,
+        engine: &SharedLayoutEngine,
         f: impl FnOnce(&mut Window) -> R,
     ) -> R {
-        let outer = std::mem::replace(&mut self.layout_engine, engine.take());
+        let outer = std::mem::replace(&mut self.layout_engine, engine.borrow_mut().take());
+        let outer_handle = self.borrowed_layout_engine.replace(engine.clone());
         let result = f(self);
-        *engine = std::mem::replace(&mut self.layout_engine, outer);
+        self.borrowed_layout_engine = outer_handle;
+        *engine.borrow_mut() = std::mem::replace(&mut self.layout_engine, outer);
         result
+    }
+
+    fn with_layout_engine_if<R>(
+        &mut self,
+        engine: Option<&SharedLayoutEngine>,
+        f: impl FnOnce(&mut Window) -> R,
+    ) -> R {
+        match engine {
+            Some(engine) => self.with_layout_engine(engine, f),
+            None => f(self),
+        }
     }
 
     /// See [`TaffyLayoutEngine::peek_keyed_state`], for the keyed measured request that the

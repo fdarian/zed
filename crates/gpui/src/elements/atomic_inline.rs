@@ -19,7 +19,8 @@ use std::{
 
 use crate::{
     AbsoluteLength, AnyElement, App, AtomicExtent, AvailableSpace, DefiniteLength, Edges,
-    InlineBox, InlineContent, LayoutId, Pixels, Point, Size, TaffyLayoutEngine, VerticalAlign,
+    InlineBox, InlineContent, LayoutId, Pixels, Point, SharedLayoutEngine, Size, TaffyLayoutEngine,
+    VerticalAlign,
     Window, px, size, taffy::RequestSignature,
 };
 
@@ -150,7 +151,7 @@ pub(crate) struct AtomicCarry {
     /// Tells this carry from every other one, and so a measure of another text's boxes from this
     /// text's.
     id: u64,
-    engine: Option<TaffyLayoutEngine>,
+    engine: SharedLayoutEngine,
     /// How each box was laid out for the last measure, which prepaint lays it out as again when the
     /// text keeps that measure.
     boxes: Vec<BoxUse>,
@@ -189,7 +190,7 @@ impl AtomicCarry {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
-            engine: None,
+            engine: Rc::new(RefCell::new(None)),
             boxes: Vec::new(),
             epoch: 0,
             seen: Vec::new(),
@@ -202,7 +203,7 @@ enum Store {
     /// Kept for the next frame's text to find again.
     Carried(Rc<RefCell<AtomicCarry>>),
     /// Used by this frame alone, because a box in it cannot be found again by a key.
-    Own(Option<TaffyLayoutEngine>),
+    Own(SharedLayoutEngine),
 }
 
 /// The atomic inlines of a text.
@@ -225,19 +226,20 @@ impl AtomicInlines {
             .filter(|carry| carry.borrow().claimed_in != Some(pass))
             .unwrap_or_else(|| Rc::new(RefCell::new(AtomicCarry::new())));
         carry.borrow_mut().claimed_in = Some(pass);
-        let mut engine = Some(match carry.borrow_mut().engine.take() {
+        let previous_engine = carry.borrow().engine.borrow_mut().take();
+        let engine: SharedLayoutEngine = Rc::new(RefCell::new(Some(match previous_engine {
             Some(mut engine) => {
                 // The pass of the frame before is over.
                 engine.end_pass();
                 engine
             }
             None => TaffyLayoutEngine::new(),
-        });
-        let unstable_before = engine.as_ref().expect("just set").unstable_requests();
+        })));
+        let unstable_before = Self::unstable_requests(&engine);
         let mut slots: Vec<Slot> = atomics
             .into_iter()
             .map(|mut atomic| {
-                let (layout_id, percent_limits) = window.with_layout_engine(&mut engine, |window| {
+                let (layout_id, percent_limits) = window.with_layout_engine(&engine, |window| {
                     let layout_id = atomic.element.request_layout(window, cx);
                     (layout_id, window.layout_has_percent_width_limits(layout_id))
                 });
@@ -267,13 +269,14 @@ impl AtomicInlines {
         // A box that was found again by its key, and whose subtree asked for what it asked for
         // the frame before, is laid out as it was. One that was made anew every frame, or whose
         // layout is rewritten after the request, is not, and neither is a box that is a leaf.
-        let engine_ref = engine.as_ref().expect("just set");
-        let signatures: Option<Vec<RequestSignature>> = (engine_ref.unstable_requests()
+        let signatures: Option<Vec<RequestSignature>> = (Self::unstable_requests(&engine)
             == unstable_before)
             .then(|| {
+                let engine = engine.borrow();
+                let engine = engine.as_ref().expect("just set");
                 slots
                     .iter()
-                    .map(|slot| engine_ref.request_signature(slot.layout_id))
+                    .map(|slot| engine.request_signature(slot.layout_id))
                     .collect()
             })
             .flatten();
@@ -343,17 +346,14 @@ impl AtomicInlines {
         Some(hasher.finish())
     }
 
-    fn take_engine(&mut self) -> Option<TaffyLayoutEngine> {
-        match &mut self.store {
-            Store::Carried(carry) => carry.borrow_mut().engine.take(),
-            Store::Own(engine) => engine.take(),
-        }
+    fn unstable_requests(engine: &SharedLayoutEngine) -> u64 {
+        engine.borrow().as_ref().expect("just set").unstable_requests()
     }
 
-    fn put_engine(&mut self, engine: Option<TaffyLayoutEngine>) {
-        match &mut self.store {
-            Store::Carried(carry) => carry.borrow_mut().engine = engine,
-            Store::Own(own) => *own = engine,
+    fn engine(&self) -> SharedLayoutEngine {
+        match &self.store {
+            Store::Carried(carry) => carry.borrow().engine.clone(),
+            Store::Own(engine) => engine.clone(),
         }
     }
 
@@ -366,8 +366,8 @@ impl AtomicInlines {
         cx: &mut App,
     ) -> Vec<InlineBox> {
         let rem_size = window.rem_size();
-        let mut engine = self.take_engine();
-        let boxes = window.with_layout_engine(&mut engine, |window| {
+        let engine = self.engine();
+        let boxes = window.with_layout_engine(&engine, |window| {
             self.slots
                 .iter_mut()
                 .map(|slot| {
@@ -383,7 +383,6 @@ impl AtomicInlines {
                 })
                 .collect()
         });
-        self.put_engine(engine);
         if let Store::Carried(carry) = &self.store {
             carry.borrow_mut().boxes = self
                 .slots
@@ -406,8 +405,8 @@ impl AtomicInlines {
         cx: &mut App,
     ) {
         let rem_size = window.rem_size();
-        let mut engine = self.take_engine();
-        window.with_layout_engine(&mut engine, |window| {
+        let engine = self.engine();
+        window.with_layout_engine(&engine, |window| {
             for slot in &mut self.slots {
                 let Some((_, origin)) = origins.iter().find(|(index, _)| *index == slot.index)
                 else {
@@ -424,17 +423,15 @@ impl AtomicInlines {
                 slot.element.prepaint_at(origin, window, cx);
             }
         });
-        self.put_engine(engine);
     }
 
     pub(crate) fn paint(&mut self, window: &mut Window, cx: &mut App) {
-        let mut engine = self.take_engine();
-        window.with_layout_engine(&mut engine, |window| {
+        let engine = self.engine();
+        window.with_layout_engine(&engine, |window| {
             for slot in &mut self.slots {
                 slot.element.paint(window, cx);
             }
         });
-        self.put_engine(engine);
     }
 }
 
@@ -610,7 +607,7 @@ mod tests {
     //! the paragraph, which is `<div style="width:...">`.
     use super::*;
     use crate::{
-        Context, FixedMetricsTextSystem, InteractiveElement as _, IntoElement, ParentElement as _,
+        AppContext as _, Context, FixedMetricsTextSystem, InteractiveElement as _, IntoElement, ParentElement as _,
         Render, StatefulInteractiveElement as _, Styled as _, StyledText, TestApp, TextLayout,
         TextRun, div,
     };
@@ -1527,6 +1524,92 @@ mod tests {
             1,
             "a click beside the box is not a click on it"
         );
+    }
+
+    /// Where a box of an atomic inline publishes from: in a frame it paints, at the end of a
+    /// layout-only pass, or from a deferred draw.
+    struct Insets {
+        deferred: bool,
+        seen: Rc<RefCell<Vec<(bool, crate::LayoutInsets)>>>,
+    }
+
+    impl Render for Insets {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.seen.clone();
+            let target = div()
+                .w(crate::px(10.))
+                .h(crate::px(10.))
+                .pt(crate::px(5.))
+                .pr(crate::px(4.))
+                .pb(crate::px(6.))
+                .pl(crate::px(3.))
+                .on_painted_layout(move |_, layout_id, window, _| {
+                    let insets = window.layout_insets(layout_id);
+                    seen.borrow_mut().push((window.is_layout_pass(), insets));
+                });
+            // More nodes than the window has, so the id of the target is not one of its own.
+            let mut element = div().children((0..12).map(|_| div().w(crate::px(1.)).h(crate::px(1.))));
+            element = if self.deferred {
+                element.child(crate::deferred(target))
+            } else {
+                element.child(target)
+            };
+            div().child(
+                div()
+                    .w(crate::px(400.))
+                    .text_size(crate::px(20.))
+                    .line_height(crate::px(20.))
+                    .child(
+                        StyledText::new(format!("xx{OBJECT}"))
+                            .with_atomic_inlines(vec![AtomicInline::new(2, element.into_any_element())]),
+                    ),
+            )
+        }
+    }
+
+    fn insets_of_a_box_in_an_atomic_inline(deferred: bool) {
+        let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut window = app.open_window({
+            let seen = seen.clone();
+            move |_, _| Insets { deferred, seen }
+        });
+        window.draw();
+        let painted = seen.borrow().last().cloned().expect("the frame painted the box");
+        assert!(!painted.0);
+        assert_eq!(painted.1.padding.top, crate::px(5.));
+        assert_eq!(painted.1.padding.right, crate::px(4.));
+        assert_eq!(painted.1.padding.bottom, crate::px(6.));
+        assert_eq!(painted.1.padding.left, crate::px(3.));
+
+        seen.borrow_mut().clear();
+        let handle = window.handle();
+        // The test app draws a frame when the update ends, so the pass is read before that.
+        let read = app.update(|cx| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                assert!(window.draw_if_dirty(cx));
+                seen.borrow().last().cloned()
+            })
+            .unwrap()
+        });
+        let read = read.expect("the layout-only pass published the box");
+        assert!(read.0, "published by a layout-only pass");
+        assert_eq!(read.1, painted.1);
+    }
+
+    /// A layout-only pass publishes after the window's own engine is back, but the id of a box in
+    /// an atomic inline is one of the engine of the inline.
+    #[test]
+    fn a_layout_only_pass_reads_the_layout_of_a_box_in_an_atomic_inline() {
+        insets_of_a_box_in_an_atomic_inline(false);
+    }
+
+    /// A deferred draw is prepainted and painted after the tree, with the ids it was requested
+    /// with in the engine of the inline.
+    #[test]
+    fn a_deferred_box_in_an_atomic_inline_reads_its_own_layout() {
+        insets_of_a_box_in_an_atomic_inline(true);
     }
 
     struct Nested;

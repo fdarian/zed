@@ -174,7 +174,7 @@ pub use styled::*;
 pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
-use taffy::TaffyLayoutEngine;
+use taffy::{SharedLayoutEngine, TaffyLayoutEngine};
 pub use taffy::{AvailableSpace, LayoutCounters, LayoutId, LayoutInsets, MeasuredLeaf};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
