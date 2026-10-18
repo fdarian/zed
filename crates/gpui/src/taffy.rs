@@ -183,6 +183,8 @@ struct NodeMeta {
     /// Set for a node with a width keyword (`min-content`, `max-content`, `fit-content`), which
     /// `compute_layout` replaces with what it measured.
     intrinsic: Option<Box<intrinsic::IntrinsicKeywords>>,
+    /// What the style of a keyword node was last resolved from, see [`intrinsic::Resolved`].
+    intrinsic_resolved: Option<Box<intrinsic::Resolved>>,
     /// The `width` that the node had before [`TaffyLayoutEngine::set_forced_width`] replaced it.
     unforced_width: Option<taffy::style::Dimension>,
 }
@@ -204,6 +206,9 @@ impl NodeMeta {
         }
         if let Some(intrinsic) = &self.intrinsic {
             intrinsic.for_each_length(&mut visit);
+        }
+        if let Some(resolved) = &self.intrinsic_resolved {
+            resolved.for_each_length(&mut visit);
         }
         if let Some(unforced_width) = self.unforced_width {
             visit(unforced_width.into_raw());
@@ -740,6 +745,9 @@ impl TaffyLayoutEngine {
         let requested = old.requested.take();
         meta.key = old.key;
         meta.stretched_in_pass = old.stretched_in_pass;
+        if meta.intrinsic.is_some() {
+            meta.intrinsic_resolved = old.intrinsic_resolved.take();
+        }
         let escapable_requested = meta.requested.take();
         *old = meta;
 
@@ -4034,6 +4042,53 @@ mod tests {
                         "frame {frame}"
                     );
                     engine.end_frame();
+                }
+            });
+        }
+
+        /// A keyword node is measured under the style it is given in place of the keyword, and
+        /// asked for again with it: when nothing under it changed that must leave its layout and
+        /// the layout of what holds it as they were, since a retained subtree is replayed only
+        /// while the generation of its layout is the one it was recorded under.
+        #[gpui::test]
+        fn a_keyword_node_that_did_not_change_leaves_the_layout_of_what_holds_it_alone(
+            cx: &mut TestAppContext,
+        ) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let mut seen = Vec::new();
+                for frame in 0..6 {
+                    let mut leaf_style = flex();
+                    leaf_style.size.width = px(80.).into();
+                    leaf_style.size.height = px(10.).into();
+                    let leaf = engine.request_keyed_layout(4, leaf_style, REM, 1., &[]);
+                    let mut keyword_style = flex();
+                    keyword_style.intrinsic_widths.min_width =
+                        Some(Some(crate::IntrinsicSize::MinContent));
+                    let keyword = engine.request_keyed_layout(3, keyword_style, REM, 1., &[leaf]);
+                    let parent = engine.request_keyed_layout(2, flex(), REM, 1., &[keyword]);
+                    let root = engine.request_keyed_layout(1, flex(), REM, 1., &[parent]);
+                    let styles_before = engine.counters().styles_set;
+                    engine.compute_layout(root, space(), window, cx);
+                    seen.push((
+                        engine.layout_generation(root),
+                        engine.layout_generation(parent),
+                        engine.layout_generation(keyword),
+                        engine.counters().styles_set - styles_before,
+                    ));
+                    assert_eq!(
+                        engine.layout_bounds(keyword, 1.).size.width,
+                        px(80.),
+                        "frame {frame}"
+                    );
+                    engine.end_frame();
+                }
+                for frame in 2..6 {
+                    assert_eq!(
+                        seen[frame], (seen[1].0, seen[1].1, seen[1].2, 0),
+                        "frame {frame} laid out the same tree again: {seen:?}"
+                    );
                 }
             });
         }

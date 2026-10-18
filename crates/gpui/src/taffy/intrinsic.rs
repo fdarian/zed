@@ -15,7 +15,7 @@ use taffy::{
     style::{CompactLength, Dimension, Display, FlexDirection},
 };
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 enum Keyword {
     MinContent,
     MaxContent,
@@ -34,7 +34,7 @@ impl Keyword {
 }
 
 /// The width and flex basis keywords of a node that has at least one.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub(super) struct IntrinsicKeywords {
     width: Option<Keyword>,
     min_width: Option<Keyword>,
@@ -90,6 +90,23 @@ impl IntrinsicKeywords {
         [self.width, self.min_width, self.max_width, self.flex_basis]
             .into_iter()
             .flatten()
+    }
+}
+
+/// What the last resolution of a keyword node was made from, which says whether the next one
+/// would come to the same style.
+pub(super) struct Resolved {
+    keywords: IntrinsicKeywords,
+    /// The dirty generation of the node once it held the resolved style.
+    generation: u64,
+    /// The style it was resolved to.
+    style: taffy::style::Style,
+}
+
+impl Resolved {
+    pub(super) fn for_each_length(&self, mut visit: impl FnMut(CompactLength)) {
+        self.keywords.for_each_length(&mut visit);
+        super::calc::for_each_length(&self.style, visit);
     }
 }
 
@@ -161,6 +178,29 @@ impl TaffyLayoutEngine {
                 }
             }
 
+            // The style the node holds is what the last resolution made of the same keywords,
+            // and nothing under it or in its style changed since (that clears its cache, which
+            // the layout after the resolution filled): measuring it would come to the same style,
+            // by way of two others, and every node above it would be a changed layout for it.
+            let generation = self.taffy.dirty_generation(id.0).expect(EXPECT_MESSAGE);
+            // A measured leaf is laid out again: the call that placed it (what a text keeps of its
+            // lines) is only known to be the last one while its own cache is cleared each frame.
+            let unchanged = self.taffy.get_node_context(id.0).is_none()
+                && !self.taffy.dirty(id.0).expect(EXPECT_MESSAGE)
+                && self
+                    .meta(id)
+                    .intrinsic_resolved
+                    .as_ref()
+                    .is_some_and(|resolved| resolved.keywords == node && resolved.generation == generation);
+            if unchanged {
+                // The containing block pass starts from the style a node was requested with.
+                let meta = self.meta_mut(id);
+                if let (Some(escapable), Some(resolved)) = (meta.escapable.as_deref_mut(), meta.intrinsic_resolved.as_deref()) {
+                    escapable.original = resolved.style.clone();
+                }
+                continue;
+            }
+
             // The content is measured without the width it is about to be given.
             let mut probe = requested.clone();
             probe.size.width = Dimension::auto();
@@ -189,10 +229,13 @@ impl TaffyLayoutEngine {
             let mut style = requested;
             apply(&node, &measured, &mut self.calcs, &mut style);
             self.rewrite_style(id, style.clone());
+            let generation = self.taffy.dirty_generation(id.0).expect(EXPECT_MESSAGE);
+            let meta = self.meta_mut(id);
             // The containing block pass starts from the style a node was requested with.
-            if let Some(escapable) = self.meta_mut(id).escapable.as_deref_mut() {
-                escapable.original = style;
+            if let Some(escapable) = meta.escapable.as_deref_mut() {
+                escapable.original = style.clone();
             }
+            meta.intrinsic_resolved = Some(Box::new(Resolved { keywords: node, generation, style }));
         }
     }
 
