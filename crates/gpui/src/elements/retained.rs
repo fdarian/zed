@@ -40,6 +40,13 @@
 //! (a drag that starts at the subtree, a sticky box, a nested scroller that is scrolled, a box that
 //! another one places) makes the recording replayable only where it was made, see [`NonRelocatable`].
 //!
+//! A subtree whose root is handed to a stacking context outside it ([`Retained::lift_z`]) is a hole
+//! in the recording of a subtree around it: that recording keeps where the context takes the root
+//! (its place among what the context was handed, its hitboxes, what it captured of the tree around
+//! it), and the context paints the root from the recording of its own, when it paints it. Any other
+//! box a subtree hands to a stacking context outside it makes the subtree unfit to replay, see
+//! [`NonReusable::Lift`].
+//!
 //! The element must have an element id that is unique among the elements around it. It names the
 //! element's state and is not on the id stack below it: the subtree has the ids it would have
 //! without the element. The root of
@@ -88,10 +95,16 @@ pub enum RetainedPhase {
     /// [`Window::publish_layout`] (their bounds, not what only paint writes), is published here,
     /// once the whole tree is prepainted.
     Layout,
+    /// A pass that only lays out has a subtree that was handed to the stacking context around
+    /// the subtree it is in (see [`Retained::lift_z`]) where its recording is. What the subtree
+    /// publishes in a pass that lays out is published here, once the whole tree is prepainted:
+    /// what its prepaint published was published with the subtree around it, with
+    /// [`RetainedPhase::Layout`].
+    LayoutPaint,
 }
 
 type Build = Box<dyn FnOnce(&mut Window, &mut App) -> AnyElement>;
-type ReplayHook = Rc<dyn Fn(RetainedPhase, Point<Pixels>, &mut Window, &mut App)>;
+pub(crate) type ReplayHook = Rc<dyn Fn(RetainedPhase, Point<Pixels>, &mut Window, &mut App)>;
 
 /// An element made by [`retained`].
 pub struct Retained {
@@ -117,6 +130,16 @@ impl Retained {
 
     /// Says that the root of the subtree is positioned with this `z-index`, and so is handed by
     /// its parent to the stacking context around it, as the element it is made of would be.
+    ///
+    /// A subtree that is handed over like this is painted by the stacking context, and does not
+    /// stop the subtree around it from being replayed: the recording of that one holds where the
+    /// context takes it, and the context paints it from its own recording. Its listener (see
+    /// [`Retained::on_replay`]) is run with [`RetainedPhase::Paint`] when the context paints it
+    /// replayed, and with [`RetainedPhase::LayoutPaint`] in a pass that only lays out; what its
+    /// prepaint publishes is published by the listener of the subtree around it. The subtree around
+    /// it must be built again when this one is (the key of the one has to hold the key of the
+    /// other), since this one is not asked for alone. If the subtree is relocatable it is built
+    /// every frame that builds the one around it.
     pub fn lift_z(mut self, z: i32) -> Self {
         self.lift_z = Some(z);
         self
@@ -231,6 +254,29 @@ impl RetainedState {
         }
     }
 
+    /// The subtrees recorded inside this one.
+    pub(crate) fn nested_recordings(&self) -> Option<Rc<[(GlobalElementId, TypeId)]>> {
+        self.recorded.as_ref().map(|recorded| recorded.prepaint.nested.clone())
+    }
+
+    /// Says what ordinal the stacking context gave the first element this subtree handed to it
+    /// in the frame being built.
+    pub(crate) fn set_lift_base(&mut self, base: u32) {
+        if let Some(recorded) = self.recorded.as_mut() {
+            recorded.lift_base = Some(base);
+        }
+    }
+
+    /// Whether a frame that is built from the rendered one can have this subtree paint itself from
+    /// its recording alone.
+    fn paints_from_its_recording(&self, rendered_serial: u64) -> bool {
+        self.recorded.as_ref().is_some_and(|recorded| {
+            recorded.serial == rendered_serial
+                && recorded.paint_serial == rendered_serial
+                && recorded.paint.is_some()
+        })
+    }
+
     /// What the last prepaint and paint of the subtree left in the frame being built, as text.
     pub(crate) fn describe(&self, window: &Window) -> Option<String> {
         let recorded = self.recorded.as_ref()?;
@@ -272,9 +318,26 @@ struct Recorded {
     unmovable_at_start: Option<NonRelocatable>,
     /// How far from the recording the last replay put the subtree.
     delta: Point<Pixels>,
+    /// The ordinal the stacking context gave the first element the subtree handed to it, when the
+    /// prepaint was last replayed.
+    lift_base: Option<u32>,
 }
 
 impl Recorded {
+    /// Whether every subtree this one handed to the stacking context around it can paint itself
+    /// from its recording, which a replay of this one leaves it to do.
+    fn holes_paint_from_their_recordings(&self, window: &Window) -> bool {
+        self.prepaint.lifts.as_ref().is_none_or(|lifts| {
+            lifts.holes().all(|hole| {
+                window
+                    .peek_element_state(hole, |state: &RetainedState| {
+                        state.paints_from_its_recording(window.rendered_serial())
+                    })
+                    .unwrap_or(false)
+            })
+        })
+    }
+
     /// Whether the recording keeps its geometry as it was in a region and not as it was in the
     /// frame, so that every replay puts it in the frame, also where it was recorded.
     fn is_regional(&self) -> bool {
@@ -367,6 +430,19 @@ impl Element for Retained {
         let outer_scope = std::mem::replace(&mut window.layout_scope, global_id.scope_hash());
         let result = self.prepaint_in_scope(global_id, bounds, request_layout, window, cx);
         window.layout_scope = outer_scope;
+        // The parent hands this subtree to the stacking context around it once this returns.
+        if self.lift_z.is_some() && self.overscan.is_none() && window.lifting() {
+            let recorded = match &result {
+                RetainedPrepaint::Replayed => !window.is_layout_pass(),
+                RetainedPrepaint::Built { record, .. } => *record,
+            };
+            if recorded {
+                window.retained.pending_hole = Some(crate::window::Hole {
+                    id: global_id.clone(),
+                    hook: self.on_replay.clone(),
+                });
+            }
+        }
         result
     }
 
@@ -383,31 +459,7 @@ impl Element for Retained {
         let global_id = &self.global_id(window);
         match prepaint {
             RetainedPrepaint::Replayed => {
-                let hook = self.on_replay.clone();
-                window.with_element_state(global_id, |state: Option<RetainedState>, window| {
-                    let mut state = state.expect("a replayed subtree has its state");
-                    let recorded = state
-                        .recorded
-                        .as_mut()
-                        .expect("a replayed subtree has its recording");
-                    let nested = recorded.prepaint.nested.clone();
-                    let delta = recorded.delta;
-                    debug_assert!(
-                        recorded.relocation.as_ref().is_none_or(|relocation| !relocation.regional()
-                            || relocation.info.covers_mask(delta, &window.content_mask())),
-                        "the region a relocatable subtree was recorded in covers the clip it is painted under"
-                    );
-                    let paint = recorded
-                        .paint
-                        .as_mut()
-                        .expect("a subtree is skipped only with its paint recorded");
-                    paint.range = window.replay_paint(paint, &nested, delta);
-                    recorded.paint_serial = window.building_serial();
-                    if let Some(hook) = hook {
-                        hook(RetainedPhase::Paint, delta, window, cx);
-                    }
-                    ((), state)
-                });
+                replay_recorded_paint(global_id, self.on_replay.as_ref(), window, cx);
             }
             RetainedPrepaint::Built {
                 element,
@@ -459,8 +511,13 @@ impl Element for Retained {
                 window.with_element_state(global_id, |state: Option<RetainedState>, window| {
                     let mut state = state.expect("a built subtree has its state");
                     state.accessed_entities.extend(accessed_entities);
+                    let lift_base = state
+                        .recorded
+                        .as_ref()
+                        .and_then(|recorded| recorded.prepaint.lifts.as_ref())
+                        .map(|lifts| lifts.ordinals());
                     let recorded = window
-                        .finish_paint_recording(mark, operations, moves)
+                        .finish_paint_recording(mark, operations, moves, lift_base)
                         .and_then(|paint| {
                             if paint.has_publications && !publishes {
                                 Err(NonReusable::Publication)
@@ -488,6 +545,46 @@ impl Element for Retained {
             }
         }
     }
+}
+
+/// Puts what the paint of the subtree `global_id` recorded into the frame being built.
+fn replay_recorded_paint(
+    global_id: &GlobalElementId,
+    hook: Option<&ReplayHook>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+        let mut state = state.expect("a replayed subtree has its state");
+        let recorded = state
+            .recorded
+            .as_mut()
+            .expect("a replayed subtree has its recording");
+        let nested = recorded.prepaint.paint_nested.clone();
+        let delta = recorded.delta;
+        let lift_base = recorded.lift_base;
+        debug_assert!(
+            recorded.relocation.as_ref().is_none_or(|relocation| !relocation.regional()
+                || relocation.info.covers_mask(delta, &window.content_mask())),
+            "the region a relocatable subtree was recorded in covers the clip it is painted under"
+        );
+        let paint = recorded
+            .paint
+            .as_mut()
+            .expect("a subtree is skipped only with its paint recorded");
+        paint.range = window.replay_paint(paint, &nested, delta, lift_base);
+        recorded.paint_serial = window.building_serial();
+        if let Some(hook) = hook {
+            hook(RetainedPhase::Paint, delta, window, cx);
+        }
+        ((), state)
+    });
+}
+
+/// Puts what the paint of a subtree that was handed to a stacking context recorded into the
+/// frame, when the context paints it, as the subtree itself would have.
+pub(crate) fn replay_hole_paint(hole: &crate::window::Hole, window: &mut Window, cx: &mut App) {
+    replay_recorded_paint(&hole.id, hole.hook.as_ref(), window, cx);
 }
 
 impl Retained {
@@ -533,6 +630,7 @@ impl Retained {
                         && recorded.paint_serial == window.rendered_serial()
                         && recorded.paint.is_some()
                         && recorded.key.shapes_layout_like(window)
+                        && recorded.holes_paint_from_their_recordings(window)
                 })
             {
                 window.retained.counters.hits += 1;
@@ -678,6 +776,7 @@ impl Retained {
                                 && recorded.paint_serial == window.rendered_serial()
                                 && recorded.paint.is_some()
                                 && recorded.key.shapes_layout_like(window)
+                                && recorded.holes_paint_from_their_recordings(window)
                         });
                     fits.then(|| (state.root, state.layout_states.clone()))
                 })
@@ -735,7 +834,7 @@ impl Retained {
                 return (false, state);
             };
             recorded.delta = delta;
-            recorded.prepaint.range =
+            (recorded.prepaint.range, recorded.lift_base) =
                 window.replay_prepaint(&recorded.prepaint, recorded.is_regional().then_some(delta));
             if let Some(relocation) = &recorded.relocation {
                 relocation.apply(delta);
@@ -810,6 +909,19 @@ impl Retained {
         });
         if let Some(hook) = self.on_replay.clone() {
             window.publish_layout(move |window, cx| hook(RetainedPhase::Layout, delta, window, cx));
+        }
+        let holes = window
+            .peek_element_state(global_id, |state: &RetainedState| {
+                state
+                    .recorded
+                    .as_ref()
+                    .and_then(|recorded| recorded.prepaint.lifts.as_ref())
+                    .map(|lifts| lifts.hooks().cloned().collect::<Vec<_>>())
+            })
+            .flatten()
+            .unwrap_or_default();
+        for hook in holes {
+            window.publish_layout(move |window, cx| hook(RetainedPhase::LayoutPaint, Point::default(), window, cx));
         }
         RetainedPrepaint::Replayed
     }
@@ -963,6 +1075,7 @@ impl Retained {
                         movable: false,
                         unmovable_at_start,
                         delta: Point::default(),
+                        lift_base: None,
                     });
                     window
                         .note_retained_recording((global_id.clone(), TypeId::of::<RetainedState>()));
@@ -1092,9 +1205,9 @@ mod tests {
     use accesskit::Role;
     use std::{cell::{Cell, RefCell}, sync::Arc};
 
-    type BuildScene = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+    pub(super) type BuildScene = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
-    struct SceneView {
+    pub(super) struct SceneView {
         build: BuildScene,
     }
 
@@ -1104,7 +1217,7 @@ mod tests {
         }
     }
 
-    fn open(cx: &mut TestAppContext, build: BuildScene) -> AnyWindowHandle {
+    pub(super) fn open(cx: &mut TestAppContext, build: BuildScene) -> AnyWindowHandle {
         let window = cx.open_window(size(px(400.), px(300.)), move |_, _| SceneView { build });
         let window = AnyWindowHandle::from(window);
         cx.update_window(window, |_, window, cx| {
@@ -1116,12 +1229,12 @@ mod tests {
         window
     }
 
-    fn draw(window: AnyWindowHandle, cx: &mut TestAppContext) {
+    pub(super) fn draw(window: AnyWindowHandle, cx: &mut TestAppContext) {
         cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
     }
 
-    fn counters(window: AnyWindowHandle, cx: &mut TestAppContext) -> RetainedCounters {
+    pub(super) fn counters(window: AnyWindowHandle, cx: &mut TestAppContext) -> RetainedCounters {
         cx.update_window(window, |_, window, _| window.retained_counters())
             .unwrap()
     }
@@ -1216,13 +1329,13 @@ mod tests {
     /// Everything a frame shows and answers, in a form that is equal for two frames that show
     /// and answer the same.
     #[derive(Debug, PartialEq)]
-    struct Snapshot {
-        scene: String,
-        a11y: String,
-        chains: Vec<String>,
+    pub(super) struct Snapshot {
+        pub(super) scene: String,
+        pub(super) a11y: String,
+        pub(super) chains: Vec<String>,
     }
 
-    fn snapshot(window: AnyWindowHandle, cx: &mut TestAppContext, points: &[(f32, f32)]) -> Snapshot {
+    pub(super) fn snapshot(window: AnyWindowHandle, cx: &mut TestAppContext, points: &[(f32, f32)]) -> Snapshot {
         cx.update_window(window, |_, window, _| {
             let scene = &window.rendered_frame.scene;
             let scene = format!(
@@ -1263,7 +1376,7 @@ mod tests {
         .unwrap()
     }
 
-    const POINTS: [(f32, f32); 6] = [
+    pub(super) const POINTS: [(f32, f32); 6] = [
         (5., 5.),
         (50., 15.),
         (90., 30.),
@@ -1272,7 +1385,7 @@ mod tests {
         (350., 250.),
     ];
 
-    fn click(window: AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
+    pub(super) fn click(window: AnyWindowHandle, cx: &mut TestAppContext, x: f32, y: f32) {
         cx.update_window(window, |_, window, cx| {
             let position = point(px(x), px(y));
             window.dispatch_event(
@@ -1299,7 +1412,7 @@ mod tests {
     }
 
     /// The focus the window has after each of `presses` tabs, and the handles it went through.
-    fn tab_order(window: AnyWindowHandle, cx: &mut TestAppContext, presses: usize) -> Vec<Option<FocusHandle>> {
+    pub(super) fn tab_order(window: AnyWindowHandle, cx: &mut TestAppContext, presses: usize) -> Vec<Option<FocusHandle>> {
         cx.update_window(window, |_, window, cx| {
             window.blur();
             (0..presses)
@@ -1749,7 +1862,7 @@ mod tests {
     /// returns what `inspect` makes of the window right after. (The test app draws a window that
     /// is dirty once the update that dirtied it is done, so a test that wants to see the window
     /// as the pass left it looks inside.)
-    fn layout_only<R>(
+    pub(super) fn layout_only<R>(
         window: AnyWindowHandle,
         cx: &mut TestAppContext,
         inspect: impl FnOnce(&mut Window) -> R,
@@ -4020,11 +4133,11 @@ mod tests {
                     labelled: rng.random_bool(0.3),
                     focusable: rng.random_bool(0.15),
                     retain: rng.random_bool(0.35),
-                    absolute: (depth > 0 && rng.random_bool(0.08)).then(|| {
+                    absolute: (depth > 0 && rng.random_bool(0.2)).then(|| {
                         (rng.random_range(0..40), rng.random_range(0..40), rng.random_range(-1..3))
                     }),
-                    stacking: rng.random_bool(0.1),
-                    escaping: rng.random_bool(0.4),
+                    stacking: rng.random_bool(0.25),
+                    escaping: rng.random_bool(0.3),
                     children,
                 }
             }
@@ -4154,7 +4267,14 @@ mod tests {
         }
 
         fn child_element(node: &Node, mode: Mode) -> AnyElement {
-            if node.retain && node.absolute.is_none() {
+            // A positioned node is a retained root only when it is lifted to its stacking context
+            // from where it is, and not when it is placed by an ancestor that clips.
+            let lift_z = match node.absolute {
+                None => None,
+                Some((_, _, z)) if !node.escaping => Some(z as i32),
+                Some(_) => return element(node, mode),
+            };
+            if node.retain {
                 let content = node.clone();
                 let key = match mode {
                     Mode::Retain => node.key(),
@@ -4163,8 +4283,11 @@ mod tests {
                         rebuilds.get()
                     }),
                 };
-                retained(("retained", node.id), key, move |_, _| element(&content, mode))
-                    .into_any_element()
+                let mut root = retained(("retained", node.id), key, move |_, _| element(&content, mode));
+                if let Some(z) = lift_z {
+                    root = root.lift_z(z);
+                }
+                root.into_any_element()
             } else {
                 element(node, mode)
             }
@@ -4288,6 +4411,10 @@ mod tests {
             let shared = Rc::new(RefCell::new(Shared { tree, spacer: 0. }));
             let retaining = open_fuzzed(cx, &shared, Mode::Retain);
             let building = open_fuzzed(cx, &shared, Mode::Rebuild);
+            cx.update_window(retaining, |_, window, _| {
+                window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+            })
+            .unwrap();
 
             for step in 0..30 {
                 {
@@ -4330,6 +4457,7 @@ mod tests {
                 }
             }
             let counters = counters(retaining, cx);
+            assert_eq!(counters.mismatches, 0, "{:?}", cx.update_window(retaining, |_, window, _| window.retention_mismatches().to_vec()));
             assert_eq!(self::counters(building, cx).replays, 0, "the control replays nothing");
             assert_eq!(counters.layout_fallbacks, 0, "{counters:?}");
             assert_eq!(self::counters(building, cx).layout_replays, 0);
@@ -4408,5 +4536,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod hole_tests;
 #[cfg(test)]
 mod relocation_tests;

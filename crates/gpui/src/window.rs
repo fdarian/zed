@@ -71,8 +71,8 @@ mod retained;
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 pub use retained::{NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub(crate) use retained::{
-    PaintRecord, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey, RetainedWindow,
-    blocker_bit, first_blocker,
+    PaintRecord, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
+    RetainedWindow, blocker_bit, first_blocker,
 };
 
 use self::a11y::A11y;
@@ -1191,7 +1191,7 @@ impl PaintContext {
 /// before) its in-flow content. Everything a normal paint of the element from its place in the tree
 /// would have seen is captured when it is handed over.
 pub(crate) struct LiftedElement {
-    pub(crate) element: AnyElement,
+    content: LiftedContent,
     pub(crate) z: i32,
     /// Position in the tree among the elements handed over to the same context.
     ordinal: u32,
@@ -1200,6 +1200,17 @@ pub(crate) struct LiftedElement {
     context: PaintContext,
     content_mask: ContentMask<Pixels>,
     image_cache: Option<AnyImageCache>,
+    /// Set when the element is a retained subtree that paints itself from its own recording,
+    /// which the recording of a subtree around it can then do without, see [`Hole`].
+    hole: Option<Hole>,
+}
+
+/// What a stacking context paints for an element that was handed to it.
+pub(crate) enum LiftedContent {
+    Element(AnyElement),
+    /// The element was not built: a retained subtree around it was replayed, and this puts what
+    /// the element painted into the frame again.
+    Replay(Option<Box<dyn FnOnce(&mut Window, &mut App)>>),
 }
 
 #[derive(Default)]
@@ -1212,6 +1223,14 @@ struct LiftList {
 pub(crate) struct LiftTicket {
     ordinal: u32,
     hitboxes_start: usize,
+}
+
+/// Identifies a lifted element that is a retained subtree whose paint is replayed from its own
+/// recording, see [`Window::pending_hole`].
+#[derive(Clone)]
+pub(crate) struct Hole {
+    pub(crate) id: GlobalElementId,
+    pub(crate) hook: Option<crate::elements::ReplayHook>,
 }
 
 pub(crate) struct DeferredDraw {
@@ -4417,7 +4436,7 @@ impl Window {
         self.draw_pass = 0;
         // What the first pass left of the subtrees it replayed, while the pass that builds every
         // subtree runs in its place for the comparison.
-        let mut shown: Option<(Vec<(GlobalElementId, TypeId)>, Vec<String>, String)> = None;
+        let mut shown: Option<(Vec<(GlobalElementId, TypeId)>, Vec<String>, String, String)> = None;
         loop {
             if shown.is_none() {
                 self.draw_pass += 1;
@@ -4427,11 +4446,18 @@ impl Window {
             self.retained.recorded_relocatably = 0;
             if self.build_pass(cx) {
                 match shown.take() {
-                    Some((subtrees, shown, registries)) => {
+                    Some((subtrees, shown, registries, frame)) => {
                         self.retained.reference = false;
                         let built = self.describe_replayed(&subtrees);
                         let built_registries = self.describe_registries();
-                        self.compare_with_reference(&subtrees, shown, built, registries, built_registries);
+                        let built_frame = self.describe_frame();
+                        self.compare_with_reference(
+                            &subtrees,
+                            shown,
+                            built,
+                            (registries, built_registries),
+                            (frame, built_frame),
+                        );
                         break;
                     }
                     // A pass that recorded subtrees to be put elsewhere is not built again for the
@@ -4446,7 +4472,7 @@ impl Window {
                     {
                         let subtrees = std::mem::take(&mut self.retained.replayed);
                         let described = self.describe_replayed(&subtrees);
-                        shown = Some((subtrees, described, self.describe_registries()));
+                        shown = Some((subtrees, described, self.describe_registries(), self.describe_frame()));
                         self.discard_pass(cx);
                         self.retained.reference = true;
                         continue;
@@ -5534,6 +5560,7 @@ impl Window {
         };
         let ordinal = list.next_ordinal;
         list.next_ordinal += 1;
+        self.retained.pending_hole = None;
         LiftTicket {
             ordinal,
             hitboxes_start: self.next_frame.hitboxes.len(),
@@ -5548,13 +5575,14 @@ impl Window {
         let hitboxes = self.next_frame.hitboxes.split_off(ticket.hitboxes_start);
         self.next_frame.hitboxes_changed();
         let entry = LiftedElement {
-            element,
+            content: LiftedContent::Element(element),
             z,
             ordinal: ticket.ordinal,
             hitboxes,
             context: PaintContext::capture(self),
             content_mask: self.content_mask(),
             image_cache: self.image_cache_stack.last().cloned(),
+            hole: self.retained.pending_hole.take(),
         };
         match self.lift_lists.last_mut() {
             Some(Some(list)) => list.entries.push(entry),
@@ -5631,13 +5659,17 @@ impl Window {
         let visibility = entry.context.visibility;
         let content_mask = entry.content_mask;
         let image_cache = entry.image_cache.take();
-        let element = &mut entry.element;
+        let content = &mut entry.content;
         self.with_rendered_view(current_view, |window| {
             window.with_visibility(visibility, |window| {
                 window.with_rem_size(Some(rem_size), |window| {
                     window.with_image_cache(image_cache, |window| {
-                        window.with_replaced_content_mask(content_mask, |window| {
-                            element.paint(window, cx)
+                        window.with_replaced_content_mask(content_mask, |window| match content {
+                            LiftedContent::Element(element) => element.paint(window, cx),
+                            LiftedContent::Replay(replay) => {
+                                let replay = replay.take().expect("a lifted element is painted once");
+                                replay(window, cx)
+                            }
                         })
                     })
                 })

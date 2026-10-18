@@ -721,10 +721,23 @@ impl Scene {
     /// The operations in `range`, as text without their draw order, for the comparison of two
     /// frames that painted them at different places in the order.
     pub(crate) fn describe_operations(&self, range: Range<usize>) -> String {
+        self.describe_operations_with(range, true)
+    }
+
+    /// The operations of the whole scene that are drawn: all but the marks that only say how a
+    /// recording of them is put under another content mask.
+    pub(crate) fn describe_drawn(&self) -> String {
+        self.describe_operations_with(0..self.paint_operations.len(), false)
+    }
+
+    fn describe_operations_with(&self, range: Range<usize>, marks: bool) -> String {
         use std::fmt::Write as _;
 
         let mut out = String::new();
         for operation in self.paint_operations.get(range).unwrap_or_default() {
+            if !marks && matches!(operation, PaintOperation::Replaced { .. } | PaintOperation::EndReplaced) {
+                continue;
+            }
             match operation {
                 PaintOperation::Primitive(Primitive::Shadow(shadow)) => write!(out, "{shadow:?}"),
                 PaintOperation::Primitive(Primitive::Quad(quad)) | PaintOperation::Quad(quad) => {
