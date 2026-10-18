@@ -362,6 +362,36 @@ impl A11y {
         update
     }
 
+    /// The tree as the frame being built has it, before it is finalized: every node in the order
+    /// the tree takes them, the node that is being built, and every claim the nodes made. For
+    /// comparing a frame with another.
+    pub(crate) fn describe_whole(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        writeln!(out, "a11y nodes {:?}", self.nodes.all_nodes).ok();
+        writeln!(out, "a11y open {:?} {:?}", self.nodes.ids_stack, self.nodes.nodes_stack).ok();
+        writeln!(out, "a11y focus {:?} {:?}", self.nodes.focus, self.nodes.active_descendant).ok();
+        let mut authors: Vec<_> = self.nodes.author_ids.iter().collect();
+        authors.sort_by_key(|(author, _)| author.as_str());
+        writeln!(out, "a11y authors {authors:?}").ok();
+        writeln!(out, "a11y relations {:?}", self.nodes.pending_relations).ok();
+        let mut focusables: Vec<_> = self.focus_ids.iter().collect();
+        focusables.sort_by_key(|(node, _)| node.0);
+        writeln!(out, "a11y focusables {focusables:?}").ok();
+        let mut bounds: Vec<_> = self.node_bounds.iter().collect();
+        bounds.sort_by_key(|(node, _)| node.0);
+        writeln!(out, "a11y bounds {bounds:?}").ok();
+        let mut actions: Vec<_> = self
+            .action_listeners
+            .iter()
+            .map(|(node, listeners)| (node.0, listeners.iter().map(|(action, _)| *action).collect::<Vec<_>>()))
+            .collect();
+        actions.sort_by_key(|(node, _)| *node);
+        writeln!(out, "a11y actions {actions:?}").ok();
+        out
+    }
+
     #[cfg(test)]
     pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
         self.debug.last_tree_update()
@@ -608,7 +638,7 @@ pub enum A11yRelation {
 
 /// Unresolved targets of one relation, recorded in prepaint and resolved in
 /// [`A11yNodeBuilder::finalize`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PendingRelation {
     node: NodeId,
     relation: A11yRelation,

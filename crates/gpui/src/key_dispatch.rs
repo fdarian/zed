@@ -137,6 +137,29 @@ pub(crate) struct DispatchActionListener {
 }
 
 impl DispatchTree {
+    /// The nodes in the order they were made, with what each holds, as text: how many listeners,
+    /// the context and the focus. For comparing a frame with another.
+    pub(crate) fn describe(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            writeln!(
+                out,
+                "dispatch {index} parent {:?} keys {} actions {:?} modifiers {} context {:?} focus {:?} view {:?}",
+                node.parent.map(|parent| parent.0),
+                node.key_listeners.len(),
+                node.action_listeners.iter().map(|listener| listener.action_type).collect::<Vec<_>>(),
+                node.modifiers_changed_listeners.len(),
+                node.context,
+                node.focus_id,
+                node.view_id,
+            )
+            .ok();
+        }
+        out
+    }
+
     pub fn new(keymap: Rc<RefCell<Keymap>>, action_registry: Rc<ActionRegistry>) -> Self {
         Self {
             node_stack: Vec::new(),

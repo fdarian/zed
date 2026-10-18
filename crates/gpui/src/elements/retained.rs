@@ -4251,6 +4251,11 @@ mod tests {
             stacking: bool,
             /// An absolutely positioned node is placed by an ancestor that clips.
             escaping: bool,
+            /// A relatively positioned node, and its z-index: it is handed to the stacking context
+            /// where it is.
+            relative: Option<i8>,
+            /// The node is a stacking context that is composited as a whole with an opacity.
+            grouped: bool,
             children: Vec<Node>,
         }
 
@@ -4284,6 +4289,8 @@ mod tests {
                     }),
                     stacking: rng.random_bool(0.25),
                     escaping: rng.random_bool(0.3),
+                    relative: (depth > 0 && rng.random_bool(0.15)).then(|| rng.random_range(-1..3)),
+                    grouped: rng.random_bool(0.1),
                     children,
                 }
             }
@@ -4317,7 +4324,7 @@ mod tests {
             fn edit(&mut self, rng: &mut StdRng, ids: &mut usize) {
                 let n = rng.random_range(0..self.count());
                 let node = self.nth_mut(n);
-                match rng.random_range(0..14) {
+                match rng.random_range(0..17) {
                     0 => node.width = *SIZES.choose(rng).unwrap(),
                     1 => node.height = *SIZES.choose(rng).unwrap(),
                     2 => node.color = rng.random_range(0..6),
@@ -4340,6 +4347,19 @@ mod tests {
                     }
                     11 if node.children.len() < 4 => {
                         node.children.push(Node::random(rng, ids, 3));
+                    }
+                    13 => {
+                        node.relative = match node.relative {
+                            None => Some(rng.random_range(-1..3)),
+                            Some(_) => None,
+                        }
+                    }
+                    14 => node.grouped = !node.grouped,
+                    15 => {
+                        node.absolute = match node.absolute {
+                            None => Some((rng.random_range(0..40), rng.random_range(0..40), rng.random_range(-1..3))),
+                            Some(_) => None,
+                        }
                     }
                     _ => {
                         node.children.pop();
@@ -4393,6 +4413,12 @@ mod tests {
             if node.stacking {
                 element = element.stacking_context();
             }
+            if node.grouped {
+                element = element.stacking_context().opacity(0.5);
+            }
+            if let Some(z) = node.relative.filter(|_| node.absolute.is_none()) {
+                element = element.relative().z_index(z as i32);
+            }
             if let Some((left, top, z)) = node.absolute {
                 element = element
                     .absolute()
@@ -4415,10 +4441,11 @@ mod tests {
         fn child_element(node: &Node, mode: Mode) -> AnyElement {
             // A positioned node is a retained root only when it is lifted to its stacking context
             // from where it is, and not when it is placed by an ancestor that clips.
-            let lift_z = match node.absolute {
-                None => None,
-                Some((_, _, z)) if !node.escaping => Some(z as i32),
-                Some(_) => return element(node, mode),
+            let lift_z = match (node.absolute, node.relative) {
+                (None, None) => None,
+                (None, Some(z)) => Some(z as i32),
+                (Some((_, _, z)), _) if !node.escaping => Some(z as i32),
+                (Some(_), _) => return element(node, mode),
             };
             if node.retain {
                 let content = node.clone();
@@ -4442,6 +4469,8 @@ mod tests {
         struct Shared {
             tree: Node,
             spacer: f32,
+            /// The root of the window is a stacking context that the positioned nodes are handed to.
+            context: bool,
         }
 
         struct Fuzzed {
@@ -4452,11 +4481,11 @@ mod tests {
         impl Render for Fuzzed {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let shared = self.shared.borrow();
-                div()
-                    .id("root")
-                    .always_hitbox()
-                    .size_full()
-                    .child(div().id("spacer").flex_none().h(px(shared.spacer)))
+                let mut root = div().id("root").always_hitbox().size_full();
+                if shared.context {
+                    root = root.stacking_context();
+                }
+                root.child(div().id("spacer").flex_none().h(px(shared.spacer)))
                     // The root of the tree is retained like any node of it, but is never lifted.
                     .child(child_element(&shared.tree, self.mode))
             }
@@ -4554,7 +4583,9 @@ mod tests {
             tree.children
                 .extend((0..3).map(|_| Node::random(&mut rng, &mut ids, 1)));
             tree.absolute = None;
-            let shared = Rc::new(RefCell::new(Shared { tree, spacer: 0. }));
+            tree.relative = None;
+            let context = rng.random_bool(0.6);
+            let shared = Rc::new(RefCell::new(Shared { tree, spacer: 0., context }));
             let retaining = open_fuzzed(cx, &shared, Mode::Retain);
             let building = open_fuzzed(cx, &shared, Mode::Rebuild);
             cx.update_window(retaining, |_, window, _| {
@@ -4571,6 +4602,10 @@ mod tests {
                         ids = next_id;
                     }
                     shared.tree.absolute = None;
+                    shared.tree.relative = None;
+                    if rng.random_bool(0.08) {
+                        shared.context = !shared.context;
+                    }
                     if rng.random_bool(0.15) {
                         shared.spacer = *[0., 7., 15.].choose(&mut rng).unwrap();
                     }

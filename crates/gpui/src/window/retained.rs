@@ -247,6 +247,8 @@ pub(crate) struct RetainedWindow {
     /// What the embedder keeps outside the frame, as text, for the comparison of a replayed frame
     /// with a built one.
     pub(crate) verifier: Option<Rc<dyn Fn(&Window) -> String>>,
+    /// The frame as a whole is not compared, see [`Window::set_retention_whole_frame`].
+    pub(crate) skip_whole_frame: bool,
     /// The frame being built is the build a replayed one is compared with: every retained
     /// subtree is built.
     pub(crate) reference: bool,
@@ -925,6 +927,15 @@ impl Window {
     /// see [`Window::retention_mismatches`]. For tests: every such frame is built twice.
     pub fn set_retention_verifier(&mut self, describe: Option<Rc<dyn Fn(&Window) -> String>>) {
         self.retained.verifier = describe;
+    }
+
+    /// Whether the verifier compares the frame as a whole too: the order of its scene, the
+    /// dispatch tree and the accessibility tree, which each subtree that replayed does not show on
+    /// its own. On by default. An embedder whose build is not the same twice in a frame (a size
+    /// that is read from the frame before, an animation that advances when it is built) turns it
+    /// off, since the two builds then differ outside the subtrees that replayed.
+    pub fn set_retention_whole_frame(&mut self, compare: bool) {
+        self.retained.skip_whole_frame = !compare;
     }
 
     /// Whether the pass being built is the one that builds every retained subtree to compare
@@ -2117,7 +2128,7 @@ impl Window {
     pub(crate) fn describe_frame(&self) -> String {
         use std::fmt::Write as _;
 
-        if self.layout_only {
+        if self.layout_only || self.retained.skip_whole_frame {
             return String::new();
         }
         let frame = &self.next_frame;
@@ -2140,6 +2151,18 @@ impl Window {
         }
         for operation in &frame.tab_stops.insertion_history {
             writeln!(out, "tab stop {operation:?}").ok();
+        }
+        out.push_str(&frame.dispatch_tree.describe());
+        writeln!(
+            out,
+            "listeners {} {} handlers {}",
+            frame.mouse_listeners.iter().flatten().count(),
+            frame.root_key_listeners.iter().flatten().count(),
+            frame.input_handlers.iter().flatten().count(),
+        )
+        .ok();
+        if self.a11y.is_active() {
+            out.push_str(&self.a11y.describe_whole());
         }
         for request in &frame.cursor_styles {
             let hitbox = request.hitbox_id.map_or_else(|| "(window)".to_owned(), name);
