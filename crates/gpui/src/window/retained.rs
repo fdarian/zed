@@ -1514,6 +1514,17 @@ impl Window {
     }
 
     /// The retained state under `key`, in the frame being built or else the rendered frame.
+    pub(crate) fn retained_state(&self, key: &(GlobalElementId, TypeId)) -> Option<&crate::elements::RetainedState> {
+        self.next_frame
+            .element_states
+            .get(key)
+            .or_else(|| self.rendered_frame.element_states.get(key))?
+            .inner
+            .downcast_ref::<Option<crate::elements::RetainedState>>()?
+            .as_ref()
+    }
+
+    /// The retained state under `key`, in the frame being built or else the rendered frame.
     fn retained_state_mut(&mut self, key: &(GlobalElementId, TypeId)) -> Option<&mut crate::elements::RetainedState> {
         self.next_frame
             .element_states

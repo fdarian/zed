@@ -4472,10 +4472,11 @@ impl Window {
             if self.build_pass(cx) {
                 match shown.take() {
                     Some((subtrees, shown, registries, frame)) => {
-                        self.retained.reference = false;
+                        // The registries are described by what the pass that built them left.
                         let built = self.describe_replayed(&subtrees);
                         let built_registries = self.describe_registries();
                         let built_frame = self.describe_frame();
+                        self.retained.reference = false;
                         self.compare_with_reference(
                             &subtrees,
                             shown,

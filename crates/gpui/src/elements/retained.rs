@@ -314,7 +314,15 @@ impl RetainedState {
         // A subtree recorded in a region prepaints and paints what lies between the content mask
         // around it and the region too, which a build under the mask leaves out: what cannot be
         // seen or hit is not compared.
-        let loose = recorded.relocation.is_some();
+        // The same goes for a subtree that holds one, which put what it recorded into the frame
+        // when it was replayed inside it.
+        let loose = recorded.relocation.is_some()
+            || recorded.prepaint.nested.iter().any(|key| {
+                window
+                    .retained_state(key)
+                    .and_then(|state| state.recorded.as_ref())
+                    .is_some_and(|recorded| recorded.relocation.is_some())
+            });
         let mut text = format!(
             "{}\n{}",
             recorded.prepaint.describe(window, loose, recorded.delta),
