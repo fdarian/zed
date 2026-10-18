@@ -392,6 +392,11 @@ impl Element for Retained {
                         .expect("a replayed subtree has its recording");
                     let nested = recorded.prepaint.nested.clone();
                     let delta = recorded.delta;
+                    debug_assert!(
+                        recorded.relocation.as_ref().is_none_or(|relocation| relocation.direct
+                            || relocation.info.covers_mask(delta, &window.content_mask())),
+                        "the region a relocatable subtree was recorded in covers the clip it is painted under"
+                    );
                     let paint = recorded
                         .paint
                         .as_mut()
@@ -436,6 +441,12 @@ impl Element for Retained {
                     let operations = operations
                         .as_ref()
                         .expect("a subtree recorded in a region painted into a scene of its own");
+                    debug_assert!(
+                        relocation.as_ref().is_some_and(|relocation| relocation
+                            .info
+                            .covers_mask(Point::default(), &window.content_mask())),
+                        "the region a relocatable subtree is recorded in covers the clip it is painted under"
+                    );
                     window.emit_relocated(operations, Point::default());
                 }
                 let Some(mark) = mark else {

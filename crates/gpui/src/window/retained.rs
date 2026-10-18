@@ -577,6 +577,11 @@ struct ClipDecision {
 }
 
 impl RelocationInfo {
+    /// Whether the region of the recording put `delta` away covers the content mask `ambient`.
+    pub(crate) fn covers_mask(&self, delta: Point<Pixels>, ambient: &ContentMask<Pixels>) -> bool {
+        covers(&Bounds::new(self.region.origin + delta, self.region.size), &ambient.bounds)
+    }
+
     /// Whether the subtree recorded here is what painting it `delta` away, inside `ambient`,
     /// would make. The region has to cover the content mask there, or the masks of what is
     /// recorded, which are cut by the region, would be smaller than the ones painting there gives.
@@ -587,8 +592,7 @@ impl RelocationInfo {
         delta: Point<Pixels>,
         ambient: &ContentMask<Pixels>,
     ) -> Result<(), RelocationMiss> {
-        let region = Bounds::new(self.region.origin + delta, self.region.size);
-        if !covers(&region, &ambient.bounds) {
+        if !self.covers_mask(delta, ambient) {
             return Err(RelocationMiss::Region);
         }
         let ambient = ContentMask::from_bounds(ambient.bounds);
