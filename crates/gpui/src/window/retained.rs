@@ -569,6 +569,10 @@ struct ClipDecision {
     mask: ContentMask<Pixels>,
     /// The content mask the clip was made inside, which holds the region.
     outer: ContentMask<Pixels>,
+    /// The mask the clip was made inside was not cut from the region, but is its own (the one of
+    /// a clip that painting made exactly, with a group), and the content mask around the region
+    /// does not cut it.
+    unclipped: bool,
     exact: bool,
 }
 
@@ -593,7 +597,10 @@ impl RelocationInfo {
             .iter()
             .all(|mask| mask.translated(delta).intersection_is_exact(&ambient))
             && self.decisions.iter().all(|decision| {
-                let outer = decision.outer.translated(delta).intersect(&ambient);
+                let mut outer = decision.outer.translated(delta);
+                if !decision.unclipped {
+                    outer = outer.intersect(&ambient);
+                }
                 decision.mask.translated(delta).intersection_is_exact(&outer) == decision.exact
             });
         if !clips_fit {
@@ -1281,6 +1288,7 @@ impl Window {
     pub(crate) fn note_rounded_mask(&mut self, mask: ContentMask<Pixels>) {
         if let Some(relocation) = self.retained.relocation.as_mut()
             && !relocation.direct
+            && self.retained.unclipped == 0
             && !relocation.info.rounded.contains(&mask)
         {
             relocation.info.rounded.push(mask);
@@ -1294,11 +1302,17 @@ impl Window {
         let Some(relocation) = self.retained.relocation.as_mut().filter(|relocation| !relocation.direct) else {
             return mask.intersection_is_exact(outer);
         };
-        let ambient = ContentMask::from_bounds(relocation.ambient.bounds);
-        let exact = mask.intersection_is_exact(&outer.intersect(&ambient));
+        let unclipped = self.retained.unclipped > 0;
+        let effective = if unclipped {
+            *outer
+        } else {
+            outer.intersect(&ContentMask::from_bounds(relocation.ambient.bounds))
+        };
+        let exact = mask.intersection_is_exact(&effective);
         relocation.info.decisions.push(ClipDecision {
             mask: *mask,
             outer: *outer,
+            unclipped,
             exact,
         });
         exact

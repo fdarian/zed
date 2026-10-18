@@ -5392,7 +5392,9 @@ impl Window {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.next_frame.scene.begin_replaced(derived);
         self.content_mask_stack.push(mask);
+        self.begin_escaped_prepaint(derived);
         let result = f(self);
+        self.end_escaped_prepaint(derived);
         self.content_mask_stack.pop();
         self.next_frame.scene.end_replaced();
         result

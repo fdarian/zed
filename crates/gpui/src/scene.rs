@@ -851,7 +851,10 @@ impl Scene {
                     reserved,
                 } => {
                     let mut effect = effect.clone();
-                    effect.translate(delta);
+                    // The group of an exact clip has no box of its own: its effect is a default.
+                    if !effect.exact_clip {
+                        effect.translate(delta);
+                    }
                     let mut content_mask = *content_mask;
                     translate_mask(&mut content_mask, delta);
                     if clipped {

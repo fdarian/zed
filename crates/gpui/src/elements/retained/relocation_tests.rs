@@ -69,6 +69,8 @@ enum Kind {
     Blurred,
     /// Cut by a `clip-path`, which cuts the pointer too.
     ClipPath,
+    /// A rounded clip inside another, whose corner the other cuts: the pointer is cut by both.
+    Nested,
     /// Has an absolutely positioned box, placed by the row.
     Absolute,
     /// Has a box that is absolutely positioned in the nearest positioned ancestor, which is the
@@ -124,6 +126,7 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles) -> AnyElement {
             row = row.p(px(4.)).child(
                 div()
                     .id(("card", index))
+                    .always_hitbox()
                     .size_full()
                     .border_1()
                     .border_color(crate::black())
@@ -132,7 +135,14 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles) -> AnyElement {
                     .shadow_md()
                     .bg(crate::white())
                     .child(text)
-                    .child(div().w(px(500.)).h(px(spec.height * 2.)).bg(crate::red().opacity(0.4))),
+                    .child(
+                        div()
+                            .id(("wide", index))
+                            .always_hitbox()
+                            .w(px(500.))
+                            .h(px(spec.height * 2.))
+                            .bg(crate::red().opacity(0.4)),
+                    ),
             );
         }
         Kind::Underlined => {
@@ -183,6 +193,38 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles) -> AnyElement {
                     .w(px(50.))
                     .h(px(10.))
                     .bg(crate::black()),
+            );
+        }
+        Kind::Nested => {
+            row = row.p(px(2.)).child(
+                div()
+                    .id(("outer", index))
+                    .always_hitbox()
+                    .size_full()
+                    .rounded_xl()
+                    .overflow_hidden()
+                    .bg(crate::white())
+                    .child(
+                        div()
+                            .id(("inner-clip", index))
+                            .always_hitbox()
+                            .ml(px(3.))
+                            .mt(px(3.))
+                            .w(px(400.))
+                            .h(px(spec.height * 2.))
+                            .rounded_xl()
+                            .overflow_hidden()
+                            .bg(crate::red().opacity(0.3))
+                            .child(text)
+                            .child(
+                                div()
+                                    .id(("leaf", index))
+                                    .always_hitbox()
+                                    .w(px(500.))
+                                    .h(px(spec.height * 3.))
+                                    .bg(crate::blue().opacity(0.3)),
+                            ),
+                    ),
             );
         }
         Kind::Positioned | Kind::Escaping | Kind::Fixed => {
@@ -356,6 +398,7 @@ impl Pair {
             ("texts", &retained.texts, &plain.texts),
             ("scroll handles", &retained.scrolls, &plain.scrolls),
             ("debug bounds", &retained.debug_bounds, &plain.debug_bounds),
+            ("hitboxes", &retained.hitboxes, &plain.hitboxes),
         ] {
             if retained != plain {
                 let retained_lines: Vec<&str> = retained.lines().collect();
@@ -366,7 +409,7 @@ impl Pair {
                     .position(|(a, b)| a != b)
                     .unwrap_or(retained_lines.len().min(plain_lines.len()));
                 let around = |lines: &[&str]| {
-                    lines[at.saturating_sub(25).min(lines.len())..(at + 40).min(lines.len())].join("\n")
+                    lines[at.saturating_sub(12).min(lines.len())..(at + 6).min(lines.len())].join("\n")
                 };
                 return Some(format!(
                     "{name} differ at line {at}\nretained:\n{}\nplain:\n{}",
@@ -402,6 +445,7 @@ impl Pair {
 }
 
 struct Observed {
+    hitboxes: String,
     debug_bounds: String,
     sprites: String,
     scene: String,
@@ -445,6 +489,30 @@ fn canonical_a11y(
         text = text.replace(&format!("#{}", id.0), &format!("@{ordinal}"));
     }
     format!("{text}\nfocus {:?}", update.focus)
+}
+
+/// `text` without the numbers that tell the views and the element paths of two windows apart:
+/// `EntityId(1v1)` and `hash: 123`.
+fn strip_identity_numbers(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next = ["EntityId(", "hash: "]
+            .iter()
+            .filter_map(|marker| rest.find(marker).map(|at| (at, *marker)))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, marker)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at + marker.len()]);
+        rest = &rest[at + marker.len()..];
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == 'v'))
+            .unwrap_or(rest.len());
+        rest = &rest[digits..];
+    }
+    out
 }
 
 /// `text` without the numbers of the views in element paths.
@@ -497,8 +565,18 @@ fn describe_handles(handles: &Handles, scroll: &ScrollHandle) -> (String, String
 }
 
 fn probes() -> Vec<(f32, f32)> {
-    let mut probes = Vec::new();
-    for x in [3., 40., 150., 290.] {
+    let mut probes = vec![
+        (5., 0.5),
+        (6., 1.5),
+        (9., 2.5),
+        (11., 0.5),
+        (295., 0.5),
+        (292., 1.5),
+        (289., 2.5),
+        (5., 218.5),
+        (292., 218.5),
+    ];
+    for x in [3., 5., 8., 40., 150., 288., 290.] {
         for y in (0..220).step_by(7) {
             probes.push((x, y as f32 + 1.5));
         }
@@ -558,6 +636,19 @@ fn observe(
         })
         .unwrap();
     let (texts, scrolls) = describe_handles(handles, scroll);
+    let hitboxes = cx
+        .update_window(window, |_, window, _| {
+            let mut entries = window
+                .rendered_frame
+                .hitboxes
+                .iter()
+                .filter(|hitbox| hitbox.is_reachable())
+                .map(|hitbox| strip_identity_numbers(&hitbox.describe()))
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries.join("\n")
+        })
+        .unwrap();
     let debug_bounds = cx
         .update_window(window, |_, window, _| {
             let mut entries = window
@@ -590,6 +681,7 @@ fn observe(
         })
         .unwrap();
     Observed {
+        hitboxes,
         debug_bounds,
         sprites,
         scene,
@@ -613,6 +705,7 @@ fn mixed(count: usize) -> Vec<RowSpec> {
         Kind::Tracked,
         Kind::Faded,
         Kind::ClipPath,
+        Kind::Nested,
         Kind::Absolute,
     ];
     (0..count)
@@ -728,6 +821,26 @@ fn a_rounded_clip_that_the_content_mask_now_cuts_through_its_corner_is_built() {
     );
     // And back, with the card whole again.
     scroll_through(&pair, cx, &[0., 2., 40.]);
+
+    // Where the content mask cuts through the arc both before and after the scroll, the card is
+    // moved, and the pointer is cut by the arc and the mask each.
+    pair.scroll_to(cx, 8.);
+    pair.draw(cx);
+    let before = pair.counters(cx);
+    scroll_through(&pair, cx, &[9., 8.5, 10., 9.]);
+    let chains = cx
+        .update_window(pair.retained, |_, window, _| {
+            window
+                .rendered_frame
+                .hitboxes
+                .iter()
+                .filter(|hitbox| !hitbox.describe().ends_with("exact "))
+                .count()
+        })
+        .unwrap();
+    assert!(chains > 0, "a card whose corner the content mask cuts has a chain of exact clips");
+    let after = pair.counters(cx);
+    assert!(after.relocations > before.relocations, "{after:?}");
 }
 
 #[test]
@@ -896,6 +1009,8 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
         Kind::Blurred,
         Kind::ClipPath,
         Kind::ClipPath,
+        Kind::Nested,
+        Kind::Nested,
         Kind::Absolute,
         Kind::Absolute,
         Kind::Positioned,
@@ -937,6 +1052,10 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
             };
             offset = (offset + jump + if fractional { rng.random_range(0..100) as f32 / 100. } else { 0. }).max(0.);
             pair.scroll_to(cx, offset);
+            if verified {
+                let mismatches = pair.mismatches(cx);
+                assert!(mismatches.is_empty(), "seed {seed} step {step} offset {offset} (scale {scale_factor}): {}", mismatches.join("\n"));
+            }
             if let Some(difference) = pair.difference(cx) {
                 panic!("seed {seed} (scale {scale_factor}, rounded {rounded}) step {step} offset {offset}: {difference}");
             }
