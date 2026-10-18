@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundImages,
-    BackgroundLayer, BackgroundTag, MaskLayer, MaskMode,
+    BackgroundLayer, BackgroundTag, MaskBorder, MaskLayer, MaskMode,
     BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, CornerRadii,
     CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
@@ -355,6 +355,10 @@ pub struct Style {
 
     /// CSS `mask-image` layers, first on top. The element is multiplied by their alpha.
     pub mask_layers: Vec<BackgroundLayer>,
+
+    /// CSS `mask-border`, painted as the top layer of the mask: it adds to what `mask_layers`
+    /// show.
+    pub mask_border: Option<MaskBorder>,
 
     /// CSS `clip-path`.
     pub clip_path: ClipPathValue,
@@ -1039,6 +1043,7 @@ impl Style {
             && self.filter.is_empty()
             && self.backdrop_filter.is_empty()
             && self.mask_layers.is_empty()
+            && self.mask_border.is_none()
             && self.clip_path == ClipPathValue::None
         {
             return None;
@@ -1056,12 +1061,17 @@ impl Style {
         };
 
         // The style lists the top layer first, the group the bottom one.
-        let mask = (!self.mask_layers.is_empty()).then(|| {
-            self.mask_layers
+        let mask = (!self.mask_layers.is_empty() || self.mask_border.is_some()).then(|| {
+            let mut layers: Vec<MaskLayer> = self
+                .mask_layers
                 .iter()
                 .rev()
                 .map(|layer| Self::mask_layer(layer, &boxes, window, cx))
-                .collect()
+                .collect();
+            if let Some(border) = &self.mask_border {
+                layers.push(border.layer(bounds, self.border_widths.to_pixels(rem_size), window, cx));
+            }
+            layers
         });
 
         Some(GroupEffect {
@@ -1529,6 +1539,7 @@ impl Default for Style {
             filter: Vec::new(),
             backdrop_filter: Vec::new(),
             mask_layers: Vec::new(),
+            mask_border: None,
             clip_path: ClipPathValue::None,
             border_colors: Edges::default(),
             border_styles: Edges::default(),

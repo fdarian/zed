@@ -21,6 +21,7 @@ mod background_layer;
 mod collapsed_borders;
 mod color;
 mod effects;
+mod mask_border;
 /// The default colors used by GPUI.
 pub mod colors;
 #[cfg(feature = "profiler")]
@@ -112,6 +113,7 @@ pub use background_layer::*;
 pub use collapsed_borders::*;
 pub use color::*;
 pub use effects::*;
+pub use mask_border::*;
 pub use ctor::ctor;
 #[cfg(feature = "profiler")]
 pub use debug_overlay::*;

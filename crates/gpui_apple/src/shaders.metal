@@ -931,10 +931,19 @@ fragment float4 polychrome_sprite_fragment(
   constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear);
   constexpr sampler nearest_neighbor_sampler(mag_filter::nearest,
                                              min_filter::nearest);
+  // Linear filtering reads half a texel past the tile's edge, which is the next tile of the atlas,
+  // or the rest of the image when the sprite is a crop of it (a slice of a nine-slice). Keep the
+  // lookup on the tile's own texels.
+  float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
+  float2 tile_origin = float2(sprite.tile.bounds.origin.x, sprite.tile.bounds.origin.y);
+  float2 tile_size = float2(sprite.tile.bounds.size.width, sprite.tile.bounds.size.height);
+  float2 tile_low = (tile_origin + 0.5) / atlas_size;
+  float2 tile_high = max((tile_origin + tile_size - 0.5) / atlas_size, tile_low);
+  float2 tile_position = clamp(input.tile_position, tile_low, tile_high);
   float4 sample = sprite.nearest_neighbor
                       ? atlas_texture.sample(nearest_neighbor_sampler,
                                              input.tile_position)
-                      : atlas_texture.sample(linear_sampler, input.tile_position);
+                      : atlas_texture.sample(linear_sampler, tile_position);
   float distance =
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii, sprite.corner_radii_y);
 
