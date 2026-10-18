@@ -2189,8 +2189,8 @@ impl Window {
     ///
     /// `relocated` says that a recording made in a region was put into the pass: it holds what lies
     /// between the content mask around it and the region too, so that it has the groups that hold
-    /// nothing there and the mouse listeners of the boxes there that a build leaves out as culled,
-    /// which nothing can hit.
+    /// nothing there and the listeners of the boxes there that a build leaves out as culled, which
+    /// nothing can hit.
     pub(crate) fn describe_frame(&self, relocated: bool) -> String {
         use std::fmt::Write as _;
 
@@ -2227,7 +2227,7 @@ impl Window {
         for operation in &frame.tab_stops.insertion_history {
             writeln!(out, "tab stop {operation:?}").ok();
         }
-        out.push_str(&frame.dispatch_tree.describe());
+        out.push_str(&frame.dispatch_tree.describe(relocated));
         if relocated {
             writeln!(
                 out,
