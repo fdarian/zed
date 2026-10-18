@@ -17,7 +17,7 @@ mod uniform_list;
 pub use anchored::*;
 pub use animation::*;
 pub use atomic_inline::{AtomicBaseline, AtomicInline};
-pub(crate) use atomic_inline::{AtomicInlines, AtomicMeasure};
+pub(crate) use atomic_inline::{AtomicCarry, AtomicInlines, AtomicMeasure};
 pub use canvas::*;
 pub use container_query::*;
 pub use deferred::*;

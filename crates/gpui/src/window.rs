@@ -7097,6 +7097,24 @@ impl Window {
         result
     }
 
+    /// See [`TaffyLayoutEngine::peek_keyed_state`], for the keyed measured request that the
+    /// element being laid out makes next.
+    pub(crate) fn peek_keyed_measure_state<S: 'static, R>(
+        &self,
+        read: impl FnOnce(&S) -> R,
+    ) -> Option<R> {
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .peek_keyed_state(self.layout_scope, read)
+    }
+
+    /// Which pass of which engine is laying out, for what one request must not claim twice.
+    pub(crate) fn layout_engine_pass(&self) -> (u64, u64) {
+        let engine = self.layout_engine.as_ref().unwrap();
+        (engine.id(), engine.pass())
+    }
+
     /// See [`TaffyLayoutEngine::has_percent_width_limits`].
     pub(crate) fn layout_has_percent_width_limits(&self, layout_id: LayoutId) -> bool {
         self.layout_engine

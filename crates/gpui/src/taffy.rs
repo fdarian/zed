@@ -124,6 +124,13 @@ struct NodeKey {
     ordinal: u32,
 }
 
+/// See [`TaffyLayoutEngine::request_signature`].
+#[derive(Clone, PartialEq)]
+pub(crate) struct RequestSignature {
+    style: taffy::style::Style,
+    children: Vec<(LayoutId, u64)>,
+}
+
 /// What the engine does, for tests and for the counters gpuix shows. They count since the engine
 /// was made.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -328,6 +335,53 @@ impl TaffyLayoutEngine {
     /// How many times `compute_layout` ran since the engine was made.
     pub(crate) fn runs(&self) -> u64 {
         self.run
+    }
+
+    /// What the request of `root` left of it and of what is directly below it, for telling a frame
+    /// that asked for the same subtree as the one before: the style the request gave the root and
+    /// how often each child was changed, which counts the changes under it too. `None` for a node
+    /// that layout measures, whose measure is not part of it.
+    pub(crate) fn request_signature(&self, root: LayoutId) -> Option<RequestSignature> {
+        if self.meta(root).measured {
+            return None;
+        }
+        let children = self.taffy.children(root.0).ok()?;
+        Some(RequestSignature {
+            style: self.taffy.style(root.0).ok()?.clone(),
+            children: children
+                .into_iter()
+                .map(|child| {
+                    (
+                        LayoutId(child),
+                        self.taffy.dirty_generation(child).expect(EXPECT_MESSAGE),
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    /// The passes the engine has ended: a request made twice in one pass is of one element built
+    /// twice.
+    pub(crate) fn pass(&self) -> u64 {
+        self.pass
+    }
+
+    /// Reads the state of the node that the next keyed measured request under `scope` would find,
+    /// if it has one of type `S`, whether or not that request's measure key is the node's. For a
+    /// request that needs what the frame before left on the node before it can say its key.
+    pub(crate) fn peek_keyed_state<S: 'static, R>(
+        &self,
+        scope: u64,
+        read: impl FnOnce(&S) -> R,
+    ) -> Option<R> {
+        let key = NodeKey {
+            scope,
+            ordinal: self.ordinals.get(&scope).copied().unwrap_or_default(),
+        };
+        let id = *self.keys.get(&key)?;
+        let context = self.taffy.get_node_context(id.0)?;
+        let state = context.keyed.as_deref()?.state.downcast_ref::<S>()?;
+        Some(read(state))
     }
 
     /// How many requests since the engine was made were of a node that is new every frame (no

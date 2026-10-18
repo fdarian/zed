@@ -1,5 +1,5 @@
 use crate::{
-    ActiveTooltip, AnyView, App, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
+    ActiveTooltip, AnyView, App, AtomicCarry, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
     DispatchPhase, Element, ElementId, EndTruncation, GlobalElementId, GlyphInset,
     HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId, MeasuredLeaf,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
@@ -675,8 +675,18 @@ impl Element for StyledText {
 
         let insets = mem::replace(&mut self.insets, Rc::new(no_insets));
         let atomic_inlines = mem::take(&mut self.atomic_inlines);
-        self.atomics = (!atomic_inlines.is_empty())
-            .then(|| Rc::new(RefCell::new(AtomicInlines::new(atomic_inlines, window, cx))));
+        self.atomics = (!atomic_inlines.is_empty()).then(|| {
+            // The boxes are laid out in the engine the frame before left on this text's node.
+            let previous = window
+                .peek_keyed_measure_state(|state: &MeasureState| state.atomics.clone())
+                .flatten();
+            Rc::new(RefCell::new(AtomicInlines::new(
+                atomic_inlines,
+                previous,
+                window,
+                cx,
+            )))
+        });
         let layout_id = self.layout.layout(
             self.text.clone(),
             runs,
@@ -819,6 +829,13 @@ impl TextLayoutInner {
     }
 }
 
+/// What the layout node of a text keeps besides its measure: the text it measured, and the engine
+/// its atomic inlines are laid out in.
+struct MeasureState {
+    layout: TextLayout,
+    atomics: Option<Rc<RefCell<AtomicCarry>>>,
+}
+
 impl TextLayout {
     /// `insets_key` stands for what `insets` returns at every width, or is `None` when it cannot be
     /// said. Layout can keep the measures of a text from one frame to the next when it is `Some`
@@ -848,8 +865,15 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        let measure_key = insets_key.filter(|_| atomics.is_none()).map(|insets_key| {
+        // Boxes in the text are part of what it measures, so the text can be kept only if they can
+        // be told from the ones of the frame before.
+        let atomic_digest = atomics.as_ref().map(|atomics| atomics.borrow().digest());
+        let atomics_carry = atomics.as_ref().and_then(|atomics| atomics.borrow().carry());
+        let measure_key = insets_key
+            .filter(|_| atomic_digest.is_none_or(|digest| digest.is_some()))
+            .map(|insets_key| {
             let mut hasher = DefaultHasher::new();
+            atomic_digest.hash(&mut hasher);
             text.hash(&mut hasher);
             runs.hash(&mut hasher);
             font_size.hash(&mut hasher);
@@ -1130,10 +1154,14 @@ impl TextLayout {
         };
         let layout_id = match measure_key {
             Some(measure_key) => {
+                let state = MeasureState {
+                    layout: self.clone(),
+                    atomics: atomics_carry,
+                };
                 let (layout_id, previous) =
-                    window.request_keyed_measured_layout(measure_key, Default::default(), self.clone(), measure);
+                    window.request_keyed_measured_layout(measure_key, Default::default(), state, measure);
                 if let Some(previous) = previous {
-                    self.take_over_measure_of(&previous);
+                    self.take_over_measure_of(&previous.layout);
                 }
                 layout_id
             }

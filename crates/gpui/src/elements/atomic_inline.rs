@@ -10,12 +10,17 @@
 //! baseline is read. In prepaint and paint the text swaps the engine of the box back in,
 //! and prepaints and paints the box where its placeholder is.
 
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    hash::{DefaultHasher, Hash as _, Hasher as _},
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
     AbsoluteLength, AnyElement, App, AtomicExtent, AvailableSpace, DefiniteLength, Edges,
     InlineBox, InlineContent, LayoutId, Pixels, Point, Size, TaffyLayoutEngine, VerticalAlign,
-    Window, px, size,
+    Window, px, size, taffy::RequestSignature,
 };
 
 /// Where the baseline of an [`AtomicInline`] is.
@@ -137,17 +142,99 @@ struct Slot {
     used_containing_width: Pixels,
 }
 
+/// What the atomic inlines of one text keep from one frame to the next, so that a text whose boxes
+/// did not change is not measured again: the engine they are laid out in, which finds the node of
+/// each element by its key and changes only what differs, and how the text last measured each box.
+/// The text keeps it on its layout node, see [`StyledText`](crate::StyledText).
+pub(crate) struct AtomicCarry {
+    /// Tells this carry from every other one, and so a measure of another text's boxes from this
+    /// text's.
+    id: u64,
+    engine: Option<TaffyLayoutEngine>,
+    /// How each box was laid out for the last measure, which prepaint lays it out as again when the
+    /// text keeps that measure.
+    boxes: Vec<BoxUse>,
+    /// Changes whenever a frame asks for other boxes than the frame before.
+    epoch: u64,
+    seen: Vec<Seen>,
+    /// The pass of the engine that laid out the text which has it, so that two texts do not use it.
+    claimed_in: Option<(u64, u64)>,
+}
+
+#[derive(Clone)]
+struct BoxUse {
+    used: Option<Layout>,
+    used_margin: Edges<Pixels>,
+    used_containing_width: Pixels,
+}
+
+/// What a frame asked for, for one box.
+#[derive(Clone, PartialEq)]
+struct Seen {
+    layout: RequestSignature,
+    index: usize,
+    margin: Edges<DefiniteLength>,
+    width: Option<DefiniteLength>,
+    align: VerticalAlign,
+    line_height: Option<Pixels>,
+    parent: Option<usize>,
+    offset: Point<DefiniteLength>,
+    percent_limits: bool,
+    /// Whether the baseline is read off the box: what it reads is part of the box.
+    measured_baseline: bool,
+}
+
+impl AtomicCarry {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            engine: None,
+            boxes: Vec::new(),
+            epoch: 0,
+            seen: Vec::new(),
+            claimed_in: None,
+        }
+    }
+}
+
+enum Store {
+    /// Kept for the next frame's text to find again.
+    Carried(Rc<RefCell<AtomicCarry>>),
+    /// Used by this frame alone, because a box in it cannot be found again by a key.
+    Own(Option<TaffyLayoutEngine>),
+}
+
 /// The atomic inlines of a text.
 pub(crate) struct AtomicInlines {
-    engine: Option<TaffyLayoutEngine>,
+    store: Store,
     slots: Vec<Slot>,
 }
 
 impl AtomicInlines {
-    /// Requests the layout of the elements, in an engine of their own.
-    pub(crate) fn new(atomics: Vec<AtomicInline>, window: &mut Window, cx: &mut App) -> Self {
-        let mut engine = Some(TaffyLayoutEngine::new());
-        let slots = atomics
+    /// Requests the layout of the elements, in an engine of their own: the one `previous` holds,
+    /// the carry of the frame before, if that is there to be used.
+    pub(crate) fn new(
+        atomics: Vec<AtomicInline>,
+        previous: Option<Rc<RefCell<AtomicCarry>>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        let pass = window.layout_engine_pass();
+        let carry = previous
+            .filter(|carry| carry.borrow().claimed_in != Some(pass))
+            .unwrap_or_else(|| Rc::new(RefCell::new(AtomicCarry::new())));
+        carry.borrow_mut().claimed_in = Some(pass);
+        let mut engine = Some(match carry.borrow_mut().engine.take() {
+            Some(mut engine) => {
+                // The pass of the frame before is over.
+                engine.end_pass();
+                engine
+            }
+            None => TaffyLayoutEngine::new(),
+        });
+        let unstable_before = engine.as_ref().expect("just set").unstable_requests();
+        let mut slots: Vec<Slot> = atomics
             .into_iter()
             .map(|mut atomic| {
                 let (layout_id, percent_limits) = window.with_layout_engine(&mut engine, |window| {
@@ -176,7 +263,98 @@ impl AtomicInlines {
                 }
             })
             .collect();
-        Self { engine, slots }
+
+        // A box that was found again by its key, and whose subtree asked for what it asked for
+        // the frame before, is laid out as it was. One that was made anew every frame, or whose
+        // layout is rewritten after the request, is not, and neither is a box that is a leaf.
+        let engine_ref = engine.as_ref().expect("just set");
+        let signatures: Option<Vec<RequestSignature>> = (engine_ref.unstable_requests()
+            == unstable_before)
+            .then(|| {
+                slots
+                    .iter()
+                    .map(|slot| engine_ref.request_signature(slot.layout_id))
+                    .collect()
+            })
+            .flatten();
+        let Some(signatures) = signatures else {
+            return Self {
+                store: Store::Own(engine),
+                slots,
+            };
+        };
+        let seen: Vec<Seen> = slots
+            .iter()
+            .zip(signatures)
+            .map(|(slot, layout)| Seen {
+                layout,
+                index: slot.index,
+                margin: slot.margin.clone(),
+                width: slot.width,
+                align: slot.align,
+                line_height: slot.line_height,
+                parent: slot.parent,
+                offset: slot.offset,
+                percent_limits: slot.percent_limits,
+                measured_baseline: matches!(slot.baseline, AtomicBaseline::Measured(_)),
+            })
+            .collect();
+        {
+            let mut carried = carry.borrow_mut();
+            if carried.seen != seen {
+                carried.epoch += 1;
+                carried.seen = seen;
+                carried.boxes.clear();
+            }
+            if carried.boxes.len() == slots.len() {
+                for (slot, used) in slots.iter_mut().zip(&carried.boxes) {
+                    slot.used = used.used;
+                    slot.used_margin = used.used_margin.clone();
+                    slot.used_containing_width = used.used_containing_width;
+                }
+            }
+            carried.engine = engine;
+        }
+        Self {
+            store: Store::Carried(carry),
+            slots,
+        }
+    }
+
+    /// The carry that the text keeps for the next frame's, if the boxes can be found again.
+    pub(crate) fn carry(&self) -> Option<Rc<RefCell<AtomicCarry>>> {
+        match &self.store {
+            Store::Carried(carry) => Some(carry.clone()),
+            Store::Own(_) => None,
+        }
+    }
+
+    /// Stands for the boxes as they are laid out, which two frames that make the text measure the
+    /// same have in common, or `None` when a box cannot be told from the one before. What a text
+    /// measured with boxes that have it is the same as long as the rest of its key is.
+    pub(crate) fn digest(&self) -> Option<u64> {
+        let Store::Carried(carry) = &self.store else {
+            return None;
+        };
+        let carry = carry.borrow();
+        let mut hasher = DefaultHasher::new();
+        carry.id.hash(&mut hasher);
+        carry.epoch.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    fn take_engine(&mut self) -> Option<TaffyLayoutEngine> {
+        match &mut self.store {
+            Store::Carried(carry) => carry.borrow_mut().engine.take(),
+            Store::Own(engine) => engine.take(),
+        }
+    }
+
+    fn put_engine(&mut self, engine: Option<TaffyLayoutEngine>) {
+        match &mut self.store {
+            Store::Carried(carry) => carry.borrow_mut().engine = engine,
+            Store::Own(own) => *own = engine,
+        }
     }
 
     /// Measures every box for a text laid out at `measure`, and returns them as the
@@ -188,7 +366,7 @@ impl AtomicInlines {
         cx: &mut App,
     ) -> Vec<InlineBox> {
         let rem_size = window.rem_size();
-        let mut engine = self.engine.take();
+        let mut engine = self.take_engine();
         let boxes = window.with_layout_engine(&mut engine, |window| {
             self.slots
                 .iter_mut()
@@ -205,7 +383,18 @@ impl AtomicInlines {
                 })
                 .collect()
         });
-        self.engine = engine;
+        self.put_engine(engine);
+        if let Store::Carried(carry) = &self.store {
+            carry.borrow_mut().boxes = self
+                .slots
+                .iter()
+                .map(|slot| BoxUse {
+                    used: slot.used,
+                    used_margin: slot.used_margin.clone(),
+                    used_containing_width: slot.used_containing_width,
+                })
+                .collect();
+        }
         boxes
     }
 
@@ -217,7 +406,7 @@ impl AtomicInlines {
         cx: &mut App,
     ) {
         let rem_size = window.rem_size();
-        let mut engine = self.engine.take();
+        let mut engine = self.take_engine();
         window.with_layout_engine(&mut engine, |window| {
             for slot in &mut self.slots {
                 let Some((_, origin)) = origins.iter().find(|(index, _)| *index == slot.index)
@@ -235,17 +424,17 @@ impl AtomicInlines {
                 slot.element.prepaint_at(origin, window, cx);
             }
         });
-        self.engine = engine;
+        self.put_engine(engine);
     }
 
     pub(crate) fn paint(&mut self, window: &mut Window, cx: &mut App) {
-        let mut engine = self.engine.take();
+        let mut engine = self.take_engine();
         window.with_layout_engine(&mut engine, |window| {
             for slot in &mut self.slots {
                 slot.element.paint(window, cx);
             }
         });
-        self.engine = engine;
+        self.put_engine(engine);
     }
 }
 
@@ -610,6 +799,8 @@ mod tests {
     thread_local! {
         /// How many times a box was laid out by its text.
         pub(super) static LAYOUT_PASSES: Cell<usize> = const { Cell::new(0) };
+        /// How many times of them the first frame of the window was.
+        pub(super) static FIRST_FRAME_PASSES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) const OBJECT: char = crate::OBJECT_REPLACEMENT_CHARACTER;
@@ -731,11 +922,13 @@ mod tests {
         let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
         let count = setup.atomics.len();
         let layout = Rc::new(RefCell::new(None));
+        LAYOUT_PASSES.with(|passes| passes.set(0));
         let mut window = app.open_window({
             let layout = layout.clone();
             move |_, _| Paragraph { setup, layout }
         });
         // Opening the window drew a frame already.
+        FIRST_FRAME_PASSES.with(|first| first.set(LAYOUT_PASSES.with(Cell::get)));
         LAYOUT_PASSES.with(|passes| passes.set(0));
         window.draw();
         let laid = window.update(|_, window, _| {
@@ -1558,7 +1751,7 @@ mod tests {
                 &format!("xx{}", OBJECT.to_string().repeat(atomics)),
                 (0..atomics).map(|_| text_box("xxxx xxxx")).collect(),
             );
-            LAYOUT_PASSES.with(|passes| passes.get())
+            FIRST_FRAME_PASSES.with(Cell::get)
         };
         assert_eq!(passes(400., 1), 2);
         assert_eq!(passes(400., 3), 6);
@@ -1686,6 +1879,142 @@ mod tests {
                 assert_close(rect.size.width, w, &format!("{name}: width of {ix}"));
                 assert_close(rect.size.height, h, &format!("{name}: height of {ix}"));
             }
+        }
+    }
+
+    /// What a frame of one window gave: the paragraph, its boxes relative to it, how the text
+    /// wrapped, and what laying it out cost.
+    #[derive(Debug, PartialEq)]
+    struct Frame {
+        paragraph: crate::Bounds<Pixels>,
+        boxes: Vec<crate::Bounds<Pixels>>,
+        wrapped: String,
+    }
+
+    /// The window engine's measures and the layouts of boxes that drawing a frame cost.
+    struct Cost {
+        measures: u64,
+        passes: usize,
+    }
+
+    /// Draws `setups` one after another in one window, as frames of a page that is edited.
+    fn frames(setups: &[Setup]) -> Vec<(Frame, Cost)> {
+        let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+        let layout = Rc::new(RefCell::new(None));
+        let mut window = app.open_window({
+            let layout = layout.clone();
+            let setup = setups[0].clone();
+            move |_, _| Paragraph { setup, layout }
+        });
+        setups
+            .iter()
+            .map(|setup| {
+                let before = window.update(|_, window, _| window.layout_counters().measures);
+                LAYOUT_PASSES.with(|passes| passes.set(0));
+                // Updating a test window draws it, once.
+                window.update(|view, _, cx| {
+                    view.setup = setup.clone();
+                    cx.notify();
+                });
+                let (paragraph, boxes, measures) = window.update(|_, window, _| {
+                    let bounds: HashMap<String, crate::Bounds<Pixels>> = window
+                        .rendered_frame
+                        .debug_bounds
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), *value))
+                        .collect();
+                    let paragraph = bounds["paragraph"];
+                    let boxes = (0..setup.atomics.len())
+                        .map(|ix| {
+                            let mut bounds = bounds[&format!("box{ix}")];
+                            bounds.origin = bounds.origin - paragraph.origin;
+                            bounds
+                        })
+                        .collect::<Vec<_>>();
+                    (paragraph, boxes, window.layout_counters().measures)
+                });
+                let wrapped = layout.borrow().as_ref().expect("rendered").wrapped_text();
+                (
+                    Frame {
+                        paragraph,
+                        boxes,
+                        wrapped,
+                    },
+                    Cost {
+                        measures: measures - before,
+                        passes: LAYOUT_PASSES.with(Cell::get),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn with_boxes(width: f32, text: &str, atomics: Vec<Atomic>) -> Setup {
+        Setup {
+            width,
+            text: text.to_string(),
+            atomics,
+            ..Default::default()
+        }
+    }
+
+    /// A text whose boxes are as they were is not measured again, and lays each box out once, as
+    /// it was last measured.
+    #[test]
+    fn a_text_whose_boxes_did_not_change_is_not_measured_again() {
+        let o = OBJECT;
+        let setup = || {
+            with_boxes(
+                150.,
+                &format!("xx{o} yy {o}{o}"),
+                vec![text_box("xxxx xxxx"), atomic(30., 10.), text_box("yy").padding(1., 2., 3., 4.)],
+            )
+        };
+        let drawn = frames(&[setup(), setup(), setup(), setup()]);
+        // The window drew its first frame when it was opened, which measured the text.
+        let first = &drawn[0].0;
+        for (frame, cost) in &drawn {
+            assert_eq!(frame, first);
+            assert_eq!(cost.measures, 0, "a frame measured the text again");
+            assert_eq!(cost.passes, 3, "each box is laid out again once, where the text left it");
+        }
+    }
+
+    /// Whatever changes between two frames, the second is the one a new window draws.
+    #[test]
+    fn a_text_whose_boxes_changed_is_measured_again_and_gives_what_a_new_window_gives() {
+        let o = OBJECT;
+        let text = format!("xx{o} yy {o}");
+        let base = || vec![text_box("xxxx xxxx"), atomic(30., 10.)];
+        let edits: Vec<(&str, Setup)> = vec![
+            ("base", with_boxes(150., &text, base())),
+            ("the text of a box", with_boxes(150., &text, vec![text_box("xxxx xxxx xxxx"), atomic(30., 10.)])),
+            ("the size of a box", with_boxes(150., &text, vec![text_box("xxxx xxxx"), atomic(40., 10.)])),
+            ("the width of the line", with_boxes(90., &text, base())),
+            ("a margin", with_boxes(150., &text, vec![text_box("xxxx xxxx").margin(0., 5., 0., 7.), atomic(30., 10.)])),
+            ("a padding", with_boxes(150., &text, vec![text_box("xxxx xxxx").padding(2., 3., 4., 5.), atomic(30., 10.)])),
+            ("an alignment", with_boxes(150., &text, vec![text_box("xxxx xxxx").aligned(VerticalAlign::Middle), atomic(30., 10.)])),
+            ("an offset", with_boxes(150., &text, vec![text_box("xxxx xxxx").offset(3., 4.), atomic(30., 10.)])),
+            ("a fixed width", with_boxes(150., &text, vec![text_box("xxxx xxxx").width(70.), atomic(30., 10.)])),
+            ("the text around", with_boxes(150., &format!("xxxx{o} yy yy {o}"), base())),
+            ("one box fewer", with_boxes(150., &format!("xx{o} yy"), vec![text_box("xxxx xxxx")])),
+            ("one box more", with_boxes(150., &format!("{o}xx{o} yy {o}"), vec![atomic(5., 5.), text_box("xxxx xxxx"), atomic(30., 10.)])),
+            ("back to the base", with_boxes(150., &text, base())),
+        ];
+        let sequence: Vec<Setup> = edits.iter().map(|(_, setup)| setup.clone()).collect();
+        // Each edit twice, so the frame after it is the one that keeps what the edit measured.
+        let twice: Vec<Setup> = sequence.iter().flat_map(|setup| [setup.clone(), setup.clone()]).collect();
+        let drawn = frames(&twice);
+        for (ix, (name, setup)) in edits.iter().enumerate() {
+            let fresh = &frames(std::slice::from_ref(setup))[0].0;
+            let (edited, cost) = &drawn[ix * 2];
+            let (kept, kept_cost) = &drawn[ix * 2 + 1];
+            assert_eq!(edited, fresh, "{name}: the frame of the edit");
+            assert_eq!(kept, fresh, "{name}: the frame after it");
+            if ix > 0 {
+                assert!(cost.measures > 0, "{name}: the edit was not measured");
+            }
+            assert_eq!(kept_cost.measures, 0, "{name}: the frame after it measured the text");
         }
     }
 }
