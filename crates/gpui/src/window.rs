@@ -4424,6 +4424,7 @@ impl Window {
             }
             self.redraw_before_present = false;
             self.retained.replayed.clear();
+            self.retained.recorded_relocatably = 0;
             if self.build_pass(cx) {
                 match shown.take() {
                     Some((subtrees, shown, registries)) => {
@@ -4433,9 +4434,15 @@ impl Window {
                         self.compare_with_reference(&subtrees, shown, built, registries, built_registries);
                         break;
                     }
+                    // A pass that recorded subtrees to be put elsewhere is not built again for the
+                    // comparison: the frame shown would be the build, whose recordings can only be
+                    // replayed where they were made, and a page with something that replays every
+                    // frame would never replay a subtree elsewhere. The frame after this one
+                    // replays them, and is compared.
                     None if self.draw_pass == 1
                         && self.retained.verifier.is_some()
-                        && !self.retained.replayed.is_empty() =>
+                        && !self.retained.replayed.is_empty()
+                        && self.retained.recorded_relocatably == 0 =>
                     {
                         let subtrees = std::mem::take(&mut self.retained.replayed);
                         let described = self.describe_replayed(&subtrees);

@@ -917,6 +917,9 @@ impl Retained {
     ) -> (bool, Option<Relocation>) {
         let publishes = self.on_replay.is_some();
         let (relocation, unmovable_at_start) = self.plan_relocation(window);
+        if relocation.as_ref().is_some_and(|relocation| !relocation.direct) {
+            window.retained.recorded_relocatably += 1;
+        }
         let surroundings = relocation
             .as_ref()
             .filter(|relocation| relocation.regional())

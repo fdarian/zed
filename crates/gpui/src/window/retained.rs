@@ -253,6 +253,8 @@ pub(crate) struct RetainedWindow {
     pub(crate) cached_view_hits: u32,
     /// The subtree being recorded so that it can be put elsewhere, see [`Relocation`].
     pub(crate) relocation: Option<Relocation>,
+    /// How many relocatable subtrees the pass being built recorded, to be put elsewhere.
+    pub(crate) recorded_relocatably: u32,
     // Counts of what a recording cannot move, which tick through a shared reference: they are
     // noted where the window is only read.
     pub(crate) sticky: Cell<u32>,
