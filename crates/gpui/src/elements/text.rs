@@ -625,11 +625,16 @@ impl StyledText {
     /// Like [`Self::with_insets`], for insets that depend on the width the text is laid
     /// out in, such as a padding in percent of it. `insets` is called each time the text
     /// is measured, with the width it is measured at, or `None` when it has no width yet.
+    ///
+    /// `key` stands for what `insets` returns at every width: two texts with the same key and
+    /// the same text, style and width have the same insets, and layout keeps the measure of
+    /// the text from one frame to the next.
     pub fn with_insets_for_width(
         mut self,
+        key: u64,
         insets: impl Fn(Option<Pixels>) -> Vec<TextInset> + 'static,
     ) -> Self {
-        self.insets_key = None;
+        self.insets_key = Some(key);
         self.insets = Rc::new(insets);
         self
     }
@@ -2969,7 +2974,7 @@ mod tests {
         impl Render for WidthInsetText {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let asked = self.asked.clone();
-                let text = StyledText::new(TEXT).with_insets_for_width(move |width| {
+                let text = StyledText::new(TEXT).with_insets_for_width(0, move |width| {
                     asked.borrow_mut().push(width);
                     // A tenth of the width in front of "bc".
                     vec![inset(1..3, width.map_or(0., |width| width.0 / 10.), 0.)]

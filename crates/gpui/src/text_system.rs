@@ -427,6 +427,11 @@ impl WindowTextSystem {
         }
     }
 
+    /// What the line layout cache has shaped and found since the window was made.
+    pub fn text_counters(&self) -> TextCounters {
+        self.line_layout_cache.counters()
+    }
+
     pub(crate) fn layout_index(&self) -> LineLayoutIndex {
         self.line_layout_cache.layout_index()
     }

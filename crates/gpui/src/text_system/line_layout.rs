@@ -10,7 +10,10 @@ use std::{
     hash::{Hash, Hasher},
     iter,
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use super::{
@@ -1534,10 +1537,35 @@ fn row_top(rows: Option<&[RowMetrics]>, row_ix: usize, line_height: Pixels) -> P
     }
 }
 
+/// What the line layout cache has done since the window was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextCounters {
+    /// Lines the platform shaped: cache misses.
+    pub shapes: u64,
+    /// Wrapped layouts computed (shaped, wrapped and inset) because no frame had them.
+    pub wrapped_layouts: u64,
+    /// Lookups that found a layout of this frame or of the frame before.
+    pub hits: u64,
+}
+
+#[derive(Default)]
+struct AtomicTextCounters {
+    shapes: AtomicU64,
+    wrapped_layouts: AtomicU64,
+    hits: AtomicU64,
+}
+
+impl AtomicTextCounters {
+    fn add(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
+    counters: AtomicTextCounters,
 }
 
 #[derive(Default)]
@@ -1598,6 +1626,15 @@ impl LineLayoutCache {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
             platform_text_system,
+            counters: AtomicTextCounters::default(),
+        }
+    }
+
+    pub fn counters(&self) -> TextCounters {
+        TextCounters {
+            shapes: self.counters.shapes.load(Ordering::Relaxed),
+            wrapped_layouts: self.counters.wrapped_layouts.load(Ordering::Relaxed),
+            hits: self.counters.hits.load(Ordering::Relaxed),
         }
     }
 
@@ -1744,11 +1781,13 @@ impl LineLayoutCache {
 
         let current_frame = self.current_frame.upgradable_read();
         if let Some(layout) = current_frame.wrapped_lines.get(key) {
+            AtomicTextCounters::add(&self.counters.hits);
             return layout.clone();
         }
 
         let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
         if let Some((key, layout)) = previous_frame_entry {
+            AtomicTextCounters::add(&self.counters.hits);
             let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
             current_frame
                 .wrapped_lines
@@ -1757,6 +1796,7 @@ impl LineLayoutCache {
             layout
         } else {
             drop(current_frame);
+            AtomicTextCounters::add(&self.counters.wrapped_layouts);
             let text = SharedString::from(text);
             let shaped_layout = self.layout_inline_line(&text, font_size, runs, inline, line_height);
             let tab_stop = options
@@ -2043,16 +2083,19 @@ impl LineLayoutCache {
 
         let current_frame = self.current_frame.upgradable_read();
         if let Some(layout) = current_frame.lines.get(key) {
+            AtomicTextCounters::add(&self.counters.hits);
             return layout.clone();
         }
 
         let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
         if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
+            AtomicTextCounters::add(&self.counters.hits);
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
         } else {
             let text = SharedString::from(text);
+            AtomicTextCounters::add(&self.counters.shapes);
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
@@ -2174,6 +2217,7 @@ impl LineLayoutCache {
                 force_width: key.force_width,
             } == key_ref
         }) {
+            AtomicTextCounters::add(&self.counters.hits);
             return layout.clone();
         }
 
@@ -2202,11 +2246,13 @@ impl LineLayoutCache {
                     .lines_by_hash
                     .insert(key.clone(), layout.clone());
                 current_frame.used_lines_by_hash.push(key);
+                AtomicTextCounters::add(&self.counters.hits);
                 return layout;
             }
         }
 
         let text = materialize_text();
+        AtomicTextCounters::add(&self.counters.shapes);
         let mut layout = self
             .platform_text_system
             .layout_line(&text, font_size, runs);
