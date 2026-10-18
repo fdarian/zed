@@ -5,7 +5,7 @@
 use super::*;
 use crate::scene::{PaintOperation, ReplayClip};
 use crate::LayoutCounters;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// Why the recording of a retained subtree cannot be replayed, so the subtree is built again
 /// every frame it is asked for.
@@ -272,6 +272,67 @@ pub(crate) struct RetainedWindow {
     pub(crate) nested_scrolls: Cell<u32>,
     /// How many boxes that escaped to an absolute content mask are being prepainted.
     pub(crate) unclipped: u32,
+    /// The recordings of prepaint that are open, outermost first.
+    open_recordings: Vec<OpenRecording>,
+    /// While an element handed to a stacking context is painted for its recording, the retained
+    /// subtrees that painted or were replayed in it, in order.
+    paint_log: Vec<(GlobalElementId, TypeId)>,
+    /// How many recordings of such a paint are open.
+    logging_paint: u32,
+}
+
+/// A recording of prepaint that has begun and not finished.
+struct OpenRecording {
+    /// How many stacking contexts were being prepainted when it began: the one it hands elements
+    /// to is the innermost of them.
+    depth: usize,
+    /// The ordinal that context gave the next element when the recording began.
+    next_ordinal: u32,
+    hook: Option<crate::elements::ReplayHook>,
+}
+
+/// A recording that was open when an element was handed to the stacking context it prepaints in:
+/// the recording holds the element, and the owner of the subtree learns what it paints through
+/// `hook` when the context paints it.
+#[derive(Clone)]
+pub(crate) struct LiftOwner {
+    pub(crate) hook: Option<crate::elements::ReplayHook>,
+    /// The ordinal of the element among the ones the recording was handed, counted from the first.
+    pub(crate) rel: u32,
+}
+
+/// What an element that a recording handed to the stacking context around it painted, for a
+/// replay of the recording to put into the frame again. One for all the recordings that were open
+/// around the element.
+pub(crate) struct PlainPaint {
+    /// How many elements were handed over while the element was prepainted, after it.
+    descendants: u32,
+    recorded: RefCell<PlainRecord>,
+}
+
+struct PlainRecord {
+    /// `None` until the context paints the element, and when what it painted cannot be repeated.
+    paint: Option<PaintRecord>,
+    /// The retained subtrees that painted inside the element.
+    nested: Rc<[(GlobalElementId, TypeId)]>,
+    /// The serial of the frame `paint` indexes.
+    serial: u64,
+    /// The entities the paint read.
+    entities: FxHashSet<EntityId>,
+}
+
+impl PlainPaint {
+    pub(crate) fn new(descendants: u32) -> Self {
+        Self {
+            descendants,
+            recorded: RefCell::new(PlainRecord {
+                paint: None,
+                nested: Rc::default(),
+                serial: 0,
+                entities: FxHashSet::default(),
+            }),
+        }
+    }
 }
 
 /// What a recording of a retained subtree could not repeat happened, if the counts differ.
@@ -1001,8 +1062,16 @@ impl Window {
 
     /// Starts recording the prepaint of a retained subtree. Pair with
     /// [`Self::finish_prepaint_recording`].
-    pub(crate) fn begin_prepaint_recording(&mut self) -> PrepaintMark {
+    ///
+    /// `hook` is the listener of the subtree, which is told what the elements it hands to the
+    /// stacking context around it paint.
+    pub(crate) fn begin_prepaint_recording(&mut self, hook: Option<crate::elements::ReplayHook>) -> PrepaintMark {
         self.invalidator.debug_assert_prepaint();
+        self.retained.open_recordings.push(OpenRecording {
+            depth: self.lift_lists.len(),
+            next_ordinal: self.ambient_lift_ordinal(),
+            hook,
+        });
         PrepaintMark {
             index: self.prepaint_index(),
             effects: self.effects(),
@@ -1022,6 +1091,7 @@ impl Window {
         mark: PrepaintMark,
         surroundings: Option<&ContentMask<Pixels>>,
     ) -> Result<PrepaintRecord, NonReusable> {
+        self.retained.open_recordings.pop().expect("a recording that finishes began");
         let end = self.prepaint_index();
         let effects = self.effects();
         let a11y = mark.a11y.map(|mark| self.a11y.end_recording(mark));
@@ -1074,6 +1144,65 @@ impl Window {
             has_publications: mark.effects.published(&effects),
             blockers,
         })
+    }
+
+    /// The recordings open around an element that is handed to the stacking context being
+    /// prepainted as its `ordinal`, outermost first.
+    pub(crate) fn lift_owners(&self, ordinal: u32) -> SmallVec<[LiftOwner; 2]> {
+        let depth = self.lift_lists.len();
+        self.retained
+            .open_recordings
+            .iter()
+            .filter(|recording| recording.depth == depth)
+            .map(|recording| LiftOwner {
+                hook: recording.hook.clone(),
+                rel: ordinal - recording.next_ordinal,
+            })
+            .collect()
+    }
+
+    /// Paints with `paint` an element that the stacking context takes from the recordings in
+    /// `owners`, and keeps what it painted in `cell`.
+    pub(crate) fn record_plain_paint(
+        &mut self,
+        cell: &PlainPaint,
+        ordinal: u32,
+        owners: &[LiftOwner],
+        cx: &mut App,
+        paint: impl FnOnce(&mut Window, &mut App),
+    ) {
+        let mark = self.begin_paint_recording();
+        let log_start = self.retained.paint_log.len();
+        self.retained.logging_paint += 1;
+        let ((), entities) = self.detect_observed_entities(cx, paint);
+        self.retained.logging_paint -= 1;
+        let nested: Rc<[(GlobalElementId, TypeId)]> = self.retained.paint_log.split_off(log_start).into();
+        let base = LiftBase {
+            base: ordinal + 1,
+            count: cell.descendants,
+        };
+        // A replay does not run the listeners that report to their owner: the recordings around
+        // have to say they report for themselves.
+        let recorded = self.finish_paint_recording(mark, None, false, Some(base)).and_then(|paint| {
+            if paint.has_publications && owners.iter().any(|owner| owner.hook.is_none()) {
+                Err(NonReusable::Publication)
+            } else {
+                Ok(paint)
+            }
+        });
+        let mut cell = cell.recorded.borrow_mut();
+        match recorded {
+            Ok(paint) => {
+                cell.paint = Some(paint);
+                cell.nested = nested;
+                cell.serial = self.building_serial();
+                cell.entities = entities;
+            }
+            Err(reason) => {
+                cell.paint = None;
+                self.retained.counters.count_non_reusable(reason);
+            }
+        }
     }
 
     /// Where the stacking context that elements are handed to stands now.
@@ -1232,6 +1361,8 @@ impl Window {
                 content_mask: stub.content_mask,
                 image_cache: stub.image_cache.clone(),
                 hole: Some(stub.hole.clone()),
+                cell: None,
+                owners: SmallVec::new(),
             });
         }
         match self.lift_lists.last_mut() {

@@ -71,7 +71,7 @@ mod retained;
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 pub use retained::{NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub(crate) use retained::{
-    PaintRecord, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
+    LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
     RetainedWindow, blocker_bit, first_blocker,
 };
 
@@ -1203,6 +1203,11 @@ pub(crate) struct LiftedElement {
     /// Set when the element is a retained subtree that paints itself from its own recording,
     /// which the recording of a subtree around it can then do without, see [`Hole`].
     hole: Option<Hole>,
+    /// Set when a recording is open around the element and it is not a hole: what it paints is
+    /// recorded here, for the recordings around to put into the frame again.
+    cell: Option<Rc<PlainPaint>>,
+    /// The recordings that were open around the element when it was handed over.
+    owners: SmallVec<[LiftOwner; 2]>,
 }
 
 /// What a stacking context paints for an element that was handed to it.
@@ -5574,6 +5579,12 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
         let hitboxes = self.next_frame.hitboxes.split_off(ticket.hitboxes_start);
         self.next_frame.hitboxes_changed();
+        let hole = self.retained.pending_hole.take();
+        let owners = self.lift_owners(ticket.ordinal);
+        // A recording that is made in a region of its own is not replayed from the frame, and has
+        // no use for the paint of an element it hands to the stacking context.
+        let cell = (hole.is_none() && !owners.is_empty() && self.retained.relocation.is_none())
+            .then(|| Rc::new(PlainPaint::new(self.ambient_lift_ordinal() - (ticket.ordinal + 1))));
         let entry = LiftedElement {
             content: LiftedContent::Element(element),
             z,
@@ -5582,7 +5593,9 @@ impl Window {
             context: PaintContext::capture(self),
             content_mask: self.content_mask(),
             image_cache: self.image_cache_stack.last().cloned(),
-            hole: self.retained.pending_hole.take(),
+            hole,
+            owners: if cell.is_some() { owners } else { SmallVec::new() },
+            cell,
         };
         match self.lift_lists.last_mut() {
             Some(Some(list)) => list.entries.push(entry),
@@ -5660,12 +5673,20 @@ impl Window {
         let content_mask = entry.content_mask;
         let image_cache = entry.image_cache.take();
         let content = &mut entry.content;
+        let cell = entry.cell.as_deref();
+        let owners = &entry.owners;
+        let ordinal = entry.ordinal;
         self.with_rendered_view(current_view, |window| {
             window.with_visibility(visibility, |window| {
                 window.with_rem_size(Some(rem_size), |window| {
                     window.with_image_cache(image_cache, |window| {
                         window.with_replaced_content_mask(content_mask, |window| match content {
-                            LiftedContent::Element(element) => element.paint(window, cx),
+                            LiftedContent::Element(element) => match cell {
+                                Some(cell) => window.record_plain_paint(cell, ordinal, owners, cx, |window, cx| {
+                                    element.paint(window, cx)
+                                }),
+                                None => element.paint(window, cx),
+                            },
                             LiftedContent::Replay(replay) => {
                                 let replay = replay.take().expect("a lifted element is painted once");
                                 replay(window, cx)

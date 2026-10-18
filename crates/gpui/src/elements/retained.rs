@@ -1040,7 +1040,7 @@ impl Retained {
             .as_ref()
             .filter(|relocation| relocation.regional())
             .map(|relocation| relocation.ambient);
-        let mark = window.begin_prepaint_recording();
+        let mark = window.begin_prepaint_recording(self.on_replay.clone());
         let relocating = relocation.is_some();
         if let Some(relocation) = relocation {
             window.begin_relocation(relocation, false);
