@@ -1739,3 +1739,124 @@ impl Render for ReadsWhilePainting {
         }))
     }
 }
+
+type Reports = Rc<RefCell<Vec<Bounds<Pixels>>>>;
+
+/// A relocatable root whose owner reports the unsnapped bounds of a box in it.
+struct Reporting {
+    mode: Mode,
+    scroll: ScrollHandle,
+    reports: Reports,
+    translation: Rc<std::cell::Cell<Point<Pixels>>>,
+}
+
+impl Render for Reporting {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let reports = self.reports.clone();
+        let translation = self.translation.clone();
+        let build = move |_: &mut Window, _: &mut App| -> AnyElement {
+            let reports = reports.clone();
+            div()
+                .id("root")
+                .w(px(200.))
+                .h(px(80.))
+                .flex_none()
+                .child(
+                    div()
+                        .id("probe")
+                        .ml(px(5.4))
+                        .mt(px(3.3))
+                        .w(px(30.3))
+                        .h(px(20.7))
+                        .on_prepainted_layout(move |_, id, window, _| {
+                            reports.borrow_mut().push(window.layout_unsnapped_bounds(id));
+                        }),
+                )
+                .into_any_element()
+        };
+        let key = match self.mode {
+            Mode::Retain => 1,
+            Mode::Rebuild => REBUILDS.with(|r| {
+                r.set(r.get() + 1);
+                r.get()
+            }),
+        };
+        let mut root = retained("root", key, build)
+            .cull_outset(Some(Edges::all(px(500.))))
+            .on_replay_translated(move |phase, delta, _, _| {
+                if phase == RetainedPhase::Prepaint {
+                    translation.set(delta);
+                }
+            });
+        if self.mode == Mode::Retain {
+            root = root.relocatable(px(100.));
+        }
+        div().id("outer").stacking_context().size_full().child(
+            div()
+                .id("page")
+                .w(px(400.))
+                .h(px(300.))
+                .flex()
+                .flex_col()
+                .overflow_scroll()
+                .track_scroll(&self.scroll)
+                .child(div().id("head").flex_none().h(px(40.)))
+                .child(root)
+                .child(div().id("tail").flex_none().h(px(800.))),
+        )
+    }
+}
+
+/// What an owner that keeps the bounds of a box from the build and moves them by the translation
+/// of a relocated replay (the way the tape of gpuix does) reports is what a build reports, under a
+/// scroll offset that is not a whole number of device pixels.
+#[gpui::test]
+fn review_unsnapped_bounds_of_a_relocated_replay_are_the_ones_a_build_reports(cx: &mut TestAppContext) {
+    let open = |cx: &mut TestAppContext, mode: Mode| {
+        let scroll = ScrollHandle::new();
+        let reports = Reports::default();
+        let translation = Rc::new(std::cell::Cell::new(Point::default()));
+        let window = cx.open_window(size(px(400.), px(300.)), {
+            let (scroll, reports, translation) = (scroll.clone(), reports.clone(), translation.clone());
+            move |_, _| Reporting { mode, scroll, reports, translation }
+        });
+        let window = AnyWindowHandle::from(window);
+        cx.update_window(window, |_, window, cx| {
+            window.set_dom_hit_testing(true);
+            window.set_scale_factor(2.);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        (window, scroll, reports, translation)
+    };
+    let (retaining, retaining_scroll, retaining_reports, translation) = open(cx, Mode::Retain);
+    let (building, building_scroll, building_reports, _) = open(cx, Mode::Rebuild);
+    let mut recorded = retaining_reports.borrow().last().copied().expect("the first draw built the root");
+    let mut failures = Vec::new();
+    for (step, offset) in [0., 3.3, 7.7, 12.2, 20.9, 41.4, 41.9, 42.1, 30.6, 0.2].into_iter().enumerate() {
+        translation.set(Point::default());
+        for (window, scroll, reports) in [
+            (retaining, &retaining_scroll, &retaining_reports),
+            (building, &building_scroll, &building_reports),
+        ] {
+            reports.borrow_mut().clear();
+            scroll.set_offset(point(px(0.), px(-offset)));
+            cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        }
+        let built = building_reports.borrow().last().copied().expect("a rebuild builds the root");
+        let reported = match retaining_reports.borrow().last().copied() {
+            Some(bounds) => {
+                recorded = bounds;
+                bounds
+            }
+            None => Bounds::new(recorded.origin + translation.get(), recorded.size),
+        };
+        let off = (reported.origin - built.origin).map(|d| d.0.abs());
+        if off.x > 1. / 256. || off.y > 1. / 256. {
+            failures.push(format!("step {step} offset {offset}: moved {reported:?}, built {built:?}"));
+        }
+    }
+    let relocations = cx.update_window(retaining, |_, window, _| window.retained_counters().relocations).unwrap();
+    assert!(relocations > 0, "some frame relocated the root");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

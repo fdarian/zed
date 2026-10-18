@@ -7271,6 +7271,11 @@ impl Window {
     /// before it is snapped to device pixels, which a browser reports for `getBoundingClientRect`
     /// (to 1/64 of a pixel). Boxes are painted from [`Self::layout_bounds`].
     ///
+    /// The scroll offset around the box is the one the box is painted at, snapped to the device
+    /// pixel as in [`Self::layout_bounds`], and not the raw one: it is also how far a relocated
+    /// replay moves what was recorded (see [`Retained::on_replay_translated`]), so that bounds
+    /// kept from the build and moved by it are the ones a build reports.
+    ///
     /// This method should only be called as part of element drawing.
     pub fn layout_unsnapped_bounds(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
         self.invalidator.debug_assert_prepaint();
@@ -7281,7 +7286,7 @@ impl Window {
             .as_mut()
             .unwrap()
             .layout_unsnapped_bounds(layout_id, scale_factor);
-        bounds.origin += self.element_offset();
+        bounds.origin += self.pixel_snap_point(self.element_offset());
         bounds
     }
 

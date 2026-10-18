@@ -186,7 +186,10 @@ impl Retained {
     /// far a replay put the subtree from where it was recorded (zero when it is where it was
     /// recorded), counted from the recording and not from the replay before, so that running it
     /// again for the same place does the same. Whatever it publishes of the subtree's geometry
-    /// is its owner's to move by that, as the frame moves its own.
+    /// is its owner's to move by that, as the frame moves its own: the translation is a whole
+    /// number of device pixels, the difference of the scroll offsets as they are painted at
+    /// (snapped), which [`Window::layout_bounds`] and [`Window::layout_unsnapped_bounds`] both
+    /// add to the box they give.
     ///
     /// A subtree that is [relocatable](Self::relocatable) and whose listeners report to their
     /// owner is only put elsewhere if the owner takes the translation this way.
