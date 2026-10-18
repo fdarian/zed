@@ -288,6 +288,12 @@ struct ViewElementState {
     reusable: bool,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// The serials of the frames the ranges index (see [`Window::building_serial`]). A pass that
+    /// is thrown away, such as the one that builds every retained subtree for the comparison with
+    /// one that replayed, hands the state back with ranges of a frame that is never rendered, and
+    /// a frame after a replay that carried the state forward has ranges of an older one.
+    prepaint_serial: u64,
+    paint_serial: u64,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
 }
@@ -396,6 +402,8 @@ impl<V: View> Element for ViewElement<V> {
                             && element_state.cache_key.text_style == text_style
                             && element_state.cache_key.visibility == visibility
                             && element_state.reusable
+                            && element_state.prepaint_serial == window.rendered_serial()
+                            && element_state.paint_serial == window.rendered_serial()
                             && !window.is_recording_relocatably()
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
@@ -408,6 +416,7 @@ impl<V: View> Element for ViewElement<V> {
                                 .extend_accessed(&element_state.accessed_entities);
                             let prepaint_end = window.prepaint_index();
                             element_state.prepaint_range = prepaint_start..prepaint_end;
+                            element_state.prepaint_serial = window.building_serial();
                             element_state.reusable = !window.in_stacking_context();
 
                             return (None, element_state);
@@ -440,6 +449,8 @@ impl<V: View> Element for ViewElement<V> {
                                 accessed_entities,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
+                                prepaint_serial: window.building_serial(),
+                                paint_serial: 0,
                                 cache_key: ViewElementCacheKey {
                                     bounds,
                                     content_mask,
@@ -497,6 +508,7 @@ impl<V: View> Element for ViewElement<V> {
 
                             let paint_end = window.paint_index();
                             element_state.paint_range = paint_start..paint_end;
+                            element_state.paint_serial = window.building_serial();
 
                             ((), element_state)
                         },

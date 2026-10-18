@@ -2508,6 +2508,72 @@ mod tests {
         });
     }
 
+    struct Counting(Rc<Cell<usize>>);
+
+    impl Render for Counting {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div().id("counting").w(px(30.)).h(px(30.)).bg(crate::blue()).always_hitbox()
+        }
+    }
+
+    /// A cached view in a retained subtree that is built every frame, next to subtrees that
+    /// replay. The frame that is compared with a build keeps the state of the view in the pass
+    /// that replayed, whose frame is never rendered.
+    #[gpui::test]
+    fn a_cached_view_in_a_retained_subtree_is_drawn_in_a_frame_that_is_verified(
+        cx: &mut TestAppContext,
+    ) {
+        for verified in [false, true] {
+            let renders = Rc::new(Cell::new(0));
+            let view = cx.new(|_| Counting(renders.clone()));
+            let clicks = Rc::new(RefCell::new(Vec::new()));
+            let window = open(cx, {
+                let clicks = clicks.clone();
+                Rc::new(move |_, _| {
+                    let view = view.clone();
+                    let cards = (0..3usize).map(|index| {
+                        let clicks = clicks.clone();
+                        retained(("retained-card", index), 1, move |_, _| card(index, &clicks))
+                    });
+                    div()
+                        .id("root")
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .children(cards)
+                        .child(retained("retained-view", 1, move |_, _| {
+                            div()
+                                .id("holder")
+                                .w(px(100.))
+                                .h(px(100.))
+                                .child(view.clone().cached(crate::StyleRefinement::default().size_full()))
+                                .into_any_element()
+                        }))
+                        .into_any_element()
+                })
+            });
+            if verified {
+                cx.update_window(window, |_, window, _| {
+                    window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+                })
+                .unwrap();
+            }
+            for _ in 0..8 {
+                draw(window, cx);
+            }
+            let end = counters(window, cx);
+            assert!(end.replays >= 3, "{end:?}");
+            assert_eq!(end.verified > 0, verified, "{end:?}");
+            assert_eq!(end.mismatches, 0, "{end:?}");
+            assert!(end.non_reusable(NonReusable::CachedView) > 0, "{end:?}");
+            // The pass that builds for the comparison draws the view in full.
+            if !verified {
+                assert!(renders.get() < 8, "the view is drawn from its cache: {}", renders.get());
+            }
+        }
+    }
+
     #[gpui::test]
     fn a_subtree_with_a_width_keyword_is_never_replayed(cx: &mut TestAppContext) {
         never_replayed(cx, NonReusable::UnstableLayout, |_, _| {
