@@ -4582,9 +4582,23 @@ mod tests {
 
         #[gpui::test(iterations = 20)]
         fn retained_subtrees_show_what_the_same_tree_built_shows(
-            mut rng: StdRng,
+            rng: StdRng,
             cx: &mut TestAppContext,
         ) {
+            fuzz_one(rng, cx, true);
+        }
+
+        /// REVIEW: the same without the verifier, whose reference build is what it presents, so
+        /// that moves of recorded ranges accumulate across frames.
+        #[gpui::test(iterations = 300)]
+        fn review_unverified_retained_subtrees_show_what_the_same_tree_built_shows(
+            rng: StdRng,
+            cx: &mut TestAppContext,
+        ) {
+            fuzz_one(rng, cx, false);
+        }
+
+        fn fuzz_one(mut rng: StdRng, cx: &mut TestAppContext, verify: bool) {
             let mut ids = 0;
             let mut tree = Node::random(&mut rng, &mut ids, 0);
             // The tree is a column of three, so that it is more than one retained subtree.
@@ -4596,10 +4610,12 @@ mod tests {
             let shared = Rc::new(RefCell::new(Shared { tree, spacer: 0., context }));
             let retaining = open_fuzzed(cx, &shared, Mode::Retain);
             let building = open_fuzzed(cx, &shared, Mode::Rebuild);
-            cx.update_window(retaining, |_, window, _| {
-                window.set_retention_verifier(Some(Rc::new(|_| String::new())));
-            })
-            .unwrap();
+            if verify {
+                cx.update_window(retaining, |_, window, _| {
+                    window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+                })
+                .unwrap();
+            }
 
             for step in 0..30 {
                 {
@@ -4731,3 +4747,5 @@ mod fragment_tests;
 mod hole_tests;
 #[cfg(test)]
 mod relocation_tests;
+#[cfg(test)]
+mod review_tests;
