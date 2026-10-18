@@ -1199,6 +1199,9 @@ pub(crate) struct LiftedElement {
     hitboxes: Vec<Hitbox>,
     context: PaintContext,
     content_mask: ContentMask<Pixels>,
+    /// Whether `content_mask` is cut from the region of the subtree being recorded in one, as the
+    /// masks inside the subtree are, and so is cut by the content mask where the recording is put.
+    derived_mask: bool,
     image_cache: Option<AnyImageCache>,
     /// Set when the element is a retained subtree that paints itself from its own recording,
     /// which the recording of a subtree around it can then do without, see [`Hole`].
@@ -5626,6 +5629,7 @@ impl Window {
     }
 
     /// Starts the paint of the content of a stacking context. Pair with
+            derived_mask: self.content_mask_is_derived(),
     /// [`Window::end_lift_paint`].
     pub(crate) fn begin_lift_paint(&mut self) {
         self.invalidator.debug_assert_paint();
@@ -5702,10 +5706,11 @@ impl Window {
             window.with_visibility(visibility, |window| {
                 window.with_rem_size(Some(rem_size), |window| {
                     window.with_image_cache(image_cache, |window| {
-                        window.with_replaced_content_mask(content_mask, |window| match content {
+                        window.with_replaced_mask(content_mask, derived_mask, |window| match content {
                             LiftedContent::Element(element) => match cell {
                                 Some(cell) => window.record_plain_paint(cell, ordinal, owners, cx, |window, cx| {
                                     element.paint(window, cx)
+        let derived_mask = entry.derived_mask;
                                 }),
                                 None => element.paint(window, cx),
                             },

@@ -1176,8 +1176,15 @@ impl Window {
             && let Some(lift_mark) = mark.lifts
             && let Some(record) = self.lifted_holes_since(lift_mark, stale_parent)
         {
-            lifts = Some(Rc::new(record));
-            reasons &= !lift_bit;
+            if let Some(surroundings) = surroundings {
+                // What leaves the region for a stacking context outside is cut by the content
+                // mask around now, as the rest of the subtree is, and is no part of a recording:
+                // a replay could not cut it by the one around then.
+                self.cut_lifted_since(lift_mark, surroundings);
+            } else if let Some(record) = self.lifted_holes_since(lift_mark, stale_parent) {
+                lifts = Some(Rc::new(record));
+                reasons &= !lift_bit;
+            }
         }
         if let Some(reason) = first_reason(reasons) {
             if let Some(surroundings) = surroundings {
@@ -1351,6 +1358,20 @@ impl Window {
         for hitbox in &mut self.next_frame.hitboxes[range] {
             *hitbox = hitbox.relocated(Point::default(), surroundings);
         }
+    fn cut_lifted_since(&mut self, mark: LiftMark, surroundings: &ContentMask<Pixels>) {
+        let Some(Some(list)) = self.lift_lists.last_mut() else {
+            return;
+        };
+        for entry in list.entries.iter_mut().skip(mark.entries) {
+            for hitbox in &mut entry.hitboxes {
+                *hitbox = hitbox.relocated(Point::default(), surroundings);
+            }
+            if entry.derived_mask {
+                entry.content_mask = entry.content_mask.intersect(surroundings);
+            }
+        }
+    }
+
         self.next_frame.hitboxes_changed();
     }
 
@@ -1453,6 +1474,8 @@ impl Window {
                 hole,
                 cell,
                 owners,
+                // A recording made in a region hands nothing to a context outside.
+                derived_mask: false,
             });
         }
         match self.lift_lists.last_mut() {
@@ -1845,6 +1868,12 @@ impl Window {
     /// factor makes device pixels exact.
     pub(crate) fn relocation_blocker_here(&self) -> Option<NonRelocatable> {
         if let Some(reason) = self.scale_blocker() {
+    /// Whether the content mask now is cut from the region of the subtree being recorded in one:
+    /// not a mask of a box that escapes to a frame outside the subtree.
+    pub(crate) fn content_mask_is_derived(&self) -> bool {
+        self.is_recording_regionally() && !self.is_prepainting_unclipped()
+    }
+
             return Some(reason);
         }
         if self.exact_clips.is_some() || self.content_mask().is_rounded() {
