@@ -2198,10 +2198,16 @@ impl Window {
             return String::new();
         }
         let frame = &self.next_frame;
-        let mut out = strip_draw_orders(&frame.scene.describe_drawn());
-        if relocated {
-            out = strip_empty_groups(&out);
-        }
+        let mut out = if relocated {
+            let marked = strip_draw_orders(&frame.scene.describe_operations(0..frame.scene.paint_operations.len(), true));
+            strip_empty_groups(&strip_empty_replaced(&marked))
+                .lines()
+                .filter(|line| *line != "replaced" && *line != "end replaced")
+                .map(|line| format!("{line}\n"))
+                .collect()
+        } else {
+            strip_draw_orders(&frame.scene.describe_drawn())
+        };
         let name = |id: HitboxId| {
             frame
                 .hitboxes
@@ -2266,7 +2272,7 @@ impl Window {
                     .and_then(|state| state.inner.downcast_ref::<Option<crate::elements::RetainedState>>())
                     .and_then(Option::as_ref)
                     .and_then(|state| state.describe(self))
-                    .map_or_else(String::new, |text| strip_empty_groups(&strip_draw_orders(&text)))
+                    .map_or_else(String::new, |text| strip_empty_groups(&strip_empty_replaced(&strip_draw_orders(&text))))
             })
             .collect()
     }
@@ -2317,6 +2323,47 @@ impl Window {
             self.retained.mismatches.push(message);
         }
     }
+}
+
+/// `text` without the masks that replace the one around and hold nothing but the widening of the
+/// groups around to their own: a box that escapes a clip that a build culled, because nothing in
+/// the clip can be seen, widens the groups when it is recorded in a region that the clip did not
+/// leave out.
+fn strip_empty_replaced(text: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    // Where the replaced masks open in `kept`, and whether anything but widening is in each.
+    let mut open: Vec<(usize, bool)> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("replaced") {
+            open.push((kept.len(), false));
+            kept.push(line);
+        } else if line == "end replaced" {
+            let Some((from, held)) = open.pop() else {
+                kept.push(line);
+                continue;
+            };
+            if held {
+                kept.push(line);
+                if let Some(parent) = open.last_mut() {
+                    parent.1 = true;
+                }
+            } else {
+                kept.truncate(from);
+            }
+        } else {
+            if !line.starts_with("widen ")
+                && let Some(parent) = open.last_mut()
+            {
+                parent.1 = true;
+            }
+            kept.push(line);
+        }
+    }
+    let mut out = kept.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// `text` without the groups that hold nothing. A subtree recorded in a region opens the groups
