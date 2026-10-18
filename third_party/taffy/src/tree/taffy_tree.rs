@@ -1765,6 +1765,40 @@ mod tests {
 
     // fdarian fork patch.
     #[test]
+    fn a_scroll_container_is_not_as_tall_as_the_top_of_the_last_box_in_it() {
+        use crate::geometry::Point;
+        use crate::style::Overflow;
+
+        let build = |taffy: &mut TaffyTree<()>| {
+            let tall = || Style { display: Display::Block, size: Size { width: auto(), height: length(30.0) }, ..Default::default() };
+            let (first, second) = (taffy.new_leaf(tall()).unwrap(), taffy.new_leaf(tall()).unwrap());
+            // Its content overflows it: the second box starts below the end of the box.
+            let boxed = taffy
+                .new_with_children(
+                    Style { display: Display::Block, size: Size { width: auto(), height: length(10.0) }, ..Default::default() },
+                    &[first, second],
+                )
+                .unwrap();
+            let scroller = taffy
+                .new_with_children(
+                    Style { display: Display::Block, overflow: Point { x: Overflow::Scroll, y: Overflow::Hidden }, ..Default::default() },
+                    &[boxed],
+                )
+                .unwrap();
+            let root = taffy.new_with_children(Style { display: Display::Block, ..Default::default() }, &[scroller]).unwrap();
+            (root, scroller)
+        };
+
+        // The height of the box is what the scroll container is, whether its layout ran the
+        // content of the box or took the box from the cache.
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let (root, scroller) = build(&mut taffy);
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert_eq!(taffy.layout(scroller).unwrap().size.height, 10.0);
+    }
+
+    // fdarian fork patch.
+    #[test]
     fn the_layout_generation_follows_the_inputs_of_a_nodes_layout() {
         let mut taffy: TaffyTree<()> = TaffyTree::new();
         let child_style = Style {

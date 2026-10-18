@@ -1170,7 +1170,14 @@ fn perform_final_layout_on_in_flow_children(
                 {
                     let child_contribution = child_block_ctx.floated_content_height_contribution();
                     let child_top_adjoining_floats = child_block_ctx.top_adjoining_floats();
-                    block_ctx.add_child_floated_content_height_contribution(y_offset_for_absolute + child_contribution);
+                    // fdarian fork patch: a child with no floats in it contributes nothing. Upstream added the
+                    // offset of the child anyway, so a formatting context root (a scroll container) was as tall
+                    // as the top of the last box in it, which only a child that overflows its own box makes
+                    // taller than the content, and a layout that replaced the child with its cached size
+                    // (which does not run the child's block context) came to another height.
+                    if child_contribution > 0.0 {
+                        block_ctx.add_child_floated_content_height_contribution(y_offset_for_absolute + child_contribution);
+                    }
                     // Floats placed while the position of the child's top margin strut was unresolved
                     // also adjoin this block's current strut
                     block_ctx.merge_adjoining_floats(child_top_adjoining_floats);

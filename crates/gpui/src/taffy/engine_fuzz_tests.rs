@@ -728,6 +728,202 @@ fn an_engine_that_lives_through_edits_lays_out_like_a_new_one(cx: &mut TestAppCo
     assert!(counters.children_set > 500, "{counters:?}");
 }
 
+/// `GPUI_ENGINE_FUZZ_SEEDS=first..last cargo test --release -p gpui --lib --features test-support
+/// -- --ignored a_long_run_of_edits` runs the sequences of more seeds than the suite does.
+#[gpui::test]
+#[ignore]
+fn a_long_run_of_edits_lays_out_like_a_new_engine(cx: &mut TestAppContext) {
+    let range = std::env::var("GPUI_ENGINE_FUZZ_SEEDS").expect("GPUI_ENGINE_FUZZ_SEEDS=first..last");
+    let (first, last) = range.split_once("..").expect("GPUI_ENGINE_FUZZ_SEEDS=first..last");
+    let (first, last) = (first.parse().expect("first seed"), last.parse().expect("last seed"));
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| assert_reuse_matches_new_engine(first..=last, 40, window, cx));
+}
+
+fn node(key: Key, style: Style, content: Content) -> Node {
+    Node { key, scope: key, style, content }
+}
+
+fn text_node(key: Key, style: Style, width: f32, line_height: f32, keyed: bool) -> Node {
+    let text = Text { width, line_height, has_baseline: false, keyed };
+    node(key, style, Content::Text(text))
+}
+
+fn calc_length(length: f32) -> Length {
+    Length::Definite(DefiniteLength::calc(px(length), 0.25))
+}
+
+fn pixels_length(length: f32) -> Length {
+    Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(length))))
+}
+
+/// The frames laid out in turn by the engine that lives, and the last of them by a new one too.
+fn assert_last_frame_matches_new_engine(
+    frames: &[(Scene, Vec<Size<AvailableSpace>>)],
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut reused = TaffyLayoutEngine::new();
+    let mut kept = Vec::new();
+    for (scene, spaces) in frames {
+        kept = lay_out_frame(&mut reused, scene, spaces, window, cx);
+    }
+    let (scene, spaces) = frames.last().expect("at least one frame");
+    let new = lay_out_frame(&mut TaffyLayoutEngine::new(), scene, spaces, window, cx);
+    for (layout, (kept, new)) in kept.iter().zip(&new).enumerate() {
+        for (key, kept) in kept {
+            assert_eq!(Some(kept), new.get(key), "layout {layout}, node {key}");
+        }
+    }
+}
+
+fn container(key: Key, style: Style, children: Vec<Node>) -> Node {
+    node(key, style, Content::Container(children))
+}
+
+#[gpui::test]
+fn a_frame_asked_again_lays_out_as_the_first_time(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let fixed = |top: Length, right: Length, left: Length| {
+            let mut style = Style::default();
+            style.position = Position::Fixed;
+            style.inset.top = top;
+            style.inset.right = right;
+            style.inset.left = left;
+            style
+        };
+        let mut margin = Style::default();
+        margin.margin.top = calc_length(8.);
+        margin.margin.left = calc_length(16.);
+        let mut absolute = Style::default();
+        absolute.position = Position::Absolute;
+        let root = container(
+            0,
+            Style::default(),
+            vec![container(
+                15,
+                Style::default(),
+                vec![container(
+                    20,
+                    absolute,
+                    vec![
+                        container(
+                            21,
+                            Style::default(),
+                            vec![
+                                text_node(22, margin, 100., 12., false),
+                                text_node(25, fixed(calc_length(16.), Length::Auto, pixels_length(90.)), 70., 8., true),
+                            ],
+                        ),
+                        text_node(27, fixed(pixels_length(110.), pixels_length(5.), Length::Auto), 20., 16., false),
+                    ],
+                )],
+            )],
+        );
+        let space = Size {
+            width: AvailableSpace::MaxContent,
+            height: AvailableSpace::MaxContent,
+        };
+        let frame = |root: &Node| (Scene { root: root.clone(), detached: None }, vec![space]);
+        assert_last_frame_matches_new_engine(&[frame(&root), frame(&root)], window, cx);
+    });
+}
+
+#[gpui::test]
+fn a_subtree_that_becomes_a_root_lays_out_as_one_that_always_was(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let wide = |width: f32| {
+            let mut style = Style::default();
+            style.size.width = pixels_length(width);
+            style
+        };
+        let padded = |left: f32, right: f32| {
+            let mut style = Style::default();
+            style.padding.left = DefiniteLength::Absolute(AbsoluteLength::Pixels(px(left)));
+            style.padding.right = DefiniteLength::Absolute(AbsoluteLength::Pixels(px(right)));
+            style
+        };
+        let mut fixed = padded(105., 0.);
+        fixed.position = Position::Fixed;
+        fixed.size.width = Length::Definite(relative(1.));
+        let mut scroller = padded(0., 55.);
+        scroller.overflow = crate::Point {
+            x: Overflow::Scroll,
+            y: Overflow::Hidden,
+        };
+        let mut tall = Style::default();
+        tall.size.height = pixels_length(105.);
+        let mut full_height = Style::default();
+        full_height.size.height = Length::Definite(relative(1.));
+        let subtree = container(
+            1,
+            Style::default(),
+            vec![container(
+                2,
+                wide(85.),
+                vec![container(
+                    39,
+                    padded(85., 75.),
+                    vec![container(
+                        40,
+                        fixed,
+                        vec![container(
+                            51,
+                            scroller,
+                            vec![container(
+                                57,
+                                tall,
+                                vec![
+                                    text_node(59, Style::default(), 40., 16., false),
+                                    text_node(60, full_height, 100., 12., false),
+                                    text_node(61, Style::default(), 75., 8., true),
+                                ],
+                            )],
+                        )],
+                    )],
+                )],
+            )],
+        );
+        let space = |width| Size {
+            width,
+            height: AvailableSpace::MaxContent,
+        };
+        let inside = Scene {
+            root: container(0, Style::default(), vec![subtree.clone()]),
+            detached: None,
+        };
+        let on_its_own = Scene {
+            root: container(0, Style::default(), Vec::new()),
+            detached: Some(subtree),
+        };
+        assert_last_frame_matches_new_engine(
+            &[
+                (inside, vec![space(AvailableSpace::MaxContent)]),
+                (on_its_own, vec![space(AvailableSpace::MinContent)]),
+            ],
+            window,
+            cx,
+        );
+    });
+}
+
+
+/// The seeds that found a way for the engine that lives to differ from a new one: a cache that
+/// told apart too little, a measured size that lost the margins that collapse through a node, and
+/// a scroll container as tall as the top of the last box in it. Each has a test of its own; these
+/// are the sequences that led to them.
+#[gpui::test]
+fn the_seeds_that_found_a_difference_lay_out_like_a_new_engine(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        for seed in [104, 380, 580, 1592, 1769, 2126] {
+            assert_reuse_matches_new_engine(seed..=seed, 40, window, cx);
+        }
+    });
+}
+
 #[gpui::test]
 fn the_generated_trees_cover_the_engine(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();

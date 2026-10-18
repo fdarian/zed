@@ -4,7 +4,7 @@
 
 use crate::geometry::Size;
 use crate::style::AvailableSpace;
-use crate::tree::{LayoutInput, LayoutOutput, RunMode};
+use crate::tree::{CollapsibleMarginSet, LayoutInput, LayoutOutput, RunMode, SizingMode};
 use crate::RequestedAxis;
 
 /// The number of cache entries for each node in the tree
@@ -17,19 +17,6 @@ const CACHE_SIZE: usize = 9;
 const INFINITY_BITS: u32 = 0b_0_11111111_00000000000000000000000_u32;
 /// `f32::NEG_INFINITY` as a u32
 const NEG_INFINITY_BITS: u32 = 0b_1_11111111_00000000000000000000000_u32;
-
-// The `CacheKey` encodes two f32s as a u64. We know that the f32s will always be
-// non-negative, so we pack two extra bits encoding the `RequestedAxis` into the
-// sign bits of the f32s. These constants help to encode and decode those bits.
-
-/// The sign bit of the first f32
-const SIGN_BIT_1: u64 = 1u64 << 63;
-/// The sign bit of the second f32
-const SIGN_BIT_2: u64 = 1u64 << 31;
-/// Mask of both sign bits (used to compute NON_SIGN_BITS_MASK)
-const BOTH_SIGN_BITS_MASK: u64 = SIGN_BIT_1 | SIGN_BIT_2;
-/// Mask of excluding the sign bits (used when setting/getting the size excluding the packed bits)
-const NON_SIGN_BITS_MASK: u64 = !BOTH_SIGN_BITS_MASK;
 
 /// Pack `Option<f32>` into `u32`
 #[inline(always)]
@@ -78,6 +65,11 @@ fn size_mixed_cache_key(kd: Size<Option<f32>>, avs: Size<AvailableSpace>) -> u64
 }
 
 /// Space-optimised cache key that packs bits into as small a size as possible
+///
+/// fdarian fork patch: the key tells apart everything the answer of a node can depend on. Upstream packs the requested
+/// axis into the sign bits of the parent size, so that a negative parent size (an inner size below its padding) is the
+/// same key as the positive one, and leaves out the sizing mode and the margin collapsing, so that a node moved to a
+/// parent that asks another way answered with the entries of the old one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 struct CacheKey {
@@ -85,29 +77,42 @@ struct CacheKey {
     kd_available_space: u64,
     /// The initial cached size of the parent's node
     parent_size: u64,
+    /// See the `MODE_` and `AXIS_` bits.
+    modes: u8,
 }
 
-impl CacheKey {
-    #[inline(always)]
-    #[allow(dead_code)]
-    /// Return the parent size with the extra bits that encode the requested axis masked out
-    fn parent_size(&self) -> u64 {
-        self.parent_size & NON_SIGN_BITS_MASK
-    }
-}
+/// Whether the style sizes of the node were not taken into account.
+const MODE_CONTENT_SIZE: u8 = 1 << 0;
+/// Whether the top margin of the node may collapse with the margin of its parent.
+const MODE_COLLAPSIBLE_START: u8 = 1 << 1;
+/// Whether the bottom margin of the node may collapse with the margin of its parent.
+const MODE_COLLAPSIBLE_END: u8 = 1 << 2;
+/// The axes asked for.
+const AXIS_HORIZONTAL: u8 = 1 << 3;
+const AXIS_VERTICAL: u8 = 1 << 4;
+/// Whether the width and the height are known dimensions, where `kd_available_space` holds either of the two kinds of
+/// value in the same bits.
+const KNOWN_WIDTH: u8 = 1 << 5;
+const KNOWN_HEIGHT: u8 = 1 << 6;
 
 impl From<&LayoutInput> for CacheKey {
     fn from(input: &LayoutInput) -> Self {
-        // Pack axis enum into spare bits in the known_dimensions and available_space values
-        let extra_bits = match input.axis {
-            RequestedAxis::Horizontal => SIGN_BIT_1,
-            RequestedAxis::Vertical => SIGN_BIT_2,
-            RequestedAxis::Both => SIGN_BIT_1 | SIGN_BIT_2,
+        let axis = match input.axis {
+            RequestedAxis::Horizontal => AXIS_HORIZONTAL,
+            RequestedAxis::Vertical => AXIS_VERTICAL,
+            RequestedAxis::Both => AXIS_HORIZONTAL | AXIS_VERTICAL,
         };
+        let flag = |condition: bool, bit: u8| if condition { bit } else { 0 };
 
         Self {
             kd_available_space: size_mixed_cache_key(input.known_dimensions, input.available_space),
-            parent_size: (size_option_cache_key(input.parent_size) & NON_SIGN_BITS_MASK) | extra_bits,
+            parent_size: size_option_cache_key(input.parent_size),
+            modes: axis
+                | flag(input.sizing_mode == SizingMode::ContentSize, MODE_CONTENT_SIZE)
+                | flag(input.vertical_margins_are_collapsible.start, MODE_COLLAPSIBLE_START)
+                | flag(input.vertical_margins_are_collapsible.end, MODE_COLLAPSIBLE_END)
+                | flag(input.known_dimensions.width.is_some(), KNOWN_WIDTH)
+                | flag(input.known_dimensions.height.is_some(), KNOWN_HEIGHT),
         }
     }
 }
@@ -122,6 +127,39 @@ pub(crate) struct CacheEntry<T> {
     content: T,
 }
 
+/// What a size measurement of a node answers with, besides the size
+///
+/// fdarian fork patch: upstream keeps the size alone, so a block container that asks for the size of a child gets the
+/// margins that collapse through the child from the child's first measurement and none from a later one: its own height
+/// depended on how many times the child was asked.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+struct Measured {
+    size: Size<f32>,
+    top_margin: CollapsibleMarginSet,
+    bottom_margin: CollapsibleMarginSet,
+    margins_can_collapse_through: bool,
+}
+
+impl Measured {
+    fn of(output: &LayoutOutput) -> Self {
+        Measured {
+            size: output.size,
+            top_margin: output.top_margin,
+            bottom_margin: output.bottom_margin,
+            margins_can_collapse_through: output.margins_can_collapse_through,
+        }
+    }
+
+    fn output(self) -> LayoutOutput {
+        let mut output = LayoutOutput::from_outer_size(self.size);
+        output.top_margin = self.top_margin;
+        output.bottom_margin = self.bottom_margin;
+        output.margins_can_collapse_through = self.margins_can_collapse_through;
+        output
+    }
+}
+
 /// A cache for caching the results of a sizing a Grid Item or Flexbox Item
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
@@ -133,7 +171,7 @@ pub struct Cache {
     /// Fully associative: any entry can hold any key. A key is the node's own sizing inputs *and* the parent size, and the same
     /// node is measured under several parent sizes (e.g. a stretched flex column child is measured under the container's
     /// width and again with an unknown parent width), so entries that differ only by parent size must not evict each other.
-    measure_entries: [Option<CacheEntry<Size<f32>>>; CACHE_SIZE],
+    measure_entries: [Option<CacheEntry<Measured>>; CACHE_SIZE],
     /// Second-chance bit per measure entry: set on a hit or store, cleared as the clock hand passes
     measure_referenced: [bool; CACHE_SIZE],
     /// The clock hand: the first measure entry considered for eviction
@@ -169,7 +207,7 @@ impl Cache {
             RunMode::ComputeSize => {
                 let index = self.measure_entries.iter().position(|entry| entry.is_some_and(|entry| entry.key == key))?;
                 self.measure_referenced[index] = true;
-                self.measure_entries[index].map(|entry| LayoutOutput::from_outer_size(entry.content))
+                self.measure_entries[index].map(|entry| entry.content.output())
             }
             RunMode::PerformHiddenLayout => None,
         }
@@ -186,7 +224,7 @@ impl Cache {
             RunMode::ComputeSize => {
                 self.is_empty = false;
                 let index = self.measure_slot_for(key);
-                self.measure_entries[index] = Some(CacheEntry { key, content: layout_output.size });
+                self.measure_entries[index] = Some(CacheEntry { key, content: Measured::of(&layout_output) });
                 self.measure_referenced[index] = true;
             }
             RunMode::PerformHiddenLayout => {}
@@ -234,4 +272,70 @@ pub enum ClearState {
     Cleared,
     /// Everything was already cleared
     AlreadyEmpty,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Line;
+    use crate::tree::RequestedAxis;
+
+    fn input() -> LayoutInput {
+        LayoutInput {
+            run_mode: RunMode::ComputeSize,
+            sizing_mode: SizingMode::InherentSize,
+            axis: RequestedAxis::Both,
+            known_dimensions: Size { width: Some(100.0), height: None },
+            parent_size: Size { width: Some(160.0), height: None },
+            available_space: Size { width: AvailableSpace::Definite(100.0), height: AvailableSpace::MaxContent },
+            vertical_margins_are_collapsible: Line::FALSE,
+        }
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn an_entry_answers_the_ask_it_was_stored_for_and_no_other() {
+        let asked = input();
+        let others = [
+            LayoutInput { sizing_mode: SizingMode::ContentSize, ..asked },
+            LayoutInput { vertical_margins_are_collapsible: Line { start: true, end: false }, ..asked },
+            LayoutInput { vertical_margins_are_collapsible: Line { start: false, end: true }, ..asked },
+            LayoutInput { axis: RequestedAxis::Vertical, ..asked },
+            // A negative parent size is not the positive one: an inner size below its padding is.
+            LayoutInput { parent_size: Size { width: Some(-160.0), height: None }, ..asked },
+            // A width that is known is not one that is available.
+            LayoutInput {
+                known_dimensions: Size { width: None, height: None },
+                available_space: Size { width: AvailableSpace::Definite(-100.0), height: AvailableSpace::MaxContent },
+                ..asked
+            },
+        ];
+        for sizes in [RunMode::ComputeSize, RunMode::PerformLayout] {
+            let asked = LayoutInput { run_mode: sizes, ..asked };
+            let mut cache = Cache::new();
+            cache.store(&asked, LayoutOutput::from_outer_size(Size { width: 100.0, height: 30.0 }));
+            assert!(cache.get(&asked).is_some());
+            for other in others {
+                assert!(cache.get(&LayoutInput { run_mode: sizes, ..other }).is_none(), "{other:?}");
+            }
+        }
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn a_size_measurement_keeps_the_margins_that_collapse_through_the_node() {
+        let asked = input();
+        let mut output = LayoutOutput::from_outer_size(Size { width: 100.0, height: 30.0 });
+        output.top_margin = CollapsibleMarginSet::from_margin(12.0);
+        output.bottom_margin = CollapsibleMarginSet::from_margin(-4.0);
+        output.margins_can_collapse_through = true;
+        let mut cache = Cache::new();
+        cache.store(&asked, output);
+
+        let measured = cache.get(&asked).unwrap();
+        assert_eq!(measured.size, output.size);
+        assert_eq!(measured.top_margin, output.top_margin);
+        assert_eq!(measured.bottom_margin, output.bottom_margin);
+        assert!(measured.margins_can_collapse_through);
+    }
 }
