@@ -805,6 +805,9 @@ struct TextLayoutInner {
     truncate_width: Option<Pixels>,
     /// The width the insets were asked for.
     inset_width: Option<Pixels>,
+    /// The width the atomic inlines were measured at: a min-content and a max-content probe ask
+    /// for no width alike, and the boxes answer them differently.
+    atomic_measure: Option<AtomicMeasure>,
     /// What the lines were laid out with: a text style can change how the same
     /// text breaks at the same width.
     options: TextLayoutOptions,
@@ -908,17 +911,17 @@ impl TextLayout {
                 let insets = insets(width);
                 // The atomic inlines are measured before the text is shaped, since their
                 // widths are what the lines are shaped with.
-                let inline: Vec<InlineBox> = match &atomics {
-                    Some(atomics) => {
-                        let measure = match (width, available_space.width) {
-                            (Some(width), _) => AtomicMeasure::Fit(width),
-                            (None, crate::AvailableSpace::MinContent) => AtomicMeasure::MinContent,
-                            (None, _) => AtomicMeasure::MaxContent,
-                        };
+                let atomic_measure = atomics.as_ref().map(|_| match (width, available_space.width) {
+                    (Some(width), _) => AtomicMeasure::Fit(width),
+                    (None, crate::AvailableSpace::MinContent) => AtomicMeasure::MinContent,
+                    (None, _) => AtomicMeasure::MaxContent,
+                });
+                let inline: Vec<InlineBox> = match (&atomics, atomic_measure) {
+                    (Some(atomics), Some(measure)) => {
                         let atomic_boxes = atomics.borrow_mut().measure(measure, window, cx);
                         inline_boxes.iter().cloned().chain(atomic_boxes).collect()
                     }
-                    None => inline_boxes.to_vec(),
+                    _ => inline_boxes.to_vec(),
                 };
                 let unmeasurable = |wrap_width, truncate_width| {
                     element_state.0.borrow_mut().replace(TextLayoutInner {
@@ -928,6 +931,7 @@ impl TextLayout {
                         wrap_width,
                         truncate_width,
                         inset_width: width,
+                        atomic_measure,
                         options: text_style.layout_options(),
                         trim_top: Pixels::ZERO,
                         trim_bottom: Pixels::ZERO,
@@ -987,6 +991,7 @@ impl TextLayout {
                     && let Some(size) = text_layout.size
                     && wrap_width == text_layout.wrap_width
                     && width == text_layout.inset_width
+                    && atomic_measure == text_layout.atomic_measure
                     && text_style.layout_options() == text_layout.options
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
@@ -1137,6 +1142,7 @@ impl TextLayout {
                     wrap_width,
                     truncate_width,
                     inset_width: width,
+                    atomic_measure,
                     options: text_style.layout_options(),
                     trim_top,
                     trim_bottom,
@@ -2057,6 +2063,7 @@ mod tests {
                     wrap_width: None,
                     truncate_width: None,
                     inset_width: None,
+                    atomic_measure: None,
                     options: Default::default(),
                     trim_top: Pixels::ZERO,
                     trim_bottom: Pixels::ZERO,
@@ -2127,6 +2134,7 @@ mod tests {
                     wrap_width: Some(px(60.)),
                     truncate_width: None,
                     inset_width: None,
+                    atomic_measure: None,
                     options: Default::default(),
                     trim_top: Pixels::ZERO,
                     trim_bottom: Pixels::ZERO,
