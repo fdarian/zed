@@ -275,8 +275,10 @@ pub(crate) struct RetainedWindow {
     pub(crate) unframed_escapes: Cell<u32>,
     pub(crate) positioned_captures: Cell<u32>,
     pub(crate) nested_scrolls: Cell<u32>,
-    /// How many boxes that escaped to an absolute content mask are being prepainted.
-    pub(crate) unclipped: u32,
+    /// For each box being prepainted or painted with a content mask of its own in place of the
+    /// one around it, while a subtree is recorded in a region, whether that mask is absolute and
+    /// not cut from the region. The innermost one says.
+    pub(crate) own_masks: Vec<bool>,
     /// The recordings of prepaint that are open, outermost first.
     open_recordings: Vec<OpenRecording>,
     /// While an element handed to a stacking context is painted for its recording, the retained
@@ -1959,9 +1961,10 @@ impl Window {
     /// Notes that a rounded content mask was pushed while a subtree is recorded in a region of its
     /// own.
     pub(crate) fn note_rounded_mask(&mut self, mask: ContentMask<Pixels>) {
+        let unclipped = self.is_prepainting_unclipped();
         if let Some(relocation) = self.retained.relocation.as_mut()
             && relocation.regional()
-            && self.retained.unclipped == 0
+            && !unclipped
             && !relocation.info.rounded.contains(&mask)
         {
             relocation.info.rounded.push(mask);
@@ -1975,7 +1978,7 @@ impl Window {
         let Some(relocation) = self.retained.relocation.as_mut().filter(|relocation| relocation.regional()) else {
             return mask.intersection_is_exact(outer);
         };
-        let unclipped = self.retained.unclipped > 0;
+        let unclipped = self.retained.own_masks.last().copied().unwrap_or(false);
         let effective = if unclipped {
             *outer
         } else {
@@ -2006,20 +2009,20 @@ impl Window {
     /// `derived` is false, which the hitboxes inside are not cut by the content mask around the
     /// region.
     pub(crate) fn begin_escaped_prepaint(&mut self, derived: bool) {
-        if self.is_recording_regionally() && !derived {
-            self.retained.unclipped += 1;
+        if self.is_recording_regionally() {
+            self.retained.own_masks.push(!derived);
         }
     }
 
     pub(crate) fn end_escaped_prepaint(&mut self, derived: bool) {
-        if self.is_recording_regionally() && !derived {
-            self.retained.unclipped -= 1;
+        if self.is_recording_regionally() {
+            self.retained.own_masks.pop();
         }
     }
 
     /// Whether the hitbox inserted now is cut by an absolute content mask and not by the region.
     pub(crate) fn is_prepainting_unclipped(&self) -> bool {
-        self.retained.unclipped > 0
+        self.retained.own_masks.last().copied().unwrap_or(false)
     }
 
     /// Notes that a box escapes to a containing block (or the viewport) for a subtree being
@@ -2275,6 +2278,18 @@ impl Window {
             return;
         }
         self.retained.counters.mismatches += 1;
+        if let Ok(dir) = std::env::var("RETAINED_VERIFY_DUMP") {
+            let at = self.retained.counters.mismatches;
+            for (name, text) in [("replayed", &shown_frame), ("built", &built_frame)] {
+                std::fs::write(format!("{dir}/mismatch-{at}-{name}.txt"), text).ok();
+            }
+            for (index, ((shown, built), subtree)) in shown.iter().zip(&built).zip(subtrees).enumerate() {
+                if !built.is_empty() && shown != built {
+                    std::fs::write(format!("{dir}/mismatch-{at}-subtree-{index}-replayed.txt"), format!("{:?}\n{shown}", subtree.0)).ok();
+                    std::fs::write(format!("{dir}/mismatch-{at}-subtree-{index}-built.txt"), built).ok();
+                }
+            }
+        }
         let message = format!("a replayed frame differs from the frame built whole in {} places\n{}", differences.len(), differences.join("\n"));
         eprintln!("[retained] {message}");
         if self.retained.mismatches.len() < 32 {

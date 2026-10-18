@@ -2025,3 +2025,77 @@ fn mask_cut_to_nothing_by_the_page_has_no_corners_wherever_it_was_cut(cx: &mut T
         panic!("differs {i}: {d}");
     }
 }
+
+impl Node {
+    /// A box of this size and nothing else; the fields are set by struct update on the result.
+    fn plain(id: usize, width: u32, height: u32) -> Node {
+        Node {
+            id,
+            width,
+            height,
+            color: 1,
+            row: false,
+            padding: 0,
+            clip: false,
+            rounded: false,
+            fade: false,
+            text: None,
+            clickable: false,
+            labelled: false,
+            focusable: false,
+            retain: false,
+            absolute: None,
+            stacking: false,
+            escaping: false,
+            relative: None,
+            grouped: false,
+            relocatable: false,
+            cullable: false,
+            children: Vec::new(),
+        }
+    }
+
+    fn with(self, children: Vec<Node>) -> Node {
+        Node { children, ..self }
+    }
+}
+
+/// Plays a page of these trees, scrolled to each offset in turn, with a read before each frame.
+fn replays_like_a_build(cx: &mut TestAppContext, trees: Vec<Node>, offsets: &[f32]) {
+    let steps = offsets
+        .iter()
+        .map(|offset| StepData {
+            trees: trees.clone(),
+            gap: 7.,
+            context: false,
+            page_height: 300.,
+            offset: *offset,
+            read: true,
+            idle: false,
+            abandon: false,
+            inner: None,
+            scale: 1.,
+            rem: 16.,
+        })
+        .collect();
+    let script = Script { scale: 1., steps };
+    for verify in [true, false] {
+        if let Some((step, difference)) = play(cx, &script, verify) {
+            panic!("verify {verify}, step {step}: {difference}");
+        }
+    }
+}
+
+/// A rounded relocatable root that sticks out of the page below, with a box that escapes it: the
+/// replay cut it by the corners of the root in a group of its own, as the build does not.
+#[gpui::test]
+fn rounded_relocatable_root_with_escaping_boxes_is_replayed_as_built(cx: &mut TestAppContext) {
+    let lifted = Node::plain(62, 100, 0).with(Vec::new());
+    let lifted = Node { absolute: Some((7, 13, 0)), clip: true, row: true, padding: 2, ..lifted };
+    let tall = Node { row: true, ..Node::plain(61, 60, 100) }.with(vec![lifted]);
+    let context = Node { escaping: true, stacking: true, row: true, ..Node::plain(60, 14, 14) }.with(vec![tall]);
+    let pad = Node { escaping: true, padding: 6, ..Node::plain(57, 0, 0) };
+    let root = Node { rounded: true, relocatable: true, ..Node::plain(47, 60, 0) }
+        .with(vec![Node { row: true, ..Node::plain(48, 36, 14) }, pad, context]);
+    replays_like_a_build(cx, vec![Node::plain(1, 22, 253), root], &[3.65, 3.65]);
+}
