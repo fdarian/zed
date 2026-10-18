@@ -1733,6 +1733,9 @@ pub struct Window {
     exact_clips: Option<Rc<ExactClips>>,
     /// What the children of each positioned element see, innermost last. Only prepaint reads it.
     pub(crate) positioned_frames: Vec<PositionedFrame>,
+    /// How many elements being prepainted are going to be handed to a stacking context when they
+    /// are done (see [`Window::begin_lift`]).
+    pub(crate) lifts_open: usize,
     /// The content mask around the place a recording made in a region is put, while an element it
     /// handed to a stacking context outside is painted: the masks cut from the region that this
     /// paints under are cut by it, as a replay would cut them.
@@ -2485,6 +2488,7 @@ impl Window {
             escapes_prepainted: 0,
             exact_clips: None,
             positioned_frames: Vec::new(),
+            lifts_open: 0,
             paint_cut: None,
             #[cfg(any(test, feature = "test-support"))]
             effect_groups_forced: false,
@@ -5623,6 +5627,7 @@ impl Window {
         self.retained.pending_hole = None;
         LiftTicket {
             ordinal,
+        self.lifts_open += 1;
             hitboxes_start: self.next_frame.hitboxes.len(),
         }
     }
@@ -5634,6 +5639,7 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
         let hitboxes = self.next_frame.hitboxes.split_off(ticket.hitboxes_start);
         self.next_frame.hitboxes_changed();
+        self.lifts_open -= 1;
         let hole = self.retained.pending_hole.take();
         let owners = self.lift_owners(ticket.ordinal);
         // A recording that is made in a region of its own is not replayed from the frame, and has

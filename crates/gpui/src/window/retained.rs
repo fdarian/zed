@@ -646,7 +646,7 @@ pub(crate) struct PaintRecord {
 /// What paint reads of the elements around the subtree. Prepaint cannot see all of it, so a
 /// replay checks it in debug builds.
 #[cfg(debug_assertions)]
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 struct PaintAmbient {
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
@@ -699,6 +699,10 @@ pub(crate) struct ReplayKey {
     /// whether an ancestor is handed to one, and so painted from it and not in place, depends on
     /// it, and what the subtree is painted under with it.
     lift_shape: (usize, u64),
+    /// How many of the elements around the subtree are handed to a stacking context: an ancestor
+    /// that is, is painted from the context under the content mask it was handed over with, where
+    /// one that is not is painted in place, under the masks of the elements around it.
+    lifts_open: usize,
     dom_hit_testing: bool,
 }
 
@@ -744,6 +748,7 @@ impl ReplayKey {
             || self.culling != later.culling
             || self.lifting != later.lifting
             || self.lift_shape != later.lift_shape
+            || self.lifts_open != later.lifts_open
             || self.dom_hit_testing != later.dom_hit_testing
         {
             return None;
@@ -1698,7 +1703,9 @@ impl Window {
         #[cfg(debug_assertions)]
         debug_assert!(
             record.ambient.matches(&self.paint_ambient(), record.moves),
-            "a retained subtree is painted where its recording was painted"
+            "a retained subtree is painted where its recording was painted: {:?} against {:?}",
+            record.ambient,
+            self.paint_ambient()
         );
         let start = self.paint_index();
         self.reuse_paint_with(
@@ -1794,6 +1801,7 @@ impl Window {
             culling: self.culling,
             lifting: self.lifting(),
             lift_shape: self.lift_shape(),
+            lifts_open: self.lifts_open,
             dom_hit_testing: self.dom_hit_testing,
         }
     }
