@@ -1273,7 +1273,7 @@ impl TextLayout {
         let line_height = element_state.line_height;
 
         let mut origins = SmallVec::new();
-        let mut line_origin = bounds.origin;
+        let mut line_origin = element_state.line_origin(bounds);
         let mut line_start_ix = 0;
         for line in element_state.lines.iter() {
             for (index, origin) in line.object_origins(line_origin, line_height, align, Some(bounds))
@@ -1323,7 +1323,7 @@ impl TextLayout {
             .expect("prepaint has not been performed");
         let line_height = element_state.line_height;
 
-        let mut line_top = bounds.origin.y;
+        let mut line_top = element_state.line_origin(bounds).y;
         let mut line_start_ix = 0;
         for line in element_state.lines.iter() {
             let line_end_ix = line_start_ix + line.len();
