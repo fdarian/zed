@@ -2030,7 +2030,15 @@ impl ToTaffy<taffy::style::Style> for Style {
             gap: self.gap.to_taffy(rem_size, scale_factor, calcs),
             flex_direction: self.flex_direction.into(),
             flex_wrap: self.flex_wrap.into(),
-            flex_basis: self.flex_basis.to_taffy(rem_size, scale_factor, calcs),
+            flex_basis: match self.intrinsic_widths.flex_basis.flatten() {
+                Some(crate::FlexBasisKeyword::Content) => taffy::style::Dimension::content(),
+                Some(crate::FlexBasisKeyword::MinContent) => taffy::style::Dimension::min_content(),
+                Some(crate::FlexBasisKeyword::MaxContent) => taffy::style::Dimension::max_content(),
+                Some(crate::FlexBasisKeyword::FitContent) => taffy::style::Dimension::fit_content(),
+                // Measured and replaced in `resolve_intrinsic_widths`.
+                Some(crate::FlexBasisKeyword::FitContentLimit(_)) => taffy::style::Dimension::auto(),
+                None => self.flex_basis.to_taffy(rem_size, scale_factor, calcs),
+            },
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
             justify_items: self.justify_items.map(|x| x.into()),
@@ -3443,9 +3451,17 @@ mod tests {
         }
 
         #[gpui::test]
-        fn a_fit_content_basis_is_max_content_and_shrinks_with_the_container(
+        fn a_fit_content_basis_is_the_container_width_between_the_content_sizes(
             cx: &mut TestAppContext,
         ) {
+            // The container's content box, whatever its other items take.
+            for (width, want) in [(500., 210.), (180., 180.), (50., 90.)] {
+                let (item, _) = flex_item_in(cx, row, width, LONG, |box_| {
+                    box_.flex_shrink_0().basis_fit_content()
+                });
+                assert_eq!(item.size.width, px(want), "in {width}px");
+            }
+
             let (roomy, _) = flex_item_in(cx, row, 500., LONG, |box_| box_.basis_fit_content());
             assert_eq!(roomy.size.width, px(210.));
             let (tight, _) = flex_item_in(cx, row, 250., LONG, |box_| box_.basis_fit_content());
@@ -3484,18 +3500,61 @@ mod tests {
         }
 
         #[gpui::test]
-        fn a_basis_keyword_is_auto_along_a_column(cx: &mut TestAppContext) {
+        fn a_basis_keyword_is_content_along_a_column(cx: &mut TestAppContext) {
             for style in [
-                (|box_: crate::Div| box_.basis_max_content()) as fn(crate::Div) -> crate::Div,
+                (|box_: crate::Div| box_.basis_content()) as fn(crate::Div) -> crate::Div,
+                |box_| box_.basis_max_content(),
                 |box_| box_.basis_min_content(),
                 |box_| box_.basis_fit_content(),
+                |box_| box_.basis_fit_content_to(px(50.)),
                 // A keyword also wins over a basis length set next to it.
                 |box_| box_.flex_basis(px(250.)).basis_max_content(),
             ] {
-                let (item, sibling) = flex_item_in(cx, column, 400., LONG, style);
+                // The height of the item is not its basis; its content height at its width is.
+                let (item, sibling) = flex_item_in(cx, column, 400., LONG, move |box_| {
+                    style(box_.flex_shrink_0().h(px(200.)))
+                });
                 assert_eq!(item.size, size(px(400.), px(10.)));
                 assert_eq!(sibling.origin.y - item.origin.y, px(10.));
             }
+        }
+
+        #[gpui::test]
+        fn a_column_item_with_a_content_basis_is_as_tall_as_its_wrapped_text(
+            cx: &mut TestAppContext,
+        ) {
+            let (item, sibling) = flex_item_in(cx, column, 150., LONG, |box_| {
+                box_.flex_shrink_0().basis_content()
+            });
+            assert_eq!(item.size, size(px(150.), px(20.)));
+            assert_eq!(sibling.origin.y - item.origin.y, px(20.));
+        }
+
+        #[gpui::test]
+        fn a_content_basis_ignores_the_width_of_a_row_item(cx: &mut TestAppContext) {
+            let (item, sibling) = flex_item_in(cx, row, 400., SHORT, |box_| {
+                box_.w(px(20.)).flex_shrink_0().basis_content()
+            });
+            assert_eq!(item.size.width, px(110.));
+            assert_eq!(sibling.origin.x - item.origin.x, px(110.));
+        }
+
+        #[gpui::test]
+        fn a_fit_content_width_is_the_flex_base_size_of_a_row_item(cx: &mut TestAppContext) {
+            let (item, _) = flex_item_in(cx, row, 180., LONG, |box_| {
+                box_.flex_shrink_0().w_fit_content()
+            });
+            assert_eq!(item.size.width, px(180.));
+            // The width is no limit: a growing item goes past its content.
+            let (grown, _) = flex_item_in(cx, row, 400., SHORT, |box_| {
+                box_.flex_grow(1.).w_fit_content()
+            });
+            assert_eq!(grown.size.width, px(300.));
+            // A basis of its own wins.
+            let (basis, _) = flex_item_in(cx, row, 250., LONG, |box_| {
+                box_.flex_shrink_0().w_fit_content().flex_basis(px(120.))
+            });
+            assert_eq!(basis.size.width, px(120.));
         }
 
         #[gpui::test]

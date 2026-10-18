@@ -229,6 +229,11 @@ impl CompactLength {
     pub const FIT_CONTENT_PX_TAG: usize = 0b00010111;
     /// The tag indicating a fit-content value with percent limit
     pub const FIT_CONTENT_PERCENT_TAG: usize = 0b00011111;
+    /// The tag indicating the `content` keyword of `flex-basis`
+    pub const CONTENT_TAG: usize = 0b00100111;
+    /// The tag indicating the `fit-content` keyword of `flex-basis`, which has no limit argument:
+    /// the limit is the available space, known only to the algorithm that reads it
+    pub const FIT_CONTENT_AVAILABLE_TAG: usize = 0b00110111;
 }
 
 impl CompactLength {
@@ -314,6 +319,21 @@ impl CompactLength {
     #[inline(always)]
     pub const fn fit_content_percent(limit: f32) -> Self {
         Self(CompactLengthInner::from_val(limit, Self::FIT_CONTENT_PERCENT_TAG))
+    }
+
+    /// The `content` keyword of `flex-basis`: the size of the item's content, whatever its `width`
+    /// or `height` is.
+    #[inline(always)]
+    pub const fn content() -> Self {
+        Self(CompactLengthInner::from_tag(Self::CONTENT_TAG))
+    }
+
+    /// The `fit-content` keyword of `flex-basis`:
+    /// `min(max-content, max(min-content, available size))`, where the available size is the main
+    /// size of the flex container's content box less the item's margins.
+    #[inline(always)]
+    pub const fn fit_content_available() -> Self {
+        Self(CompactLengthInner::from_tag(Self::FIT_CONTENT_AVAILABLE_TAG))
     }
 
     /// Get the primary tag
@@ -530,6 +550,8 @@ impl<'de> serde::Deserialize<'de> for CompactLength {
                 | CompactLength::MAX_CONTENT_TAG
                 | CompactLength::FIT_CONTENT_PX_TAG
                 | CompactLength::FIT_CONTENT_PERCENT_TAG
+                | CompactLength::CONTENT_TAG
+                | CompactLength::FIT_CONTENT_AVAILABLE_TAG
                 | CompactLength::FR_TAG
         ) {
             Ok(value)

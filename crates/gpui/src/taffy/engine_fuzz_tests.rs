@@ -12,7 +12,7 @@
 //! give, as an element without an id has the id of the nearest ancestor that has one.
 use super::*;
 use crate::{
-    AbsoluteLength, DefiniteLength, Display, GridTemplate, GridTemplateMinSize, IntrinsicSize, Length,
+    AbsoluteLength, DefiniteLength, Display, FlexBasisKeyword, GridTemplate, GridTemplateMinSize, IntrinsicSize, Length,
     Overflow, Position, TestAppContext, px, relative,
 };
 use std::{
@@ -140,6 +140,16 @@ impl Generator {
         }))
     }
 
+    fn basis_keyword(&mut self) -> Option<Option<FlexBasisKeyword>> {
+        Some(Some(match self.random.below(5) {
+            0 => FlexBasisKeyword::Content,
+            1 => FlexBasisKeyword::MinContent,
+            2 => FlexBasisKeyword::MaxContent,
+            3 => FlexBasisKeyword::FitContent,
+            _ => FlexBasisKeyword::FitContentLimit(self.definite()),
+        }))
+    }
+
     fn style(&mut self) -> Style {
         let mut style = Style::default();
         style.display = match self.random.below(8) {
@@ -210,7 +220,7 @@ impl Generator {
             style.intrinsic_widths.max_width = self.intrinsic();
         }
         if self.random.one_in(10) {
-            style.intrinsic_widths.flex_basis = self.intrinsic();
+            style.intrinsic_widths.flex_basis = self.basis_keyword();
         }
         style.measure_natural_width = self.random.one_in(10);
         style

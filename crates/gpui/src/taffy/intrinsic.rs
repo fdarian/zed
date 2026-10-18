@@ -1,15 +1,19 @@
 //! Intrinsic widths: `min-content`, `max-content`, `fit-content` and `fit-content(<limit>)` for
-//! `width`, `min-width`, `max-width` and `flex-basis`.
+//! `width`, `min-width` and `max-width`, and `fit-content(<limit>)` for `flex-basis`.
 //!
-//! Taffy has no such keywords, so a node carrying one is laid out as its own root before the real
-//! layout, once with `min-content` and once with `max-content` available width, and its taffy
-//! style is rewritten with what that measured. The keywords only mean something in the inline
-//! axis: in the block axis they behave as `auto`, so heights need nothing. A `flex-basis` keyword
-//! is the same width measured, but only a row flex container's items have the inline axis as
-//! their main axis, so it is resolved where the parent is known, and left `auto` elsewhere.
+//! Taffy has no such keywords for sizes, so a node carrying one is laid out as its own root before
+//! the real layout, once with `min-content` and once with `max-content` available width, and its
+//! taffy style is rewritten with what that measured. The keywords only mean something in the
+//! inline axis: in the block axis they behave as `auto`, so heights need nothing.
+//!
+//! The keywords of `flex-basis` other than the limit one are not here: taffy's flexbox reads them
+//! (`Dimension::content` and kin), because the available main size `fit-content` needs and the
+//! width that decides the height of a column item are only known while the container lays out.
+//! What is here is `width: fit-content` on a row flex item, which is the basis `fit-content`
+//! unless the author gave the item a basis, and `fit-content(<limit>)` as a basis.
 
 use super::{EXPECT_MESSAGE, LayoutId, TaffyLayoutEngine, ToTaffy as _, calc::CalcArena};
-use crate::{App, AvailableSpace, IntrinsicSize, Pixels, Style, Window, size};
+use crate::{App, AvailableSpace, FlexBasisKeyword, IntrinsicSize, Pixels, Style, Window, size};
 use taffy::{
     LinearCalc,
     style::{CompactLength, Dimension, Display, FlexDirection},
@@ -50,12 +54,19 @@ impl IntrinsicKeywords {
         calcs: &mut CalcArena,
     ) -> Option<Box<Self>> {
         let widths = &style.intrinsic_widths;
-        let (width, min_width, max_width, flex_basis) = (
+        let (width, min_width, max_width) = (
             widths.width.flatten(),
             widths.min_width.flatten(),
             widths.max_width.flatten(),
-            widths.flex_basis.flatten(),
         );
+        // The other basis keywords are taffy's own.
+        let flex_basis = widths
+            .flex_basis
+            .flatten()
+            .and_then(|keyword| match keyword {
+                FlexBasisKeyword::FitContentLimit(limit) => Some(IntrinsicSize::FitContentLimit(limit)),
+                _ => None,
+            });
         if width.is_none() && min_width.is_none() && max_width.is_none() && flex_basis.is_none() {
             return None;
         }
@@ -162,20 +173,32 @@ impl TaffyLayoutEngine {
                 }
             }
 
-            // A flex basis keyword wins over a basis length set next to it, also where it
-            // does not count.
-            if let Some(keyword) = node.flex_basis {
-                if self.is_row_flex_item(id) {
-                    // The available space is not known here, and the item shrinks to the
-                    // container anyway, so `fit-content` is `max-content`.
-                    node.flex_basis = Some(match keyword {
-                        Keyword::FitContent => Keyword::MaxContent,
-                        other => other,
-                    });
-                } else {
-                    node.flex_basis = None;
-                    requested.flex_basis = Dimension::auto();
+            // A basis keyword wins over a basis length set next to it, also where it does not
+            // count: `to_taffy` left `auto` for the limit one.
+            let row_item = self.is_row_flex_item(id);
+            if node.flex_basis.is_some() && !row_item {
+                // Along a column, and in a container with no main axis, every keyword is `content`.
+                node.flex_basis = None;
+                requested.flex_basis = Dimension::content();
+            }
+            // In Chrome `width: fit-content` on a row item is not a size the item is held to: it is
+            // the flex base size when the item has no basis of its own, and `flex-grow` and
+            // `flex-shrink` move the item from there. So no width, nor the bounds a block gets.
+            if row_item && matches!(node.width, Some(Keyword::FitContent)) {
+                node.width = None;
+                if requested.flex_basis.is_auto() {
+                    requested.flex_basis = Dimension::fit_content();
                 }
+            }
+            if node.keywords().next().is_none() {
+                self.rewrite_style(id, requested.clone());
+                let meta = self.meta_mut(id);
+                // What an earlier resolution kept would hold calcs of a style the node no longer has.
+                meta.intrinsic_resolved = None;
+                if let Some(escapable) = meta.escapable.as_deref_mut() {
+                    escapable.original = requested;
+                }
+                continue;
             }
 
             // The style the node holds is what the last resolution made of the same keywords,
@@ -373,8 +396,6 @@ fn apply(
     style: &mut taffy::style::Style,
 ) {
     if let Some(keyword) = node.flex_basis {
-        // `Slot::Max` is the bound whose keyword results are a basis: `fit-content` was turned
-        // into `max-content` already.
         style.flex_basis = bound(keyword, Slot::Max, measured);
     }
     if let Some(keyword) = node.min_width {

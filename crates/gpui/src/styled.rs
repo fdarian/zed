@@ -3,7 +3,7 @@ use crate::{
     CellVerticalAlign, CursorStyle,
     DefiniteLength, Direction, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontVariations,
-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
+    FlexBasisKeyword, FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
     JustifyContent, Length, LineHeight, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
     StyleRefinement, TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace,
@@ -622,29 +622,36 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Sets the flex basis of the element to `min-content`. Only a row flex container's items
-    /// take it; elsewhere the basis stays `auto`.
+    /// Sets the flex basis of the element to `content`: the size of its content, whatever its
+    /// `width` or `height` is.
+    fn basis_content(mut self) -> Self {
+        self.style().intrinsic_widths.flex_basis = Some(Some(FlexBasisKeyword::Content));
+        self
+    }
+
+    /// Sets the flex basis of the element to `min-content`. Along a column it is `content`.
     fn basis_min_content(mut self) -> Self {
-        self.style().intrinsic_widths.flex_basis = Some(Some(IntrinsicSize::MinContent));
+        self.style().intrinsic_widths.flex_basis = Some(Some(FlexBasisKeyword::MinContent));
         self
     }
 
-    /// Sets the flex basis of the element to `max-content`.
+    /// Sets the flex basis of the element to `max-content`. Along a column it is `content`.
     fn basis_max_content(mut self) -> Self {
-        self.style().intrinsic_widths.flex_basis = Some(Some(IntrinsicSize::MaxContent));
+        self.style().intrinsic_widths.flex_basis = Some(Some(FlexBasisKeyword::MaxContent));
         self
     }
 
-    /// Sets the flex basis of the element to `fit-content`, which is `max-content` for a basis.
+    /// Sets the flex basis of the element to `fit-content`:
+    /// `min(max-content, max(min-content, available main size))`. Along a column it is `content`.
     fn basis_fit_content(mut self) -> Self {
-        self.style().intrinsic_widths.flex_basis = Some(Some(IntrinsicSize::FitContent));
+        self.style().intrinsic_widths.flex_basis = Some(Some(FlexBasisKeyword::FitContent));
         self
     }
 
     /// Sets the flex basis of the element to `fit-content(<limit>)`.
     fn basis_fit_content_to(mut self, limit: impl Into<DefiniteLength>) -> Self {
         self.style().intrinsic_widths.flex_basis =
-            Some(Some(IntrinsicSize::FitContentLimit(limit.into())));
+            Some(Some(FlexBasisKeyword::FitContentLimit(limit.into())));
         self
     }
 

@@ -191,16 +191,35 @@ pub enum IntrinsicSize {
     FitContentLimit(DefiniteLength),
 }
 
-/// The widths and the flex basis that are an [`IntrinsicSize`] keyword. They exist next to
-/// `Style::size`, `min_size`, `max_size` and `flex_basis` because taffy has no intrinsic size
-/// keywords, so those fields hold `auto` for the one that carries a keyword and layout fills in
-/// the measured value.
+/// A `flex-basis` keyword that depends on the content, next to the lengths of `Style::flex_basis`.
+///
+/// Along a row flex container's main axis, the inline one, they are the sizes their names say.
+/// Along a column's, the block axis, every one of them is `content`, as in Chrome.
+#[derive(Copy, Clone, PartialEq, Debug, JsonSchema, Serialize, Deserialize)]
+pub enum FlexBasisKeyword {
+    /// `content`: the size of the content, whatever the item's `width` or `height` is.
+    Content,
+    /// `min-content`: the narrowest width the content can take without overflowing.
+    MinContent,
+    /// `max-content`: the width of the content with no line broken.
+    MaxContent,
+    /// `fit-content`: `min(max-content, max(min-content, available main size))`, the available
+    /// size being the container's content box less the item's margins.
+    FitContent,
+    /// `fit-content(<limit>)`: `min(max-content, max(min-content, limit))`. CSS has no such
+    /// basis; a percentage or `calc()` limit is not clamped.
+    FitContentLimit(DefiniteLength),
+}
+
+/// The widths that are an [`IntrinsicSize`] keyword, and the flex basis that is a
+/// [`FlexBasisKeyword`]. They exist next to `Style::size`, `min_size`, `max_size` and
+/// `flex_basis` because those hold `auto` (or a length) for the one that carries a keyword and
+/// layout fills in the measured value.
 ///
 /// A keyword wins over a length set for the same property. A style that sets a length or `auto`
 /// for a property a keyword was set on by an earlier style has to clear the keyword: refining
-/// with `Some(None)` does, where `None` leaves it alone. In the block axis the keywords behave as
-/// `auto`, so there are no height fields, and a flex basis keyword only counts in a row flex
-/// container, where the main axis is the inline one.
+/// with `Some(None)` does, where `None` leaves it alone. In the block axis the width keywords
+/// behave as `auto`, so there are no height fields.
 #[derive(Clone, Copy, Default, PartialEq, Debug, Refineable)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct IntrinsicWidths {
@@ -210,9 +229,8 @@ pub struct IntrinsicWidths {
     pub min_width: Option<Option<IntrinsicSize>>,
     /// The keyword for `max-width`. `fit-content` is `max-content` here.
     pub max_width: Option<Option<IntrinsicSize>>,
-    /// The keyword for `flex-basis`. `fit-content` is `max-content` here: the available space
-    /// is not known to the measurement, and `flex-shrink` narrows the item to the container.
-    pub flex_basis: Option<Option<IntrinsicSize>>,
+    /// The keyword for `flex-basis`.
+    pub flex_basis: Option<Option<FlexBasisKeyword>>,
 }
 
 /// The CSS styling that can be applied to an element via the `Styled` trait

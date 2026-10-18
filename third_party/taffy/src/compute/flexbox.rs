@@ -5,7 +5,7 @@ use crate::style::{
     AlignContent, AlignContentKeyword, AlignItems, AlignItemsKeyword, AlignSelf, AvailableSpace, FlexWrap,
     JustifyContent, LengthPercentageAuto, Overflow, Position,
 };
-use crate::style::{CoreStyle, FlexDirection, FlexboxContainerStyle, FlexboxItemStyle};
+use crate::style::{CompactLength, CoreStyle, Dimension, FlexDirection, FlexboxContainerStyle, FlexboxItemStyle};
 use crate::style_helpers::{TaffyMaxContent, TaffyMinContent};
 use crate::tree::{Layout, LayoutInput, LayoutOutput, RunMode, SizingMode};
 use crate::tree::{LayoutFlexboxContainer, LayoutPartialTreeExt, NodeId};
@@ -636,6 +636,40 @@ fn determine_available_space(
     Size { width, height }
 }
 
+/// A `flex-basis` that sizes the item from its content (`Dimension::content` and the content size
+/// keywords), which taffy styles carry as tags of the basis.
+///
+/// CSS Flexbox 1 has `content` only, and leaves the sizing keywords to CSS Sizing 3. Chrome applies
+/// them to the inline axis, the main axis of a row, as their names say: `min-content` and
+/// `max-content` are those content sizes, `fit-content` is
+/// `min(max-content, max(min-content, available main size))`, with the main size of the container's
+/// content box less the item's margins as the available size. Along a column the main axis is the
+/// block one, where Chrome takes every one of the keywords as `content`: the item's content height at
+/// the width it gets, not its `height`.
+///
+/// An item's `width` and `height` are not the basis then, but they stay what they are elsewhere: an
+/// automatic minimum size, and what the container sizes the item by when it is sized by its items.
+#[derive(Copy, Clone)]
+enum BasisKeyword {
+    Content,
+    MinContent,
+    MaxContent,
+    FitContent,
+}
+
+impl BasisKeyword {
+    fn of(basis: Dimension, is_column: bool) -> Option<Self> {
+        let keyword = match basis.tag() {
+            CompactLength::CONTENT_TAG => Self::Content,
+            CompactLength::MIN_CONTENT_TAG => Self::MinContent,
+            CompactLength::MAX_CONTENT_TAG => Self::MaxContent,
+            CompactLength::FIT_CONTENT_AVAILABLE_TAG => Self::FitContent,
+            _ => return None,
+        };
+        Some(if is_column { Self::Content } else { keyword })
+    }
+}
+
 /// Determine the flex base size and hypothetical main size of each item.
 ///
 /// # [9.2. Line Length Determination](https://www.w3.org/TR/css-flexbox-1/#line-sizing)
@@ -735,10 +769,15 @@ fn determine_flex_base_size(
             Size::ZERO
         }
         .main(dir);
-        let flex_basis = child_style
-            .flex_basis()
-            .maybe_resolve(container_width, |val, basis| tree.calc(val, basis))
-            .maybe_add(box_sizing_adjustment);
+        let basis_style = child_style.flex_basis();
+        let basis_keyword = BasisKeyword::of(basis_style, constants.is_column);
+        let flex_basis = if basis_keyword.is_some() {
+            None
+        } else {
+            basis_style
+                .maybe_resolve(container_width, |val, basis| tree.calc(val, basis))
+                .maybe_add(box_sizing_adjustment)
+        };
 
         drop(child_style);
 
@@ -753,9 +792,11 @@ fn determine_flex_base_size(
             // Note: `child.size` has already been resolved against aspect_ratio in generate_anonymous_flex_items
             // So B will just work here by using main_size without special handling for aspect_ratio
             let main_size = child.size.main(dir);
-            if let Some(flex_basis) = flex_basis.or(main_size) {
-                break 'flex_basis flex_basis;
-            };
+            if basis_keyword.is_none() {
+                if let Some(flex_basis) = flex_basis.or(main_size) {
+                    break 'flex_basis flex_basis;
+                };
+            }
 
             // C. If the used flex basis is content or depends on its available space,
             //    and the flex container is being sized under a min-content or max-content
@@ -781,28 +822,47 @@ fn determine_flex_base_size(
             //    is auto and not definite, in this calculation use fit-content as the
             //    flex item’s cross size. The flex base size is the item’s resulting main size.
 
-            let child_available_space = Size::MAX_CONTENT
-                .with_main(
-                    dir,
-                    // Map AvailableSpace::Definite to AvailableSpace::MaxContent
-                    if available_space.main(dir) == AvailableSpace::MinContent {
-                        AvailableSpace::MinContent
-                    } else {
-                        AvailableSpace::MaxContent
-                    },
+            //
+            // A flex-basis keyword (see `BasisKeyword`) is this same step, with the main available
+            // space it names in place of the container's.
+            let mut measure_main = |main_available_space: AvailableSpace| {
+                tree.measure_child_size(
+                    child.node,
+                    child_known_dimensions,
+                    child_parent_size,
+                    Size::MAX_CONTENT.with_main(dir, main_available_space).with_cross(dir, cross_axis_available_space),
+                    SizingMode::ContentSize,
+                    dir.main_axis(),
+                    Line::FALSE,
                 )
-                .with_cross(dir, cross_axis_available_space);
+            };
+
+            // Map AvailableSpace::Definite to AvailableSpace::MaxContent
+            let container_constraint = if available_space.main(dir) == AvailableSpace::MinContent {
+                AvailableSpace::MinContent
+            } else {
+                AvailableSpace::MaxContent
+            };
 
             debug_log!("COMPUTE CHILD BASE SIZE:");
-            break 'flex_basis tree.measure_child_size(
-                child.node,
-                child_known_dimensions,
-                child_parent_size,
-                child_available_space,
-                SizingMode::ContentSize,
-                dir.main_axis(),
-                Line::FALSE,
-            );
+            break 'flex_basis match basis_keyword {
+                None | Some(BasisKeyword::Content) => measure_main(container_constraint),
+                Some(BasisKeyword::MinContent) => measure_main(AvailableSpace::MinContent),
+                Some(BasisKeyword::MaxContent) => measure_main(AvailableSpace::MaxContent),
+                Some(BasisKeyword::FitContent) => {
+                    // The available size is the container's content box. A container sized under a
+                    // content constraint has none, and there fit-content is that constraint.
+                    let available = constants.node_inner_size.main(dir).or(available_space.main(dir).into_option());
+                    match available {
+                        Some(available) => {
+                            let min_content = measure_main(AvailableSpace::MinContent);
+                            let max_content = measure_main(AvailableSpace::MaxContent);
+                            max_content.min(min_content.max(available - child.margin.main_axis_sum(dir)))
+                        }
+                        None => measure_main(container_constraint),
+                    }
+                }
+            };
         };
 
         // Floor flex-basis by the padding_border_sum (floors inner_flex_basis at zero)
@@ -2675,5 +2735,153 @@ mod tests {
     fn nested_auto_width_columns_layout_cost_is_linear_in_depth() {
         let calls = nested_auto_width_columns_flex_calls(14);
         assert!(calls < 14 * 10, "layout of 14 nested auto-width columns took {calls} flexbox computations");
+    }
+}
+
+/// Tests of the `flex-basis` keywords (`Dimension::content`, `min_content`, `max_content` and `fit_content`) against the
+/// numbers headless Chrome has for the same pages (see `packages/react/src/__tests__/flex-basis.test.tsx` in gpuix, which
+/// has many more). The "text" is a leaf of five words, each 20px wide, that wraps between them: 20px at min-content, 100px
+/// at max-content, a line 10px high.
+#[cfg(test)]
+mod basis_tests {
+    use crate::prelude::*;
+    use crate::{FlexDirection, TaffyTree};
+
+    const WORDS: usize = 5;
+
+    fn measure(known: Size<Option<f32>>, available: Size<AvailableSpace>, words: usize) -> Size<f32> {
+        let width = known.width.unwrap_or(match available.width {
+            AvailableSpace::MinContent => 20.0,
+            AvailableSpace::MaxContent => 20.0 * words as f32,
+            AvailableSpace::Definite(width) => width.min(20.0 * words as f32).max(20.0),
+        });
+        let per_line = (width / 20.0).floor().max(1.0);
+        let lines = (words as f32 / per_line).ceil();
+        Size { width, height: known.height.unwrap_or(lines * 10.0) }
+    }
+
+    /// The border box `(width, height)` of the only item of a flex container, once the item is given `change`.
+    fn item(container: Style, available: Size<AvailableSpace>, change: impl FnOnce(&mut Style)) -> Size<f32> {
+        let mut tree: TaffyTree<usize> = TaffyTree::new();
+        tree.disable_rounding();
+        let mut style = Style { flex_shrink: 0.0, ..Style::default() };
+        change(&mut style);
+        let item = tree.new_leaf_with_context(style, WORDS).unwrap();
+        let root = tree.new_with_children(Style { display: Display::Flex, ..container }, &[item]).unwrap();
+        tree.compute_layout_with_measure(root, available, |known, available, _, context, _| {
+            measure(known, available, *context.unwrap())
+        })
+        .unwrap();
+        tree.layout(item).unwrap().size
+    }
+
+    fn row(width: f32) -> Style {
+        Style { size: Size { width: length(width), height: auto() }, ..Style::default() }
+    }
+
+    fn column(width: f32, height: f32) -> Style {
+        Style { flex_direction: FlexDirection::Column, size: Size { width: length(width), height: length(height) }, ..Style::default() }
+    }
+
+    fn definite(width: f32) -> Size<AvailableSpace> {
+        Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent }
+    }
+
+    fn basis(dimension: Dimension) -> impl FnOnce(&mut Style) {
+        move |style| style.flex_basis = dimension
+    }
+
+    #[test]
+    fn a_row_item_takes_the_content_size_its_keyword_names() {
+        for (keyword, want) in [
+            (Dimension::content(), 100.0),
+            (Dimension::max_content(), 100.0),
+            (Dimension::min_content(), 20.0),
+            (Dimension::auto(), 100.0),
+        ] {
+            assert_eq!(item(row(300.0), definite(300.0), basis(keyword)).width, want, "{keyword:?}");
+        }
+    }
+
+    #[test]
+    fn fit_content_is_the_container_width_between_the_content_sizes() {
+        for (container, want) in [(10.0, 20.0), (60.0, 60.0), (100.0, 100.0), (300.0, 100.0)] {
+            let size = item(row(container), definite(container), basis(Dimension::fit_content()));
+            assert_eq!(size.width, want, "in {container}px");
+        }
+    }
+
+    #[test]
+    fn fit_content_leaves_the_margins_of_the_item_out() {
+        let size = item(row(80.0), definite(80.0), |style| {
+            style.flex_basis = Dimension::fit_content();
+            style.margin = Rect { left: length(10.0), right: length(20.0), top: length(0.0), bottom: length(0.0) };
+        });
+        assert_eq!(size.width, 50.0);
+    }
+
+    #[test]
+    fn fit_content_is_the_content_box_of_the_container() {
+        let container = Style { padding: Rect { left: length(10.0), right: length(10.0), top: length(0.0), bottom: length(0.0) }, ..row(80.0) };
+        assert_eq!(item(container, definite(80.0), basis(Dimension::fit_content())).width, 60.0);
+    }
+
+    #[test]
+    fn a_container_sized_by_its_content_has_no_width_to_fit() {
+        let auto_row = Style::default();
+        let max_content = Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent };
+        let min_content = Size { width: AvailableSpace::MinContent, height: AvailableSpace::MaxContent };
+        assert_eq!(item(auto_row.clone(), max_content, basis(Dimension::fit_content())).width, 100.0);
+        assert_eq!(item(auto_row, min_content, basis(Dimension::fit_content())).width, 20.0);
+    }
+
+    #[test]
+    fn the_width_is_not_the_basis_of_a_keyword_but_min_and_max_width_clamp_it() {
+        let with_width = |keyword: Dimension, change: fn(&mut Style)| {
+            item(row(300.0), definite(300.0), move |style| {
+                style.size.width = length(50.0);
+                style.flex_basis = keyword;
+                change(style);
+            })
+            .width
+        };
+        assert_eq!(with_width(Dimension::content(), |_| {}), 100.0);
+        assert_eq!(with_width(Dimension::fit_content(), |_| {}), 100.0);
+        assert_eq!(with_width(Dimension::content(), |style| style.max_size.width = length(60.0)), 60.0);
+        assert_eq!(with_width(Dimension::content(), |style| style.min_size.width = length(150.0)), 150.0);
+        assert_eq!(with_width(Dimension::auto(), |_| {}), 50.0);
+    }
+
+    #[test]
+    fn a_column_item_is_its_content_height_at_the_width_it_gets_for_every_keyword() {
+        for keyword in [Dimension::content(), Dimension::min_content(), Dimension::max_content(), Dimension::fit_content()] {
+            // 40px wide: two words a line, three lines. The height of the item is not the basis.
+            let size = item(column(40.0, 500.0), Size::MAX_CONTENT, |style| {
+                style.size.height = length(200.0);
+                style.flex_basis = keyword;
+            });
+            assert_eq!(size, Size { width: 40.0, height: 30.0 }, "{keyword:?}");
+        }
+        let auto = item(column(40.0, 500.0), Size::MAX_CONTENT, |style| style.size.height = length(200.0));
+        assert_eq!(auto.height, 200.0);
+    }
+
+    #[test]
+    fn a_width_that_is_set_alongside_a_keyword_keeps_its_automatic_minimum_size() {
+        // 50px of the content may not shrink below the smaller of its width and its min-content size
+        // (20px here), so the 100px basis shrinks to the container and no further than 20px.
+        let mut tree: TaffyTree<usize> = TaffyTree::new();
+        tree.disable_rounding();
+        let item = tree
+            .new_leaf_with_context(Style { size: Size { width: length(50.0), height: auto() }, flex_basis: Dimension::content(), ..Style::default() }, WORDS)
+            .unwrap();
+        let sibling = tree.new_leaf(Style { size: Size { width: length(5.0), height: auto() }, flex_shrink: 0.0, ..Style::default() }).unwrap();
+        let root = tree.new_with_children(Style { display: Display::Flex, ..row(10.0) }, &[item, sibling]).unwrap();
+        tree.compute_layout_with_measure(root, definite(10.0), |known, available, _, context, _| match context {
+            Some(words) => measure(known, available, *words),
+            None => Size::ZERO,
+        })
+        .unwrap();
+        assert_eq!(tree.layout(item).unwrap().size.width, 20.0);
     }
 }

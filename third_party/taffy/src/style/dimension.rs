@@ -301,6 +301,33 @@ impl Dimension {
         Self(CompactLength::calc(ptr))
     }
 
+    /// The `min-content` keyword. Only `flex_basis` reads it among the sizes of a flex item.
+    #[inline(always)]
+    pub const fn min_content() -> Self {
+        Self(CompactLength::min_content())
+    }
+
+    /// The `max-content` keyword. Only `flex_basis` reads it among the sizes of a flex item.
+    #[inline(always)]
+    pub const fn max_content() -> Self {
+        Self(CompactLength::max_content())
+    }
+
+    /// The `fit-content` keyword: `min(max-content, max(min-content, available size))`. Only
+    /// `flex_basis` reads it among the sizes of a flex item, with the main size of the flex
+    /// container's content box less the item's margins as the available size.
+    #[inline(always)]
+    pub const fn fit_content() -> Self {
+        Self(CompactLength::fit_content_available())
+    }
+
+    /// The `content` keyword: the size of the content, ignoring the item's own `width` or
+    /// `height`. Only `flex_basis` reads it.
+    #[inline(always)]
+    pub const fn content() -> Self {
+        Self(CompactLength::content())
+    }
+
     /// Create a LengthPercentageAuto from a raw `CompactLength`.
     /// # Safety
     /// CompactLength must represent a valid variant for LengthPercentageAuto
