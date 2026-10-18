@@ -5672,6 +5672,7 @@ impl Window {
         cx: &mut App,
     ) {
         self.invalidator.debug_assert_paint();
+        self.notify_lift_owners(&entry.owners, true, cx);
         let tab_stops_start = self.next_frame.tab_stops.paint_index();
         let outer = self
             .lift_paints
@@ -5731,6 +5732,7 @@ impl Window {
             .painted
             .push((entry.ordinal, tab_stops_start..tab_stops_end));
         self.next_frame.dispatch_tree.set_active_node(context_node);
+        self.notify_lift_owners(&entry.owners, false, cx);
     }
 
     /// Updates the global element offset relative to the current offset. This is used to implement

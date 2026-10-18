@@ -11,7 +11,7 @@ use crate::{
 };
 use std::cell::{Cell, RefCell};
 
-type Log = Rc<RefCell<Vec<String>>>;
+pub(super) type Log = Rc<RefCell<Vec<String>>>;
 
 /// What the retained subtree around the hole holds.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -45,8 +45,8 @@ struct Holes {
     phases: Log,
 }
 
-const HOLE_BUTTON: (f32, f32) = (22., 52.);
-const CHAINS: [(f32, f32); 12] = [
+pub(super) const HOLE_BUTTON: (f32, f32) = (22., 52.);
+pub(super) const CHAINS: [(f32, f32); 12] = [
     (12., 12.),
     (30., 60.),
     (22., 52.),
@@ -222,7 +222,7 @@ impl Holes {
     }
 }
 
-fn button(name: &'static str, clicks: &Log) -> AnyElement {
+pub(super) fn button(name: &'static str, clicks: &Log) -> AnyElement {
     div()
         .id(name)
         .always_hitbox()

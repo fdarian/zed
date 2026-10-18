@@ -1458,8 +1458,8 @@ impl Window {
         &mut self,
         cell: &PlainPaint,
         ordinal: u32,
-        _rel: u32,
-        _hook: Option<&crate::elements::ReplayHook>,
+        rel: u32,
+        hook: Option<&crate::elements::ReplayHook>,
         cx: &mut App,
     ) {
         // Taken out so that nothing borrows the cell while the subtrees inside it move.
@@ -1472,9 +1472,34 @@ impl Window {
             )
         };
         paint.range = self.replay_paint(&paint, &nested, Point::default(), Some(ordinal + 1));
-        let mut recorded = cell.recorded.borrow_mut();
-        recorded.paint = Some(paint);
-        recorded.serial = self.building_serial();
+        {
+            let mut recorded = cell.recorded.borrow_mut();
+            recorded.paint = Some(paint);
+            recorded.serial = self.building_serial();
+        }
+        if let Some(hook) = hook {
+            hook(crate::elements::RetainedPhase::LiftedPaint(rel), Point::default(), self, cx);
+        }
+    }
+
+    /// Tells the listeners of the recordings that hold an element that the context starts to paint
+    /// it, or that it is done.
+    pub(crate) fn notify_lift_owners(&mut self, owners: &[LiftOwner], begin: bool, cx: &mut App) {
+        use crate::elements::RetainedPhase;
+
+        if begin {
+            for owner in owners {
+                if let Some(hook) = &owner.hook {
+                    hook(RetainedPhase::LiftedBegin(owner.rel), Point::default(), self, cx);
+                }
+            }
+        } else {
+            for owner in owners.iter().rev() {
+                if let Some(hook) = &owner.hook {
+                    hook(RetainedPhase::LiftedEnd, Point::default(), self, cx);
+                }
+            }
+        }
     }
 
     /// The retained state under `key`, in the frame being built or else the rendered frame.

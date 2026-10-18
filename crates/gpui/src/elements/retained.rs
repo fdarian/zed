@@ -104,6 +104,23 @@ pub enum RetainedPhase {
     /// what its prepaint published was published with the subtree around it, with
     /// [`RetainedPhase::Layout`].
     LayoutPaint,
+    /// The stacking context around the subtree starts to paint an element that was handed to it
+    /// while the subtree was recorded, or is built, and the subtree is its owner: the ordinal of
+    /// the element counted from the first the subtree handed over. Everything the element paints
+    /// until the matching [`RetainedPhase::LiftedEnd`] is not in the paint of the subtree, though a
+    /// replay of the subtree puts it into the frame again, with [`RetainedPhase::LiftedPaint`].
+    /// Elements handed over inside it, which the context paints after it, are in between only
+    /// when they are painted inside it. Recordings nest: the ends come in the reverse order of the
+    /// beginnings.
+    LiftedBegin(u32),
+    /// What the element started by [`RetainedPhase::LiftedBegin`] paints is done.
+    LiftedEnd,
+    /// A replay of the subtree has the stacking context put the paint of the element with this
+    /// ordinal (counted as for [`RetainedPhase::LiftedBegin`]) into the frame again. Run in place
+    /// of everything that [`RetainedPhase::LiftedBegin`] and [`RetainedPhase::LiftedEnd`] bracketed
+    /// when it was built, at the place the context paints the element; inside the brackets of the
+    /// recordings that are open around the subtree when it is replayed.
+    LiftedPaint(u32),
 }
 
 type Build = Box<dyn FnOnce(&mut Window, &mut App) -> AnyElement>;
@@ -4665,6 +4682,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod fragment_tests;
 #[cfg(test)]
 mod hole_tests;
 #[cfg(test)]
