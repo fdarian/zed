@@ -75,6 +75,65 @@ impl DecorationGeometry {
     pub fn bands(&self) -> impl Iterator<Item = DecorationBand> {
         iter::once(self.first).chain(self.second)
     }
+
+    /// The marks of a dotted or dashed line fitted to a line `width` long, as Blink's
+    /// `StrokeData` does: the gaps are stretched or squeezed so that the last mark ends where
+    /// the line does (a dot of a thick dotted line is centred on the end), and a dashed line
+    /// too short for two dashes is solid. A thin dotted line (under four device pixels) is
+    /// a row of square marks, one thickness long, and is not fitted. All in device pixels.
+    pub fn fitted(self, thickness: f32, width: f32) -> Self {
+        match self.shape {
+            SHAPE_DASHED => {
+                if width <= 2. * self.mark_length {
+                    return Self {
+                        shape: SHAPE_SOLID,
+                        mark_length: 0.,
+                        mark_period: 0.,
+                        ..self
+                    };
+                }
+                let gap = self.mark_period - self.mark_length;
+                Self {
+                    mark_period: self.mark_length + best_dash_gap(width, self.mark_length, gap),
+                    ..self
+                }
+            }
+            SHAPE_DOTTED if thickness < ROUND_DOT_THICKNESS => Self {
+                shape: SHAPE_DASHED,
+                ..self
+            },
+            SHAPE_DOTTED => Self {
+                // The dots' centres run from half a thickness in to half a thickness short of the
+                // end, so the line the gaps are fitted to is a thickness shorter.
+                mark_period: best_dash_gap((width - thickness).max(0.), 0., self.mark_period),
+                ..self
+            },
+            _ => self,
+        }
+    }
+}
+
+/// The thickness, in device pixels, from which a dotted line is round dots.
+const ROUND_DOT_THICKNESS: f32 = 4.;
+
+/// The gap between marks of `dash` that fits a whole number of them in `length` and is the
+/// closest to the nominal `gap` (Blink's `StrokeData::SelectBestDashGap`).
+fn best_dash_gap(length: f32, dash: f32, gap: f32) -> f32 {
+    let fewest = ((length + gap) / (dash + gap)).floor();
+    let most = fewest + 1.;
+    let gap_for = |marks: f32| {
+        if marks > 1. {
+            (length - marks * dash) / (marks - 1.)
+        } else {
+            f32::INFINITY
+        }
+    };
+    let (small, large) = (gap_for(fewest), gap_for(most));
+    if large <= 0. || (small - gap).abs() < (large - gap).abs() {
+        small
+    } else {
+        large
+    }
 }
 
 /// The geometry of a line of `thickness`, with Chrome-like proportions:
@@ -214,6 +273,29 @@ mod tests {
             bands(DecorationKind::Underline, TextDecorationStyle::Dotted, 2.),
             [(0., 2.)]
         );
+    }
+
+    #[test]
+    fn a_dashed_line_ends_on_a_dash_and_too_short_a_one_is_solid() {
+        let dashed = decoration_geometry(DecorationKind::Underline, TextDecorationStyle::Dashed, 2.);
+        assert_eq!(dashed.fitted(2., 12.).shape, SHAPE_SOLID);
+        let fitted = dashed.fitted(2., 40.);
+        assert_eq!(fitted.mark_length, 6.);
+        assert!((fitted.mark_period - 34. / 3.).abs() < 1e-4);
+        // 13 spaces of 8: the best gap is a little under the nominal 4.
+        let fitted = dashed.fitted(2., 104.);
+        assert!((fitted.mark_period - 9.8).abs() < 1e-4, "{}", fitted.mark_period);
+    }
+
+    #[test]
+    fn a_thin_dotted_line_is_square_marks_and_a_thick_one_round_dots_fitted_to_the_line() {
+        let thin = decoration_geometry(DecorationKind::Underline, TextDecorationStyle::Dotted, 3.)
+            .fitted(3., 40.);
+        assert_eq!((thin.shape, thin.mark_length, thin.mark_period), (SHAPE_DASHED, 3., 6.));
+        let thick = decoration_geometry(DecorationKind::Underline, TextDecorationStyle::Dotted, 4.)
+            .fitted(4., 40.);
+        assert_eq!(thick.shape, SHAPE_DOTTED);
+        assert!((thick.mark_period - 7.2).abs() < 1e-4, "{}", thick.mark_period);
     }
 
     #[test]

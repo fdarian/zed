@@ -1586,6 +1586,12 @@ pub struct UnderlineStyle {
     /// baseline of the row, the baseline of a box with no `vertical-align` of its own
     /// that declared it.
     pub decorator: Option<u64>,
+
+    /// The text fragment the line is on, for a line whose pattern (dotted, dashed, wavy)
+    /// starts over with every fragment, as Chrome draws it. Two lines that differ here
+    /// are painted as two, so a caller that numbers the text nodes of a paragraph with it
+    /// gets a pattern per text node. Zero for a line with no pattern.
+    pub fragment: u32,
 }
 
 /// The properties that can be applied to a strikethrough.
@@ -1604,6 +1610,14 @@ pub struct StrikethroughStyle {
 
     /// How the strikethrough is drawn.
     pub style: TextDecorationStyle,
+
+    /// The [`InlineBox::key`](crate::InlineBox::key) of the box that declared the line.
+    /// CSS puts a strike-through at two thirds of the ascent of that box's font, below
+    /// the top of the text it is drawn over. `None` is the font of the line itself.
+    pub decorator: Option<u64>,
+
+    /// See [`UnderlineStyle::fragment`].
+    pub fragment: u32,
 }
 
 /// The properties that can be applied to an overline.
@@ -1622,6 +1636,9 @@ pub struct OverlineStyle {
 
     /// How the overline is drawn.
     pub style: TextDecorationStyle,
+
+    /// See [`UnderlineStyle::fragment`].
+    pub fragment: u32,
 }
 
 /// A decoration line beyond the first of its kind on a run. CSS decorations of

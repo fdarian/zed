@@ -155,6 +155,8 @@ pub struct PlacedBox {
     /// How far the box reaches above and below its own baseline.
     pub above: Pixels,
     pub below: Pixels,
+    /// The ascent of the box's font, which decorations the box declares are placed by.
+    pub ascent: Pixels,
 }
 
 /// How far the strut of an inline box reaches above and below its baseline: the ascent and
@@ -274,6 +276,7 @@ pub(crate) struct ResolvedBox {
     pub placement: RunPlacement,
     pub above: Pixels,
     pub below: Pixels,
+    pub ascent: Pixels,
 }
 
 /// Where each box of `specs` sits on its line, as the baseline shift that CSS 2.1
@@ -293,7 +296,7 @@ pub(crate) fn resolve_placements(
         placement: RunPlacement::Baseline,
     };
     let mut frames: Vec<Frame> = Vec::with_capacity(specs.len());
-    let mut extents: Vec<(Pixels, Pixels)> = Vec::with_capacity(specs.len());
+    let mut extents: Vec<(Pixels, Pixels, Pixels)> = Vec::with_capacity(specs.len());
     for (ix, spec) in specs.iter().enumerate() {
         let parent = spec
             .parent
@@ -352,7 +355,7 @@ pub(crate) fn resolve_placements(
             }
         };
 
-        extents.push((above, below));
+        extents.push((above, below, ascent));
         frames.push(Frame {
             font_size,
             ascent,
@@ -364,10 +367,11 @@ pub(crate) fn resolve_placements(
     frames
         .into_iter()
         .zip(extents)
-        .map(|(frame, (above, below))| ResolvedBox {
+        .map(|(frame, (above, below, ascent))| ResolvedBox {
             placement: frame.placement,
             above,
             below,
+            ascent,
         })
         .collect()
 }
@@ -516,6 +520,7 @@ pub(crate) fn apply_inline(
                     placement: resolved.placement,
                     above: resolved.above,
                     below: resolved.below,
+                    ascent: resolved.ascent,
                 })
             })
             .collect(),

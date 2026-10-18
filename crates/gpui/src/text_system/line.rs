@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, DecorationThickness, DevicePixels, ExtraDecoration, FontId, GlyphInset, Half, Hsla, LineLayout,
+    App, Bounds, DecorationThickness, DevicePixels, ExtraDecoration, FontId, GlyphInset, Half, Hsla, LineLayout, RowMetrics,
     OverlineStyle, Pixels, Point, RenderGlyphParams, Result, ShapedRun, SharedString,
-    StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary, extent_in_line,
+    StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
@@ -427,6 +427,9 @@ fn decoration_thickness(
 /// a decoration starts there when it begins on that glyph and ends before the
 /// trailing inset of the glyph it ends after: the decoration of a CSS inline box
 /// covers its text, not its padding.
+///
+/// Underlines and overlines are painted with the glyphs, below them. Strike-throughs
+/// are painted over them, in a layer of their own after the last glyph.
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -452,11 +455,8 @@ fn paint_line(
         let mut line_ix = 0;
         let mut run_end = 0;
         let mut color = black();
-        let mut current_underline: Option<OpenDecoration<UnderlineStyle>> = None;
-        let mut current_strikethrough: Option<OpenDecoration<StrikethroughStyle>> = None;
-        let mut current_overline: Option<OpenDecoration<OverlineStyle>> = None;
-        let mut current_extras: Vec<OpenDecoration<ExtraDecoration>> = Vec::new();
-        let mut extras_source: &[ExtraDecoration] = &[];
+        let mut open: Vec<OpenDecoration> = Vec::new();
+        let mut finished: Vec<FinishedDecoration> = Vec::new();
         let text_system = cx.text_system().clone();
         let scale_factor = window.scale_factor();
         let mut glyph_origin = point(
@@ -493,69 +493,22 @@ fn paint_line(
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
-                    let row_baseline = glyph_origin.y + rows[line_ix].baseline;
-                    let underline_baseline = |decorator| {
-                        row_baseline - layout.box_raise(decorator, line_ix, rows)
-                    };
-                    if let Some(underline) = current_underline.as_mut() {
-                        if glyph_origin.x == underline.x {
-                            underline.x -= max_glyph_size.width.half();
-                        };
-                        window.paint_underline(
-                            underline.origin(underline_baseline(underline.style.decorator)),
-                            glyph_origin.x - previous_trailing - underline.x,
-                            &underline.style,
-                        );
-                        if glyph.index < run_end {
-                            underline.x = origin.x;
-                        } else {
-                            current_underline = None;
-                        }
-                    }
-                    if let Some(strikethrough) = current_strikethrough.as_mut() {
-                        if glyph_origin.x == strikethrough.x {
-                            strikethrough.x -= max_glyph_size.width.half();
-                        };
-                        window.paint_strikethrough(
-                            strikethrough.origin(row_baseline),
-                            glyph_origin.x - previous_trailing - strikethrough.x,
-                            &strikethrough.style,
-                        );
-                        if glyph.index < run_end {
-                            strikethrough.x = origin.x;
-                        } else {
-                            current_strikethrough = None;
-                        }
-                    }
-                    if let Some(overline) = current_overline.as_mut() {
-                        if glyph_origin.x == overline.x {
-                            overline.x -= max_glyph_size.width.half();
-                        };
-                        window.paint_overline(
-                            overline.origin(row_baseline),
-                            glyph_origin.x - previous_trailing - overline.x,
-                            &overline.style,
-                        );
-                        if glyph.index < run_end {
-                            overline.x = origin.x;
-                        } else {
-                            current_overline = None;
-                        }
-                    }
-                    for extra in &mut current_extras {
-                        paint_extra(
-                            window,
-                            extra,
-                            glyph_origin.x - previous_trailing,
-                            row_baseline,
-                            &underline_baseline,
+                    // The spaces that hang past the end of a row are not decorated.
+                    let end_x = glyph_origin.x
+                        - previous_trailing
+                        - hanging_width(hanging_widths, line_ix);
+                    let carried_on = glyph.index < run_end;
+                    for line in std::mem::take(&mut open) {
+                        finish_decoration_line(
+                            &mut finished,
+                            &line,
+                            end_x,
+                            glyph_origin.y,
                             max_glyph_size.width.half(),
                         );
-                        extra.x = origin.x;
-                    }
-                    if glyph.index >= run_end {
-                        current_extras.clear();
-                        extras_source = &[];
+                        if carried_on {
+                            open.push(line);
+                        }
                     }
 
                     glyph_origin.y += rows[line_ix].height;
@@ -569,22 +522,22 @@ fn paint_line(
                         wraps.peek(),
                         hanging_width(hanging_widths, line_ix),
                     );
+                    for line in &mut open {
+                        line.x = glyph_origin.x + leading;
+                    }
                 }
                 prev_glyph_position = glyph.position;
                 // Where this run sits in its row, which a vertical alignment moves.
                 let run_baseline = rows[line_ix].baseline - line_rows.raise(run_ix, line_ix);
-                let row_baseline = glyph_origin.y + run_baseline;
-                // CSS draws an underline at the baseline of the box that declared it, not
-                // at that of the run the last of its glyphs is in.
-                let underline_baseline = |decorator| {
-                    glyph_origin.y + rows[line_ix].baseline
-                        - layout.box_raise(decorator, line_ix, rows)
+                let placement = DecorationPlacement {
+                    layout,
+                    rows,
+                    run,
+                    run_baseline,
+                    row_ix: line_ix,
+                    scale_factor,
                 };
 
-                let mut finished_underline: Option<OpenDecoration<UnderlineStyle>> = None;
-                let mut finished_strikethrough: Option<OpenDecoration<StrikethroughStyle>> = None;
-                let mut finished_overline: Option<OpenDecoration<OverlineStyle>> = None;
-                let mut finished_extras = Vec::new();
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
@@ -597,153 +550,69 @@ fn paint_line(
                         style_run = decoration_runs.next();
                     }
 
+                    let wanted = style_run.map(wanted_lines).unwrap_or_default();
+                    // A line that goes on across the runs is the same line, so that its
+                    // pattern runs on; the others end at this glyph.
+                    let mut unmatched: Vec<&ExtraDecoration> = wanted.iter().collect();
+                    for line in std::mem::take(&mut open) {
+                        match unmatched.iter().position(|source| **source == line.source) {
+                            Some(found) => {
+                                unmatched.remove(found);
+                                open.push(line);
+                            }
+                            None => finish_decoration_line(
+                                &mut finished,
+                                &line,
+                                glyph_origin.x - previous_trailing,
+                                glyph_origin.y,
+                                max_glyph_size.width.half(),
+                            ),
+                        }
+                    }
                     if let Some(style_run) = style_run {
-                        if let Some(underline) = &current_underline
-                            && style_run.underline.as_ref() != Some(&underline.style)
-                        {
-                            finished_underline = current_underline.take();
-                        }
-                        if let Some(run_underline) = style_run.underline.as_ref() {
-                            let thickness = decoration_thickness(
-                                run_underline.thickness,
-                                run_underline.thickness_kind,
-                                &text_system,
-                                run.font_id,
-                                layout.font_size,
-                            );
-                            current_underline.get_or_insert(OpenDecoration {
-                                x: glyph_origin.x + leading,
-                                baseline_offset: underline_offset(
-                                    run_underline.offset,
-                                    thickness,
-                                    scale_factor,
-                                ),
-                                style: UnderlineStyle {
-                                    color: Some(run_underline.color.unwrap_or(style_run.color)),
-                                    thickness,
-                                    ..*run_underline
-                                },
-                            });
-                        }
-                        if let Some(strikethrough) = &current_strikethrough
-                            && style_run.strikethrough.as_ref() != Some(&strikethrough.style)
-                        {
-                            finished_strikethrough = current_strikethrough.take();
-                        }
-                        if let Some(run_strikethrough) = style_run.strikethrough.as_ref() {
-                            current_strikethrough.get_or_insert(OpenDecoration {
-                                x: glyph_origin.x + leading,
-                                baseline_offset: strikethrough_offset(layout, run, line_height),
-                                style: StrikethroughStyle {
-                                    color: Some(run_strikethrough.color.unwrap_or(style_run.color)),
-                                    thickness: decoration_thickness(
-                                        run_strikethrough.thickness,
-                                        run_strikethrough.thickness_kind,
-                                        &text_system,
-                                        run.font_id,
-                                        layout.font_size,
-                                    ),
-                                    ..*run_strikethrough
-                                },
-                            });
-                        }
-                        if let Some(overline) = &current_overline
-                            && style_run.overline.as_ref() != Some(&overline.style)
-                        {
-                            finished_overline = current_overline.take();
-                        }
-                        if let Some(run_overline) = style_run.overline.as_ref() {
-                            current_overline.get_or_insert(OpenDecoration {
-                                x: glyph_origin.x + leading,
-                                baseline_offset: overline_offset(layout, run),
-                                style: OverlineStyle {
-                                    color: Some(run_overline.color.unwrap_or(style_run.color)),
-                                    thickness: decoration_thickness(
-                                        run_overline.thickness,
-                                        run_overline.thickness_kind,
-                                        &text_system,
-                                        run.font_id,
-                                        layout.font_size,
-                                    ),
-                                    ..*run_overline
-                                },
-                            });
-                        }
-
-                        if style_run.extra_decorations.as_slice() != extras_source {
-                            finished_extras = std::mem::take(&mut current_extras);
-                            extras_source = &style_run.extra_decorations;
-                            current_extras = extras_source
+                        for source in unmatched {
+                            let order = wanted
                                 .iter()
-                                .map(|extra| {
-                                    open_extra(
-                                        extra,
-                                        glyph_origin.x + leading,
-                                        style_run.color,
-                                        layout,
-                                        run,
-                                        line_height,
-                                        &text_system,
-                                        scale_factor,
-                                    )
-                                })
-                                .collect();
+                                .position(|line| line == source)
+                                .unwrap_or_default();
+                            open.push(open_decoration(
+                                source,
+                                order,
+                                glyph_origin.x + leading,
+                                style_run.color,
+                                &placement,
+                                &text_system,
+                            ));
                         }
-
                         run_end += style_run.len as usize;
                         color = style_run.color;
                     } else {
                         run_end = layout.len;
-                        finished_extras = std::mem::take(&mut current_extras);
-                        extras_source = &[];
-                        finished_underline = current_underline.take();
-                        finished_strikethrough = current_strikethrough.take();
-                        finished_overline = current_overline.take();
                     }
                 }
 
-                if let Some(mut underline) = finished_underline {
-                    if underline.x == glyph_origin.x {
-                        underline.x -= max_glyph_size.width.half();
-                    };
-                    window.paint_underline(
-                        underline.origin(underline_baseline(underline.style.decorator)),
-                        glyph_origin.x - previous_trailing - underline.x,
-                        &underline.style,
-                    );
-                }
-
-                if let Some(mut strikethrough) = finished_strikethrough {
-                    if strikethrough.x == glyph_origin.x {
-                        strikethrough.x -= max_glyph_size.width.half();
-                    };
-                    window.paint_strikethrough(
-                        strikethrough.origin(row_baseline),
-                        glyph_origin.x - previous_trailing - strikethrough.x,
-                        &strikethrough.style,
-                    );
-                }
-
-                if let Some(mut overline) = finished_overline {
-                    if overline.x == glyph_origin.x {
-                        overline.x -= max_glyph_size.width.half();
-                    };
-                    window.paint_overline(
-                        overline.origin(row_baseline),
-                        glyph_origin.x - previous_trailing - overline.x,
-                        &overline.style,
-                    );
-                }
-
-                for mut extra in finished_extras {
-                    paint_extra(
-                        window,
-                        &mut extra,
-                        glyph_origin.x - previous_trailing,
-                        row_baseline,
-                        &underline_baseline,
-                        max_glyph_size.width.half(),
-                    );
+                // A line that a change of font, size or alignment moves ends where that
+                // happens and goes on at its new place, as Chrome draws a line per fragment.
+                for line in std::mem::take(&mut open) {
+                    let top = placement.top(&line.style);
+                    if top == line.top {
+                        open.push(line);
+                    } else if line.x >= glyph_origin.x + leading {
+                        open.push(OpenDecoration { top, ..line });
+                    } else {
+                        finish_decoration_line(
+                            &mut finished,
+                            &line,
+                            glyph_origin.x - previous_trailing,
+                            glyph_origin.y,
+                            max_glyph_size.width.half(),
+                        );
+                        open.push(OpenDecoration {
+                            x: glyph_origin.x + leading,
+                            top,
+                            ..line
+                        });
+                    }
                 }
 
                 let painted_origin = point(glyph_origin.x + leading, glyph_origin.y);
@@ -790,52 +659,40 @@ fn paint_line(
             let glyph = &run.glyphs[boundary.glyph_ix];
             last_line_end_x -= glyph.position.x;
         }
-
-        let last_row_baseline = glyph_origin.y + rows[line_ix].baseline;
-        let last_underline_baseline =
-            |decorator| last_row_baseline - layout.box_raise(decorator, line_ix, rows);
-        if let Some(mut underline) = current_underline.take() {
-            if last_line_end_x == underline.x {
-                underline.x -= max_glyph_size.width.half()
-            };
-            window.paint_underline(
-                underline.origin(last_underline_baseline(underline.style.decorator)),
-                last_line_end_x - underline.x,
-                &underline.style,
-            );
-        }
-
-        if let Some(mut strikethrough) = current_strikethrough.take() {
-            if last_line_end_x == strikethrough.x {
-                strikethrough.x -= max_glyph_size.width.half()
-            };
-            window.paint_strikethrough(
-                strikethrough.origin(last_row_baseline),
-                last_line_end_x - strikethrough.x,
-                &strikethrough.style,
-            );
-        }
-
-        if let Some(mut overline) = current_overline.take() {
-            if last_line_end_x == overline.x {
-                overline.x -= max_glyph_size.width.half()
-            };
-            window.paint_overline(
-                overline.origin(last_row_baseline),
-                last_line_end_x - overline.x,
-                &overline.style,
-            );
-        }
-
-        for mut extra in current_extras {
-            paint_extra(
-                window,
-                &mut extra,
+        for line in open {
+            finish_decoration_line(
+                &mut finished,
+                &line,
                 last_line_end_x,
-                last_row_baseline,
-                &last_underline_baseline,
+                glyph_origin.y,
                 max_glyph_size.width.half(),
             );
+        }
+
+        // The line of the innermost box is on top of those of the boxes around it.
+        finished.sort_by_key(|line| line.order);
+        for line in &finished {
+            match &line.style {
+                ExtraDecoration::Underline(style) => {
+                    window.paint_underline(line.origin, line.width, style)
+                }
+                ExtraDecoration::Overline(style) => {
+                    window.paint_overline(line.origin, line.width, style)
+                }
+                ExtraDecoration::Strikethrough(_) => {}
+            }
+        }
+        if finished
+            .iter()
+            .any(|line| matches!(line.style, ExtraDecoration::Strikethrough(_)))
+        {
+            window.paint_layer(line_bounds, |window| {
+                for line in &finished {
+                    if let ExtraDecoration::Strikethrough(style) = &line.style {
+                        window.paint_strikethrough(line.origin, line.width, style);
+                    }
+                }
+            });
         }
 
         Ok(())
@@ -997,100 +854,158 @@ fn paint_line_background(
     })
 }
 
-/// An underline, strikethrough or overline that has started and has not been painted yet.
-struct OpenDecoration<Style> {
+/// A decoration line that has started and has not been painted yet.
+struct OpenDecoration {
     x: Pixels,
-    /// Below the baseline of the row it is on, so that it keeps its place when it
-    /// wraps onto a row whose baseline is elsewhere.
-    baseline_offset: Pixels,
-    style: Style,
+    /// Where the style run that opened it listed it: the lines of the outer boxes first.
+    order: usize,
+    /// Below the top of the row it is on, so that it keeps its place when a vertical
+    /// alignment moves the run it is drawn over.
+    top: Pixels,
+    /// The line with its colour and thickness resolved.
+    style: ExtraDecoration,
+    /// The line as the style run declared it, which a later run is compared with to see
+    /// whether this is still the line it asks for.
+    source: ExtraDecoration,
 }
 
-impl<Style> OpenDecoration<Style> {
-    fn origin(&self, row_baseline: Pixels) -> Point<Pixels> {
-        point(self.x, row_baseline + self.baseline_offset)
+/// The lines a style run asks for, in the order they are painted: the lines of the boxes
+/// around the innermost one come first, so that the innermost box's line is on top.
+fn wanted_lines(style_run: &DecorationRun) -> SmallVec<[ExtraDecoration; 4]> {
+    let mut lines: SmallVec<[ExtraDecoration; 4]> =
+        style_run.extra_decorations.iter().copied().collect();
+    lines.extend(style_run.underline.map(ExtraDecoration::Underline));
+    lines.extend(style_run.strikethrough.map(ExtraDecoration::Strikethrough));
+    lines.extend(style_run.overline.map(ExtraDecoration::Overline));
+    lines
+}
+
+/// Where the lines drawn over a run go: the run, and the row it is in.
+struct DecorationPlacement<'a> {
+    layout: &'a LineLayout,
+    rows: &'a [RowMetrics],
+    run: &'a ShapedRun,
+    /// The baseline of the run in its row, where a vertical alignment has moved it.
+    run_baseline: Pixels,
+    row_ix: usize,
+    scale_factor: f32,
+}
+
+impl DecorationPlacement<'_> {
+    fn ascent(&self) -> Pixels {
+        if self.layout.is_styled(self.run) {
+            self.run.ascent
+        } else {
+            self.layout.ascent
+        }
+    }
+
+    /// The ascent of the font of the box `decorator`, which declared a line.
+    fn decorator_ascent(&self, decorator: Option<u64>) -> Pixels {
+        decorator
+            .and_then(|key| self.layout.boxes.iter().find(|placed| placed.key == key))
+            .map_or(self.layout.ascent, |placed| placed.ascent)
+    }
+
+    /// The top of the straight line of `line` below the top of its row, as Chrome puts it:
+    ///
+    /// - An underline is at the baseline of the box that declared it, whatever the text it is
+    ///   drawn under is raised to, and `offset` is measured from there.
+    /// - A strike-through is at two thirds of the ascent of the font of the box that declared
+    ///   it, down from the top of the text it is drawn over (that text's own ascent, at its
+    ///   own baseline), and centred on that.
+    /// - An overline is on the top of the text it is drawn over, which the line grows up from.
+    fn top(&self, line: &ExtraDecoration) -> Pixels {
+        match line {
+            ExtraDecoration::Underline(underline) => {
+                self.rows[self.row_ix].baseline
+                    - self.layout.box_raise(underline.decorator, self.row_ix, self.rows)
+                    + underline_offset(underline.offset, underline.thickness, self.scale_factor)
+            }
+            ExtraDecoration::Strikethrough(strikethrough) => {
+                self.run_baseline - self.ascent()
+                    + self.decorator_ascent(strikethrough.decorator) * (2. / 3.)
+                    - strikethrough.thickness * 0.5
+            }
+            ExtraDecoration::Overline(_) => self.run_baseline - self.ascent(),
+        }
     }
 }
 
-fn open_extra(
-    extra: &ExtraDecoration,
+/// `source` started at `x`, over the run `placement` says, with its colour and thickness
+/// resolved against `run_color` and the font.
+fn open_decoration(
+    source: &ExtraDecoration,
+    order: usize,
     x: Pixels,
     run_color: Hsla,
-    layout: &LineLayout,
-    run: &ShapedRun,
-    line_height: Pixels,
+    placement: &DecorationPlacement,
     text_system: &TextSystem,
-    scale_factor: f32,
-) -> OpenDecoration<ExtraDecoration> {
+) -> OpenDecoration {
     let thickness = |thickness, kind| {
         decoration_thickness(
             thickness,
             kind,
             text_system,
-            run.font_id,
-            layout.font_size,
+            placement.run.font_id,
+            placement.layout.font_size,
         )
     };
-    let (baseline_offset, style) = match extra {
-        ExtraDecoration::Underline(underline) => {
-            let thickness = thickness(underline.thickness, underline.thickness_kind);
-            (
-                underline_offset(underline.offset, thickness, scale_factor),
-                ExtraDecoration::Underline(UnderlineStyle {
-                    color: Some(underline.color.unwrap_or(run_color)),
-                    thickness,
-                    ..*underline
-                }),
-            )
-        }
-        ExtraDecoration::Strikethrough(strikethrough) => (
-            strikethrough_offset(layout, run, line_height),
+    let style = match source {
+        ExtraDecoration::Underline(underline) => ExtraDecoration::Underline(UnderlineStyle {
+            color: Some(underline.color.unwrap_or(run_color)),
+            thickness: thickness(underline.thickness, underline.thickness_kind),
+            ..*underline
+        }),
+        ExtraDecoration::Strikethrough(strikethrough) => {
             ExtraDecoration::Strikethrough(StrikethroughStyle {
                 color: Some(strikethrough.color.unwrap_or(run_color)),
                 thickness: thickness(strikethrough.thickness, strikethrough.thickness_kind),
                 ..*strikethrough
-            }),
-        ),
-        ExtraDecoration::Overline(overline) => (
-            overline_offset(layout, run),
-            ExtraDecoration::Overline(OverlineStyle {
-                color: Some(overline.color.unwrap_or(run_color)),
-                thickness: thickness(overline.thickness, overline.thickness_kind),
-                ..*overline
-            }),
-        ),
+            })
+        }
+        ExtraDecoration::Overline(overline) => ExtraDecoration::Overline(OverlineStyle {
+            color: Some(overline.color.unwrap_or(run_color)),
+            thickness: thickness(overline.thickness, overline.thickness_kind),
+            ..*overline
+        }),
     };
     OpenDecoration {
         x,
-        baseline_offset,
+        order,
+        top: placement.top(&style),
         style,
+        source: *source,
     }
 }
 
-/// Paints `extra` from where it started to `end_x`.
-fn paint_extra(
-    window: &mut Window,
-    extra: &mut OpenDecoration<ExtraDecoration>,
+/// A decoration line that is complete: where it goes, and the order it is painted in.
+struct FinishedDecoration {
+    order: usize,
+    origin: Point<Pixels>,
+    width: Pixels,
+    style: ExtraDecoration,
+}
+
+/// Ends `line` at `end_x`, in the row that starts at `row_top`.
+fn finish_decoration_line(
+    finished: &mut Vec<FinishedDecoration>,
+    line: &OpenDecoration,
     end_x: Pixels,
-    row_baseline: Pixels,
-    underline_baseline: &dyn Fn(Option<u64>) -> Pixels,
+    row_top: Pixels,
     half_glyph_width: Pixels,
 ) {
-    if extra.x == end_x {
-        extra.x -= half_glyph_width;
-    }
-    let origin = match &extra.style {
-        ExtraDecoration::Underline(style) => extra.origin(underline_baseline(style.decorator)),
-        ExtraDecoration::Strikethrough(_) | ExtraDecoration::Overline(_) => {
-            extra.origin(row_baseline)
-        }
+    let x = if line.x == end_x {
+        line.x - half_glyph_width
+    } else {
+        line.x
     };
-    let width = end_x - extra.x;
-    match &extra.style {
-        ExtraDecoration::Underline(style) => window.paint_underline(origin, width, style),
-        ExtraDecoration::Strikethrough(style) => window.paint_strikethrough(origin, width, style),
-        ExtraDecoration::Overline(style) => window.paint_overline(origin, width, style),
-    }
+    finished.push(FinishedDecoration {
+        order: line.order,
+        origin: point(x, row_top + line.top),
+        width: end_x - x,
+        style: line.style,
+    });
 }
 
 /// Where the top of an underline of `thickness` sits below the baseline, as Chrome
@@ -1104,35 +1019,6 @@ fn underline_offset(offset: Option<Pixels>, thickness: Pixels, scale_factor: f32
         None => (thickness.0 * scale_factor / 2.0).ceil().max(1.0),
     };
     px(device_pixels / scale_factor)
-}
-
-/// Where an overline on `run` sits relative to the baseline: the top of the run's
-/// ascent, whatever row it is on.
-fn overline_offset(layout: &LineLayout, run: &ShapedRun) -> Pixels {
-    let ascent = if layout.is_styled(run) {
-        run.ascent
-    } else {
-        layout.ascent
-    };
-    -ascent
-}
-
-/// Where a strikethrough on `run` sits relative to the baseline, from the run's own
-/// ascent and half-leading rather than from the row it happens to be in.
-fn strikethrough_offset(layout: &LineLayout, run: &ShapedRun, line_height: Pixels) -> Pixels {
-    let (ascent, baseline) = if layout.is_styled(run) {
-        let run_line_height = run.line_height.unwrap_or(line_height);
-        (
-            run.ascent,
-            extent_in_line(run.ascent, run.descent, run_line_height).0,
-        )
-    } else {
-        (
-            layout.ascent,
-            extent_in_line(layout.ascent, layout.descent, line_height).0,
-        )
-    };
-    ((ascent * 0.5) + baseline) * 0.5 - baseline
 }
 
 /// How wide the spaces that hang at the end of line `line_ix` are. A layout that
@@ -1856,15 +1742,18 @@ mod tests {
             assert_close(painted.lines[0].0, painted.baseline(2) + 2., "underline");
         }
 
+        /// Chrome centres a strike-through two thirds of the way down from the top of the text, by
+        /// the ascent of the font of the box that declared it: here the plain text of the line,
+        /// whatever the text it is drawn over.
         #[test]
-        fn a_strikethrough_on_big_text_is_between_its_ascent_and_its_baseline() {
+        fn a_strikethrough_on_big_text_goes_by_the_ascent_of_the_decorating_font() {
             let painted = mixed(|ix, run| if ix == 1 { struck(run) } else { run });
             assert_eq!(painted.lines.len(), 1);
-            let ascent = f32::from(painted.run(5).ascent);
-            let baseline = f32::from(painted.rows[1].baseline);
+            let big_ascent = f32::from(painted.run(5).ascent);
+            let decorating_ascent = f32::from(painted.layout.ascent());
             assert_close(
                 painted.lines[0].0,
-                painted.row_tops[1] + ((ascent * 0.5) + baseline) * 0.5,
+                painted.baseline(1) - big_ascent + decorating_ascent * 2. / 3. - 0.5,
                 "strikethrough",
             );
         }
@@ -1873,12 +1762,10 @@ mod tests {
         fn a_strikethrough_on_plain_text_follows_the_baseline_of_a_taller_row() {
             let painted = mixed(|ix, run| if ix == 2 { struck(run) } else { run });
             assert_eq!(painted.lines.len(), 1);
-            let strut = painted.layout.rows(px(LINE_HEIGHT))[0].baseline;
-            let ascent = painted.layout.ascent();
-            let strut_offset = f32::from(((ascent * 0.5) + strut) * 0.5 - strut);
+            let ascent = f32::from(painted.layout.ascent());
             assert_close(
                 painted.lines[0].0,
-                painted.baseline(2) + strut_offset,
+                painted.baseline(2) - ascent / 3. - 0.5,
                 "strikethrough",
             );
         }
@@ -1916,7 +1803,7 @@ mod tests {
             for (row, line) in struck.lines.iter().enumerate() {
                 assert_close(
                     line.0,
-                    top + row as f32 * LINE_HEIGHT + ((ascent * 0.5) + padding_top + ascent) * 0.5,
+                    top + row as f32 * LINE_HEIGHT + padding_top + ascent * 2. / 3. - 0.5,
                     "strikethrough",
                 );
             }

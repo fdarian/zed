@@ -4643,6 +4643,7 @@ mod tests {
                 placement: RunPlacement::Baseline,
                 above: px(0.),
                 below: px(0.),
+                ascent: px(0.),
             })
             .collect();
         let options = TextLayoutOptions {

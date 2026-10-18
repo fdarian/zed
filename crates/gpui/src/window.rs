@@ -6494,9 +6494,15 @@ impl Window {
         if thickness.0 == 0. {
             return;
         }
-        let geometry = decoration_geometry(kind, style, thickness.0);
-        let origin = origin.map(|c| ScaledPixels(round_to_device_pixel_down(c.0, scale_factor)));
         let width = self.snap_stroke(width);
+        let geometry = decoration_geometry(kind, style, thickness.0).fitted(thickness.0, width.0);
+        let mut origin =
+            origin.map(|c| ScaledPixels(round_to_device_pixel_down(c.0, scale_factor)));
+        if kind == DecorationKind::Overline {
+            // Chrome puts the bottom edge of an overline on the top of the text, so the line
+            // grows upwards from it.
+            origin.y -= thickness;
+        }
         let color = color.unwrap_or_default().opacity(self.element_opacity());
         let content_mask = self.snapped_content_mask();
 
@@ -11369,7 +11375,8 @@ mod tests {
         cx: &mut crate::VisualTestContext,
         decorate: impl FnOnce(crate::Div) -> crate::Div,
     ) -> Vec<crate::Underline> {
-        cx.draw(point(px(0.), px(0.)), size(px(200.), px(40.)), |_, _| {
+        // Below the top of the window: an overline is drawn above the top of its text.
+        cx.draw(point(px(0.), px(10.)), size(px(200.), px(40.)), |_, _| {
             decorate(div().text_size(px(16.))).child("decorated")
         });
         cx.update(|window, _| window.painted_underlines())
@@ -11377,7 +11384,7 @@ mod tests {
 
     #[gpui::test]
     fn text_decoration_styles_reach_the_scene(cx: &mut TestAppContext) {
-        use crate::text_decoration::{SHAPE_DASHED, SHAPE_DOTTED, SHAPE_SOLID, SHAPE_WAVY};
+        use crate::text_decoration::{SHAPE_DASHED, SHAPE_SOLID, SHAPE_WAVY};
         let cx = cx.add_empty_window();
 
         let solid = painted_decorations(cx, |el| el.underline());
@@ -11387,7 +11394,8 @@ mod tests {
 
         let dotted = painted_decorations(cx, |el| el.underline().text_decoration_dotted());
         assert_eq!(dotted.len(), 1);
-        assert_eq!(dotted[0].style, SHAPE_DOTTED);
+        assert!(dotted[0].thickness.0 < 4., "a thin dotted line is square marks");
+        assert_eq!(dotted[0].style, SHAPE_DASHED);
         assert_eq!(dotted[0].mark_length, dotted[0].thickness);
         assert_eq!(dotted[0].mark_period.0, dotted[0].thickness.0 * 2.);
 
@@ -11599,7 +11607,7 @@ mod tests {
         style: crate::TextDecorationStyle,
     ) -> Vec<crate::Underline> {
         use crate::{OverlineStyle, StrikethroughStyle, UnderlineStyle};
-        cx.draw(point(px(0.), px(0.)), size(px(1000.), px(200.)), |_, _| {
+        cx.draw(point(px(0.), px(50.)), size(px(1000.), px(200.)), |_, _| {
             let mut el = div().text_size(px(font_size));
             el.text_style().underline = Some(UnderlineStyle {
                 thickness,
