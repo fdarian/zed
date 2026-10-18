@@ -966,6 +966,16 @@ impl Window {
         self.layout_engine().unstable_requests()
     }
 
+    /// See [`TaffyLayoutEngine::escapable_requests`].
+    pub(crate) fn escapable_layout_requests(&self) -> usize {
+        self.layout_engine().escapable_requests()
+    }
+
+    /// See [`TaffyLayoutEngine::escapes_subtree`].
+    pub(crate) fn layout_requests_escape(&self, root: LayoutId, since: usize) -> bool {
+        self.layout_engine().escapes_subtree(root, since)
+    }
+
     fn effects(&self) -> Effects {
         let engine = self.layout_engine();
         Effects {
@@ -1768,7 +1778,7 @@ impl PaintRecord {
         let frame = &window.next_frame;
         let mut out = frame
             .scene
-            .describe_operations(self.range.start.scene_index..self.range.end.scene_index);
+            .describe_operations(self.range.start.scene_index..self.range.end.scene_index, loose);
         let reachable = |id: Option<HitboxId>| {
             id.and_then(|id| frame.hitboxes.iter().find(|hitbox| hitbox.id == id))
                 .is_none_or(Hitbox::is_reachable)

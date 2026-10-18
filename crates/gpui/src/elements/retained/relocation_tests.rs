@@ -300,8 +300,12 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> 
             );
         }
         Kind::Positioned | Kind::Escaping | Kind::Fixed => {
-            if spec.kind == Kind::Positioned {
-                row = row.relative();
+            // A div lays out as a containing block unless it says it is static: only a static
+            // row leaves the box to an ancestor.
+            match spec.kind {
+                Kind::Positioned => row = row.relative(),
+                Kind::Escaping => row.style().position = Some(Position::Static),
+                _ => {}
             }
             let mut placed = div()
                 .id(("placed", index))
@@ -1001,15 +1005,19 @@ fn rows_past_the_overscan_are_culled_and_prepainted_again_when_they_come_near() 
 #[test]
 fn absolute_boxes_move_with_their_row_and_boxes_placed_elsewhere_keep_the_row_where_it_is() {
     let cx = &mut app();
-    let pair = Pair::new(cx, rows(24, 40., Kind::Absolute), 1., false);
-    pair.draw(cx);
-    let before = pair.counters(cx);
-    scroll_through(&pair, cx, &[3., 12., 40., 41.5]);
-    let after = pair.counters(cx);
-    assert!(after.relocations > before.relocations, "{after:?}");
+    // A box that the row itself places moves with it, also one that is placed in the window
+    // when no ancestor in the row is positioned.
+    for kind in [Kind::Absolute, Kind::Positioned] {
+        let pair = Pair::new(cx, rows(24, 40., kind), 1., false);
+        pair.draw(cx);
+        let before = pair.counters(cx);
+        scroll_through(&pair, cx, &[3., 12., 40., 41.5]);
+        let after = pair.counters(cx);
+        assert!(after.relocations > before.relocations, "{kind:?}: {after:?}");
+    }
 
     // A box that is placed by an ancestor, or by the window, is not placed by the row at all.
-    for kind in [Kind::Positioned, Kind::Escaping, Kind::Fixed] {
+    for kind in [Kind::Escaping, Kind::Fixed] {
         let pair = Pair::new(cx, rows(24, 40., kind), 1., false);
         pair.draw(cx);
         let before = pair.counters(cx);

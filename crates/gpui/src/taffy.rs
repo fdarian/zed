@@ -449,6 +449,40 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// How many escapable nodes the pass has requested so far. Pair with
+    /// [`Self::escapes_subtree`].
+    pub(crate) fn escapable_requests(&self) -> usize {
+        self.escapable_nodes.len()
+    }
+
+    /// Whether an escapable node requested since `since` (an [`Self::escapable_requests`]) has a
+    /// containing block outside the subtree of `root`: it is `root` itself, it is fixed, or no
+    /// ancestor of it up to `root` is positioned. Such a node is rewritten after layout against a
+    /// box that the subtree does not hold, so a frame cannot keep the subtree's nodes. One
+    /// whose containing block is inside is rewritten against boxes that the subtree lays out
+    /// alone, and keeps what it was rewritten to for as long as the nodes do.
+    pub(crate) fn escapes_subtree(&self, root: LayoutId, since: usize) -> bool {
+        self.escapable_nodes[since..].iter().any(|&id| {
+            if id == root || self.meta(id).escapable().kind == containing_block::EscapableKind::Fixed {
+                return true;
+            }
+            let Some(parent) = self.taffy.parent(id.0) else { return true };
+            let mut current = LayoutId(parent);
+            loop {
+                if !self.meta(current).is_static {
+                    return false;
+                }
+                if current == root {
+                    return true;
+                }
+                match self.taffy.parent(current.0) {
+                    Some(parent) => current = LayoutId(parent),
+                    None => return true,
+                }
+            }
+        })
+    }
+
     /// Frees every node that is not in the tree of a root that the pass laid out. Nodes that were
     /// requested and then left out of every tree are garbage, so are the ones of an abandoned
     /// pass that the last pass did not ask for again.
@@ -867,7 +901,6 @@ impl TaffyLayoutEngine {
     fn register(&mut self, id: LayoutId, meta: &NodeMeta) {
         if meta.escapable.is_some() {
             self.escapable_nodes.push(id);
-            self.unstable_requests += 1;
         }
         if meta.intrinsic.is_some() {
             self.intrinsic_pending.push(id);

@@ -642,14 +642,16 @@ impl Retained {
             window.retained.counters.builds += 1;
             let accessed_states_start = window.accessed_states_len();
             let unstable_before = window.unstable_layout_requests();
+            let escapable_before = window.escapable_layout_requests();
             let build = self.build();
             let ((element, root), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
                 let mut element = build(window, cx);
                 let root = request_subtree_layout(&mut element, lift_z, window, cx);
                 (element, root)
             });
-            let unreusable = (window.unstable_layout_requests() != unstable_before)
-                .then_some(NonReusable::UnstableLayout);
+            let unreusable = (window.unstable_layout_requests() != unstable_before
+                || window.layout_requests_escape(root, escapable_before))
+            .then_some(NonReusable::UnstableLayout);
             let state = RetainedState {
                 key,
                 engine: window.layout_engine_id(),
@@ -944,6 +946,7 @@ impl Retained {
         let generation_before = window.layout_dirty_generation(root);
         let counters_before = window.engine_counters();
         let unstable_before = window.unstable_layout_requests();
+        let escapable_before = window.escapable_layout_requests();
         let accessed_states_start = window.accessed_states_len();
         let build = self.build();
         let ((mut element, built_root), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
@@ -952,7 +955,8 @@ impl Retained {
             (element, root)
         });
         let layout_states = window.accessed_states_since(accessed_states_start);
-        let unstable = window.unstable_layout_requests() != unstable_before;
+        let unstable = window.unstable_layout_requests() != unstable_before
+            || window.layout_requests_escape(built_root, escapable_before);
         let counters_after = window.engine_counters();
         let mismatch = built_root != root
             || counters_after.nodes_created != counters_before.nodes_created
@@ -2685,6 +2689,97 @@ mod tests {
                 assert!(renders.get() < 8, "the view is drawn from its cache: {}", renders.get());
             }
         }
+    }
+
+    fn absolute_child() -> crate::Stateful<crate::Div> {
+        let mut absolute = div()
+            .id("absolute")
+            .absolute()
+            .top(px(5.))
+            .left(px(5.))
+            .w(px(20.))
+            .h(px(20.))
+            .bg(crate::red());
+        absolute.style().position = Some(Position::AbsoluteInAncestor);
+        absolute
+    }
+
+    /// A retained root `root` makes that says it is lifted, drawn for a few frames, with the counters before and after the last three.
+    fn lifted_root(cx: &mut TestAppContext, root: fn() -> AnyElement) -> (RetainedCounters, RetainedCounters) {
+        let window = open(cx, {
+            Rc::new(move |_, _| {
+                div()
+                    .id("page")
+                    .size_full()
+                    .child(retained("lifted", 1, move |_, _| root()).lift_z(0))
+                    .into_any_element()
+            })
+        });
+        for _ in 0..2 {
+            draw(window, cx);
+        }
+        let before = counters(window, cx);
+        for _ in 0..3 {
+            draw(window, cx);
+        }
+        (before, counters(window, cx))
+    }
+
+    #[gpui::test]
+    fn an_absolute_box_in_a_positioned_root_is_replayed_with_it(cx: &mut TestAppContext) {
+        let (before, after) = lifted_root(cx, || {
+            let mut holder = div().id("holder").w(px(60.)).h(px(60.)).child(absolute_child());
+            holder.style().position = Some(Position::Relative);
+            holder.into_any_element()
+        });
+        assert_eq!(after.replays, before.replays + 3);
+        assert_eq!(after.total_non_reusable(), before.total_non_reusable(), "{after:?}");
+    }
+
+    #[gpui::test]
+    fn an_absolute_box_with_its_containing_block_below_the_root_of_the_subtree_is_replayed(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, builds, _) = single(cx, false, |_, _| {
+            let mut holder = div().id("holder").w(px(60.)).h(px(60.));
+            holder.style().position = Some(Position::Static);
+            let mut block = div().id("block").w(px(50.)).h(px(50.)).child(absolute_child());
+            block.style().position = Some(Position::Relative);
+            holder.child(block).into_any_element()
+        });
+        let built = builds.get();
+        let before = counters(window, cx);
+        for _ in 0..3 {
+            draw(window, cx);
+        }
+        let after = counters(window, cx);
+        assert_eq!(builds.get(), built);
+        assert_eq!(after.replays, before.replays + 3);
+        assert_eq!(after.total_non_reusable(), 0, "{after:?}");
+    }
+
+    #[gpui::test]
+    fn an_absolute_box_with_its_containing_block_above_the_subtree_is_never_replayed(
+        cx: &mut TestAppContext,
+    ) {
+        never_replayed(cx, NonReusable::UnstableLayout, |_, _| {
+            let mut holder = div().id("holder").w(px(60.)).h(px(60.)).child(absolute_child());
+            holder.style().position = Some(Position::Static);
+            holder.into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn a_fixed_box_in_a_positioned_block_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed(cx, NonReusable::UnstableLayout, |_, _| {
+            let mut fixed = div().id("fixed").w(px(20.)).h(px(20.)).bg(crate::red());
+            fixed.style().position = Some(Position::Fixed);
+            let mut block = div().id("block").w(px(50.)).h(px(50.)).child(fixed);
+            block.style().position = Some(Position::Relative);
+            let mut holder = div().id("holder").w(px(60.)).h(px(60.)).child(block);
+            holder.style().position = Some(Position::Static);
+            holder.into_any_element()
+        });
     }
 
     #[gpui::test]

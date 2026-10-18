@@ -719,18 +719,20 @@ impl Scene {
     }
 
     /// The operations in `range`, as text without their draw order, for the comparison of two
-    /// frames that painted them at different places in the order.
-    pub(crate) fn describe_operations(&self, range: Range<usize>) -> String {
-        self.describe_operations_with(range, true)
+    /// frames that painted them at different places in the order. `loose` leaves out whether a
+    /// replaced content mask was cut from the masks inside the recording, which a recording
+    /// put in a region of its own has and a build of the same subtree does not.
+    pub(crate) fn describe_operations(&self, range: Range<usize>, loose: bool) -> String {
+        self.describe_operations_with(range, true, loose)
     }
 
     /// The operations of the whole scene that are drawn: all but the marks that only say how a
     /// recording of them is put under another content mask.
     pub(crate) fn describe_drawn(&self) -> String {
-        self.describe_operations_with(0..self.paint_operations.len(), false)
+        self.describe_operations_with(0..self.paint_operations.len(), false, false)
     }
 
-    fn describe_operations_with(&self, range: Range<usize>, marks: bool) -> String {
+    fn describe_operations_with(&self, range: Range<usize>, marks: bool, loose: bool) -> String {
         use std::fmt::Write as _;
 
         let mut out = String::new();
@@ -760,6 +762,7 @@ impl Scene {
                 PaintOperation::WidenGroups(mask) => write!(out, "widen {mask:?}"),
                 PaintOperation::StartTextClip => write!(out, "text clip"),
                 PaintOperation::EndTextClip => write!(out, "end text clip"),
+                PaintOperation::Replaced { .. } if loose => write!(out, "replaced"),
                 PaintOperation::Replaced { derived } => write!(out, "replaced {derived}"),
                 PaintOperation::EndReplaced => write!(out, "end replaced"),
             }
@@ -2622,7 +2625,7 @@ mod tests {
     }
 
     fn describe(scene: &Scene) -> String {
-        scene.describe_operations(0..scene.len())
+        scene.describe_operations(0..scene.len(), false)
     }
 
     #[test]
