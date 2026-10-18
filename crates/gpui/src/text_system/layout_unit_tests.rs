@@ -1,4 +1,4 @@
-//! REVIEW: probes of how text is laid out in 1/64 of a pixel.
+//! How text is laid out in 1/64 of a pixel: wrapping, truncation, text-box-trim and atomic inlines.
 use crate::{
     AnyElement, App, Bounds, Context, FixedMetricsTextSystem, InteractiveElement as _, IntoElement,
     LayoutId, NoopTextSystem, ParentElement as _, Pixels, PlatformTextSystem, Render, StyledText,
@@ -72,7 +72,7 @@ const TEXTS: [&str; 11] = [
 
 /// A text in a flex item is laid out at its own measured width. It must not wrap.
 #[test]
-fn review_own_width_never_wraps_sweep() {
+fn own_width_never_wraps_sweep() {
     let mut failures = Vec::new();
     for (name, system) in systems() {
         for text in TEXTS {
@@ -148,24 +148,22 @@ fn cut_by_own_width(ellipsis: &'static str) -> Vec<String> {
     failures
 }
 
-// REVIEW: a text in a box as wide as the text must not be cut.
+/// A text in a box as wide as the text is not cut.
 #[test]
-fn review_ellipsis_end_own_width_is_not_cut() {
+fn ellipsis_end_own_width_is_not_cut() {
     let failures = cut_by_own_width("end");
     assert!(failures.is_empty(), "{} cut, first {:?}", failures.len(), &failures[..failures.len().min(3)]);
 }
 
 #[test]
-fn review_ellipsis_start_own_width_is_not_cut() {
+fn ellipsis_start_own_width_is_not_cut() {
     let failures = cut_by_own_width("start");
     assert!(failures.is_empty(), "{} cut, first {:?}", failures.len(), &failures[..failures.len().min(3)]);
 }
 
-// REVIEW: line_wrapper.rs middle_split compares `total_width <= truncate_width` with no slack, and
-// elements/text.rs compares the shaped width with `<= flat_width`, so a middle-ellipsis text
-// laid out in the width it measured (ceil to 1/64 less the slack) is cut although it fits.
+/// The same for the middle ellipsis, whose comparison tolerates the float that a measured width comes back as.
 #[test]
-fn review_ellipsis_middle_own_width_is_not_cut() {
+fn ellipsis_middle_own_width_is_not_cut() {
     let failures = cut_by_own_width("middle");
     assert!(failures.is_empty(), "{} cut, first {:?}", failures.len(), &failures[..failures.len().min(3)]);
 }
@@ -198,7 +196,7 @@ mod gpui_div {
 
 /// Zero, tiny, huge and odd widths and empty or odd text lay out without panicking.
 #[test]
-fn review_odd_widths_do_not_panic() {
+fn odd_widths_do_not_panic() {
     let styles: [fn(gpui_div::Div) -> gpui_div::Div; 8] = [
         |d| d,
         |d| d.whitespace_nowrap().text_ellipsis(),
@@ -224,7 +222,7 @@ fn review_odd_widths_do_not_panic() {
 
 /// A clamped text shows an ellipsis exactly when the unclamped text needs more lines.
 #[test]
-fn review_line_clamp_boundary() {
+fn line_clamp_boundary() {
     let text = "aaaa bbbb cccc dddd eeee ffff gggg hhhh";
     let mut failures = Vec::new();
     for (name, system) in systems() {
@@ -258,7 +256,7 @@ fn review_line_clamp_boundary() {
 /// A box (its width is a device pixel, 1/2 here) holds the text on a line iff the width the text
 /// measured at is not over the box.
 #[test]
-fn review_wrap_follows_measured_width() {
+fn wrap_follows_measured_width() {
     let text = "alpha beta gamma";
     let mut failures = Vec::new();
     for (name, system) in systems() {
@@ -291,11 +289,9 @@ fn review_wrap_follows_measured_width() {
     assert!(failures.is_empty(), "{} wrong, first {:?}", failures.len(), &failures[..failures.len().min(4)]);
 }
 
-// REVIEW: elements/text.rs baseline_for_index and atomic_origins start at `bounds.origin`, where
-// every other query starts at `line_origin(bounds)`, which is `trim_top` above it. For a text
-// with text-box-trim they put the baseline of a run, and the boxes in the text, `trim_top` too low.
+/// The baseline of a run is where its row says, also for a text with `text-box-trim`, whose lines start above its bounds.
 #[test]
-fn review_baseline_for_index_agrees_with_row_for_index_under_text_box_trim() {
+fn baseline_for_index_agrees_with_row_for_index_under_text_box_trim() {
     use crate::{TextBoxEdge, TextBoxOver, TextBoxTrim, TextBoxUnder};
     let found = laid_out(Arc::new(FixedMetricsTextSystem::menlo()), |out| {
         let styled = StyledText::new("Hello").with_text_box_trim(TextBoxTrim {
@@ -326,10 +322,9 @@ fn review_baseline_for_index_agrees_with_row_for_index_under_text_box_trim() {
     assert_eq!(baseline, row, "trim_top is {top:?}");
 }
 
-// REVIEW: the same offset moves atomic inlines of a trimmed text: their baseline-aligned bottom
-// edge should be on the baseline of the row they are in.
+/// The bottom edge of an atomic inline in a trimmed text is on the baseline of its row.
 #[test]
-fn review_atomic_inline_sits_on_the_baseline_under_text_box_trim() {
+fn atomic_inline_sits_on_the_baseline_under_text_box_trim() {
     use crate::{AtomicInline, TextBoxEdge, TextBoxOver, TextBoxTrim, TextBoxUnder};
     let found = laid_out(Arc::new(FixedMetricsTextSystem::menlo()), |out| {
         let object = crate::OBJECT_REPLACEMENT_CHARACTER;
@@ -590,7 +585,7 @@ mod stale {
 
 /// Whatever frame came before, a frame lays out as it does in a window that had no frame before.
 #[test]
-fn review_no_stale_measure_between_frames() {
+fn no_stale_measure_between_frames() {
     use stale::*;
     let system: Arc<dyn PlatformTextSystem> = Arc::new(NoopTextSystem::new());
     let variants = perturbations();
@@ -717,7 +712,7 @@ mod stale_atomic {
     }
 
     #[test]
-    fn review_no_stale_measure_with_atomics() {
+    fn no_stale_measure_with_atomics() {
         let b = base();
         let mut variants = Vec::new();
         let mut push = |name: &'static str, a: A| variants.push((name, a));
@@ -751,7 +746,7 @@ mod stale_atomic {
 }
 
 #[test]
-fn review_trim_of_empty_text_does_not_panic() {
+fn trim_of_empty_text_does_not_panic() {
     use stale::*;
     for text in ["", " ", "\n", "\n\n", "a\n"] {
         for over in 0..3 {
@@ -770,9 +765,7 @@ fn review_trim_of_empty_text_does_not_panic() {
     }
 }
 
-// REVIEW: line_wrapper.rs should_truncate_line cuts only when `width.floor() > truncate_width`,
-// a leftover of whole-pixel measures: a start-ellipsis text up to a pixel wider than its box is not
-// cut and overflows, where an end-ellipsis one is (`overflows` with 1/1024).
+/// A text half a pixel wider than its box is cut by every ellipsis.
 fn cut_when_over(kind: &'static str) -> String {
     let text = "abcdefghij abcdefghi"; // 20 characters, 12 * size wide
     let size = 100.5 / 12.;
@@ -796,17 +789,17 @@ fn cut_when_over(kind: &'static str) -> String {
 }
 
 #[test]
-fn review_ellipsis_end_cuts_text_half_a_pixel_over() {
+fn ellipsis_end_cuts_text_half_a_pixel_over() {
     assert_ne!(cut_when_over("end"), "abcdefghij abcdefghi");
 }
 
 #[test]
-fn review_ellipsis_start_cuts_text_half_a_pixel_over() {
+fn ellipsis_start_cuts_text_half_a_pixel_over() {
     assert_ne!(cut_when_over("start"), "abcdefghij abcdefghi");
 }
 
 #[test]
-fn review_ellipsis_middle_cuts_text_half_a_pixel_over() {
+fn ellipsis_middle_cuts_text_half_a_pixel_over() {
     assert_ne!(cut_when_over("middle"), "abcdefghij abcdefghi");
 }
 
@@ -831,18 +824,18 @@ fn item_width_with_atomic(nowrap: bool) -> f32 {
     found[0].0.size.width.0
 }
 
-// REVIEW: elements/text.rs measure closure: for `white-space: nowrap` the wrap width is `None` for a
-// min-content and a max-content probe alike, so the cached-layout check (wrap_width, inset width,
-// options) answers the min-content probe of a text with atomic inlines with the size of its
-// max-content probe (or the other way round), though the boxes were measured for the other.
-// A flex item of such a text then cannot shrink to the min-content of its boxes.
+/// A flex item with a `nowrap` text that has an atomic inline shrinks to the min-content of its
+/// boxes. The text has no break, so its min-content is its whole line with each box at its own
+/// min-content, which the max-content probe, asked for the same (no) width, must not answer.
 #[test]
-fn review_nowrap_text_with_atomic_has_min_content_of_its_boxes() {
+fn nowrap_text_with_atomic_has_min_content_of_its_boxes() {
     let wrapping = item_width_with_atomic(false);
     let nowrap = item_width_with_atomic(true);
-    // "ab " is 3 characters; the box is "xxxx" wide at its narrowest, 9 characters at its widest.
     let char_width = 14. * 0.6;
-    eprintln!("wrapping {wrapping}, nowrap {nowrap}, min {}, max {}", 7. * char_width, 12. * char_width);
-    // With the cached layout bypassed the item is 67.2 wide (a box measured for the min-content probe).
-    assert!(nowrap < 80., "nowrap item is {nowrap} wide: the max-content size, 100.8");
+    let max_content = 12. * char_width;
+    // The wrapping item is as wide as the widest of "ab" and the box at its min-content; the
+    // nowrap one has "ab " and that box on one line.
+    let expected = 3. * char_width + wrapping;
+    assert!(nowrap < max_content, "nowrap item is {nowrap} wide, the max-content size {max_content}");
+    assert!((nowrap - expected).abs() < 0.02, "nowrap item is {nowrap} wide, not {expected}");
 }

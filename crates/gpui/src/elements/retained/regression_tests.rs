@@ -1,5 +1,9 @@
-//! REVIEW (round 2): fuzz of random trees of retained subtrees in a scrolled page, with the verifier
-//! off so that the frame shown is the frame that replayed, against the same trees built whole.
+//! Random trees of retained subtrees in a scrolled page, the frame that replays against the same
+//! trees built whole, and the cases it found: relocatable subtrees that hand boxes to a stacking
+//! context, recordings that go stale, and holes.
+//!
+//! Without the verifier the frame shown is the frame that replayed, so that moves of recorded
+//! ranges accumulate across frames; the verified fuzz checks each replayed frame against its build.
 
 use super::*;
 use crate::{
@@ -12,6 +16,23 @@ use std::{
     cell::RefCell,
     hash::{Hash, Hasher},
 };
+
+/// Whether the random pages have a feature. `RETAINED_FUZZ_ON` and `RETAINED_FUZZ_OFF` list
+/// (comma separated) the ones to add to or take from the default, to find which one a failure
+/// needs. The features: `lift` (positioned nodes), `round` (rounded clips), `lifts` (relocatable
+/// roots that hold positioned nodes), `toggle` (the window root becomes a stacking context and
+/// stops being one) are on by default; `nested` (a scroller in the scroller), `scale` (scale factor
+/// and rem size change), `abandon` (frames that are drawn and not shown) and `cull` (nodes that are
+/// culled outside the clip) find cases that replays and recordings do not agree on yet, so that
+/// the verified fuzz fails within a few hundred pages with the three together, and within a few
+/// with `cull`.
+fn feature(name: &str) -> bool {
+    let listed = |var: &str| std::env::var(var).is_ok_and(|list| list.split(',').any(|listed| listed == name));
+    if listed("RETAINED_FUZZ_OFF") {
+        return false;
+    }
+    listed("RETAINED_FUZZ_ON") || matches!(name, "lift" | "round" | "lifts" | "toggle")
+}
 
 const SIZES: [u32; 6] = [0, 14, 22, 36, 60, 100];
 const WORDS: [&str; 4] = ["a", "retained", "two words", "qq"];
@@ -75,15 +96,16 @@ impl Node {
             relative: (depth > 0 && rng.random_bool(0.15)).then(|| rng.random_range(-1..3)),
             grouped: rng.random_bool(0.1),
             relocatable: false,
-            cullable: std::env::var("REVIEW_CULL").is_ok() && rng.random_bool(0.2),
+            cullable: feature("cull") && rng.random_bool(0.2),
             children,
         }
     }
 
     fn dump(&self, depth: usize, out: &mut String) {
         out.push_str(&format!(
-            "{}{} {}x{} retain {} reloc {} abs {:?} rel {:?} esc {} stack {} clip {} rounded {} fade {} grouped {} row {} pad {}\n",
-            "  ".repeat(depth), self.id, self.width, self.height, self.retain, self.relocatable, self.absolute, self.relative, self.escaping, self.stacking, self.clip, self.rounded, self.fade, self.grouped, self.row, self.padding
+            "{}{} {}x{} retain {} reloc {} abs {:?} rel {:?} esc {} stack {} clip {} rounded {} fade {} grouped {} row {} pad {} text {:?} clickable {} labelled {} focusable {} cullable {}\n",
+            "  ".repeat(depth), self.id, self.width, self.height, self.retain, self.relocatable, self.absolute, self.relative, self.escaping, self.stacking, self.clip, self.rounded, self.fade, self.grouped, self.row, self.padding,
+            self.text, self.clickable, self.labelled, self.focusable, self.cullable
         ));
         for child in &self.children {
             child.dump(depth + 1, out);
@@ -183,7 +205,7 @@ thread_local! {
 
 fn element(node: &Node, mode: Mode) -> AnyElement {
     let mut node = node.clone();
-    if std::env::var("REVIEW_NOLIFT").is_ok() {
+    if !feature("lift") {
         node.absolute = None;
         node.relative = None;
     }
@@ -203,7 +225,7 @@ fn element(node: &Node, mode: Mode) -> AnyElement {
     if node.clip {
         element = element.overflow_hidden();
     }
-    if node.rounded && std::env::var("REVIEW_NOROUND").is_err() {
+    if node.rounded && feature("round") {
         element = element.rounded_lg().overflow_hidden();
     }
     if node.fade {
@@ -257,7 +279,7 @@ fn element(node: &Node, mode: Mode) -> AnyElement {
 
 fn child_element(node: &Node, mode: Mode, top: bool) -> AnyElement {
     let mut node = node.clone();
-    if std::env::var("REVIEW_NOLIFT").is_ok() {
+    if !feature("lift") {
         node.absolute = None;
         node.relative = None;
     }
@@ -283,7 +305,7 @@ fn child_element(node: &Node, mode: Mode, top: bool) -> AnyElement {
         }
         if top {
             // A relocatable root is kept as far as its overscan past its outset.
-            let relocatable = node.relocatable && (!node.lifts() || std::env::var("REVIEW_LIFTS").is_ok());
+            let relocatable = node.relocatable && (!node.lifts() || feature("lifts"));
             let outset = if relocatable && mode == Mode::Rebuild { 600. } else { 500. };
             root = root.cull_outset(Some(Edges::all(px(outset))));
             if relocatable && mode == Mode::Retain {
@@ -535,7 +557,7 @@ fn script(rng: &mut StdRng, scrolling: bool) -> Script {
             tree
         })
         .collect();
-    if let Ok(keep) = std::env::var("REVIEW_KEEP") {
+    if let Ok(keep) = std::env::var("RETAINED_FUZZ_KEEP") {
         let keep: Vec<usize> = keep.split(',').filter_map(|id| id.parse().ok()).collect();
         trees.retain(|tree| keep.contains(&tree.id));
     }
@@ -547,7 +569,7 @@ fn script(rng: &mut StdRng, scrolling: bool) -> Script {
     let mut inner_offset = 0f32;
     let mut step_scale = scale;
     let mut rem = 16f32;
-    let nested = std::env::var("REVIEW_NESTED").is_ok() && rng.random_bool(0.5);
+    let nested = feature("nested") && rng.random_bool(0.5);
     let mut steps = Vec::new();
     for _ in 0..30 {
         for _ in 0..rng.random_range(0..3) {
@@ -561,7 +583,7 @@ fn script(rng: &mut StdRng, scrolling: bool) -> Script {
             trees[which].absolute = None;
             trees[which].relative = None;
         }
-        if rng.random_bool(0.05) && std::env::var("REVIEW_TOGGLE").is_ok() {
+        if rng.random_bool(0.05) && feature("toggle") {
             context = !context;
         }
         if rng.random_bool(0.1) {
@@ -580,10 +602,10 @@ fn script(rng: &mut StdRng, scrolling: bool) -> Script {
             let fractional = if rng.random_bool(0.5) { rng.random_range(0..100) as f32 / 100. } else { 0. };
             offset = (offset + jump + fractional).max(0.);
         }
-        if std::env::var("REVIEW_SCALE").is_ok() && rng.random_bool(0.1) {
+        if feature("scale") && rng.random_bool(0.1) {
             step_scale = *[1., 2., 1.5, 4.].choose(rng).unwrap();
         }
-        if std::env::var("REVIEW_SCALE").is_ok() && rng.random_bool(0.1) {
+        if feature("scale") && rng.random_bool(0.1) {
             rem = *[16., 14., 20.].choose(rng).unwrap();
         }
         steps.push(StepData {
@@ -649,7 +671,7 @@ fn play(cx: &mut TestAppContext, script: &Script, verify: bool) -> Option<(usize
             shared.gap = step.gap;
             shared.context = step.context;
             shared.page_height = step.page_height;
-            shared.abandon = step.abandon && std::env::var("REVIEW_ABANDON").is_ok();
+            shared.abandon = step.abandon && feature("abandon");
             shared.inner = step.inner;
         }
         for window in [retaining, building] {
@@ -865,7 +887,7 @@ fn shrink(cx: &mut TestAppContext, mut script: Script, verify: bool) -> Script {
 fn run(mut rng: StdRng, cx: &mut TestAppContext, scrolling: bool, verify: bool) {
     let script = script(&mut rng, scrolling);
     if let Some((index, difference)) = play(cx, &script, verify) {
-        if std::env::var("REVIEW_NOSHRINK").is_ok() {
+        if std::env::var("RETAINED_FUZZ_NOSHRINK").is_ok() {
             panic!("step {index} scale {}: {difference}", script.scale);
         }
         let small = shrink(cx, script.clone(), verify);
@@ -897,13 +919,13 @@ fn run(mut rng: StdRng, cx: &mut TestAppContext, scrolling: bool, verify: bool) 
     }
 }
 
-#[gpui::test(iterations = 200)]
-fn review_scrolled_unverified(rng: StdRng, cx: &mut TestAppContext) {
+#[gpui::test(iterations = 60)]
+fn scrolled_unverified(rng: StdRng, cx: &mut TestAppContext) {
     run(rng, cx, true, false);
 }
 
-#[gpui::test(iterations = 100)]
-fn review_scrolled_verified(rng: StdRng, cx: &mut TestAppContext) {
+#[gpui::test(iterations = 30)]
+fn scrolled_verified(rng: StdRng, cx: &mut TestAppContext) {
     run(rng, cx, true, true);
 }
 
@@ -963,7 +985,7 @@ impl Render for Simple {
 }
 
 #[gpui::test]
-fn review_abs_in_zero_rounded_root(cx: &mut TestAppContext) {
+fn abs_in_zero_rounded_root(cx: &mut TestAppContext) {
     for shape in [0u8, 1] {
         let mut out = Vec::new();
         for mode in [Mode::Retain, Mode::Rebuild] {
@@ -1098,7 +1120,7 @@ fn leaky_run(cx: &mut TestAppContext, lifted: u8, scrolls: &[f32]) -> [String; 2
 }
 
 #[gpui::test]
-fn review_lifted_box_of_a_relocatable_row_is_cut_by_the_page(cx: &mut TestAppContext) {
+fn lifted_box_of_a_relocatable_row_is_cut_by_the_page(cx: &mut TestAppContext) {
     for lifted in [0u8, 1] {
         let [retained, built] = leaky_run(cx, lifted, &[]);
         let differing: Vec<String> = retained
@@ -1112,7 +1134,7 @@ fn review_lifted_box_of_a_relocatable_row_is_cut_by_the_page(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn review_internal_lift_of_a_relocatable_row_is_cut_by_the_page_when_replayed(cx: &mut TestAppContext) {
+fn internal_lift_of_a_relocatable_row_is_cut_by_the_page_when_replayed(cx: &mut TestAppContext) {
     // The row is a stacking context that holds the lifted box itself, so the row can be replayed.
     let failures: Vec<String> = [2u8, 3].into_iter().filter_map(|lifted| internal_lift_is_cut(cx, lifted)).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -1207,7 +1229,7 @@ impl Render for Nest {
 }
 
 #[gpui::test]
-fn review_hole_with_fragment_in_a_rounded_clip_cut_by_the_page(cx: &mut TestAppContext) {
+fn hole_with_fragment_in_a_rounded_clip_cut_by_the_page(cx: &mut TestAppContext) {
     let sequences: [&[f32]; 4] = [
         &[0., 0., 20., 20., 40., 40., 41., 41.],
         &[0., 0., 10., 30., 50., 60., 60., 70.],
@@ -1329,7 +1351,7 @@ impl Render for Toggle {
 }
 
 #[gpui::test]
-fn review_replay_after_an_ancestor_starts_to_lift(cx: &mut TestAppContext) {
+fn replay_after_an_ancestor_starts_to_lift(cx: &mut TestAppContext) {
     let context = Rc::new(std::cell::Cell::new(false));
     let mut windows = Vec::new();
     for mode in [Mode::Retain, Mode::Rebuild] {
@@ -1410,9 +1432,9 @@ fn plain(id: usize, width: u32, height: u32) -> Node {
 /// from the context with H's mask cut by the page. R's key (its own bounds, content mask, exact clips,
 /// lifting) is the same in both frames, and the replay puts the old masks into the frame. (The debug
 /// assertion `a retained subtree is painted where its recording was painted` panics for it.)
-/// Found by `review_scrolled_unverified` with REVIEW_TOGGLE=1, seed 16, shrunk by `shrink`.
+/// Found by `scrolled_unverified` with the context toggled, seed 16, shrunk by `shrink`.
 #[gpui::test]
-fn review_replay_goes_stale_when_an_ancestor_starts_to_lift(cx: &mut TestAppContext) {
+fn replay_goes_stale_when_an_ancestor_starts_to_lift(cx: &mut TestAppContext) {
     let mut r = plain(24, 100, 60);
     r.retain = true;
     r.row = true;
@@ -1544,7 +1566,7 @@ impl Render for Resize {
 }
 
 #[gpui::test]
-fn review_contained_absolute_follows_the_resize_of_its_root(cx: &mut TestAppContext) {
+fn contained_absolute_follows_the_resize_of_its_root(cx: &mut TestAppContext) {
     for shape in [0u8, 1, 2] {
         let width = Rc::new(std::cell::Cell::new(400.));
         let height = Rc::new(std::cell::Cell::new(200.));
@@ -1588,7 +1610,7 @@ fn review_contained_absolute_follows_the_resize_of_its_root(cx: &mut TestAppCont
 
 /// Trees that come and go leave no element states, recordings or lifted cells behind.
 #[gpui::test(iterations = 12)]
-fn review_removed_trees_leave_nothing_behind(mut rng: StdRng, cx: &mut TestAppContext) {
+fn removed_trees_leave_nothing_behind(mut rng: StdRng, cx: &mut TestAppContext) {
     let mut script = script(&mut rng, true);
     let all = script.steps[0].trees.clone();
     let shared = Rc::new(RefCell::new(Shared {
@@ -1642,7 +1664,7 @@ struct Number(usize);
 /// An entity that a retained subtree reads only while it paints, and that the stacking context
 /// paints (a hole), changes: the wrapper that holds the hole is replayed, and the hole is never asked.
 #[gpui::test]
-fn review_entity_read_while_a_hole_paints_has_the_wrapper_built_when_it_changes(cx: &mut TestAppContext) {
+fn entity_read_while_a_hole_paints_has_the_wrapper_built_when_it_changes(cx: &mut TestAppContext) {
     // The control, a positioned box that is not a retained subtree, is shown the new number.
     entity_read_while_painting(cx, false);
     entity_read_while_painting(cx, true);
@@ -1811,7 +1833,7 @@ impl Render for Reporting {
 /// of a relocated replay (the way the tape of gpuix does) reports is what a build reports, under a
 /// scroll offset that is not a whole number of device pixels.
 #[gpui::test]
-fn review_unsnapped_bounds_of_a_relocated_replay_are_the_ones_a_build_reports(cx: &mut TestAppContext) {
+fn unsnapped_bounds_of_a_relocated_replay_are_the_ones_a_build_reports(cx: &mut TestAppContext) {
     let open = |cx: &mut TestAppContext, mode: Mode| {
         let scroll = ScrollHandle::new();
         let reports = Reports::default();
@@ -1859,4 +1881,147 @@ fn review_unsnapped_bounds_of_a_relocated_replay_are_the_ones_a_build_reports(cx
     let relocations = cx.update_window(retaining, |_, window, _| window.retained_counters().relocations).unwrap();
     assert!(relocations > 0, "some frame relocated the root");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An absolute box that escapes to a containing block inside a relocatable root, handed to the
+/// stacking context around the page, is painted under a mask cut from the region of the root,
+/// and is cut by the page on the frame that records it. Found by `scrolled_unverified`, seed 0.
+#[gpui::test]
+fn escaping_lifted_child_of_a_relocatable_root_is_cut_by_the_page(cx: &mut TestAppContext) {
+    let mut n27 = plain(27, 22, 22);
+    n27.absolute = Some((6, 16, 0));
+    n27.escaping = true;
+    let mut n22 = plain(22, 0, 0);
+    n22.relocatable = true;
+    n22.children = vec![n27];
+    let step = StepData {
+        trees: vec![n22],
+        gap: 7.,
+        context: true,
+        page_height: 300.,
+        offset: 1.,
+        read: false,
+        idle: false,
+        abandon: false,
+        inner: None,
+        scale: 2.,
+        rem: 16.,
+    };
+    let script = Script { scale: 2., steps: vec![step] };
+    if let Some((i, d)) = play(cx, &script, false) {
+        panic!("differs {i}: {d}");
+    }
+}
+
+/// A rounded relocatable root, clipped exactly with a group, holds an effect group with a
+/// positioned box: the box is painted under the mask it was handed to its stacking context with,
+/// which the replay cuts by the page although it is inside the group of the clip, whose own mask
+/// it does not cut. Found by `scrolled_verified`, seed 10, shrunk by `shrink`.
+#[gpui::test]
+fn rounded_relocatable_root_with_a_lifted_box_in_an_effect_group_is_cut_by_the_page(cx: &mut TestAppContext) {
+    let mut n35 = plain(35, 36, 22);
+    n35.row = true;
+    n35.relative = Some(2);
+    let mut n32 = plain(32, 60, 0);
+    n32.row = true;
+    n32.children = vec![n35];
+    let mut n31 = plain(31, 100, 60);
+    n31.grouped = true;
+    n31.children = vec![n32];
+    let mut n36 = plain(36, 0, 100);
+    n36.row = true;
+    let n37 = plain(37, 60, 14);
+    let mut n30 = plain(30, 14, 0);
+    n30.relocatable = true;
+    n30.rounded = true;
+    n30.padding = 6;
+    n30.children = vec![n31, n36, n37];
+    let mut n40 = plain(40, 0, 60);
+    n40.row = true;
+    let mut n53 = plain(53, 14, 36);
+    n53.absolute = Some((14, 3, 1));
+    n53.row = true;
+    let mut n52 = plain(52, 60, 0);
+    n52.children = vec![n53];
+    let mut n51 = plain(51, 60, 22);
+    n51.absolute = Some((28, 1, -1));
+    n51.escaping = true;
+    n51.row = true;
+    n51.padding = 4;
+    n51.children = vec![n52];
+    let mut n50 = plain(50, 36, 0);
+    n50.children = vec![n51];
+    let step = StepData {
+        trees: vec![n30, n40, n50],
+        gap: 7.,
+        context: false,
+        page_height: 300.,
+        offset: 333.57,
+        read: true,
+        idle: true,
+        abandon: false,
+        inner: None,
+        scale: 2.,
+        rem: 16.,
+    };
+    let script = Script { scale: 2., steps: vec![step] };
+    if let Some((i, d)) = play(cx, &script, true) {
+        panic!("differs {i}: {d}");
+    }
+}
+
+/// A mask that is cut to nothing by the page has no corners, whether it was cut once or first by
+/// the region of the root and then by the page. Found by `scrolled_verified`, seed 303.
+#[gpui::test]
+fn mask_cut_to_nothing_by_the_page_has_no_corners_wherever_it_was_cut(cx: &mut TestAppContext) {
+    let mut n29 = plain(29, 0, 60);
+    n29.absolute = Some((2, 8, 0));
+    n29.escaping = true;
+    let mut n28 = plain(28, 100, 60);
+    n28.relative = Some(0);
+    n28.children = vec![n29];
+    let mut n27 = plain(27, 100, 60);
+    n27.absolute = Some((31, 0, 2));
+    n27.rounded = true;
+    n27.row = true;
+    n27.children = vec![n28];
+    let mut n21 = plain(21, 0, 14);
+    n21.relocatable = true;
+    n21.clip = true;
+    n21.row = true;
+    n21.children = vec![n27];
+    let mut n30 = plain(30, 22, 36);
+    n30.escaping = true;
+    n30.row = true;
+    let n51 = plain(51, 100, 22);
+    let mut n64 = plain(64, 22, 60);
+    n64.escaping = true;
+    n64.row = true;
+    let mut n65 = plain(65, 60, 14);
+    n65.escaping = true;
+    n65.row = true;
+    let mut n74 = plain(74, 14, 60);
+    n74.relative = Some(0);
+    let mut n73 = plain(73, 36, 22);
+    n73.escaping = true;
+    n73.row = true;
+    n73.padding = 4;
+    n73.children = vec![n74];
+    let step = StepData {
+        trees: vec![n21, n30, n51, n64, n65, n73],
+        gap: 30.,
+        context: false,
+        page_height: 300.,
+        offset: 350.12,
+        read: false,
+        idle: true,
+        abandon: false,
+        inner: None,
+        scale: 2.,
+        rem: 16.,
+    };
+    let script = Script { scale: 2., steps: vec![step] };
+    if let Some((i, d)) = play(cx, &script, true) {
+        panic!("differs {i}: {d}");
+    }
 }

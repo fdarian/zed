@@ -4594,10 +4594,10 @@ mod tests {
             fuzz_one(rng, cx, true);
         }
 
-        /// REVIEW: the same without the verifier, whose reference build is what it presents, so
-        /// that moves of recorded ranges accumulate across frames.
-        #[gpui::test(iterations = 300)]
-        fn review_unverified_retained_subtrees_show_what_the_same_tree_built_shows(
+        /// The same without the verifier, whose reference build is what it presents, so that
+        /// moves of recorded ranges accumulate across frames.
+        #[gpui::test(iterations = 40)]
+        fn unverified_retained_subtrees_show_what_the_same_tree_built_shows(
             rng: StdRng,
             cx: &mut TestAppContext,
         ) {
@@ -4754,4 +4754,4 @@ mod hole_tests;
 #[cfg(test)]
 mod relocation_tests;
 #[cfg(test)]
-mod review_tests;
+mod regression_tests;

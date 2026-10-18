@@ -5627,9 +5627,9 @@ impl Window {
         let ordinal = list.next_ordinal;
         list.next_ordinal += 1;
         self.retained.pending_hole = None;
+        self.lifts_open += 1;
         LiftTicket {
             ordinal,
-        self.lifts_open += 1;
             hitboxes_start: self.next_frame.hitboxes.len(),
         }
     }
@@ -5639,9 +5639,9 @@ impl Window {
     /// captured here is what its parent's children are painted with.
     pub(crate) fn finish_lift(&mut self, ticket: LiftTicket, z: i32, element: AnyElement) -> u32 {
         self.invalidator.debug_assert_prepaint();
+        self.lifts_open -= 1;
         let hitboxes = self.next_frame.hitboxes.split_off(ticket.hitboxes_start);
         self.next_frame.hitboxes_changed();
-        self.lifts_open -= 1;
         let hole = self.retained.pending_hole.take();
         let owners = self.lift_owners(ticket.ordinal);
         // A recording that is made in a region of its own is not replayed from the frame, and has
