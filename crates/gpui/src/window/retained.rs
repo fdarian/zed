@@ -256,6 +256,9 @@ pub(crate) struct RetainedWindow {
     /// it by its parent, which takes it when it finishes handing it over (see
     /// [`Window::finish_lift`]).
     pub(crate) pending_hole: Option<Hole>,
+    /// The layout node of the subtree whose listener is being run for a replay, see
+    /// [`Window::replayed_root`].
+    pub(crate) replayed_root: Option<LayoutId>,
     /// The subtrees that replayed in the pass being built.
     pub(crate) replayed: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mismatches: Vec<String>,
@@ -965,6 +968,15 @@ impl Window {
 
     pub(crate) fn note_publication(&mut self) {
         self.retained.publications = self.retained.publications.wrapping_add(1);
+    }
+
+    /// The layout node of the retained subtree whose [`RetainedPhase::Prepaint`] or
+    /// [`RetainedPhase::Paint`] listener is being run, for a listener that republishes what depends
+    /// on the surroundings of the subtree, such as the content box of its parent
+    /// ([`Window::layout_parent_content_size`]): a replay writes what the build recorded, and the
+    /// surroundings may have changed without the subtree. `None` outside such a listener.
+    pub fn replayed_root(&self) -> Option<LayoutId> {
+        self.retained.replayed_root
     }
 
     /// Whether the frame being built can skip retained subtrees. Only in the first pass of a

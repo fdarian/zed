@@ -628,7 +628,9 @@ fn replay_recorded_paint(
         recorded.paint_serial = window.building_serial();
         window.log_painted_subtree(global_id);
         if let Some(hook) = hook {
+            window.retained.replayed_root = Some(state.root);
             hook(RetainedPhase::Paint, delta, window, cx);
+            window.retained.replayed_root = None;
         }
         ((), state)
     });
@@ -905,7 +907,9 @@ impl Retained {
             }
             state.recorded = Some(recorded);
             if let Some(hook) = hook {
+                window.retained.replayed_root = Some(state.root);
                 hook(RetainedPhase::Prepaint, delta, window, cx);
+                window.retained.replayed_root = None;
             }
             (true, state)
         });
