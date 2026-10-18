@@ -31,6 +31,15 @@
 //! replay. What the subtree published outside the frame is published again by the
 //! [`Retained::on_replay`] listener, with [`RetainedPhase::Layout`].
 //!
+//! A subtree that is [relocatable](Retained::relocatable) is recorded to be replayed elsewhere than
+//! where it was recorded, by a whole number of device pixels, as a scroller moves its content. Its
+//! prepaint and paint run in a region that reaches past the clip around it, and paint goes to a
+//! scene of its own, which keeps the operations; the frame gets them moved and cut by the clip
+//! there is where they are put. The hitboxes, accessibility nodes and what text and scroll handles
+//! hold outside the frame move with them. What has a position that is not in the frame to move
+//! (a drag that starts at the subtree, a sticky box, a nested scroller that is scrolled, a box that
+//! another one places) makes the recording replayable only where it was made, see [`NonRelocatable`].
+//!
 //! The element must have an element id that is unique among the elements around it. It names the
 //! element's state and is not on the id stack below it: the subtree has the ids it would have
 //! without the element. The root of

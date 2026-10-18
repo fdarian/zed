@@ -1182,10 +1182,14 @@ impl Window {
         self.retained.nested_scrolls.set(self.retained.nested_scrolls.get().wrapping_add(1));
     }
 
-    /// Says that a handle outside the frame holds a position of the subtree being recorded:
-    /// `apply` sets it to what it was when recorded, moved by the delta it is given, and
-    /// `describe` says what it is now. Does nothing outside such a recording.
-    pub(crate) fn note_relocated(
+    /// Says that something outside the frame holds a position of the subtree being recorded (the
+    /// bounds a handle reports, for example), which a [relocatable](crate::Retained::relocatable)
+    /// subtree that is put elsewhere has to move with it. `apply` is run with how far the subtree
+    /// is from where it was recorded, and sets it to what it was when it was recorded, moved by that
+    /// (not by how far the replay before moved it). `describe` says what it is now, for comparing
+    /// a replay with a build, see [`Window::set_retention_verifier`]. Does nothing outside such
+    /// a recording.
+    pub fn note_relocated(
         &mut self,
         apply: impl Fn(Point<Pixels>) + 'static,
         describe: impl Fn() -> String + 'static,

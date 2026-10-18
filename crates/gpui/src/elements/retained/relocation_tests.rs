@@ -461,6 +461,41 @@ fn strip_view_ids(text: &str) -> String {
     out
 }
 
+/// What the text layouts and scroll handles of the rows hold, which a read of bounds sees.
+fn describe_handles(handles: &Handles, scroll: &ScrollHandle) -> (String, String) {
+    let texts = handles
+        .texts
+        .borrow()
+        .iter()
+        .map(|(index, layout)| {
+            let bounds = layout.bounds();
+            let middle = bounds.center();
+            format!(
+                "{index}: {bounds:?} at {:?} {:?} {:?}",
+                layout.index_for_position(middle),
+                layout.index_for_position(point(bounds.left() + px(3.), bounds.top() + px(2.))),
+                layout.index_for_position(point(bounds.right() - px(1.), bounds.bottom() - px(1.))),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut scrolls = format!(
+        "page {:?} {:?} {:?}\n",
+        scroll.bounds(),
+        scroll.padding_box(),
+        (0..scroll.children_count()).map(|ix| scroll.bounds_for_item(ix)).collect::<Vec<_>>()
+    );
+    for (index, tracker) in handles.trackers.borrow().iter() {
+        scrolls.push_str(&format!(
+            "{index}: {:?} {:?} {:?}\n",
+            tracker.bounds(),
+            tracker.padding_box(),
+            tracker.bounds_for_item(0)
+        ));
+    }
+    (texts, scrolls)
+}
+
 fn probes() -> Vec<(f32, f32)> {
     let mut probes = Vec::new();
     for x in [3., 40., 150., 290.] {
@@ -522,36 +557,7 @@ fn observe(
             (scene, a11y, chains)
         })
         .unwrap();
-    let texts = handles
-        .texts
-        .borrow()
-        .iter()
-        .map(|(index, layout)| {
-            let bounds = layout.bounds();
-            let middle = bounds.center();
-            format!(
-                "{index}: {bounds:?} at {:?} {:?} {:?}",
-                layout.index_for_position(middle),
-                layout.index_for_position(point(bounds.left() + px(3.), bounds.top() + px(2.))),
-                layout.index_for_position(point(bounds.right() - px(1.), bounds.bottom() - px(1.))),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut scrolls = format!(
-        "page {:?} {:?} {:?}\n",
-        scroll.bounds(),
-        scroll.padding_box(),
-        (0..scroll.children_count()).map(|ix| scroll.bounds_for_item(ix)).collect::<Vec<_>>()
-    );
-    for (index, tracker) in handles.trackers.borrow().iter() {
-        scrolls.push_str(&format!(
-            "{index}: {:?} {:?} {:?}\n",
-            tracker.bounds(),
-            tracker.padding_box(),
-            tracker.bounds_for_item(0)
-        ));
-    }
+    let (texts, scrolls) = describe_handles(handles, scroll);
     let debug_bounds = cx
         .update_window(window, |_, window, _| {
             let mut entries = window
@@ -767,6 +773,44 @@ fn absolute_boxes_move_with_their_row_and_boxes_placed_elsewhere_keep_the_row_wh
     }
 }
 
+/// A read of bounds right after a scroll: the pass that only lays out, and what the handles hold
+/// after it.
+fn bounds_read_after_a_scroll(pair: &Pair, cx: &mut TestApp, offset: f32) -> (String, String) {
+    let mut read = |window: AnyWindowHandle, handles: &Handles, scroll: &ScrollHandle| {
+        scroll.set_offset(point(px(0.), px(-offset)));
+        cx.update_window(window, |view, window, cx| {
+            let view = view.downcast::<SceneView>().unwrap();
+            view.update(cx, |_, cx| cx.notify());
+            assert!(window.draw_if_dirty(cx), "a pass ran");
+            describe_handles(handles, scroll)
+        })
+        .unwrap()
+    };
+    let retained = read(pair.retained, &pair.handles, &pair.scroll);
+    let plain = read(pair.plain, &pair.plain_handles, &pair.plain_scroll);
+    assert_eq!(retained.0, plain.0, "text bounds after a read at {offset}");
+    assert_eq!(retained.1, plain.1, "scroll bounds after a read at {offset}");
+    retained
+}
+
+#[test]
+fn a_read_of_bounds_after_a_scroll_sees_the_rows_where_the_scroll_put_them() {
+    for scale_factor in [1., 2.] {
+        let cx = &mut app();
+        let pair = Pair::new(cx, mixed(30), scale_factor, false);
+        pair.draw(cx);
+        let before = pair.counters(cx);
+        for offset in [5., 17.5, 33., 60.25, 61., 3.] {
+            bounds_read_after_a_scroll(&pair, cx, offset);
+            pair.assert_same(cx, &format!("the frame after a read at {offset}"));
+            pair.scroll_to(cx, offset);
+            pair.assert_same(cx, &format!("the frame drawn at {offset}"));
+        }
+        let after = pair.counters(cx);
+        assert!(after.layout_replays > before.layout_replays, "{after:?}");
+    }
+}
+
 #[test]
 fn a_scale_factor_that_is_not_a_power_of_two_builds_the_rows() {
     let cx = &mut app();
@@ -859,7 +903,11 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
         Kind::Fixed,
     ];
     let mut relocated = 0;
-    for seed in 0..24u64 {
+    let seeds = std::env::var("RELOCATION_FUZZ_SEEDS")
+        .ok()
+        .and_then(|seeds| seeds.parse().ok())
+        .unwrap_or(24u64);
+    for seed in 0..seeds {
         let mut rng = StdRng::seed_from_u64(seed);
         let count = rng.random_range(12..50);
         let specs = (0..count)
@@ -871,6 +919,13 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
         let scale_factor = if rng.random_bool(0.5) { 1. } else { 2. };
         let rounded = rng.random_bool(0.25);
         let pair = Pair::new(cx, specs, scale_factor, rounded);
+        let verified = rng.random_bool(0.5);
+        if verified {
+            cx.update_window(pair.retained, |_, window, _| {
+                window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+            })
+            .unwrap();
+        }
         let mut offset = 0f32;
         for step in 0..14 {
             let fractional = rng.random_bool(0.5);
@@ -891,6 +946,10 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
             }
         }
         relocated += pair.counters(cx).relocations;
+        if verified {
+            let mismatches = pair.mismatches(cx);
+            assert!(mismatches.is_empty(), "seed {seed}: {}", mismatches.join("\n"));
+        }
     }
     assert!(relocated > 100, "the fuzz moved rows: {relocated}");
 }
