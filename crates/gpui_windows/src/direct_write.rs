@@ -664,6 +664,7 @@ impl DirectWriteState {
                         height: (metrics.glyphBoxTop - metrics.glyphBoxBottom) as _,
                     },
                 },
+                widens_ascent: false,
             }
         }
     }

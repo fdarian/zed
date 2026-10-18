@@ -857,11 +857,9 @@ impl TextLayout {
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = window.pixel_snap(
-            text_style
-                .line_height
-                .to_pixels(font_size.into(), window.rem_size()),
-        );
+        let line_height =
+            window.pixel_snap(window.text_system().line_height(&text_style, window.rem_size()));
+        let options = text_style.layout_options(window.text_system());
 
         let runs = if let Some(runs) = runs {
             runs
@@ -884,7 +882,7 @@ impl TextLayout {
             text_style.white_space.hash(&mut hasher);
             text_style.text_overflow.hash(&mut hasher);
             text_style.line_clamp.hash(&mut hasher);
-            text_style.layout_options().hash(&mut hasher);
+            options.hash(&mut hasher);
             trim.hash(&mut hasher);
             text_style.text_box_edge.hash(&mut hasher);
             if text_style.text_overflow.is_some() || !trim.is_none() {
@@ -932,7 +930,7 @@ impl TextLayout {
                         truncate_width,
                         inset_width: width,
                         atomic_measure,
-                        options: text_style.layout_options(),
+                        options,
                         trim_top: Pixels::ZERO,
                         trim_bottom: Pixels::ZERO,
                         size: Some(Size::default()),
@@ -953,7 +951,7 @@ impl TextLayout {
                                 text.clone(),
                                 font_size,
                                 &runs,
-                                text_style.layout_options(),
+                                options,
                                 &insets,
                                 &inline,
                                 line_height,
@@ -992,7 +990,7 @@ impl TextLayout {
                     && wrap_width == text_layout.wrap_width
                     && width == text_layout.inset_width
                     && atomic_measure == text_layout.atomic_measure
-                    && text_style.layout_options() == text_layout.options
+                    && options == text_layout.options
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
                 {
@@ -1022,7 +1020,7 @@ impl TextLayout {
                                     max_lines: text_style.line_clamp,
                                     affix,
                                     affix_width: line_wrapper.width_of(affix),
-                                    options: text_style.layout_options(),
+                                    options,
                                     insets: &insets,
                                 },
                             )
@@ -1045,7 +1043,7 @@ impl TextLayout {
                                 &runs,
                                 None,
                                 None,
-                                text_style.layout_options(),
+                                options,
                                 &insets,
                                 &inline,
                                 line_height,
@@ -1093,7 +1091,7 @@ impl TextLayout {
                             &runs,
                             wrap_width,            // Wrap if we know the width.
                             text_style.line_clamp, // Limit the number of lines if line_clamp is set.
-                            text_style.layout_options(),
+                            options,
                             insets,
                             inline,
                             line_height,
@@ -1143,7 +1141,7 @@ impl TextLayout {
                     truncate_width,
                     inset_width: width,
                     atomic_measure,
-                    options: text_style.layout_options(),
+                    options,
                     trim_top,
                     trim_bottom,
                     size: Some(size),

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Bounds, DevicePixels, ExtraDecoration, Hsla, OverlineStyle, Pixels, PlatformTextSystem, Point, Result,
-    SharedString, Size, StrikethroughStyle, TextRenderingMode, UnderlineStyle, px,
+    SharedString, Size, StrikethroughStyle, TextRenderingMode, TextStyle, UnderlineStyle, px,
 };
 use anyhow::{Context as _, anyhow};
 use collections::FxHashMap;
@@ -322,6 +322,23 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.descent(font_size))
     }
 
+    /// The content area of an inline box in the given font and size, as Chrome measures it.
+    pub fn line_box(&self, font_id: FontId, font_size: Pixels) -> LineBox {
+        self.read_metrics(font_id, |metrics| metrics.line_box(font_size))
+    }
+
+    /// The line height `style` asks for, in pixels, not yet laid out in whole
+    /// sixty-fourths of a pixel: `normal` is the height of its font.
+    pub fn line_height(&self, style: &TextStyle, rem_size: Pixels) -> Pixels {
+        let font_size = style.font_size.to_pixels(rem_size);
+        style
+            .line_height
+            .to_pixels(style.font_size, rem_size, || {
+                self.line_box(self.resolve_font(&style.font()), font_size)
+                    .normal_line_height()
+            })
+    }
+
     /// Get the recommended baseline offset for the given font and line height.
     pub fn baseline_offset(
         &self,
@@ -329,10 +346,7 @@ impl TextSystem {
         font_size: Pixels,
         line_height: Pixels,
     ) -> Pixels {
-        let ascent = self.ascent(font_id, font_size);
-        let descent = self.descent(font_id, font_size);
-        let padding_top = (line_height - ascent - descent) / 2.;
-        padding_top + ascent
+        self.line_box(font_id, font_size).extent(line_height).0
     }
 
     /// The underline thickness the font reports for `font_size`, zero when it has none.
@@ -934,6 +948,7 @@ impl WindowTextSystem {
             font_size,
             &font_runs,
             force_width,
+            None,
         );
 
         self.font_runs_pool.lock().push(font_runs);
@@ -955,6 +970,7 @@ impl WindowTextSystem {
                     font_size: None,
                     line_height: None,
                 }],
+                None,
                 None,
             )
             .width
@@ -1461,9 +1477,70 @@ pub struct FontMetrics {
     /// The outer limits of the area that the font covers.
     /// Corresponds to the xMin / xMax / yMin / yMax values in the OpenType `head` table
     pub bounding_box: Bounds<f32>,
+
+    /// Whether the rounded ascent of the font is made taller by 15% of its content area,
+    /// as Chrome does on macOS for Times, Helvetica and Courier, whose own metrics are
+    /// tighter than the fonts they stand in for. See [`Self::line_box`].
+    pub widens_ascent: bool,
+}
+
+/// The content area of the inline box of a font at a size, and the leading its line gap
+/// adds to `line-height: normal`, as Chrome measures them: the whole pixel each is
+/// rounded to, so every line of the font is as tall as the next whatever the size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineBox {
+    /// The distance from the baseline up to the top of the content area.
+    pub ascent: Pixels,
+    /// The distance from the baseline down to the bottom of the content area, positive.
+    pub descent: Pixels,
+    /// The font's line gap.
+    pub line_gap: Pixels,
+}
+
+impl LineBox {
+    /// The height of a line with `line-height: normal`.
+    pub fn normal_line_height(&self) -> Pixels {
+        self.ascent + self.descent + self.line_gap
+    }
+
+    /// How far above the baseline an inline box with this content area reaches in a line
+    /// of `line_height`, and how far below it.
+    pub fn extent(&self, line_height: Pixels) -> (Pixels, Pixels) {
+        extent_in_line(self.ascent, self.descent, line_height)
+    }
+}
+
+/// How far above the baseline an inline box reaches in a line of `line_height`, and how
+/// far below it, for a content area of `ascent` and `descent`: the line height is shared
+/// around the content area as half-leading, whose share above the box is rounded down to
+/// a whole pixel, as Chrome does.
+pub fn extent_in_line(ascent: Pixels, descent: Pixels, line_height: Pixels) -> (Pixels, Pixels) {
+    let above = ascent + ((line_height - ascent - descent) / 2.).floor();
+    (above, line_height - above)
+}
+
+/// The largest multiple of a sixty-fourth of a pixel, Chrome's `LayoutUnit`, that does
+/// not exceed `length`: how a line height is laid out.
+pub fn floor_to_layout_unit(length: Pixels) -> Pixels {
+    px((length.0 * 64.).floor() / 64.)
 }
 
 impl FontMetrics {
+    /// The content area of an inline box in this font at `font_size`.
+    pub fn line_box(&self, font_size: Pixels) -> LineBox {
+        let round = |length: Pixels| px((length.0 + 0.5).floor());
+        let mut ascent = round(self.ascent(font_size));
+        let descent = round(-self.descent(font_size));
+        if self.widens_ascent {
+            ascent += px(((ascent + descent).0 * 0.15 + 0.5).floor());
+        }
+        LineBox {
+            ascent,
+            descent,
+            line_gap: round(self.line_gap(font_size)),
+        }
+    }
+
     /// Returns the vertical distance from the baseline of the font to the top of the glyph covers in pixels.
     pub fn ascent(&self, font_size: Pixels) -> Pixels {
         Pixels((self.ascent / self.units_per_em as f32) * font_size.0)
@@ -1842,3 +1919,116 @@ mod insets_tests {
 
 #[cfg(test)]
 mod layout_unit_tests;
+
+#[cfg(test)]
+mod line_box_tests {
+    use super::*;
+    use crate::{AbsoluteLength, LineHeight};
+
+    /// Menlo's hhea metrics, in units of 2048.
+    fn menlo() -> FontMetrics {
+        FontMetrics {
+            units_per_em: 2048,
+            ascent: 1901.,
+            descent: -483.,
+            line_gap: 0.,
+            underline_position: 0.,
+            underline_thickness: 0.,
+            cap_height: 0.,
+            x_height: 0.,
+            bounding_box: Bounds::default(),
+            widens_ascent: false,
+        }
+    }
+
+    /// Helvetica's, whose ascent Chrome on macOS widens.
+    fn helvetica() -> FontMetrics {
+        FontMetrics {
+            ascent: 1577.,
+            descent: -471.,
+            widens_ascent: true,
+            ..menlo()
+        }
+    }
+
+    fn content(metrics: &FontMetrics, size: f32) -> (f32, f32, f32) {
+        let line_box = metrics.line_box(px(size));
+        (
+            line_box.ascent.0,
+            line_box.descent.0,
+            line_box.normal_line_height().0,
+        )
+    }
+
+    /// The `.text` and `normal` heights of `menlo.400.*` in Chrome (`line-box-oracle.json` of gpuix).
+    #[test]
+    fn test_the_ascent_and_descent_are_each_rounded_to_a_pixel() {
+        assert_eq!(content(&menlo(), 16.), (15., 4., 19.));
+        assert_eq!(content(&menlo(), 20.), (19., 5., 24.));
+        assert_eq!(content(&menlo(), 24.), (22., 6., 28.));
+    }
+
+    /// `helvetica.400.*`: the ascent is widened by 15% of the content area, rounded.
+    #[test]
+    fn test_the_ascent_of_a_widened_font_grows_by_a_sixth_of_the_content() {
+        assert_eq!(content(&helvetica(), 12.), (11., 3., 14.));
+        assert_eq!(content(&helvetica(), 20.), (18., 5., 23.));
+        assert_eq!(content(&helvetica(), 24.), (22., 6., 28.));
+        let unwidened = FontMetrics {
+            widens_ascent: false,
+            ..helvetica()
+        };
+        assert_eq!(content(&unwidened, 24.), (18., 6., 24.));
+    }
+
+    #[test]
+    fn test_the_line_gap_is_rounded_into_normal() {
+        let gapped = FontMetrics {
+            line_gap: 41.,
+            ..menlo()
+        };
+        // 41 / 2048 of 24px is 0.48px, 41 / 2048 of 40px is 0.8px.
+        assert_eq!(content(&gapped, 24.), (22., 6., 28.));
+        assert_eq!(content(&gapped, 40.), (37., 9., 47.));
+    }
+
+    #[test]
+    fn test_half_leading_is_floored_above_the_text() {
+        // Menlo at 16px in a line of 20px: 1px over, so the ascent has none and the descent 1.
+        assert_eq!(extent_in_line(px(15.), px(4.), px(20.)), (px(15.), px(5.)));
+        // 24px: 5px over, 2px above and 3 below.
+        assert_eq!(extent_in_line(px(15.), px(4.), px(24.)), (px(17.), px(7.)));
+        // A line shorter than the text has a negative half-leading, floored toward the top:
+        // `menlo.400.16.1` is 16px tall and its text starts 2px above it.
+        assert_eq!(extent_in_line(px(15.), px(4.), px(16.)), (px(13.), px(3.)));
+        // A line height that is not a whole pixel gives the descent the rest.
+        assert_eq!(
+            extent_in_line(px(15.), px(4.), px(20.390625)),
+            (px(15.), px(5.390625))
+        );
+    }
+
+    #[test]
+    fn test_a_line_height_is_laid_out_in_sixty_fourths_of_a_pixel() {
+        assert_eq!(floor_to_layout_unit(px(14.4)), px(14.390625));
+        assert_eq!(floor_to_layout_unit(px(15.6)), px(15.59375));
+        assert_eq!(floor_to_layout_unit(px(24.)), px(24.));
+        assert_eq!(floor_to_layout_unit(px(0.01)), px(0.));
+    }
+
+    #[test]
+    fn test_normal_asks_the_font_and_a_length_does_not() {
+        let size: AbsoluteLength = px(20.).into();
+        assert_eq!(LineHeight::Normal.to_pixels(size, px(16.), || px(23.)), px(23.));
+        assert_eq!(
+            LineHeight::from(crate::relative(1.5)).to_pixels(size, px(16.), || unreachable!()),
+            px(30.)
+        );
+        assert_eq!(
+            LineHeight::from(px(24.)).to_pixels(size, px(16.), || unreachable!()),
+            px(24.)
+        );
+        assert_eq!(TextStyle::default().line_height, LineHeight::Normal);
+    }
+}
+

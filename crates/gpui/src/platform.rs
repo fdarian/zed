@@ -1209,6 +1209,7 @@ impl PlatformTextSystem for NoopTextSystem {
                     height: 1364.0,
                 },
             },
+            widens_ascent: false,
         }
     }
 
@@ -1268,8 +1269,8 @@ impl PlatformTextSystem for NoopTextSystem {
                     runs.push(ShapedRun {
                         font_id: FontId(0),
                         font_size: run_size,
-                        ascent: run_size * (metrics.ascent / units_per_em),
-                        descent: run_size * (metrics.descent / units_per_em),
+                        ascent: metrics.line_box(run_size).ascent,
+                        descent: metrics.line_box(run_size).descent,
                         line_height: font_run.line_height,
                         glyphs: Vec::new(),
                         inline: Default::default(),
@@ -1297,8 +1298,8 @@ impl PlatformTextSystem for NoopTextSystem {
         LineLayout {
             font_size,
             width: position,
-            ascent: font_size * (metrics.ascent / units_per_em),
-            descent: font_size * (metrics.descent / units_per_em),
+            ascent: metrics.line_box(font_size).ascent,
+            descent: metrics.line_box(font_size).descent,
             runs,
             len: text.len(),
         }

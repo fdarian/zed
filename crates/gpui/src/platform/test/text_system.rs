@@ -190,8 +190,8 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
                 shaped.push(ShapedRun {
                     font_id: FontId(0),
                     font_size: run_size,
-                    ascent: run_size * self.ascent,
-                    descent: run_size * self.descent,
+                    ascent: self.font_metrics(FontId(0)).line_box(run_size).ascent,
+                    descent: self.font_metrics(FontId(0)).line_box(run_size).descent,
                     line_height: font_run.line_height,
                     glyphs: Vec::new(),
                     inline: Default::default(),
@@ -212,8 +212,8 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
         LineLayout {
             font_size,
             width: x,
-            ascent: font_size * self.ascent,
-            descent: font_size * self.descent,
+            ascent: self.font_metrics(FontId(0)).line_box(font_size).ascent,
+            descent: self.font_metrics(FontId(0)).line_box(font_size).descent,
             runs: shaped,
             len: text.len(),
         }

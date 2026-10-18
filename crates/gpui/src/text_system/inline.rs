@@ -6,7 +6,7 @@
 //! [`InlineBox`] list next to the text, as it does with [`TextInset`](crate::TextInset)s,
 //! and the layout of the text puts them on their line.
 
-use crate::{Font, FontId, FontMetrics, LineLayout, Pixels, ShapedRun, px};
+use crate::{Font, FontId, FontMetrics, LineLayout, Pixels, ShapedRun, extent_in_line, px};
 use std::{
     hash::{Hash, Hasher},
     ops::Range,
@@ -259,10 +259,11 @@ pub(crate) fn resolve_placements(
         let (font_size, ascent, descent, x_height) = match spec.content {
             SpecContent::Text { font_id, font_size } => {
                 let metrics = font_metrics(font_id);
+                let line_box = metrics.line_box(font_size);
                 (
                     font_size,
-                    metrics.ascent(font_size),
-                    -metrics.descent(font_size),
+                    line_box.ascent,
+                    line_box.descent,
                     metrics.x_height(font_size),
                 )
             }
@@ -271,10 +272,7 @@ pub(crate) fn resolve_placements(
         let own_line_height = spec.line_height.unwrap_or(line_height);
         // The extent of the inline box around the baseline of the box itself.
         let (above, below) = match spec.content {
-            SpecContent::Text { .. } => {
-                let above = ascent + (own_line_height - ascent - descent) / 2.;
-                (above, own_line_height - above)
-            }
+            SpecContent::Text { .. } => extent_in_line(ascent, descent, own_line_height),
             SpecContent::Atomic(extent) => (extent.ascent, extent.descent),
         };
 

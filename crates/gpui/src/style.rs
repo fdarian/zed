@@ -12,7 +12,7 @@ use crate::{
     FontFallbacks, FontFeatures, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions, TextWrapStyle,
-    TextRun, Window, OverflowWrap, TextBoxEdge, WordBreak, black, phi, point, px, quad, rems, size,
+    TextRun, TextSystem, Window, OverflowWrap, TextBoxEdge, WordBreak, black, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use gpui_util::ResultExt;
@@ -602,6 +602,44 @@ pub enum TextAlign {
     Right,
 }
 
+/// A CSS `line-height`.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum LineHeight {
+    /// The height of the font: its ascent, descent and line gap, each rounded to a whole
+    /// pixel as Chrome does. See [`crate::FontMetrics::line_box`].
+    Normal,
+    /// A multiple of the font size, or a length.
+    Length(DefiniteLength),
+}
+
+impl LineHeight {
+    /// The line height in pixels for text of `font_size`. `normal` asks for the height of
+    /// the font of the text, which only the caller knows.
+    pub fn to_pixels(
+        self,
+        font_size: AbsoluteLength,
+        rem_size: Pixels,
+        normal: impl FnOnce() -> Pixels,
+    ) -> Pixels {
+        match self {
+            Self::Normal => normal(),
+            Self::Length(length) => length.to_pixels(font_size, rem_size),
+        }
+    }
+}
+
+impl Default for LineHeight {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl<T: Into<DefiniteLength>> From<T> for LineHeight {
+    fn from(length: T) -> Self {
+        Self::Length(length.into())
+    }
+}
+
 /// The properties that can be used to style text in GPUI
 #[derive(Refineable, Clone, Debug, PartialEq)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -624,8 +662,8 @@ pub struct TextStyle {
     /// The font size to use, in pixels or rems.
     pub font_size: AbsoluteLength,
 
-    /// The line height to use, in pixels or fractions
-    pub line_height: DefiniteLength,
+    /// The line height to use: `normal`, pixels or fractions of the font size
+    pub line_height: LineHeight,
 
     /// The font weight, e.g. bold
     pub font_weight: FontWeight,
@@ -702,7 +740,7 @@ impl Default for TextStyle {
             font_variations: FontVariations::default(),
             font_fallbacks: None,
             font_size: rems(1.).into(),
-            line_height: phi(),
+            line_height: LineHeight::Normal,
             font_weight: FontWeight::default(),
             font_style: FontStyle::default(),
             background_color: None,
@@ -793,8 +831,9 @@ impl TextStyle {
     }
 
     /// What the text of this style is laid out with, beyond its font and wrap width.
-    pub fn layout_options(&self) -> TextLayoutOptions {
+    pub fn layout_options(&self, text_system: &TextSystem) -> TextLayoutOptions {
         TextLayoutOptions {
+            strut_font: Some(text_system.resolve_font(&self.font())),
             tab_size: self.tab_size,
             hang_trailing_spaces: self.hang_trailing_spaces,
             break_spaces: self.break_spaces,
@@ -814,11 +853,6 @@ impl TextStyle {
             weight: self.font_weight,
             style: self.font_style,
         }
-    }
-
-    /// Returns the rounded line height in pixels.
-    pub fn line_height_in_pixels(&self, rem_size: Pixels) -> Pixels {
-        self.line_height.to_pixels(self.font_size, rem_size).round()
     }
 
     /// Convert this text style into a [`TextRun`], for the given length of the text.

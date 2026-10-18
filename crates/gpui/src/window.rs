@@ -3845,7 +3845,9 @@ impl Window {
 
     /// The line height associated with the current text style.
     pub fn line_height(&self) -> Pixels {
-        self.text_style().line_height_in_pixels(self.rem_size())
+        self.text_system()
+            .line_height(&self.text_style(), self.rem_size())
+            .round()
     }
 
     /// Rounds a logical value to the nearest device pixel.

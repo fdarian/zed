@@ -28,7 +28,6 @@ use font_kit::{
     font::Font as FontKitFont,
     handle::Handle,
     hinting::HintingOptions,
-    metrics::Metrics,
     properties::{Style as FontkitStyle, Weight as FontkitWeight},
     source::SystemSource,
     sources::mem::MemSource,
@@ -69,6 +68,8 @@ struct MacTextSystemState {
     memory_source: MemSource,
     system_source: SystemSource,
     fonts: Vec<FontKitFont>,
+    /// The metrics of each of `fonts`, by the same index.
+    font_metrics: Vec<FontMetrics>,
     font_selections: HashMap<Font, FontId>,
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
@@ -86,6 +87,7 @@ impl MacTextSystem {
             memory_source: MemSource::empty(),
             system_source: SystemSource::new(),
             fonts: Vec::new(),
+            font_metrics: Vec::new(),
             font_selections: HashMap::default(),
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
@@ -182,7 +184,7 @@ impl PlatformTextSystem for MacTextSystem {
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
-        font_kit_metrics_to_metrics(self.0.read().fonts[font_id.0].metrics())
+        self.0.read().font_metrics[font_id.0]
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
@@ -379,15 +381,21 @@ impl MacTextSystemState {
                 );
                 continue;
             }
-            let font_id = FontId(self.fonts.len());
+            let font_id = self.push_font(font);
             font_ids.push(font_id);
             self.font_ids_by_postscript_name
                 .insert(postscript_name.clone(), font_id);
             self.postscript_names_by_font_id
                 .insert(font_id, postscript_name);
-            self.fonts.push(font);
         }
         Ok(font_ids)
+    }
+
+    fn push_font(&mut self, font: FontKitFont) -> FontId {
+        let font_id = FontId(self.fonts.len());
+        self.font_metrics.push(font_kit_metrics_to_metrics(&font));
+        self.fonts.push(font);
+        font_id
     }
 
     /// `font_id` with the axes it has set to `variations`, and to `weight` on `wght`
@@ -429,8 +437,7 @@ impl MacTextSystemState {
         }
         let mut font = self.fonts[font_id.0].clone();
         apply_variations(&mut font, key.1.tag_value_list(), &axes);
-        let varied = FontId(self.fonts.len());
-        self.fonts.push(font);
+        let varied = self.push_font(font);
         if let Some(postscript_name) = self.postscript_names_by_font_id.get(&font_id).cloned() {
             self.postscript_names_by_font_id
                 .insert(varied, postscript_name);
@@ -454,15 +461,13 @@ impl MacTextSystemState {
         if let Some(font_id) = self.font_ids_by_postscript_name.get(&postscript_name) {
             *font_id
         } else {
-            let font_id = FontId(self.fonts.len());
+            let font_id = self.push_font(font_kit::font::Font::from_core_graphics_font(
+                requested_font.copy_to_CGFont(),
+            ));
             self.font_ids_by_postscript_name
                 .insert(postscript_name.clone(), font_id);
             self.postscript_names_by_font_id
                 .insert(font_id, postscript_name);
-            self.fonts
-                .push(font_kit::font::Font::from_core_graphics_font(
-                    requested_font.copy_to_CGFont(),
-                ));
             font_id
         }
     }
@@ -589,8 +594,6 @@ impl MacTextSystemState {
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
         let mut string = CFMutableAttributedString::new();
-        let mut max_ascent = 0.0f32;
-        let mut max_descent = 0.0f32;
         let mut input_runs = Vec::<InputRun>::with_capacity(font_runs.len());
 
         {
@@ -609,13 +612,8 @@ impl MacTextSystemState {
                 let cf_range = CFRange::init(utf16_start, length);
                 let font = &self.fonts[run.font_id.0];
 
-                let font_metrics = font.metrics();
-                let font_scale = f32::from(font_size) / font_metrics.units_per_em as f32;
-                max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
-                max_descent = max_descent.max(-font_metrics.descent * font_scale);
-
                 let run_font_size = run.font_size.unwrap_or(font_size);
-                let run_scale = f32::from(run_font_size) / font_metrics.units_per_em as f32;
+                let line_box = self.font_metrics[run.font_id.0].line_box(run_font_size);
                 let ct_font_size = if break_ligature {
                     px(f32::from(run_font_size).next_up())
                 } else {
@@ -627,8 +625,8 @@ impl MacTextSystemState {
                     postscript_name: ct_font.postscript_name(),
                     utf16_start,
                     font_size: run_font_size,
-                    ascent: px(font_metrics.ascent * run_scale),
-                    descent: px(-font_metrics.descent * run_scale),
+                    ascent: line_box.ascent,
+                    descent: line_box.descent,
                     line_height: run.line_height,
                 });
                 unsafe {
@@ -711,12 +709,17 @@ impl MacTextSystemState {
             }
         }
         let typographic_bounds = line.get_typographic_bounds();
+        // The strut is the font of the element the text is in, which the caller sets when
+        // it knows it. Without it the font of the first run stands for it.
+        let strut = font_runs
+            .first()
+            .map(|run| self.font_metrics[run.font_id.0].line_box(font_size));
         LineLayout {
             runs,
             font_size,
             width: typographic_bounds.width.into(),
-            ascent: max_ascent.into(),
-            descent: max_descent.into(),
+            ascent: strut.map_or(Pixels::ZERO, |strut| strut.ascent),
+            descent: strut.map_or(Pixels::ZERO, |strut| strut.descent),
             len: text.len(),
         }
     }
@@ -764,7 +767,8 @@ impl<'a> StringIndexConverter<'a> {
     }
 }
 
-fn font_kit_metrics_to_metrics(metrics: Metrics) -> FontMetrics {
+fn font_kit_metrics_to_metrics(font: &FontKitFont) -> FontMetrics {
+    let metrics = font.metrics();
     FontMetrics {
         units_per_em: metrics.units_per_em,
         ascent: metrics.ascent,
@@ -775,6 +779,11 @@ fn font_kit_metrics_to_metrics(metrics: Metrics) -> FontMetrics {
         cap_height: metrics.cap_height,
         x_height: metrics.x_height,
         bounding_box: bounds_from_rect(metrics.bounding_box),
+        // Blink's list, matched on the family name exactly: "Helvetica Neue" is not one.
+        widens_ascent: matches!(
+            font.family_name().as_str(),
+            "Times" | "Helvetica" | "Courier"
+        ),
     }
 }
 
@@ -1448,5 +1457,94 @@ mod tests {
         let digits = |wght, text| width(&fonts, &tabular(wght), text);
         assert!((digits(700., "1111") - digits(700., "0000")).abs() < 0.01);
         assert!(digits(700., "1111") > digits(400., "1111"));
+    }
+
+    /// The content area and the line `line-height: normal` makes, in Chrome on macOS, of
+    /// `Hxg` in a font at a size (`fixtures/line-box-oracle.json` of gpuix:
+    /// `<family>.<weight>.<size>.normal` and its `.text`). Helvetica, Times and Courier have their
+    /// ascent widened by a sixth of the content area, and the other fonts do not.
+    #[test]
+    fn test_the_line_box_of_a_font_is_the_one_chrome_makes() {
+        let fonts = MacTextSystem::new();
+        let cases: &[(&str, f32, f32, f32, f32)] = &[
+            ("Helvetica Neue", 400., 20., 23., 24.),
+            ("Helvetica Neue", 700., 20., 24., 25.),
+            ("Helvetica Neue", 400., 24., 28., 29.),
+            ("Helvetica Neue", 700., 12., 15., 15.),
+            ("Helvetica", 400., 12., 14., 14.),
+            ("Helvetica", 700., 20., 23., 23.),
+            ("Helvetica", 400., 24., 28., 28.),
+            ("Menlo", 400., 16., 19., 19.),
+            ("Menlo", 700., 20., 24., 24.),
+            ("Menlo", 400., 24., 28., 28.),
+            ("Times", 400., 14., 17., 17.),
+            ("Times", 700., 16., 18., 18.),
+            ("Courier", 400., 20., 23., 23.),
+            ("Courier", 700., 12., 14., 14.),
+        ];
+        for (family, weight, size, content, normal) in cases {
+            let font = Font {
+                weight: FontWeight(*weight),
+                ..font(*family)
+            };
+            let font_id = fonts.font_id(&font).unwrap();
+            let line_box = fonts.font_metrics(font_id).line_box(px(*size));
+            let label = format!("{family} {weight} {size}px");
+            assert_eq!(
+                f32::from(line_box.ascent + line_box.descent),
+                *content,
+                "{label}: the content area"
+            );
+            assert_eq!(
+                f32::from(line_box.normal_line_height()),
+                *normal,
+                "{label}: line-height: normal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_only_helvetica_times_and_courier_widen_their_ascent() {
+        let fonts = MacTextSystem::new();
+        let widens = |family: &str| {
+            fonts
+                .font_metrics(fonts.font_id(&font(family)).unwrap())
+                .widens_ascent
+        };
+        assert!(widens("Helvetica"));
+        assert!(widens("Times"));
+        assert!(widens("Courier"));
+        assert!(!widens("Helvetica Neue"));
+        assert!(!widens("Menlo"));
+        assert!(!widens("Courier New"));
+    }
+
+    #[test]
+    fn test_a_run_is_shaped_with_the_line_box_of_its_font_at_its_size() {
+        let fonts = MacTextSystem::new();
+        let helvetica = fonts.font_id(&font("Helvetica")).unwrap();
+        let bold = fonts
+            .font_id(&Font {
+                weight: FontWeight::BOLD,
+                ..font("Helvetica Neue")
+            })
+            .unwrap();
+        let run = |font_id, len, font_size| FontRun {
+            font_id,
+            len,
+            font_size,
+            line_height: None,
+        };
+        let layout = fonts.layout_line(
+            "aabb",
+            px(20.),
+            &[run(helvetica, 2, None), run(bold, 2, None)],
+        );
+        // The strut is the font of the first run, and a run in another font has its own box.
+        assert_eq!((layout.ascent, layout.descent), (px(18.), px(5.)));
+        assert_eq!(layout.runs.len(), 2);
+        assert_eq!((layout.runs[0].ascent, layout.runs[0].descent), (px(18.), px(5.)));
+        // Bold Helvetica Neue at 20px is 24px of content in Chrome.
+        assert_eq!((layout.runs[1].ascent, layout.runs[1].descent), (px(20.), px(4.)));
     }
 }

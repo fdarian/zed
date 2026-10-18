@@ -1667,6 +1667,7 @@ mod tests {
         word_break: WordBreak::Normal,
         overflow_wrap: OverflowWrap::BreakWord,
         text_wrap_style: TextWrapStyle::Auto,
+        strut_font: None,
     };
 
     #[cfg(target_os = "macos")]
@@ -1677,6 +1678,7 @@ mod tests {
         word_break: WordBreak::Normal,
         overflow_wrap: OverflowWrap::BreakWord,
         text_wrap_style: TextWrapStyle::Auto,
+        strut_font: None,
     };
 
     #[cfg(target_os = "macos")]

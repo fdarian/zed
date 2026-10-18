@@ -182,6 +182,7 @@ impl PlatformTextSystem for CosmicTextSystem {
                 origin: point(0.0, 0.0),
                 size: size(metrics.max_width, metrics.ascent + metrics.descent),
             },
+            widens_ascent: false,
         }
     }
 

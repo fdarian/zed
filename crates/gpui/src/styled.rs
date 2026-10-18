@@ -4,7 +4,7 @@ use crate::{
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontVariations,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
-    JustifyContent, Length, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
+    JustifyContent, Length, LineHeight, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
     StyleRefinement, TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace,
     px, relative, rems,
@@ -989,7 +989,7 @@ pub trait Styled: Sized {
     }
 
     /// Sets the line height of this element and its children.
-    fn line_height(mut self, line_height: impl Into<DefiniteLength>) -> Self {
+    fn line_height(mut self, line_height: impl Into<LineHeight>) -> Self {
         self.text_style().line_height = Some(line_height.into());
         self
     }

@@ -17,7 +17,7 @@ use std::{
 };
 
 use super::{
-    InlineRun, InlineSpec, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
+    InlineRun, InlineSpec, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
     apply_inline,
     resolve_placements,
 };
@@ -106,6 +106,10 @@ pub struct TextLayoutOptions {
     pub overflow_wrap: OverflowWrap,
     /// Which breaks a wrapped line is given among the ones that fit.
     pub text_wrap_style: TextWrapStyle,
+    /// The font of the element the text is in, whose ascent and descent are the strut of
+    /// every line: the content area every line has, whatever its runs are set in. `None`
+    /// leaves the strut to the font of the first run.
+    pub strut_font: Option<FontId>,
 }
 
 impl TextLayoutOptions {
@@ -346,8 +350,15 @@ impl LineRows {
 }
 
 impl LineLayout {
+    /// Whether the run is an inline box of its own in the line: it differs from the
+    /// strut in the size or the line height it was set with, or in the content area its
+    /// font has at that size, so the line is as tall as both together need.
     pub(crate) fn is_styled(&self, run: &ShapedRun) -> bool {
-        run.font_size != self.font_size || run.line_height.is_some() || !run.inline.is_default()
+        run.font_size != self.font_size
+            || run.line_height.is_some()
+            || run.ascent != self.ascent
+            || run.descent != self.descent
+            || !run.inline.is_default()
     }
 
     fn has_styled_runs(&self) -> bool {
@@ -373,10 +384,10 @@ impl LineLayout {
     /// tallest run aligned to its top or bottom.
     pub fn line_rows(&self, wrap_boundaries: &[WrapBoundary], line_height: Pixels) -> LineRows {
         let row_count = wrap_boundaries.len() + 1;
-        let half_leading = (line_height - self.ascent - self.descent) / 2.;
+        let (strut_above, strut_below) = extent_in_line(self.ascent, self.descent, line_height);
         let strut = RowMetrics {
             height: line_height,
-            baseline: half_leading + self.ascent,
+            baseline: strut_above,
         };
         if !self.has_styled_runs() {
             return LineRows {
@@ -385,8 +396,6 @@ impl LineLayout {
             };
         }
 
-        let strut_above = half_leading + self.ascent;
-        let strut_below = half_leading + self.descent;
         let mut above: SmallVec<[Pixels; 1]> = smallvec![strut_above; row_count];
         let mut below: SmallVec<[Pixels; 1]> = smallvec![strut_below; row_count];
         let mut top_height: SmallVec<[Pixels; 1]> = smallvec![Pixels::ZERO; row_count];
@@ -409,8 +418,7 @@ impl LineLayout {
             }
 
             let run_line_height = run.line_height.unwrap_or(line_height);
-            let run_above = run.ascent + (run_line_height - run.ascent - run.descent) / 2.;
-            let run_below = run_line_height - run_above;
+            let (run_above, run_below) = extent_in_line(run.ascent, run.descent, run_line_height);
             // The boxes of its aligned group around an atomic inline are one with it.
             let (run_above, run_below) = match run.inline.aligned_strut {
                 Some(strut) => (run_above.max(strut.above), run_below.max(strut.below)),
@@ -1764,6 +1772,7 @@ impl LineLayoutCache {
             } else {
                 TextWrapStyle::default()
             },
+            strut_font: options.strut_font,
         };
         let max_lines = max_lines.filter(|_| wrap_width.is_some());
         let key = &CacheKeyRef {
@@ -1798,7 +1807,14 @@ impl LineLayoutCache {
             drop(current_frame);
             AtomicTextCounters::add(&self.counters.wrapped_layouts);
             let text = SharedString::from(text);
-            let shaped_layout = self.layout_inline_line(&text, font_size, runs, inline, line_height);
+            let shaped_layout = self.layout_inline_line(
+                &text,
+                font_size,
+                runs,
+                inline,
+                line_height,
+                options.strut_font,
+            );
             let tab_stop = options
                 .tab_size
                 .map(|tab_size| self.tab_stop_resolver(tab_size, font_size));
@@ -1909,20 +1925,23 @@ impl LineLayoutCache {
         runs: &[FontRun],
         inline: &[InlineSpec],
         line_height: Pixels,
+        strut_font: Option<FontId>,
     ) -> Arc<LineLayout> {
         if inline.is_empty() {
-            return self.layout_line::<&SharedString>(text, font_size, runs, None);
+            return self.layout_line::<&SharedString>(text, font_size, runs, None, strut_font);
         }
         let shaped = if inline.iter().any(|spec| spec.atomic().is_some()) {
-            Arc::new(self.layout_line_with_atomics(text, font_size, runs, inline))
+            Arc::new(self.layout_line_with_atomics(text, font_size, runs, inline, strut_font))
         } else {
-            self.layout_line::<&SharedString>(text, font_size, runs, None)
+            self.layout_line::<&SharedString>(text, font_size, runs, None, strut_font)
         };
-        let x_height = runs.first().map_or(Pixels::ZERO, |run| {
-            self.platform_text_system
-                .font_metrics(run.font_id)
-                .x_height(run.font_size.unwrap_or(font_size))
-        });
+        let x_height = strut_font
+            .or_else(|| runs.first().map(|run| run.font_id))
+            .map_or(Pixels::ZERO, |font_id| {
+                self.platform_text_system
+                    .font_metrics(font_id)
+                    .x_height(font_size)
+            });
         let boxes = resolve_placements(
             inline,
             LineMetrics {
@@ -1946,6 +1965,7 @@ impl LineLayoutCache {
         font_size: Pixels,
         runs: &[FontRun],
         inline: &[InlineSpec],
+        strut_font: Option<FontId>,
     ) -> LineLayout {
         let mut layout_runs: Vec<ShapedRun> = Vec::new();
         let mut x = Pixels::ZERO;
@@ -1970,6 +1990,7 @@ impl LineLayoutCache {
                 font_size,
                 segment,
                 None,
+                strut_font,
             );
             for run in &shaped.runs {
                 layout_runs.push(ShapedRun {
@@ -2009,9 +2030,12 @@ impl LineLayoutCache {
                         &mut descent,
                     );
                     let run_size = run.font_size.unwrap_or(font_size);
-                    let metrics = self.platform_text_system.font_metrics(run.font_id);
-                    ascent = ascent.max(metrics.ascent(font_size));
-                    descent = descent.max(-metrics.descent(font_size));
+                    let strut = self
+                        .platform_text_system
+                        .font_metrics(strut_font.unwrap_or(run.font_id))
+                        .line_box(font_size);
+                    ascent = ascent.max(strut.ascent);
+                    descent = descent.max(strut.descent);
                     layout_runs.push(ShapedRun {
                         font_id: run.font_id,
                         font_size: run_size,
@@ -2063,11 +2087,16 @@ impl LineLayoutCache {
         font_size: Pixels,
         runs: &[FontRun],
         force_width: Option<Pixels>,
+        strut_font: Option<FontId>,
     ) -> Arc<LineLayout>
     where
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        let options = TextLayoutOptions {
+            strut_font,
+            ..TextLayoutOptions::default()
+        };
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
@@ -2075,7 +2104,7 @@ impl LineLayoutCache {
             wrap_width: None,
             max_lines: None,
             force_width,
-            options: TextLayoutOptions::default(),
+            options,
             insets: &[],
             inline: &[],
             line_height: Pixels::ZERO,
@@ -2099,6 +2128,14 @@ impl LineLayoutCache {
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            if let Some(strut_font) = strut_font {
+                let strut = self
+                    .platform_text_system
+                    .font_metrics(strut_font)
+                    .line_box(font_size);
+                layout.ascent = strut.ascent;
+                layout.descent = strut.descent;
+            }
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -2111,7 +2148,7 @@ impl LineLayoutCache {
                 wrap_width: None,
                 max_lines: None,
                 force_width,
-                options: TextLayoutOptions::default(),
+                options,
                 insets: Box::default(),
                 inline: Box::default(),
                 line_height: Pixels::ZERO,
@@ -4072,15 +4109,14 @@ mod tests {
 
         fn strut(layout: &WrappedLineLayout) -> RowMetrics {
             let line_height = px(LINE_HEIGHT);
-            let half_leading = (line_height - layout.ascent() - layout.descent()) / 2.;
             RowMetrics {
                 height: line_height,
-                baseline: half_leading + layout.ascent(),
+                baseline: crate::extent_in_line(layout.ascent(), layout.descent(), line_height).0,
             }
         }
 
         fn above(run: &ShapedRun, line_height: Pixels) -> Pixels {
-            run.ascent + (line_height - run.ascent - run.descent) / 2.
+            crate::extent_in_line(run.ascent, run.descent, line_height).0
         }
 
         /// "aaaa " plain, "bbbb " big, "cc dd": plain "cc " and big "dd", which wraps into
@@ -4456,3 +4492,77 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod line_box_tests {
+    use super::*;
+
+    fn run(ascent: f32, descent: f32, line_height: Option<f32>) -> ShapedRun {
+        ShapedRun {
+            font_id: FontId(0),
+            font_size: px(20.),
+            ascent: px(ascent),
+            descent: px(descent),
+            line_height: line_height.map(px),
+            glyphs: vec![ShapedGlyph {
+                id: crate::GlyphId(0),
+                position: point(px(0.), px(0.)),
+                index: 0,
+                is_emoji: false,
+            }],
+            inline: InlineRun::default(),
+        }
+    }
+
+    fn layout(runs: Vec<ShapedRun>) -> LineLayout {
+        LineLayout {
+            font_size: px(20.),
+            width: px(10.),
+            ascent: px(19.),
+            descent: px(4.),
+            runs,
+            len: 1,
+        }
+    }
+
+    #[test]
+    fn test_a_run_with_the_content_area_of_the_strut_is_not_a_box_of_its_own() {
+        let layout = layout(vec![run(19., 4., None)]);
+        assert!(!layout.is_styled(&layout.runs[0]));
+        // The half-leading is 0.5px, floored: the strut is 19px above the baseline.
+        assert_eq!(
+            layout.rows(&[], px(24.)).as_slice(),
+            [RowMetrics {
+                height: px(24.),
+                baseline: px(19.)
+            }]
+        );
+    }
+
+    /// Bold Helvetica Neue at 20px (a content area of 20 and 4) beside regular Helvetica Neue
+    /// (19 and 4), in a line of 24px: Chrome makes the line 25px tall,
+    /// `mixed.helvetica-neue.reg20-bold20.24px`.
+    #[test]
+    fn test_a_run_whose_font_has_another_content_area_is_a_box_of_its_own() {
+        let layout = layout(vec![run(19., 4., None), run(20., 4., None)]);
+        assert!(layout.is_styled(&layout.runs[1]));
+        // The strut reaches 19 above the baseline and 5 below, the bold run 20 and 4.
+        assert_eq!(
+            layout.rows(&[], px(24.)).as_slice(),
+            [RowMetrics {
+                height: px(25.),
+                baseline: px(20.)
+            }]
+        );
+    }
+
+    #[test]
+    fn test_the_strut_is_not_grown_by_the_font_of_a_run() {
+        let mut layout = layout(vec![run(20., 4., None)]);
+        layout.ascent = px(19.);
+        layout.descent = px(4.);
+        // Only the run has glyphs, but the strut is still the line's font.
+        assert_eq!(layout.rows(&[], px(24.))[0].height, px(25.));
+    }
+}
+

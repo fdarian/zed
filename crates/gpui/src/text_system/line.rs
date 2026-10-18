@@ -1,7 +1,7 @@
 use crate::{
     App, Bounds, DecorationThickness, DevicePixels, ExtraDecoration, FontId, GlyphInset, Half, Hsla, LineLayout,
     OverlineStyle, Pixels, Point, RenderGlyphParams, Result, ShapedRun, SharedString,
-    StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
+    StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary, extent_in_line,
     WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
@@ -1103,12 +1103,12 @@ fn strikethrough_offset(layout: &LineLayout, run: &ShapedRun, line_height: Pixel
         let run_line_height = run.line_height.unwrap_or(line_height);
         (
             run.ascent,
-            run.ascent + (run_line_height - run.ascent - run.descent) / 2.,
+            extent_in_line(run.ascent, run.descent, run_line_height).0,
         )
     } else {
         (
             layout.ascent,
-            (line_height - layout.ascent - layout.descent) / 2. + layout.ascent,
+            extent_in_line(layout.ascent, layout.descent, line_height).0,
         )
     };
     ((ascent * 0.5) + baseline) * 0.5 - baseline
