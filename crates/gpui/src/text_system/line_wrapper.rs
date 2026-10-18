@@ -187,7 +187,7 @@ impl LineWrapper {
                     let char_width = self.width_at(ix, c, styles);
                     width += char_width;
 
-                    if width.floor() > truncate_width {
+                    if crate::util::overflows(width, truncate_width) {
                         return Some(truncate_ix);
                     }
                 }
@@ -203,7 +203,7 @@ impl LineWrapper {
                     let char_width = self.width_at(ix, c, styles);
                     width += char_width;
 
-                    if width.floor() > truncate_width {
+                    if crate::util::overflows(width, truncate_width) {
                         return Some(truncate_ix);
                     }
                 }
@@ -265,7 +265,7 @@ impl LineWrapper {
             total_width += self.width_at(ix, c, styles);
         }
 
-        if total_width <= truncate_width {
+        if !crate::util::overflows(total_width, truncate_width) {
             return None;
         }
 

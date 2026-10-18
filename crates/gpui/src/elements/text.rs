@@ -1052,7 +1052,7 @@ impl TextLayout {
                             )?;
                             if unclipped
                                 .iter()
-                                .all(|line| line.size(line_height).width <= flat_width)
+                                .all(|line| !crate::util::overflows(line.size(line_height).width, flat_width))
                             {
                                 // The truncation below sums per-character advances,
                                 // which overestimates the shaped width (no kerning), cutting
