@@ -1202,6 +1202,10 @@ pub(crate) struct LiftedElement {
     /// Whether `content_mask` is cut from the region of the subtree being recorded in one, as the
     /// masks inside the subtree are, and so is cut by the content mask where the recording is put.
     derived_mask: bool,
+    /// The content mask the recording that handed the element to this context is put under, when
+    /// it was recorded in a region: what the element paints under masks cut from the region is
+    /// cut by it.
+    cut: Option<ContentMask<Pixels>>,
     image_cache: Option<AnyImageCache>,
     /// Set when the element is a retained subtree that paints itself from its own recording,
     /// which the recording of a subtree around it can then do without, see [`Hole`].
@@ -1729,6 +1733,10 @@ pub struct Window {
     exact_clips: Option<Rc<ExactClips>>,
     /// What the children of each positioned element see, innermost last. Only prepaint reads it.
     pub(crate) positioned_frames: Vec<PositionedFrame>,
+    /// The content mask around the place a recording made in a region is put, while an element it
+    /// handed to a stacking context outside is painted: the masks cut from the region that this
+    /// paints under are cut by it, as a replay would cut them.
+    paint_cut: Option<ContentMask<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
     effect_groups_forced: bool,
     /// The elements lifted into each stacking context being prepainted, innermost last. `None`
@@ -2477,6 +2485,7 @@ impl Window {
             escapes_prepainted: 0,
             exact_clips: None,
             positioned_frames: Vec::new(),
+            paint_cut: None,
             #[cfg(any(test, feature = "test-support"))]
             effect_groups_forced: false,
             lift_lists: Vec::new(),
@@ -5452,6 +5461,7 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
+        let mask = self.cut_derived(mask, derived);
         self.next_frame.scene.begin_replaced(derived);
         self.content_mask_stack.push(mask);
         self.begin_escaped_prepaint(derived);
@@ -5460,6 +5470,13 @@ impl Window {
         self.content_mask_stack.pop();
         self.next_frame.scene.end_replaced();
         result
+    }
+
+    fn cut_derived(&self, mask: ContentMask<Pixels>, derived: bool) -> ContentMask<Pixels> {
+        match self.paint_cut {
+            Some(cut) if derived => mask.intersect(&cut),
+            _ => mask,
+        }
     }
 
     /// Like [`Window::with_replaced_content_mask`] for the paint of a box that escaped its
@@ -5474,6 +5491,7 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let scale_factor = self.scale_factor();
+        let mask = self.cut_derived(mask, derived);
         self.next_frame.scene.begin_replaced(derived);
         self.next_frame.scene.widen_groups(ContentMask {
             bounds: self.cover_bounds(mask.bounds),
@@ -5630,6 +5648,7 @@ impl Window {
             context: PaintContext::capture(self),
             content_mask: self.content_mask(),
             derived_mask: self.content_mask_is_derived(),
+            cut: None,
             image_cache: self.image_cache_stack.last().cloned(),
             hole,
             owners: if cell.is_some() { owners } else { SmallVec::new() },
@@ -5711,6 +5730,7 @@ impl Window {
         let visibility = entry.context.visibility;
         let content_mask = entry.content_mask;
         let derived_mask = entry.derived_mask;
+        let outer_cut = entry.cut.map(|cut| self.paint_cut.replace(cut));
         let image_cache = entry.image_cache.take();
         let content = &mut entry.content;
         let cell = entry.cell.as_deref();
@@ -5736,6 +5756,9 @@ impl Window {
                 })
             })
         });
+        if let Some(outer_cut) = outer_cut {
+            self.paint_cut = outer_cut;
+        }
         mem::swap(
             &mut self.element_id_stack,
             &mut entry.context.element_id_stack,

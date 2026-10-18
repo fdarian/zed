@@ -1369,6 +1369,7 @@ impl Window {
             if entry.derived_mask {
                 entry.content_mask = entry.content_mask.intersect(surroundings);
             }
+            entry.cut = Some(*surroundings);
         }
     }
 
@@ -1476,6 +1477,7 @@ impl Window {
                 content_mask: stub.content_mask,
                 // A recording made in a region hands nothing to a context outside.
                 derived_mask: false,
+                cut: None,
                 image_cache: stub.image_cache.clone(),
                 hole,
                 cell,
