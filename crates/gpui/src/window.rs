@@ -4479,7 +4479,7 @@ impl Window {
         self.draw_pass = 0;
         // What the first pass left of the subtrees it replayed, while the pass that builds every
         // subtree runs in its place for the comparison.
-        let mut shown: Option<(Vec<(GlobalElementId, TypeId)>, Vec<String>, String, String)> = None;
+        let mut shown: Option<(Vec<(GlobalElementId, TypeId)>, Vec<String>, String, String, bool)> = None;
         loop {
             if shown.is_none() {
                 self.draw_pass += 1;
@@ -4487,13 +4487,14 @@ impl Window {
             self.redraw_before_present = false;
             self.retained.replayed.clear();
             self.retained.recorded_relocatably = 0;
+            self.retained.relocated_replays = 0;
             if self.build_pass(cx) {
                 match shown.take() {
-                    Some((subtrees, shown, registries, frame)) => {
+                    Some((subtrees, shown, registries, frame, relocated)) => {
                         // The registries are described by what the pass that built them left.
                         let built = self.describe_replayed(&subtrees);
                         let built_registries = self.describe_registries();
-                        let built_frame = self.describe_frame();
+                        let built_frame = self.describe_frame(relocated);
                         self.retained.reference = false;
                         self.compare_with_reference(
                             &subtrees,
@@ -4516,7 +4517,8 @@ impl Window {
                     {
                         let subtrees = std::mem::take(&mut self.retained.replayed);
                         let described = self.describe_replayed(&subtrees);
-                        shown = Some((subtrees, described, self.describe_registries(), self.describe_frame()));
+                        let relocated = self.retained.relocated_replays > 0;
+                        shown = Some((subtrees, described, self.describe_registries(), self.describe_frame(relocated), relocated));
                         self.discard_pass(cx);
                         self.retained.reference = true;
                         continue;

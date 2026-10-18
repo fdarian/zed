@@ -269,6 +269,8 @@ pub(crate) struct RetainedWindow {
     pub(crate) relocation: Option<Relocation>,
     /// How many relocatable subtrees the pass being built recorded, to be put elsewhere.
     pub(crate) recorded_relocatably: u32,
+    /// How many recordings made in a region were put into the pass being built.
+    pub(crate) relocated_replays: u32,
     // Counts of what a recording cannot move, which tick through a shared reference: they are
     // noted where the window is only read.
     pub(crate) sticky: Cell<u32>,
@@ -1947,6 +1949,7 @@ impl Window {
     /// Puts the `operations` a relocatable subtree recorded into the scene, `delta` away from where
     /// they were recorded, inside the content mask that is around now.
     pub(crate) fn emit_relocated(&mut self, operations: &[PaintOperation], delta: Point<Pixels>) {
+        self.retained.relocated_replays += 1;
         let scale_factor = self.scale_factor;
         let ambient = self.content_mask();
         let clip = ReplayClip {
@@ -2183,7 +2186,12 @@ impl Window {
     /// the order they were asked for. What each subtree that replayed left is compared on its own
     /// without the order it left it in, which this checks. A pass that only lays out has none of
     /// it. What the pointer cannot reach is left out.
-    pub(crate) fn describe_frame(&self) -> String {
+    ///
+    /// `relocated` says that a recording made in a region was put into the pass: it holds what lies
+    /// between the content mask around it and the region too, so that it has the groups that hold
+    /// nothing there and the mouse listeners of the boxes there that a build leaves out as culled,
+    /// which nothing can hit.
+    pub(crate) fn describe_frame(&self, relocated: bool) -> String {
         use std::fmt::Write as _;
 
         if self.layout_only || self.retained.skip_whole_frame {
@@ -2191,6 +2199,9 @@ impl Window {
         }
         let frame = &self.next_frame;
         let mut out = strip_draw_orders(&frame.scene.describe_drawn());
+        if relocated {
+            out = strip_empty_groups(&out);
+        }
         let name = |id: HitboxId| {
             frame
                 .hitboxes
@@ -2211,14 +2222,24 @@ impl Window {
             writeln!(out, "tab stop {operation:?}").ok();
         }
         out.push_str(&frame.dispatch_tree.describe());
-        writeln!(
-            out,
-            "listeners {} {} handlers {}",
-            frame.mouse_listeners.iter().flatten().count(),
-            frame.root_key_listeners.iter().flatten().count(),
-            frame.input_handlers.iter().flatten().count(),
-        )
-        .ok();
+        if relocated {
+            writeln!(
+                out,
+                "listeners {} handlers {}",
+                frame.root_key_listeners.iter().flatten().count(),
+                frame.input_handlers.iter().flatten().count(),
+            )
+            .ok();
+        } else {
+            writeln!(
+                out,
+                "listeners {} {} handlers {}",
+                frame.mouse_listeners.iter().flatten().count(),
+                frame.root_key_listeners.iter().flatten().count(),
+                frame.input_handlers.iter().flatten().count(),
+            )
+            .ok();
+        }
         if self.a11y.is_active() {
             out.push_str(&self.a11y.describe_whole());
         }

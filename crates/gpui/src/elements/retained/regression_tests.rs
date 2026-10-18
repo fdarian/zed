@@ -112,6 +112,27 @@ impl Node {
         }
     }
 
+    /// The Rust that builds this node with `Node::plain` and `Node::with`, for a test of the page.
+    fn code(&self) -> String {
+        let plain = Node::plain(self.id, self.width, self.height);
+        let mut fields = String::new();
+        macro_rules! differs {
+            ($($field:ident),*) => {$(
+                if self.$field != plain.$field {
+                    fields += &format!("{}: {:?}, ", stringify!($field), self.$field);
+                }
+            )*};
+        }
+        differs!(color, row, padding, clip, rounded, fade, text, clickable, labelled, focusable, retain, absolute, stacking, escaping, relative, grouped, relocatable, cullable);
+        let base = format!("Node {{ {fields}..Node::plain({}, {}, {}) }}", self.id, self.width, self.height);
+        if self.children.is_empty() {
+            base
+        } else {
+            let children: Vec<String> = self.children.iter().map(Node::code).collect();
+            format!("{base}.with(vec![{}])", children.join(", "))
+        }
+    }
+
     fn lifts(&self) -> bool {
         self.absolute.is_some() || self.relative.is_some() || self.children.iter().any(Node::lifts)
     }
@@ -909,6 +930,18 @@ fn run(mut rng: StdRng, cx: &mut TestAppContext, scrolling: bool, verify: bool) 
                 }
             }
         }
+        let last = small.steps.last().unwrap();
+        dump.push_str(&format!(
+            "replays_like_a_build(cx, Page {{ gap: {:?}, context: {}, height: {:?}, scale: {:?}, read: {}, idle: {}, ..Page::default() }}, vec![{}], &[{}]);\n",
+            last.gap,
+            last.context,
+            last.page_height,
+            small.scale,
+            last.read,
+            last.idle,
+            last.trees.iter().map(Node::code).collect::<Vec<_>>().join(", "),
+            small.steps.iter().map(|step| format!("{:?}", step.offset)).collect::<Vec<_>>().join(", "),
+        ));
         panic!(
             "failed at step {index} of {} (scale {}), shrunk to {} steps, fails at {small_index} scale {}:\n{dump}\n{small_difference}",
             script.steps.len(),
@@ -2060,25 +2093,41 @@ impl Node {
     }
 }
 
-/// Plays a page of these trees, scrolled to each offset in turn, with a read before each frame.
-fn replays_like_a_build(cx: &mut TestAppContext, trees: Vec<Node>, offsets: &[f32]) {
+/// The page the trees of a test are in.
+struct Page {
+    gap: f32,
+    context: bool,
+    height: f32,
+    scale: f32,
+    read: bool,
+    idle: bool,
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Page { gap: 7., context: false, height: 300., scale: 1., read: true, idle: false }
+    }
+}
+
+/// Plays a page of these trees, scrolled to each offset in turn, with and without the verifier.
+fn replays_like_a_build(cx: &mut TestAppContext, page: Page, trees: Vec<Node>, offsets: &[f32]) {
     let steps = offsets
         .iter()
         .map(|offset| StepData {
             trees: trees.clone(),
-            gap: 7.,
-            context: false,
-            page_height: 300.,
+            gap: page.gap,
+            context: page.context,
+            page_height: page.height,
             offset: *offset,
-            read: true,
-            idle: false,
+            read: page.read,
+            idle: page.idle,
             abandon: false,
             inner: None,
-            scale: 1.,
+            scale: page.scale,
             rem: 16.,
         })
         .collect();
-    let script = Script { scale: 1., steps };
+    let script = Script { scale: page.scale, steps };
     for verify in [true, false] {
         if let Some((step, difference)) = play(cx, &script, verify) {
             panic!("verify {verify}, step {step}: {difference}");
@@ -2097,5 +2146,16 @@ fn rounded_relocatable_root_with_escaping_boxes_is_replayed_as_built(cx: &mut Te
     let pad = Node { escaping: true, padding: 6, ..Node::plain(57, 0, 0) };
     let root = Node { rounded: true, relocatable: true, ..Node::plain(47, 60, 0) }
         .with(vec![Node { row: true, ..Node::plain(48, 36, 14) }, pad, context]);
-    replays_like_a_build(cx, vec![Node::plain(1, 22, 253), root], &[3.65, 3.65]);
+    replays_like_a_build(cx, Page::default(), vec![Node::plain(1, 22, 253), root], &[3.65, 3.65]);
+}
+
+/// A recording made in a region holds the boxes between the clip around it and the region that
+/// a build culls: their listeners, which nothing can hit, and the groups that hold nothing there.
+/// The frame that replays them is the same as the build for everything that shows or is hit.
+#[gpui::test]
+fn culled_boxes_in_a_relocatable_root_replay_as_built(cx: &mut TestAppContext) {
+    // A clickable box in the root, a focusable one in a lifted box, and a group left empty.
+    replays_like_a_build(cx, Page { gap: 120.0, context: false, height: 250.5, scale: 1.0, read: true, idle: false, ..Page::default() }, vec![Node { color: 5, row: true, escaping: true, ..Node::plain(0, 14, 60) }, Node { color: 5, row: true, ..Node::plain(22, 36, 60) }, Node { color: 4, escaping: true, ..Node::plain(34, 0, 100) }, Node { color: 4, row: true, relocatable: true, ..Node::plain(40, 60, 22) }.with(vec![Node { color: 2, clickable: true, cullable: true, ..Node::plain(54, 60, 60) }])], &[0.0]);
+    replays_like_a_build(cx, Page { gap: 30.0, context: false, height: 250.5, scale: 1.0, read: true, idle: true, ..Page::default() }, vec![Node { row: true, relocatable: true, ..Node::plain(0, 36, 36) }.with(vec![Node { color: 2, row: true, relative: Some(0), ..Node::plain(2, 0, 100) }.with(vec![Node { color: 0, row: true, ..Node::plain(3, 60, 36) }.with(vec![Node { color: 3, row: true, focusable: true, cullable: true, ..Node::plain(4, 100, 14) }])])]), Node { color: 5, ..Node::plain(7, 100, 22) }, Node { ..Node::plain(8, 14, 60) }, Node { color: 5, row: true, ..Node::plain(21, 0, 22) }, Node { color: 0, row: true, ..Node::plain(22, 0, 100) }, Node { color: 0, row: true, escaping: true, ..Node::plain(32, 100, 14) }, Node { color: 2, ..Node::plain(46, 0, 22) }, Node { color: 5, ..Node::plain(47, 0, 0) }.with(vec![Node { color: 4, ..Node::plain(48, 22, 60) }, Node { color: 2, row: true, ..Node::plain(52, 14, 100) }, Node { color: 3, ..Node::plain(58, 22, 0) }.with(vec![Node { row: true, ..Node::plain(59, 36, 36) }])])], &[580.49994]);
+    replays_like_a_build(cx, Page { gap: 30.0, context: false, height: 300.0, scale: 2.0, read: false, idle: true, ..Page::default() }, vec![Node { color: 5, row: true, escaping: true, relocatable: true, ..Node::plain(0, 36, 100) }.with(vec![Node { color: 4, row: true, absolute: Some((23, 36, 2)), ..Node::plain(8, 100, 60) }.with(vec![Node { color: 2, row: true, cullable: true, ..Node::plain(9, 14, 36) }.with(vec![Node { color: 2, row: true, fade: true, escaping: true, ..Node::plain(10, 22, 22) }])])]), Node { color: 0, ..Node::plain(14, 36, 36) }, Node { color: 3, ..Node::plain(19, 14, 100) }, Node { color: 2, row: true, escaping: true, ..Node::plain(34, 22, 36) }, Node { color: 2, ..Node::plain(36, 14, 100) }, Node { color: 3, row: true, ..Node::plain(53, 14, 36) }, Node { color: 2, escaping: true, ..Node::plain(62, 60, 100) }, Node { color: 0, text: Some(1), ..Node::plain(66, 36, 0) }], &[823.35]);
 }
