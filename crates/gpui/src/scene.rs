@@ -813,12 +813,15 @@ impl Scene {
         let hidden = mem::take(&mut self.hidden);
         // The masks that replaced the one around them in the recording are not cut by the one
         // around the place the recording is put, unless they were cut from the masks inside it.
-        let mut replaced: Vec<bool> = Vec::new();
-        let mut unclipped_depth = 0usize;
+        // Whether what is put now is cut by `clip`: inside a mask that replaced the one around
+        // it, until one that was cut from the masks inside the recording (a box handed to a
+        // stacking context inside it, painted under the mask it was handed over with) replaces
+        // that in turn.
+        let mut clipping: Vec<bool> = Vec::new();
         // Whether each layer open was skipped, as a painter skips one that is clipped away.
         let mut layers: Vec<bool> = Vec::new();
         for operation in operations {
-            let clipped = unclipped_depth == 0;
+            let clipped = clipping.last().copied().unwrap_or(true);
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
@@ -894,16 +897,11 @@ impl Scene {
                 PaintOperation::StartTextClip => self.start_text_clip(),
                 PaintOperation::EndTextClip => self.end_text_clip(),
                 PaintOperation::Replaced { derived } => {
-                    replaced.push(*derived);
-                    if !*derived {
-                        unclipped_depth += 1;
-                    }
+                    clipping.push(*derived);
                     self.begin_replaced(*derived);
                 }
                 PaintOperation::EndReplaced => {
-                    if replaced.pop() == Some(false) {
-                        unclipped_depth -= 1;
-                    }
+                    clipping.pop();
                     self.end_replaced();
                 }
             }
