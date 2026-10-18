@@ -1224,7 +1224,7 @@ pub(crate) struct ReplayClip {
 /// stays where the result still has the corner.
 fn clip_mask(mask: &mut ContentMask<ScaledPixels>, clip: &Bounds<ScaledPixels>) {
     let bounds = mask.bounds.intersect(clip);
-    let keep = |anchor: Anchor| mask.bounds.corner(anchor) == bounds.corner(anchor);
+    let keep = |anchor: Anchor| !bounds.is_empty() && mask.bounds.corner(anchor) == bounds.corner(anchor);
     let radii = |corners: &Corners<ScaledPixels>| Corners {
         top_left: if keep(Anchor::TopLeft) { corners.top_left } else { ScaledPixels(0.) },
         top_right: if keep(Anchor::TopRight) { corners.top_right } else { ScaledPixels(0.) },

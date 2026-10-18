@@ -2832,9 +2832,11 @@ impl ContentMask<Pixels> {
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
         // The horizontal and vertical radius of a corner, `None` unless the mask has the corner
-        // where the result has it.
+        // where the result has it. A result that shows nothing has no corners, wherever the
+        // empty intersection lies: cutting a mask in two steps leaves it somewhere else than
+        // cutting it in one.
         let radius = |mask: &Self, anchor: Anchor| {
-            (mask.bounds.corner(anchor) == bounds.corner(anchor)).then(|| {
+            (!bounds.is_empty() && mask.bounds.corner(anchor) == bounds.corner(anchor)).then(|| {
                 let horizontal = mask.corner_radii.corner(anchor);
                 let vertical = mask.corner_radii_y.corner(anchor);
                 (horizontal, if vertical == Pixels::ZERO { horizontal } else { vertical })
