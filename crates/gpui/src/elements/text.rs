@@ -1,5 +1,5 @@
 use crate::{
-    ActiveTooltip, AnyView, App, AtomicCarry, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
+    ActiveTooltip, floor_to_layout_unit, AnyView, App, AtomicCarry, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
     DispatchPhase, Element, ElementId, EndTruncation, GlobalElementId, GlyphInset,
     HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId, MeasuredLeaf,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
@@ -857,8 +857,9 @@ impl TextLayout {
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height =
-            window.pixel_snap(window.text_system().line_height(&text_style, window.rem_size()));
+        let line_height = floor_to_layout_unit(
+            window.text_system().line_height(&text_style, window.rem_size()),
+        );
         let options = text_style.layout_options(window.text_system());
 
         let runs = if let Some(runs) = runs {
@@ -2259,7 +2260,7 @@ mod tests {
 
             let layout = laid_out(cx, BOTH);
             let line = &layout.line_layouts()[0];
-            let baseline = (px(24.) - line.ascent() - line.descent()) / 2. + line.ascent();
+            let baseline = crate::extent_in_line(line.ascent(), line.descent(), px(24.)).0;
             let bounds = layout.bounds();
             // The box is the cap height to the layout unit; its edges are snapped to device pixels.
             assert!((bounds.size.height - cap).abs() <= px(0.5));
