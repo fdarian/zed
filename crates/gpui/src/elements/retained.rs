@@ -476,8 +476,10 @@ impl Element for Retained {
         let outer_scope = std::mem::replace(&mut window.layout_scope, global_id.scope_hash());
         let result = self.prepaint_in_scope(global_id, bounds, request_layout, window, cx);
         window.layout_scope = outer_scope;
-        // The parent hands this subtree to the stacking context around it once this returns.
-        if self.lift_z.is_some() && self.overscan.is_none() && window.lifting() {
+        // The parent hands this subtree to the stacking context around it once this returns, unless
+        // it is in a culled subtree, where nothing is handed over: the next element that is would
+        // take this one for the subtree it hands over.
+        if self.lift_z.is_some() && self.overscan.is_none() && window.lifting() && !window.is_culling() {
             let recorded = match &result {
                 RetainedPrepaint::Replayed => !window.is_layout_pass(),
                 RetainedPrepaint::Built { record, .. } => *record,

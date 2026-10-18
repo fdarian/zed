@@ -786,6 +786,19 @@ fn play(cx: &mut TestAppContext, script: &Script, verify: bool) -> Option<(usize
     None
 }
 
+/// [`play`], where a panic is a failure like a difference is: the step it was in is not known.
+fn play_catching(cx: &mut TestAppContext, script: &Script, verify: bool) -> Option<(usize, String)> {
+    let played = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| play(cx, script, verify)));
+    played.unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_owned()))
+            .unwrap_or_else(|| "a panic".to_owned());
+        Some((script.steps.len(), format!("panicked: {message}")))
+    })
+}
+
 fn remove_node(node: &mut Node, id: usize) -> bool {
     if let Some(at) = node.children.iter().position(|child| child.id == id) {
         node.children.remove(at);
@@ -811,10 +824,10 @@ fn map_node(node: &mut Node, id: usize, f: &dyn Fn(&mut Node)) {
 }
 
 fn shrink(cx: &mut TestAppContext, mut script: Script, verify: bool) -> Script {
-    let fails = |cx: &mut TestAppContext, script: &Script| !script.steps.is_empty() && play(cx, script, verify).is_some();
+    let fails = |cx: &mut TestAppContext, script: &Script| !script.steps.is_empty() && play_catching(cx, script, verify).is_some();
     loop {
         let mut changed = false;
-        if let Some((index, _)) = play(cx, &script, verify) {
+        if let Some((index, _)) = play_catching(cx, &script, verify) {
             if index + 1 < script.steps.len() {
                 script.steps.truncate(index + 1);
                 changed = true;
@@ -907,12 +920,15 @@ fn shrink(cx: &mut TestAppContext, mut script: Script, verify: bool) -> Script {
 
 fn run(mut rng: StdRng, cx: &mut TestAppContext, scrolling: bool, verify: bool) {
     let script = script(&mut rng, scrolling);
-    if let Some((index, difference)) = play(cx, &script, verify) {
-        if std::env::var("RETAINED_FUZZ_NOSHRINK").is_ok() {
+    // Without shrinking a panic is not caught, to show where it is from.
+    let shrinking = std::env::var("RETAINED_FUZZ_NOSHRINK").is_err();
+    let failure = if shrinking { play_catching(cx, &script, verify) } else { play(cx, &script, verify) };
+    if let Some((index, difference)) = failure {
+        if !shrinking {
             panic!("step {index} scale {}: {difference}", script.scale);
         }
         let small = shrink(cx, script.clone(), verify);
-        let (small_index, small_difference) = play(cx, &small, verify).expect("the shrunk script fails");
+        let (small_index, small_difference) = play_catching(cx, &small, verify).expect("the shrunk script fails");
         let mut dump = String::new();
         for (at, step) in small.steps.iter().enumerate() {
             dump.push_str(&format!(
@@ -2182,4 +2198,12 @@ fn effect_groups_in_culled_boxes_of_a_relocatable_root_replay_as_built(cx: &mut 
     replays_like_a_build(cx, Page { gap: 120.0, context: false, height: 180.0, scale: 2.0, read: false, idle: true, ..Page::default() }, vec![Node { color: 4, escaping: true, ..Node::plain(0, 14, 100) }, Node { color: 5, ..Node::plain(1, 22, 14) }, Node { color: 2, row: true, ..Node::plain(9, 0, 36) }, Node { color: 0, ..Node::plain(10, 22, 14) }, Node { escaping: true, ..Node::plain(25, 22, 36) }, Node { row: true, escaping: true, cullable: true, ..Node::plain(40, 60, 22) }, Node { color: 5, row: true, escaping: true, relocatable: true, ..Node::plain(55, 14, 36) }.with(vec![Node { color: 3, absolute: Some((14, 7, 2)), ..Node::plain(67, 100, 100) }.with(vec![Node { color: 2, cullable: true, ..Node::plain(69, 22, 22) }.with(vec![Node { color: 3, row: true, fade: true, absolute: Some((32, 10, 0)), escaping: true, ..Node::plain(71, 36, 22) }])])])], &[438.73004]);
     replays_like_a_build(cx, Page { gap: 30.0, context: false, height: 300.0, scale: 2.0, read: false, idle: true, ..Page::default() }, vec![Node { color: 5, row: true, stacking: true, escaping: true, relocatable: true, ..Node::plain(0, 36, 100) }.with(vec![Node { color: 4, row: true, absolute: Some((23, 36, 2)), ..Node::plain(8, 100, 60) }.with(vec![Node { color: 2, row: true, cullable: true, ..Node::plain(9, 14, 36) }.with(vec![Node { color: 2, row: true, fade: true, escaping: true, ..Node::plain(10, 22, 22) }])])]), Node { color: 0, ..Node::plain(14, 36, 36) }, Node { color: 3, ..Node::plain(19, 14, 100) }, Node { color: 2, row: true, escaping: true, ..Node::plain(34, 22, 36) }, Node { color: 2, ..Node::plain(36, 14, 100) }, Node { color: 3, row: true, ..Node::plain(53, 14, 36) }, Node { color: 2, escaping: true, ..Node::plain(62, 60, 100) }, Node { color: 0, text: Some(1), ..Node::plain(66, 36, 0) }], &[823.35]);
     replays_like_a_build(cx, Page { gap: 120.0, context: false, height: 180.0, scale: 2.0, read: false, idle: true, ..Page::default() }, vec![Node { row: true, cullable: true, ..Node::plain(0, 36, 14) }, Node { ..Node::plain(6, 22, 60) }, Node { color: 2, ..Node::plain(9, 0, 60) }, Node { color: 0, ..Node::plain(22, 100, 14) }, Node { color: 4, row: true, relocatable: true, ..Node::plain(32, 36, 22) }.with(vec![Node { color: 2, row: true, cullable: true, ..Node::plain(34, 0, 22) }.with(vec![Node { fade: true, absolute: Some((26, 12, 1)), escaping: true, ..Node::plain(35, 36, 22) }])])], &[107.450005]);
+}
+
+#[gpui::test]
+fn lifted_retained_root_in_a_culled_box_is_not_taken_for_the_hole_of_its_lifted_ancestor(cx: &mut TestAppContext) {
+    // 15 is lifted, 21 below it is culled, and 22 below that is a retained root with a z-index:
+    // nothing is handed over in a culled box, so the recording of 15 has no hole.
+    replays_like_a_build(cx, Page { gap: 120.0, context: true, height: 300.0, scale: 1.0, read: false, idle: true, ..Page::default() }, vec![Node { color: 5, escaping: true, cullable: true, ..Node::plain(14, 22, 22) }.with(vec![Node { color: 0, row: true, relative: Some(1), ..Node::plain(15, 60, 14) }.with(vec![Node { escaping: true, cullable: true, ..Node::plain(21, 60, 36) }.with(vec![Node { color: 0, row: true, retain: true, relative: Some(-1), ..Node::plain(22, 100, 60) }])])]), Node { color: 2, escaping: true, ..Node::plain(25, 0, 22) }, Node { color: 4, row: true, ..Node::plain(43, 100, 100) }, Node { color: 0, escaping: true, ..Node::plain(66, 0, 60) }, Node { color: 5, row: true, escaping: true, cullable: true, ..Node::plain(74, 0, 100) }], &[1176.47]);
+    replays_like_a_build(cx, Page { gap: 120.0, context: false, height: 300.0, scale: 1.0, read: false, idle: true, ..Page::default() }, vec![Node { color: 3, row: true, ..Node::plain(0, 100, 22) }.with(vec![Node { color: 5, row: true, focusable: true, ..Node::plain(1, 14, 60) }.with(vec![Node { color: 0, absolute: Some((1, 23, 1)), escaping: true, relative: Some(0), ..Node::plain(6, 22, 100) }.with(vec![Node { color: 5, focusable: true, absolute: Some((34, 31, 2)), escaping: true, ..Node::plain(8, 36, 60) }])]), Node { color: 0, ..Node::plain(9, 22, 100) }.with(vec![Node { color: 5, row: true, ..Node::plain(10, 22, 60) }.with(vec![Node { color: 0, row: true, focusable: true, escaping: true, ..Node::plain(12, 100, 60) }]), Node { color: 3, relative: Some(1), ..Node::plain(13, 22, 14) }.with(vec![Node { color: 5, row: true, focusable: true, cullable: true, ..Node::plain(15, 14, 36) }])])]), Node { color: 4, ..Node::plain(18, 0, 14) }, Node { color: 5, row: true, ..Node::plain(24, 100, 0) }.with(vec![Node { color: 3, focusable: true, ..Node::plain(25, 0, 36) }, Node { color: 2, row: true, ..Node::plain(26, 100, 100) }.with(vec![Node { color: 3, row: true, focusable: true, ..Node::plain(27, 14, 100) }]), Node { color: 4, row: true, focusable: true, cullable: true, ..Node::plain(32, 22, 100) }]), Node { color: 0, row: true, ..Node::plain(33, 22, 0) }, Node { color: 0, row: true, relocatable: true, ..Node::plain(34, 36, 14) }.with(vec![Node { color: 5, clickable: true, focusable: true, cullable: true, ..Node::plain(38, 60, 100) }])], &[200.42, 399.86996]);
 }
