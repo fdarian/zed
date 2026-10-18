@@ -6055,52 +6055,6 @@ impl Window {
         }
     }
 
-    fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
-        let horizontal = &quad.corner_radii;
-        let vertical = CornerRadii {
-            x: quad.corner_radii,
-            y: quad.corner_radii_y,
-        }
-        .explicit_y();
-        let widths = &quad.border_widths;
-        // How far in from each edge a rounded corner reaches: the vertical radius from the top and
-        // bottom, the horizontal one from the left and right.
-        let edge_radii = Edges {
-            top: vertical.top_left.max(vertical.top_right),
-            right: horizontal.top_right.max(horizontal.bottom_right),
-            bottom: vertical.bottom_left.max(vertical.bottom_right),
-            left: horizontal.top_left.max(horizontal.bottom_left),
-        };
-
-        let antialias_inset = point(ScaledPixels(1.0), ScaledPixels(1.0));
-        let inset_bounds = |top_left_inset, bottom_right_inset| {
-            Bounds::from_corners(
-                quad.bounds.origin + top_left_inset + antialias_inset,
-                quad.bounds.bottom_right() - bottom_right_inset - antialias_inset,
-            )
-        };
-
-        // Rounded corners need only be excluded on one axis. Either candidate
-        // is empty of border pixels, so use the larger interior.
-        let horizontal_band = inset_bounds(
-            point(widths.left, widths.top.max(edge_radii.top)),
-            point(widths.right, widths.bottom.max(edge_radii.bottom)),
-        );
-        let vertical_band = inset_bounds(
-            point(widths.left.max(edge_radii.left), widths.top),
-            point(widths.right.max(edge_radii.right), widths.bottom),
-        );
-
-        let area = |bounds: &Bounds<ScaledPixels>| {
-            bounds.size.width.0.max(0.) * bounds.size.height.0.max(0.)
-        };
-        if area(&horizontal_band) >= area(&vertical_band) {
-            horizontal_band
-        } else {
-            vertical_band
-        }
-    }
-
     /// The quad in device pixels, snapped and masked the way painting it would.
     pub(crate) fn device_quad(&self, quad: PaintQuad, opacity: f32) -> Quad {
         let snapped_bounds = self.snap_bounds(quad.bounds);
@@ -6138,60 +6092,7 @@ impl Window {
 
         let opacity = self.element_opacity();
         let quad = self.device_quad(quad, opacity);
-
-        if !quad.background.is_transparent() {
-            self.next_frame.scene.insert_primitive(quad);
-            return;
-        }
-
-        // Splitting a border-only quad around its empty interior avoids shading
-        // every transparent pixel inside large outlines.
-        let outer_bounds = quad.bounds;
-        let inner_bounds = Self::largest_border_interior(&quad);
-
-        // A strip narrows the mask to a different rectangle, which would drop the mask's rounded
-        // corners, so a rounded mask paints the whole quad.
-        if inner_bounds.is_empty() || quad.content_mask.corner_radii != Corners::default() {
-            self.next_frame.scene.insert_primitive(quad);
-            return;
-        }
-
-        let strips = [
-            // Top
-            Bounds::from_corners(
-                outer_bounds.origin,
-                point(outer_bounds.right(), inner_bounds.top()),
-            ),
-            // Bottom
-            Bounds::from_corners(
-                point(outer_bounds.left(), inner_bounds.bottom()),
-                outer_bounds.bottom_right(),
-            ),
-            // Left
-            Bounds::from_corners(
-                point(outer_bounds.left(), inner_bounds.top()),
-                inner_bounds.bottom_left(),
-            ),
-            // Right
-            Bounds::from_corners(
-                inner_bounds.top_right(),
-                point(outer_bounds.right(), inner_bounds.bottom()),
-            ),
-        ];
-
-        for strip in strips {
-            let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
-            if !content_mask_bounds.is_empty() {
-                self.next_frame.scene.insert_primitive(Quad {
-                    content_mask: ContentMask {
-                        bounds: content_mask_bounds,
-                        corner_radii: Corners::default(),
-                        corner_radii_y: Corners::default(),
-                    },
-                    ..quad
-                });
-            }
-        }
+        self.next_frame.scene.insert_quad(quad);
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.

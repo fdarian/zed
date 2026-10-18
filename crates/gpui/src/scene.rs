@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, BackgroundTile, Bounds, ContentMask, Corners, Edges,
+    Anchor, AtlasTextureId, AtlasTile, Background, BackgroundTile, Bounds, ContentMask, CornerRadii, Corners, Edges,
     GroupEffect, Hsla, MAX_GROUP_EXTENT, Pixels, Point, Radians, ResolvedFilter, ScaledPixels, Size,
     bounds_tree::BoundsTree, filter_margin, point, visual_bounds,
 };
@@ -198,7 +198,12 @@ impl Scene {
             }
             _ => self.record(PaintOperation::Primitive(primitive.clone())),
         }
+        self.route(primitive, glyph);
+    }
 
+    /// Puts an already recorded primitive where it is drawn: opacity of a flat group, the open text
+    /// clips, and the scene of the innermost open group.
+    fn route(&mut self, primitive: Primitive, glyph: bool) {
         let mut primitive = primitive;
         if !self.effect_groups_enabled {
             let opacity: f32 = self.flat_opacities.iter().product();
@@ -212,6 +217,68 @@ impl Scene {
             }
         }
         self.current_mut().insert_primitive_local(primitive);
+    }
+
+    /// Inserts a quad. One with no background is split around its empty interior, so that the
+    /// shader does not shade every transparent pixel inside a large outline. The split is made
+    /// here and not by the painter because the pieces are cut out of the quad's content mask,
+    /// which a recording that is put elsewhere only knows once it is.
+    pub(crate) fn insert_quad(&mut self, quad: Quad) {
+        if self.hidden || quad.bounds.intersect(&quad.content_mask.bounds).is_empty() {
+            return;
+        }
+        self.record(PaintOperation::Quad(quad));
+        if !quad.background.is_transparent() {
+            self.route(quad.into(), true);
+            return;
+        }
+        let outer_bounds = quad.bounds;
+        let inner_bounds = largest_border_interior(&quad);
+
+        // A strip narrows the mask to a different rectangle, which would drop the mask's rounded
+        // corners, so a rounded mask paints the whole quad.
+        if inner_bounds.is_empty() || quad.content_mask.corner_radii != Corners::default() {
+            self.route(quad.into(), true);
+            return;
+        }
+
+        let strips = [
+            // Top
+            Bounds::from_corners(
+                outer_bounds.origin,
+                point(outer_bounds.right(), inner_bounds.top()),
+            ),
+            // Bottom
+            Bounds::from_corners(
+                point(outer_bounds.left(), inner_bounds.bottom()),
+                outer_bounds.bottom_right(),
+            ),
+            // Left
+            Bounds::from_corners(
+                point(outer_bounds.left(), inner_bounds.top()),
+                inner_bounds.bottom_left(),
+            ),
+            // Right
+            Bounds::from_corners(
+                inner_bounds.top_right(),
+                point(outer_bounds.right(), inner_bounds.bottom()),
+            ),
+        ];
+
+        for strip in strips {
+            let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
+            if !content_mask_bounds.is_empty() {
+                let piece = Quad {
+                    content_mask: ContentMask {
+                        bounds: content_mask_bounds,
+                        corner_radii: Corners::default(),
+                        corner_radii_y: Corners::default(),
+                    },
+                    ..quad
+                };
+                self.route(piece.into(), true);
+            }
+        }
     }
 
     /// Stores the primitive in this scene with an order, without recording or routing it.
@@ -635,7 +702,9 @@ impl Scene {
         for operation in self.paint_operations.get(range).unwrap_or_default() {
             match operation {
                 PaintOperation::Primitive(Primitive::Shadow(shadow)) => write!(out, "{shadow:?}"),
-                PaintOperation::Primitive(Primitive::Quad(quad)) => write!(out, "{quad:?}"),
+                PaintOperation::Primitive(Primitive::Quad(quad)) | PaintOperation::Quad(quad) => {
+                    write!(out, "{quad:?}")
+                }
                 PaintOperation::Primitive(Primitive::Path(path)) => write!(out, "{path:?}"),
                 PaintOperation::Primitive(Primitive::Underline(underline)) => write!(out, "{underline:?}"),
                 PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)) => write!(out, "{sprite:?}"),
@@ -666,6 +735,7 @@ impl Scene {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Quad(quad) => self.insert_quad(*quad),
                 PaintOperation::Image(sprite) => self.insert_image(*sprite),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
@@ -676,6 +746,111 @@ impl Scene {
                 } => self.start_group(effect.clone(), *content_mask, *reserved),
                 PaintOperation::EndGroup => self.end_group(),
                 PaintOperation::WidenGroups(escaped) => self.widen_groups(*escaped),
+                PaintOperation::StartTextClip => self.start_text_clip(),
+                PaintOperation::EndTextClip => self.end_text_clip(),
+            }
+        }
+        self.hidden = hidden;
+    }
+
+    /// Puts recorded `operations` into this scene `delta` away from where they were recorded,
+    /// clipped by `clip`, the content mask around the place they are put in, which they were
+    /// recorded without: their masks hold the region they were recorded in. What this gives is
+    /// what painting at the new place under `clip` gives, when a painter's decisions do not
+    /// depend on where the clip is: see [`Window::replay_key`].
+    pub(crate) fn replay_translated(
+        &mut self,
+        operations: &[PaintOperation],
+        delta: Point<ScaledPixels>,
+        clip: &ReplayClip,
+    ) {
+        // The recorded operations already left out whatever was hidden when they were recorded.
+        let hidden = mem::take(&mut self.hidden);
+        // The masks inside an exact-clip group are the clip's own, not cut by the one around it.
+        let mut exact_groups: Vec<bool> = Vec::new();
+        let mut exact_depth = 0usize;
+        // Whether each layer open was skipped, as a painter skips one that is clipped away.
+        let mut layers: Vec<bool> = Vec::new();
+        for operation in operations {
+            let clipped = exact_depth == 0;
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let mut primitive = primitive.clone();
+                    primitive.translate_replayed(delta);
+                    if clipped {
+                        primitive.clip_to(clip);
+                    }
+                    self.insert_primitive(primitive);
+                }
+                PaintOperation::Quad(quad) => {
+                    let mut quad = *quad;
+                    quad.translate(delta);
+                    if clipped {
+                        clip_mask(&mut quad.content_mask, &clip.snapped);
+                    }
+                    self.insert_quad(quad);
+                }
+                PaintOperation::Image(sprite) => {
+                    let mut sprite = *sprite;
+                    sprite.translate(delta);
+                    if clipped {
+                        clip_mask(&mut sprite.content_mask, &clip.snapped);
+                    }
+                    self.insert_image(sprite);
+                }
+                PaintOperation::StartLayer(bounds) => {
+                    let mut bounds = *bounds;
+                    translate_bounds(&mut bounds, delta);
+                    if clipped {
+                        bounds = bounds.intersect(&clip.snapped);
+                    }
+                    let skipped = bounds.is_empty();
+                    layers.push(skipped);
+                    if !skipped {
+                        self.push_layer(bounds);
+                    }
+                }
+                PaintOperation::EndLayer => {
+                    if layers.pop() == Some(false) {
+                        self.pop_layer();
+                    }
+                }
+                PaintOperation::StartGroup {
+                    effect,
+                    content_mask,
+                    reserved,
+                } => {
+                    let mut effect = effect.clone();
+                    effect.translate(delta);
+                    let mut content_mask = *content_mask;
+                    translate_mask(&mut content_mask, delta);
+                    if clipped {
+                        clip_mask(&mut content_mask, &clip.snapped);
+                    }
+                    let reserved = reserved.map(|mut bounds| {
+                        translate_bounds(&mut bounds, delta);
+                        bounds
+                    });
+                    exact_groups.push(effect.exact_clip);
+                    if effect.exact_clip {
+                        exact_depth += 1;
+                    }
+                    self.start_group(effect, content_mask, reserved);
+                }
+                PaintOperation::EndGroup => {
+                    if exact_groups.pop() == Some(true) {
+                        exact_depth -= 1;
+                    }
+                    self.end_group();
+                }
+                PaintOperation::WidenGroups(escaped) => {
+                    let mut escaped = *escaped;
+                    translate_mask(&mut escaped, delta);
+                    if clipped {
+                        clip_mask(&mut escaped, &clip.snapped);
+                    }
+                    self.widen_groups(escaped);
+                }
                 PaintOperation::StartTextClip => self.start_text_clip(),
                 PaintOperation::EndTextClip => self.end_text_clip(),
             }
@@ -750,8 +925,12 @@ pub(crate) enum PrimitiveKind {
     EffectGroup,
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
+    /// A quad before a border-only one is split around its empty interior, which depends on the
+    /// content mask it ends up with: see [`Scene::insert_quad`].
+    Quad(Quad),
     Image(PolychromeSprite),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
@@ -764,6 +943,52 @@ pub(crate) enum PaintOperation {
     WidenGroups(ContentMask<ScaledPixels>),
     StartTextClip,
     EndTextClip,
+}
+
+fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
+    let horizontal = &quad.corner_radii;
+    let vertical = CornerRadii {
+        x: quad.corner_radii,
+        y: quad.corner_radii_y,
+    }
+    .explicit_y();
+    let widths = &quad.border_widths;
+    // How far in from each edge a rounded corner reaches: the vertical radius from the top and
+    // bottom, the horizontal one from the left and right.
+    let edge_radii = Edges {
+        top: vertical.top_left.max(vertical.top_right),
+        right: horizontal.top_right.max(horizontal.bottom_right),
+        bottom: vertical.bottom_left.max(vertical.bottom_right),
+        left: horizontal.top_left.max(horizontal.bottom_left),
+    };
+
+    let antialias_inset = point(ScaledPixels(1.0), ScaledPixels(1.0));
+    let inset_bounds = |top_left_inset, bottom_right_inset| {
+        Bounds::from_corners(
+            quad.bounds.origin + top_left_inset + antialias_inset,
+            quad.bounds.bottom_right() - bottom_right_inset - antialias_inset,
+        )
+    };
+
+    // Rounded corners need only be excluded on one axis. Either candidate
+    // is empty of border pixels, so use the larger interior.
+    let horizontal_band = inset_bounds(
+        point(widths.left, widths.top.max(edge_radii.top)),
+        point(widths.right, widths.bottom.max(edge_radii.bottom)),
+    );
+    let vertical_band = inset_bounds(
+        point(widths.left.max(edge_radii.left), widths.top),
+        point(widths.right.max(edge_radii.right), widths.bottom),
+    );
+
+    let area = |bounds: &Bounds<ScaledPixels>| {
+        bounds.size.width.0.max(0.) * bounds.size.height.0.max(0.)
+    };
+    if area(&horizontal_band) >= area(&vertical_band) {
+        horizontal_band
+    } else {
+        vertical_band
+    }
 }
 
 /// Keeps a group's bounds to what can show: what the content mask lets through, plus what the
@@ -866,6 +1091,52 @@ impl Primitive {
         }
     }
 
+    /// Moves the primitive by `delta`, the way a painter that painted it there would have put it
+    /// where it ends up on screen: a sprite's bounds move, and its transformation changes so that
+    /// what the transformation does to the moved bounds is the old place moved by `delta`.
+    fn translate_replayed(&mut self, delta: Point<ScaledPixels>) {
+        match self {
+            Primitive::Shadow(shadow) => shadow.translate(delta),
+            Primitive::Quad(quad) => quad.translate(delta),
+            Primitive::Path(path) => path.translate(delta),
+            Primitive::Underline(underline) => underline.translate(delta),
+            Primitive::MonochromeSprite(sprite) => {
+                translate_bounds(&mut sprite.bounds, delta);
+                translate_transformation(&mut sprite.transformation, delta);
+                translate_mask(&mut sprite.content_mask, delta);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                translate_bounds(&mut sprite.bounds, delta);
+                translate_transformation(&mut sprite.transformation, delta);
+                translate_mask(&mut sprite.content_mask, delta);
+            }
+            Primitive::PolychromeSprite(sprite) => sprite.translate(delta),
+            Primitive::Surface(surface) => surface.translate(delta),
+        }
+    }
+
+    /// Cuts the primitive by `clip`, as painting under it would have.
+    fn clip_to(&mut self, clip: &ReplayClip) {
+        match self {
+            Primitive::Path(path) => clip_mask(&mut path.content_mask, &clip.plain),
+            Primitive::Shadow(shadow) => clip_mask(&mut shadow.content_mask, &clip.snapped),
+            Primitive::Quad(quad) => clip_mask(&mut quad.content_mask, &clip.snapped),
+            Primitive::Underline(underline) => {
+                clip_mask(&mut underline.content_mask, &clip.snapped)
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                clip_mask(&mut sprite.content_mask, &clip.snapped)
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                clip_mask(&mut sprite.content_mask, &clip.snapped)
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                clip_mask(&mut sprite.content_mask, &clip.snapped)
+            }
+            Primitive::Surface(surface) => clip_mask(&mut surface.content_mask, &clip.snapped),
+        }
+    }
+
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
@@ -880,6 +1151,47 @@ impl Primitive {
     }
 }
 
+
+/// The content mask around the place a recording is put in, in device pixels, as the painters
+/// that made the recording would have cut it: `snapped` is what most of them cut by (the mask
+/// grown to whole pixels), and `plain` what a path is cut by (the mask scaled).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReplayClip {
+    pub(crate) snapped: Bounds<ScaledPixels>,
+    pub(crate) plain: Bounds<ScaledPixels>,
+}
+
+/// Cuts `mask` by the plain rectangle `clip`, as [`ContentMask::intersect`] does: a rounded corner
+/// stays where the result still has the corner.
+fn clip_mask(mask: &mut ContentMask<ScaledPixels>, clip: &Bounds<ScaledPixels>) {
+    let bounds = mask.bounds.intersect(clip);
+    let keep = |anchor: Anchor| mask.bounds.corner(anchor) == bounds.corner(anchor);
+    let radii = |corners: &Corners<ScaledPixels>| Corners {
+        top_left: if keep(Anchor::TopLeft) { corners.top_left } else { ScaledPixels(0.) },
+        top_right: if keep(Anchor::TopRight) { corners.top_right } else { ScaledPixels(0.) },
+        bottom_right: if keep(Anchor::BottomRight) {
+            corners.bottom_right
+        } else {
+            ScaledPixels(0.)
+        },
+        bottom_left: if keep(Anchor::BottomLeft) { corners.bottom_left } else { ScaledPixels(0.) },
+    };
+    let corner_radii = radii(&mask.corner_radii);
+    let corner_radii_y = radii(&mask.corner_radii_y);
+    *mask = ContentMask {
+        bounds,
+        corner_radii,
+        corner_radii_y,
+    };
+}
+
+/// Moves what `transformation` draws by `delta` when its bounds were moved by `delta` too: the
+/// shader draws `rotation_scale * bounds + translation`.
+fn translate_transformation(transformation: &mut TransformationMatrix, delta: Point<ScaledPixels>) {
+    let [[a, b], [c, d]] = transformation.rotation_scale;
+    transformation.translation[0] += (1. - a) * delta.x.0 - b * delta.y.0;
+    transformation.translation[1] += -c * delta.x.0 + (1. - d) * delta.y.0;
+}
 
 fn translate_bounds(bounds: &mut Bounds<ScaledPixels>, delta: Point<ScaledPixels>) {
     bounds.origin = bounds.origin + delta;
@@ -2235,6 +2547,127 @@ mod tests {
         scene.finish();
         assert!(scene.groups.is_empty());
         assert!(scene.quads.is_empty());
+    }
+
+    fn clip(x: f32, y: f32, width: f32, height: f32) -> ReplayClip {
+        ReplayClip {
+            snapped: bounds(x, y, width, height),
+            plain: bounds(x, y, width, height),
+        }
+    }
+
+    fn masked(content_mask: ContentMask<ScaledPixels>, shift: f32, clip: &Bounds<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        let mut mask = content_mask;
+        translate_mask(&mut mask, point(ScaledPixels(0.), ScaledPixels(shift)));
+        clip_mask(&mut mask, clip);
+        mask
+    }
+
+    fn describe(scene: &Scene) -> String {
+        scene.describe_operations(0..scene.len())
+    }
+
+    #[test]
+    fn a_translated_replay_is_the_scene_painted_where_it_lands() {
+        let region = ContentMask {
+            bounds: bounds(0., 0., WINDOW, 3. * WINDOW),
+            ..mask()
+        };
+        let mut recorded = scene();
+        let mut rows = [quad(10., 10., 50., 20.), quad(10., 120., 50., 20.), quad(10., 700., 50., 20.)];
+        for row in &mut rows {
+            row.content_mask = region;
+            recorded.insert_quad(*row);
+        }
+        recorded.push_layer(bounds(0., 100., 100., 100.));
+        let mut sprite = glyph(20., 130.);
+        sprite.content_mask = region;
+        recorded.insert_primitive(sprite);
+        recorded.pop_layer();
+        recorded.push_layer(bounds(0., 800., 100., 100.));
+        recorded.pop_layer();
+
+        // The viewport slid up by 100 px: what was at 120 is at 20.
+        let viewport = clip(0., 0., WINDOW, 150.);
+        let mut replayed = scene();
+        replayed.replay_translated(
+            &recorded.paint_operations,
+            point(ScaledPixels(0.), ScaledPixels(-100.)),
+            &viewport,
+        );
+
+        let mut painted = scene();
+        for row in &rows {
+            let mut row = *row;
+            row.bounds.origin.y.0 -= 100.;
+            row.content_mask = masked(region, -100., &viewport.snapped);
+            painted.insert_quad(row);
+        }
+        painted.push_layer(bounds(0., 0., 100., 100.));
+        let mut sprite = glyph(20., 30.);
+        sprite.content_mask = masked(region, -100., &viewport.snapped);
+        painted.insert_primitive(sprite);
+        painted.pop_layer();
+
+        assert_eq!(describe(&replayed), describe(&painted));
+        assert_eq!(replayed.quads.len(), 1, "the rows at 10 and 700 are clipped away");
+        replayed.finish();
+        painted.finish();
+        let orders = |scene: &Scene| scene.quads.iter().map(|quad| quad.order).collect::<Vec<_>>();
+        assert_eq!(orders(&replayed), orders(&painted));
+    }
+
+    #[test]
+    fn a_translated_sprite_keeps_its_place_under_its_transformation() {
+        let rotated = TransformationMatrix::unit().rotate(crate::Radians(0.5)).scale(size(2., 3.));
+        let draws_at = |sprite: &MonochromeSprite| {
+            let origin = sprite.bounds.origin;
+            sprite.transformation.apply(Point::new(origin.x.0.into(), origin.y.0.into()).map(|v: crate::Pixels| v))
+        };
+        let mut recorded = scene();
+        let mut sprite = glyph(10., 10.);
+        sprite.transformation = rotated;
+        recorded.insert_primitive(sprite);
+
+        let delta = point(ScaledPixels(7.), ScaledPixels(-4.));
+        let mut replayed = scene();
+        replayed.replay_translated(&recorded.paint_operations, delta, &clip(-100., -100., 1000., 1000.));
+        let moved = replayed.monochrome_sprites[0];
+        let before = draws_at(&sprite);
+        let after = draws_at(&moved);
+        assert!((after.x.0 - before.x.0 - delta.x.0).abs() < 1e-4);
+        assert!((after.y.0 - before.y.0 - delta.y.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_translated_replay_clips_inside_the_exact_group_by_its_own_mask_only() {
+        let inner = ContentMask {
+            bounds: bounds(0., 0., 500., 500.),
+            ..mask()
+        };
+        let mut recorded = scene();
+        recorded.start_group(
+            GroupEffect {
+                exact_clip: true,
+                ..GroupEffect::default()
+            },
+            mask(),
+            None,
+        );
+        let mut inside = quad(10., 10., 20., 20.);
+        inside.content_mask = inner;
+        recorded.insert_quad(inside);
+        recorded.end_group();
+
+        let mut replayed = scene();
+        replayed.replay_translated(
+            &recorded.paint_operations,
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            &clip(0., 0., 100., 100.),
+        );
+        assert_eq!(replayed.groups.len(), 1);
+        assert_eq!(replayed.groups[0].content_mask.bounds, bounds(0., 0., 100., 100.));
+        assert_eq!(replayed.groups[0].scene.quads[0].content_mask.bounds.size.width.0 > 0., true);
     }
 
     #[cfg(target_os = "macos")]
