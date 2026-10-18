@@ -1434,8 +1434,20 @@ impl PrepaintRecord {
                 .map_or_else(|| "(outside)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
         };
         let mut out = String::new();
-        let range = self.range.start.hitboxes_index..self.range.end.hitboxes_index;
-        for hitbox in frame.hitboxes.get(range).unwrap_or_default() {
+        // The hitboxes are found by the elements they were inserted for and not by where the range
+        // of the recording is in the frame: a stacking context moves hitboxes about once it has
+        // them all, and a subtree recorded in a region has others than a build (the ones that
+        // cannot be hit) that move what comes after them.
+        let identities: FxHashSet<&GlobalElementId> = self
+            .hitboxes
+            .hitboxes
+            .iter()
+            .filter_map(|hitbox| hitbox.identity.as_ref())
+            .collect();
+        for hitbox in &frame.hitboxes {
+            if !hitbox.identity.as_ref().is_some_and(|identity| identities.contains(identity)) {
+                continue;
+            }
             if loose && !hitbox.is_reachable() {
                 continue;
             }
@@ -1518,7 +1530,7 @@ impl Window {
                     .and_then(|state| state.inner.downcast_ref::<Option<crate::elements::RetainedState>>())
                     .and_then(Option::as_ref)
                     .and_then(|state| state.describe(self))
-                    .map_or_else(String::new, |text| strip_draw_orders(&text))
+                    .map_or_else(String::new, |text| strip_empty_groups(&strip_draw_orders(&text)))
             })
             .collect()
     }
@@ -1554,6 +1566,25 @@ impl Window {
             self.retained.mismatches.push(message);
         }
     }
+}
+
+/// `text` without the groups that hold nothing. A subtree recorded in a region opens the groups
+/// of the clips and effects in it that a build under the content mask around it does not reach,
+/// and what is in them is cut away by the mask it is put in.
+fn strip_empty_groups(text: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if line == "end group" && kept.last().is_some_and(|last| last.starts_with("group ")) {
+            kept.pop();
+        } else {
+            kept.push(line);
+        }
+    }
+    let mut out = kept.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// `text` without the `order: N` fields of the primitives.
