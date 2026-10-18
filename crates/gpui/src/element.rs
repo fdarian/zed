@@ -447,7 +447,7 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
         inspector_id: Option<InspectorElementId>,
         bounds: Bounds<Pixels>,
         /// The content mask an escaping element paints with.
-        escaped_mask: Option<ContentMask<Pixels>>,
+        escaped_mask: Option<(ContentMask<Pixels>, bool)>,
         culled: Culled,
         request_layout: RequestLayoutState,
         prepaint: PrepaintState,
@@ -544,14 +544,16 @@ impl<E: Element> Drawable<E> {
 
                 // Inside a culled subtree nothing draws or is hit, so only the offset an
                 // escaping box is placed by matters: its bounds are read.
-                let escaped = self
-                    .element
-                    .escapes_to()
-                    .map(|escape| window.escape_frame(escape));
-                if let Some((mask, offset)) = escaped {
+                let escaped = self.element.escapes_to().map(|escape| {
+                    let derived = window.escape_frame_is_in_recording(escape);
+                    let (mask, offset) = window.escape_frame(escape);
+                    (mask, offset, derived)
+                });
+                if let Some((mask, offset, derived)) = escaped {
                     if culled == Culled::No {
-                        window.note_escape(&mask);
+                        window.note_escape(&mask, derived);
                         window.content_mask_stack.push(mask);
+                        window.begin_escaped_prepaint(derived);
                     }
                     window.element_offset_stack.push(offset);
                 }
@@ -641,8 +643,9 @@ impl<E: Element> Drawable<E> {
                 if !sticky_offset.is_zero() {
                     window.element_offset_stack.pop();
                 }
-                if escaped.is_some() {
+                if let Some((_, _, derived)) = escaped {
                     if culled == Culled::No {
+                        window.end_escaped_prepaint(derived);
                         window.content_mask_stack.pop();
                     }
                     window.element_offset_stack.pop();
@@ -686,7 +689,9 @@ impl<E: Element> Drawable<E> {
                     global_id,
                     inspector_id,
                     bounds,
-                    escaped_mask: escaped.map(|(mask, _)| mask).filter(|_| culled == Culled::No),
+                    escaped_mask: escaped
+                        .map(|(mask, _, derived)| (mask, derived))
+                        .filter(|_| culled == Culled::No),
                     culled,
                     request_layout,
                     prepaint,
@@ -744,7 +749,7 @@ impl<E: Element> Drawable<E> {
                     }
                 };
                 match escaped_mask {
-                    Some(mask) => window.with_escaped_content_mask(mask, paint),
+                    Some((mask, derived)) => window.with_escaped_content_mask(mask, derived, paint),
                     None if culled == Culled::Root => {
                         window.content_mask_stack.push(ContentMask::default());
                         paint(window);

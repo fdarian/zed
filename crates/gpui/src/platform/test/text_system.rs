@@ -6,11 +6,18 @@ use std::borrow::Cow;
 
 /// A [`NoopTextSystem`] with glyphs that rasterize to something, so
 /// that painting a glyph leaves a sprite in the scene.
-pub(crate) struct RasterizingTextSystem(NoopTextSystem);
+pub(crate) struct RasterizingTextSystem(NoopTextSystem, bool);
 
 impl RasterizingTextSystem {
     pub(crate) fn new() -> Self {
-        Self(NoopTextSystem::new())
+        Self(NoopTextSystem::new(), false)
+    }
+
+    /// A text system whose glyphs are drawn above the baseline, inside the box that the font says
+    /// a glyph is in, as ink is: a painter that skips the glyphs whose box is outside the content
+    /// mask then skips only glyphs that are not visible.
+    pub(crate) fn with_ink_in_the_box() -> Self {
+        Self(NoopTextSystem::new(), true)
     }
 }
 
@@ -47,9 +54,14 @@ impl PlatformTextSystem for RasterizingTextSystem {
         self.0.glyph_for_char(font_id, ch)
     }
 
-    fn glyph_raster_bounds(&self, _: &RenderGlyphParams) -> anyhow::Result<Bounds<DevicePixels>> {
+    fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> anyhow::Result<Bounds<DevicePixels>> {
+        let above = if self.1 {
+            (params.font_size.0 * params.scale_factor * 0.5) as i32
+        } else {
+            0
+        };
         Ok(Bounds {
-            origin: Default::default(),
+            origin: crate::point(DevicePixels(0), DevicePixels(-above)),
             size: crate::size(DevicePixels(1), DevicePixels(1)),
         })
     }

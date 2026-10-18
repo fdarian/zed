@@ -874,6 +874,9 @@ pub struct Hitbox {
     parent: Option<HitboxId>,
     clip: Option<Rc<ResolvedClipPath>>,
     exact_clips: Option<Rc<ExactClips>>,
+    /// Inserted in a box that escaped to an absolute content mask, which a subtree recorded in a
+    /// region of its own does not cut by the content mask around the region.
+    unclipped: bool,
 }
 
 /// The `overflow` clips around a hitbox that `content_mask` is only an approximation of, as a
@@ -922,6 +925,11 @@ impl Hitbox {
     /// was recorded, inside `surroundings`: moved, and cut by the content mask around it, which
     /// the region stood in for when it was recorded.
     pub(crate) fn relocated(&self, delta: Point<Pixels>, surroundings: &ContentMask<Pixels>) -> Hitbox {
+        if self.unclipped {
+            // Placed by what the subtree is not part of: it stays where it is.
+            debug_assert!(delta.is_zero(), "a subtree with a box that escapes is not moved");
+            return self.clone();
+        }
         let mut bounds = self.bounds;
         bounds.origin += delta;
         let clip = self.clip.as_ref().map(|clip| {
@@ -942,6 +950,7 @@ impl Hitbox {
                 .exact_clips
                 .as_ref()
                 .map(|clips| Rc::new(clips.relocated(delta, surroundings))),
+            unclipped: false,
         }
     }
 
@@ -5336,9 +5345,18 @@ impl Window {
 
     /// Notes during prepaint that a box is placed outside the clip around it. It is what
     /// [`Window::escapes_prepainted`] counts.
-    pub(crate) fn note_escape(&mut self, escaped: &ContentMask<Pixels>) {
-        let clip = self.content_mask().bounds;
-        if clip.union(&escaped.bounds) != clip {
+    pub(crate) fn note_escape(&mut self, escaped: &ContentMask<Pixels>, derived: bool) {
+        let mut clip = self.content_mask().bounds;
+        let mut escaped = escaped.bounds;
+        // The region of a subtree recorded to be put elsewhere stands in for the content mask
+        // around it, which is what a box escapes. A mask cut from the region is cut from that.
+        if let Some(relocation) = self.retained.relocation.as_ref().filter(|relocation| !relocation.direct) {
+            clip = clip.intersect(&relocation.ambient.bounds);
+            if derived {
+                escaped = escaped.intersect(&relocation.ambient.bounds);
+            }
+        }
+        if clip.union(&escaped) != clip {
             self.escapes_prepainted = self.escapes_prepainted.wrapping_add(1);
         }
     }
@@ -5358,29 +5376,49 @@ impl Window {
         mask: ContentMask<Pixels>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.with_replaced_mask(mask, false, f)
+    }
+
+    /// [`Window::with_replaced_content_mask`] where `derived` says that the mask comes from the
+    /// content masks inside the subtree being recorded in a region of its own (see
+    /// [`crate::Retained::relocatable`]), and so is cut by the content mask around the region where
+    /// the recording is put, as the masks inside it are.
+    fn with_replaced_mask<R>(
+        &mut self,
+        mask: ContentMask<Pixels>,
+        derived: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
+        self.next_frame.scene.begin_replaced(derived);
         self.content_mask_stack.push(mask);
         let result = f(self);
         self.content_mask_stack.pop();
+        self.next_frame.scene.end_replaced();
         result
     }
 
     /// Like [`Window::with_replaced_content_mask`] for the paint of a box that escaped its
-    /// ancestors' clip. An effect group (opacity, filter, mask, clip-path) around it composites
+    /// ancestors' clip. An effect group (opacity, filter, mask, clip path) around it composites
     /// the box with the rest of the group, so the group is widened to the box's mask instead of
-    /// cutting the box to the mask it started with.
+    /// cutting the box to the mask it started with. `derived` is as for
+    /// [`Window::with_replaced_mask`].
     pub(crate) fn with_escaped_content_mask<R>(
         &mut self,
         mask: ContentMask<Pixels>,
+        derived: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let scale_factor = self.scale_factor();
+        self.next_frame.scene.begin_replaced(derived);
         self.next_frame.scene.widen_groups(ContentMask {
             bounds: self.cover_bounds(mask.bounds),
             corner_radii: mask.corner_radii.scale(scale_factor),
             corner_radii_y: mask.corner_radii_y.scale(scale_factor),
         });
-        self.with_replaced_content_mask(mask, f)
+        let result = self.with_replaced_mask(mask, derived, f);
+        self.next_frame.scene.end_replaced();
+        result
     }
 
     /// Runs `f`, the drawing of the children of a positioned element, so that its content mask and
@@ -7216,6 +7254,7 @@ impl Window {
             parent: self.hitbox_parent_stack.last().copied(),
             clip: clip.map(Rc::new),
             exact_clips: self.exact_clips.clone(),
+            unclipped: self.is_prepainting_unclipped(),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         self.next_frame.hitboxes_changed();
@@ -11036,6 +11075,7 @@ mod tests {
                     })
                 }),
                 exact_clips: None,
+                unclipped: false,
             });
         }
         frame

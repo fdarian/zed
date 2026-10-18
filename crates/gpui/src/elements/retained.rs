@@ -290,7 +290,14 @@ pub enum RetainedLayout {
 #[doc(hidden)]
 pub enum RetainedPrepaint {
     Replayed,
-    Built { element: AnyElement, record: bool },
+    Built {
+        element: AnyElement,
+        record: bool,
+        /// How the subtree is painted to be put elsewhere, if it was prepainted that way: what
+        /// it captured in prepaint is cut from the region, and is painted in a scene of its own
+        /// whether or not the recording is kept.
+        relocation: Option<Relocation>,
+    },
 }
 
 impl Element for Retained {
@@ -388,28 +395,26 @@ impl Element for Retained {
                     ((), state)
                 });
             }
-            RetainedPrepaint::Built { element, record } => {
-                if !*record {
-                    element.paint(window, cx);
-                    return;
-                }
-                let mark = window.begin_paint_recording();
-                let relocation = window.with_element_state(global_id, |state: Option<RetainedState>, _| {
-                    let mut state = state.expect("a built subtree has its state");
-                    let relocation = state
-                        .recorded
-                        .as_mut()
-                        .and_then(|recorded| recorded.relocation.take());
-                    (relocation, state)
-                });
+            RetainedPrepaint::Built {
+                element,
+                record,
+                relocation,
+            } => {
+                let relocation = relocation.take();
                 let regional = relocation.as_ref().is_some_and(|relocation| !relocation.direct);
                 let relocating = relocation.is_some();
+                let mark = record.then(|| window.begin_paint_recording());
                 if let Some(relocation) = relocation {
                     window.begin_relocation(relocation, true);
                 }
-                let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
+                let accessed_entities = if *record {
+                    window
+                        .detect_observed_entities(cx, |window, cx| element.paint(window, cx))
+                        .1
+                } else {
                     element.paint(window, cx);
-                });
+                    Default::default()
+                };
                 let (relocation, operations) = if relocating {
                     let (relocation, operations) = window.end_relocation();
                     (Some(relocation), operations)
@@ -424,6 +429,9 @@ impl Element for Retained {
                         .expect("a subtree recorded in a region painted into a scene of its own");
                     window.emit_relocated(operations, Point::default());
                 }
+                let Some(mark) = mark else {
+                    return;
+                };
                 let publishes = self.on_replay.is_some();
                 let translates = self.translates;
                 let relocatable = self.overscan.is_some();
@@ -577,11 +585,12 @@ impl Retained {
                     return RetainedPrepaint::Built {
                         element,
                         record: false,
+                        relocation: None,
                     };
                 }
                 let root = self.root(global_id, window);
                 let key = window.replay_key(bounds, root);
-                let record = self.record_prepaint(
+                let (record, relocation) = self.record_prepaint(
                     global_id,
                     key,
                     unreusable,
@@ -591,7 +600,11 @@ impl Retained {
                         element.prepaint(window, cx);
                     },
                 );
-                RetainedPrepaint::Built { element, record }
+                RetainedPrepaint::Built {
+                    element,
+                    record,
+                    relocation,
+                }
             }
             RetainedLayout::Handed => unreachable!("a retained element is prepainted once"),
         }
@@ -846,18 +859,28 @@ impl Retained {
             return RetainedPrepaint::Built {
                 element,
                 record: false,
+                relocation: None,
             };
         }
 
         if !window.retention_records() || window.is_recording_relocatably() {
             element.prepaint(window, cx);
-            return RetainedPrepaint::Built { element, record: false };
+            return RetainedPrepaint::Built {
+                element,
+                record: false,
+                relocation: None,
+            };
         }
         let unreusable = unstable.then_some(NonReusable::UnstableLayout);
-        let record = self.record_prepaint(global_id, key, unreusable, window, cx, |window, cx| {
-            element.prepaint(window, cx);
-        });
-        RetainedPrepaint::Built { element, record }
+        let (record, relocation) =
+            self.record_prepaint(global_id, key, unreusable, window, cx, |window, cx| {
+                element.prepaint(window, cx);
+            });
+        RetainedPrepaint::Built {
+            element,
+            record,
+            relocation,
+        }
     }
 
     /// Prepaints a built subtree with `prepaint`, and stores what it left in the frame in the
@@ -870,7 +893,7 @@ impl Retained {
         window: &mut Window,
         cx: &mut App,
         prepaint: impl FnOnce(&mut Window, &mut App),
-    ) -> bool {
+    ) -> (bool, Option<Relocation>) {
         let publishes = self.on_replay.is_some();
         let (relocation, unmovable_at_start) = self.plan_relocation(window);
         let surroundings = relocation
@@ -885,7 +908,7 @@ impl Retained {
         let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| prepaint(window, cx));
         let relocation = relocating.then(|| window.end_relocation().0);
         let recording = window.finish_prepaint_recording(mark, surroundings.as_ref());
-        window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+        let record = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a built subtree has its state");
             state.accessed_entities.extend(accessed_entities);
             let root = state.root;
@@ -912,7 +935,7 @@ impl Retained {
                         key,
                         prepaint,
                         paint: None,
-                        relocation,
+                        relocation: None,
                         movable: false,
                         unmovable_at_start,
                         delta: Point::default(),
@@ -928,7 +951,8 @@ impl Retained {
                 }
             };
             (record, state)
-        })
+        });
+        (record, relocation)
     }
 
     /// How the prepaint and the paint of the subtree that `bounds` is the box of are recorded to

@@ -259,6 +259,8 @@ pub(crate) struct RetainedWindow {
     pub(crate) unframed_escapes: Cell<u32>,
     pub(crate) positioned_captures: Cell<u32>,
     pub(crate) nested_scrolls: Cell<u32>,
+    /// How many boxes that escaped to an absolute content mask are being prepainted.
+    pub(crate) unclipped: u32,
 }
 
 /// What a recording of a retained subtree could not repeat happened, if the counts differ.
@@ -622,7 +624,8 @@ pub(crate) struct Relocated {
 
 /// A subtree recorded so that it can be put elsewhere: the part of the recording that is not in
 /// the frame.
-pub(crate) struct Relocation {
+#[doc(hidden)]
+pub struct Relocation {
     pub(crate) info: RelocationInfo,
     pub(crate) handles: Vec<Relocated>,
     /// The content mask around the subtree when it was recorded.
@@ -1295,6 +1298,37 @@ impl Window {
             exact,
         });
         exact
+    }
+
+    /// Whether the box that escapes to `escape` is placed by a positioned frame that the subtree
+    /// being recorded in a region of its own made, which the region stands in for: its content
+    /// mask is cut from the region and not absolute.
+    pub(crate) fn escape_frame_is_in_recording(&self, escape: Escape) -> bool {
+        self.retained.relocation.as_ref().is_some_and(|relocation| {
+            !relocation.direct
+                && escape == Escape::ContainingBlock
+                && self.positioned_frames.len() > relocation.frames_below
+        })
+    }
+
+    /// Starts the prepaint of a box that escaped to a content mask: an absolute one, if
+    /// `derived` is false, which the hitboxes inside are not cut by the content mask around the
+    /// region.
+    pub(crate) fn begin_escaped_prepaint(&mut self, derived: bool) {
+        if self.is_recording_relocatably() && !derived {
+            self.retained.unclipped += 1;
+        }
+    }
+
+    pub(crate) fn end_escaped_prepaint(&mut self, derived: bool) {
+        if self.is_recording_relocatably() && !derived {
+            self.retained.unclipped -= 1;
+        }
+    }
+
+    /// Whether the hitbox inserted now is cut by an absolute content mask and not by the region.
+    pub(crate) fn is_prepainting_unclipped(&self) -> bool {
+        self.retained.unclipped > 0
     }
 
     /// Notes that a box escapes to a containing block (or the viewport) for a subtree being

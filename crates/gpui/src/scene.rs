@@ -180,6 +180,16 @@ impl Scene {
         self.paint_operations
     }
 
+    /// Marks the start of what is painted under a content mask that replaces the one around it,
+    /// see [`PaintOperation::Replaced`].
+    pub(crate) fn begin_replaced(&mut self, derived: bool) {
+        self.record(PaintOperation::Replaced { derived });
+    }
+
+    pub(crate) fn end_replaced(&mut self) {
+        self.record(PaintOperation::EndReplaced);
+    }
+
     /// While hidden, primitives are dropped (`visibility: hidden`): the element keeps its box in
     /// the layout, and effect groups and layers still open and close around nothing.
     pub fn set_hidden(&mut self, hidden: bool) {
@@ -737,6 +747,8 @@ impl Scene {
                 PaintOperation::WidenGroups(mask) => write!(out, "widen {mask:?}"),
                 PaintOperation::StartTextClip => write!(out, "text clip"),
                 PaintOperation::EndTextClip => write!(out, "end text clip"),
+                PaintOperation::Replaced { derived } => write!(out, "replaced {derived}"),
+                PaintOperation::EndReplaced => write!(out, "end replaced"),
             }
             .ok();
             out.push('\n');
@@ -763,6 +775,8 @@ impl Scene {
                 PaintOperation::WidenGroups(escaped) => self.widen_groups(*escaped),
                 PaintOperation::StartTextClip => self.start_text_clip(),
                 PaintOperation::EndTextClip => self.end_text_clip(),
+                PaintOperation::Replaced { derived } => self.begin_replaced(*derived),
+                PaintOperation::EndReplaced => self.end_replaced(),
             }
         }
         self.hidden = hidden;
@@ -781,13 +795,14 @@ impl Scene {
     ) {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
-        // The masks inside an exact-clip group are the clip's own, not cut by the one around it.
-        let mut exact_groups: Vec<bool> = Vec::new();
-        let mut exact_depth = 0usize;
+        // The masks that replaced the one around them in the recording are not cut by the one
+        // around the place the recording is put, unless they were cut from the masks inside it.
+        let mut replaced: Vec<bool> = Vec::new();
+        let mut unclipped_depth = 0usize;
         // Whether each layer open was skipped, as a painter skips one that is clipped away.
         let mut layers: Vec<bool> = Vec::new();
         for operation in operations {
-            let clipped = exact_depth == 0;
+            let clipped = unclipped_depth == 0;
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let mut primitive = primitive.clone();
@@ -846,18 +861,9 @@ impl Scene {
                         translate_bounds(&mut bounds, delta);
                         bounds
                     });
-                    exact_groups.push(effect.exact_clip);
-                    if effect.exact_clip {
-                        exact_depth += 1;
-                    }
                     self.start_group(effect, content_mask, reserved);
                 }
-                PaintOperation::EndGroup => {
-                    if exact_groups.pop() == Some(true) {
-                        exact_depth -= 1;
-                    }
-                    self.end_group();
-                }
+                PaintOperation::EndGroup => self.end_group(),
                 PaintOperation::WidenGroups(escaped) => {
                     let mut escaped = *escaped;
                     translate_mask(&mut escaped, delta);
@@ -868,6 +874,19 @@ impl Scene {
                 }
                 PaintOperation::StartTextClip => self.start_text_clip(),
                 PaintOperation::EndTextClip => self.end_text_clip(),
+                PaintOperation::Replaced { derived } => {
+                    replaced.push(*derived);
+                    if !*derived {
+                        unclipped_depth += 1;
+                    }
+                    self.begin_replaced(*derived);
+                }
+                PaintOperation::EndReplaced => {
+                    if replaced.pop() == Some(false) {
+                        unclipped_depth -= 1;
+                    }
+                    self.end_replaced();
+                }
             }
         }
         self.hidden = hidden;
@@ -958,6 +977,14 @@ pub(crate) enum PaintOperation {
     WidenGroups(ContentMask<ScaledPixels>),
     StartTextClip,
     EndTextClip,
+    /// What follows, until the matching [`PaintOperation::EndReplaced`], was painted under a
+    /// content mask that replaced the one around it. `derived` says that it was cut from the
+    /// masks inside the subtree that painted it, and not an absolute one such as the viewport's.
+    /// A recording put under another content mask cuts the first by that mask and not the second.
+    Replaced {
+        derived: bool,
+    },
+    EndReplaced,
 }
 
 fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
@@ -2669,9 +2696,11 @@ mod tests {
             mask(),
             None,
         );
+        recorded.begin_replaced(false);
         let mut inside = quad(10., 10., 20., 20.);
         inside.content_mask = inner;
         recorded.insert_quad(inside);
+        recorded.end_replaced();
         recorded.end_group();
 
         let mut replayed = scene();

@@ -4,19 +4,41 @@
 
 use super::*;
 use crate::{
-    AnyWindowHandle, AppContext as _, Context, Edges, InteractiveElement, ParentElement, Position, Render,
-    RetainedCounters, ScrollHandle, StatefulInteractiveElement, StyledText, Styled, TestAppContext,
-    TextLayout, div, point, px, size,
+    AnyView, AnyWindowHandle, Bounds, Context, Edges, InteractiveElement, ParentElement, Position, Render,
+    RasterizingTextSystem, RetainedCounters, ScrollHandle, StatefulInteractiveElement, StyledText, Styled, TestApp,
+    TextLayout, WindowBounds, WindowOptions, div, point, px, size,
 };
 use accesskit::Role;
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 const VIEW_WIDTH: f32 = 300.;
 const VIEW_HEIGHT: f32 = 220.;
 const OVERSCAN: f32 = 100.;
 
 type BuildScene = Rc<dyn Fn() -> AnyElement>;
+
+fn app() -> TestApp {
+    TestApp::with_text_system(Arc::new(RasterizingTextSystem::with_ink_in_the_box()))
+}
+
+trait Windows {
+    fn update_window<R>(
+        &mut self,
+        window: AnyWindowHandle,
+        update: impl FnOnce(AnyView, &mut Window, &mut App) -> R,
+    ) -> anyhow::Result<R>;
+}
+
+impl Windows for TestApp {
+    fn update_window<R>(
+        &mut self,
+        window: AnyWindowHandle,
+        update: impl FnOnce(AnyView, &mut Window, &mut App) -> R,
+    ) -> anyhow::Result<R> {
+        self.update(|cx| crate::AppContext::update_window(cx, window, update))
+    }
+}
 
 struct SceneView {
     build: BuildScene,
@@ -41,6 +63,21 @@ enum Kind {
     Sticky,
     /// Listens for a mouse down outside by the bounds of its hitbox.
     ByBounds,
+    /// Drawn as a group, faded.
+    Faded,
+    /// Drawn as a group, blurred.
+    Blurred,
+    /// Cut by a `clip-path`, which cuts the pointer too.
+    ClipPath,
+    /// Has an absolutely positioned box, placed by the row.
+    Absolute,
+    /// Has a box that is absolutely positioned in the nearest positioned ancestor, which is the
+    /// row.
+    Positioned,
+    /// Has a box that is absolutely positioned in an ancestor outside the row.
+    Escaping,
+    /// Has a box placed by the viewport.
+    Fixed,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,6 +99,7 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles) -> AnyElement {
     let colors = [crate::red(), crate::green(), crate::blue(), crate::yellow()];
     let mut row = div()
         .id(("row", index))
+        .debug_selector(|| format!("row-{index}"))
         .always_hitbox()
         .flex_none()
         .w(px(VIEW_WIDTH))
@@ -125,6 +163,60 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles) -> AnyElement {
         Kind::ByBounds => {
             row = row.child(text).on_mouse_down_out(|_, _, _| {});
         }
+        Kind::Faded => {
+            row = row
+                .opacity(0.6)
+                .child(text)
+                .child(div().w(px(80.)).h(px(12.)).bg(crate::blue()));
+        }
+        Kind::Blurred => {
+            row.style().filter = Some(vec![crate::FilterFunction::Blur(px(1.))]);
+            row = row.child(text).child(div().w(px(80.)).h(px(12.)).bg(crate::blue()));
+        }
+        Kind::Absolute => {
+            row = row.relative().child(text).child(
+                div()
+                    .id(("absolute", index))
+                    .absolute()
+                    .top(px(6.))
+                    .left(px(120.))
+                    .w(px(50.))
+                    .h(px(10.))
+                    .bg(crate::black()),
+            );
+        }
+        Kind::Positioned | Kind::Escaping | Kind::Fixed => {
+            if spec.kind == Kind::Positioned {
+                row = row.relative();
+            }
+            let mut placed = div()
+                .id(("placed", index))
+                .top(px(6.))
+                .left(px(120.))
+                .w(px(50.))
+                .h(px(10.))
+                .bg(crate::black());
+            placed.style().position = Some(if spec.kind == Kind::Fixed {
+                Position::Fixed
+            } else {
+                Position::AbsoluteInAncestor
+            });
+            row = row.child(text).child(placed);
+        }
+        Kind::ClipPath => {
+            let none = crate::LengthPercentage::Length(px(0.));
+            row.style().clip_path = Some(crate::ClipPathValue::Shape(crate::ClipPath {
+                shape: crate::ClipShape::Inset {
+                    top: crate::LengthPercentage::Length(px(2.)),
+                    right: none,
+                    bottom: none,
+                    left: crate::LengthPercentage::Length(px(30.)),
+                    radii: crate::InsetRadii::default(),
+                },
+                reference: crate::BackgroundBox::BorderBox,
+            }));
+            row = row.child(text).child(div().w(px(80.)).h(px(12.)).bg(crate::blue()));
+        }
     }
     row.into_any_element()
 }
@@ -141,12 +233,20 @@ fn page(
         let spec = *spec;
         if retained_rows {
             let handles = handles.clone();
-            retained(("retained-row", index), 1, move |_, _| {
+            let mut row = retained(("retained-row", index), 1, move |_, _| {
                 row_element(index, spec, &handles)
             })
-            .relocatable(px(OVERSCAN))
-            .cull_outset(Some(Edges::all(px(12.))))
-            .into_any_element()
+            .relocatable(px(OVERSCAN));
+            // A box placed by something else than the row is outside the extent its owner can
+            // vouch for, so such a row is not culled.
+            if !matches!(spec.kind, Kind::Positioned | Kind::Escaping | Kind::Fixed) {
+                row = row.cull_outset(Some(Edges::all(px(12.))));
+            }
+            // A positioned box is the child of a stacking context where there is one.
+            if matches!(spec.kind, Kind::Positioned | Kind::Absolute) {
+                row = row.lift_z(0);
+            }
+            row.into_any_element()
         } else {
             row_element(index, spec, handles)
         }
@@ -180,9 +280,9 @@ struct Pair {
 }
 
 impl Pair {
-    fn new(cx: &mut TestAppContext, specs: Vec<RowSpec>, scale_factor: f32, rounded: bool) -> Self {
+    fn new(cx: &mut TestApp, specs: Vec<RowSpec>, scale_factor: f32, rounded: bool) -> Self {
         let specs = Rc::new(specs);
-        let open = |cx: &mut TestAppContext, retained_rows: bool| {
+        let open = |cx: &mut TestApp, retained_rows: bool| {
             let scroll = ScrollHandle::new();
             let handles = Rc::new(Handles::default());
             let build: BuildScene = {
@@ -191,8 +291,17 @@ impl Pair {
                 let scroll = scroll.clone();
                 Rc::new(move || page(&specs, &handles, &scroll, retained_rows, rounded))
             };
-            let window = cx.open_window(size(px(400.), px(300.)), move |_, _| SceneView { build });
-            let window = AnyWindowHandle::from(window);
+            let window = cx.open_window_with_options(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(400.), px(300.)),
+                    ))),
+                    ..Default::default()
+                },
+                move |_, _| SceneView { build },
+            );
+            let window = AnyWindowHandle::from(window.handle());
             cx.update_window(window, |_, window, cx| {
                 window.set_dom_hit_testing(true);
                 window.set_a11y_active_for_tests(true);
@@ -217,34 +326,36 @@ impl Pair {
         pair
     }
 
-    fn draw(&self, cx: &mut TestAppContext) {
+    fn draw(&self, cx: &mut TestApp) {
         for window in [self.retained, self.plain] {
             cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
                 .unwrap();
         }
     }
 
-    fn scroll_to(&self, cx: &mut TestAppContext, offset: f32) {
+    fn scroll_to(&self, cx: &mut TestApp, offset: f32) {
         for scroll in [&self.scroll, &self.plain_scroll] {
             scroll.set_offset(point(px(0.), px(-offset)));
         }
         self.draw(cx);
     }
 
-    fn counters(&self, cx: &mut TestAppContext) -> RetainedCounters {
+    fn counters(&self, cx: &mut TestApp) -> RetainedCounters {
         cx.update_window(self.retained, |_, window, _| window.retained_counters())
             .unwrap()
     }
 
     /// Whether the two windows show and answer the same, as a text that says where not.
-    fn difference(&self, cx: &mut TestAppContext) -> Option<String> {
+    fn difference(&self, cx: &mut TestApp) -> Option<String> {
         let retained = observe(self.retained, &self.handles, &self.scroll, cx);
         let plain = observe(self.plain, &self.plain_handles, &self.plain_scroll, cx);
         for (name, retained, plain) in [
+            ("sprites", &retained.sprites, &plain.sprites),
             ("scene", &retained.scene, &plain.scene),
             ("a11y", &retained.a11y, &plain.a11y),
             ("texts", &retained.texts, &plain.texts),
             ("scroll handles", &retained.scrolls, &plain.scrolls),
+            ("debug bounds", &retained.debug_bounds, &plain.debug_bounds),
         ] {
             if retained != plain {
                 let retained_lines: Vec<&str> = retained.lines().collect();
@@ -255,7 +366,7 @@ impl Pair {
                     .position(|(a, b)| a != b)
                     .unwrap_or(retained_lines.len().min(plain_lines.len()));
                 let around = |lines: &[&str]| {
-                    lines[at.saturating_sub(25).min(lines.len())..(at + 6).min(lines.len())].join("\n")
+                    lines[at.saturating_sub(25).min(lines.len())..(at + 40).min(lines.len())].join("\n")
                 };
                 return Some(format!(
                     "{name} differ at line {at}\nretained:\n{}\nplain:\n{}",
@@ -278,19 +389,21 @@ impl Pair {
         None
     }
 
-    fn assert_same(&self, cx: &mut TestAppContext, step: &str) {
+    fn assert_same(&self, cx: &mut TestApp, step: &str) {
         if let Some(difference) = self.difference(cx) {
             panic!("{step}: {difference}");
         }
     }
 
-    fn mismatches(&self, cx: &mut TestAppContext) -> Vec<String> {
+    fn mismatches(&self, cx: &mut TestApp) -> Vec<String> {
         cx.update_window(self.retained, |_, window, _| window.retention_mismatches().to_vec())
             .unwrap()
     }
 }
 
 struct Observed {
+    debug_bounds: String,
+    sprites: String,
     scene: String,
     a11y: String,
     chains: Vec<String>,
@@ -362,7 +475,7 @@ fn observe(
     window: AnyWindowHandle,
     handles: &Handles,
     scroll: &ScrollHandle,
-    cx: &mut TestAppContext,
+    cx: &mut TestApp,
 ) -> Observed {
     let probes = probes();
     let (scene, a11y, chains) = cx
@@ -439,7 +552,40 @@ fn observe(
             tracker.bounds_for_item(0)
         ));
     }
+    let debug_bounds = cx
+        .update_window(window, |_, window, _| {
+            let mut entries = window
+                .rendered_frame
+                .debug_bounds
+                .iter()
+                .map(|(selector, bounds)| format!("{selector}: {bounds:?}"))
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries.join("\n")
+        })
+        .unwrap();
+    let sprites = cx
+        .update_window(window, |_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            let mut lines = scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| {
+                    format!(
+                        "mono {} {:?} {:?} {:?}",
+                        sprite.order, sprite.bounds.origin, sprite.bounds.size, sprite.content_mask.bounds
+                    )
+                })
+                .collect::<Vec<_>>();
+            lines.extend(scene.quads.iter().map(|quad| {
+                format!("quad {} {:?} {:?} {:?}", quad.order, quad.bounds.origin, quad.bounds.size, quad.content_mask.bounds)
+            }));
+            lines.join("\n")
+        })
+        .unwrap();
     Observed {
+        debug_bounds,
+        sprites,
         scene,
         a11y,
         chains,
@@ -453,7 +599,16 @@ fn rows(count: usize, height: f32, kind: Kind) -> Vec<RowSpec> {
 }
 
 fn mixed(count: usize) -> Vec<RowSpec> {
-    let kinds = [Kind::Plain, Kind::Button, Kind::Card, Kind::Underlined, Kind::Tracked];
+    let kinds = [
+        Kind::Plain,
+        Kind::Button,
+        Kind::Card,
+        Kind::Underlined,
+        Kind::Tracked,
+        Kind::Faded,
+        Kind::ClipPath,
+        Kind::Absolute,
+    ];
     (0..count)
         .map(|index| RowSpec {
             kind: kinds[index % kinds.len()],
@@ -463,15 +618,16 @@ fn mixed(count: usize) -> Vec<RowSpec> {
 }
 
 /// Scrolls through `offsets`, expecting the same as the plain window after each.
-fn scroll_through(pair: &Pair, cx: &mut TestAppContext, offsets: &[f32]) {
+fn scroll_through(pair: &Pair, cx: &mut TestApp, offsets: &[f32]) {
     for offset in offsets {
         pair.scroll_to(cx, *offset);
         pair.assert_same(cx, &format!("scrolled to {offset}"));
     }
 }
 
-#[gpui::test]
-fn rows_replayed_after_a_scroll_are_the_rows_a_build_shows(cx: &mut TestAppContext) {
+#[test]
+fn rows_replayed_after_a_scroll_are_the_rows_a_build_shows() {
+    let cx = &mut app();
     for scale_factor in [1., 2.] {
         let pair = Pair::new(cx, mixed(40), scale_factor, false);
         pair.assert_same(cx, "the first frame");
@@ -493,8 +649,9 @@ fn rows_replayed_after_a_scroll_are_the_rows_a_build_shows(cx: &mut TestAppConte
     }
 }
 
-#[gpui::test]
-fn a_scroll_by_whole_pixels_replays_the_rows_it_keeps(cx: &mut TestAppContext) {
+#[test]
+fn a_scroll_by_whole_pixels_replays_the_rows_it_keeps() {
+    let cx = &mut app();
     let pair = Pair::new(cx, rows(40, 40., Kind::Plain), 1., false);
     pair.scroll_to(cx, 0.);
     let before = pair.counters(cx);
@@ -506,8 +663,9 @@ fn a_scroll_by_whole_pixels_replays_the_rows_it_keeps(cx: &mut TestAppContext) {
     assert_eq!(after.relocation_misses(RelocationMiss::Place), 0);
 }
 
-#[gpui::test]
-fn a_fractional_scroll_moves_rows_by_the_snapped_difference(cx: &mut TestAppContext) {
+#[test]
+fn a_fractional_scroll_moves_rows_by_the_snapped_difference() {
+    let cx = &mut app();
     for scale_factor in [1., 2.] {
         let pair = Pair::new(cx, mixed(30), scale_factor, false);
         pair.draw(cx);
@@ -518,8 +676,9 @@ fn a_fractional_scroll_moves_rows_by_the_snapped_difference(cx: &mut TestAppCont
     }
 }
 
-#[gpui::test]
-fn rows_that_come_from_past_the_overscan_are_built(cx: &mut TestAppContext) {
+#[test]
+fn rows_that_come_from_past_the_overscan_are_built() {
+    let cx = &mut app();
     let pair = Pair::new(cx, rows(60, 40., Kind::Button), 1., false);
     pair.draw(cx);
     let before = pair.counters(cx);
@@ -535,8 +694,9 @@ fn rows_that_come_from_past_the_overscan_are_built(cx: &mut TestAppContext) {
     pair.assert_same(cx, "after replaying them");
 }
 
-#[gpui::test]
-fn a_clip_with_rounded_corners_is_no_place_to_move_rows_to(cx: &mut TestAppContext) {
+#[test]
+fn a_clip_with_rounded_corners_is_no_place_to_move_rows_to() {
+    let cx = &mut app();
     let pair = Pair::new(cx, mixed(30), 1., true);
     pair.draw(cx);
     let before = pair.counters(cx);
@@ -546,8 +706,9 @@ fn a_clip_with_rounded_corners_is_no_place_to_move_rows_to(cx: &mut TestAppConte
     assert!(after.non_relocatable(NonRelocatable::Clip) > 0, "{after:?}");
 }
 
-#[gpui::test]
-fn a_rounded_clip_that_the_content_mask_now_cuts_through_its_corner_is_built(cx: &mut TestAppContext) {
+#[test]
+fn a_rounded_clip_that_the_content_mask_now_cuts_through_its_corner_is_built() {
+    let cx = &mut app();
     let pair = Pair::new(cx, rows(10, 60., Kind::Card), 1., false);
     pair.draw(cx);
     pair.assert_same(cx, "before the scroll");
@@ -563,8 +724,52 @@ fn a_rounded_clip_that_the_content_mask_now_cuts_through_its_corner_is_built(cx:
     scroll_through(&pair, cx, &[0., 2., 40.]);
 }
 
-#[gpui::test]
-fn a_scale_factor_that_is_not_a_power_of_two_builds_the_rows(cx: &mut TestAppContext) {
+#[test]
+fn rows_past_the_overscan_are_culled_and_prepainted_again_when_they_come_near() {
+    let cx = &mut app();
+    let pair = Pair::new(cx, rows(60, 40., Kind::Button), 1., false);
+    let has_hitbox = |pair: &Pair, cx: &mut TestApp, row: usize| {
+        cx.update_window(pair.retained, |_, window, _| {
+            let name = format!("row-{row}");
+            window.rendered_frame.hitboxes.iter().any(|hitbox| format!("{:?}", hitbox.describe()).contains(&format!(".{name} ")) || hitbox.describe().contains(&format!("row-{row} ")) || hitbox.describe().contains(&format!("(\"row\", {row})")))
+        })
+        .unwrap()
+    };
+    pair.draw(cx);
+    assert!(has_hitbox(&pair, cx, 0));
+    assert!(!has_hitbox(&pair, cx, 40), "a row 1600 px down is culled");
+    scroll_through(&pair, cx, &[1590.]);
+    pair.draw(cx);
+    assert!(has_hitbox(&pair, cx, 40));
+    assert!(!has_hitbox(&pair, cx, 0));
+    scroll_through(&pair, cx, &[0.]);
+    assert!(!has_hitbox(&pair, cx, 40));
+}
+
+#[test]
+fn absolute_boxes_move_with_their_row_and_boxes_placed_elsewhere_keep_the_row_where_it_is() {
+    let cx = &mut app();
+    let pair = Pair::new(cx, rows(24, 40., Kind::Absolute), 1., false);
+    pair.draw(cx);
+    let before = pair.counters(cx);
+    scroll_through(&pair, cx, &[3., 12., 40., 41.5]);
+    let after = pair.counters(cx);
+    assert!(after.relocations > before.relocations, "{after:?}");
+
+    // A box that is placed by an ancestor, or by the window, is not placed by the row at all.
+    for kind in [Kind::Positioned, Kind::Escaping, Kind::Fixed] {
+        let pair = Pair::new(cx, rows(24, 40., kind), 1., false);
+        pair.draw(cx);
+        let before = pair.counters(cx);
+        scroll_through(&pair, cx, &[3., 12., 40., 41.5]);
+        let after = pair.counters(cx);
+        assert_eq!(after.relocations, before.relocations, "{kind:?}: {after:?}");
+    }
+}
+
+#[test]
+fn a_scale_factor_that_is_not_a_power_of_two_builds_the_rows() {
+    let cx = &mut app();
     let pair = Pair::new(cx, mixed(30), 1.5, false);
     pair.draw(cx);
     let before = pair.counters(cx);
@@ -574,8 +779,9 @@ fn a_scale_factor_that_is_not_a_power_of_two_builds_the_rows(cx: &mut TestAppCon
     assert!(after.non_relocatable(NonRelocatable::Scale) > 0, "{after:?}");
 }
 
-#[gpui::test]
-fn rows_with_something_that_keeps_their_place_are_never_moved(cx: &mut TestAppContext) {
+#[test]
+fn rows_with_something_that_keeps_their_place_are_never_moved() {
+    let cx = &mut app();
     let cases = [
         (Kind::Sticky, NonRelocatable::Sticky),
         (Kind::ByBounds, NonRelocatable::PositionedCapture),
@@ -593,8 +799,9 @@ fn rows_with_something_that_keeps_their_place_are_never_moved(cx: &mut TestAppCo
     }
 }
 
-#[gpui::test]
-fn a_scroller_that_is_not_scrolled_has_its_bounds_moved_with_the_row(cx: &mut TestAppContext) {
+#[test]
+fn a_scroller_that_is_not_scrolled_has_its_bounds_moved_with_the_row() {
+    let cx = &mut app();
     let pair = Pair::new(cx, rows(24, 40., Kind::Tracked), 1., false);
     pair.draw(cx);
     let before = pair.counters(cx);
@@ -604,8 +811,9 @@ fn a_scroller_that_is_not_scrolled_has_its_bounds_moved_with_the_row(cx: &mut Te
     assert_eq!(after.non_relocatable(NonRelocatable::NestedScroll), 0);
 }
 
-#[gpui::test]
-fn a_replay_that_moved_rows_is_the_build_it_is_compared_with(cx: &mut TestAppContext) {
+#[test]
+fn a_replay_that_moved_rows_is_the_build_it_is_compared_with() {
+    let cx = &mut app();
     for scale_factor in [1., 2.] {
         let pair = Pair::new(cx, mixed(30), scale_factor, false);
         cx.update_window(pair.retained, |_, window, _| {
@@ -625,8 +833,9 @@ fn a_replay_that_moved_rows_is_the_build_it_is_compared_with(cx: &mut TestAppCon
     }
 }
 
-#[gpui::test]
-fn random_pages_and_scrolls_show_what_a_build_shows(cx: &mut TestAppContext) {
+#[test]
+fn random_pages_and_scrolls_show_what_a_build_shows() {
+    let cx = &mut app();
     let kinds = [
         Kind::Plain,
         Kind::Plain,
@@ -638,6 +847,16 @@ fn random_pages_and_scrolls_show_what_a_build_shows(cx: &mut TestAppContext) {
         Kind::Scrolled,
         Kind::Sticky,
         Kind::ByBounds,
+        Kind::Faded,
+        Kind::Faded,
+        Kind::Blurred,
+        Kind::ClipPath,
+        Kind::ClipPath,
+        Kind::Absolute,
+        Kind::Absolute,
+        Kind::Positioned,
+        Kind::Escaping,
+        Kind::Fixed,
     ];
     let mut relocated = 0;
     for seed in 0..24u64 {
