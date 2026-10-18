@@ -9738,7 +9738,7 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use super::point_in_rounded_rect;
-    use crate::{ContentMask, CornerRadii, ScaledPixels};
+    use crate::{ContentMask, CornerRadii, FontId, GlyphId, ScaledPixels, UnderlineStyle};
     use std::{
         cell::{Cell, RefCell},
         path::PathBuf,
@@ -11925,5 +11925,215 @@ mod tests {
         // Lower down the same corner is on the parent's straight edge.
         let lower = mask(-50., 30., 100., 100., (0., 0.));
         assert_exactness(&parent, &lower, true);
+    }
+
+    /// What a scene of text, lines, images and boxes painted at a spot is, with every
+    /// position moved back by `delta`, for comparing it with the same scene painted elsewhere.
+    fn scene_moved_back(scene: &crate::Scene, delta: Point<ScaledPixels>) -> Vec<String> {
+        fn back(bounds: &mut Bounds<ScaledPixels>, delta: Point<ScaledPixels>) {
+            bounds.origin = bounds.origin - delta;
+        }
+        let mut lines = Vec::new();
+        for quad in &scene.quads {
+            let mut quad = quad.clone();
+            back(&mut quad.bounds, delta);
+            back(&mut quad.content_mask.bounds, delta);
+            lines.push(format!("{quad:?}"));
+        }
+        for underline in &scene.underlines {
+            let mut underline = *underline;
+            back(&mut underline.bounds, delta);
+            back(&mut underline.content_mask.bounds, delta);
+            lines.push(format!("{underline:?}"));
+        }
+        for sprite in &scene.monochrome_sprites {
+            let mut sprite = sprite.clone();
+            back(&mut sprite.bounds, delta);
+            back(&mut sprite.content_mask.bounds, delta);
+            lines.push(format!("{sprite:?}"));
+        }
+        for sprite in &scene.polychrome_sprites {
+            let mut sprite = sprite.clone();
+            back(&mut sprite.bounds, delta);
+            back(&mut sprite.content_mask.bounds, delta);
+            lines.push(format!("{sprite:?}"));
+        }
+        lines
+    }
+
+    struct SceneAt {
+        origin: Rc<Cell<Point<Pixels>>>,
+        scale_factor: f32,
+    }
+
+    impl Render for SceneAt {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            const SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="7"><rect width="9" height="7"/></svg>"#;
+            let origin = self.origin.clone();
+            let scale_factor = self.scale_factor;
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, cx| {
+                    // The test platform's window is always at 2; a draw puts that back.
+                    window.set_scale_factor(scale_factor);
+                    let origin = origin.get();
+                    let mask = ContentMask {
+                        bounds: Bounds::new(
+                            origin + point(px(-3.5), px(-1.25)),
+                            size(px(400.), px(300.)),
+                        ),
+                        ..Default::default()
+                    };
+                    // A shifted scene leaves the window, and what the window's own mask does not
+                    // contain is not painted at all.
+                    window.content_mask_stack.push(ContentMask {
+                        bounds: Bounds::new(
+                            point(px(-8192.), px(-8192.)),
+                            size(px(16384.), px(16384.)),
+                        ),
+                        ..Default::default()
+                    });
+                    window.with_content_mask(Some(mask), |window| {
+                        for column in 0..40 {
+                            for row in 0..6 {
+                                let at = origin
+                                    + point(
+                                        px(column as f32 * 0.3125 + 0.0625),
+                                        px(12. + row as f32 * 18.1875),
+                                    );
+                                let glyph_font = FontId(0);
+                                window
+                                    .paint_glyph(at, glyph_font, GlyphId(1), px(16.), crate::black())
+                                    .unwrap();
+                                window
+                                    .paint_emoji(
+                                        at + point(px(0.), px(9.5)),
+                                        glyph_font,
+                                        GlyphId(2),
+                                        px(16.),
+                                    )
+                                    .unwrap();
+                                window.paint_underline(
+                                    at + point(px(0.25), px(3.)),
+                                    px(7.5 + column as f32 * 0.125),
+                                    &UnderlineStyle {
+                                        thickness: px(1.),
+                                        color: Some(crate::red()),
+                                        ..Default::default()
+                                    },
+                                );
+                                window
+                                    .paint_svg(
+                                        Bounds::new(
+                                            at + point(px(1.5), px(-8.)),
+                                            size(px(9.), px(7.0625 + row as f32 * 0.25)),
+                                        ),
+                                        "tick.svg".into(),
+                                        Some(SVG),
+                                        crate::TransformationMatrix::unit(),
+                                        crate::blue(),
+                                        cx,
+                                    )
+                                    .unwrap();
+                                window.paint_quad(crate::quad(
+                                    Bounds::new(
+                                        at + point(px(-0.5), px(-9.5)),
+                                        size(
+                                            px(5.5 + column as f32 * 0.0625),
+                                            px(4.5 + row as f32 * 0.125),
+                                        ),
+                                    ),
+                                    px(2.),
+                                    crate::green(),
+                                    px(1.),
+                                    crate::black(),
+                                    crate::BorderStyle::Solid,
+                                ));
+                            }
+                        }
+                    });
+                    window.content_mask_stack.pop();
+                },
+            )
+            .size_full()
+        }
+    }
+
+    /// A whole number of device pixels along is a whole number of device pixels along for
+    /// everything painted: rounding to the pixel, the subpixel variant of a glyph, the pixel an
+    /// emoji or an image sits in. Retained subtrees rely on it to be replayed shifted.
+    #[test]
+    fn painting_shifted_by_whole_device_pixels_gives_the_primitives_shifted() {
+        use crate::{RasterizingTextSystem, TestApp};
+        use std::sync::Arc;
+
+        let device_shifts = [
+            (-613, 40),
+            (-64, -64),
+            (-37, 3),
+            (-5, -100),
+            (-1, 257),
+            (1, -1),
+            (2, 8),
+            (3, -37),
+            (8, 21),
+            (21, -5),
+            (100, 2),
+            (257, -613),
+        ];
+        let origins = [
+            point(px(0.), px(0.)),
+            point(px(5.5), px(3.25)),
+            point(px(-4.75), px(11.125)),
+            point(px(-30.), px(-26.5)),
+        ];
+        for scale_factor in [1., 2.] {
+            let origin = Rc::new(Cell::new(point(px(0.), px(0.))));
+            let mut app = TestApp::with_text_system(Arc::new(RasterizingTextSystem::new()));
+            let mut window = app.open_window({
+                let origin = origin.clone();
+                move |_, _| SceneAt {
+                    origin,
+                    scale_factor,
+                }
+            });
+            let paint_at = |window: &mut crate::TestAppWindow<SceneAt>,
+                            at: Point<Pixels>,
+                            moved_back_by: Point<ScaledPixels>| {
+                origin.set(at);
+                window.update(|_, _, cx| cx.notify());
+                window.draw();
+                window.update(|_, window, _| {
+                    let scene = &window.rendered_frame.scene;
+                    assert!(!scene.quads.is_empty() && !scene.underlines.is_empty());
+                    assert!(scene.monochrome_sprites.len() >= 2 * 40 * 6);
+                    assert!(!scene.polychrome_sprites.is_empty());
+                    scene_moved_back(scene, moved_back_by)
+                })
+            };
+            for base in origins {
+                let reference = paint_at(&mut window, base, point(ScaledPixels(0.), ScaledPixels(0.)));
+                for (shift_x, shift_y) in device_shifts {
+                    let shifted_to = base
+                        + point(
+                            px(shift_x as f32 / scale_factor),
+                            px(shift_y as f32 / scale_factor),
+                        );
+                    let moved_back = paint_at(
+                        &mut window,
+                        shifted_to,
+                        point(ScaledPixels(shift_x as f32), ScaledPixels(shift_y as f32)),
+                    );
+                    assert_eq!(moved_back.len(), reference.len());
+                    for (index, (moved, expected)) in moved_back.iter().zip(&reference).enumerate()
+                    {
+                        assert_eq!(
+                            moved, expected,
+                            "primitive {index}, scale {scale_factor}, from {base:?} by ({shift_x}, {shift_y}) device pixels"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
