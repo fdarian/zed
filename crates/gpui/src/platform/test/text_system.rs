@@ -96,6 +96,7 @@ pub(crate) struct FixedMetricsTextSystem {
     pub ascent: f32,
     pub descent: f32,
     pub x_height: f32,
+    pub cap_height: f32,
 }
 
 impl FixedMetricsTextSystem {
@@ -104,10 +105,11 @@ impl FixedMetricsTextSystem {
     pub(crate) fn menlo() -> Self {
         Self {
             noop: NoopTextSystem::new(),
-            advance: 0.6021,
+            advance: 1233. / 2048.,
             ascent: 0.95,
             descent: 0.25,
-            x_height: 0.547,
+            x_height: 1120. / 2048.,
+            cap_height: 1493. / 2048.,
         }
     }
 }
@@ -131,6 +133,7 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
             ascent: self.ascent * 1000.,
             descent: -self.descent * 1000.,
             x_height: self.x_height * 1000.,
+            cap_height: self.cap_height * 1000.,
             ..self.noop.font_metrics(FontId(0))
         }
     }

@@ -186,6 +186,35 @@ pub(crate) fn floor_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor).floor()
 }
 
+/// Chrome's `LayoutUnit`: boxes are laid out in 1/64 of a logical pixel and painted on device
+/// pixels. Text takes the unit above its advance and the one nearest its height.
+pub(crate) const LAYOUT_UNIT: f32 = 1. / 64.;
+
+/// How far text may stand over the width it is laid out in and still fit, in logical pixels. A
+/// width measured up to a layout unit crosses layout in device pixels and comes back as a float.
+const FIT_SLACK: f32 = 1. / 1024.;
+
+/// The first multiple of [`LAYOUT_UNIT`] at or above `logical`, for a size that must hold its
+/// content: a width the text is laid out in must not wrap the text. A sum of advances a hair above
+/// a multiple of the unit is that multiple.
+#[inline]
+pub(crate) fn ceil_to_layout_unit(logical: f32) -> f32 {
+    (logical / LAYOUT_UNIT - FIT_SLACK / LAYOUT_UNIT).ceil() * LAYOUT_UNIT
+}
+
+/// The multiple of [`LAYOUT_UNIT`] nearest to `logical`, for a size that is a measure of the font.
+#[inline]
+pub(crate) fn round_to_layout_unit(logical: f32) -> f32 {
+    (logical / LAYOUT_UNIT).round() * LAYOUT_UNIT
+}
+
+/// Whether text `width` wide stands over `available`: the slack is for the float that a width
+/// measured by [`ceil_to_layout_unit`] comes back as.
+#[inline]
+pub(crate) fn overflows(width: crate::Pixels, available: crate::Pixels) -> bool {
+    width.0 > available.0 + FIT_SLACK
+}
+
 #[inline]
 pub(crate) fn ceil_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor).ceil()

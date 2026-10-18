@@ -8,6 +8,7 @@ use crate::{
     WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
     point, set_tooltip_on_window,
 };
+use crate::util::{ceil_to_layout_unit, round_to_layout_unit};
 use anyhow::Context as _;
 use gpui_util::ResultExt;
 use itertools::Itertools;
@@ -929,7 +930,7 @@ impl TextLayout {
                                 &inline,
                                 line_height,
                             ) {
-                                Ok(width) => Some(width.ceil()),
+                                Ok(width) => Some(Pixels(ceil_to_layout_unit(width.0))),
                                 Err(error) => {
                                     log::error!("measuring the min-content width: {error:#}");
                                     return unmeasurable(None, None);
@@ -1079,7 +1080,7 @@ impl TextLayout {
                 for line in &lines {
                     let line_size = line.size(line_height);
                     size.height += line_size.height;
-                    size.width = size.width.max(line_size.width).ceil();
+                    size.width = size.width.max(line_size.width);
                 }
                 let (trim_top, trim_bottom) = match (lines.first(), lines.last()) {
                     (Some(first_line), Some(last_line)) if !trim.is_none() => {
@@ -1100,6 +1101,10 @@ impl TextLayout {
                     _ => (Pixels::ZERO, Pixels::ZERO),
                 };
                 size.height -= trim_top + trim_bottom;
+                // As Chrome lays a text out: the width above its advance, the height at the
+                // layout unit nearest to it.
+                size.width = Pixels(ceil_to_layout_unit(size.width.0));
+                size.height = Pixels(round_to_layout_unit(size.height.0));
 
                 let inner = TextLayoutInner {
                     lines: Rc::new(lines),
@@ -2222,7 +2227,8 @@ mod tests {
             let line = &layout.line_layouts()[0];
             let baseline = (px(24.) - line.ascent() - line.descent()) / 2. + line.ascent();
             let bounds = layout.bounds();
-            assert!(bounds.size.height >= cap && bounds.size.height < cap + px(1.));
+            // The box is the cap height to the layout unit; its edges are snapped to device pixels.
+            assert!((bounds.size.height - cap).abs() <= px(0.5));
             let (top, bottom) = layout.text_box_trim_amounts();
             assert_eq!(top, baseline - cap);
             assert_eq!(bottom, px(24.) - baseline);
@@ -2727,18 +2733,210 @@ mod tests {
         }
     }
 
+    /// Boxes of text are laid out in fractions of a pixel and painted on device pixels, as in
+    /// Chrome: a width is the advance of the text up to 1/64 of a pixel, and the height of a
+    /// trimmed text is the metric of its font to the nearest 1/64. The numbers are from headless
+    /// Chrome 155 on macOS (`getBoundingClientRect` of the same boxes in HTML, with Menlo, whose
+    /// advance and cap height `FixedMetricsTextSystem::menlo` has), each case saying which. The
+    /// layout is read before it is snapped.
+    mod chrome_layout_units {
+        use super::*;
+        use crate::{
+            AnyElement, App, Context, FixedMetricsTextSystem, InteractiveElement as _, LayoutId,
+            ParentElement as _, Render, Styled, TestApp, TextBoxEdge, TextBoxOver, TextBoxUnder,
+            div, px,
+        };
+        use std::collections::HashMap;
+
+        type Probe = Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>;
+
+        struct Page {
+            build: fn(&Probe) -> AnyElement,
+            probe: Probe,
+        }
+
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                (self.build)(&self.probe)
+            }
+        }
+
+        fn tag(
+            probe: &Probe,
+            name: &'static str,
+        ) -> impl Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App) + 'static {
+            let probe = probe.clone();
+            move |_, layout_id, window, _| {
+                probe
+                    .borrow_mut()
+                    .insert(name, window.layout_unsnapped_bounds(layout_id));
+            }
+        }
+
+        fn laid_out(build: fn(&Probe) -> AnyElement) -> HashMap<&'static str, Bounds<Pixels>> {
+            let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+            let probe = Probe::default();
+            let mut window = app.open_window({
+                let probe = probe.clone();
+                move |_, _| Page { build, probe }
+            });
+            window.draw();
+            let boxes = probe.borrow().clone();
+            boxes
+        }
+
+        const BOTH: TextBoxTrim = TextBoxTrim {
+            start: true,
+            end: true,
+        };
+
+        /// Chrome reports 1/64 of a pixel.
+        fn assert_chrome(actual: Pixels, chrome: f32, what: &str) {
+            assert!(
+                (actual.0 - chrome).abs() < 1e-3,
+                "{what}: {} != Chrome's {chrome}",
+                actual.0
+            );
+        }
+
+        /// `<div style="font:12px/16px Menlo;display:flex;flex-direction:column;align-items:flex-start">
+        /// <span style="display:inline-flex;padding:0 6px">Hello world</span></div>` and its kin:
+        /// a chip that is as wide as its text. Chrome: [width, height] of the chip.
+        fn chip(probe: &Probe, size: f32, line: f32, padding: f32, text: &'static str) -> AnyElement {
+            div()
+                .w(px(600.))
+                .flex()
+                .flex_col()
+                .items_start()
+                .text_size(px(size))
+                .line_height(px(line))
+                .child(
+                    div()
+                        .flex()
+                        .px(px(padding))
+                        .on_prepainted_layout(tag(probe, "chip"))
+                        .child(StyledText::new(text)),
+                )
+                .into_any_element()
+        }
+
+        #[test]
+        fn a_chip_is_as_wide_as_its_text_to_the_layout_unit() {
+            // Where the layout rounded each text up to a whole pixel these were 80, 92, 79
+            // and 91.
+            let cases: [(fn(&Probe) -> AnyElement, [f32; 2]); 4] = [
+                (|probe| chip(probe, 12., 16., 0., "Hello world"), [79.484375, 16.]),
+                (|probe| chip(probe, 12., 16., 6., "Hello world"), [91.484375, 16.]),
+                (|probe| chip(probe, 13., 20., 8., "Settings"), [78.625, 20.]),
+                (|probe| chip(probe, 15., 22., 0., "Fractional"), [90.3125, 22.]),
+            ];
+            for (build, [width, height]) in cases {
+                let chip = laid_out(build)["chip"];
+                assert_chrome(chip.size.width, width, "chip width");
+                assert_chrome(chip.size.height, height, "chip height");
+            }
+        }
+
+        /// `<div style="height:40px;display:flex;align-items:center;font:14px/21px Menlo">
+        /// <span style="text-box:trim-both cap alphabetic">Hello</span></div>`: the label is as
+        /// tall as the cap height of the font and exactly in the middle of the box.
+        fn centred(probe: &Probe, size: f32, line: f32, height: f32, over: TextBoxOver) -> AnyElement {
+            let mut outer = div()
+                .w(px(600.))
+                .h(px(height))
+                .flex()
+                .items_center()
+                .text_size(px(size))
+                .line_height(px(line));
+            outer.text_style().text_box_edge = Some(TextBoxEdge {
+                over,
+                under: TextBoxUnder::Alphabetic,
+            });
+            outer
+                .on_prepainted_layout(tag(probe, "box"))
+                .child(
+                    div()
+                        .on_prepainted_layout(tag(probe, "label"))
+                        .child(StyledText::new("Hello").with_text_box_trim(BOTH)),
+                )
+                .into_any_element()
+        }
+
+        #[test]
+        fn a_cap_trimmed_label_is_centred_in_its_box_to_the_layout_unit() {
+            // [box height, label y in the box, label width, label height]
+            let cases: [(fn(&Probe) -> AnyElement, [f32; 4]); 4] = [
+                (|probe| centred(probe, 14., 21., 40., TextBoxOver::Cap), [40., 14.890625, 42.15625, 10.203125]),
+                (|probe| centred(probe, 12., 16., 32., TextBoxOver::Cap), [32., 11.625, 36.125, 8.75]),
+                (|probe| centred(probe, 16., 24., 41., TextBoxOver::Cap), [41., 14.65625, 48.171875, 11.671875]),
+                (|probe| centred(probe, 16., 24., 41., TextBoxOver::Ex), [41., 16.125, 48.171875, 8.75]),
+            ];
+            for (build, [box_height, y, width, height]) in cases {
+                let boxes = laid_out(build);
+                let (outer, label) = (boxes["box"], boxes["label"]);
+                assert_chrome(outer.size.height, box_height, "box height");
+                // Chrome floors half of the free space to a layout unit.
+                assert!(
+                    ((label.origin.y - outer.origin.y).0 - y).abs() <= 1. / 64. + 1e-4,
+                    "label y: {:?} != Chrome's {y}",
+                    label.origin.y - outer.origin.y
+                );
+                assert_chrome(label.size.width, width, "label width");
+                assert_chrome(label.size.height, height, "label height");
+            }
+        }
+
+        /// A text in a flex item is as wide as it measured, and is laid out at that width
+        /// without wrapping, whatever the font size: the width crosses layout in device pixels
+        /// and comes back.
+        #[test]
+        fn a_text_laid_out_at_its_own_width_does_not_wrap() {
+            const NAMES: [&str; 8] = ["0", "1", "2", "3", "4", "5", "6", "7"];
+            fn sizes(probe: &Probe) -> AnyElement {
+                let mut column = div()
+                    .w(px(700.))
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .line_height(px(20.));
+                for (ix, name) in NAMES.iter().enumerate() {
+                    column = column.child(
+                        div()
+                            .flex()
+                            .text_size(px(11.3 + ix as f32 * 1.7))
+                            .on_prepainted_layout(tag(probe, name))
+                            .child(StyledText::new("Fractional widths of the quick brown fox")),
+                    );
+                }
+                column.into_any_element()
+            }
+            let boxes = laid_out(sizes);
+            for name in NAMES {
+                let text = boxes[name];
+                assert_eq!(text.size.height, px(20.), "text {name} wrapped: {text:?}");
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     mod min_content {
         use super::*;
         use crate::{
-            AppContext as _, Context, OverflowWrap, ParentElement as _, Render, Styled as _,
-            TestAppContext, WordBreak, div, font, px,
+            AppContext as _, Context, InteractiveElement as _, OverflowWrap, ParentElement as _,
+            Render, Styled as _, TestAppContext, WordBreak, div, font, px,
         };
+
+        /// What the box is as wide as when it holds `characters` of the space: their advances,
+        /// up to the layout unit.
+        fn wide(space: Pixels, characters: f32) -> Pixels {
+            Pixels(ceil_to_layout_unit((space * characters).0))
+        }
 
         struct MinContentText {
             text: &'static str,
             style: fn(&mut crate::StyleRefinement),
             layout: Rc<RefCell<Option<TextLayout>>>,
+            width: Rc<Cell<Pixels>>,
         }
 
         impl Render for MinContentText {
@@ -2750,31 +2948,38 @@ mod tests {
                     .font_family(font("Menlo").family)
                     .text_size(px(16.));
                 (self.style)(keyworded.style());
+                let width = self.width.clone();
+                let keyworded = keyworded.on_prepainted_layout(move |_, layout_id, window, _| {
+                    width.set(window.layout_unsnapped_bounds(layout_id).size.width);
+                });
                 div().w(px(400.)).child(keyworded.child(text))
             }
         }
 
-        /// The width and the height in lines of `text` in a box whose width is
-        /// `min-content`, with `style` applied to the box.
+        /// The width, before it is snapped to device pixels, and the height in lines of `text` in
+        /// a box whose width is `min-content`, with `style` applied to the box.
         fn laid_out(
             cx: &mut TestAppContext,
             text: &'static str,
             style: fn(&mut crate::StyleRefinement),
         ) -> (Pixels, usize) {
             let layout = Rc::new(RefCell::new(None));
+            let width = Rc::new(Cell::new(Pixels::ZERO));
             let window = cx.add_window({
                 let layout = layout.clone();
+                let width = width.clone();
                 move |_, _| MinContentText {
                     text,
                     style,
                     layout,
+                    width,
                 }
             });
             cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
                 .unwrap();
             let layout = layout.borrow().clone().unwrap();
             let lines = layout.wrapped_text().split('\n').count();
-            (layout.bounds().size.width, lines)
+            (width.get(), lines)
         }
 
         fn space(cx: &mut TestAppContext) -> Pixels {
@@ -2790,7 +2995,7 @@ mod tests {
         #[crate::test]
         fn a_box_is_as_wide_as_the_longest_word_and_the_text_wraps_in_it(cx: &mut TestAppContext) {
             let (width, lines) = laid_out(cx, "aa bbbbbb cccc", |_| {});
-            assert_eq!(width, (space(cx) * 7.).ceil());
+            assert_eq!(width, wide(space(cx), 7.));
             assert_eq!(lines, 3);
         }
 
@@ -2806,9 +3011,9 @@ mod tests {
                 style.text_style().overflow_wrap = Some(OverflowWrap::Anywhere);
             });
             let space = space(cx);
-            assert_eq!(normal, (space * 7.).ceil());
+            assert_eq!(normal, wide(space, 7.));
             assert_eq!(break_word, normal);
-            assert_eq!(anywhere, space.ceil());
+            assert_eq!(anywhere, wide(space, 1.));
             assert_eq!(normal_lines, 3);
             assert!(anywhere_lines > normal_lines);
         }
@@ -2820,8 +3025,8 @@ mod tests {
             });
             let (kept, _) = laid_out(cx, "aaaa bb", |_| {});
             let space = space(cx);
-            assert_eq!(hung, (space * 4.).ceil());
-            assert_eq!(kept, (space * 5.).ceil());
+            assert_eq!(hung, wide(space, 4.));
+            assert_eq!(kept, wide(space, 5.));
         }
 
         #[crate::test]
@@ -2829,7 +3034,7 @@ mod tests {
             let (width, _) = laid_out(cx, "abcdef ghi", |style| {
                 style.text_style().word_break = Some(WordBreak::BreakAll);
             });
-            assert_eq!(width, space(cx).ceil());
+            assert_eq!(width, wide(space(cx), 1.));
         }
     }
 

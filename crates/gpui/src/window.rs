@@ -7231,6 +7231,24 @@ impl Window {
             .layout_content_size(layout_id, scale_factor)
     }
 
+    /// The border box of the given layout node relative to the window, as layout computed it and
+    /// before it is snapped to device pixels, which a browser reports for `getBoundingClientRect`
+    /// (to 1/64 of a pixel). Boxes are painted from [`Self::layout_bounds`].
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_unsnapped_bounds(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
+        self.invalidator.debug_assert_prepaint();
+
+        let scale_factor = self.scale_factor();
+        let mut bounds = self
+            .layout_engine
+            .as_mut()
+            .unwrap()
+            .layout_unsnapped_bounds(layout_id, scale_factor);
+        bounds.origin += self.element_offset();
+        bounds
+    }
+
     /// The padding and border widths the given layout node was laid out with, in
     /// logical pixels. They are the resolved ones: a percentage is a length, and a
     /// style that depends on state (hover, focus) is the state's.

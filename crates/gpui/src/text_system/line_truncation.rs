@@ -76,7 +76,7 @@ impl Row {
             .map(|glyph| (glyph.index, glyph.position.x));
         let mut cut = self.start;
         for (index, x) in glyphs.chain(iter::once((self.end, self.end_x))) {
-            if x - self.start_x + affix_width > line_width {
+            if crate::util::overflows(x - self.start_x + affix_width, line_width) {
                 break;
             }
             cut = index;
@@ -124,7 +124,7 @@ impl WindowTextSystem {
 
             let row_ix = if cut_by_lines { allowed - 1 } else { rows - 1 };
             let row = Row::of(line, row_ix);
-            if cut_by_lines || row.width(line, row_ix) > truncation.line_width {
+            if cut_by_lines || crate::util::overflows(row.width(line, row_ix), truncation.line_width) {
                 let cut = row.cut(line, truncation.affix_width, truncation.line_width);
                 let kept = line.text[row.start..cut]
                     .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());

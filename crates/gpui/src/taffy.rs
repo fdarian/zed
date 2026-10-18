@@ -1,8 +1,8 @@
 use crate::{
     AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
-    Style, Window, size,
+    Style, Window, point, size,
     util::{
-        ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
+        ceil_to_layout_unit, round_half_toward_zero, round_stroke_to_device_pixel,
         round_to_device_pixel,
     },
 };
@@ -986,8 +986,9 @@ impl TaffyLayoutEngine {
                 self.meta_mut(id)
                     .unforced_width
                     .get_or_insert(style.size.width);
-                style.size.width =
-                    taffy::style::Dimension::length(round_to_device_pixel(width.0, scale_factor));
+                // A width that was measured, so it is kept as it is: snapping it down would wrap
+                // the text it was measured for.
+                style.size.width = taffy::style::Dimension::length(width.0 * scale_factor);
             }
             None => match self.meta_mut(id).unforced_width.take() {
                 Some(unforced) => style.size.width = unforced,
@@ -1592,6 +1593,21 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// The border box of the node as layout computed it, in logical pixels and before it is
+    /// snapped to device pixels: what a browser reports for `getBoundingClientRect`.
+    pub fn layout_unsnapped_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
+        self.layout_bounds(id, scale_factor);
+        let origin = self.absolute_outer_origins[&id];
+        let size = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE).size;
+        Bounds {
+            origin: point(Pixels(origin.x / scale_factor), Pixels(origin.y / scale_factor)),
+            size: Size {
+                width: Pixels(size.width / scale_factor),
+                height: Pixels(size.height / scale_factor),
+            },
+        }
+    }
+
     /// The padding and border widths the node was laid out with, with percentages and
     /// the style of the current state (hover, focus) already resolved.
     pub fn layout_insets(&mut self, id: LayoutId, scale_factor: f32) -> LayoutInsets {
@@ -1715,7 +1731,7 @@ fn measure_leaf(
 }
 
 fn snap_measured_size_to_device_pixels(size: Size<Pixels>, scale_factor: f32) -> Size<f32> {
-    size.map(|d| ceil_to_device_pixel(d.0.max(0.0), scale_factor))
+    size.map(|d| ceil_to_layout_unit(d.0.max(0.0)) * scale_factor)
 }
 
 /// `exact` keeps the widths as they are, in device pixels, where the others are whole ones: a

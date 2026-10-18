@@ -289,7 +289,8 @@ impl Slot {
             tests::LAYOUT_PASSES.with(|passes| passes.set(passes.get() + 1));
             self.laid_out_as = Some(layout);
         }
-        window.layout_bounds(self.layout_id).size
+        // Not snapped to device pixels: the text is shaped with this width.
+        window.layout_unsnapped_bounds(self.layout_id).size
     }
 
     fn max_size(
@@ -1046,7 +1047,7 @@ mod tests {
                 text: format!("{o}"),
                 boxes: vec![text_box("xxxx xxxx")],
                 height: 40.,
-                rects: vec![[0., 0., 49., 40.]],
+                rects: vec![[0., 0., 48.19, 40.]],
             },
             Case {
                 name: "padding above the text raises the baseline",
@@ -1054,7 +1055,7 @@ mod tests {
                 text: format!("xx{o}{o}"),
                 boxes: vec![text_box("yy zz").padding(10., 0., 0., 0.), mark()],
                 height: 30.,
-                rects: vec![[24.09, 0., 61., 30.], [85.09, 27., 1., 0.]],
+                rects: vec![[24.09, 0., 60.23, 30.], [84.32, 27., 1., 0.]],
             },
             Case {
                 name: "the baseline is the last line of the text",
@@ -1070,7 +1071,7 @@ mod tests {
                 text: format!("xx{o}{o}"),
                 boxes: vec![text_box("xxxx\nyyyy").padding(0., 0., 6., 0.), mark()],
                 height: 46.,
-                rects: vec![[24.09, 0., 49., 46.], [73.09, 37., 1., 0.]],
+                rects: vec![[24.09, 0., 48.19, 46.], [72.28, 37., 1., 0.]],
             },
             Case {
                 name: "a box with no text has its bottom edge for a baseline",
@@ -1092,7 +1093,7 @@ mod tests {
                     mark(),
                 ],
                 height: 30.,
-                rects: vec![[29.09, 2., 67., 24.], [99.09, 21., 1., 0.]],
+                rects: vec![[29.09, 2., 66.23, 24.], [98.32, 21., 1., 0.]],
             },
         ];
         for case in cases {
@@ -1241,7 +1242,7 @@ mod tests {
     fn a_flex_item_is_sized_by_the_min_and_max_content_of_its_boxes() {
         let o = OBJECT;
         for (container, width, height, box_origin) in [
-            (400., 109., 20., (24.09, 7.)),
+            (400., 108.19, 20., (24.09, 7.)),
             (80., 80., 60., (0., 27.)),
             (40., 60., 60., (0., 27.)),
         ] {
@@ -1252,7 +1253,6 @@ mod tests {
                 ..Default::default()
             });
             let name = format!("in a flex row of {container}px");
-            // Chrome's 108.19 is 109 once the text is measured to the next whole pixel.
             assert_close(laid.paragraph.size.width, width, &format!("{name}: width"));
             assert_close(
                 laid.paragraph.size.height,
@@ -1384,7 +1384,7 @@ mod tests {
             24.09,
             "x of the middle box",
         );
-        assert_close(middle.size.width, 35., "width of the middle box");
+        assert_close(middle.size.width, 34.09, "width of the middle box");
         assert_close(
             inner.origin.x - middle.origin.x,
             24.09,

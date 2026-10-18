@@ -713,7 +713,7 @@ impl LineLayout {
             // Without a place to break, a word that does not fit is left to overflow
             // when `overflow_wrap` is normal, and goes on until one turns up.
             if !hanging
-                && wrap_width.is_some_and(|wrap_width| width > wrap_width)
+                && wrap_width.is_some_and(|wrap_width| crate::util::overflows(width, wrap_width))
                 && boundary > last_boundary
                 && (last_candidate_ix.is_some() || breaks_words)
             {
