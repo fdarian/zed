@@ -393,7 +393,7 @@ impl Element for Retained {
                     let nested = recorded.prepaint.nested.clone();
                     let delta = recorded.delta;
                     debug_assert!(
-                        recorded.relocation.as_ref().is_none_or(|relocation| relocation.direct
+                        recorded.relocation.as_ref().is_none_or(|relocation| !relocation.regional()
                             || relocation.info.covers_mask(delta, &window.content_mask())),
                         "the region a relocatable subtree was recorded in covers the clip it is painted under"
                     );
@@ -415,7 +415,8 @@ impl Element for Retained {
                 relocation,
             } => {
                 let relocation = relocation.take();
-                let regional = relocation.as_ref().is_some_and(|relocation| !relocation.direct);
+                let regional = relocation.as_ref().is_some_and(Relocation::regional);
+                let moves = relocation.as_ref().is_some_and(|relocation| !relocation.direct);
                 let relocating = relocation.is_some();
                 let mark = record.then(|| window.begin_paint_recording());
                 if let Some(relocation) = relocation {
@@ -459,7 +460,7 @@ impl Element for Retained {
                     let mut state = state.expect("a built subtree has its state");
                     state.accessed_entities.extend(accessed_entities);
                     let recorded = window
-                        .finish_paint_recording(mark, operations)
+                        .finish_paint_recording(mark, operations, moves)
                         .and_then(|paint| {
                             if paint.has_publications && !publishes {
                                 Err(NonReusable::Publication)
@@ -918,7 +919,7 @@ impl Retained {
         let (relocation, unmovable_at_start) = self.plan_relocation(window);
         let surroundings = relocation
             .as_ref()
-            .filter(|relocation| !relocation.direct)
+            .filter(|relocation| relocation.regional())
             .map(|relocation| relocation.ambient);
         let mark = window.begin_prepaint_recording();
         let relocating = relocation.is_some();
@@ -984,9 +985,13 @@ impl Retained {
         let Some(overscan) = self.overscan else {
             return (None, None);
         };
-        // Nothing of a culled subtree shows, wherever it is put.
+        // Nothing of a culled subtree shows, wherever it is put: it is recorded as it is and put
+        // wherever it is culled too, with what it holds in the frame moved.
         if window.is_culling() {
-            return (None, None);
+            if let Some(reason) = window.scale_blocker() {
+                return (None, Some(reason));
+            }
+            return (Some(Relocation::culled(window.content_mask(), window.retained.reference)), None);
         }
         if let Some(reason) = window.relocation_blocker_here() {
             return (None, Some(reason));
@@ -1018,6 +1023,9 @@ impl Recorded {
             .relocation
             .as_ref()
             .expect("a recording that can be moved has its relocation");
+        if relocation.culled {
+            return Ok(delta);
+        }
         relocation.info.fits(delta, ambient).map(|()| delta).map_err(Some)
     }
 
@@ -1056,7 +1064,7 @@ impl Recorded {
         if (self.prepaint.has_publications || paint.has_publications) && !translates {
             blockers |= blocker_bit(NonRelocatable::Publication);
         }
-        if let Some(relocation) = self.relocation.as_ref().filter(|relocation| !relocation.direct)
+        if let Some(relocation) = self.relocation.as_ref().filter(|relocation| relocation.regional())
             && relocation.info.fits(Point::default(), &relocation.ambient).is_err()
         {
             blockers |= blocker_bit(NonRelocatable::Clip);

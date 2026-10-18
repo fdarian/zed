@@ -5350,7 +5350,7 @@ impl Window {
         let mut escaped = escaped.bounds;
         // The region of a subtree recorded to be put elsewhere stands in for the content mask
         // around it, which is what a box escapes. A mask cut from the region is cut from that.
-        if let Some(relocation) = self.retained.relocation.as_ref().filter(|relocation| !relocation.direct) {
+        if let Some(relocation) = self.retained.relocation.as_ref().filter(|relocation| relocation.regional()) {
             clip = clip.intersect(&relocation.ambient.bounds);
             if derived {
                 escaped = escaped.intersect(&relocation.ambient.bounds);

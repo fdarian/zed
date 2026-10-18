@@ -342,6 +342,7 @@ fn page(
     scroll: &ScrollHandle,
     retained_rows: bool,
     rounded: bool,
+    framed: bool,
     cx: &mut App,
 ) -> AnyElement {
     let rows = specs.iter().enumerate().map(|(index, spec)| {
@@ -398,11 +399,10 @@ fn page(
     if rounded {
         scroller = scroller.rounded_xl();
     }
-    div()
-        .id("page")
-        .size_full()
-        .child(scroller.children(rows))
-        .into_any_element()
+    // A positioned page is the frame around the scroller, which does not scroll with the rows.
+    let page = div().id("page").size_full();
+    let page = if framed { page.relative() } else { page };
+    page.child(scroller.children(rows)).into_any_element()
 }
 
 struct Pair {
@@ -416,6 +416,10 @@ struct Pair {
 
 impl Pair {
     fn new(cx: &mut TestApp, specs: Vec<RowSpec>, scale_factor: f32, rounded: bool) -> Self {
+        Self::build(cx, specs, scale_factor, rounded, false)
+    }
+
+    fn build(cx: &mut TestApp, specs: Vec<RowSpec>, scale_factor: f32, rounded: bool, framed: bool) -> Self {
         let specs = Rc::new(specs);
         let open = |cx: &mut TestApp, retained_rows: bool| {
             let scroll = ScrollHandle::new();
@@ -427,7 +431,7 @@ impl Pair {
                 let specs = specs.clone();
                 let handles = handles.clone();
                 let scroll = scroll.clone();
-                Rc::new(move |_, cx| page(&specs, &handles, &scroll, retained_rows, rounded, cx))
+                Rc::new(move |_, cx| page(&specs, &handles, &scroll, retained_rows, rounded, framed, cx))
             };
             let window = cx.open_window_with_options(
                 WindowOptions {
@@ -862,6 +866,35 @@ fn a_scroll_by_whole_pixels_replays_the_rows_it_keeps() {
 }
 
 #[test]
+fn rows_in_a_positioned_page_are_moved_though_the_page_is_not() {
+    let cx = &mut app();
+    let pair = Pair::build(cx, mixed(40), 1., false, true);
+    pair.assert_same(cx, "the first frame");
+    let before = pair.counters(cx);
+    scroll_through(&pair, cx, &[1., 2., 5., 30., 31., 90., 91., 120., 60., 0.]);
+    let after = pair.counters(cx);
+    assert!(after.relocations > before.relocations, "{after:?}");
+    assert_eq!(after.mismatches, 0);
+}
+
+#[test]
+fn rows_that_are_culled_are_put_where_the_scroll_puts_them_and_stay_culled() {
+    let cx = &mut app();
+    let pair = Pair::new(cx, rows(60, 40., Kind::Button), 1., false);
+    pair.draw(cx);
+    let before = pair.counters(cx);
+    // About 8 rows show and as many are within the overscan: the other 40 are culled all the way.
+    scroll_through(&pair, cx, &[1., 2., 3., 6., 7.5]);
+    let after = pair.counters(cx);
+    assert!(
+        after.relocations - before.relocations > 5 * 40,
+        "the culled rows were moved too: {after:?}"
+    );
+    assert_eq!(after.builds, before.builds, "no row is built for a scroll within the overscan");
+    assert_eq!(after.lazy_builds, before.lazy_builds, "{after:?}");
+}
+
+#[test]
 fn a_fractional_scroll_moves_rows_by_the_snapped_difference() {
     let cx = &mut app();
     for scale_factor in [1., 2.] {
@@ -895,7 +928,8 @@ fn rows_that_come_from_past_the_overscan_are_built() {
 #[test]
 fn a_clip_with_rounded_corners_is_no_place_to_move_rows_to() {
     let cx = &mut app();
-    let pair = Pair::new(cx, mixed(30), 1., true);
+    // Few rows, none of which is culled: a culled one is put anywhere that is culled too.
+    let pair = Pair::new(cx, mixed(7), 1., true);
     pair.draw(cx);
     let before = pair.counters(cx);
     scroll_through(&pair, cx, &[3., 12., 40., 41.]);
@@ -1104,7 +1138,8 @@ fn rows_with_something_that_keeps_their_place_are_never_moved() {
         (Kind::Scrolled, NonRelocatable::NestedScroll),
     ];
     for (kind, reason) in cases {
-        let pair = Pair::new(cx, rows(24, 40., kind), 1., false);
+        // None of the rows is culled: a culled one has not taken the position of anything.
+        let pair = Pair::new(cx, rows(7, 40., kind), 1., false);
         pair.draw(cx);
         let before = pair.counters(cx);
         scroll_through(&pair, cx, &[3., 12., 40., 41., 7.5]);
@@ -1202,7 +1237,8 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
             .collect();
         let scale_factor = if rng.random_bool(0.5) { 1. } else { 2. };
         let rounded = rng.random_bool(0.25);
-        let pair = Pair::new(cx, specs, scale_factor, rounded);
+        let framed = rng.random_bool(0.5);
+        let pair = Pair::build(cx, specs, scale_factor, rounded, framed);
         if verified {
             cx.update_window(pair.retained, |_, window, _| {
                 window.set_retention_verifier(Some(Rc::new(|_| String::new())));
@@ -1225,7 +1261,7 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
                 assert!(mismatches.is_empty(), "seed {seed} step {step} offset {offset} (scale {scale_factor}): {}", mismatches.join("\n"));
             }
             if let Some(difference) = pair.difference(cx) {
-                panic!("seed {seed} (scale {scale_factor}, rounded {rounded}) step {step} offset {offset}: {difference}");
+                panic!("seed {seed} (scale {scale_factor}, rounded {rounded}, framed {framed}) step {step} offset {offset}: {difference}");
             }
             if rng.random_bool(0.3) {
                 pair.draw(cx);
