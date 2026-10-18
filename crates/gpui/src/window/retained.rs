@@ -550,12 +550,10 @@ impl ReplayKey {
 #[derive(Clone)]
 pub(crate) struct RelocationInfo {
     /// The bounds the subtree was prepainted and painted in, instead of the content mask around
-    /// it: what that shows of it plus what scrolling could soon show. The part of its extent
-    /// outside this was left out.
+    /// it: what that shows of it plus what scrolling could soon show. What the subtree has outside
+    /// this was left out, and the masks of what it has inside are this one cut by the clips in the
+    /// subtree.
     region: Bounds<Pixels>,
-    /// Where the subtree can draw and be hit, if its owner says: the root's box and the
-    /// outset it vouches for.
-    extent: Option<Bounds<Pixels>>,
     /// The rounded content masks the subtree painted and hit under.
     rounded: Vec<ContentMask<Pixels>>,
     decisions: Vec<ClipDecision>,
@@ -574,8 +572,9 @@ struct ClipDecision {
 
 impl RelocationInfo {
     /// Whether the subtree recorded here is what painting it `delta` away, inside `ambient`,
-    /// would make. The part of it that is visible there must be inside what was recorded, and no
-    /// rounded clip may be cut by `ambient`, or cut differently than painting under `ambient`
+    /// would make. The region has to cover the content mask there, or the masks of what is
+    /// recorded, which are cut by the region, would be smaller than the ones painting there gives.
+    /// No rounded clip may be cut by `ambient`, or cut differently than painting under `ambient`
     /// at the place it was recorded cut it.
     pub(crate) fn fits(
         &self,
@@ -583,13 +582,7 @@ impl RelocationInfo {
         ambient: &ContentMask<Pixels>,
     ) -> Result<(), RelocationMiss> {
         let region = Bounds::new(self.region.origin + delta, self.region.size);
-        let visible = match self.extent {
-            Some(extent) => ambient
-                .bounds
-                .intersect(&Bounds::new(extent.origin + delta, extent.size)),
-            None => ambient.bounds,
-        };
-        if !covers(&region, &visible) {
+        if !covers(&region, &ambient.bounds) {
             return Err(RelocationMiss::Region);
         }
         let ambient = ContentMask::from_bounds(ambient.bounds);
@@ -645,30 +638,12 @@ pub(crate) struct Relocation {
 }
 
 impl Relocation {
-    /// A recording of a subtree whose box is `bounds`, in a region that reaches `overscan` past
-    /// the content mask `ambient` around it. `outset` is how far the subtree draws and is hit
-    /// outside its box, when its owner says.
-    pub(crate) fn new(
-        ambient: ContentMask<Pixels>,
-        overscan: Pixels,
-        bounds: Bounds<Pixels>,
-        outset: Option<Edges<Pixels>>,
-        direct: bool,
-    ) -> Self {
-        let extent = outset.map(|outset| {
-            Bounds::from_corners(
-                point(bounds.left() - outset.left, bounds.top() - outset.top),
-                point(bounds.right() + outset.right, bounds.bottom() + outset.bottom),
-            )
-        });
-        let mut region = ambient.bounds.dilate(overscan);
-        if let Some(extent) = extent {
-            region = region.intersect(&extent);
-        }
+    /// A recording of a subtree in a region that reaches `overscan` past the content mask
+    /// `ambient` around it.
+    pub(crate) fn new(ambient: ContentMask<Pixels>, overscan: Pixels, direct: bool) -> Self {
         Self {
             info: RelocationInfo {
-                region,
-                extent,
+                region: ambient.bounds.dilate(overscan),
                 rounded: Vec::new(),
                 decisions: Vec::new(),
             },
@@ -1355,7 +1330,7 @@ impl PrepaintRecord {
     /// What the prepaint left in the frame being built, as text. `loose` leaves out what cannot be
     /// reached by the pointer, which a subtree recorded in a region has more of than a build under
     /// the content mask around it.
-    pub(crate) fn describe(&self, window: &Window, loose: bool) -> String {
+    pub(crate) fn describe(&self, window: &Window, loose: bool, delta: Point<Pixels>) -> String {
         use std::fmt::Write as _;
 
         let frame = &window.next_frame;
@@ -1381,7 +1356,7 @@ impl PrepaintRecord {
             .ok();
         }
         if let Some(a11y) = &self.a11y {
-            writeln!(out, "a11y {}", a11y.describe()).ok();
+            writeln!(out, "a11y {}", a11y.describe(delta, window.scale_factor)).ok();
         }
         out
     }
@@ -1424,7 +1399,7 @@ impl PaintRecord {
         }
         writeln!(out, "tab stops {:?}", self.tab_stops).ok();
         if let Some(a11y) = &self.a11y {
-            writeln!(out, "a11y {}", a11y.describe()).ok();
+            writeln!(out, "a11y {}", a11y.describe(Point::default(), window.scale_factor)).ok();
         }
         out
     }

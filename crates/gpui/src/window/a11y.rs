@@ -423,20 +423,49 @@ pub(crate) struct A11yRecording {
 }
 
 impl A11yRecording {
-    /// The nodes the subtree gave the tree, as text.
-    pub(crate) fn describe(&self) -> String {
+    /// The nodes the subtree gave the tree, as text, as a replay `delta` away from where it was
+    /// recorded gives them.
+    pub(crate) fn describe(&self, delta: Point<Pixels>, scale_factor: f32) -> String {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|(id, node)| (*id, moved_node(node, delta, scale_factor)))
+            .collect::<Vec<_>>();
+        let bounds = self
+            .bounds
+            .iter()
+            .map(|(id, bounds)| (*id, Bounds::new(bounds.origin + delta, bounds.size)))
+            .collect::<Vec<_>>();
         format!(
             "{:?}\nchildren {:?}\nauthors {:?}\nfocusables {:?}\nbounds {:?}\nactions {} focus {:?} {:?}",
-            self.nodes,
+            nodes,
             self.top_children,
             self.authors,
             self.focusables,
-            self.bounds,
+            bounds,
             self.actions.len(),
             self.focus,
             self.active_descendant,
         )
     }
+}
+
+/// `node` with its bounds moved by `delta`.
+fn moved_node(node: &accesskit::Node, delta: Point<Pixels>, scale_factor: f32) -> accesskit::Node {
+    let mut node = node.clone();
+    if let Some(rect) = node.bounds() {
+        let (dx, dy) = (
+            f64::from(delta.x.0 * scale_factor),
+            f64::from(delta.y.0 * scale_factor),
+        );
+        node.set_bounds(accesskit::Rect {
+            x0: rect.x0 + dx,
+            y0: rect.y0 + dy,
+            x1: rect.x1 + dx,
+            y1: rect.y1 + dy,
+        });
+    }
+    node
 }
 
 impl A11y {
@@ -515,22 +544,9 @@ impl A11y {
         for (id, node) in &recording.nodes {
             let claimed = self.nodes.seen_ids.insert(*id);
             debug_assert!(claimed, "Duplicate a11y node id: {id:?}");
-            let mut node = node.clone();
-            if !delta.is_zero()
-                && let Some(rect) = node.bounds()
-            {
-                let (dx, dy) = (
-                    f64::from(delta.x.0 * scale_factor),
-                    f64::from(delta.y.0 * scale_factor),
-                );
-                node.set_bounds(accesskit::Rect {
-                    x0: rect.x0 + dx,
-                    y0: rect.y0 + dy,
-                    x1: rect.x1 + dx,
-                    y1: rect.y1 + dy,
-                });
-            }
-            self.nodes.all_nodes.push((*id, node));
+            self.nodes
+                .all_nodes
+                .push((*id, moved_node(node, delta, scale_factor)));
         }
         for (author_id, id) in &recording.authors {
             self.nodes.claim_author_id(author_id.clone(), *id);

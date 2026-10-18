@@ -232,7 +232,7 @@ impl RetainedState {
         let loose = recorded.relocation.is_some();
         let mut text = format!(
             "{}\n{}",
-            recorded.prepaint.describe(window, loose),
+            recorded.prepaint.describe(window, loose, recorded.delta),
             paint.describe(window, loose)
         );
         if let Some(relocation) = &recorded.relocation {
@@ -585,7 +585,6 @@ impl Retained {
                     global_id,
                     key,
                     unreusable,
-                    bounds,
                     window,
                     cx,
                     |window, cx| {
@@ -855,7 +854,7 @@ impl Retained {
             return RetainedPrepaint::Built { element, record: false };
         }
         let unreusable = unstable.then_some(NonReusable::UnstableLayout);
-        let record = self.record_prepaint(global_id, key, unreusable, bounds, window, cx, |window, cx| {
+        let record = self.record_prepaint(global_id, key, unreusable, window, cx, |window, cx| {
             element.prepaint(window, cx);
         });
         RetainedPrepaint::Built { element, record }
@@ -868,13 +867,12 @@ impl Retained {
         global_id: &GlobalElementId,
         key: ReplayKey,
         unreusable: Option<NonReusable>,
-        bounds: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
         prepaint: impl FnOnce(&mut Window, &mut App),
     ) -> bool {
         let publishes = self.on_replay.is_some();
-        let (relocation, unmovable_at_start) = self.plan_relocation(bounds, window);
+        let (relocation, unmovable_at_start) = self.plan_relocation(window);
         let surroundings = relocation
             .as_ref()
             .filter(|relocation| !relocation.direct)
@@ -937,22 +935,19 @@ impl Retained {
     /// be put elsewhere, if its owner says they can, and, if they cannot be here, why.
     fn plan_relocation(
         &self,
-        bounds: Bounds<Pixels>,
         window: &Window,
     ) -> (Option<Relocation>, Option<NonRelocatable>) {
         let Some(overscan) = self.overscan else {
             return (None, None);
         };
+        // Nothing of a culled subtree shows, wherever it is put.
+        if window.is_culling() {
+            return (None, None);
+        }
         if let Some(reason) = window.relocation_blocker_here() {
             return (None, Some(reason));
         }
-        let relocation = Relocation::new(
-            window.content_mask(),
-            overscan,
-            bounds,
-            self.cull_outset,
-            window.retained.reference,
-        );
+        let relocation = Relocation::new(window.content_mask(), overscan, window.retained.reference);
         (Some(relocation), None)
     }
 }
@@ -4177,3 +4172,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod relocation_tests;
