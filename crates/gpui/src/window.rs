@@ -79,8 +79,9 @@ use self::a11y::A11y;
 use self::a11y::ROOT_NODE_ID;
 use crate::tab_stop::{LiftedMarker, LiftedTabStops, TabStopOperation};
 use crate::util::{
-    atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
+    atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_down,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
+    round_to_device_pixel_down, split_glyph_origin,
 };
 pub use prompts::*;
 
@@ -3715,10 +3716,10 @@ impl Window {
     #[inline]
     fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
-        let left = round_to_device_pixel(bounds.left().0, scale_factor);
-        let top = round_to_device_pixel(bounds.top().0, scale_factor);
-        let right = round_to_device_pixel(bounds.right().0, scale_factor).max(left);
-        let bottom = round_to_device_pixel(bounds.bottom().0, scale_factor).max(top);
+        let left = round_to_device_pixel_down(bounds.left().0, scale_factor);
+        let top = round_to_device_pixel_down(bounds.top().0, scale_factor);
+        let right = round_to_device_pixel_down(bounds.right().0, scale_factor).max(left);
+        let bottom = round_to_device_pixel_down(bounds.bottom().0, scale_factor).max(top);
         Bounds::from_corners(
             point(ScaledPixels(left), ScaledPixels(top)),
             point(ScaledPixels(right), ScaledPixels(bottom)),
@@ -6284,7 +6285,7 @@ impl Window {
             return;
         }
         let geometry = decoration_geometry(kind, style, thickness.0);
-        let origin = origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor)));
+        let origin = origin.map(|c| ScaledPixels(round_to_device_pixel_down(c.0, scale_factor)));
         let width = self.snap_stroke(width);
         let color = color.unwrap_or_default().opacity(self.element_opacity());
         let content_mask = self.snapped_content_mask();
@@ -6329,17 +6330,10 @@ impl Window {
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
 
-        let quantized_origin = Point::new(
-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
-                / SUBPIXEL_VARIANTS_X as f32,
-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
-                / SUBPIXEL_VARIANTS_Y as f32,
-        );
-        let subpixel_variant = Point::new(
-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
-        );
-        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+        let (integer_x, subpixel_x) = split_glyph_origin(glyph_origin.x.0, SUBPIXEL_VARIANTS_X);
+        let (integer_y, subpixel_y) = split_glyph_origin(glyph_origin.y.0, SUBPIXEL_VARIANTS_Y);
+        let subpixel_variant = Point::new(subpixel_x, subpixel_y);
+        let integer_origin = point(ScaledPixels(integer_x), ScaledPixels(integer_y));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
         let dilation = self.text_system().glyph_dilation_for_color(color);
         let params = RenderGlyphParams {
@@ -6431,7 +6425,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
-        let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0)));
+        let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_down(c.0)));
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -6524,7 +6518,7 @@ impl Window {
                 .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
         };
         let final_bounds = svg_bounds
-            .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
+            .map_origin(|value| ScaledPixels(round_half_down(value.0)))
             .map_size(|size| size.ceil());
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
