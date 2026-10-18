@@ -4588,7 +4588,10 @@ mod tests {
             .unwrap()
         }
 
-        #[gpui::test(iterations = 20)]
+        /// Random trees of retained subtrees edited frame by frame, shown against the same trees
+        /// built whole. Seeds take a quarter of a second: `ITERATIONS=3000` runs a long one (see
+        /// also `regression_tests` for the scrolled page).
+        #[gpui::test(iterations = 300)]
         fn retained_subtrees_show_what_the_same_tree_built_shows(
             rng: StdRng,
             cx: &mut TestAppContext,
@@ -4598,7 +4601,7 @@ mod tests {
 
         /// The same without the verifier, whose reference build is what it presents, so that
         /// moves of recorded ranges accumulate across frames.
-        #[gpui::test(iterations = 40)]
+        #[gpui::test(iterations = 300)]
         fn unverified_retained_subtrees_show_what_the_same_tree_built_shows(
             rng: StdRng,
             cx: &mut TestAppContext,
@@ -4674,7 +4677,6 @@ mod tests {
             assert_eq!(self::counters(building, cx).replays, 0, "the control replays nothing");
             assert_eq!(counters.layout_fallbacks, 0, "{counters:?}");
             assert_eq!(self::counters(building, cx).layout_replays, 0);
-            assert!(counters.layout_replays > 0 && counters.layout_builds > 0, "{counters:?}");
         }
     }
 

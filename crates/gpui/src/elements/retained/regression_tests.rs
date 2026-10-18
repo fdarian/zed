@@ -17,21 +17,22 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-/// Whether the random pages have a feature. `RETAINED_FUZZ_ON` and `RETAINED_FUZZ_OFF` list
-/// (comma separated) the ones to add to or take from the default, to find which one a failure
-/// needs. The features: `lift` (positioned nodes), `round` (rounded clips), `lifts` (relocatable
-/// roots that hold positioned nodes), `toggle` (the window root becomes a stacking context and
-/// stops being one) are on by default; `nested` (a scroller in the scroller), `scale` (scale factor
-/// and rem size change), `abandon` (frames that are drawn and not shown) and `cull` (nodes that are
-/// culled outside the clip) find cases that replays and recordings do not agree on yet, so that
-/// the verified fuzz fails within a few hundred pages with the three together, and within a few
-/// with `cull`.
+/// Whether the random pages have a feature. All are on. `RETAINED_FUZZ_OFF` lists (comma
+/// separated) the ones to take away, to find which one a failure needs: `lift` (positioned
+/// nodes), `round` (rounded clips), `lifts` (relocatable roots that hold positioned nodes),
+/// `toggle` (the window root becomes a stacking context and stops being one), `nested` (a scroller
+/// in the scroller), `scale` (scale factor and rem size change), `abandon` (frames that are drawn
+/// and not shown) and `cull` (nodes that are culled outside the clip).
+///
+/// To run long, set `ITERATIONS` (and `SEED`, the first seed): the verified fuzz takes about 1.7
+/// seconds a seed, a script being 30 frames in two windows, so 1500 seeds are about 40 minutes
+/// in one process and 7 minutes in 8 that each run a range of seeds
+/// (`SEED=$((n * 190)) ITERATIONS=190 cargo test -p gpui --lib --features test-support scrolled_`).
+/// A failure is shrunk to the Rust of a test that plays it, unless `RETAINED_FUZZ_NOSHRINK` is
+/// set, which also lets a panic through to show where it is from. `RETAINED_VERIFY_DUMP=dir`
+/// writes the texts of the first frame that differs from its build to `dir`.
 fn feature(name: &str) -> bool {
-    let listed = |var: &str| std::env::var(var).is_ok_and(|list| list.split(',').any(|listed| listed == name));
-    if listed("RETAINED_FUZZ_OFF") {
-        return false;
-    }
-    listed("RETAINED_FUZZ_ON") || matches!(name, "lift" | "round" | "lifts" | "toggle")
+    !std::env::var("RETAINED_FUZZ_OFF").is_ok_and(|list| list.split(',').any(|listed| listed == name))
 }
 
 const SIZES: [u32; 6] = [0, 14, 22, 36, 60, 100];
@@ -974,12 +975,12 @@ fn run(mut rng: StdRng, cx: &mut TestAppContext, scrolling: bool, verify: bool) 
     }
 }
 
-#[gpui::test(iterations = 60)]
+#[gpui::test(iterations = 100)]
 fn scrolled_unverified(rng: StdRng, cx: &mut TestAppContext) {
     run(rng, cx, true, false);
 }
 
-#[gpui::test(iterations = 30)]
+#[gpui::test(iterations = 100)]
 fn scrolled_verified(rng: StdRng, cx: &mut TestAppContext) {
     run(rng, cx, true, true);
 }
