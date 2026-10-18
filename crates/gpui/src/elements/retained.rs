@@ -2447,6 +2447,162 @@ mod tests {
         assert_eq!(bar_y(cx), wrapped);
     }
 
+    type ParentStyle = fn(crate::Stateful<crate::Div>, bool) -> crate::Stateful<crate::Div>;
+
+    /// A subtree of text under a parent that `style` styles, in its second state when the flag is
+    /// set. A frame that sets it is compared with the frame of a build of the same.
+    fn replay_under_a_text_style(cx: &mut TestAppContext, style: ParentStyle) {
+        let changed = Rc::new(Cell::new(false));
+        let key = Rc::new(Cell::new(1));
+        let window = open(cx, {
+            let changed = changed.clone();
+            let key = key.clone();
+            Rc::new(move |_, _| {
+                let parent = style(div().id("parent").w(px(60.)).flex().flex_col(), changed.get());
+                div()
+                    .id("root")
+                    .size_full()
+                    .child(
+                        parent
+                            .child(retained("retained", key.get(), move |_, _| {
+                                div().id("text").bg(crate::red()).child("aaaa bbbb cccc dddd").into_any_element()
+                            }))
+                            .child(div().id("bar").flex_none().h(px(10.)).w(px(50.)).bg(crate::green())),
+                    )
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        assert!(before.replays > 0);
+
+        changed.set(true);
+        draw(window, cx);
+        let drawn = snapshot(window, cx, &POINTS);
+        let after = counters(window, cx);
+        assert_eq!(after.layout_fallbacks, before.layout_fallbacks);
+        assert_eq!(after.replays, before.replays, "not replayed under another text style");
+        key.set(2);
+        draw(window, cx);
+        let built = snapshot(window, cx, &POINTS);
+        assert_eq!(drawn.scene, built.scene);
+        assert_eq!(drawn.a11y, built.a11y);
+        assert_eq!(drawn.chains, built.chains);
+
+        // And back, replayed again at the end.
+        changed.set(false);
+        draw(window, cx);
+        draw(window, cx);
+        draw(window, cx);
+        assert!(counters(window, cx).replays > before.replays);
+    }
+
+    #[gpui::test]
+    fn a_wrap_mode_around_a_subtree_is_part_of_what_it_was_recorded_under(cx: &mut TestAppContext) {
+        replay_under_a_text_style(cx, |parent, changed| if changed { parent.whitespace_nowrap() } else { parent });
+    }
+
+    #[gpui::test]
+    fn a_wrap_style_around_a_subtree_is_part_of_what_it_was_recorded_under(cx: &mut TestAppContext) {
+        replay_under_a_text_style(cx, |mut parent, changed| {
+            if changed {
+                parent.text_style().text_wrap_style = Some(crate::TextWrapStyle::Balance);
+            }
+            parent
+        });
+    }
+
+    #[gpui::test]
+    fn a_text_box_edge_around_a_subtree_is_part_of_what_it_was_recorded_under(cx: &mut TestAppContext) {
+        replay_under_a_text_style(cx, |mut parent, changed| {
+            parent.text_style().text_box_edge = Some(crate::TextBoxEdge {
+                over: if changed { crate::TextBoxOver::Ex } else { crate::TextBoxOver::Cap },
+                under: crate::TextBoxUnder::Alphabetic,
+            });
+            parent
+        });
+    }
+
+    #[gpui::test]
+    fn font_variations_around_a_subtree_are_part_of_what_it_was_recorded_under(cx: &mut TestAppContext) {
+        replay_under_a_text_style(cx, |parent, changed| {
+            if changed {
+                parent.font_variations(crate::FontVariations::new([(u32::from_be_bytes(*b"wght"), 800.)]))
+            } else {
+                parent
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn a_font_weight_around_a_subtree_is_part_of_what_it_was_recorded_under(cx: &mut TestAppContext) {
+        replay_under_a_text_style(cx, |parent, changed| {
+            if changed { parent.font_weight(crate::FontWeight::BOLD) } else { parent }
+        });
+    }
+
+    #[gpui::test]
+    fn an_outline_outside_the_box_of_a_replayed_subtree_is_painted_as_a_build_paints_it(cx: &mut TestAppContext) {
+        let key = Rc::new(Cell::new(1));
+        let window = open(cx, {
+            let key = key.clone();
+            Rc::new(move |_, _| {
+                let cards = (0..3usize).map(|index| {
+                    retained(("outlined", index), key.get(), move |_, _| {
+                        div()
+                            .id(("card", index))
+                            .w(px(100.))
+                            .h(px(30.))
+                            .flex_none()
+                            .bg(crate::blue())
+                            .outline(crate::Outline {
+                                width: px(2.),
+                                color: crate::red(),
+                                offset: px(3.),
+                                style: crate::BorderStyle::Solid,
+                            })
+                            .child("outlined")
+                            .into_any_element()
+                    })
+                });
+                // The gap is narrower than the outline, which paints over the card above it.
+                div()
+                    .id("root")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .pl(px(10.))
+                    .pt(px(10.))
+                    .children(cards)
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        draw(window, cx);
+        assert!(counters(window, cx).replays > before.replays);
+        let replayed = snapshot(window, cx, &POINTS);
+        let painted_outside = cx
+            .update_window(window, |_, window, _| {
+                let scale = window.scale_factor();
+                window
+                    .painted_quads()
+                    .iter()
+                    .any(|quad| quad.bounds.origin.x.0 / scale < 10.)
+            })
+            .unwrap();
+        assert!(painted_outside, "the outline is painted outside the card");
+        key.set(2);
+        draw(window, cx);
+        let built = snapshot(window, cx, &POINTS);
+        assert_eq!(replayed.scene, built.scene);
+        assert_eq!(replayed.a11y, built.a11y);
+        assert_eq!(replayed.chains, built.chains);
+    }
+
     struct Number(usize);
 
     #[gpui::test]
