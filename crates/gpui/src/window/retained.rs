@@ -245,7 +245,6 @@ pub(crate) struct RetainedWindow {
     pub(crate) replayed: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mismatches: Vec<String>,
     // Counts of what a recording cannot repeat, which move on whenever it happens.
-    pub(crate) lifts: u32,
     pub(crate) publications: u32,
     pub(crate) redraw_requests: u32,
     pub(crate) autoscroll_requests: u32,
@@ -268,7 +267,10 @@ pub(crate) struct RetainedWindow {
 /// What a recording of a retained subtree could not repeat happened, if the counts differ.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Effects {
-    lifts: u32,
+    /// How many elements the stacking context around the recording was handed, by the next
+    /// ordinal it gives. The ones handed to a context that begins inside the recording are
+    /// not counted: the recording holds their paint.
+    ambient_lifts: u32,
     escapes: u32,
     publications: u32,
     redraw_requests: u32,
@@ -317,7 +319,7 @@ impl Effects {
                 reasons |= 1 << reason.index();
             }
         };
-        add(self.lifts != later.lifts, NonReusable::Lift);
+        add(self.ambient_lifts != later.ambient_lifts, NonReusable::Lift);
         add(self.escapes != later.escapes, NonReusable::Escape);
         add(
             self.deferred_draws != later.deferred_draws,
@@ -888,7 +890,7 @@ impl Window {
     fn effects(&self) -> Effects {
         let engine = self.layout_engine();
         Effects {
-            lifts: self.retained.lifts,
+            ambient_lifts: self.ambient_lift_ordinal(),
             escapes: self.escapes_prepainted,
             publications: self.retained.publications,
             redraw_requests: self.retained.redraw_requests,

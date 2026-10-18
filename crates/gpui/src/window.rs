@@ -5463,6 +5463,15 @@ impl Window {
         matches!(self.lift_lists.last(), Some(Some(_)))
     }
 
+    /// The ordinal the stacking context that elements are handed to now gives the next one, or 0
+    /// when there is none.
+    pub(crate) fn ambient_lift_ordinal(&self) -> u32 {
+        match self.lift_lists.last() {
+            Some(Some(list)) => list.next_ordinal,
+            _ => 0,
+        }
+    }
+
     /// Whether the element being prepainted is inside a stacking context, however many layout
     /// roots away. What is recorded by position in `Frame::hitboxes` and in the tab stop log is
     /// then moved when the context finishes.
@@ -5519,7 +5528,6 @@ impl Window {
     /// that it counts in tree order before the elements inside it.
     pub(crate) fn begin_lift(&mut self) -> LiftTicket {
         self.invalidator.debug_assert_prepaint();
-        self.retained.lifts = self.retained.lifts.wrapping_add(1);
         let list = match self.lift_lists.last_mut() {
             Some(Some(list)) => list,
             _ => panic!("begin_lift outside a stacking context"),

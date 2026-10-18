@@ -2111,6 +2111,16 @@ mod tests {
         hook: bool,
         inner: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
     ) -> (AnyWindowHandle, Rc<Cell<usize>>, Rc<RefCell<Vec<RetainedPhase>>>) {
+        single_under(cx, hook, false, inner)
+    }
+
+    /// [`single`] with the window's root a stacking context if `context` says so.
+    fn single_under(
+        cx: &mut TestAppContext,
+        hook: bool,
+        context: bool,
+        inner: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> (AnyWindowHandle, Rc<Cell<usize>>, Rc<RefCell<Vec<RetainedPhase>>>) {
         let builds = Rc::new(Cell::new(0));
         let phases = Rc::new(RefCell::new(Vec::new()));
         let inner: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement> = Rc::new(inner);
@@ -2130,7 +2140,11 @@ mod tests {
                     let phases = phases.clone();
                     subtree = subtree.on_replay(move |phase, _, _| phases.borrow_mut().push(phase));
                 }
-                div().id("root").size_full().child(subtree).into_any_element()
+                let mut root = div().id("root").size_full();
+                if context {
+                    root = root.stacking_context();
+                }
+                root.child(subtree).into_any_element()
             })
         });
         for _ in 0..3 {
@@ -2146,7 +2160,16 @@ mod tests {
         reason: NonReusable,
         inner: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
     ) {
-        let (window, builds, _) = single(cx, false, inner);
+        never_replayed_under(cx, reason, false, inner)
+    }
+
+    fn never_replayed_under(
+        cx: &mut TestAppContext,
+        reason: NonReusable,
+        context: bool,
+        inner: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) {
+        let (window, builds, _) = single_under(cx, false, context, inner);
         let before = counters(window, cx);
         let built = builds.get();
         for _ in 0..4 {
@@ -2166,11 +2189,10 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_subtree_that_lifts_is_never_replayed(cx: &mut TestAppContext) {
-        never_replayed(cx, NonReusable::Lift, |_, _| {
+    fn a_subtree_that_lifts_into_the_context_around_it_is_never_replayed(cx: &mut TestAppContext) {
+        never_replayed_under(cx, NonReusable::Lift, true, |_, _| {
             div()
-                .id("context")
-                .stacking_context()
+                .id("plain")
                 .w(px(100.))
                 .h(px(100.))
                 .child(
@@ -2185,6 +2207,98 @@ mod tests {
                 .child(div().id("below").w(px(30.)).h(px(30.)).bg(crate::blue()))
                 .into_any_element()
         });
+    }
+
+    /// A stacking context with lifted boxes, some below its content and some above, and a
+    /// listener on each, so that a frame that replays it can be told from one that builds it.
+    fn context_with_lifts(clicks: &Rc<RefCell<Vec<usize>>>) -> AnyElement {
+        let click = |index: usize| {
+            let clicks = clicks.clone();
+            move |_: &crate::ClickEvent, _: &mut Window, _: &mut App| clicks.borrow_mut().push(index)
+        };
+        div()
+            .id("context")
+            .stacking_context()
+            .w(px(100.))
+            .h(px(100.))
+            .child(
+                div()
+                    .id("behind")
+                    .absolute()
+                    .z_index(-1)
+                    .left(px(10.))
+                    .top(px(10.))
+                    .w(px(50.))
+                    .h(px(50.))
+                    .bg(crate::green())
+                    .on_click(click(0)),
+            )
+            .child(
+                div()
+                    .id("lifted")
+                    .absolute()
+                    .z_index(2)
+                    .w(px(20.))
+                    .h(px(20.))
+                    .bg(crate::red())
+                    .on_click(click(1)),
+            )
+            .child(div().id("below").w(px(30.)).h(px(30.)).bg(crate::blue()).on_click(click(2)))
+            .into_any_element()
+    }
+
+    #[gpui::test]
+    fn a_stacking_context_that_lifts_inside_itself_is_replayed_as_it_is_built(cx: &mut TestAppContext) {
+        let key = Rc::new(Cell::new(1));
+        let builds = Rc::new(Cell::new(0));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let window = open(cx, {
+            let key = key.clone();
+            let builds = builds.clone();
+            let clicks = clicks.clone();
+            Rc::new(move |_, _| {
+                let clicks = clicks.clone();
+                let builds = builds.clone();
+                div()
+                    .id("root")
+                    .size_full()
+                    .child(retained("retained", key.get(), move |_, _| {
+                        builds.set(builds.get() + 1);
+                        context_with_lifts(&clicks)
+                    }))
+                    .into_any_element()
+            })
+        });
+        cx.update_window(window, |_, window, _| {
+            window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        })
+        .unwrap();
+        for _ in 0..3 {
+            draw(window, cx);
+        }
+        let before = counters(window, cx);
+        draw(window, cx);
+        draw(window, cx);
+        let after = counters(window, cx);
+        assert_eq!(after.verified, before.verified + 2);
+        assert_eq!(after.replays, before.replays + 2);
+        assert_eq!(after.total_non_reusable(), 0, "{after:?}");
+        assert_eq!(after.mismatches, 0, "{after:?}");
+        let replayed = snapshot(window, cx, &POINTS);
+        let tabs = tab_order(window, cx, 2);
+        click(window, cx, 5., 5.);
+        click(window, cx, 45., 45.);
+        click(window, cx, 25., 25.);
+        assert_eq!(*clicks.borrow(), [1, 0, 2], "the lifted box is hit above the ones it overlaps");
+
+        key.set(2);
+        draw(window, cx);
+        let rebuilt = snapshot(window, cx, &POINTS);
+        assert_eq!(counters(window, cx).replays, after.replays, "a new key builds");
+        assert_eq!(replayed.scene, rebuilt.scene);
+        assert_eq!(replayed.chains, rebuilt.chains);
+        assert_eq!(replayed.a11y, rebuilt.a11y);
+        assert_eq!(tabs, tab_order(window, cx, 2));
     }
 
     #[gpui::test]
