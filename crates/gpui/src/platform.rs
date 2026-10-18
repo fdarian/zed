@@ -1302,6 +1302,7 @@ impl PlatformTextSystem for NoopTextSystem {
             descent: metrics.line_box(font_size).descent,
             runs,
             len: text.len(),
+            boxes: Vec::new(),
         }
     }
 

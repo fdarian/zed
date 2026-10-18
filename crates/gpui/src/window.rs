@@ -81,8 +81,8 @@ use self::a11y::ROOT_NODE_ID;
 use crate::tab_stop::{LiftedMarker, LiftedTabStops, TabStopOperation};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_down,
-    round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
-    round_to_device_pixel_down, split_glyph_origin,
+    round_half_toward_zero_f64, round_stroke_to_device_pixel, round_thickness_to_device_pixel,
+    round_to_device_pixel, round_to_device_pixel_down, split_glyph_origin,
 };
 pub use prompts::*;
 
@@ -3896,7 +3896,7 @@ impl Window {
 
     /// A computed `auto` or `from-font` thickness is fractional. Chrome fills a solid or
     /// double line with the thickness floored to a device pixel and strokes a dotted or
-    /// dashed one with it rounded; a length was already rounded when it resolved.
+    /// dashed one with it rounded, as it does a length.
     #[inline]
     fn snap_decoration_thickness(
         &self,
@@ -3909,7 +3909,7 @@ impl Window {
         if floors {
             ScaledPixels(floor_to_device_pixel(thickness.0, self.scale_factor()).max(1.0))
         } else {
-            self.snap_stroke(thickness)
+            ScaledPixels(round_thickness_to_device_pixel(thickness.0, self.scale_factor()))
         }
     }
 

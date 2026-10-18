@@ -721,6 +721,7 @@ impl MacTextSystemState {
             ascent: strut.map_or(Pixels::ZERO, |strut| strut.ascent),
             descent: strut.map_or(Pixels::ZERO, |strut| strut.descent),
             len: text.len(),
+            boxes: Vec::new(),
         }
     }
 }
@@ -1197,6 +1198,8 @@ mod tests {
             parent: None,
             align: VerticalAlign::Baseline,
             line_height: None,
+            wraps: None,
+            key: None,
             content: InlineContent::Atomic(AtomicExtent {
                 advance: px(30.),
                 ascent: px(25.),

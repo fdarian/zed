@@ -210,6 +210,7 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
             x += run_size * self.advance;
         }
         LineLayout {
+            boxes: Vec::new(),
             font_size,
             width: x,
             ascent: self.font_metrics(FontId(0)).line_box(font_size).ascent,

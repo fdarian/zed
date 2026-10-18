@@ -860,7 +860,14 @@ impl TextLayout {
         let line_height = floor_to_layout_unit(
             window.text_system().line_height(&text_style, window.rem_size()),
         );
-        let options = text_style.layout_options(window.text_system());
+        let mut options = text_style.layout_options(window.text_system());
+        // A box that wraps in text that does not makes lines, and the spaces at the end
+        // of them hang as they do in text that wraps.
+        let text_wraps = text_style.white_space == WhiteSpace::Normal
+            || inline_boxes.iter().any(|inline_box| inline_box.wraps == Some(true));
+        if text_wraps {
+            options.hang_trailing_spaces |= options.nowrap;
+        }
 
         let runs = if let Some(runs) = runs {
             runs
@@ -939,7 +946,7 @@ impl TextLayout {
                     });
                     MeasuredLeaf::from(Size::default())
                 };
-                let wrap_width = if text_style.white_space == WhiteSpace::Normal {
+                let wrap_width = if text_wraps {
                     match (known_dimensions.width, available_space.width) {
                         (Some(width), _) | (None, crate::AvailableSpace::Definite(width)) => {
                             Some(width)
@@ -3274,6 +3281,203 @@ mod tests {
             let c = inset.layout.insets_at(2).unwrap();
             assert_eq!((c.index, c.leading, c.trailing), (2, px(0.), px(4.)));
             assert_eq!(inset.layout.insets_at(3), None);
+        }
+    }
+
+    mod inline_boxes {
+        use super::*;
+        use crate::{
+            Context, InlineContent, ParentElement as _, RasterizingTextSystem, Render, Styled as _,
+            TestApp, UnderlineStyle, VerticalAlign, WhiteSpace, div, px,
+        };
+
+        /// A box over `range` of the text, that says how it wraps and how it is aligned.
+        fn inline_box(
+            range: Range<usize>,
+            key: Option<u64>,
+            align: VerticalAlign,
+            wraps: Option<bool>,
+        ) -> InlineBox {
+            InlineBox {
+                range,
+                parent: None,
+                align,
+                line_height: None,
+                wraps,
+                key,
+                content: InlineContent::Text {
+                    font: crate::font("Menlo"),
+                    font_size: px(16.),
+                },
+            }
+        }
+
+        struct Boxed {
+            text: &'static str,
+            boxes: Vec<InlineBox>,
+            underline: Option<(Range<usize>, Option<u64>)>,
+            nowrap: bool,
+            width: Pixels,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for Boxed {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let run = |len, decorator: Option<u64>, underlined: bool| TextRun {
+                    len,
+                    color: crate::black(),
+                    underline: underlined.then(|| UnderlineStyle {
+                        thickness: px(1.),
+                        decorator,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut text = StyledText::new(self.text);
+                text = match &self.underline {
+                    Some((range, decorator)) => text.with_runs(vec![
+                        run(range.start, None, false),
+                        run(range.len(), *decorator, true),
+                        run(self.text.len() - range.end, None, false),
+                    ]),
+                    None => text,
+                };
+                text = text.with_inline_boxes(self.boxes.clone());
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let mut container = div().w(self.width).text_size(px(16.));
+                if self.nowrap {
+                    container.text_style().white_space = Some(WhiteSpace::Nowrap);
+                }
+                container.child(text)
+            }
+        }
+
+        struct Painted {
+            layout: TextLayout,
+            /// The y of every underline, in logical pixels.
+            underlines: Vec<f32>,
+        }
+
+        fn painted(
+            text: &'static str,
+            boxes: Vec<InlineBox>,
+            underline: Option<(Range<usize>, Option<u64>)>,
+            nowrap: bool,
+            width: Pixels,
+        ) -> Painted {
+            let mut app = TestApp::with_text_system(Arc::new(RasterizingTextSystem::new()));
+            let layout = Rc::new(RefCell::new(None));
+            let mut window = app.open_window({
+                let layout = layout.clone();
+                move |_, _| Boxed {
+                    text,
+                    boxes,
+                    underline,
+                    nowrap,
+                    width,
+                    layout,
+                }
+            });
+            window.draw();
+            let underlines = window.update(|_, window, _| {
+                let scale = window.scale_factor();
+                window
+                    .rendered_frame
+                    .scene
+                    .underlines
+                    .iter()
+                    .map(|underline| underline.bounds.origin.y.0 / scale)
+                    .collect::<Vec<_>>()
+            });
+            let layout = layout.borrow().clone().unwrap();
+            Painted { layout, underlines }
+        }
+
+        #[test]
+        fn an_underline_is_drawn_at_the_baseline_of_the_box_that_declared_it() {
+            // "bb" is raised, and the underline is over all of "aabbcc", closed by a raised glyph.
+            let underline = |decorator| {
+                painted(
+                    "aabbcc",
+                    vec![
+                        inline_box(2..6, Some(1), VerticalAlign::Super, None),
+                        inline_box(0..6, Some(2), VerticalAlign::Baseline, None),
+                    ],
+                    Some((0..6, decorator)),
+                    false,
+                    px(400.),
+                )
+                .underlines
+            };
+            let row = underline(None);
+            assert_eq!(row.len(), 1);
+            // A declaring box on the baseline, whatever is raised inside it, or none at all.
+            assert_eq!(underline(Some(2)), row);
+            // A key no box has leaves it on the baseline of the row.
+            assert_eq!(underline(Some(99)), row);
+            // The raised box declared it: it follows the box up by a third of the font size and a pixel.
+            let raised = underline(Some(1));
+            assert_eq!(raised.len(), 1);
+            let raise = 16. / 3. + 1.;
+            assert!(
+                (row[0] - raised[0] - raise).abs() <= 1.,
+                "{} is not {raise} above {}",
+                raised[0],
+                row[0]
+            );
+        }
+
+        #[test]
+        fn an_underline_closed_by_a_raised_glyph_is_not_raised() {
+            // The underline is over "aabb" and the glyph after it, which closes it, is raised.
+            let at = |range: Range<usize>| {
+                painted(
+                    "aabbcc",
+                    vec![inline_box(4..6, Some(1), VerticalAlign::Super, None)],
+                    Some((range, None)),
+                    false,
+                    px(400.),
+                )
+                .underlines
+            };
+            assert_eq!(at(0..4), at(0..6));
+        }
+
+        #[test]
+        fn an_underline_that_wraps_is_drawn_at_the_baseline_of_its_box_in_each_row() {
+            let painted = painted(
+                "aaaa bbbb cccc",
+                vec![inline_box(5..9, Some(1), VerticalAlign::Super, None)],
+                Some((0..14, Some(1))),
+                false,
+                px(80.),
+            );
+            assert!(painted.layout.wrapped_text().contains('\n'));
+            assert!(painted.underlines.len() >= 2);
+        }
+
+        #[test]
+        fn a_box_that_wraps_in_text_that_does_not_lets_the_text_break_in_it_alone() {
+            let wrapped = |boxes: Vec<InlineBox>, nowrap: bool| {
+                painted("aaaa bbbb cccc dddd", boxes, None, nowrap, px(120.))
+                    .layout
+                    .wrapped_text()
+                    .replace('\n', "|")
+            };
+            let unwrapped = wrapped(Vec::new(), true);
+            assert!(!unwrapped.contains('|'), "{unwrapped}");
+            let in_box = wrapped(
+                vec![inline_box(10..19, None, VerticalAlign::Baseline, Some(true))],
+                true,
+            );
+            assert!(in_box.contains('|'), "{in_box}");
+            // Nothing breaks before the box: the space is the text's own.
+            assert!(!in_box[..in_box.find('|').unwrap()].contains("aaaa|"), "{in_box}");
+            let nowrap_in_wrapping = wrapped(
+                vec![inline_box(0..19, None, VerticalAlign::Baseline, Some(false))],
+                false,
+            );
+            assert!(!nowrap_in_wrapping.contains('|'), "{nowrap_in_wrapping}");
         }
     }
 

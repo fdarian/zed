@@ -17,7 +17,7 @@ use std::{
 };
 
 use super::{
-    InlineRun, InlineSpec, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
+    InlineRun, InlineSpec, PlacedBox, RunWrap, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
     apply_inline,
     resolve_placements,
 };
@@ -110,6 +110,11 @@ pub struct TextLayoutOptions {
     /// every line: the content area every line has, whatever its runs are set in. `None`
     /// leaves the strut to the font of the first run.
     pub strut_font: Option<FontId>,
+    /// That a line may not break in the text, CSS `text-wrap-mode: nowrap`. It is what
+    /// the text outside every [`InlineBox`](crate::InlineBox) has, and what a box that
+    /// says nothing about it inherits; a box can say otherwise. A text with no wrap
+    /// width does not break whatever this is.
+    pub nowrap: bool,
 }
 
 impl TextLayoutOptions {
@@ -245,6 +250,9 @@ pub struct LineLayout {
     pub runs: Vec<ShapedRun>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+    /// The boxes with a [key](crate::InlineBox::key) that are on this line, and where
+    /// they sit.
+    pub boxes: Vec<PlacedBox>,
 }
 
 /// A run of text that has been shaped .
@@ -350,6 +358,24 @@ impl LineRows {
 }
 
 impl LineLayout {
+    /// How far above the baseline of row `row_ix`, of the `rows` this line makes, the
+    /// baseline of the box with `key` is: zero for a box on the baseline, negative for one
+    /// below it. Zero too for a box this line has no key for, and for no key, which is the
+    /// baseline of the row.
+    pub fn box_raise(&self, key: Option<u64>, row_ix: usize, rows: &[RowMetrics]) -> Pixels {
+        let Some(placed) = key.and_then(|key| self.boxes.iter().find(|placed| placed.key == key))
+        else {
+            return Pixels::ZERO;
+        };
+        let row = rows[row_ix];
+        match placed.placement {
+            RunPlacement::Baseline => Pixels::ZERO,
+            RunPlacement::Raised(raise) => raise,
+            RunPlacement::Top => row.baseline - placed.above,
+            RunPlacement::Bottom => row.baseline - (row.height - placed.below),
+        }
+    }
+
     /// Whether the run is an inline box of its own in the line: it differs from the
     /// strut in the size or the line height it was set with, or in the content area its
     /// font has at that size, so the line is as tall as both together need.
@@ -634,6 +660,7 @@ impl LineLayout {
             descent: self.descent,
             runs: left_runs,
             len: byte_index,
+            boxes: self.boxes.clone(),
         };
 
         let right = LineLayout {
@@ -643,6 +670,7 @@ impl LineLayout {
             descent: self.descent,
             runs: right_runs,
             len: self.len - byte_index,
+            boxes: self.boxes.clone(),
         };
 
         (left, right)
@@ -680,6 +708,8 @@ impl LineLayout {
         let mut broke_word = false;
         let mut prev_ch = '\0';
         let mut prev_was_object = false;
+        let mut word_wraps = !options.nowrap;
+        let mut spaces: Option<SpaceRun> = None;
         let mut positions = GlyphPositions::new(self, text, tab_stop, options, insets);
         let mut placed = 0;
 
@@ -692,20 +722,40 @@ impl LineLayout {
                 continue;
             }
 
+            // The spaces before this glyph and what a line may do around them.
+            if ch == ' ' {
+                let wrap = positions.glyphs[ix].wrap;
+                let run = spaces.get_or_insert(SpaceRun {
+                    word_wraps,
+                    space_wraps: wrap.wraps,
+                    opens_nowrap: false,
+                });
+                run.space_wraps = wrap.wraps;
+                run.opens_nowrap |= wrap.opens_nowrap;
+            }
+            // Whether a line may break right before this glyph, which is a place a
+            // line breaks at if the text wraps there.
+            let may_break_here = match spaces {
+                Some(run) => run.may_break(),
+                None => ix == 0 || may_break_apart(&positions.glyphs[ix - 1], &positions.glyphs[ix]),
+            };
+
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
             if positions.glyphs[ix].is_object {
                 // A line may break on either side of an atomic inline, like an image.
-                if first_non_whitespace_ix.is_some() {
+                if first_non_whitespace_ix.is_some() && may_break_here {
                     last_candidate_ix = Some(ix);
                 }
             } else if prev_was_object && ch != ' ' && first_non_whitespace_ix.is_some() {
-                last_candidate_ix = Some(ix);
-            } else if LineWrapper::is_word_char(ch) || (keep_all && is_cjk(ch)) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
+                if may_break_here {
                     last_candidate_ix = Some(ix);
                 }
-            } else if ch != ' ' && first_non_whitespace_ix.is_some() {
+            } else if LineWrapper::is_word_char(ch) || (keep_all && is_cjk(ch)) {
+                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() && may_break_here {
+                    last_candidate_ix = Some(ix);
+                }
+            } else if ch != ' ' && first_non_whitespace_ix.is_some() && may_break_here {
                 last_candidate_ix = Some(ix);
             }
 
@@ -719,11 +769,15 @@ impl LineLayout {
             let width = positions.x(ix + 1) - last_boundary_x;
 
             // Without a place to break, a word that does not fit is left to overflow
-            // when `overflow_wrap` is normal, and goes on until one turns up.
+            // when `overflow_wrap` is normal, and goes on until one turns up. A word
+            // is not broken where the text does not wrap.
             if !hanging
                 && wrap_width.is_some_and(|wrap_width| crate::util::overflows(width, wrap_width))
                 && boundary > last_boundary
-                && (last_candidate_ix.is_some() || breaks_words)
+                && (last_candidate_ix.is_some()
+                    || (breaks_words
+                        && ix > 0
+                        && may_break_apart(&positions.glyphs[ix - 1], &positions.glyphs[ix])))
             {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
@@ -747,7 +801,7 @@ impl LineLayout {
             // After a space the line may break, and a space that does not fit then
             // starts the next line. Taken after the check above, so that the space
             // itself is measured against the breaks before it.
-            if options.break_spaces && ch == ' ' {
+            if options.break_spaces && ch == ' ' && positions.glyphs[ix].wrap.wraps {
                 last_candidate_ix = Some(ix + 1);
             }
             // Between letters the line may break, so the candidate is always the
@@ -755,8 +809,13 @@ impl LineLayout {
             if break_all
                 && let Some(next) = positions.glyphs.get(ix + 1)
                 && may_break_between(ch, next.wrap_char)
+                && may_break_apart(&positions.glyphs[ix], next)
             {
                 last_candidate_ix = Some(ix + 1);
+            }
+            if ch != ' ' {
+                spaces = None;
+                word_wraps = positions.glyphs[ix].wrap.wraps;
             }
             prev_ch = ch;
             prev_was_object = positions.glyphs[ix].is_object;
@@ -888,6 +947,7 @@ impl LineLayout {
             descent: self.descent,
             runs,
             len: self.len,
+            boxes: self.boxes.clone(),
         }
     }
 }
@@ -931,6 +991,30 @@ struct WrapGlyph {
     hangs: bool,
     font_id: FontId,
     shaped_x: Pixels,
+    wrap: RunWrap,
+}
+
+/// Whether a line may break between two characters that are neither of them a space,
+/// `before` and `after`, which are next to each other. CSS gives the box around both
+/// the say, which Chromium reads as: any of the three boxes lets it.
+fn may_break_apart(before: &WrapGlyph, after: &WrapGlyph) -> bool {
+    after.wrap.joint_wraps || before.wrap.wraps || after.wrap.wraps
+}
+
+/// The spaces between two words, as far as whether a line may break after them. The space
+/// is the box's to say, as CSS has it, and Chromium lets the word before it say too,
+/// unless a box that does not wrap starts at the space.
+#[derive(Clone, Copy)]
+struct SpaceRun {
+    word_wraps: bool,
+    space_wraps: bool,
+    opens_nowrap: bool,
+}
+
+impl SpaceRun {
+    fn may_break(&self) -> bool {
+        self.space_wraps || (self.word_wraps && !self.opens_nowrap)
+    }
 }
 
 /// The x of each glyph of a line and then of its end. They are the shaped
@@ -1004,6 +1088,11 @@ impl<'a> GlyphPositions<'a> {
         insets: &[TextInset],
     ) -> Self {
         let tab_is_space = tab_stop.is_some() || options.spaces_hang() || options.break_spaces;
+        let text_wraps = RunWrap {
+            wraps: !options.nowrap,
+            joint_wraps: !options.nowrap,
+            opens_nowrap: false,
+        };
         let glyphs: Vec<WrapGlyph> = layout
             .runs
             .iter()
@@ -1011,7 +1100,19 @@ impl<'a> GlyphPositions<'a> {
             .flat_map(|(run_ix, run)| {
                 run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
                     let character = text[glyph.index..].chars().next().unwrap();
+                    let run_wrap = run.inline.wrap.unwrap_or(text_wraps);
                     WrapGlyph {
+                        // Only the first glyph of a run has a place that may break
+                        // between it and the run before.
+                        wrap: if glyph_ix == 0 {
+                            run_wrap
+                        } else {
+                            RunWrap {
+                                joint_wraps: run_wrap.wraps,
+                                opens_nowrap: false,
+                                ..run_wrap
+                            }
+                        },
                         boundary: WrapBoundary { run_ix, glyph_ix },
                         // A tab is white space that may break, like the space it is
                         // when the text is not laid out with tab stops.
@@ -1773,6 +1874,7 @@ impl LineLayoutCache {
                 TextWrapStyle::default()
             },
             strut_font: options.strut_font,
+            nowrap: options.nowrap && wrap_width.is_some(),
         };
         let max_lines = max_lines.filter(|_| wrap_width.is_some());
         let key = &CacheKeyRef {
@@ -1814,6 +1916,7 @@ impl LineLayoutCache {
                 inline,
                 line_height,
                 options.strut_font,
+                !options.nowrap,
             );
             let tab_stop = options
                 .tab_size
@@ -1926,6 +2029,7 @@ impl LineLayoutCache {
         inline: &[InlineSpec],
         line_height: Pixels,
         strut_font: Option<FontId>,
+        root_wraps: bool,
     ) -> Arc<LineLayout> {
         if inline.is_empty() {
             return self.layout_line::<&SharedString>(text, font_size, runs, None, strut_font);
@@ -1953,7 +2057,7 @@ impl LineLayoutCache {
             line_height,
             &|font_id| self.platform_text_system.font_metrics(font_id),
         );
-        Arc::new(apply_inline(&shaped, inline, &boxes))
+        Arc::new(apply_inline(&shaped, inline, &boxes, root_wraps))
     }
 
     /// Shapes the text between the atomic inlines of `inline`, which the shaper never
@@ -2078,6 +2182,7 @@ impl LineLayoutCache {
             descent,
             runs: layout_runs,
             len: text.len(),
+            boxes: Vec::new(),
         }
     }
 
@@ -2545,6 +2650,7 @@ mod tests {
 
     fn make_layout(glyphs: Vec<ShapedGlyph>) -> LineLayout {
         LineLayout {
+            boxes: Vec::new(),
             font_size: px(16.),
             width: px(100.),
             ascent: px(12.),
@@ -4491,6 +4597,235 @@ mod tests {
             RowMetrics { height: px(19.), baseline: px(12.) }
         );
     }
+
+    /// Ten pixel wide characters in `markup`, whose boxes are `<n>` (does not wrap),
+    /// `<w>` (wraps) and `<p>` (says nothing), wrapped at `columns` and a half; the
+    /// rows, without the spaces between them. `root_nowrap` is a text that does not wrap
+    /// outside its boxes.
+    fn rows_of(markup: &str, columns: f32, root_nowrap: bool, options: TextLayoutOptions) -> Vec<String> {
+        let mut text = String::new();
+        let mut specs: Vec<InlineSpec> = Vec::new();
+        let mut open: Vec<usize> = Vec::new();
+        let mut rest = markup;
+        while !rest.is_empty() {
+            if let Some(tag) = ["<n>", "<w>", "<p>"].iter().find(|tag| rest.starts_with(**tag)) {
+                specs.push(InlineSpec {
+                    range: text.len()..text.len(),
+                    parent: open.last().copied(),
+                    align: crate::VerticalAlign::Baseline,
+                    line_height: None,
+                    wraps: match *tag {
+                        "<n>" => Some(false),
+                        "<w>" => Some(true),
+                        _ => None,
+                    },
+                    key: None,
+                    content: crate::text_system::SpecContent::Text {
+                        font_id: FontId(0),
+                        font_size: px(16.),
+                    },
+                });
+                open.push(specs.len() - 1);
+                rest = &rest[3..];
+            } else if ["</n>", "</w>", "</p>"].iter().any(|tag| rest.starts_with(*tag)) {
+                let ix = open.pop().expect("a closing tag matches an opening one");
+                specs[ix].range.end = text.len();
+                rest = &rest[4..];
+            } else {
+                let character = rest.chars().next().unwrap();
+                text.push(character);
+                rest = &rest[character.len_utf8()..];
+            }
+        }
+        let boxes: Vec<crate::text_system::ResolvedBox> = specs
+            .iter()
+            .map(|_| crate::text_system::ResolvedBox {
+                placement: RunPlacement::Baseline,
+                above: px(0.),
+                below: px(0.),
+            })
+            .collect();
+        let options = TextLayoutOptions {
+            nowrap: root_nowrap,
+            hang_trailing_spaces: true,
+            ..options
+        };
+        let shaped = apply_inline(&monospace_layout(&text, 10.), &specs, &boxes, !root_nowrap);
+        let computation = shaped.compute_wrap_boundaries(
+            &text,
+            Some(px(columns * 10. + 5.)),
+            None,
+            options,
+            None,
+            &[],
+        );
+        let chars: Vec<char> = text.chars().collect();
+        let mut rows = Vec::new();
+        for (ix, start) in computation.line_starts.iter().enumerate() {
+            let end = computation.line_starts.get(ix + 1).copied().unwrap_or(chars.len());
+            rows.push(chars[*start..end].iter().collect::<String>().trim().to_string());
+        }
+        rows
+    }
+
+    fn rows(markup: &str, columns: f32, root_nowrap: bool) -> Vec<String> {
+        let options = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            ..Default::default()
+        };
+        rows_of(markup, columns, root_nowrap, options)
+    }
+
+    /// The expectations of the next tests were read off Chromium, with the same text in a
+    /// block and `text-wrap-mode` on its spans: `fixtures/text-wrap-spans-oracle.html`.
+    #[test]
+    fn test_a_box_that_does_not_wrap_is_not_broken_and_moves_whole() {
+        for (markup, expected) in [
+            ("aaaa bbbb cccc dddd eeee ffff", "aaaa bbbb cccc dddd|eeee ffff"),
+            ("aaaa bbbb <n>cccc dddd eeee</n> ffff", "aaaa bbbb|cccc dddd eeee ffff"),
+            ("aaaa bbbb cccc <n>dddd eeee</n> ffff", "aaaa bbbb cccc|dddd eeee ffff"),
+            ("<n>aaaa bbbb cccc dddd eeee</n> ffff gggg", "aaaa bbbb cccc dddd eeee|ffff gggg"),
+            ("aaaa bbbb cccc <n>dddd eeee ffff gggg</n>", "aaaa bbbb cccc|dddd eeee ffff gggg"),
+            (
+                "aaaa <n>bbbb cccc dddd eeee ffff gggg</n> hhhh",
+                "aaaa|bbbb cccc dddd eeee ffff gggg|hhhh",
+            ),
+            ("aaaa bbbb<n>cccc dddd</n>eeee ffff", "aaaa|bbbbcccc ddddeeee|ffff"),
+            ("aaaa bbbb <n>cccc</n> dddd eeee ffff", "aaaa bbbb cccc dddd|eeee ffff"),
+        ] {
+            assert_eq!(rows(markup, 20., false).join("|"), expected, "{markup}");
+        }
+    }
+
+    #[test]
+    fn test_the_space_of_a_box_that_does_not_wrap_does_not_break() {
+        for (markup, expected) in [
+            // The space leads the box.
+            ("aaaa bbbb cccc<n> dddd eeee</n> ffff", "aaaa bbbb|cccc dddd eeee ffff"),
+            // The space ends it.
+            ("aaaa bbbb <n>cccc dddd </n>eeee ffff", "aaaa bbbb|cccc dddd eeee ffff"),
+        ] {
+            assert_eq!(rows(markup, 20., false).join("|"), expected, "{markup}");
+        }
+    }
+
+    #[test]
+    fn test_a_box_inside_and_a_box_around_a_box_take_the_mode_they_say_or_inherit() {
+        for (markup, expected) in [
+            (
+                "aaaa bbbb <n>cccc dddd <w>eeee ffff</w> gggg</n> hhhh",
+                "aaaa bbbb|cccc dddd eeee ffff|gggg hhhh",
+            ),
+            ("aaaa bbbb <n>cccc <p>dddd eeee</p> ffff</n> gggg", "aaaa bbbb|cccc dddd eeee ffff|gggg"),
+            ("aaaa bbbb <n><p><p>cccc dddd eeee</p></p></n> ffff", "aaaa bbbb|cccc dddd eeee ffff"),
+        ] {
+            assert_eq!(rows(markup, 20., false).join("|"), expected, "{markup}");
+        }
+    }
+
+    #[test]
+    fn test_a_box_that_wraps_in_text_that_does_not_wraps() {
+        for (markup, expected) in [
+            ("aaaa bbbb cccc dddd eeee ffff", "aaaa bbbb cccc dddd eeee ffff"),
+            ("aaaa bbbb <w>cccc dddd eeee ffff</w> gggg", "aaaa bbbb cccc dddd|eeee ffff gggg"),
+            ("aaaa bbbb cccc <w>dddd eeee</w> ffff", "aaaa bbbb cccc dddd|eeee ffff"),
+            ("<w>aaaa bbbb cccc dddd eeee</w> ffff gggg", "aaaa bbbb cccc dddd|eeee ffff gggg"),
+            ("aaaa bbbb cccc<w> dddd eeee</w> ffff", "aaaa bbbb cccc dddd|eeee ffff"),
+            ("aaaa bbbb <w>cccc dddd </w>eeee ffff", "aaaa bbbb cccc dddd|eeee ffff"),
+            ("aaaa bbbb <w>cccc <p>dddd eeee</p> ffff</w> gggg", "aaaa bbbb cccc dddd|eeee ffff gggg"),
+        ] {
+            assert_eq!(rows(markup, 20., true).join("|"), expected, "{markup}");
+        }
+    }
+
+    #[test]
+    fn test_a_word_is_not_broken_where_the_text_does_not_wrap() {
+        let breaking = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Anywhere,
+            ..Default::default()
+        };
+        assert_eq!(
+            rows_of("aaaa <n>bbbbbbbbbbbbbbbbbbbb</n> cccc", 10., false, breaking).join("|"),
+            "aaaa|bbbbbbbbbbbbbbbbbbbb|cccc"
+        );
+        assert_eq!(
+            rows("aaaa <w>bbbbbbbbbbbbbbbbbbbb</w> cccc", 10., true).join("|"),
+            "aaaa bbbbbbbbbbbbbbbbbbbb|cccc"
+        );
+        // Where the text wraps the word is broken, but not in the box that does not.
+        assert_eq!(
+            rows_of("aaaa <w>bbbbbbbbbbbbbbbbbbbb</w> cccc", 10., true, breaking).join("|"),
+            "aaaa bbbbb|bbbbbbbbbb|bbbbb cccc"
+        );
+    }
+
+    /// Whether `W S N`, a word, a space and a word in boxes each of its own, break at the
+    /// space in a text 10.5 columns wide, for every mode of the text and of the three
+    /// boxes (`i` is no box): Chromium's, from the same file.
+    #[test]
+    fn test_the_break_at_a_space_between_boxes_is_the_space_s_or_the_word_before_it() {
+        let modes = ['i', 'w', 'n'];
+        for (root_nowrap, expected) in [
+            (false, "111111000111111000111111000"),
+            (true, "000111000111111000000111000"),
+        ] {
+            let mut expected = expected.chars();
+            for word in modes {
+                for space in modes {
+                    for next in modes {
+                        let boxed = |mode: char, text: &str| match mode {
+                            'i' => text.to_string(),
+                            mode => format!("<{mode}>{text}</{mode}>"),
+                        };
+                        let markup = format!("{}{}{}", boxed(word, "wwwwww"), boxed(space, " "), boxed(next, "zzzzzz"));
+                        let broke = rows(&markup, 10., root_nowrap).len() > 1;
+                        assert_eq!(
+                            broke,
+                            expected.next() == Some('1'),
+                            "text nowrap {root_nowrap}, word {word}, space {space}, next {next}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A box that does not wrap starting at the space takes the break away from the word
+    /// before it, even when it says the same as the text around it.
+    #[test]
+    fn test_a_box_that_does_not_wrap_opening_at_the_space_is_no_break() {
+        // Chromium: a nowrap text with a span that wraps, then a plain span with the space.
+        assert_eq!(rows("<w>wwwwww</w> zzzzzz", 10., true).len(), 2);
+        assert_eq!(rows("<w>wwwwww</w><p> </p>zzzzzz", 10., true).len(), 1);
+        assert_eq!(rows("<w>wwwwww</w><p> </p>zzzzzz", 10., false).len(), 2);
+    }
+
+    #[test]
+    fn test_between_letters_a_box_around_both_or_either_side_lets_the_line_break() {
+        let break_all = TextLayoutOptions {
+            word_break: WordBreak::BreakAll,
+            ..Default::default()
+        };
+        let modes = ['i', 'w', 'n'];
+        for (root_nowrap, expected) in [(false, "111111111"), (true, "010111010")] {
+            let mut expected = expected.chars();
+            for first in modes {
+                for second in modes {
+                    let boxed = |mode: char, text: &str| match mode {
+                        'i' => text.to_string(),
+                        mode => format!("<{mode}>{text}</{mode}>"),
+                    };
+                    let markup = format!("{}{}", boxed(first, "wwwwwwwww"), boxed(second, "zzzzzzzzzz"));
+                    let broke = rows_of(&markup, 10., root_nowrap, break_all).len() > 1;
+                    assert_eq!(
+                        broke,
+                        expected.next() == Some('1'),
+                        "text nowrap {root_nowrap}, {first} then {second}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4516,6 +4851,7 @@ mod line_box_tests {
 
     fn layout(runs: Vec<ShapedRun>) -> LineLayout {
         LineLayout {
+            boxes: Vec::new(),
             font_size: px(20.),
             width: px(10.),
             ascent: px(19.),
@@ -4565,4 +4901,3 @@ mod line_box_tests {
         assert_eq!(layout.rows(&[], px(24.))[0].height, px(25.));
     }
 }
-

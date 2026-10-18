@@ -840,6 +840,7 @@ impl TextStyle {
             word_break: self.word_break,
             overflow_wrap: self.overflow_wrap,
             text_wrap_style: self.text_wrap_style,
+            nowrap: self.white_space == WhiteSpace::Nowrap,
         }
     }
 
@@ -1578,6 +1579,13 @@ pub struct UnderlineStyle {
     /// `text-underline-offset`; negative is above it). `None` is `auto`: a gap below
     /// the baseline that grows with the thickness.
     pub offset: Option<Pixels>,
+
+    /// The [`InlineBox::key`](crate::InlineBox::key) of the box that declared the
+    /// underline. CSS draws it at the baseline of that box, whatever the boxes inside it
+    /// are raised or lowered to, and `offset` is measured from there. `None` is the
+    /// baseline of the row, the baseline of a box with no `vertical-align` of its own
+    /// that declared it.
+    pub decorator: Option<u64>,
 }
 
 /// The properties that can be applied to a strikethrough.

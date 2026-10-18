@@ -378,6 +378,8 @@ impl AtomicInlines {
                         parent: slot.parent,
                         align: slot.align,
                         line_height: slot.line_height,
+                        wraps: None,
+                        key: None,
                         content: InlineContent::Atomic(extent),
                     }
                 })
@@ -854,6 +856,8 @@ mod tests {
                     parent: span.parent,
                     align: span.align,
                     line_height: span.line_height.map(crate::px),
+                    wraps: None,
+                    key: None,
                     content: InlineContent::Text {
                         font: crate::font("Menlo"),
                         font_size: crate::px(span.font_size),

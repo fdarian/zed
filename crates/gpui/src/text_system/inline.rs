@@ -117,6 +117,16 @@ pub struct InlineBox {
     /// The `line-height` of the box. `None` is the one the line is laid out with, which
     /// is how a text run without a line height of its own sits on its line.
     pub line_height: Option<Pixels>,
+    /// Whether a line may break inside the box's text, CSS `text-wrap-mode`. `None` is
+    /// what the box around it says, or the text's own for a box with none.
+    ///
+    /// A box that wraps as the box around it does has nothing to say about it, and is
+    /// best left out unless it says something else.
+    pub wraps: Option<bool>,
+    /// Names the box to what is drawn along with it rather than with its glyphs: the
+    /// [`UnderlineStyle::decorator`](crate::UnderlineStyle::decorator) of an underline it
+    /// declared. Two boxes of a text must not have the same key.
+    pub key: Option<u64>,
     /// What is in the box.
     pub content: InlineContent,
 }
@@ -133,6 +143,18 @@ pub enum RunPlacement {
     Top,
     /// The bottom of the run's box is on the bottom of the row.
     Bottom,
+}
+
+/// Where a box with a key sits on its line, once the line is laid out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlacedBox {
+    /// The [`InlineBox::key`] of the box.
+    pub key: u64,
+    /// Where the box sits, as its runs do.
+    pub placement: RunPlacement,
+    /// How far the box reaches above and below its own baseline.
+    pub above: Pixels,
+    pub below: Pixels,
 }
 
 /// How far the strut of an inline box reaches above and below its baseline: the ascent and
@@ -173,12 +195,33 @@ pub struct InlineRun {
     /// For an atomic inline in a box aligned to the top or the bottom of its row: the struts
     /// of the boxes of that aligned group around it, which are one with the box in the group.
     pub aligned_strut: Option<InlineStrut>,
+    /// How the run wraps, when the text was laid out with boxes; `None` is the text's own
+    /// `TextLayoutOptions::nowrap` everywhere. It does not make a run a box of its own.
+    pub wrap: Option<RunWrap>,
 }
 
 impl InlineRun {
     pub(crate) fn is_default(&self) -> bool {
-        *self == Self::default()
+        Self {
+            wrap: None,
+            ..*self
+        } == Self::default()
     }
+}
+
+/// Whether a line may break in and around a run, as CSS decides it for the characters on
+/// either side of a place that may break (CSS Text 3 §5.1), and as Chromium has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RunWrap {
+    /// Whether a line may break inside the run's text: its `text-wrap-mode`.
+    pub wraps: bool,
+    /// For a place that may break between the character before the run and its first one,
+    /// not at a space: the `text-wrap-mode` of the nearest box around both.
+    pub joint_wraps: bool,
+    /// Whether a box that does not wrap starts at the first character of the run. Chromium
+    /// takes the break before a space inside such a box away from the word before it, which
+    /// would otherwise decide it.
+    pub opens_nowrap: bool,
 }
 
 /// An [`InlineBox`] once its fonts are resolved and its range is on a line.
@@ -188,6 +231,8 @@ pub(crate) struct InlineSpec {
     pub parent: Option<usize>,
     pub align: VerticalAlign,
     pub line_height: Option<Pixels>,
+    pub wraps: Option<bool>,
+    pub key: Option<u64>,
     pub content: SpecContent,
 }
 
@@ -362,17 +407,50 @@ fn struts_around(
     (on_baseline, aligned)
 }
 
+/// Whether the text of each of `specs` may break, with `root` for the text outside every
+/// box: a box says so itself or takes it from the box around it.
+fn resolved_wraps(specs: &[InlineSpec], root: bool) -> Vec<bool> {
+    let mut wraps: Vec<bool> = Vec::with_capacity(specs.len());
+    for (ix, spec) in specs.iter().enumerate() {
+        let inherited = spec
+            .parent
+            .filter(|parent| *parent < ix)
+            .map_or(root, |parent| wraps[parent]);
+        wraps.push(spec.wraps.unwrap_or(inherited));
+    }
+    wraps
+}
+
+/// The nearest box around both `a` and `b`, which are boxes of `specs` or none.
+fn common_box(specs: &[InlineSpec], a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    let chain = |mut ix: Option<usize>| {
+        let mut chain = Vec::new();
+        while let Some(current) = ix {
+            chain.push(current);
+            ix = specs[current].parent;
+        }
+        chain
+    };
+    let of_b = chain(b);
+    chain(a).into_iter().find(|ix| of_b.contains(ix))
+}
+
 /// `layout` with every run split where the innermost box around its glyphs changes,
 /// each part carrying the placement of its box, and the runs of atomic inlines marked.
+/// `root_wraps` is whether the text outside every box may break.
 pub(crate) fn apply_inline(
     layout: &LineLayout,
     specs: &[InlineSpec],
     boxes: &[ResolvedBox],
+    root_wraps: bool,
 ) -> LineLayout {
     let innermost = |index: usize| -> Option<usize> {
         specs.iter().rposition(|spec| spec.range.contains(&index))
     };
+    let wraps = resolved_wraps(specs, root_wraps);
+    let wraps_in = |ix: Option<usize>| ix.map_or(root_wraps, |ix| wraps[ix]);
     let mut runs: Vec<ShapedRun> = Vec::with_capacity(layout.runs.len());
+    let mut previous_box: Option<Option<usize>> = None;
     for run in &layout.runs {
         let mut start = 0;
         while start < run.glyphs.len() {
@@ -381,6 +459,19 @@ pub(crate) fn apply_inline(
             while end < run.glyphs.len() && innermost(run.glyphs[end].index) == spec_ix {
                 end += 1;
             }
+            let first_index = run.glyphs[start].index;
+            let wrap = RunWrap {
+                wraps: wraps_in(spec_ix),
+                joint_wraps: match previous_box {
+                    Some(previous) => wraps_in(common_box(specs, previous, spec_ix)),
+                    None => wraps_in(spec_ix),
+                },
+                opens_nowrap: specs
+                    .iter()
+                    .enumerate()
+                    .any(|(ix, spec)| spec.range.start == first_index && !wraps[ix]),
+            };
+            previous_box = Some(spec_ix);
             runs.push(ShapedRun {
                 glyphs: run.glyphs[start..end].to_vec(),
                 inline: match spec_ix {
@@ -396,9 +487,13 @@ pub(crate) fn apply_inline(
                             object,
                             strut,
                             aligned_strut,
+                            wrap: Some(wrap),
                         }
                     }
-                    None => run.inline,
+                    None => InlineRun {
+                        wrap: Some(wrap),
+                        ..run.inline
+                    },
                 },
                 ..run.clone()
             });
@@ -412,5 +507,17 @@ pub(crate) fn apply_inline(
         descent: layout.descent,
         runs,
         len: layout.len,
+        boxes: specs
+            .iter()
+            .zip(boxes)
+            .filter_map(|(spec, resolved)| {
+                spec.key.map(|key| PlacedBox {
+                    key,
+                    placement: resolved.placement,
+                    above: resolved.above,
+                    below: resolved.below,
+                })
+            })
+            .collect(),
     }
 }

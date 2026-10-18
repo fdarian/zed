@@ -181,6 +181,18 @@ pub(crate) fn round_stroke_to_device_pixel(logical: f32, scale_factor: f32) -> f
     }
 }
 
+/// A thickness rounded to the nearest device pixel, a half up, and at least one: only
+/// none at all stays none. This is how Chrome fills a line whose thickness is a length,
+/// so `1.5px` is two pixels on a display of scale 1 and `0.3px` is one.
+#[inline]
+pub(crate) fn round_thickness_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
+    if logical == 0.0 {
+        0.0
+    } else {
+        (logical.max(0.0) * scale_factor).round().max(1.0)
+    }
+}
+
 #[inline]
 pub(crate) fn floor_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor).floor()
@@ -225,6 +237,32 @@ mod tests {
     use crate::TestAppContext;
 
     use super::*;
+
+    #[test]
+    fn a_thickness_rounds_a_half_up_and_is_at_least_a_device_pixel() {
+        // Chrome, `fixtures/text-decoration-oracle.json`: the rows a line of this thickness fills.
+        for (thickness, scale, expected) in [
+            (0.0, 1.0, 0.0),
+            (0.01, 1.0, 1.0),
+            (0.3, 1.0, 1.0),
+            (0.7, 2.0, 1.0),
+            (1.0, 2.0, 2.0),
+            (1.25, 2.0, 3.0),
+            (1.5, 1.0, 2.0),
+            (1.5, 2.0, 3.0),
+            (2.6, 1.0, 3.0),
+            (2.6, 2.0, 5.0),
+            (3.4, 2.0, 7.0),
+            (3.5, 1.0, 4.0),
+            (3.5, 2.0, 7.0),
+        ] {
+            assert_eq!(
+                round_thickness_to_device_pixel(thickness, scale),
+                expected,
+                "{thickness} at {scale}"
+            );
+        }
+    }
 
     #[test]
     fn test_round_half_toward_zero() {

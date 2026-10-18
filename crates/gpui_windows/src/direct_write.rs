@@ -635,6 +635,7 @@ impl DirectWriteState {
                 descent,
                 runs,
                 len: text.len(),
+                boxes: Vec::new(),
             })
         }
     }

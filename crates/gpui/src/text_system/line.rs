@@ -82,6 +82,7 @@ impl ShapedLine {
             descent: layout.descent,
             runs: layout.runs.clone(),
             len,
+            boxes: layout.boxes.clone(),
         });
         self
     }
@@ -493,12 +494,15 @@ fn paint_line(
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
                     let row_baseline = glyph_origin.y + rows[line_ix].baseline;
+                    let underline_baseline = |decorator| {
+                        row_baseline - layout.box_raise(decorator, line_ix, rows)
+                    };
                     if let Some(underline) = current_underline.as_mut() {
                         if glyph_origin.x == underline.x {
                             underline.x -= max_glyph_size.width.half();
                         };
                         window.paint_underline(
-                            underline.origin(row_baseline),
+                            underline.origin(underline_baseline(underline.style.decorator)),
                             glyph_origin.x - previous_trailing - underline.x,
                             &underline.style,
                         );
@@ -544,6 +548,7 @@ fn paint_line(
                             extra,
                             glyph_origin.x - previous_trailing,
                             row_baseline,
+                            &underline_baseline,
                             max_glyph_size.width.half(),
                         );
                         extra.x = origin.x;
@@ -569,6 +574,12 @@ fn paint_line(
                 // Where this run sits in its row, which a vertical alignment moves.
                 let run_baseline = rows[line_ix].baseline - line_rows.raise(run_ix, line_ix);
                 let row_baseline = glyph_origin.y + run_baseline;
+                // CSS draws an underline at the baseline of the box that declared it, not
+                // at that of the run the last of its glyphs is in.
+                let underline_baseline = |decorator| {
+                    glyph_origin.y + rows[line_ix].baseline
+                        - layout.box_raise(decorator, line_ix, rows)
+                };
 
                 let mut finished_underline: Option<OpenDecoration<UnderlineStyle>> = None;
                 let mut finished_strikethrough: Option<OpenDecoration<StrikethroughStyle>> = None;
@@ -696,7 +707,7 @@ fn paint_line(
                         underline.x -= max_glyph_size.width.half();
                     };
                     window.paint_underline(
-                        underline.origin(row_baseline),
+                        underline.origin(underline_baseline(underline.style.decorator)),
                         glyph_origin.x - previous_trailing - underline.x,
                         &underline.style,
                     );
@@ -730,6 +741,7 @@ fn paint_line(
                         &mut extra,
                         glyph_origin.x - previous_trailing,
                         row_baseline,
+                        &underline_baseline,
                         max_glyph_size.width.half(),
                     );
                 }
@@ -780,12 +792,14 @@ fn paint_line(
         }
 
         let last_row_baseline = glyph_origin.y + rows[line_ix].baseline;
+        let last_underline_baseline =
+            |decorator| last_row_baseline - layout.box_raise(decorator, line_ix, rows);
         if let Some(mut underline) = current_underline.take() {
             if last_line_end_x == underline.x {
                 underline.x -= max_glyph_size.width.half()
             };
             window.paint_underline(
-                underline.origin(last_row_baseline),
+                underline.origin(last_underline_baseline(underline.style.decorator)),
                 last_line_end_x - underline.x,
                 &underline.style,
             );
@@ -819,6 +833,7 @@ fn paint_line(
                 &mut extra,
                 last_line_end_x,
                 last_row_baseline,
+                &last_underline_baseline,
                 max_glyph_size.width.half(),
             );
         }
@@ -1058,12 +1073,18 @@ fn paint_extra(
     extra: &mut OpenDecoration<ExtraDecoration>,
     end_x: Pixels,
     row_baseline: Pixels,
+    underline_baseline: &dyn Fn(Option<u64>) -> Pixels,
     half_glyph_width: Pixels,
 ) {
     if extra.x == end_x {
         extra.x -= half_glyph_width;
     }
-    let origin = extra.origin(row_baseline);
+    let origin = match &extra.style {
+        ExtraDecoration::Underline(style) => extra.origin(underline_baseline(style.decorator)),
+        ExtraDecoration::Strikethrough(_) | ExtraDecoration::Overline(_) => {
+            extra.origin(row_baseline)
+        }
+    };
     let width = end_x - extra.x;
     match &extra.style {
         ExtraDecoration::Underline(style) => window.paint_underline(origin, width, style),
@@ -1190,6 +1211,7 @@ mod tests {
 
         ShapedLine {
             layout: Arc::new(LineLayout {
+                boxes: Vec::new(),
                 font_size: px(16.0),
                 width: px(width),
                 ascent: px(12.0),
@@ -1269,6 +1291,7 @@ mod tests {
         // Successive splits simulate the incremental splitting done during wrap.
         let line = ShapedLine {
             layout: Arc::new(LineLayout {
+                boxes: Vec::new(),
                 font_size: px(16.0),
                 width: px(60.0),
                 ascent: px(12.0),

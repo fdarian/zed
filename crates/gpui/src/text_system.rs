@@ -884,6 +884,8 @@ impl WindowTextSystem {
                 parent,
                 align: inline_box.align,
                 line_height: inline_box.line_height,
+                wraps: inline_box.wraps,
+                key: inline_box.key,
                 content,
             });
         }
