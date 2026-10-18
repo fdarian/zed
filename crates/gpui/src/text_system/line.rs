@@ -43,6 +43,27 @@ pub struct DecorationRun {
 
     /// The lines drawn besides the underline, strikethrough and overline
     pub extra_decorations: Vec<ExtraDecoration>,
+
+    /// The paint group of the run, see [`TextRun::group`](crate::TextRun::group).
+    pub group: u64,
+}
+
+/// Which runs of a line a painting pass paints, by their [`DecorationRun::group`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PaintScope {
+    /// The runs that are in no group.
+    Ungrouped,
+    /// The runs of one group.
+    Group(u64),
+}
+
+impl PaintScope {
+    fn admits(self, group: u64) -> bool {
+        match self {
+            Self::Ungrouped => group == 0,
+            Self::Group(wanted) => group == wanted,
+        }
+    }
 }
 
 /// A line of text that has been shaped and decorated.
@@ -107,6 +128,7 @@ impl ShapedLine {
             &[],
             &[],
             &[],
+            PaintScope::Ungrouped,
             window,
             cx,
         )?;
@@ -133,6 +155,7 @@ impl ShapedLine {
             &self.decoration_runs,
             &[],
             &[],
+            PaintScope::Ungrouped,
             window,
             cx,
         )?;
@@ -176,6 +199,7 @@ impl ShapedLine {
                     strikethrough: decoration.strikethrough,
                     overline: decoration.overline,
                     extra_decorations: decoration.extra_decorations.clone(),
+                    group: decoration.group,
                 });
                 right_decorations.push(DecorationRun {
                     len: right_len,
@@ -185,6 +209,7 @@ impl ShapedLine {
                     strikethrough: decoration.strikethrough,
                     overline: decoration.overline,
                     extra_decorations: decoration.extra_decorations.clone(),
+                    group: decoration.group,
                 });
             }
 
@@ -245,6 +270,7 @@ impl LineLayout {
             &[],
             &[],
             &[],
+            PaintScope::Ungrouped,
             window,
             cx,
         )
@@ -274,6 +300,7 @@ impl LineLayout {
             decoration_runs,
             &[],
             &[],
+            PaintScope::Ungrouped,
             window,
             cx,
         )
@@ -323,11 +350,58 @@ impl WrappedLine {
             &self.wrap_boundaries,
             &self.hanging_widths,
             &self.layout.insets,
+            PaintScope::Ungrouped,
             window,
             cx,
         )?;
 
         Ok(())
+    }
+
+    /// Paints the background and the runs of this line that are in paint `group`
+    /// ([`TextRun::group`](crate::TextRun::group)), and no other.
+    pub fn paint_group(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        bounds: Option<Bounds<Pixels>>,
+        group: u64,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        let align_width = match bounds {
+            Some(bounds) => Some(bounds.size.width),
+            None => self.layout.wrap_width,
+        };
+        let scope = PaintScope::Group(group);
+        paint_line_background(
+            origin,
+            &self.layout.unwrapped_layout,
+            line_height,
+            align,
+            align_width,
+            &self.decoration_runs,
+            &self.wrap_boundaries,
+            &self.hanging_widths,
+            scope,
+            window,
+            cx,
+        )?;
+        paint_line(
+            origin,
+            &self.layout.unwrapped_layout,
+            line_height,
+            align,
+            align_width,
+            &self.decoration_runs,
+            &self.wrap_boundaries,
+            &self.hanging_widths,
+            &self.layout.insets,
+            scope,
+            window,
+            cx,
+        )
     }
 
     /// Where the atomic inlines of this line are in the window, as the top left corners
@@ -394,6 +468,7 @@ impl WrappedLine {
             &self.decoration_runs,
             &self.wrap_boundaries,
             &self.hanging_widths,
+            PaintScope::Ungrouped,
             window,
             cx,
         )?;
@@ -440,6 +515,7 @@ fn paint_line(
     wrap_boundaries: &[WrapBoundary],
     hanging_widths: &[Pixels],
     insets: &[GlyphInset],
+    scope: PaintScope,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -455,6 +531,7 @@ fn paint_line(
         let mut line_ix = 0;
         let mut run_end = 0;
         let mut color = black();
+        let mut group = 0;
         let mut open: Vec<OpenDecoration> = Vec::new();
         let mut finished: Vec<FinishedDecoration> = Vec::new();
         let text_system = cx.text_system().clone();
@@ -553,9 +630,13 @@ fn paint_line(
                     let wanted = style_run.map(wanted_lines).unwrap_or_default();
                     // A line that goes on across the runs is the same line, so that its
                     // pattern runs on; the others end at this glyph.
+                    let next_group = style_run.map_or(0, |style_run| style_run.group);
                     let mut unmatched: Vec<&ExtraDecoration> = wanted.iter().collect();
                     for line in std::mem::take(&mut open) {
-                        match unmatched.iter().position(|source| **source == line.source) {
+                        let carried = (line.group == next_group)
+                            .then(|| unmatched.iter().position(|source| **source == line.source))
+                            .flatten();
+                        match carried {
                             Some(found) => {
                                 unmatched.remove(found);
                                 open.push(line);
@@ -578,6 +659,7 @@ fn paint_line(
                             open.push(open_decoration(
                                 source,
                                 order,
+                                next_group,
                                 glyph_origin.x + leading,
                                 style_run.color,
                                 &placement,
@@ -589,6 +671,7 @@ fn paint_line(
                     } else {
                         run_end = layout.len;
                     }
+                    group = next_group;
                 }
 
                 // A line that a change of font, size or alignment moves ends where that
@@ -629,7 +712,10 @@ fn paint_line(
                 let reach = max_glyph_size.width.max(max_glyph_size.height);
                 // The placeholder of an atomic inline is not a glyph: the element in
                 // its place paints itself.
-                if !run.inline.object && max_glyph_bounds.dilate(reach).intersects(&content_mask.bounds) {
+                if !run.inline.object
+                    && scope.admits(group)
+                    && max_glyph_bounds.dilate(reach).intersects(&content_mask.bounds)
+                {
                     let baseline_offset = point(px(0.0), run_baseline);
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
@@ -670,6 +756,7 @@ fn paint_line(
         }
 
         // The line of the innermost box is on top of those of the boxes around it.
+        finished.retain(|line| scope.admits(line.group));
         finished.sort_by_key(|line| line.order);
         for line in &finished {
             match &line.style {
@@ -708,6 +795,7 @@ fn paint_line_background(
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
     hanging_widths: &[Pixels],
+    scope: PaintScope,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -722,6 +810,8 @@ fn paint_line_background(
         let mut line_ix = 0;
         let mut run_end = 0;
         let mut current_background: Option<(Point<Pixels>, Hsla)> = None;
+        // The paint group of `current_background`.
+        let mut background_group = 0;
         let text_system = cx.text_system().clone();
         let mut glyph_origin = point(
             aligned_origin_x(
@@ -745,21 +835,22 @@ fn paint_line_background(
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
-                    if let Some((background_origin, background_color)) = current_background.as_mut()
-                    {
+                    if let Some((background_origin, background_color)) = current_background.as_mut() {
                         if glyph_origin.x == background_origin.x {
                             background_origin.x -= max_glyph_size.width.half()
                         }
-                        window.paint_quad(fill(
-                            Bounds {
-                                origin: *background_origin,
-                                size: size(
-                                    glyph_origin.x - background_origin.x,
-                                    rows[line_ix].height,
-                                ),
-                            },
-                            *background_color,
-                        ));
+                        if scope.admits(background_group) {
+                            window.paint_quad(fill(
+                                Bounds {
+                                    origin: *background_origin,
+                                    size: size(
+                                        glyph_origin.x - background_origin.x,
+                                        rows[line_ix].height,
+                                    ),
+                                },
+                                *background_color,
+                            ));
+                        }
                         if glyph.index < run_end {
                             background_origin.x = origin.x;
                             background_origin.y += rows[line_ix].height;
@@ -782,7 +873,7 @@ fn paint_line_background(
                 }
                 prev_glyph_position = glyph.position;
 
-                let mut finished_background: Option<(Point<Pixels>, Hsla)> = None;
+                let mut finished_background: Option<(Point<Pixels>, Hsla, u64)> = None;
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
@@ -797,11 +888,17 @@ fn paint_line_background(
 
                     if let Some(style_run) = style_run {
                         if let Some((_, background_color)) = &mut current_background
-                            && style_run.background_color.as_ref() != Some(background_color)
+                            && (style_run.background_color.as_ref() != Some(background_color)
+                                || style_run.group != background_group)
                         {
-                            finished_background = current_background.take();
+                            finished_background = current_background
+                                .take()
+                                .map(|(origin, color)| (origin, color, background_group));
                         }
                         if let Some(run_background) = style_run.background_color {
+                            if current_background.is_none() {
+                                background_group = style_run.group;
+                            }
                             current_background.get_or_insert((
                                 point(glyph_origin.x, glyph_origin.y),
                                 run_background,
@@ -810,11 +907,16 @@ fn paint_line_background(
                         run_end += style_run.len as usize;
                     } else {
                         run_end = layout.len;
-                        finished_background = current_background.take();
+                        finished_background = current_background
+                            .take()
+                            .map(|(origin, color)| (origin, color, background_group));
                     }
                 }
 
-                if let Some((mut background_origin, background_color)) = finished_background {
+                if let Some((mut background_origin, background_color, finished_group)) =
+                    finished_background
+                    && scope.admits(finished_group)
+                {
                     let mut width = glyph_origin.x - background_origin.x;
                     if background_origin.x == glyph_origin.x {
                         background_origin.x -= max_glyph_size.width.half();
@@ -837,7 +939,9 @@ fn paint_line_background(
             last_line_end_x -= glyph.position.x;
         }
 
-        if let Some((mut background_origin, background_color)) = current_background.take() {
+        if let Some((mut background_origin, background_color)) = current_background.take()
+            && scope.admits(background_group)
+        {
             if last_line_end_x == background_origin.x {
                 background_origin.x -= max_glyph_size.width.half()
             };
@@ -857,6 +961,8 @@ fn paint_line_background(
 /// A decoration line that has started and has not been painted yet.
 struct OpenDecoration {
     x: Pixels,
+    /// The paint group of the run that opened it: a line does not go on into another group.
+    group: u64,
     /// Where the style run that opened it listed it: the lines of the outer boxes first.
     order: usize,
     /// Below the top of the row it is on, so that it keeps its place when a vertical
@@ -937,6 +1043,7 @@ impl DecorationPlacement<'_> {
 fn open_decoration(
     source: &ExtraDecoration,
     order: usize,
+    group: u64,
     x: Pixels,
     run_color: Hsla,
     placement: &DecorationPlacement,
@@ -972,6 +1079,7 @@ fn open_decoration(
     };
     OpenDecoration {
         x,
+        group,
         order,
         top: placement.top(&style),
         style,
@@ -982,6 +1090,7 @@ fn open_decoration(
 /// A decoration line that is complete: where it goes, and the order it is painted in.
 struct FinishedDecoration {
     order: usize,
+    group: u64,
     origin: Point<Pixels>,
     width: Pixels,
     style: ExtraDecoration,
@@ -1002,6 +1111,7 @@ fn finish_decoration_line(
     };
     finished.push(FinishedDecoration {
         order: line.order,
+        group: line.group,
         origin: point(x, row_top + line.top),
         width: end_x - x,
         style: line.style,
@@ -1320,6 +1430,7 @@ mod tests {
                     strikethrough: None,
                     overline: None,
                     extra_decorations: Vec::new(),
+                    group: 0,
                 },
                 DecorationRun {
                     len: 3,
@@ -1329,6 +1440,7 @@ mod tests {
                     strikethrough: None,
                     overline: None,
                     extra_decorations: Vec::new(),
+                    group: 0,
                 },
                 DecorationRun {
                     len: 1,
@@ -1338,6 +1450,7 @@ mod tests {
                     strikethrough: None,
                     overline: None,
                     extra_decorations: Vec::new(),
+                    group: 0,
                 },
             ],
         );
@@ -1768,6 +1881,47 @@ mod tests {
                 painted.baseline(2) - ascent / 3. - 0.5,
                 "strikethrough",
             );
+        }
+
+        /// The glyphs painted for `runs` of "aaaa bbbb" by the text and by paint group `group`.
+        fn painted_with_group(runs: Vec<TextRun>, group: u64) -> usize {
+            struct Grouped {
+                runs: Vec<TextRun>,
+                group: u64,
+            }
+
+            impl Render for Grouped {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    let text = StyledText::new("aaaa bbbb").with_runs(self.runs.clone());
+                    let layout = text.layout().clone();
+                    let group = self.group;
+                    div().text_size(px(FONT_SIZE)).line_height(px(LINE_HEIGHT)).child(text).child(
+                        crate::canvas(
+                            |_, _, _| (),
+                            move |_, _, window, cx| layout.paint_group("aaaa bbbb", group, window, cx),
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                }
+            }
+
+            let mut app = TestApp::with_text_system(Arc::new(RasterizingTextSystem::new()));
+            let mut window = app.open_window(move |_, _| Grouped { runs, group });
+            window.draw();
+            window.update(|_, window, _| window.rendered_frame.scene.monochrome_sprites.len())
+        }
+
+        #[test]
+        fn a_run_in_a_paint_group_is_painted_by_the_group_and_not_by_the_text() {
+            let grouped = |group| TextRun { group, ..plain(5) };
+            let runs = |group| vec![grouped(0), TextRun { group, ..plain(4) }];
+            // "aaaa " plain; "bbbb" in group 1: with nobody painting group 1 only the first five
+            // glyphs paint (the space has none), and the group paints the other four.
+            let without_the_group = painted_with_group(runs(1), 2);
+            let with_the_group = painted_with_group(runs(1), 1);
+            assert_eq!(with_the_group - without_the_group, 4);
+            assert_eq!(painted_with_group(runs(0), 1), without_the_group + 4, "nothing is left out when no run is grouped");
         }
 
         /// Without runs of their own size every row is the line height, with the

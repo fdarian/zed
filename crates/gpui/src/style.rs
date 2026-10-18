@@ -876,6 +876,7 @@ impl TextStyle {
             line_height: None,
             overline: self.overline,
             extra_decorations: self.extra_decorations.clone(),
+            group: 0,
         }
     }
 }

@@ -1261,6 +1261,38 @@ impl TextLayout {
         }
     }
 
+    /// Paints what [`Self::paint`] leaves out: the backgrounds and runs of paint `group`
+    /// ([`TextRun::group`](crate::TextRun::group)), as one unit that the caller can wrap in an
+    /// effect group.
+    pub fn paint_group(&self, text: &str, group: u64, window: &mut Window, cx: &mut App) {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .with_context(|| format!("measurement has not been performed on {text}"))
+            .unwrap();
+        let bounds = element_state
+            .bounds
+            .with_context(|| format!("prepaint has not been performed on {text}"))
+            .unwrap();
+
+        let line_height = element_state.line_height;
+        let mut line_origin = element_state.line_origin(bounds);
+        let text_style = window.text_style();
+        for line in element_state.lines.iter() {
+            line.paint_group(
+                line_origin,
+                line_height,
+                text_style.text_align,
+                Some(bounds),
+                group,
+                window,
+                cx,
+            )
+            .log_err();
+            line_origin.y += line.size(line_height).height;
+        }
+    }
+
     /// The layout node of the text, once it has requested its layout. It is the node whose
     /// bounds `Window::layout_bounds` gives while the text is prepainted or painted, which
     /// the baseline callback of an [`AtomicInline`] needs for the text it holds.

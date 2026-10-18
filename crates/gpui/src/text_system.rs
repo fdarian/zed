@@ -485,6 +485,7 @@ impl WindowTextSystem {
                 && last_run.overline == run.overline
                 && last_run.extra_decorations == run.extra_decorations
                 && last_run.background_color == run.background_color
+                && last_run.group == run.group
             {
                 last_run.len += run.len as u32;
                 continue;
@@ -497,6 +498,7 @@ impl WindowTextSystem {
                 strikethrough: run.strikethrough,
                 overline: run.overline,
                 extra_decorations: run.extra_decorations.clone(),
+                group: run.group,
             });
         }
 
@@ -537,6 +539,7 @@ impl WindowTextSystem {
                 && last_run.overline == run.overline
                 && last_run.extra_decorations == run.extra_decorations
                 && last_run.background_color == run.background_color
+                && last_run.group == run.group
             {
                 last_run.len += run.len as u32;
                 continue;
@@ -549,6 +552,7 @@ impl WindowTextSystem {
                 strikethrough: run.strikethrough,
                 overline: run.overline,
                 extra_decorations: run.extra_decorations.clone(),
+                group: run.group,
             });
         }
 
@@ -684,6 +688,7 @@ impl WindowTextSystem {
                 && last_run.overline == run.overline
                 && last_run.extra_decorations == run.extra_decorations
                     && last_run.background_color == run.background_color
+                    && last_run.group == run.group
                 {
                     last_run.len += run_len_within_line as u32;
                     false
@@ -696,6 +701,7 @@ impl WindowTextSystem {
                         strikethrough: run.strikethrough,
                         overline: run.overline,
                         extra_decorations: run.extra_decorations.clone(),
+                        group: run.group,
                     });
                     true
                 };
@@ -1342,6 +1348,11 @@ pub struct TextRun {
     pub overline: Option<OverlineStyle>,
     /// The lines drawn besides `underline`, `strikethrough` and `overline`.
     pub extra_decorations: Vec<ExtraDecoration>,
+    /// The paint group the run is in, `0` for none. A group is painted on its own, as a unit
+    /// (see [`TextLayout::paint_group`](crate::TextLayout::paint_group)): painting a layout
+    /// with [`TextLayout::paint`](crate::TextLayout::paint) leaves the runs of every group out.
+    /// CSS composites an inline box with an `opacity` below one that way.
+    pub group: u64,
 }
 
 #[cfg(all(target_os = "macos", test))]
