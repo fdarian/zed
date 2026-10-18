@@ -5527,6 +5527,19 @@ impl Window {
         }
     }
 
+    /// How many lists of elements handed to a stacking context are open, and which of them are
+    /// stacking contexts (the last 64 of them) and which layout roots.
+    pub(crate) fn lift_shape(&self) -> (usize, u64) {
+        let bits = self
+            .lift_lists
+            .iter()
+            .rev()
+            .take(64)
+            .enumerate()
+            .fold(0u64, |bits, (at, list)| bits | (u64::from(list.is_some()) << at));
+        (self.lift_lists.len(), bits)
+    }
+
     /// Whether the element being prepainted is inside a stacking context, however many layout
     /// roots away. What is recorded by position in `Frame::hitboxes` and in the tab stop log is
     /// then moved when the context finishes.
@@ -5616,6 +5629,7 @@ impl Window {
             hitboxes,
             context: PaintContext::capture(self),
             content_mask: self.content_mask(),
+            derived_mask: self.content_mask_is_derived(),
             image_cache: self.image_cache_stack.last().cloned(),
             hole,
             owners: if cell.is_some() { owners } else { SmallVec::new() },
@@ -5629,7 +5643,6 @@ impl Window {
     }
 
     /// Starts the paint of the content of a stacking context. Pair with
-            derived_mask: self.content_mask_is_derived(),
     /// [`Window::end_lift_paint`].
     pub(crate) fn begin_lift_paint(&mut self) {
         self.invalidator.debug_assert_paint();
@@ -5697,6 +5710,7 @@ impl Window {
         let rem_size = entry.context.rem_size;
         let visibility = entry.context.visibility;
         let content_mask = entry.content_mask;
+        let derived_mask = entry.derived_mask;
         let image_cache = entry.image_cache.take();
         let content = &mut entry.content;
         let cell = entry.cell.as_deref();
@@ -5710,7 +5724,6 @@ impl Window {
                             LiftedContent::Element(element) => match cell {
                                 Some(cell) => window.record_plain_paint(cell, ordinal, owners, cx, |window, cx| {
                                     element.paint(window, cx)
-        let derived_mask = entry.derived_mask;
                                 }),
                                 None => element.paint(window, cx),
                             },

@@ -695,6 +695,10 @@ pub(crate) struct ReplayKey {
     culling: bool,
     /// A stacking context takes the positioned boxes of the subtree.
     lifting: bool,
+    /// Which of the layout roots and stacking contexts around the subtree are stacking contexts:
+    /// whether an ancestor is handed to one, and so painted from it and not in place, depends on
+    /// it, and what the subtree is painted under with it.
+    lift_shape: (usize, u64),
     dom_hit_testing: bool,
 }
 
@@ -739,6 +743,7 @@ impl ReplayKey {
             || self.a11y_active != later.a11y_active
             || self.culling != later.culling
             || self.lifting != later.lifting
+            || self.lift_shape != later.lift_shape
             || self.dom_hit_testing != later.dom_hit_testing
         {
             return None;
@@ -1174,7 +1179,6 @@ impl Window {
         let mut lifts = None;
         if reasons & lift_bit != 0
             && let Some(lift_mark) = mark.lifts
-            && let Some(record) = self.lifted_holes_since(lift_mark, stale_parent)
         {
             if let Some(surroundings) = surroundings {
                 // What leaves the region for a stacking context outside is cut by the content
@@ -1354,10 +1358,6 @@ impl Window {
         })
     }
 
-    fn relocate_hitboxes_in_place(&mut self, range: Range<usize>, surroundings: &ContentMask<Pixels>) {
-        for hitbox in &mut self.next_frame.hitboxes[range] {
-            *hitbox = hitbox.relocated(Point::default(), surroundings);
-        }
     fn cut_lifted_since(&mut self, mark: LiftMark, surroundings: &ContentMask<Pixels>) {
         let Some(Some(list)) = self.lift_lists.last_mut() else {
             return;
@@ -1372,6 +1372,10 @@ impl Window {
         }
     }
 
+    fn relocate_hitboxes_in_place(&mut self, range: Range<usize>, surroundings: &ContentMask<Pixels>) {
+        for hitbox in &mut self.next_frame.hitboxes[range] {
+            *hitbox = hitbox.relocated(Point::default(), surroundings);
+        }
         self.next_frame.hitboxes_changed();
     }
 
@@ -1470,12 +1474,12 @@ impl Window {
                 hitboxes,
                 context: stub.context.clone(),
                 content_mask: stub.content_mask,
+                // A recording made in a region hands nothing to a context outside.
+                derived_mask: false,
                 image_cache: stub.image_cache.clone(),
                 hole,
                 cell,
                 owners,
-                // A recording made in a region hands nothing to a context outside.
-                derived_mask: false,
             });
         }
         match self.lift_lists.last_mut() {
@@ -1787,6 +1791,7 @@ impl Window {
             a11y_active: self.a11y.is_active_when_presented(),
             culling: self.culling,
             lifting: self.lifting(),
+            lift_shape: self.lift_shape(),
             dom_hit_testing: self.dom_hit_testing,
         }
     }
@@ -1863,17 +1868,17 @@ impl Window {
         self.retained.relocation.as_ref().is_some_and(Relocation::regional)
     }
 
-    /// Whether a subtree that is relocatable can be recorded in a region of its own here: the
-    /// content mask around has no rounded corners and is not cut by an exact clip, and the scale
-    /// factor makes device pixels exact.
-    pub(crate) fn relocation_blocker_here(&self) -> Option<NonRelocatable> {
-        if let Some(reason) = self.scale_blocker() {
     /// Whether the content mask now is cut from the region of the subtree being recorded in one:
     /// not a mask of a box that escapes to a frame outside the subtree.
     pub(crate) fn content_mask_is_derived(&self) -> bool {
         self.is_recording_regionally() && !self.is_prepainting_unclipped()
     }
 
+    /// Whether a subtree that is relocatable can be recorded in a region of its own here: the
+    /// content mask around has no rounded corners and is not cut by an exact clip, and the scale
+    /// factor makes device pixels exact.
+    pub(crate) fn relocation_blocker_here(&self) -> Option<NonRelocatable> {
+        if let Some(reason) = self.scale_blocker() {
             return Some(reason);
         }
         if self.exact_clips.is_some() || self.content_mask().is_rounded() {
