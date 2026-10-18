@@ -13,9 +13,8 @@
 //!   - A child of a table, row group or row that is not a table part is a cell of its own, where CSS wraps it and its
 //!     neighbours in one anonymous cell. It is as big as its row, and its content stays at the top: only nodes with the
 //!     role of a cell are aligned in their row.
-//!   - Percentage heights of rows, row groups and cells are `auto`.
 //!   - Cells and rows with `rowspan`s that leave rows without a cell of their own (and no height) share the height of
-//!     the spanning cell differently in some cases, and percent rows past 100% are not shrunk the way Chrome does.
+//!     the spanning cell differently in some cases.
 //!   - `direction: rtl` is ignored, columns are not mirrored.
 //!   - A table that is a flex item and is given less width than its min-content still reports its min-content width,
 //!     but the flex container positions it for the width it asked for.
@@ -108,8 +107,22 @@ struct RowHeight {
     height: f32,
     /// The distance from the top of the row to the baseline of its baseline-aligned cells, if it has any
     baseline: Option<f32>,
-    /// Whether `height` was given to the row
+    /// Whether `height` was given to the row, as a length or a percentage
     fixed: bool,
+    /// The percentage of the height of its row group the row asks for, as a fraction: its own, or the largest of its
+    /// cells
+    percent: Option<f32>,
+}
+
+/// What a row group asks of its height
+#[derive(Copy, Clone, Default)]
+struct SectionHeight {
+    /// Whether the group has a height as a length
+    requested: bool,
+    /// The percentage of the height of the groups the group asks for, as a fraction
+    percent: Option<f32>,
+    /// How much taller than its rows the group has to be for its height as a length
+    min_extra: f32,
 }
 
 /// What is known of a cell once the widths of the columns are
@@ -262,8 +275,9 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
     let column_widths = distribute(assignable_width, &columns, true);
 
     // 5. Row heights
-    let (fits, mut rows, fixed_sections) = table.measure_rows(&column_widths);
-    let content_height_without_spacing: f32 = rows.iter().map(|row| row.height).sum();
+    let (fits, mut rows, section_heights) = table.measure_rows(&column_widths);
+    let content_height_without_spacing: f32 = rows.iter().map(|row| row.height).sum::<f32>()
+        + section_heights.iter().map(|section| section.min_extra).sum::<f32>();
 
     // 6. Caption heights
     let caption_sizes = table.caption_heights(&captions, table_width);
@@ -285,9 +299,10 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
         natural_grid_height,
     );
     let extra_height = grid_height - natural_grid_height;
-    if extra_height > 0.0 {
-        table.distribute_table_height(&mut rows, &fixed_sections, extra_height);
-    }
+    // The groups are 100% of what the spacing around them leaves, in the table
+    let group_count = structure.sections.iter().filter(|section| section.row_count > 0).count();
+    let percent_base = grid_height - padding_border_size.height - spacing.height * (group_count + 1) as f32;
+    table.distribute_table_height(&mut rows, &section_heights, extra_height, percent_base);
     let table_size = Size { width: table_width, height: captions_top + grid_height + captions_bottom };
 
     // Where the first row's baseline is, for a table that is itself aligned by baseline

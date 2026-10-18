@@ -3381,6 +3381,218 @@ mod chrome {
 /// Collapsed borders: the layout only sees the half widths of the borders, as the border widths of the table and of its
 /// cells, with no spacing. `detailed_layout_info` has the lines the borders are centred on.
 #[cfg(feature = "detailed_layout_info")]
+/// Percentage heights of rows, row groups and cells, against the numbers of Chrome (`<tr style="height:30%">`,
+/// `<td style="height:50%">`, `<tbody style="height:20%">`), with one 30px wide box of the given height in every cell.
+/// The page is the one above; the numbers are `[y, height]` of the rows, and of the groups when there are any.
+mod percent_heights {
+    use super::*;
+
+    /// A row with a percentage height
+    fn pr(percent_height: Option<f32>, box_height: f32) -> Spec {
+        tr(
+            |s| {
+                if let Some(percent_height) = percent_height {
+                    s.size.height = percent(percent_height);
+                }
+            },
+            vec![td(|_| {}, vec![boxed(30.0, box_height)])],
+        )
+    }
+
+    /// A row with a cell that has a percentage height
+    fn pc(percent_height: f32, box_height: f32) -> Spec {
+        tr(|_| {}, vec![td(|s| s.size.height = percent(percent_height), vec![boxed(30.0, box_height)])])
+    }
+
+    fn high(height: f32) -> impl FnOnce(&mut Style) {
+        move |s| s.size.height = length(height)
+    }
+
+    /// A row group with a height
+    fn group(kind: RowGroupKind, height: Option<Dimension>, children: Vec<Spec>) -> Spec {
+        part(
+            "tbody",
+            TableRole::RowGroup(kind),
+            move |s| {
+                if let Some(height) = height {
+                    s.size.height = height;
+                }
+            },
+            children,
+        )
+    }
+
+    /// The rects of a table of the given size with the rows `[y, height]`, a box at the top of every cell
+    fn rows_rects(table: [f32; 4], rows: &[[f32; 2]]) -> Vec<[f32; 4]> {
+        let mut rects = vec![table];
+        let x = (table[2] - 30.0) / 2.0;
+        for [y, height] in rows {
+            rects.push([x, *y, 30.0, *height]);
+            rects.push([x, *y, 30.0, *height]);
+            rects.push([x, *y, 30.0, 0.0]);
+        }
+        rects
+    }
+
+    /// Checks the table and the rows, with the heights of the boxes in them
+    #[track_caller]
+    fn check(tree: Vec<Spec>, table: [f32; 4], rows: &[[f32; 2]], box_heights: &[f32]) {
+        let mut want = rows_rects(table, rows);
+        for (index, height) in box_heights.iter().enumerate() {
+            want[3 + index * 3][3] = *height;
+        }
+        assert_rects(rects(tree, 300.0), &want);
+    }
+
+    /// ```html
+    /// <table style="height:200px"><tr style="height:50%"><td><div style="height:10px"></div></td></tr><tr><td><div style="height:10px"></div></td></tr></table>
+    /// ```
+    #[test]
+    fn a_row_takes_its_percentage_of_the_height_of_the_table() {
+        let tree = vec![table(high(200.0), vec![pr(Some(0.5), 10.0), pr(None, 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 100.0], [100.0, 100.0]], &[10.0, 10.0]);
+    }
+
+    /// The same table with a height of `auto` has no height to take a share of
+    #[test]
+    fn a_percentage_of_an_auto_table_is_auto() {
+        let tree = vec![table(|_| {}, vec![pr(Some(0.5), 10.0), pr(None, 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 20.0], &[[0.0, 10.0], [10.0, 10.0]], &[10.0, 10.0]);
+    }
+
+    /// A `min-height` makes the table taller than its rows, so there is a height for the percentage
+    #[test]
+    fn a_table_that_a_min_height_makes_taller_has_one() {
+        let tree = vec![table(|s| s.min_size.height = length(100.0), vec![pr(Some(0.8), 10.0), pr(None, 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 100.0], &[[0.0, 80.0], [80.0, 20.0]], &[10.0, 10.0]);
+    }
+
+    /// The percentage of a cell is the percentage of its row
+    #[test]
+    fn a_cell_percentage_is_that_of_its_row() {
+        let tree = vec![table(high(200.0), vec![pc(0.5, 10.0), pr(None, 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 100.0], [100.0, 100.0]], &[10.0, 10.0]);
+        // The largest of a row and its cells, and a row is as tall as its content at least
+        let tree = vec![table(
+            high(200.0),
+            vec![
+                tr(|s| s.size.height = percent(0.2), vec![td(|s| s.size.height = percent(0.4), vec![boxed(30.0, 10.0)])]),
+                pr(None, 10.0),
+            ],
+        )];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 80.0], [80.0, 120.0]], &[10.0, 10.0]);
+        let tree = vec![table(high(200.0), vec![pc(0.2, 90.0), pr(None, 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 90.0], [90.0, 110.0]], &[90.0, 10.0]);
+    }
+
+    /// Rows past 100% lose the share of the later ones, and what each lacks shares the height when there is not
+    /// enough: 70% and 70% of 200px (the second only 30%) with a 10px auto row, and 80% three times.
+    #[test]
+    fn percentages_past_a_hundred_are_cut_and_scaled_to_the_room() {
+        let tree = vec![table(high(200.0), vec![pr(Some(0.7), 10.0), pr(Some(0.7), 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 140.0], [140.0, 60.0]], &[10.0, 10.0]);
+        let tree = vec![table(high(200.0), vec![pr(Some(0.7), 10.0), pr(Some(0.7), 10.0), pr(None, 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 132.78], [132.78, 57.22], [190.0, 10.0]], &[10.0, 10.0, 10.0]);
+        let tree = vec![table(high(200.0), vec![pr(Some(0.7), 10.0), pr(Some(0.7), 10.0), pr(None, 50.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 103.89], [103.89, 46.11], [150.0, 50.0]], &[10.0, 10.0, 50.0]);
+        let tree = vec![table(high(200.0), vec![pr(Some(0.5), 10.0), pr(Some(0.5), 10.0), pr(Some(0.5), 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 95.0], [95.0, 95.0], [190.0, 10.0]], &[10.0, 10.0, 10.0]);
+    }
+
+    /// What the percentages leave goes to the rows without a height, or to all rows in proportion when every row has one
+    #[test]
+    fn what_the_percentages_leave_goes_to_the_other_rows() {
+        let tree = vec![table(high(300.0), vec![pr(Some(0.2), 10.0), pr(None, 10.0), pr(None, 30.0)])];
+        check(tree, [0.0, 0.0, 30.0, 300.0], &[[0.0, 60.0], [60.0, 60.0], [120.0, 180.0]], &[10.0, 10.0, 30.0]);
+        let tree = vec![table(high(200.0), vec![pr(Some(0.2), 10.0), pr(None, 0.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 40.0], [40.0, 160.0]], &[10.0, 0.0]);
+        let tree = vec![table(high(200.0), vec![pr(Some(0.2), 10.0), pr(None, 0.0), pr(None, 0.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 40.0], [40.0, 80.0], [120.0, 80.0]], &[10.0, 0.0, 0.0]);
+        let tree = vec![table(high(200.0), vec![pr(Some(0.1), 10.0), pr(Some(0.3), 10.0)])];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 50.0], [50.0, 150.0]], &[10.0, 10.0]);
+        let tree = vec![table(
+            high(200.0),
+            vec![pr(Some(0.2), 10.0), tr(high(30.0), vec![td(|_| {}, vec![boxed(30.0, 10.0)])])],
+        )];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 114.29], [114.29, 85.71]], &[10.0, 10.0]);
+        let tree = vec![table(
+            high(200.0),
+            vec![
+                tr(high(30.0), vec![td(|_| {}, vec![boxed(30.0, 10.0)])]),
+                pr(None, 0.0),
+            ],
+        )];
+        check(tree, [0.0, 0.0, 30.0, 200.0], &[[0.0, 30.0], [30.0, 170.0]], &[10.0, 0.0]);
+    }
+
+    /// The percentage is of the height of the rows and the spacing between them: the spacing around the first and last
+    /// row is not part of it. Three rows, 30% in the first, 10px of spacing, a table of 300px.
+    #[test]
+    fn the_spacing_around_the_rows_is_not_part_of_the_height() {
+        let tree = vec![table(
+            |s| {
+                s.size.height = length(300.0);
+                s.border_spacing = Size { width: 10.0, height: 10.0 };
+            },
+            vec![pr(Some(0.3), 10.0), pr(None, 10.0), pr(None, 10.0)],
+        )];
+        check(tree, [0.0, 0.0, 50.0, 300.0], &[[10.0, 84.0], [104.0, 88.0], [202.0, 88.0]], &[10.0, 10.0, 10.0]);
+    }
+
+    /// Row groups take their percentage of the height of the groups, and the rows in a group theirs of the group
+    #[test]
+    fn row_groups_and_the_rows_in_them() {
+        let body = |children| group(RowGroupKind::Body, None, children);
+        // 50% of the first group, which gets 133.33px of the 200px, its second row the rest
+        let tree = vec![table(high(200.0), vec![body(vec![pr(Some(0.5), 10.0), pr(None, 10.0)]), body(vec![pr(None, 10.0)])])];
+        let got = rects(tree, 300.0);
+        assert!((got[1][3] - 133.33).abs() < 0.02, "group {:?}", got[1]);
+        assert!((got[2][3] - 66.67).abs() < 0.02, "row {:?}", got[2]);
+        assert!((got[5][3] - 66.66).abs() < 0.02, "row {:?}", got[5]);
+        assert!((got[8][3] - 66.67).abs() < 0.02, "group {:?}", got[8]);
+
+        // Groups of 80% and 40% lack 230px and 110px of the 300px: they share 280px in that proportion
+        let tree = vec![table(
+            high(300.0),
+            vec![
+                group(RowGroupKind::Body, Some(percent(0.8)), vec![pr(None, 10.0)]),
+                group(RowGroupKind::Body, Some(percent(0.4)), vec![pr(None, 10.0)]),
+            ],
+        )];
+        let got = rects(tree, 300.0);
+        assert!((got[1][3] - 199.41).abs() < 0.02 && (got[5][3] - 100.59).abs() < 0.02, "groups {:?} {:?}", got[1], got[5]);
+
+        // 10% of the groups, a group with a length, and a group that is 0px high: the last takes what is left
+        let tree = vec![table(
+            high(300.0),
+            vec![
+                group(RowGroupKind::Body, Some(percent(0.1)), vec![pr(None, 10.0)]),
+                group(RowGroupKind::Body, Some(length(50.0)), vec![pr(None, 10.0)]),
+                group(RowGroupKind::Body, None, vec![pr(None, 0.0)]),
+            ],
+        )];
+        let got = rects(tree, 300.0);
+        assert!(
+            (got[1][3] - 30.0).abs() < 0.02 && (got[5][3] - 50.0).abs() < 0.02 && (got[9][3] - 220.0).abs() < 0.02,
+            "groups {:?} {:?} {:?}",
+            got[1],
+            got[5],
+            got[9]
+        );
+
+        // The header group takes its percentage, but the body takes what is left over
+        let tree = vec![table(
+            high(300.0),
+            vec![
+                group(RowGroupKind::Header, Some(percent(0.3)), vec![pr(None, 10.0)]),
+                group(RowGroupKind::Body, None, vec![pr(None, 10.0)]),
+            ],
+        )];
+        let got = rects(tree, 300.0);
+        assert!((got[1][3] - 90.0).abs() < 0.02 && (got[5][3] - 210.0).abs() < 0.02, "groups {:?} {:?}", got[1], got[5]);
+    }
+}
+
 mod collapsed {
     use super::*;
     use crate::compute::table::DetailedTableInfo;
