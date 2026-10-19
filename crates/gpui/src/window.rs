@@ -134,6 +134,9 @@ struct WindowInvalidatorInner {
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
     pub update_count: usize,
+    /// The `update_count` the layout the window last built was computed at, if nothing but
+    /// paint-only invalidations came since. See [`WindowInvalidator::layout_is_current`].
+    pub layout_current_at: Option<usize>,
     #[cfg(feature = "profiler")]
     pub frame_dirty: FrameDirtyAccumulator,
     pub platform_waker: Option<Rc<dyn Fn()>>,
@@ -166,6 +169,7 @@ impl WindowInvalidator {
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
+                layout_current_at: None,
                 #[cfg(feature = "profiler")]
                 frame_dirty: FrameDirtyAccumulator::default(),
                 platform_waker: None,
@@ -252,6 +256,21 @@ impl WindowInvalidator {
 
     pub fn update_count(&self) -> usize {
         self.inner.borrow().update_count
+    }
+
+    /// Records that the layout being built now is the one the invalidations so far describe.
+    /// An invalidation that arrives while it is built (`update_count` moves) is not covered.
+    pub fn mark_layout_current(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.layout_current_at = Some(inner.update_count);
+    }
+
+    /// Whether every invalidation since the last layout was declared paint-only (see
+    /// [`App::notify_paint_only`]), so the boxes published by that layout are still the
+    /// boxes of the window. Any other invalidation moves `update_count` past the record.
+    pub fn layout_is_current(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.layout_current_at == Some(inner.update_count)
     }
 
     #[cfg(feature = "profiler")]
@@ -4111,14 +4130,18 @@ impl Window {
     /// the next frame draws and presents once, however many reads came before it.
     ///
     /// Returns true if a pass ran, and false without running one when the window is clean (the
-    /// last draw is current), when nothing was invalidated since the previous pass, or when a
-    /// draw is already running on this thread.
+    /// last draw is current), when nothing was invalidated since the previous pass, when every
+    /// invalidation since the last layout was paint-only (see [`App::notify_paint_only`]), or
+    /// when a draw is already running on this thread.
     ///
     /// The pass does not swap frames, so it is safe while an input event is being dispatched:
     /// the dispatch is reading the rendered frame, and a swap would pull it out from under
     /// the handlers. See [`Window::layout_pass`].
     pub fn draw_if_dirty(&mut self, cx: &mut App) -> bool {
-        if !self.invalidator.is_dirty() || draw_in_progress() {
+        if !self.invalidator.is_dirty()
+            || draw_in_progress()
+            || self.invalidator.layout_is_current()
+        {
             return false;
         }
         self.layout_pass(cx, false)
@@ -4305,6 +4328,7 @@ impl Window {
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.requested_autoscroll = None;
+        self.invalidator.mark_layout_current();
 
         let mouse_hit_test = self.mouse_hit_test.clone();
         let captured_hitbox = self.captured_hitbox;
@@ -4367,6 +4391,7 @@ impl Window {
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
+        self.invalidator.mark_layout_current();
         self.measured_at = None;
         self.requested_autoscroll = None;
 

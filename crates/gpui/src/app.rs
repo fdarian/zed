@@ -2745,6 +2745,19 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
+        self.notify_entity(entity_id, false);
+    }
+
+    /// [`App::notify`] for a change the caller knows moves no box: a window whose layout was
+    /// current before it stays current, so [`Window::draw_if_dirty`] runs no pass for a read
+    /// of bounds. The next draw still happens. Any other invalidation that came before, or comes
+    /// after, makes the layout stale again, so a wrong call here is a stale read and a doubtful
+    /// one should use [`App::notify`].
+    pub fn notify_paint_only(&mut self, entity_id: EntityId) {
+        self.notify_entity(entity_id, true);
+    }
+
+    fn notify_entity(&mut self, entity_id: EntityId, paint_only: bool) {
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)
@@ -2772,7 +2785,11 @@ impl App {
             }
         } else {
             for invalidator in &live_invalidators {
-                invalidator.invalidate_view(entity_id, self);
+                let layout_was_current = invalidator.layout_is_current();
+                let invalidated = invalidator.invalidate_view(entity_id, self);
+                if paint_only && layout_was_current && invalidated {
+                    invalidator.mark_layout_current();
+                }
             }
         }
 
