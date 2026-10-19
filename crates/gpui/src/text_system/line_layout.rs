@@ -153,6 +153,20 @@ fn may_break_between(before: char, after: char) -> bool {
     before != ' ' && !glue(before) && !glue(after) && !closing(after) && !opening(before)
 }
 
+/// Whether a line may break after the character, as it may after a hyphen: U+002D, the
+/// hyphen U+2010 and the en dash U+2013 (UAX #14 classes HY and BA). It is part of the word
+/// it ends, so there is no break before it.
+fn breaks_after(character: char) -> bool {
+    matches!(character, '-' | '\u{2010}' | '\u{2013}')
+}
+
+/// Whether a line may break between a hyphen `before` and `after`. Chrome does so in front
+/// of a letter or a digit, and not in front of punctuation that ends or joins a word (`-.`,
+/// `-,`, `-)`) or of another dash.
+fn breaks_after_hyphen(before: char, after: char) -> bool {
+    breaks_after(before) && after.is_alphanumeric()
+}
+
 /// Whether the character is one of the CJK scripts or their punctuation, which
 /// `word-break: keep-all` keeps together.
 fn is_cjk(character: char) -> bool {
@@ -751,8 +765,12 @@ impl LineLayout {
                 if may_break_here {
                     last_candidate_ix = Some(ix);
                 }
-            } else if LineWrapper::is_word_char(ch) || (keep_all && is_cjk(ch)) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() && may_break_here {
+            } else if LineWrapper::is_word_char(ch) || breaks_after(ch) || (keep_all && is_cjk(ch)) {
+                if (prev_ch == ' ' || breaks_after_hyphen(prev_ch, ch))
+                    && ch != ' '
+                    && first_non_whitespace_ix.is_some()
+                    && may_break_here
+                {
                     last_candidate_ix = Some(ix);
                 }
             } else if ch != ' ' && first_non_whitespace_ix.is_some() && may_break_here {
@@ -3173,6 +3191,64 @@ mod tests {
             layout.index_for_position(point(px(5.), px(20.)), line_height),
             Ok(5)
         );
+    }
+
+    fn unbroken_words(text: &str, wrap_width: f32) -> Vec<usize> {
+        let options = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            ..Default::default()
+        };
+        boundary_indices(&line_with_options(text, Some(wrap_width), options))
+    }
+
+    #[test]
+    fn test_a_line_breaks_after_a_hyphen_and_not_before_it() {
+        // Ten pixel characters: "well-" is 50 wide and the line 55.
+        assert_eq!(unbroken_words("well-known", 55.), vec![5]);
+        assert_eq!(unbroken_words("a-b-c", 25.), vec![2, 4]);
+        // The hyphen stays on the line it ends, even when it is the character that overflows.
+        assert_eq!(unbroken_words("well-known", 45.), vec![5]);
+        // After a space and then a hyphen, the hyphen starts the line and the break follows it.
+        assert_eq!(unbroken_words("aa -bb", 25.), vec![3, 4]);
+    }
+
+    #[test]
+    fn test_the_dashes_that_end_a_word_break_after_them() {
+        // Three bytes each, so `c` starts at 5.
+        assert_eq!(unbroken_words("ab\u{2010}cd", 25.), vec![5]);
+        assert_eq!(unbroken_words("ab\u{2013}cd", 25.), vec![5]);
+        // The non-breaking hyphen is glue.
+        assert_eq!(unbroken_words("ab\u{2011}cd", 25.), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_a_hyphen_breaks_before_a_digit_but_not_before_punctuation_that_ends_a_word() {
+        assert_eq!(unbroken_words("12-34", 25.), vec![3]);
+        assert_eq!(unbroken_words("ab-1", 25.), vec![3]);
+        for text in ["ab-.cd", "ab-,cd", "ab-)", "ab-!", "ab--"] {
+            assert_eq!(unbroken_words(text, 25.), Vec::<usize>::new(), "{text}");
+        }
+        // A dash after a dash is not a place to break, the letter after the last one is.
+        assert_eq!(unbroken_words("ab\u{2010}-cd", 25.), vec![6]);
+    }
+
+    #[test]
+    fn test_a_hyphen_does_not_break_where_the_text_does_not_wrap() {
+        let options = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            nowrap: true,
+            ..Default::default()
+        };
+        let layout = line_with_options("well-known", Some(55.), options);
+        assert!(boundary_indices(&layout).is_empty());
+    }
+
+    #[test]
+    fn test_min_content_is_the_longest_segment_between_hyphens() {
+        let text = "self-evident truths";
+        let shaped = monospace_layout(text, 10.);
+        let opportunities = shaped.break_opportunities(text, TextLayoutOptions::default(), &[]);
+        assert_eq!(opportunities.breaks, vec![5, 13]);
     }
 
     fn breaking_line(text: &str, wrap_width: Option<f32>) -> WrappedLineLayout {
