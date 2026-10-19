@@ -3,6 +3,7 @@ mod font_features;
 mod inline;
 mod font_variations;
 mod line;
+mod line_break;
 mod line_layout;
 mod line_truncation;
 mod line_wrapper;

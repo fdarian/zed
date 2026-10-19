@@ -61,6 +61,10 @@ futures-concurrency.workspace = true
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
 http_client.workspace = true
+icu_properties = "2.3"
+# `unstable` is the Unicode 17 line break data, which Chromium's ICU 78 follows; the stable one is
+# older and breaks differently around currency signs and quotes.
+icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data", "unstable"] }
 image.workspace = true
 inventory.workspace = true
 itertools.workspace = true

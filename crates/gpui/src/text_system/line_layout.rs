@@ -16,6 +16,7 @@ use std::{
     },
 };
 
+use super::line_break::LineBreaks;
 use super::{
     InlineRun, InlineSpec, PlacedBox, RunWrap, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
     apply_inline,
@@ -55,15 +56,17 @@ impl Hash for TabSize {
 /// Where a line may break between letters, as in CSS `word-break`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum WordBreak {
-    /// A line breaks after spaces, and before characters that are not part of a
-    /// word, such as CJK.
+    /// A line breaks where Chrome's does: after spaces and hyphens, between CJK
+    /// characters, and at the other places the Unicode line breaking algorithm
+    /// allows, as `line_break.rs` has them.
     #[default]
     Normal,
     /// A line may also break between any two letters, so it is filled to the
     /// edge even when a space earlier on it would do.
     BreakAll,
-    /// There is no break between CJK characters, which then behave like the
-    /// letters of a word: only spaces and punctuation remain.
+    /// There is no break between two letters or numbers, CJK characters included,
+    /// which then behave like the letters of a word: only spaces and punctuation
+    /// remain.
     KeepAll,
 }
 
@@ -151,39 +154,6 @@ fn may_break_between(before: char, after: char) -> bool {
         |c: char| "!?)]},.:;\"'”’»…".contains(c) || ('\u{0300}'..='\u{036F}').contains(&c);
     let opening = |c| matches!(c, '(' | '[' | '{' | '“' | '‘' | '«');
     before != ' ' && !glue(before) && !glue(after) && !closing(after) && !opening(before)
-}
-
-/// Whether a line may break after the character, as it may after a hyphen: U+002D, the
-/// hyphen U+2010 and the en dash U+2013 (UAX #14 classes HY and BA). It is part of the word
-/// it ends, so there is no break before it.
-fn breaks_after(character: char) -> bool {
-    matches!(character, '-' | '\u{2010}' | '\u{2013}')
-}
-
-/// Whether a line may break between a hyphen `before` and `after`. Chrome does so in front
-/// of a letter or a digit, and not in front of punctuation that ends or joins a word (`-.`,
-/// `-,`, `-)`) or of another dash.
-fn breaks_after_hyphen(before: char, after: char) -> bool {
-    breaks_after(before) && after.is_alphanumeric()
-}
-
-/// Whether the character is one of the CJK scripts or their punctuation, which
-/// `word-break: keep-all` keeps together.
-fn is_cjk(character: char) -> bool {
-    matches!(
-        character,
-        '\u{1100}'..='\u{11FF}' // Hangul Jamo
-            | '\u{2E80}'..='\u{303F}' // CJK radicals, symbols and punctuation
-            | '\u{3040}'..='\u{30FF}' // Hiragana and Katakana
-            | '\u{3130}'..='\u{318F}' // Hangul Compatibility Jamo
-            | '\u{31F0}'..='\u{31FF}' // Katakana Phonetic Extensions
-            | '\u{3400}'..='\u{4DBF}' // CJK Extension A
-            | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
-            | '\u{AC00}'..='\u{D7AF}' // Hangul Syllables
-            | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
-            | '\u{FF00}'..='\u{FFEF}' // Halfwidth and Fullwidth Forms
-            | '\u{20000}'..='\u{323AF}' // CJK Extensions B to H
-    )
 }
 
 /// Extra inline advance around a byte range of a line of text, as the padding,
@@ -705,7 +675,7 @@ impl LineLayout {
         insets: &[TextInset],
     ) -> WrapComputation {
         let hang = options.spaces_hang();
-        let keep_all = options.word_break == WordBreak::KeepAll;
+        let line_breaks = LineBreaks::new(text, options.word_break == WordBreak::KeepAll);
         let break_all = options.word_break == WordBreak::BreakAll;
         let breaks_words = options.overflow_wrap != OverflowWrap::Normal;
         let mut boundaries = SmallVec::new();
@@ -720,7 +690,6 @@ impl LineLayout {
         };
         let mut last_boundary_x = px(0.);
         let mut broke_word = false;
-        let mut prev_ch = '\0';
         let mut prev_was_object = false;
         let mut word_wraps = !options.nowrap;
         let mut spaces: Option<SpaceRun> = None;
@@ -765,15 +734,11 @@ impl LineLayout {
                 if may_break_here {
                     last_candidate_ix = Some(ix);
                 }
-            } else if LineWrapper::is_word_char(ch) || breaks_after(ch) || (keep_all && is_cjk(ch)) {
-                if (prev_ch == ' ' || breaks_after_hyphen(prev_ch, ch))
-                    && ch != ' '
-                    && first_non_whitespace_ix.is_some()
-                    && may_break_here
-                {
-                    last_candidate_ix = Some(ix);
-                }
-            } else if ch != ' ' && first_non_whitespace_ix.is_some() && may_break_here {
+            } else if ch != ' '
+                && first_non_whitespace_ix.is_some()
+                && may_break_here
+                && line_breaks.contains(positions.glyphs[ix].index)
+            {
                 last_candidate_ix = Some(ix);
             }
 
@@ -835,7 +800,6 @@ impl LineLayout {
                 spaces = None;
                 word_wraps = positions.glyphs[ix].wrap.wraps;
             }
-            prev_ch = ch;
             prev_was_object = positions.glyphs[ix].is_object;
         }
 
@@ -1001,6 +965,8 @@ pub(super) struct BreakOpportunities {
 
 struct WrapGlyph {
     boundary: WrapBoundary,
+    /// The byte of the text the glyph starts at.
+    index: usize,
     /// The character at the glyph's index, as the wrapping rules see it.
     wrap_char: char,
     is_tab: bool,
@@ -1132,6 +1098,7 @@ impl<'a> GlyphPositions<'a> {
                             }
                         },
                         boundary: WrapBoundary { run_ix, glyph_ix },
+                        index: glyph.index,
                         // A tab is white space that may break, like the space it is
                         // when the text is not laid out with tab stops.
                         wrap_char: if tab_is_space && character == '\t' {
@@ -3225,11 +3192,40 @@ mod tests {
     fn test_a_hyphen_breaks_before_a_digit_but_not_before_punctuation_that_ends_a_word() {
         assert_eq!(unbroken_words("12-34", 25.), vec![3]);
         assert_eq!(unbroken_words("ab-1", 25.), vec![3]);
-        for text in ["ab-.cd", "ab-,cd", "ab-)", "ab-!", "ab--"] {
+        for text in ["ab-.cd", "ab-,cd", "ab-)", "ab-!"] {
             assert_eq!(unbroken_words(text, 25.), Vec::<usize>::new(), "{text}");
         }
-        // A dash after a dash is not a place to break, the letter after the last one is.
+        // Chrome breaks between two hyphens, as it does after one in front of a letter.
+        assert_eq!(unbroken_words("ab--", 25.), vec![3]);
+        // A hyphen after U+2010 is not a place to break, the letter after it is.
         assert_eq!(unbroken_words("ab\u{2010}-cd", 25.), vec![6]);
+    }
+
+    #[test]
+    fn test_a_line_breaks_where_chrome_does() {
+        // Ten pixel characters, in 25 pixels, so a text breaks at the first place there is
+        // one after its second character.
+        for (text, breaks) in [
+            // Before an opening bracket only after punctuation.
+            ("art(x)", vec![]),
+            ("pre-(fix)", vec![4]),
+            // After a hyphen in front of a quote or a symbol.
+            ("art-\"x\"", vec![4]),
+            ("art-%x", vec![4]),
+            ("re-\u{2011}entry", vec![3]),
+            // After a question mark and not after a slash.
+            ("a/b?c", vec![4]),
+            ("a/bcd/e", vec![]),
+            // A hyphen in front of a digit follows a letter or a digit, a minus sign does not.
+            ("x-1", vec![2]),
+            ("$-1", vec![]),
+            ("-12", vec![]),
+            // Between CJK characters, and between emoji.
+            ("ab\u{4E2D}\u{6587}cd", vec![2, 8]),
+            ("\u{1F600}\u{1F601}\u{1F602}", vec![8]),
+        ] {
+            assert_eq!(unbroken_words(text, 25.), breaks, "{text}");
+        }
     }
 
     #[test]
@@ -3545,10 +3541,10 @@ mod tests {
         // The run still breaks at a space, and inside only if overflow-wrap says so.
         let broken = word_break_line(text, 35., WordBreak::KeepAll, OverflowWrap::BreakWord);
         assert_eq!(boundary_chars(&broken, text), vec![3, 5]);
-        // Punctuation that is not CJK is still a place to break.
+        // Punctuation that is not CJK is still a place to break: here after the slash, as in Chrome.
         let slash = "中中/中中";
         let kept = word_break_line(slash, 35., WordBreak::KeepAll, OverflowWrap::Normal);
-        assert_eq!(boundary_chars(&kept, slash), vec![2]);
+        assert_eq!(boundary_chars(&kept, slash), vec![3]);
     }
 
     fn inset(range: Range<usize>, leading: f32, trailing: f32) -> TextInset {
