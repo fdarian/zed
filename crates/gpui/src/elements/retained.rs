@@ -62,7 +62,7 @@ use crate::{
     AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, NonReusable, PaintIndex, PaintRecord, Pixels, Point, PrepaintRecord,
     PrepaintStateIndex, Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
-    blocker_bit, first_blocker, IsZero,
+    blocker_bit, first_blocker, IsZero, SubtreeText,
 };
 use collections::FxHashSet;
 use std::{any::TypeId, ops::Range, rc::Rc};
@@ -313,7 +313,7 @@ impl RetainedState {
     }
 
     /// What the last prepaint and paint of the subtree left in the frame being built, as text.
-    pub(crate) fn describe(&self, window: &Window) -> Option<String> {
+    pub(crate) fn describe(&self, window: &Window) -> Option<SubtreeText> {
         let recorded = self.recorded.as_ref()?;
         let paint = recorded.paint.as_ref()?;
         // A subtree recorded in a region prepaints and paints what lies between the content mask
@@ -328,20 +328,23 @@ impl RetainedState {
                     .and_then(|state| state.recorded.as_ref())
                     .is_some_and(|recorded| recorded.relocation.is_some())
             });
-        let mut text = format!(
-            "{}\n{}",
-            recorded.prepaint.describe(window, loose, recorded.delta),
-            paint.describe(window, loose)
-        );
-        if let Some(lifts) = &recorded.prepaint.lifts {
-            for cell in lifts.cells() {
-                text.push_str(&cell.describe(window, loose));
+        let describe = |loose: bool| {
+            let mut text = format!(
+                "{}\n{}",
+                recorded.prepaint.describe(window, loose, recorded.delta),
+                paint.describe(window, loose)
+            );
+            if let Some(lifts) = &recorded.prepaint.lifts {
+                for cell in lifts.cells() {
+                    text.push_str(&cell.describe(window, loose));
+                }
             }
-        }
-        if let Some(relocation) = &recorded.relocation {
-            text.push_str(&relocation.describe());
-        }
-        Some(text)
+            if let Some(relocation) = &recorded.relocation {
+                text.push_str(&relocation.describe());
+            }
+            text
+        };
+        Some(SubtreeText::new(loose, &describe(false), &describe(true)))
     }
 }
 

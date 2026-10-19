@@ -363,7 +363,7 @@ impl PlainPaint {
         let recorded = self.recorded.borrow();
         match &recorded.paint {
             Some(paint) if recorded.serial == window.building_serial() => {
-                format!("\nlifted {}", paint.describe(window, loose))
+                format!("\nlifted\n{}", paint.describe(window, loose))
             }
             _ => "\nlifted (not painted)".to_owned(),
         }
@@ -2270,10 +2270,10 @@ impl Window {
 
     /// What the retained subtrees that replayed in the pass being built left in the frame, by
     /// subtree, as text. The draw order of the scene is not in it: it is the order of the frame.
-    pub(crate) fn describe_replayed(&self, subtrees: &[(GlobalElementId, TypeId)]) -> Vec<String> {
+    pub(crate) fn describe_replayed(&self, subtrees: &[(GlobalElementId, TypeId)]) -> Vec<SubtreeText> {
         // A pass that only lays out puts nothing of a subtree into its frame.
         if self.layout_only {
-            return vec![String::new(); subtrees.len()];
+            return subtrees.iter().map(|_| SubtreeText::default()).collect();
         }
         subtrees
             .iter()
@@ -2284,7 +2284,7 @@ impl Window {
                     .and_then(|state| state.inner.downcast_ref::<Option<crate::elements::RetainedState>>())
                     .and_then(Option::as_ref)
                     .and_then(|state| state.describe(self))
-                    .map_or_else(String::new, |text| strip_what_holds_nothing(&strip_draw_orders(&text)))
+                    .unwrap_or_default()
             })
             .collect()
     }
@@ -2294,17 +2294,18 @@ impl Window {
     pub(crate) fn compare_with_reference(
         &mut self,
         subtrees: &[(GlobalElementId, TypeId)],
-        shown: Vec<String>,
-        built: Vec<String>,
+        shown: Vec<SubtreeText>,
+        built: Vec<SubtreeText>,
         (shown_registries, built_registries): (String, String),
         (shown_frame, built_frame): (String, String),
     ) {
         self.retained.counters.verified += 1;
         let mut differences = Vec::new();
-        for ((subtree, shown), built) in subtrees.iter().zip(&shown).zip(&built) {
-            // A subtree that could not be recorded when built whole says nothing to compare.
-            if !built.is_empty() && shown != built {
+        let mut differing = Vec::new();
+        for (index, ((subtree, shown), built)) in subtrees.iter().zip(&shown).zip(&built).enumerate() {
+            if let Some((shown, built)) = shown.differs_from(built) {
                 differences.push(format!("{:?}\n{}", subtree.0, first_difference(shown, built)));
+                differing.push((index, shown, built));
             }
         }
         if shown_registries != built_registries {
@@ -2322,11 +2323,12 @@ impl Window {
             for (name, text) in [("replayed", &shown_frame), ("built", &built_frame)] {
                 std::fs::write(format!("{dir}/mismatch-{at}-{name}.txt"), text).ok();
             }
-            for (index, ((shown, built), subtree)) in shown.iter().zip(&built).zip(subtrees).enumerate() {
-                if !built.is_empty() && shown != built {
-                    std::fs::write(format!("{dir}/mismatch-{at}-subtree-{index}-replayed.txt"), format!("{:?}\n{shown}", subtree.0)).ok();
-                    std::fs::write(format!("{dir}/mismatch-{at}-subtree-{index}-built.txt"), built).ok();
-                }
+            for (name, text) in [("replayed", &shown_registries), ("built", &built_registries)] {
+                std::fs::write(format!("{dir}/mismatch-{at}-registries-{name}.txt"), text).ok();
+            }
+            for (index, shown, built) in differing {
+                std::fs::write(format!("{dir}/mismatch-{at}-subtree-{index}-replayed.txt"), format!("{:?}\n{shown}", subtrees[index].0)).ok();
+                std::fs::write(format!("{dir}/mismatch-{at}-subtree-{index}-built.txt"), built).ok();
             }
         }
         let message = format!("a replayed frame differs from the frame built whole in {} places\n{}", differences.len(), differences.join("\n"));
@@ -2334,6 +2336,41 @@ impl Window {
         if self.retained.mismatches.len() < 32 {
             self.retained.mismatches.push(message);
         }
+    }
+}
+
+/// What a retained subtree left in a frame, as text, in the forms it is compared in.
+#[derive(Default)]
+pub(crate) struct SubtreeText {
+    /// Whether the subtree was recorded in a region, or holds one that was: it has more than a
+    /// build under the content mask around it, see [`PrepaintRecord::describe`].
+    loose: bool,
+    /// Everything the subtree left.
+    strict: String,
+    /// Without what only the part of a region that a build leaves out has: what cannot be hit.
+    loosened: String,
+}
+
+impl SubtreeText {
+    pub(crate) fn new(loose: bool, strict: &str, loosened: &str) -> Self {
+        let normalized = |text: &str| strip_what_holds_nothing(&strip_draw_orders(text));
+        Self { loose, strict: normalized(strict), loosened: normalized(loosened) }
+    }
+
+    /// The texts of the two sides if they differ. They are compared without what only a region
+    /// has when either side was recorded in one: a replay and a build of the same subtree are
+    /// not always recorded the same way, and then neither has to give what the other cannot.
+    fn differs_from<'a>(&'a self, built: &'a SubtreeText) -> Option<(&'a str, &'a str)> {
+        // A subtree that could not be recorded when built whole says nothing to compare.
+        if built.strict.is_empty() {
+            return None;
+        }
+        let (shown, built) = if self.loose || built.loose {
+            (&self.loosened, &built.loosened)
+        } else {
+            (&self.strict, &built.strict)
+        };
+        (shown != built).then_some((shown.as_str(), built.as_str()))
     }
 }
 
@@ -2438,4 +2475,89 @@ fn first_difference(replayed: &str, built: &str) -> String {
         text[start..].chars().take(500).collect::<String>()
     };
     format!("  replayed: {}\n  built:    {}", around(replayed), around(built))
+}
+
+#[cfg(test)]
+mod subtree_text_tests {
+    use super::SubtreeText;
+
+    /// A cell of a lifted element as `PlainPaint::describe` and `PaintRecord::describe` print it
+    /// in the text of a subtree.
+    fn lifted(operations: &[&str]) -> String {
+        let operations: String = operations.iter().map(|operation| format!("{operation}\n")).collect();
+        format!("\nlifted\n{operations}tab stops []\na11y []\n")
+    }
+
+    fn strict(text: &str) -> SubtreeText {
+        SubtreeText::new(false, text, text)
+    }
+
+    fn difference(shown: &SubtreeText, built: &SubtreeText) -> Option<(String, String)> {
+        shown.differs_from(built).map(|(shown, built)| (shown.to_owned(), built.to_owned()))
+    }
+
+    #[test]
+    fn a_widening_in_a_mask_of_a_lifted_element_that_a_build_culled_is_no_difference() {
+        // A recording made in a region widens the groups around a box that a build culled, and
+        // paints nothing in the mask that it replaces for it.
+        let shown = strict(&lifted(&["replaced false", "widen ContentMask", "end replaced"]));
+        let built = strict(&lifted(&[]));
+        assert_eq!(difference(&shown, &built), None);
+        assert_eq!(difference(&built, &shown), None);
+    }
+
+    #[test]
+    fn masks_and_groups_that_hold_nothing_in_a_lifted_element_go_one_inside_the_other() {
+        let shown = strict(&lifted(&["group Mask", "replaced false", "widen ContentMask", "end replaced", "end group"]));
+        let built = strict(&lifted(&[]));
+        assert_eq!(difference(&shown, &built), None);
+    }
+
+    #[test]
+    fn what_is_drawn_in_a_mask_of_a_lifted_element_is_a_difference() {
+        let shown = strict(&lifted(&["replaced false", "widen ContentMask", "Quad red", "end replaced"]));
+        let built = strict(&lifted(&["replaced false", "widen ContentMask", "Quad blue", "end replaced"]));
+        assert!(difference(&shown, &built).is_some());
+        let built = strict(&lifted(&[]));
+        assert!(difference(&shown, &built).is_some());
+    }
+
+    #[test]
+    fn a_lifted_element_that_one_side_lacks_is_a_difference() {
+        let shown = strict(&format!("Quad red\n{}", lifted(&["Quad blue"])));
+        let built = strict("Quad red\n");
+        assert!(difference(&shown, &built).is_some());
+    }
+
+    #[test]
+    fn a_subtree_that_could_not_be_recorded_when_built_is_not_compared() {
+        assert_eq!(difference(&strict("Quad red\n"), &SubtreeText::default()), None);
+    }
+
+    /// The text a recording made in a region has, and the same without what a build leaves out.
+    fn region(listeners: &str) -> SubtreeText {
+        SubtreeText::new(true, &format!("Quad red\n{listeners}"), "Quad red\n")
+    }
+
+    #[test]
+    fn a_region_on_either_side_leaves_out_what_a_build_does_not_have() {
+        let region = region("listeners 4 0 handlers 0\n");
+        let build = strict("Quad red\n");
+        assert_eq!(difference(&region, &build), None);
+        assert_eq!(difference(&build, &region), None);
+    }
+
+    #[test]
+    fn two_subtrees_that_are_not_in_a_region_are_compared_in_all_they_hold() {
+        let shown = strict("Quad red\nlisteners 4 0 handlers 0\n");
+        let built = strict("Quad red\nlisteners 2 0 handlers 0\n");
+        assert!(difference(&shown, &built).is_some());
+    }
+
+    #[test]
+    fn a_region_still_differs_in_what_a_build_has() {
+        let region = region("");
+        let build = strict("Quad red\nQuad blue\n");
+        assert!(difference(&region, &build).is_some());
+    }
 }

@@ -72,7 +72,7 @@ pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 pub use retained::{NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub(crate) use retained::{
     LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
-    RetainedWindow, blocker_bit, first_blocker,
+    RetainedWindow, SubtreeText, blocker_bit, first_blocker,
 };
 
 use self::a11y::A11y;
@@ -4497,7 +4497,7 @@ impl Window {
         self.draw_pass = 0;
         // What the first pass left of the subtrees it replayed, while the pass that builds every
         // subtree runs in its place for the comparison.
-        let mut shown: Option<(Vec<(GlobalElementId, TypeId)>, Vec<String>, String, String, bool)> = None;
+        let mut shown: Option<(Vec<(GlobalElementId, TypeId)>, Vec<SubtreeText>, String, String, bool)> = None;
         loop {
             if shown.is_none() {
                 self.draw_pass += 1;
