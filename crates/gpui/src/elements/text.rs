@@ -820,6 +820,11 @@ struct TextLayoutInner {
     align: crate::TextAlign,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+    /// How far below the snapped top of `bounds` the box top is before taffy snaps it. A glyph
+    /// is placed from the unsnapped top and rounded once, as Chrome does, so a label centred in
+    /// a box does not land a row off when the snap went the other way. The relocation of a
+    /// retained root moves by whole pixels, which leaves it as it is.
+    phase_y: Pixels,
 }
 
 impl TextLayoutInner {
@@ -828,9 +833,12 @@ impl TextLayoutInner {
         Some(line.rows(self.line_height).first()?.baseline)
     }
 
-    /// Where the first line starts: above the bounds by the space the trim cut.
+    /// Where the first line starts: above the unsnapped top of the bounds by the space the trim cut.
     fn line_origin(&self, bounds: Bounds<Pixels>) -> Point<Pixels> {
-        point(bounds.origin.x, bounds.origin.y - self.trim_top)
+        point(
+            bounds.origin.x,
+            bounds.origin.y + self.phase_y - self.trim_top,
+        )
     }
 }
 
@@ -947,6 +955,7 @@ impl TextLayout {
                         align: text_align,
                         size: Some(Size::default()),
                         bounds: None,
+                        phase_y: Pixels::ZERO,
                     });
                     MeasuredLeaf::from(Size::default())
                 };
@@ -1159,6 +1168,7 @@ impl TextLayout {
                     align: text_align,
                     size: Some(size),
                     bounds: None,
+                    phase_y: Pixels::ZERO,
                 };
                 let first_baseline = inner.first_baseline();
                 element_state.0.borrow_mut().replace(inner);
@@ -1209,6 +1219,13 @@ impl TextLayout {
                 .with_context(|| format!("measurement has not been performed on {text}"))
                 .unwrap();
             element_state.bounds = Some(bounds);
+            element_state.phase_y = match self.1.get() {
+                Some(layout_id) => {
+                    window.layout_unsnapped_bounds(layout_id).origin.y
+                        - window.layout_bounds(layout_id).origin.y
+                }
+                None => Pixels::ZERO,
+            };
         }
         if window.tracks_relocation() {
             let target = self.0.clone();
@@ -2150,6 +2167,7 @@ mod tests {
                     trim_bottom: Pixels::ZERO,
                     align: Default::default(),
                     size: None,
+                    phase_y: Pixels::ZERO,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
                         size(px(100.), px(90.)),
@@ -2222,6 +2240,7 @@ mod tests {
                     trim_bottom: Pixels::ZERO,
                     align: Default::default(),
                     size: None,
+                    phase_y: Pixels::ZERO,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
                         size(px(60.), px(200.)),
@@ -3058,6 +3077,102 @@ mod tests {
                 let text = boxes[name];
                 assert_eq!(text.size.height, px(20.), "text {name} wrapped: {text:?}");
             }
+        }
+    }
+
+    /// A cap-trimmed label is placed from the top of its box before that is snapped, and its
+    /// baseline rounded once, as Chrome does. The rows are from headless Chrome 155 on macOS
+    /// (`<div style="display:flex;align-items:center;height:28px;font:13px Inter">
+    /// <span style="text-box:trim-both cap alphabetic">H</span></div>`, the row of the bottom of the
+    /// "H"), with the metrics of Inter, which the fixed text system here has.
+    mod trimmed_label_baseline {
+        use super::*;
+        use crate::{
+            Context, FixedMetricsTextSystem, ParentElement as _, Render, Styled as _, TestApp,
+            TextBoxEdge, TextBoxOver, TextBoxUnder, div, px,
+        };
+
+        struct Pill {
+            size: f32,
+            height: f32,
+            centred: bool,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for Pill {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let text = StyledText::new("H").with_text_box_trim(TextBoxTrim {
+                    start: true,
+                    end: true,
+                });
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let mut pill = div()
+                    .w(px(200.))
+                    .h(px(self.height))
+                    .flex()
+                    .text_size(px(self.size))
+                    .line_height(px(self.height - 8.));
+                if self.centred {
+                    pill = pill.items_center();
+                }
+                pill.text_style().text_box_edge = Some(TextBoxEdge {
+                    over: TextBoxOver::Cap,
+                    under: TextBoxUnder::Alphabetic,
+                });
+                pill.child(div().child(text)).into_any_element()
+            }
+        }
+
+        /// The device row of the baseline of the glyph, as painted, and the baseline that
+        /// the text reports for the same glyph.
+        fn painted_baseline(size: f32, height: f32, centred: bool) -> (f32, Pixels) {
+            let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::inter()));
+            app.set_window_scale_factor(1.);
+            let layout = Rc::new(RefCell::new(None));
+            let mut window = app.open_window({
+                let layout = layout.clone();
+                move |_, _| Pill {
+                    size,
+                    height,
+                    centred,
+                    layout,
+                }
+            });
+            window.draw();
+            let layout = layout.borrow().clone().unwrap();
+            let rows = window.update(|_, window, _| {
+                let scale = window.scale_factor();
+                window
+                    .rendered_frame
+                    .scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| sprite.bounds.origin.y.0 / scale)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(rows.len(), 1, "one glyph is painted");
+            (rows[0], layout.row_for_index(0).unwrap().baseline)
+        }
+
+        #[test]
+        fn a_13px_label_in_a_28px_pill_sits_on_row_19() {
+            let (row, reported) = painted_baseline(13., 28., true);
+            assert_eq!(row, 19.);
+            assert_eq!(reported.0.round(), row, "the baseline the text reports is the one painted");
+        }
+
+        #[test]
+        fn a_12px_label_in_a_24px_pill_sits_on_row_16() {
+            let (row, reported) = painted_baseline(12., 24., true);
+            assert_eq!(row, 16.);
+            assert_eq!(reported.0.round(), row, "the baseline the text reports is the one painted");
+        }
+
+        #[test]
+        fn a_label_at_the_top_of_a_box_is_on_the_row_of_its_cap_height() {
+            // The top is a whole pixel, so there is no phase: 9.457 and 8.73 round to 9.
+            assert_eq!(painted_baseline(13., 28., false).0, 9.);
+            assert_eq!(painted_baseline(12., 24., false).0, 9.);
         }
     }
 

@@ -112,6 +112,19 @@ impl FixedMetricsTextSystem {
             cap_height: 1493. / 2048.,
         }
     }
+
+    /// The metrics of Inter (`InterVariable.ttf`, 2048 units to the em: hhea ascent 1984 and
+    /// descent 494, cap height 1490, x-height 1118). The advance is that of an average glyph.
+    pub(crate) fn inter() -> Self {
+        Self {
+            noop: NoopTextSystem::new(),
+            advance: 0.6,
+            ascent: 1984. / 2048.,
+            descent: 494. / 2048.,
+            x_height: 1118. / 2048.,
+            cap_height: 1490. / 2048.,
+        }
+    }
 }
 
 impl PlatformTextSystem for FixedMetricsTextSystem {

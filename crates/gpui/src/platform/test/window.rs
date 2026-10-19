@@ -48,6 +48,7 @@ pub(crate) struct TestWindowState {
     start_external_drag_result: bool,
     pointer_locked: bool,
     last_mouse_movement: Point<Pixels>,
+    scale_factor: f32,
 }
 
 #[derive(Clone)]
@@ -83,7 +84,11 @@ impl TestWindow {
             Some(r) => r.sprite_atlas(),
             None => Arc::new(TestAtlas::new()),
         };
+        let scale_factor = platform
+            .upgrade()
+            .map_or(2.0, |platform| platform.window_scale_factor.get());
         Self(Rc::new(Mutex::new(TestWindowState {
+            scale_factor,
             bounds: params.bounds,
             display,
             platform,
@@ -242,7 +247,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn scale_factor(&self) -> f32 {
-        2.0
+        self.0.lock().scale_factor
     }
 
     fn appearance(&self) -> WindowAppearance {

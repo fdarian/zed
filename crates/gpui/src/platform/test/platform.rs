@@ -11,7 +11,7 @@ use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::Arc,
@@ -35,6 +35,8 @@ pub(crate) struct TestPlatform {
     pub opened_url: RefCell<Option<String>>,
     pub(crate) system_notifications: RefCell<TestSystemNotifications>,
     pub text_system: Arc<dyn PlatformTextSystem>,
+    /// The scale factor of the windows opened from now on.
+    pub(crate) window_scale_factor: Cell<f32>,
     pub expect_restart:
         RefCell<Option<oneshot::Sender<(Option<PathBuf>, Vec<std::ffi::OsString>)>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
@@ -147,6 +149,7 @@ impl TestPlatform {
             opened_url: Default::default(),
             system_notifications: Default::default(),
             text_system,
+            window_scale_factor: Cell::new(2.0),
             headless_renderer_factory,
         })
     }

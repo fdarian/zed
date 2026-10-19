@@ -768,10 +768,15 @@ mod tests {
                 child = child.child(text);
                 baseline = AtomicBaseline::Measured(Box::new(move |window, root, _| {
                     let text_top = window
-                        .layout_bounds(layout.layout_id().expect("the text requested its layout"))
+                        .layout_unsnapped_bounds(
+                            layout.layout_id().expect("the text requested its layout"),
+                        )
                         .origin
                         .y;
-                    Some(text_top - window.layout_bounds(root).origin.y + layout.last_baseline()?)
+                    Some(
+                        text_top - window.layout_unsnapped_bounds(root).origin.y
+                            + layout.last_baseline()?,
+                    )
                 }));
             }
             let mut inline = AtomicInline::new(index, child.into_any_element());

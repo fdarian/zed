@@ -149,6 +149,11 @@ impl TestApp {
         self.read(|cx| f(entity.read(cx), cx))
     }
 
+    /// Sets the scale factor of the windows opened after this call, which is 2 by default.
+    pub fn set_window_scale_factor(&mut self, scale_factor: f32) {
+        self.platform.window_scale_factor.set(scale_factor);
+    }
+
     /// Open a test window with the given root view, using maximized bounds.
     pub fn open_window<V: Render + 'static>(
         &mut self,
