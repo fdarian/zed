@@ -681,6 +681,14 @@ impl PaintAmbient {
 #[derive(PartialEq)]
 pub(crate) struct ReplayKey {
     bounds: Bounds<Pixels>,
+    /// The size layout gave the root, before it is snapped. The boxes inside are snapped edge by
+    /// edge from the root's origin, so two roots of one snapped box can have inside them boxes of
+    /// different snapped sizes.
+    unsnapped_size: Size<Pixels>,
+    /// Where the root's unsnapped origin falls between two device pixels. Moving the root by whole
+    /// device pixels leaves it as it was, and with it every edge inside that snaps to the same
+    /// side, which is why it is the phase and not the origin that a relocation keeps.
+    phase: SubpixelPhase,
     content_mask: ContentMask<Pixels>,
     exact_clips: Vec<ContentMask<Pixels>>,
     text_style: TextStyle,
@@ -713,6 +721,37 @@ pub(crate) struct ReplayKey {
     dom_hit_testing: bool,
 }
 
+/// The fractional part of a position in device pixels, per axis, in `[0, 1)`.
+///
+/// Two phases are equal when they are within [`SubpixelPhase::TOLERANCE`], on the circle, since
+/// 0.999 and 0.001 are the same place a pixel apart. The origin is a sum of the offsets of the
+/// nodes above it in `f32`, so the phase of a root that was only moved by whole device pixels
+/// differs by the rounding of that sum, a few units in the last place, which is about 1/1024 per
+/// operation at 8192 device pixels. The tolerance is above that and below the 1/64 that sizes measured from text are quantized to,
+/// so that a layout that moved the root by a step of its own is a different phase: an exact
+/// comparison would miss replays, and a bucketed one would call equal two phases a bucket
+/// boundary apart.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubpixelPhase(Point<f32>);
+
+impl SubpixelPhase {
+    const TOLERANCE: f32 = 1. / 256.;
+
+    fn of(origin: Point<Pixels>, scale_factor: f32) -> Self {
+        Self(origin.map(|coordinate| (coordinate.0 * scale_factor).rem_euclid(1.)))
+    }
+}
+
+impl PartialEq for SubpixelPhase {
+    fn eq(&self, other: &Self) -> bool {
+        let close = |a: f32, b: f32| {
+            let distance = (a - b).abs();
+            distance.min(1. - distance) <= Self::TOLERANCE
+        };
+        close(self.0.x, other.0.x) && close(self.0.y, other.0.y)
+    }
+}
+
 impl ReplayKey {
     /// Whether what the layout of the subtree reads of the elements around it is what it was when
     /// the recording was made: the nodes the engine kept are the ones the subtree would ask for
@@ -743,6 +782,8 @@ impl ReplayKey {
             || later.content_mask.is_rounded()
             || self.layout_origin != later.layout_origin
             || self.bounds.size != later.bounds.size
+            || self.unsnapped_size != later.unsnapped_size
+            || self.phase != later.phase
             || self.text_style != later.text_style
             || self.visibility != later.visibility
             || self.element_opacity != later.element_opacity
@@ -1793,12 +1834,15 @@ impl Window {
             clips = clip.outer.as_deref();
         }
         let layout_origin = self.layout_bounds_unshifted(root).origin;
+        let unsnapped = self.layout_unsnapped_bounds(root);
         let positioned_frame = self
             .positioned_frames
             .last()
             .map(|frame| (frame.content_mask, frame.element_offset));
         ReplayKey {
             bounds,
+            unsnapped_size: unsnapped.size,
+            phase: SubpixelPhase::of(unsnapped.origin, self.scale_factor),
             content_mask: self.content_mask(),
             exact_clips,
             text_style: self.text_style(),

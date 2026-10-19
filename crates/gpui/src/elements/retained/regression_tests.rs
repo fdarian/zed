@@ -2239,3 +2239,127 @@ fn lifted_retained_root_in_a_culled_box_is_not_taken_for_the_hole_of_its_lifted_
 fn focusable_culled_boxes_of_a_relocatable_root_in_a_nested_scroller_replay_as_built(cx: &mut TestAppContext) {
     replays_like_a_build(cx, Page { gap: 120.0, context: false, height: 300.0, scale: 1.0, ..Page::default() }, vec![Node { color: 3, row: true, ..Node::plain(0, 100, 22) }.with(vec![Node { color: 5, row: true, focusable: true, ..Node::plain(1, 14, 60) }.with(vec![Node { color: 0, absolute: Some((1, 23, 1)), escaping: true, relative: Some(0), ..Node::plain(6, 22, 100) }.with(vec![Node { color: 5, focusable: true, absolute: Some((34, 31, 2)), escaping: true, ..Node::plain(8, 36, 60) }])]), Node { color: 0, ..Node::plain(9, 22, 100) }.with(vec![Node { color: 5, row: true, ..Node::plain(10, 22, 60) }.with(vec![Node { color: 0, row: true, focusable: true, escaping: true, ..Node::plain(12, 100, 60) }]), Node { color: 3, relative: Some(1), ..Node::plain(13, 22, 14) }.with(vec![Node { color: 5, row: true, focusable: true, cullable: true, ..Node::plain(15, 14, 36) }])])]), Node { color: 4, ..Node::plain(18, 0, 14) }, Node { color: 5, row: true, ..Node::plain(24, 100, 0) }.with(vec![Node { color: 3, focusable: true, ..Node::plain(25, 0, 36) }, Node { color: 2, row: true, ..Node::plain(26, 100, 100) }.with(vec![Node { color: 3, row: true, focusable: true, ..Node::plain(27, 14, 100) }]), Node { color: 4, row: true, focusable: true, cullable: true, ..Node::plain(32, 22, 100) }]), Node { color: 0, row: true, ..Node::plain(33, 22, 0) }, Node { color: 0, row: true, relocatable: true, ..Node::plain(34, 36, 14) }.with(vec![Node { color: 5, clickable: true, focusable: true, cullable: true, ..Node::plain(38, 60, 100) }])], &[Frame { read: true, idle: true, abandon: false, inner: Some(116.119995), scale: 2.0, rem: 16.0, ..Frame::at(200.42) }, Frame { read: false, idle: true, abandon: false, inner: Some(1.0), scale: 2.0, rem: 20.0, ..Frame::at(399.86996) }]);
 }
+
+/// A relocatable root in a scroller, after a sibling of a width in `lead`, with a box inside that is
+/// 43.4 wide (the widths are percentages, since a length is rounded before layout): its edges snap from the root's sub-pixel origin, to 43 wide where the root begins at
+/// 10 and to 44 where it begins at 10.4, though the snapped box of the root is the same.
+struct Phased {
+    mode: Mode,
+    scroll: ScrollHandle,
+    lead: Rc<std::cell::Cell<f32>>,
+}
+
+impl Render for Phased {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let build = |_: &mut Window, _: &mut App| -> AnyElement {
+            div()
+                .id("phased-root")
+                .w(px(50.))
+                .h(px(20.))
+                .flex_none()
+                .child(div().id("label").w(crate::relative(0.868)).h(px(10.)).bg(crate::red()))
+                .into_any_element()
+        };
+        let key = match self.mode {
+            Mode::Retain => 1,
+            Mode::Rebuild => REBUILDS.with(|r| {
+                r.set(r.get() + 1);
+                r.get()
+            }),
+        };
+        let mut root = retained("root", key, build).cull_outset(Some(Edges::all(px(500.))));
+        if self.mode == Mode::Retain {
+            root = root.relocatable(px(100.));
+        }
+        div().id("outer").stacking_context().size_full().child(
+            div()
+                .id("page")
+                .w(px(400.))
+                .h(px(300.))
+                .overflow_scroll()
+                .track_scroll(&self.scroll)
+                .child(
+                    div()
+                        .id("row")
+                        .flex()
+                        .flex_none()
+                        .w(px(300.))
+                        .h(px(40.))
+                        .child(div().id("lead").flex_none().w(crate::relative(self.lead.get() / 300.)).h(px(10.)))
+                        .child(root),
+                )
+                .child(div().id("tail").flex_none().h(px(800.))),
+        )
+    }
+}
+
+/// What the layout of a root puts between two device pixels is read by the boxes inside it, each
+/// edge snapped on its own: a root that stays in the same snapped box while its unsnapped origin
+/// settles at another fraction is not the root that was recorded, but one that is moved by whole
+/// device pixels, with the same fraction, is.
+#[gpui::test]
+fn a_root_whose_sub_pixel_origin_changed_is_built_and_one_moved_by_whole_pixels_is_replayed(cx: &mut TestAppContext) {
+    let lead = Rc::new(std::cell::Cell::new(10.));
+    let open = |cx: &mut TestAppContext, mode: Mode| {
+        let scroll = ScrollHandle::new();
+        let window = cx.open_window(size(px(400.), px(300.)), {
+            let (scroll, lead) = (scroll.clone(), lead.clone());
+            move |_, _| Phased { mode, scroll, lead }
+        });
+        let window = AnyWindowHandle::from(window);
+        cx.update_window(window, |_, window, cx| {
+            window.set_dom_hit_testing(true);
+            window.set_a11y_active_for_tests(true);
+            window.set_scale_factor(1.);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        (window, scroll)
+    };
+    let (retaining, retaining_scroll) = open(cx, Mode::Retain);
+    let (building, building_scroll) = open(cx, Mode::Rebuild);
+    let counters = |cx: &mut TestAppContext| cx.update_window(retaining, |_, window, _| window.retained_counters()).unwrap();
+    let mut last_built = shown(building, cx);
+    // (lead, scroll, replays, relocations): how many more of each the frame makes. A replay is
+    // compared with the recording it was made from, so the frames after a scroll relocate again.
+    let frames = [
+        (10., 0., 1, 0),
+        (10.4, 0., 0, 0),
+        (10.4, 0., 1, 0),
+        (10.4, -7., 1, 1),
+        (10.4, -7.3, 1, 1),
+        (10., -9., 0, 0),
+        (10., -9., 1, 0),
+        (10., -12., 1, 1),
+    ];
+    for (step, (lead_width, offset, replays, relocations)) in frames.into_iter().enumerate() {
+        lead.set(lead_width);
+        let before = counters(cx);
+        for (window, scroll) in [(retaining, &retaining_scroll), (building, &building_scroll)] {
+            scroll.set_offset(point(px(0.), px(offset)));
+            cx.update_window(window, |view, window, cx| {
+                view.downcast::<Phased>().unwrap().update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+        let after = counters(cx);
+        let (retained, built) = (shown(retaining, cx), shown(building, cx));
+        let differing: Vec<String> = retained
+            .lines()
+            .zip(built.lines())
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| format!("retained {}\nbuilt    {}", &a[..a.len().min(300)], &b[..b.len().min(300)]))
+            .collect();
+        assert!(differing.is_empty(), "step {step}: {} lines differ\n{}", differing.len(), differing.join("\n"));
+        assert_eq!(
+            (after.replays - before.replays, after.relocations - before.relocations),
+            (replays, relocations),
+            "step {step}: replays and relocations of the frame, {after:?}"
+        );
+        if step == 1 {
+            assert_ne!(built, last_built, "the box inside snaps to another width at the other fraction");
+        }
+        last_built = built;
+    }
+}
