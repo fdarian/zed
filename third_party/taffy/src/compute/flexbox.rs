@@ -716,16 +716,17 @@ fn determine_flex_base_size(
         // Available space for child sizing
         // Min/max sizes transferred through the aspect ratio are taken into account here
         // https://github.com/w3c/csswg-drafts/issues/10997
-        let cross_axis_margin_sum = constants.margin.cross_axis_sum(dir);
+        let cross_axis_margin_sum = child.margin.cross_axis_sum(dir);
         let transferred_min_size = child.min_size.maybe_apply_aspect_ratio(child.aspect_ratio);
         let transferred_max_size = child.max_size.maybe_apply_aspect_ratio(child.aspect_ratio);
-        let child_min_cross = transferred_min_size.cross(dir).maybe_add(cross_axis_margin_sum);
-        let child_max_cross = transferred_max_size.cross(dir).maybe_add(cross_axis_margin_sum);
+        let child_min_cross = transferred_min_size.cross(dir);
+        let child_max_cross = transferred_max_size.cross(dir);
 
-        // Clamp available space by min- and max- size
+        // The space the item's border box fits into: the available space less the item's own margins, kept between
+        // its min and max size. An item that does not stretch is sized into it as well.
         let cross_axis_available_space: AvailableSpace = match available_space.cross(dir) {
             AvailableSpace::Definite(val) => AvailableSpace::Definite(
-                cross_axis_parent_size.unwrap_or(val).maybe_clamp(child_min_cross, child_max_cross),
+                (cross_axis_parent_size.unwrap_or(val) - cross_axis_margin_sum).maybe_clamp(child_min_cross, child_max_cross),
             ),
             AvailableSpace::MinContent => match child_min_cross {
                 Some(min) => AvailableSpace::Definite(min),
@@ -752,10 +753,7 @@ fn determine_flex_base_size(
                 && !child.margin_is_auto.cross_end(constants.dir)
                 && ckd.cross(dir).is_none()
             {
-                ckd.set_cross(
-                    dir,
-                    cross_axis_available_space.into_option().maybe_sub(child.margin.cross_axis_sum(dir)),
-                );
+                ckd.set_cross(dir, cross_axis_available_space.into_option());
             }
             ckd
         };
@@ -1130,12 +1128,12 @@ fn determine_container_main_size(
                                 let cross_axis_parent_size = constants.node_inner_size.cross(dir);
 
                                 // Available space for child sizing
-                                let cross_axis_margin_sum = constants.margin.cross_axis_sum(dir);
-                                let child_min_cross = item.min_size.cross(dir).maybe_add(cross_axis_margin_sum);
-                                let child_max_cross = item.max_size.cross(dir).maybe_add(cross_axis_margin_sum);
+                                let cross_axis_margin_sum = item.margin.cross_axis_sum(dir);
+                                let child_min_cross = item.min_size.cross(dir);
+                                let child_max_cross = item.max_size.cross(dir);
                                 let cross_axis_available_space: AvailableSpace = available_space
                                     .cross(dir)
-                                    .map_definite_value(|val| cross_axis_parent_size.unwrap_or(val))
+                                    .map_definite_value(|val| cross_axis_parent_size.unwrap_or(val) - cross_axis_margin_sum)
                                     .maybe_clamp(child_min_cross, child_max_cross);
 
                                 let child_available_space = available_space.with_cross(dir, cross_axis_available_space);
@@ -1144,12 +1142,7 @@ fn determine_container_main_size(
                                 let child_known_dimensions = {
                                     let mut ckd = item.size.with_main(dir, None);
                                     if item.align_self == AlignSelf::STRETCH && ckd.cross(dir).is_none() {
-                                        ckd.set_cross(
-                                            dir,
-                                            cross_axis_available_space
-                                                .into_option()
-                                                .maybe_sub(item.margin.cross_axis_sum(dir)),
-                                        );
+                                        ckd.set_cross(dir, cross_axis_available_space.into_option());
                                     }
                                     ckd
                                 };
@@ -1482,10 +1475,17 @@ fn determine_hypothetical_cross_size(
             .maybe_clamp(transferred_min_cross, transferred_max_cross)
             .maybe_max(padding_border_sum);
 
-        let child_available_cross = available_space
-            .cross(constants.dir)
-            .maybe_clamp(transferred_min_cross, transferred_max_cross)
-            .maybe_max(padding_border_sum);
+        // An item that does not stretch is sized into the cross space less its own margins, as a stretched one is
+        // in `determine_used_cross_size`.
+        let cross_axis_margin_sum = child.margin.cross_axis_sum(constants.dir);
+        let child_available_cross = match available_space.cross(constants.dir) {
+            AvailableSpace::Definite(space) => AvailableSpace::Definite(
+                (constants.node_inner_size.cross(constants.dir).unwrap_or(space) - cross_axis_margin_sum)
+                    .maybe_clamp(transferred_min_cross, transferred_max_cross)
+                    .max(padding_border_sum),
+            ),
+            space => space.maybe_clamp(transferred_min_cross, transferred_max_cross).maybe_max(padding_border_sum),
+        };
 
         let child_inner_cross = child_cross.unwrap_or_else(|| {
             tree.measure_child_size(
@@ -2883,5 +2883,94 @@ mod basis_tests {
         })
         .unwrap();
         assert_eq!(tree.layout(item).unwrap().size.width, 20.0);
+    }
+}
+
+/// Margins of a flex container and of its items on the cross axis. What an item's cross size fits into is the container's
+/// inner cross size less the item's own margins; the margin of the container is outside it. The "text" is the leaf of
+/// `basis_tests`: five words of 20px that wrap between them, 10px a line.
+#[cfg(test)]
+mod margin_tests {
+    use crate::prelude::*;
+    use crate::TaffyTree;
+
+    fn words(known: Size<Option<f32>>, available: Size<AvailableSpace>) -> Size<f32> {
+        let width = known.width.unwrap_or(match available.width {
+            AvailableSpace::MinContent => 20.0,
+            AvailableSpace::MaxContent => 100.0,
+            AvailableSpace::Definite(width) => width.min(100.0).max(20.0),
+        });
+        let per_line = (width / 20.0).floor().max(1.0);
+        Size { width, height: known.height.unwrap_or((5.0 / per_line).ceil() * 10.0) }
+    }
+
+    fn margin_left(margin: f32) -> Rect<LengthPercentageAuto> {
+        Rect { left: length(margin), right: length(0.0), top: length(0.0), bottom: length(0.0) }
+    }
+
+    /// The border box `(width, height)` of the item of a column 200px wide whose height is `column_height`, with a margin on
+    /// the left of the column and one on the left of the item. The item is at most 100px wide.
+    fn item(column_height: Dimension, column_margin: f32, item_margin: f32, align: AlignSelf) -> Size<f32> {
+        let mut tree: TaffyTree<()> = TaffyTree::new();
+        tree.disable_rounding();
+        let item = tree
+            .new_leaf_with_context(
+                Style {
+                    margin: margin_left(item_margin),
+                    align_self: Some(align),
+                    max_size: Size { width: length(100.0), height: auto() },
+                    ..Style::default()
+                },
+                (),
+            )
+            .unwrap();
+        let column = tree
+            .new_with_children(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
+                    size: Size { width: length(200.0), height: column_height },
+                    margin: margin_left(column_margin),
+                    ..Style::default()
+                },
+                &[item],
+            )
+            .unwrap();
+        tree.compute_layout_with_measure(
+            column,
+            Size { width: AvailableSpace::Definite(200.0), height: AvailableSpace::MaxContent },
+            |known, available, _, _, _| words(known, available),
+        )
+        .unwrap();
+        tree.layout(item).unwrap().size
+    }
+
+    #[test]
+    fn the_margin_of_a_column_does_not_narrow_what_its_items_fit_into() {
+        for height in [auto(), length(300.0)] {
+            for margin in [-12.0, 0.0, 12.0] {
+                assert_eq!(item(height, margin, 0.0, AlignSelf::STRETCH), Size { width: 100.0, height: 10.0 }, "a column margin of {margin}px");
+            }
+        }
+    }
+
+    #[test]
+    fn the_margin_of_an_item_narrows_what_it_fits_into() {
+        // 150px less 70px: the item is at most 100px wide, and 80px wide when 70px of the 150px are margin.
+        for height in [auto(), length(300.0)] {
+            assert_eq!(item(height, 0.0, 100.0, AlignSelf::STRETCH), Size { width: 100.0, height: 10.0 }, "100px of margin");
+            assert_eq!(item(height, 0.0, 130.0, AlignSelf::STRETCH), Size { width: 70.0, height: 20.0 }, "130px of margin");
+        }
+    }
+
+    #[test]
+    fn the_margin_of_an_item_aligned_to_a_side_narrows_what_it_fits_into() {
+        for align in [AlignSelf::FLEX_START, AlignSelf::CENTER] {
+            for height in [auto(), length(300.0)] {
+                assert_eq!(item(height, 0.0, 100.0, align), Size { width: 100.0, height: 10.0 }, "{align:?}, 100px of margin");
+                assert_eq!(item(height, 0.0, 130.0, align), Size { width: 70.0, height: 20.0 }, "{align:?}, 130px of margin");
+                assert_eq!(item(height, 12.0, 130.0, align), Size { width: 70.0, height: 20.0 }, "{align:?}, a margin on both");
+            }
+        }
     }
 }

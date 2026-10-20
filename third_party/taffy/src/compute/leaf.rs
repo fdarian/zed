@@ -41,7 +41,6 @@ where
 
     // Note: both horizontal and vertical percentage padding/borders are resolved against the container's inline size (i.e. width).
     // This is not a bug, but is how CSS is specified (see: https://developer.mozilla.org/en-US/docs/Web/CSS/padding#values)
-    let margin = style.margin().resolve_or_zero(parent_size.width, &resolve_calc_value);
     let padding = style.padding().resolve_or_zero(parent_size.width, &resolve_calc_value);
     let border = style.border().resolve_or_zero(parent_size.width, &resolve_calc_value);
     let padding_border = padding + border;
@@ -123,13 +122,13 @@ where
         };
     }
 
+    // The available space is the node's border box's: whoever lays it out has taken its margins from it.
     // Compute available space
     let available_space = Size {
         width: known_dimensions
             .width
             .map(AvailableSpace::from)
             .unwrap_or(available_space.width)
-            .maybe_sub(margin.horizontal_axis_sum())
             .maybe_set(known_dimensions.width)
             .maybe_set(node_size.width)
             .map_definite_value(|size| {
@@ -139,7 +138,6 @@ where
             .height
             .map(AvailableSpace::from)
             .unwrap_or(available_space.height)
-            .maybe_sub(margin.vertical_axis_sum())
             .maybe_set(known_dimensions.height)
             .maybe_set(node_size.height)
             .map_definite_value(|size| {

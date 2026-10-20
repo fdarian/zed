@@ -2966,6 +2966,59 @@ mod tests {
             );
         }
 
+        /// What a flex item's cross axis fits into is the container's content width less the item's own
+        /// margins, never the container's: a column with a negative margin lays its `fit-content` item out as
+        /// one without. `hello wonderful world` in 12px of padding on each side is 114px wide at min-content
+        /// and 234px at max-content. The React tests' fit-content-margin-oracle.html has Chrome's boxes for
+        /// the same pages.
+        #[gpui::test]
+        fn the_margin_of_a_flex_column_does_not_size_its_fit_content_item(cx: &mut TestAppContext) {
+            let mut boxed = |column_width: f32, column_margin: f32, item_margin: f32| {
+                let (_, cx) = probe(cx, LONG, move |text| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w(px(column_width))
+                        .ml(px(column_margin))
+                        .child(
+                            div()
+                                .debug_selector(|| "box".into())
+                                .w_fit_content()
+                                .px(px(12.))
+                                .ml(px(item_margin))
+                                .child(words(text)),
+                        )
+                        .into_any_element()
+                });
+                bounds(cx, "box").size
+            };
+            for (fits_into, want) in [
+                (60., size(px(114.), px(30.))),
+                (118., size(px(118.), px(30.))),
+                (160., size(px(160.), px(30.))),
+                (174., size(px(174.), px(20.))),
+                (200., size(px(200.), px(20.))),
+                (300., size(px(234.), px(10.))),
+            ] {
+                for column_margin in [0., -12., 12.] {
+                    assert_eq!(
+                        boxed(fits_into, column_margin, 0.),
+                        want,
+                        "a column {fits_into}px wide with a margin of {column_margin}px"
+                    );
+                }
+                // The item's own margin takes from, or gives, the width it fits into.
+                for item_margin in [-12., 12.] {
+                    assert_eq!(
+                        boxed(fits_into + item_margin, 0., item_margin),
+                        want,
+                        "an item with a margin of {item_margin}px in a column {}px wide",
+                        fits_into + item_margin
+                    );
+                }
+            }
+        }
+
         #[gpui::test]
         fn fit_content_of_a_limit_is_the_limit_between_min_and_max_content(
             cx: &mut TestAppContext,
