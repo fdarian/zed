@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::{
-    AnyWindowHandle, AppContext as _, Context, Edges, InteractiveElement, LayoutCounters, ParentElement, Pixels,
+    AnyWindowHandle, AppContext as _, Context, Edges, FrameWorkCounters, InteractiveElement, LayoutCounters, ParentElement, Pixels,
     Render, RetainedCounters, Size, StatefulInteractiveElement, Styled,
     TestAppContext, canvas, div, px, size,
 };
@@ -48,6 +48,7 @@ impl Render for Page {
                         .flex_none()
                         .w(px(400.))
                         .h(px(height))
+                        .bg(crate::blue())
                         .child(
                             canvas(
                                 |_, window, _| {
@@ -99,6 +100,7 @@ fn frame(cx: &mut TestAppContext, window: AnyWindowHandle, edit: impl FnOnce(&mu
 struct Snapshot {
     retained: RetainedCounters,
     layout: LayoutCounters,
+    work: FrameWorkCounters,
     culled: u64,
     prepaints: (u64, u64),
 }
@@ -107,6 +109,7 @@ fn snapshot(cx: &mut TestAppContext, window: AnyWindowHandle) -> Snapshot {
     cx.update_window(window, |_, window, _| Snapshot {
         retained: window.retained_counters(),
         layout: window.layout_counters(),
+        work: window.frame_work_counters(),
         culled: window.culled_subtree_count(),
         prepaints: PREPAINTS.with(Cell::get),
     })
@@ -161,7 +164,60 @@ fn a_frame_after_an_unchanged_one_works_out_no_extent_and_no_overflow_for_the_ro
     assert_eq!(grown.culled - idle.culled, cards as u64 - 3);
 }
 
-/// `cargo test -p gpui --lib --features test-support -- --ignored --nocapture culled_frame_time`
+#[gpui::test]
+fn a_frame_that_replays_every_card_works_on_the_elements_around_them_only(cx: &mut TestAppContext) {
+    let mut works = Vec::new();
+    for cards in [4, 40] {
+        let window = open(cx, cards);
+        let before = snapshot(cx, window);
+        frame(cx, window, |page| page.tick += 1);
+        let after = snapshot(cx, window);
+        assert_eq!(after.retained.replays - before.retained.replays, cards as u64);
+        works.push(FrameWorkCounters {
+            prepainted: after.work.prepainted - before.work.prepainted,
+            culled_prepainted: after.work.culled_prepainted - before.work.culled_prepainted,
+            painted: after.work.painted - before.work.painted,
+            culled_painted: after.work.culled_painted - before.work.culled_painted,
+            painted_primitives: after.work.painted_primitives - before.work.painted_primitives,
+            replayed_primitives: after.work.replayed_primitives - before.work.replayed_primitives,
+        });
+    }
+    // The view, the page, the box that changed and the scroller are built; the cards, retained roots and
+    // their wrappers, are not counted, and the three that show put their quad in again.
+    let expected = FrameWorkCounters {
+        prepainted: 4,
+        culled_prepainted: 0,
+        painted: 4,
+        culled_painted: 0,
+        painted_primitives: 1,
+        replayed_primitives: 3,
+    };
+    assert_eq!(works[0], expected, "4 cards");
+    assert_eq!(works[1], expected, "40 cards: what is culled costs no prepaint, paint or primitive");
+}
+
+#[gpui::test]
+fn a_card_that_is_built_in_a_culled_subtree_counts_as_culled(cx: &mut TestAppContext) {
+    let window = open(cx, 40);
+    let idle_before = snapshot(cx, window);
+    frame(cx, window, |page| page.tick += 1);
+    let idle = snapshot(cx, window);
+    frame(cx, window, |page| page.last_height = 60.);
+    let grown = snapshot(cx, window);
+    assert_eq!(grown.retained.builds - idle.retained.builds, 1);
+    // The card and its canvas are prepainted and painted with the mask of the scroller's clip
+    // emptied; the page, the live box and the scroller are built as in any frame.
+    assert_eq!(grown.work.culled_prepainted - idle.work.culled_prepainted, 2);
+    assert_eq!(grown.work.culled_painted - idle.work.culled_painted, 2);
+    assert_eq!(grown.work.prepainted - idle.work.prepainted, idle.work.prepainted - idle_before.work.prepainted);
+    assert_eq!(
+        grown.work.painted_primitives - idle.work.painted_primitives,
+        idle.work.painted_primitives - idle_before.work.painted_primitives,
+        "a culled card puts nothing into the scene"
+    );
+}
+
+/// `cargo test -p gpui --lib --features test-support -- --ignored --nocapture culled_frame_time`/// `cargo test -p gpui --lib --features test-support -- --ignored --nocapture culled_frame_time`
 #[gpui::test]
 #[ignore]
 fn culled_frame_time(cx: &mut TestAppContext) {

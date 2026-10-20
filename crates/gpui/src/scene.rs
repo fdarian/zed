@@ -63,6 +63,20 @@ pub struct Scene {
     text_clips: Vec<TextClip>,
     next_group_id: u64,
     hidden: bool,
+    /// What the primitives inserted now are counted as in `counts`.
+    inserting: PrimitiveCount,
+    /// Primitives routed into this scene since it was made, which `clear` keeps.
+    pub(crate) counts: crate::FrameWorkCounters,
+}
+
+/// How a primitive a scene takes is counted, see [`crate::FrameWorkCounters`].
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PrimitiveCount {
+    #[default]
+    Painted,
+    Replayed,
+    /// The primitive was counted already, when a scene of its own took it.
+    Uncounted,
 }
 
 /// A group under construction: its content goes to its own scene until the group ends.
@@ -245,7 +259,18 @@ impl Scene {
                 clip.scene.insert_primitive_local(glyph.clone());
             }
         }
+        match self.inserting {
+            PrimitiveCount::Painted => self.counts.painted_primitives += 1,
+            PrimitiveCount::Replayed => self.counts.replayed_primitives += 1,
+            PrimitiveCount::Uncounted => {}
+        }
         self.current_mut().insert_primitive_local(primitive);
+    }
+
+    /// Adds what a recorder scene counted to this one's, which the recorder's primitives are
+    /// put into.
+    pub(crate) fn absorb_counts(&mut self, recorder: &Scene) {
+        self.counts.add(&recorder.counts);
     }
 
     /// Inserts a quad. One with no background is split around its empty interior, so that the
@@ -779,6 +804,7 @@ impl Scene {
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
+        let inserting = mem::replace(&mut self.inserting, PrimitiveCount::Replayed);
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
@@ -799,6 +825,7 @@ impl Scene {
                 PaintOperation::EndReplaced => self.end_replaced(),
             }
         }
+        self.inserting = inserting;
         self.hidden = hidden;
     }
 
@@ -812,9 +839,11 @@ impl Scene {
         operations: &[PaintOperation],
         delta: Point<ScaledPixels>,
         clip: &ReplayClip,
+        count: PrimitiveCount,
     ) {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
+        let inserting = mem::replace(&mut self.inserting, count);
         // The masks that replaced the one around them in the recording are not cut by the one
         // around the place the recording is put, unless they were cut from the masks inside it.
         // Whether what is put now is cut by `clip`: inside a mask that replaced the one around
@@ -910,6 +939,7 @@ impl Scene {
                 }
             }
         }
+        self.inserting = inserting;
         self.hidden = hidden;
     }
 
@@ -2657,6 +2687,7 @@ mod tests {
             &recorded.paint_operations,
             point(ScaledPixels(0.), ScaledPixels(-100.)),
             &viewport,
+            PrimitiveCount::Replayed,
         );
 
         let mut painted = scene();
@@ -2694,7 +2725,7 @@ mod tests {
 
         let delta = point(ScaledPixels(7.), ScaledPixels(-4.));
         let mut replayed = scene();
-        replayed.replay_translated(&recorded.paint_operations, delta, &clip(-100., -100., 1000., 1000.));
+        replayed.replay_translated(&recorded.paint_operations, delta, &clip(-100., -100., 1000., 1000.), PrimitiveCount::Replayed);
         let moved = replayed.monochrome_sprites[0];
         let before = draws_at(&sprite);
         let after = draws_at(&moved);
@@ -2729,6 +2760,7 @@ mod tests {
             &recorded.paint_operations,
             point(ScaledPixels(0.), ScaledPixels(0.)),
             &clip(0., 0., 100., 100.),
+            PrimitiveCount::Replayed,
         );
         assert_eq!(replayed.groups.len(), 1);
         assert_eq!(replayed.groups[0].content_mask.bounds, bounds(0., 0., 100., 100.));

@@ -69,7 +69,7 @@ mod prompts;
 mod retained;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
-pub use retained::{NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
+pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub(crate) use retained::{
     LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
     RetainedWindow, SubtreeText, blocker_bit, first_blocker,

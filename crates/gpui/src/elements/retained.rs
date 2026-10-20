@@ -62,7 +62,7 @@ use crate::{
     AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, NonReusable, PaintIndex, PaintRecord, Pixels, Point, PrepaintRecord,
     PrepaintStateIndex, Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
-    blocker_bit, first_blocker, IsZero, SubtreeText,
+    blocker_bit, first_blocker, IsZero, SubtreeText, scene::PrimitiveCount,
 };
 use collections::FxHashSet;
 use std::{any::TypeId, ops::Range, rc::Rc};
@@ -551,7 +551,8 @@ impl Element for Retained {
                             .covers_mask(Point::default(), &window.content_mask())),
                         "the region a relocatable subtree is recorded in covers the clip it is painted under"
                     );
-                    window.emit_relocated(operations, Point::default());
+                    // The recorder scene counted these when they were painted.
+                    window.emit_relocated(operations, Point::default(), PrimitiveCount::Uncounted);
                 }
                 let Some(mark) = mark else {
                     return;

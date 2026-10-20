@@ -3,7 +3,7 @@
 //! puts a recording into the frame being built.
 
 use super::*;
-use crate::scene::{PaintOperation, ReplayClip};
+use crate::scene::{PaintOperation, PrimitiveCount, ReplayClip};
 use crate::LayoutCounters;
 use std::cell::{Cell, RefCell};
 
@@ -156,6 +156,38 @@ impl RelocationMiss {
     }
 }
 
+/// The work frames did to build and draw the elements, since the window was made: what a frame
+/// that changes little still pays for, and what a replay of a recording does not. Subtract two
+/// reads for a span of frames. Replays are in [`RetainedCounters::replays`], a root that is
+/// replayed is not counted here, nor is a retained root's own wrapper, built or replayed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameWorkCounters {
+    /// Elements whose own `prepaint` ran, outside a culled subtree.
+    pub prepainted: u64,
+    /// Elements whose `prepaint_culled` ran, inside a subtree the clip hides.
+    pub culled_prepainted: u64,
+    /// Elements whose own `paint` ran.
+    pub painted: u64,
+    /// Elements whose `paint_culled` ran.
+    pub culled_painted: u64,
+    /// Primitives that painting put into the scene, after what is hidden or clipped away is
+    /// left out. A quad with no background that is split around its interior counts each piece.
+    pub painted_primitives: u64,
+    /// Primitives a replay put into the scene again, counted the same way.
+    pub replayed_primitives: u64,
+}
+
+impl FrameWorkCounters {
+    pub(crate) fn add(&mut self, other: &FrameWorkCounters) {
+        self.prepainted += other.prepainted;
+        self.culled_prepainted += other.culled_prepainted;
+        self.painted += other.painted;
+        self.culled_painted += other.culled_painted;
+        self.painted_primitives += other.painted_primitives;
+        self.replayed_primitives += other.replayed_primitives;
+    }
+}
+
 /// What retained subtrees did in a window, since it was made.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedCounters {
@@ -239,6 +271,9 @@ impl RetainedCounters {
 #[derive(Default)]
 pub(crate) struct RetainedWindow {
     pub(crate) counters: RetainedCounters,
+    /// What the elements did; the primitives are counted by the scenes, see
+    /// [`Window::frame_work_counters`].
+    pub(crate) work: FrameWorkCounters,
     /// Counts the frames that were drawn. A recording indexes the vectors of the frame it was
     /// made in, which is the rendered frame only in the draw that follows.
     pub(crate) rendered_serial: u64,
@@ -974,6 +1009,15 @@ impl Window {
     /// What retained subtrees did in this window since it was made.
     pub fn retained_counters(&self) -> RetainedCounters {
         self.retained.counters
+    }
+
+    /// What building and drawing the elements did in this window since it was made, see
+    /// [`FrameWorkCounters`].
+    pub fn frame_work_counters(&self) -> FrameWorkCounters {
+        let mut counters = self.retained.work;
+        counters.add(&self.rendered_frame.scene.counts);
+        counters.add(&self.next_frame.scene.counts);
+        counters
     }
 
     /// Makes every frame that replayed a retained subtree be built once more, with every subtree
@@ -1771,7 +1815,7 @@ impl Window {
             !record.moves,
         );
         if let Some(operations) = &record.operations {
-            self.emit_relocated(operations, delta);
+            self.emit_relocated(operations, delta, PrimitiveCount::Replayed);
         }
         #[cfg(any(test, feature = "test-support"))]
         if record.moves {
@@ -1996,6 +2040,7 @@ impl Window {
             self.exact_clips = relocation.saved_exact_clips.take();
             if let Some(scene) = relocation.saved_scene.take() {
                 let recorder = mem::replace(&mut self.next_frame.scene, scene);
+                self.next_frame.scene.absorb_counts(&recorder);
                 operations = Some(recorder.into_operations().into());
             }
         }
@@ -2004,7 +2049,12 @@ impl Window {
 
     /// Puts the `operations` a relocatable subtree recorded into the scene, `delta` away from where
     /// they were recorded, inside the content mask that is around now.
-    pub(crate) fn emit_relocated(&mut self, operations: &[PaintOperation], delta: Point<Pixels>) {
+    pub(crate) fn emit_relocated(
+        &mut self,
+        operations: &[PaintOperation],
+        delta: Point<Pixels>,
+        count: PrimitiveCount,
+    ) {
         self.retained.relocated_replays += 1;
         let scale_factor = self.scale_factor;
         let ambient = self.content_mask();
@@ -2014,7 +2064,7 @@ impl Window {
         };
         self.next_frame
             .scene
-            .replay_translated(operations, delta.scale(scale_factor), &clip);
+            .replay_translated(operations, delta.scale(scale_factor), &clip, count);
     }
 
     /// Notes that a rounded content mask was pushed while a subtree is recorded in a region of its

@@ -471,6 +471,12 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
 
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
 impl<E: Element> Drawable<E> {
+    /// A retained root is bookkeeping for what it replays or builds, which are counted as
+    /// elements of their own, see [`crate::FrameWorkCounters`].
+    fn is_retained_wrapper() -> bool {
+        std::any::TypeId::of::<E>() == std::any::TypeId::of::<crate::Retained>()
+    }
+
     pub(crate) fn new(element: E) -> Self {
         Drawable {
             element,
@@ -631,6 +637,12 @@ impl<E: Element> Drawable<E> {
                 let outer_scope = global_id
                     .as_ref()
                     .map(|global_id| mem::replace(&mut window.layout_scope, global_id.scope_hash()));
+                if !Self::is_retained_wrapper() {
+                    match culled {
+                        Culled::No => window.retained.work.prepainted += 1,
+                        Culled::Root | Culled::Inside => window.retained.work.culled_prepainted += 1,
+                    }
+                }
                 let mut prepaint = if culled == Culled::No {
                     self.element.prepaint(
                         global_id.as_ref(),
@@ -738,6 +750,12 @@ impl<E: Element> Drawable<E> {
                 }
 
                 window.next_frame.dispatch_tree.set_active_node(node_id);
+                if !Self::is_retained_wrapper() {
+                    match culled {
+                        Culled::No => window.retained.work.painted += 1,
+                        Culled::Root | Culled::Inside => window.retained.work.culled_painted += 1,
+                    }
+                }
                 let element = &mut self.element;
                 let mut paint = |window: &mut Window| {
                     if culled == Culled::No {
