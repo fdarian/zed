@@ -2215,8 +2215,8 @@ pub enum Position {
     /// WARNING: to opt-out of layouting entirely, you must use [`Display::None`] instead on your [`Style`] object.
     Absolute,
     /// Lays out like [`Position::Relative`] with the insets ignored. Once laid out, the element is
-    /// moved to stay inside the scrollport of its nearest scroll container, inset by `top`,
-    /// `right`, `bottom` and `left`, and never out of its parent's content box.
+    /// moved to stay inside the scrollport of its nearest scroll container less that container's
+    /// padding, inset by `top`, `right`, `bottom` and `left`, and never out of its parent's content box.
     Sticky,
     /// CSS `position: absolute`. The offset, percentage sizes and margins resolve against the
     /// padding box of the closest ancestor that is not [`Position::Static`], or the root of the

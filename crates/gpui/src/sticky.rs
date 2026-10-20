@@ -1,10 +1,12 @@
 //! `position: sticky`.
 //!
 //! A sticky element lays out like a relative one with its insets ignored. When it is
-//! prepainted, it is moved so that it stays inside the scrollport of its nearest scroll container,
-//! inset by its own `top`, `right`, `bottom` and `left`, but never out of its parent's content
-//! box (CSS calls that the sticky constraint rectangle). Scroll containers and every other
-//! `Div` publish those two rectangles here while their children prepaint.
+//! prepainted, it is moved so that it stays inside the scrollport of its nearest scroll container
+//! less that container's padding on every side (the sticky view rectangle, Chrome's constraining
+//! rect), inset by its own `top`, `right`, `bottom` and `left`, but never out of its parent's
+//! content box (CSS calls that the sticky constraint rectangle). Percentage insets resolve against
+//! the size of the sticky view rectangle. Scroll containers and every other `Div` publish those
+//! two rectangles here while their children prepaint.
 //!
 //! This state is per thread, not per window: prepainting is single threaded and every push is
 //! popped before the next window draws.
@@ -15,21 +17,21 @@ use crate::{
     Bounds, EdgesRefinement, Length, Overflow, Pixels, Point, Size, Style, Window, point,
 };
 
-/// How far from each edge of the scrollport a sticky element stays. `None` leaves that edge free.
+/// How far from each edge of the sticky view rectangle a sticky element stays. `None` leaves that edge free.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StickyInsets {
-    /// Distance from the top of the scrollport.
+    /// Distance from the top of the sticky view rectangle.
     pub top: Option<Pixels>,
-    /// Distance from the right of the scrollport.
+    /// Distance from the right of the sticky view rectangle.
     pub right: Option<Pixels>,
-    /// Distance from the bottom of the scrollport.
+    /// Distance from the bottom of the sticky view rectangle.
     pub bottom: Option<Pixels>,
-    /// Distance from the left of the scrollport.
+    /// Distance from the left of the sticky view rectangle.
     pub left: Option<Pixels>,
 }
 
 impl StickyInsets {
-    /// Resolves a style's inset, with percentages taken of the scrollport.
+    /// Resolves a style's inset, with percentages taken of the sticky view rectangle.
     pub(crate) fn resolve(
         inset: &EdgesRefinement<Length>,
         port: Size<Pixels>,
@@ -54,12 +56,14 @@ impl StickyInsets {
 }
 
 thread_local! {
+    /// The sticky view rectangle of the nearest scroll container.
     static SCROLLPORT: Cell<Option<Bounds<Pixels>>> = const { Cell::new(None) };
     static CONTAINING_BLOCK: Cell<Option<Bounds<Pixels>>> = const { Cell::new(None) };
 }
 
 /// The two rectangles a `Div`'s children's sticky elements are held to, in window coordinates:
-/// the div's scrollport if it scrolls (its padding box), and its content box. A scroll container's
+/// the div's sticky view rectangle if it scrolls (its scrollport less its padding), and its content
+/// box. A scroll container's
 /// content box covers everything it can scroll to, so a header directly inside it can stick for
 /// the whole scroll. `scroll_offset` moves the content, and `content_end` is where the children
 /// end, measured from the div's origin before the offset.
@@ -89,6 +93,7 @@ pub(crate) fn frames(
         padding_box.right() - padding.right,
         padding_box.bottom() - padding.bottom,
     );
+    let view = Bounds::from_corners(origin, far);
     if scrolls {
         if let Some(end) = content_end {
             far = point(
@@ -99,19 +104,19 @@ pub(crate) fn frames(
     }
     let shift = if scrolls { scroll_offset } else { Point::default() };
     let containing_block = Bounds::from_corners(origin + shift, far + shift);
-    (scrolls.then_some(padding_box), containing_block)
+    (scrolls.then_some(view), containing_block)
 }
 
 /// Runs `f`, which prepaints a `Div`'s children, with the rectangles those children's sticky
-/// elements are held to: the div's scrollport, if it scrolls, and its content box.
+/// elements are held to: the div's sticky view rectangle, if it scrolls, and its content box.
 pub(crate) fn within<R>(
-    scrollport: Option<Bounds<Pixels>>,
+    view: Option<Bounds<Pixels>>,
     containing_block: Bounds<Pixels>,
     f: impl FnOnce() -> R,
 ) -> R {
     let outer = (SCROLLPORT.get(), CONTAINING_BLOCK.get());
-    if scrollport.is_some() {
-        SCROLLPORT.set(scrollport);
+    if view.is_some() {
+        SCROLLPORT.set(view);
     }
     CONTAINING_BLOCK.set(Some(containing_block));
     let result = f();
@@ -120,14 +125,14 @@ pub(crate) fn within<R>(
     result
 }
 
-/// The size percentage insets resolve against: the scrollport of the nearest scroll container,
-/// or the window's `viewport` if none scrolls around the element.
+/// The size percentage insets resolve against: the sticky view rectangle of the nearest scroll
+/// container, or the window's `viewport` if none scrolls around the element.
 pub(crate) fn port_size(viewport: Size<Pixels>) -> Size<Pixels> {
     SCROLLPORT.get().map_or(viewport, |port| port.size)
 }
 
 /// How far a sticky element at `natural` (where layout and scrolling put it) is moved. The
-/// window's `viewport` is the scrollport when no container scrolls around it.
+/// window's `viewport` is the view rectangle when no container scrolls around it.
 pub(crate) fn offset(
     natural: Bounds<Pixels>,
     insets: StickyInsets,
@@ -214,6 +219,79 @@ mod tests {
                 Size { width: px(85.), height: px(69.) }
             ))
         );
+    }
+
+    /// A 300x200 scroller at (50, 60) with a border of 2 3 5 7 and a padding of 4 8 12 16 (top, right,
+    /// bottom, left), holding 1000x1000 of content, scrolled to `scroll`. A 40x30 element that
+    /// would sit `natural` from the top left of the content is placed, and the answer is where it
+    /// is from the top left of the scroller. The numbers are headless Chrome's
+    /// (packages/react/src/__tests__/fixtures/sticky-padding-oracle.html).
+    fn stuck(natural: (f32, f32), insets: StickyInsets, scroll: (f32, f32)) -> (f32, f32) {
+        let bounds = Bounds::new(point(px(50.), px(60.)), Size { width: px(300.), height: px(200.) });
+        let mut style = Style::default();
+        style.overflow = Point { x: Overflow::Scroll, y: Overflow::Scroll };
+        style.border_widths = crate::Edges {
+            top: px(2.).into(),
+            right: px(3.).into(),
+            bottom: px(5.).into(),
+            left: px(7.).into(),
+        };
+        style.padding = crate::Edges {
+            top: px(4.).into(),
+            right: px(8.).into(),
+            bottom: px(12.).into(),
+            left: px(16.).into(),
+        };
+        let content_origin = (7. + 16., 2. + 4.);
+        let (view, containing_block) = frames(
+            bounds,
+            &style,
+            point(px(-scroll.0), px(-scroll.1)),
+            Some(point(px(content_origin.0 + 1000.), px(content_origin.1 + 1000.))),
+            Size::default(),
+            px(16.),
+        );
+        let natural = Bounds::new(
+            point(
+                bounds.origin.x + px(content_origin.0 + natural.0 - scroll.0),
+                bounds.origin.y + px(content_origin.1 + natural.1 - scroll.1),
+            ),
+            Size { width: px(40.), height: px(30.) },
+        );
+        let shift = within(view, containing_block, || {
+            offset(natural, insets, Bounds::new(Point::default(), bounds.size))
+        });
+        let placed = natural.origin + shift;
+        ((placed.x - bounds.origin.x).into(), (placed.y - bounds.origin.y).into())
+    }
+
+    fn insets(top: Option<f32>, right: Option<f32>, bottom: Option<f32>, left: Option<f32>) -> StickyInsets {
+        StickyInsets { top: top.map(px), right: right.map(px), bottom: bottom.map(px), left: left.map(px) }
+    }
+
+    #[test]
+    fn the_sticky_view_rectangle_is_the_scrollport_less_the_padding_on_every_side() {
+        let none = None;
+        // The border is 2 3 5 7 and the padding 4 8 12 16, so the rectangle spans x 23..289 and y 6..183.
+        for (scroll, top, top_10, bottom_5, left_7, right_3) in [
+            ((0., 0.), (23., 6.), (23., 16.), (23., 148.), (30., 106.), (246., 106.)),
+            ((150., 300.), (-127., 6.), (-127., 16.), (-127., 148.), (30., -194.), (246., -194.)),
+            ((500., 700.), (-477., 6.), (-477., 16.), (-477., 6.), (30., -594.), (246., -594.)),
+        ] {
+            assert_eq!(stuck((0., 0.), insets(Some(0.), none, none, none), scroll), top, "top 0, scrolled {scroll:?}");
+            assert_eq!(stuck((0., 0.), insets(Some(10.), none, none, none), scroll), top_10, "top 10, scrolled {scroll:?}");
+            assert_eq!(stuck((0., 700.), insets(none, none, Some(5.), none), scroll), bottom_5, "bottom 5, scrolled {scroll:?}");
+            assert_eq!(stuck((0., 100.), insets(none, none, none, Some(7.)), scroll), left_7, "left 7, scrolled {scroll:?}");
+            assert_eq!(stuck((800., 100.), insets(none, Some(3.), none, none), scroll), right_3, "right 3, scrolled {scroll:?}");
+        }
+    }
+
+    #[test]
+    fn all_four_insets_hold_the_element_inside_the_padding() {
+        let all = insets(Some(5.), Some(6.), Some(7.), Some(8.));
+        assert_eq!(stuck((120., 60.), all, (0., 0.)), (143., 66.));
+        assert_eq!(stuck((120., 60.), all, (150., 300.)), (31., 11.));
+        assert_eq!(stuck((800., 700.), insets(None, Some(0.), Some(0.), None), (500., 700.)), (249., 6.));
     }
 
     #[test]
