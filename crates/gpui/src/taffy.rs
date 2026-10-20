@@ -181,6 +181,15 @@ pub struct LayoutCounters {
     pub passes: u64,
     /// Calls to the measure functions of leaves.
     pub measures: u64,
+    /// Subtrees whose painted extent ([`TaffyLayoutEngine::painted_extent`]) was worked out from
+    /// their children, and not found as an earlier pass or frame left it.
+    pub extent_walks: u64,
+    /// Subtrees whose scrollable overflow was worked out from their children, and not found as
+    /// an earlier pass or frame left it.
+    pub overflow_walks: u64,
+    /// Like `overflow_walks`, for the scrollable overflow from the unsnapped boxes
+    /// ([`TaffyLayoutEngine::layout_unsnapped_scrollable_overflow_end`]).
+    pub unsnapped_overflow_walks: u64,
 }
 
 /// What the engine knows about a node besides what taffy does. It lives as long as the node.
@@ -208,6 +217,8 @@ struct NodeMeta {
     /// The node's subtree belongs to another layer (deferred and anchored elements), so it is
     /// not part of the scrollable overflow of the scrollers it sits in.
     detached: bool,
+    /// What `detached` was before the request that reset it.
+    was_detached: bool,
     /// Set for a node whose containing block may not be its taffy parent. Taffy always resolves
     /// an absolute node against its parent, so `compute_layout` rewrites these styles to where
     /// the real containing block is.
@@ -283,8 +294,19 @@ pub struct TaffyLayoutEngine {
     escapable_nodes: Vec<LayoutId>,
     /// Owns what the `calc()` lengths in the taffy styles point to.
     calcs: CalcArena,
-    /// [`Self::painted_extent`] of the nodes it has been asked about, and of what is below them.
-    painted_extents: FxHashMap<LayoutId, PaintedExtent>,
+    /// [`Self::painted_extent`] of the nodes it has been asked about, and of what is below them,
+    /// kept while [`ExtentStamp`] says the subtree is as it was.
+    painted_extents: FxHashMap<LayoutId, Memo<PaintedExtent>>,
+    /// Where the scrollable overflow of the nodes ends, kept like `painted_extents`.
+    scroll_reaches: FxHashMap<LayoutId, Memo<ScrollReach>>,
+    /// [`Self::scroll_reaches`] from the unsnapped boxes, which are not the snapped ones' values.
+    unsnapped_scroll_reaches: FxHashMap<LayoutId, Memo<ScrollReach>>,
+    /// Changes when a node became or stopped being static, escapable or detached with no change
+    /// to its style, which no layout generation follows, so that no extent computed before is kept.
+    extent_epoch: u64,
+    /// The nodes that were detached when their request reset that, to be checked once the
+    /// requests are done, for the ones that stopped being.
+    detach_rechecks: Vec<LayoutId>,
     /// How many values `calcs` held after the last sweep: it only needs a sweep when it holds more.
     calcs_after_sweep: usize,
 
@@ -329,6 +351,40 @@ struct PaintedExtent {
     open_absolute: bool,
 }
 
+/// What an extent of a subtree was worked out from. While a node's stamp is the one its extent
+/// was stored with, the extent is what working it out again would give: the layout of the subtree
+/// is as it was (`layout_generation`, see [`taffy::TaffyTree::layout_generation`], which leaves
+/// where the node is in its parent out), and so is the place the extent is in (the node's
+/// absolute origin, which the extent's coordinates are counted from, and the scale it is snapped
+/// at).
+#[derive(Clone, Copy, PartialEq)]
+struct ExtentStamp {
+    layout_generation: u64,
+    epoch: u64,
+    origin: Point<f32>,
+    scale_factor: f32,
+}
+
+/// An extent with the stamp it was stored under.
+#[derive(Clone, Copy)]
+struct Memo<T> {
+    stamp: ExtentStamp,
+    value: T,
+    /// The pass the extent is good for, when it holds a box whose containing block is above the
+    /// node: where such a box is depends on a layout that this node's generation does not follow.
+    only_in_pass: Option<u64>,
+}
+
+/// Where the scrollable overflow of the descendants of a node ends: the far corner of their
+/// border boxes, in the layout root's coordinates.
+#[derive(Clone, Copy)]
+struct ScrollReach {
+    end: Point<Pixels>,
+    /// Whether the node or an ancestor was a containing block when this was worked out, which
+    /// decides whether the absolute boxes below count.
+    positioned: bool,
+}
+
 /// A pass that ends without a frame lets its nodes pile up until there are this many more than
 /// the last collection left, over twice as many, and then collects.
 const GARBAGE_SLACK: usize = 4096;
@@ -356,6 +412,10 @@ impl TaffyLayoutEngine {
             escapable_nodes: Vec::new(),
             calcs: CalcArena::default(),
             painted_extents: FxHashMap::default(),
+            scroll_reaches: FxHashMap::default(),
+            unsnapped_scroll_reaches: FxHashMap::default(),
+            extent_epoch: 0,
+            detach_rechecks: Vec::new(),
             calcs_after_sweep: 0,
             keys: FxHashMap::default(),
             ordinals: FxHashMap::default(),
@@ -536,7 +596,6 @@ impl TaffyLayoutEngine {
         self.intrinsic_pending.clear();
         self.natural_pending.clear();
         self.natural_widths.clear();
-        self.painted_extents.clear();
         self.escapable_nodes.clear();
         self.ordinals.clear();
         self.pass += 1;
@@ -622,6 +681,9 @@ impl TaffyLayoutEngine {
         for id in self.taffy.unreached_nodes(collection) {
             let id = LayoutId(id);
             let meta = self.meta.remove(&id).expect("garbage was found in the metadata");
+            self.painted_extents.remove(&id);
+            self.scroll_reaches.remove(&id);
+            self.unsnapped_scroll_reaches.remove(&id);
             if let Some(key) = meta.key {
                 self.keys.remove(&key);
             }
@@ -642,7 +704,12 @@ impl TaffyLayoutEngine {
     }
 
     pub fn mark_detached(&mut self, id: LayoutId) {
-        self.meta_mut(id).detached = true;
+        let meta = self.meta_mut(id);
+        meta.detached = true;
+        let became_detached = !meta.was_detached;
+        if became_detached {
+            self.extent_epoch += 1;
+        }
     }
 
     /// The style of the node as its element asked for it, whatever layout did to it since.
@@ -795,6 +862,14 @@ impl TaffyLayoutEngine {
             || old.natural != meta.natural
             || old.unforced_width.is_some();
         let requested = old.requested.take();
+        let escapable_kind = |meta: &NodeMeta| meta.escapable.as_deref().map(|escapable| escapable.kind);
+        if old.is_static != meta.is_static || escapable_kind(old) != escapable_kind(&meta) {
+            self.extent_epoch += 1;
+        }
+        meta.was_detached = old.detached;
+        if old.detached {
+            self.detach_rechecks.push(id);
+        }
         meta.key = old.key;
         meta.stretched_in_pass = old.stretched_in_pass;
         if meta.intrinsic.is_some() {
@@ -1010,6 +1085,9 @@ impl TaffyLayoutEngine {
             requested: escapable.is_some().then(|| Box::new(taffy_style.clone())),
             natural: style.measure_natural_width,
             is_static: style.position == crate::Position::Static,
+            // A new node has no extent kept, and its parent changed to get it: only a node found
+            // again says what it was.
+            was_detached: true,
             escapable,
             intrinsic: intrinsic::IntrinsicKeywords::of(
                 style,
@@ -1580,7 +1658,8 @@ impl TaffyLayoutEngine {
     }
 
     /// [`Self::layout_scrollable_overflow_end`] from the boxes as layout computed them, before
-    /// they are snapped to device pixels.
+    /// they are snapped to device pixels. Kept from one pass and frame to the next like it, in a
+    /// map of its own.
     pub fn layout_unsnapped_scrollable_overflow_end(
         &mut self,
         container: LayoutId,
@@ -1595,22 +1674,40 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
         snapped: bool,
     ) -> Option<Point<Pixels>> {
-        let mut end = Point::new(Pixels::MIN, Pixels::MIN);
+        self.settle_detached();
         let positioned = !self.meta(container).is_static;
-        self.extend_scrollable_overflow(container, positioned, scale_factor, snapped, &mut end);
+        let (end, _) = self.scrollable_reach(container, positioned, scale_factor, snapped);
         (end.x != Pixels::MIN).then_some(end)
     }
 
-    /// `positioned`: `parent` or an ancestor of it up to the scroll container is a containing
-    /// block for absolutely positioned descendants.
-    fn extend_scrollable_overflow(
+    /// The end of the scrollable overflow of what is below `parent`, and whether it counts an
+    /// absolute box whose containing block is not `parent` or inside it, which makes it good for
+    /// the pass only. `positioned`: `parent` or an ancestor of it up to the scroll container is a
+    /// containing block for absolutely positioned descendants.
+    fn scrollable_reach(
         &mut self,
         parent: LayoutId,
         positioned: bool,
         scale_factor: f32,
         snapped: bool,
-        end: &mut Point<Pixels>,
-    ) {
+    ) -> (Point<Pixels>, bool) {
+        let stamp = self.extent_stamp(parent, scale_factor);
+        let reaches = if snapped { &self.scroll_reaches } else { &self.unsnapped_scroll_reaches };
+        if let Some(memo) = reaches.get(&parent)
+            && memo.stamp == stamp
+            && memo.value.positioned == positioned
+            && memo.only_in_pass.is_none_or(|pass| pass == self.pass)
+        {
+            return (memo.value.end, memo.only_in_pass.is_some());
+        }
+        if snapped {
+            self.counters.overflow_walks += 1;
+        } else {
+            self.counters.unsnapped_overflow_walks += 1;
+        }
+
+        let mut end = Point::new(Pixels::MIN, Pixels::MIN);
+        let mut open_absolute = false;
         for index in 0..self.taffy.child_count(parent.0) {
             let child = LayoutId(
                 self.taffy
@@ -1626,7 +1723,8 @@ impl TaffyLayoutEngine {
             match meta.escapable.as_deref().map(|escapable| escapable.kind) {
                 Some(containing_block::EscapableKind::Fixed) => continue,
                 Some(containing_block::EscapableKind::Ancestor) if !positioned => continue,
-                Some(containing_block::EscapableKind::Ancestor) | None => {}
+                Some(containing_block::EscapableKind::Ancestor) => open_absolute = true,
+                None => {}
             }
 
             let bounds = if snapped {
@@ -1641,9 +1739,10 @@ impl TaffyLayoutEngine {
             let visible_x = overflow.x == taffy::style::Overflow::Visible;
             let visible_y = overflow.y == taffy::style::Overflow::Visible;
             if visible_x || visible_y {
-                let mut inner = Point::new(Pixels::MIN, Pixels::MIN);
                 let child_positioned = positioned || !self.meta(child).is_static;
-                self.extend_scrollable_overflow(child, child_positioned, scale_factor, snapped, &mut inner);
+                let (inner, inner_open) =
+                    self.scrollable_reach(child, child_positioned, scale_factor, snapped);
+                open_absolute |= inner_open;
                 if visible_x {
                     end.x = end.x.max(inner.x);
                 }
@@ -1652,6 +1751,26 @@ impl TaffyLayoutEngine {
                 }
             }
         }
+        // A positioned node is the containing block of the absolute boxes below it.
+        if open_absolute && !self.meta(parent).is_static {
+            open_absolute = false;
+        }
+        if !self.taffy.dirty(parent.0).expect(EXPECT_MESSAGE) {
+            let reaches = if snapped {
+                &mut self.scroll_reaches
+            } else {
+                &mut self.unsnapped_scroll_reaches
+            };
+            reaches.insert(
+                parent,
+                Memo {
+                    stamp,
+                    value: ScrollReach { end, positioned },
+                    only_in_pass: open_absolute.then_some(self.pass),
+                },
+            );
+        }
+        (end, open_absolute)
     }
 
     /// The rectangle in the layout root's coordinates that holds the border box of `id` and of
@@ -1665,14 +1784,20 @@ impl TaffyLayoutEngine {
     /// one whose containing block is above `id`, or a detached one (a popup or a portal). Such a
     /// subtree is drawn somewhere else than its parent.
     pub fn painted_extent(&mut self, id: LayoutId, scale_factor: f32) -> Option<Bounds<Pixels>> {
+        self.settle_detached();
         let extent = self.subtree_extent(id, scale_factor);
         (!extent.unbounded && !extent.open_absolute).then_some(extent.bounds)
     }
 
     fn subtree_extent(&mut self, id: LayoutId, scale_factor: f32) -> PaintedExtent {
-        if let Some(extent) = self.painted_extents.get(&id) {
-            return *extent;
+        let stamp = self.extent_stamp(id, scale_factor);
+        if let Some(memo) = self.painted_extents.get(&id)
+            && memo.stamp == stamp
+            && memo.only_in_pass.is_none_or(|pass| pass == self.pass)
+        {
+            return memo.value;
         }
+        self.counters.extent_walks += 1;
         let mut extent = PaintedExtent {
             bounds: self.layout_bounds(id, scale_factor),
             unbounded: false,
@@ -1723,9 +1848,44 @@ impl TaffyLayoutEngine {
         if extent.open_absolute && !self.meta(id).is_static {
             extent.open_absolute = false;
         }
-        self.painted_extents.insert(id, extent);
+        if !self.taffy.dirty(id.0).expect(EXPECT_MESSAGE) {
+            self.painted_extents.insert(
+                id,
+                Memo {
+                    stamp,
+                    value: extent,
+                    only_in_pass: extent.open_absolute.then_some(self.pass),
+                },
+            );
+        }
         extent
     }
+
+    /// What the extents of `id` are good for, see [`ExtentStamp`].
+    fn extent_stamp(&mut self, id: LayoutId, scale_factor: f32) -> ExtentStamp {
+        self.layout_bounds(id, scale_factor);
+        ExtentStamp {
+            layout_generation: self.taffy.layout_generation(id.0).expect(EXPECT_MESSAGE),
+            epoch: self.extent_epoch,
+            origin: *self.absolute_outer_origins.get(&id).expect("layout_bounds caches the origin"),
+            scale_factor,
+        }
+    }
+
+    /// Tells the extents that a node that was detached and is not anymore is no longer left
+    /// out of them: its request reset the flag, and the request that follows sets it again if
+    /// the node still is.
+    fn settle_detached(&mut self) {
+        if self.detach_rechecks.is_empty() {
+            return;
+        }
+        for id in std::mem::take(&mut self.detach_rechecks) {
+            if self.meta.get(&id).is_some_and(|meta| !meta.detached) {
+                self.extent_epoch += 1;
+            }
+        }
+    }
+
 
     /// The extent of the node's content, measured from its padding-box origin.
     ///

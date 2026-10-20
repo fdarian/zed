@@ -511,6 +511,8 @@ struct Observed {
     parent_content_size: Option<Size<Pixels>>,
     natural_width: Option<Pixels>,
     scrollable_overflow_end: Option<Point<Pixels>>,
+    unsnapped_scrollable_overflow_end: Option<Point<Pixels>>,
+    painted_extent: Option<Bounds<Pixels>>,
     /// What a keyed text leaf holds of its last measure: the answer to the call that placed it.
     lines: Option<Option<(Size<Pixels>, Option<Pixels>)>>,
     /// Whether layout placed the leaf that `lines` is of. What a leaf holds when only asked about
@@ -553,6 +555,9 @@ fn observe(
                 parent_content_size: engine.layout_parent_content_size(*id, scale_factor),
                 natural_width: engine.layout_natural_width(*id, scale_factor),
                 scrollable_overflow_end: engine.layout_scrollable_overflow_end(*id, scale_factor),
+                unsnapped_scrollable_overflow_end: engine
+                    .layout_unsnapped_scrollable_overflow_end(*id, scale_factor),
+                painted_extent: engine.painted_extent(*id, scale_factor),
             };
             (*key, observed)
         })
@@ -1162,6 +1167,9 @@ fn delta(before: LayoutCounters, after: LayoutCounters) -> LayoutCounters {
         children_set: after.children_set - before.children_set,
         passes: after.passes - before.passes,
         measures: after.measures - before.measures,
+        extent_walks: after.extent_walks - before.extent_walks,
+        overflow_walks: after.overflow_walks - before.overflow_walks,
+        unsnapped_overflow_walks: after.unsnapped_overflow_walks - before.unsnapped_overflow_walks,
     }
 }
 
@@ -1379,5 +1387,166 @@ fn passes_that_make_no_frame_cannot_pile_nodes_up_without_end(cx: &mut TestAppCo
             "{} nodes",
             engine.meta.len()
         );
+    });
+}
+
+fn pixel_length(pixels: f32) -> Length {
+    Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(pixels))))
+}
+
+fn boxed(width: f32, height: f32) -> Style {
+    let mut style = Style::default();
+    style.display = Display::Flex;
+    style.flex_shrink = 0.;
+    style.size.width = pixel_length(width);
+    style.size.height = pixel_length(height);
+    style
+}
+
+/// A clipping column of `rows` rows of two boxes each; the last row is `last_height` high.
+/// Returns the root and the rows.
+fn request_rows(engine: &mut TaffyLayoutEngine, rows: usize, last_height: f32) -> (LayoutId, Vec<LayoutId>) {
+    let ids: Vec<LayoutId> = (0..rows)
+        .map(|row| {
+            let cells: Vec<_> = (0..2)
+                .map(|cell| {
+                    engine.request_keyed_layout(1000 + (row * 2 + cell) as u64, boxed(10., 10.), REM_SIZE, 1., &[])
+                })
+                .collect();
+            let height = if row + 1 == rows { last_height } else { 20. };
+            engine.request_keyed_layout(1 + row as u64, boxed(100., height), REM_SIZE, 1., &cells)
+        })
+        .collect();
+    let mut root = boxed(100., 100.);
+    root.flex_direction = crate::FlexDirection::Column;
+    root.overflow = Point { x: Overflow::Hidden, y: Overflow::Hidden };
+    let root = engine.request_keyed_layout(0, root, REM_SIZE, 1., &ids);
+    (root, ids)
+}
+
+/// One frame of the rows that asks the engine what culling and scrolling ask, and returns how
+/// many extents and overflows it had to work out.
+fn row_frame(
+    engine: &mut TaffyLayoutEngine,
+    rows: usize,
+    last_height: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> (LayoutCounters, Vec<Option<Bounds<Pixels>>>, Option<Point<Pixels>>, Option<Point<Pixels>>) {
+    let (root, ids) = request_rows(engine, rows, last_height);
+    engine.compute_layout(
+        root,
+        size(AvailableSpace::Definite(px(100.)), AvailableSpace::Definite(px(100.))),
+        window,
+        cx,
+    );
+    let before = engine.counters();
+    let extents = ids.iter().map(|id| engine.painted_extent(*id, 1.)).collect();
+    let end = engine.layout_scrollable_overflow_end(root, 1.);
+    let unsnapped_end = engine.layout_unsnapped_scrollable_overflow_end(root, 1.);
+    let walked = delta(before, engine.counters());
+    engine.end_frame();
+    (walked, extents, end, unsnapped_end)
+}
+
+#[gpui::test]
+fn extents_and_overflows_are_kept_across_frames_and_worked_out_again_where_the_layout_changed(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        let rows = 50;
+        let (first, extents, end, unsnapped_end) = row_frame(&mut engine, rows, 20., window, cx);
+        assert_eq!(first.extent_walks, rows as u64 * 3, "each row and its two boxes");
+        assert_eq!(first.overflow_walks, 1 + rows as u64 * 3);
+        assert_eq!(first.unsnapped_overflow_walks, 1 + rows as u64 * 3);
+        assert_eq!(end, Some(point(px(100.), px(rows as f32 * 20.))));
+        assert_eq!(unsnapped_end, end);
+
+        // The same page again: nothing is worked out.
+        let (idle, idle_extents, idle_end, idle_unsnapped_end) = row_frame(&mut engine, rows, 20., window, cx);
+        assert_eq!((idle.extent_walks, idle.overflow_walks, idle.unsnapped_overflow_walks), (0, 0, 0));
+        assert_eq!((&idle_extents, idle_end, idle_unsnapped_end), (&extents, end, unsnapped_end));
+
+        // The last row grows: it and the root are worked out again, and none of the rows above.
+        let (grown, grown_extents, grown_end, grown_unsnapped_end) =
+            row_frame(&mut engine, rows, 30., window, cx);
+        assert_eq!(grown.extent_walks, 1);
+        assert_eq!(grown.overflow_walks, 2);
+        assert_eq!(grown.unsnapped_overflow_walks, 2);
+        assert_eq!(grown_unsnapped_end, grown_end);
+        assert_eq!(grown_end, Some(point(px(100.), px(rows as f32 * 20. + 10.))));
+        assert_eq!(grown_extents[..rows - 1], extents[..rows - 1]);
+        assert_ne!(grown_extents[rows - 1], extents[rows - 1]);
+    });
+}
+
+/// Asks what culling and scrolling ask of `node` and of `root` in an engine that lived through
+/// the frames before and in a new one, and says they agree.
+fn assert_extents_match_a_new_engine(
+    kept: &mut TaffyLayoutEngine,
+    request: &dyn Fn(&mut TaffyLayoutEngine) -> (LayoutId, LayoutId),
+    what: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let space = size(AvailableSpace::Definite(px(200.)), AvailableSpace::Definite(px(200.)));
+    let mut answers = |engine: &mut TaffyLayoutEngine| {
+        let (root, node) = request(engine);
+        engine.compute_layout(root, space, window, cx);
+        let answer = (
+            engine.painted_extent(node, 1.),
+            engine.layout_scrollable_overflow_end(root, 1.),
+            engine.layout_unsnapped_scrollable_overflow_end(root, 1.),
+        );
+        engine.end_frame();
+        answer
+    };
+    let kept = answers(kept);
+    let fresh = answers(&mut TaffyLayoutEngine::new());
+    assert_eq!(kept, fresh, "{what}");
+}
+
+#[gpui::test]
+fn a_node_that_stops_being_static_or_becomes_detached_is_not_taken_for_what_it_was(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut engine = TaffyLayoutEngine::new();
+        // root > middle > escaping box, which the middle contains only while it is positioned.
+        let scene = |position: Position, detached: bool| {
+            move |engine: &mut TaffyLayoutEngine| {
+                let mut escaping = boxed(30., 30.);
+                escaping.position = Position::AbsoluteInAncestor;
+                escaping.inset.left = pixel_length(80.);
+                escaping.inset.top = pixel_length(80.);
+                let escaping = engine.request_keyed_layout(3, escaping, REM_SIZE, 1., &[]);
+                let mut middle = boxed(40., 40.);
+                middle.position = position;
+                let middle = engine.request_keyed_layout(2, middle, REM_SIZE, 1., &[escaping]);
+                if detached {
+                    engine.mark_detached(escaping);
+                }
+                let mut root = boxed(100., 100.);
+                root.overflow = Point { x: Overflow::Hidden, y: Overflow::Hidden };
+                let root = engine.request_keyed_layout(1, root, REM_SIZE, 1., &[middle]);
+                (root, middle)
+            }
+        };
+        for (position, detached, what) in [
+            (Position::Relative, false, "positioned"),
+            (Position::Relative, false, "positioned again"),
+            (Position::Static, false, "not positioned"),
+            (Position::Static, false, "not positioned again"),
+            (Position::Relative, false, "positioned once more"),
+            (Position::Relative, true, "detached"),
+            (Position::Relative, true, "detached again"),
+            (Position::Relative, false, "attached again"),
+            (Position::Static, false, "not positioned and attached"),
+            (Position::Static, true, "not positioned and detached"),
+            (Position::Static, false, "not positioned and attached again"),
+        ] {
+            assert_extents_match_a_new_engine(&mut engine, &scene(position, detached), what, window, cx);
+        }
     });
 }
