@@ -452,7 +452,7 @@ fn request_node(
             let lines = Lines::default();
             let measure = {
                 let lines = lines.clone();
-                move |known, available, _window: &mut Window, _cx: &mut App| {
+                move |known, available, _run, _window: &mut Window, _cx: &mut App| {
                     let measured = text.measure(known, available);
                     lines.set(Some((measured.size, measured.first_baseline)));
                     measured
@@ -1037,7 +1037,7 @@ fn end_frame_frees_the_nodes_no_root_reaches_with_their_measure_closures_and_the
         let held = std::rc::Rc::new(());
         let measured = |held: &std::rc::Rc<()>| {
             let held = held.clone();
-            move |_: Size<Option<Pixels>>, _: Size<AvailableSpace>, _: &mut Window, _: &mut App| {
+            move |_: Size<Option<Pixels>>, _: Size<AvailableSpace>, _: MeasureRun, _: &mut Window, _: &mut App| {
                 let _ = &held;
                 MeasuredLeaf::from(Size::default())
             }
@@ -1310,7 +1310,7 @@ fn measured_leaves_are_new_every_frame_until_they_have_keys(cx: &mut TestAppCont
     cx.update(|window, cx| {
         let mut engine = TaffyLayoutEngine::new();
         let frame = |engine: &mut TaffyLayoutEngine, window: &mut Window, cx: &mut App| {
-            let text = engine.request_measured_layout(Style::default(), REM_SIZE, 1., |_, _, _, _| {
+            let text = engine.request_measured_layout(Style::default(), REM_SIZE, 1., |_, _, _, _, _| {
                 MeasuredLeaf::from(size(px(10.), px(10.)))
             });
             let root = engine.request_keyed_layout(1, Style::default(), REM_SIZE, 1., &[text]);
@@ -1361,7 +1361,7 @@ fn passes_that_make_no_frame_cannot_pile_nodes_up_without_end(cx: &mut TestAppCo
         let frame = |engine: &mut TaffyLayoutEngine, window: &mut Window, cx: &mut App| {
             let leaves: Vec<_> = (0..64)
                 .map(|_| {
-                    engine.request_measured_layout(Style::default(), REM_SIZE, 1., |_, _, _, _| {
+                    engine.request_measured_layout(Style::default(), REM_SIZE, 1., |_, _, _, _, _| {
                         MeasuredLeaf::from(size(px(10.), px(10.)))
                     })
                 })

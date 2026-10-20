@@ -49,8 +49,38 @@ impl From<Size<Pixels>> for MeasuredLeaf {
     }
 }
 
-type MeasureFn =
-    dyn FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> MeasuredLeaf;
+/// Whether layout is placing a measured leaf, or only asking how large it would be.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MeasureRun {
+    /// The answer is the size the leaf ends up with: taffy's `PerformLayout`, which is either
+    /// computed by a call or served from the final-layout entry of the node, never from the entries
+    /// of size probes. What a measure function keeps for the paint of the leaf is what the last
+    /// such call left.
+    Place,
+    /// A container sizing pass asks (`ComputeSize`), possibly at widths the leaf is never laid out
+    /// at. A measure function that keeps what it measured must leave that as it is.
+    Probe,
+}
+
+impl From<taffy::tree::RunMode> for MeasureRun {
+    fn from(run_mode: taffy::tree::RunMode) -> Self {
+        match run_mode {
+            taffy::tree::RunMode::PerformLayout => MeasureRun::Place,
+            taffy::tree::RunMode::ComputeSize => MeasureRun::Probe,
+            taffy::tree::RunMode::PerformHiddenLayout => {
+                unreachable!("a hidden layout does not call measure functions")
+            }
+        }
+    }
+}
+
+type MeasureFn = dyn FnMut(
+    Size<Option<Pixels>>,
+    Size<AvailableSpace>,
+    MeasureRun,
+    &mut Window,
+    &mut App,
+) -> MeasuredLeaf;
 type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 
 struct NodeContext {
@@ -807,6 +837,7 @@ impl TaffyLayoutEngine {
         measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
+            MeasureRun,
             &mut Window,
             &mut App,
         ) -> MeasuredLeaf
@@ -841,6 +872,7 @@ impl TaffyLayoutEngine {
         measure: impl FnMut(
             Size<Option<Pixels>>,
             Size<AvailableSpace>,
+            MeasureRun,
             &mut Window,
             &mut App,
         ) -> MeasuredLeaf
@@ -899,7 +931,13 @@ impl TaffyLayoutEngine {
     }
 
     fn box_measure(
-        measure: impl FnMut(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> MeasuredLeaf
+        measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            MeasureRun,
+            &mut Window,
+            &mut App,
+        ) -> MeasuredLeaf
         + 'static,
     ) -> NodeMeasureFn {
         let measure = Box::new(measure) as Box<MeasureFn>;
@@ -1262,7 +1300,7 @@ impl TaffyLayoutEngine {
                             });
                         }
                     }
-                    measure_leaf(node_context, call, scale_factor, window, cx)
+                    measure_leaf(node_context, call, run_mode.into(), scale_factor, window, cx)
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -1305,7 +1343,7 @@ impl TaffyLayoutEngine {
             if keyed.last_call != Some(placement.call) {
                 keyed.last_call = Some(placement.call);
                 self.counters.measures += 1;
-                measure_leaf(context, placement.call, scale_factor, window, cx);
+                measure_leaf(context, placement.call, MeasureRun::Place, scale_factor, window, cx);
             }
         }
         self.probed = probed;
@@ -1768,6 +1806,7 @@ pub(crate) fn hash_measure_key(key: impl std::hash::Hash) -> u64 {
 fn measure_leaf(
     node_context: &mut NodeContext,
     call: MeasureCall,
+    run: MeasureRun,
     scale_factor: f32,
     window: &mut Window,
     cx: &mut App,
@@ -1788,7 +1827,7 @@ fn measure_leaf(
         untransform(available_space.height),
     );
 
-    let measured = (node_context.measure)(known_dimensions, available_space, window, cx);
+    let measured = (node_context.measure)(known_dimensions, available_space, run, window, cx);
     taffy::MeasuredLeaf {
         size: snap_measured_size_to_device_pixels(measured.size, scale_factor).into(),
         first_baseline: measured
@@ -2761,7 +2800,7 @@ mod tests {
                 let text = self.text;
                 let baseline = self.baseline;
                 let layout_id =
-                    window.request_measured_layout(style, move |known, available, _window, _cx| {
+                    window.request_measured_layout(style, move |known, available, _run, _window, _cx| {
                         let wrap = known.width.map(|width| width.0).or(match available.width {
                             AvailableSpace::Definite(width) => Some(width.0),
                             AvailableSpace::MinContent => Some(0.),
@@ -4005,7 +4044,7 @@ mod tests {
                 let calls = self.calls.clone();
                 let layout_id = window.request_measured_layout(
                     style,
-                    move |_: crate::Size<Option<Pixels>>, _: crate::Size<AvailableSpace>, _, _| {
+                    move |_: crate::Size<Option<Pixels>>, _: crate::Size<AvailableSpace>, _, _, _| {
                         calls.set(calls.get() + 1);
                         size(px(30.), px(10.))
                     },

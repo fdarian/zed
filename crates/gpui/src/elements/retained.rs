@@ -4766,3 +4766,5 @@ mod hole_tests;
 mod relocation_tests;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod probe_tests;

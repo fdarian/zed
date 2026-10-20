@@ -450,7 +450,7 @@ impl Element for Img {
                                 ratio.map(f32::to_bits),
                             ));
                             window
-                                .request_keyed_measured_layout(measure_key, style, (), move |known, _, _, _| {
+                                .request_keyed_measured_layout(measure_key, style, (), move |known, _, _, _, _| {
                                     match (known.width, known.height, ratio) {
                                         (Some(width), Some(height), _) => size(width, height),
                                         (Some(width), None, Some(ratio)) => size(width, width / ratio),

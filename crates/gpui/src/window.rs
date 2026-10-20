@@ -12,7 +12,7 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragOperation, Edges, Effect, Entity,
     EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
-    Keystroke, KeystrokeEvent, LayoutCounters, LayoutId, LayoutInsets, LineLayoutIndex, MeasuredLeaf, Modifiers, ModifiersChangedEvent,
+    Keystroke, KeystrokeEvent, LayoutCounters, LayoutId, LayoutInsets, LineLayoutIndex, MeasureRun, MeasuredLeaf, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, OverlineStyle, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
@@ -7107,11 +7107,13 @@ impl Window {
     ///
     /// The given closure is invoked at layout time with the known dimensions and available space and
     /// returns a `Size`, or a [`MeasuredLeaf`] when the node has text and so a first baseline.
+    /// [`MeasureRun::Probe`] says the call only asks for a size, which a closure that keeps what it
+    /// measured for its paint must not leave in it.
     ///
     /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
     pub fn request_measured_layout<F, R>(&mut self, style: Style, measure: F) -> LayoutId
     where
-        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> R + 'static,
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, MeasureRun, &mut Window, &mut App) -> R + 'static,
         R: Into<MeasuredLeaf>,
     {
         self.invalidator.debug_assert_prepaint();
@@ -7121,8 +7123,8 @@ impl Window {
         self.layout_engine
             .as_mut()
             .unwrap()
-            .request_measured_layout(style, rem_size, scale_factor, move |known, available, window, cx| {
-                measure(known, available, window, cx).into()
+            .request_measured_layout(style, rem_size, scale_factor, move |known, available, run, window, cx| {
+                measure(known, available, run, window, cx).into()
             })
     }
 
@@ -7147,7 +7149,7 @@ impl Window {
         measure: F,
     ) -> (LayoutId, Option<S>)
     where
-        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> R + 'static,
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, MeasureRun, &mut Window, &mut App) -> R + 'static,
         R: Into<MeasuredLeaf>,
         S: 'static,
     {
@@ -7162,7 +7164,7 @@ impl Window {
             rem_size,
             scale_factor,
             state,
-            move |known, available, window, cx| measure(known, available, window, cx).into(),
+            move |known, available, run, window, cx| measure(known, available, run, window, cx).into(),
         )
     }
 

@@ -1600,7 +1600,7 @@ impl Element for List {
                         measure_key,
                         style,
                         (),
-                        move |known_dimensions, available_space, _window, _cx| {
+                        move |known_dimensions, available_space, _run, _window, _cx| {
                             let width =
                                 known_dimensions
                                     .width

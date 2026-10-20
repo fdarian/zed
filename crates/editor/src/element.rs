@@ -7970,7 +7970,7 @@ impl Element for EditorElement {
                         let editor_handle = cx.entity();
                         window.request_measured_layout(
                             Style::default(),
-                            move |known_dimensions, available_space, window, cx| {
+                            move |known_dimensions, available_space, _run, window, cx| {
                                 editor_handle
                                     .update(cx, |editor, cx| {
                                         compute_auto_height_layout(

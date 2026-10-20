@@ -1,7 +1,7 @@
 use crate::{
     ActiveTooltip, floor_to_layout_unit, AnyView, App, AtomicCarry, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
     DispatchPhase, Element, ElementId, EndTruncation, GlobalElementId, GlyphInset,
-    HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId, MeasuredLeaf,
+    HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId, MeasureRun, MeasuredLeaf,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     SharedString, Size, TextBoxMetrics, TextBoxTrim, TextInset, TextLayoutOptions, TextOverflow, TextRun,
     TextStyle, TooltipId, TruncateFrom,
@@ -919,6 +919,7 @@ impl TextLayout {
 
             move |known_dimensions: Size<Option<Pixels>>,
                   available_space: Size<crate::AvailableSpace>,
+                  run: MeasureRun,
                   window: &mut Window,
                   cx: &mut App| {
                 let width = known_dimensions.width.or(match available_space.width {
@@ -941,22 +942,24 @@ impl TextLayout {
                     _ => inline_boxes.to_vec(),
                 };
                 let unmeasurable = |wrap_width, truncate_width| {
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
-                        lines: Default::default(),
-                        len: 0,
-                        line_height,
-                        wrap_width,
-                        truncate_width,
-                        inset_width: width,
-                        atomic_measure,
-                        options,
-                        trim_top: Pixels::ZERO,
-                        trim_bottom: Pixels::ZERO,
-                        align: text_align,
-                        size: Some(Size::default()),
-                        bounds: None,
-                        phase_y: Pixels::ZERO,
-                    });
+                    if run == MeasureRun::Place {
+                        element_state.0.borrow_mut().replace(TextLayoutInner {
+                            lines: Default::default(),
+                            len: 0,
+                            line_height,
+                            wrap_width,
+                            truncate_width,
+                            inset_width: width,
+                            atomic_measure,
+                            options,
+                            trim_top: Pixels::ZERO,
+                            trim_bottom: Pixels::ZERO,
+                            align: text_align,
+                            size: Some(Size::default()),
+                            bounds: None,
+                            phase_y: Pixels::ZERO,
+                        });
+                    }
                     MeasuredLeaf::from(Size::default())
                 };
                 let wrap_width = if text_wraps {
@@ -1171,7 +1174,12 @@ impl TextLayout {
                     phase_y: Pixels::ZERO,
                 };
                 let first_baseline = inner.first_baseline();
-                element_state.0.borrow_mut().replace(inner);
+                // A probe answers a size question at a width the text may never be laid out at.
+                // The handle holds the layout that was placed and prepainted, which a retained
+                // root replays without measuring or prepainting again.
+                if run == MeasureRun::Place {
+                    element_state.0.borrow_mut().replace(inner);
+                }
 
                 MeasuredLeaf {
                     size,
