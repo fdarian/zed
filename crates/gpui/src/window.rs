@@ -7415,6 +7415,24 @@ impl Window {
             .map(|end| end + snapped_offset)
     }
 
+    /// How far the scrollable overflow of the given layout node's descendants reaches from the
+    /// origin of its border box, as layout computed it and before it is snapped to device pixels:
+    /// the box a browser reports for `scrollWidth` and `scrollHeight` is this one, less the
+    /// border and plus the padding at the far side. `None` if no descendant counts. Which nodes
+    /// count is as for [`TaffyLayoutEngine::layout_scrollable_overflow_end`], which scrolling
+    /// uses and which is measured from the snapped boxes.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_unsnapped_scrollable_overflow(&mut self, layout_id: LayoutId) -> Option<Size<Pixels>> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let scale_factor = self.scale_factor();
+        let engine = self.layout_engine.as_mut().unwrap();
+        let end = engine.layout_unsnapped_scrollable_overflow_end(layout_id, scale_factor)?;
+        let origin = engine.layout_unsnapped_bounds(layout_id, scale_factor).origin;
+        Some((end - origin).into())
+    }
+
     /// How far the grid of the given `display: table` layout node is from the top and from the
     /// bottom of its border box, in logical pixels: the height of its captions above and below
     /// the rows. `None` when it has no caption.

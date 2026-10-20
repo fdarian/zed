@@ -1576,9 +1576,28 @@ impl TaffyLayoutEngine {
         container: LayoutId,
         scale_factor: f32,
     ) -> Option<Point<Pixels>> {
+        self.scrollable_overflow_end(container, scale_factor, true)
+    }
+
+    /// [`Self::layout_scrollable_overflow_end`] from the boxes as layout computed them, before
+    /// they are snapped to device pixels.
+    pub fn layout_unsnapped_scrollable_overflow_end(
+        &mut self,
+        container: LayoutId,
+        scale_factor: f32,
+    ) -> Option<Point<Pixels>> {
+        self.scrollable_overflow_end(container, scale_factor, false)
+    }
+
+    fn scrollable_overflow_end(
+        &mut self,
+        container: LayoutId,
+        scale_factor: f32,
+        snapped: bool,
+    ) -> Option<Point<Pixels>> {
         let mut end = Point::new(Pixels::MIN, Pixels::MIN);
         let positioned = !self.meta(container).is_static;
-        self.extend_scrollable_overflow(container, positioned, scale_factor, &mut end);
+        self.extend_scrollable_overflow(container, positioned, scale_factor, snapped, &mut end);
         (end.x != Pixels::MIN).then_some(end)
     }
 
@@ -1589,6 +1608,7 @@ impl TaffyLayoutEngine {
         parent: LayoutId,
         positioned: bool,
         scale_factor: f32,
+        snapped: bool,
         end: &mut Point<Pixels>,
     ) {
         for index in 0..self.taffy.child_count(parent.0) {
@@ -1609,7 +1629,11 @@ impl TaffyLayoutEngine {
                 Some(containing_block::EscapableKind::Ancestor) | None => {}
             }
 
-            let bounds = self.layout_bounds(child, scale_factor);
+            let bounds = if snapped {
+                self.layout_bounds(child, scale_factor)
+            } else {
+                self.layout_unsnapped_bounds(child, scale_factor)
+            };
             let far = bounds.bottom_right();
             end.x = end.x.max(far.x);
             end.y = end.y.max(far.y);
@@ -1619,7 +1643,7 @@ impl TaffyLayoutEngine {
             if visible_x || visible_y {
                 let mut inner = Point::new(Pixels::MIN, Pixels::MIN);
                 let child_positioned = positioned || !self.meta(child).is_static;
-                self.extend_scrollable_overflow(child, child_positioned, scale_factor, &mut inner);
+                self.extend_scrollable_overflow(child, child_positioned, scale_factor, snapped, &mut inner);
                 if visible_x {
                     end.x = end.x.max(inner.x);
                 }

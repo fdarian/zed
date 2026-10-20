@@ -5867,6 +5867,47 @@ mod tests {
         assert_eq!(parent, Some(size(px(180.), px(80.))));
     }
 
+    struct UnsnappedOverflowTestView {
+        recorded: Rc<RefCell<Vec<Option<Size<Pixels>>>>>,
+    }
+
+    impl Render for UnsnappedOverflowTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let recorded = self.recorded.clone();
+            div()
+                .flex()
+                .w(px(100.))
+                .h(px(40.))
+                .on_prepainted_layout(move |_, layout_id, window, _| {
+                    recorded.borrow_mut().push(window.layout_unsnapped_scrollable_overflow(layout_id));
+                })
+                .child(div().w(relative(0.3333)).h(px(10.)).flex_none())
+                .child(div().w(px(10.)).h(px(10.)).flex_none())
+        }
+    }
+
+    #[gpui::test]
+    fn the_unsnapped_scrollable_overflow_reaches_to_the_far_edge_layout_gave_its_children(cx: &mut TestAppContext) {
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let recorded = recorded.clone();
+            move |_, _| UnsnappedOverflowTestView { recorded }
+        });
+        let any_window = AnyWindowHandle::from(window);
+
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let reach = recorded
+            .borrow()
+            .last()
+            .copied()
+            .expect("the listener ran at least once")
+            .expect("the children count");
+        assert!((f32::from(reach.width) - 43.33).abs() < 0.001, "{reach:?}");
+        assert_eq!(reach.height, px(10.));
+    }
+
     struct InsetsTestView {
         recorded: Rc<RefCell<Vec<LayoutInsets>>>,
     }
