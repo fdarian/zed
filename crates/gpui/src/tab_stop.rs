@@ -42,6 +42,19 @@ pub(crate) struct LiftedMarker {
     pub(crate) ordinal: u32,
 }
 
+/// What a parent painted for one of its children, and where the child sits in the document.
+pub(crate) struct PaintedChild {
+    /// The child's position in the document. Children are painted in layout or paint order, which
+    /// CSS `order` and `z-index` move away from it.
+    pub(crate) document: u32,
+    /// The part of [`TabStopMap::insertion_history`] the child registered. Empty for a child a
+    /// stacking context lifted.
+    pub(crate) log: std::ops::Range<usize>,
+    /// The part of [`LiftedTabStops::markers`] noted while the child was painted, for the lifted
+    /// elements it skipped, the child itself included.
+    pub(crate) markers: std::ops::Range<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub enum TabStopOperation {
     Insert(FocusHandle),
@@ -133,12 +146,61 @@ impl TabStopMap {
         self.current_path.0.pop();
     }
 
+    /// Puts the tab stops the `children` of a parent registered, from `start` on, in document
+    /// order. Tab order is document order, but a parent that paints its children in another order
+    /// (CSS `order`, stacking) registers them in that order. `children` is in painting order and
+    /// covers the log from `start` without gaps.
+    ///
+    /// The markers of `lifted`, the stacking context painting the children, that the children
+    /// noted move with them: they hold positions of the log, and the order of equal positions.
+    pub(crate) fn restore_children_order(
+        &mut self,
+        start: usize,
+        children: &[PaintedChild],
+        lifted: Option<&mut LiftedTabStops>,
+    ) {
+        let mut order: Vec<usize> = (0..children.len()).collect();
+        order.sort_by_key(|child| children[*child].document);
+        if order.iter().enumerate().all(|(position, child)| position == *child) {
+            return;
+        }
+
+        let segments: Vec<_> = order
+            .iter()
+            .map(|child| children[*child].log.clone())
+            .collect();
+        self.restore_document_order(start, &segments);
+
+        let Some(lifted) = lifted else { return };
+        let mut new_start = vec![0; children.len()];
+        let mut position = start;
+        for child in &order {
+            new_start[*child] = position;
+            position += children[*child].log.len();
+        }
+        for (child, new_start) in children.iter().zip(&new_start) {
+            for marker in &mut lifted.markers[child.markers.clone()] {
+                marker.position = marker.position - child.log.start + new_start;
+            }
+        }
+        let first = children.first().map_or(0, |child| child.markers.start);
+        let last = children.last().map_or(0, |child| child.markers.end);
+        let mut noted: Vec<_> = lifted.markers.drain(first..last).map(Some).collect();
+        let mut in_document_order = Vec::with_capacity(noted.len());
+        for child in &order {
+            let range = &children[*child].markers;
+            in_document_order.extend(
+                noted[range.start - first..range.end - first]
+                    .iter_mut()
+                    .map(|marker| marker.take().expect("a marker belongs to one child")),
+            );
+        }
+        lifted.markers.splice(first..first, in_document_order);
+    }
+
     /// Puts the tab stops recorded since `start` back in the order of `segments`, the ranges of
     /// [`Self::insertion_history`] that each belonged to one child, listed in document order.
-    ///
-    /// Tab order is document order, but a parent that paints its children in another order
-    /// (CSS stacking) prepaints them in that order and so registers them in it.
-    pub fn restore_document_order(&mut self, start: usize, segments: &[std::ops::Range<usize>]) {
+    fn restore_document_order(&mut self, start: usize, segments: &[std::ops::Range<usize>]) {
         let in_order = segments.windows(2).all(|pair| pair[0].end <= pair[1].start);
         let has_tab_stops = self.insertion_history[start..]
             .iter()
@@ -536,6 +598,7 @@ mod sum_tree_impl {
 mod tests {
     use itertools::Itertools as _;
 
+    use super::{LiftedMarker, LiftedTabStops, PaintedChild};
     use crate::{FocusHandle, FocusId, FocusMap, TabStopMap};
     use std::sync::Arc;
 
@@ -555,6 +618,104 @@ mod tests {
         assert_eq!(map.next(Some(&twice.id)), Some(after.clone()));
         assert_eq!(map.prev(Some(&after.id)), Some(twice.clone()));
         assert_eq!(map.tab_stop_count(), 3);
+    }
+
+    fn painted(document: u32, log: std::ops::Range<usize>, markers: std::ops::Range<usize>) -> PaintedChild {
+        PaintedChild { document, log, markers }
+    }
+
+    #[test]
+    fn test_children_painted_out_of_order_are_visited_in_document_order() {
+        let focus_map = Arc::new(FocusMap::default());
+        let mut map = TabStopMap::default();
+        // Painted c, b, a (and a second stop in b), declared a, b, c.
+        let [c, b, b_inner, a] = std::array::from_fn(|_| FocusHandle::new(&focus_map).tab_stop(true));
+        for handle in [&c, &b, &b_inner, &a] {
+            map.insert(handle);
+        }
+        let children = [painted(2, 0..1, 0..0), painted(1, 1..3, 0..0), painted(0, 3..4, 0..0)];
+        map.restore_children_order(0, &children, None);
+
+        let mut forward = vec![];
+        let mut current = None;
+        for _ in 0..4 {
+            let next = map.next(current.as_ref()).unwrap();
+            current = Some(next.id);
+            forward.push(next);
+        }
+        assert_eq!(forward, [a.clone(), b, b_inner, c.clone()]);
+        // Shift+Tab from the first goes to the last.
+        assert_eq!(map.prev(Some(&a.id)), Some(c));
+    }
+
+    #[test]
+    fn test_children_painted_out_of_order_keep_the_tab_index_before_the_document_order() {
+        let focus_map = Arc::new(FocusMap::default());
+        let mut map = TabStopMap::default();
+        // Painted d, c, b, a, declared a, b, c, d; b and d have a tab index that sorts first.
+        let d = FocusHandle::new(&focus_map).tab_stop(true).tab_index(-1);
+        let c = FocusHandle::new(&focus_map).tab_stop(true);
+        let b = FocusHandle::new(&focus_map).tab_stop(true).tab_index(-1);
+        let a = FocusHandle::new(&focus_map).tab_stop(true);
+        for handle in [&d, &c, &b, &a] {
+            map.insert(handle);
+        }
+        let children = [
+            painted(3, 0..1, 0..0),
+            painted(2, 1..2, 0..0),
+            painted(1, 2..3, 0..0),
+            painted(0, 3..4, 0..0),
+        ];
+        map.restore_children_order(0, &children, None);
+
+        assert_eq!(map.next(None), Some(b.clone()));
+        assert_eq!(map.next(Some(&b.id)), Some(d.clone()));
+        assert_eq!(map.next(Some(&d.id)), Some(a.clone()));
+        assert_eq!(map.next(Some(&a.id)), Some(c));
+    }
+
+    fn marker(ordinal: u32, position: usize) -> LiftedMarker {
+        LiftedMarker { within: None, position, ordinal }
+    }
+
+    #[test]
+    fn test_the_markers_of_children_painted_out_of_order_move_with_them() {
+        let focus_map = Arc::new(FocusMap::default());
+        let mut map = TabStopMap::default();
+        // Painted: a stop of the child declared last, then two children that a stacking context
+        // lifted (declared first and second), with the first of them skipped last.
+        let stop = FocusHandle::new(&focus_map).tab_stop(true);
+        map.insert(&stop);
+        let mut lifted = LiftedTabStops {
+            markers: vec![marker(11, 1), marker(10, 1)],
+            ..Default::default()
+        };
+        let children = [painted(2, 0..1, 0..0), painted(1, 1..1, 0..1), painted(0, 1..1, 1..2)];
+        map.restore_children_order(0, &children, Some(&mut lifted));
+
+        let markers: Vec<_> = lifted.markers.iter().map(|marker| (marker.ordinal, marker.position)).collect();
+        assert_eq!(markers, [(10, 0), (11, 0)]);
+    }
+
+    #[test]
+    fn test_a_marker_in_a_child_moves_by_the_distance_the_child_moved() {
+        let focus_map = Arc::new(FocusMap::default());
+        let mut map = TabStopMap::default();
+        let [late, early_first, early_second] =
+            std::array::from_fn(|_| FocusHandle::new(&focus_map).tab_stop(true));
+        for handle in [&late, &early_first, &early_second] {
+            map.insert(handle);
+        }
+        // The second child skipped a lifted element between its two stops.
+        let mut lifted = LiftedTabStops {
+            markers: vec![marker(7, 2)],
+            ..Default::default()
+        };
+        let children = [painted(1, 0..1, 0..0), painted(0, 1..3, 0..1)];
+        map.restore_children_order(0, &children, Some(&mut lifted));
+
+        assert_eq!(lifted.markers[0].position, 1);
+        assert_eq!(map.next(None), Some(early_first));
     }
 
     #[test]

@@ -78,7 +78,7 @@ pub(crate) use retained::{
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
-use crate::tab_stop::{LiftedMarker, LiftedTabStops, TabStopOperation};
+use crate::tab_stop::{LiftedMarker, LiftedTabStops, PaintedChild, TabStopOperation};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_down,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_thickness_to_device_pixel,
@@ -5720,6 +5720,20 @@ impl Window {
             position,
             ordinal,
         });
+    }
+
+    /// How many lifted elements the stacking context being painted has seen skipped so far.
+    pub(crate) fn lift_marker_count(&self) -> usize {
+        self.lift_paints.last().map_or(0, |lifted| lifted.markers.len())
+    }
+
+    /// Puts the tab stops that `children`, painted from log position `start` on, registered back
+    /// in document order. See [`TabStopMap::restore_children_order`].
+    pub(crate) fn restore_children_tab_order(&mut self, start: usize, children: &[PaintedChild]) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame
+            .tab_stops
+            .restore_children_order(start, children, self.lift_paints.last_mut());
     }
 
     /// Ends the paint of a stacking context whose in-flow children registered the tab stops in

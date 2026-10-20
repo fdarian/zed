@@ -27,6 +27,7 @@ use crate::{
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     scroll_routing, size,
     sticky::{self, StickyInsets},
+    tab_stop::PaintedChild,
     window::{LiftedElement, WindowRegion},
 };
 use collections::HashMap;
@@ -1917,6 +1918,7 @@ pub fn div() -> Div {
         image_cache: None,
         prepaint_order_fn: None,
         paint_ranks: None,
+        document_order: None,
         stacking_context: false,
         lifted: Vec::new(),
         lifted_children: SmallVec::new(),
@@ -1932,6 +1934,7 @@ pub struct Div {
     image_cache: Option<Box<dyn ImageCacheProvider>>,
     prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
     paint_ranks: Option<Vec<i32>>,
+    document_order: Option<Vec<u32>>,
     stacking_context: bool,
     /// The positioned descendants this stacking context was handed, in paint order. Set by
     /// prepaint, painted and emptied by paint.
@@ -1976,6 +1979,15 @@ impl Div {
     /// orders them, without moving them in the layout.
     pub fn paint_ranks(mut self, ranks: Vec<i32>) -> Self {
         self.paint_ranks = Some(ranks);
+        self
+    }
+
+    /// Where each child sits in the document, for children that layout and paint in another
+    /// order (CSS `order` in a flex or grid container): `positions[i]` belongs to the i-th child,
+    /// and missing entries are the child's own index. Tab stops are visited in document order,
+    /// whatever order the children are laid out and painted in.
+    pub fn document_order(mut self, positions: Vec<u32>) -> Self {
+        self.document_order = Some(positions);
         self
     }
 
@@ -2574,6 +2586,7 @@ impl Div {
             .as_ref()
             .filter(|_| !self.children_lifting)
             .map(|_| self.child_paint_order());
+        let document_order = self.document_order.clone();
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
@@ -2599,37 +2612,35 @@ impl Div {
                     }
 
                     let in_flow_start = window.next_frame.tab_stops.paint_index();
-                    if let Some(order) = &paint_order {
-                        // Tab stops register while painting, so they follow the paint order and
-                        // are put back in document order afterwards.
-                        let tab_stops_start = window.next_frame.tab_stops.insertion_history.len();
-                        let mut segments = Vec::with_capacity(order.len());
-                        for &idx in order {
-                            let from = window.next_frame.tab_stops.insertion_history.len();
+                    // Tab stops register while painting, so they follow the paint order and are
+                    // put back in document order afterwards.
+                    let reorders_tab_stops = paint_order.is_some() || document_order.is_some();
+                    let mut painted = Vec::new();
+                    for position in 0..self.children.len() {
+                        let idx = paint_order.as_ref().map_or(position, |order| order[position]);
+                        let log_start = window.next_frame.tab_stops.paint_index();
+                        let markers_start = window.lift_marker_count();
+                        if let Some((_, ordinal)) = self
+                            .lifted_children
+                            .iter()
+                            .find(|(lifted, _)| *lifted == idx)
+                        {
+                            window.mark_lifted(*ordinal);
+                        } else {
                             self.children[idx].paint(window, cx);
-                            let to = window.next_frame.tab_stops.insertion_history.len();
-                            segments.push((idx, from..to));
                         }
-                        segments.sort_by_key(|(idx, _)| *idx);
-                        let segments: Vec<_> =
-                            segments.into_iter().map(|(_, range)| range).collect();
-                        window
-                            .next_frame
-                            .tab_stops
-                            .restore_document_order(tab_stops_start, &segments);
-                    } else {
-                        for (idx, child) in self.children.iter_mut().enumerate() {
-                            if let Some((_, ordinal)) = self
-                                .lifted_children
-                                .iter()
-                                .find(|(lifted, _)| *lifted == idx)
-                            {
-                                window.mark_lifted(*ordinal);
-                                continue;
-                            }
-                            child.paint(window, cx);
+                        if reorders_tab_stops {
+                            painted.push(PaintedChild {
+                                document: document_order
+                                    .as_ref()
+                                    .and_then(|positions| positions.get(idx).copied())
+                                    .unwrap_or(idx as u32),
+                                log: log_start..window.next_frame.tab_stops.paint_index(),
+                                markers: markers_start..window.lift_marker_count(),
+                            });
                         }
                     }
+                    window.restore_children_tab_order(in_flow_start, &painted);
                     let in_flow = in_flow_start..window.next_frame.tab_stops.paint_index();
 
                     for entry in &mut lifted[first_above..] {
@@ -4930,6 +4941,12 @@ impl Stateful<Div> {
     /// See [`Div::paint_ranks`].
     pub fn paint_ranks(mut self, ranks: Vec<i32>) -> Self {
         self.element = self.element.paint_ranks(ranks);
+        self
+    }
+
+    /// See [`Div::document_order`].
+    pub fn document_order(mut self, positions: Vec<u32>) -> Self {
+        self.element = self.element.document_order(positions);
         self
     }
 
@@ -10260,6 +10277,186 @@ mod tests {
                     order
                 })
                 .unwrap()
+            }
+
+            /// The names of the tab stops in the order Shift+Tab visits them, from the last.
+            fn back_tab_order(
+                window: &AnyWindowHandle,
+                cx: &mut TestAppContext,
+                names: &[(&'static str, &FocusHandle)],
+            ) -> Vec<&'static str> {
+                let ids: Vec<_> = names
+                    .iter()
+                    .map(|(name, handle)| (handle.id, *name))
+                    .collect();
+                cx.update_window(*window, |_, window, _| {
+                    let mut order = Vec::new();
+                    let mut current = None;
+                    for _ in 0..names.len() {
+                        let previous = window
+                            .rendered_frame
+                            .tab_stops
+                            .prev(current.as_ref())
+                            .expect("a tab stop");
+                        order.push(ids.iter().find(|(id, _)| *id == previous.id).unwrap().1);
+                        current = Some(previous.id);
+                    }
+                    order
+                })
+                .unwrap()
+            }
+
+            #[gpui::test]
+            fn tab_order_follows_the_document_position_of_children_built_in_another_order(
+                cx: &mut TestAppContext,
+            ) {
+                let [a, b, c, d] = handles(cx);
+                // Laid out and painted as d, b, c, a (CSS `order`), declared as a, b, c, d.
+                for stacking in [false, true] {
+                    let window = open_scene(cx, true, {
+                        let (a, b, c, d) = (a.clone(), b.clone(), c.clone(), d.clone());
+                        move || {
+                            let root = if stacking { context() } else { root() };
+                            root.document_order(vec![3, 1, 2, 0])
+                                .child(stop("d", &d))
+                                .child(stop("b", &b))
+                                .child(stop("c", &c))
+                                .child(stop("a", &a))
+                                .into_any_element()
+                        }
+                    });
+                    let names = [("a", &a), ("b", &b), ("c", &c), ("d", &d)];
+                    assert_eq!(
+                        tab_order(&window, cx, &names),
+                        ["a", "b", "c", "d"],
+                        "stacking: {stacking}"
+                    );
+                    assert_eq!(
+                        back_tab_order(&window, cx, &names),
+                        ["d", "c", "b", "a"],
+                        "stacking: {stacking}"
+                    );
+                }
+            }
+
+            #[gpui::test]
+            fn document_order_composes_with_paint_ranks_and_nested_containers(
+                cx: &mut TestAppContext,
+            ) {
+                let [a, c, d, e] = handles(cx);
+                let window = open_scene(cx, true, {
+                    let (a, c, d, e) = (a.clone(), c.clone(), d.clone(), e.clone());
+                    move || {
+                        // Built c, the inner pair, a; declared a, the inner pair, c. The inner
+                        // pair is built e, d and declared d, e.
+                        root()
+                            .document_order(vec![2, 1, 0])
+                            .paint_ranks(vec![0, 0, -1])
+                            .child(stop("c", &c))
+                            .child(
+                                corner("inner")
+                                    .document_order(vec![1, 0])
+                                    .child(stop("e", &e))
+                                    .child(stop("d", &d)),
+                            )
+                            .child(stop("a", &a))
+                            .into_any_element()
+                    }
+                });
+                // The rank of "a" paints it first, which is not where it is in the document.
+                let names = [("a", &a), ("d", &d), ("e", &e), ("c", &c)];
+                assert_eq!(
+                    tab_order(&window, cx, &names),
+                    ["a", "d", "e", "c"]
+                );
+            }
+
+            #[gpui::test]
+            fn positive_tab_indices_come_first_and_ties_keep_document_order(
+                cx: &mut TestAppContext,
+            ) {
+                let [a, b, c, d] = handles(cx);
+                // As gpuix maps a DOM `tabIndex` of 1 to a tab index below zero.
+                let (a, b, c, d) = (a.tab_index(0), b.tab_index(-1), c.tab_index(0), d.tab_index(-1));
+                let window = open_scene(cx, true, {
+                    let (a, b, c, d) = (a.clone(), b.clone(), c.clone(), d.clone());
+                    move || {
+                        // Built d, c, b, a and declared a, b, c, d.
+                        context()
+                            .document_order(vec![3, 2, 1, 0])
+                            .child(stop("d", &d))
+                            .child(stop("c", &c))
+                            .child(stop("b", &b))
+                            .child(stop("a", &a))
+                            .into_any_element()
+                    }
+                });
+                assert_eq!(
+                    tab_order(&window, cx, &[("a", &a), ("b", &b), ("c", &c), ("d", &d)]),
+                    ["b", "d", "a", "c"]
+                );
+            }
+
+            #[gpui::test]
+            fn a_lifted_element_keeps_its_document_place_among_children_built_in_another_order(
+                cx: &mut TestAppContext,
+            ) {
+                let [first, lifted, inner, last] = handles(cx);
+                for z in [-1, 0, 5] {
+                    let window = open_scene(cx, true, {
+                        let (first, lifted, inner, last) =
+                            (first.clone(), lifted.clone(), inner.clone(), last.clone());
+                        move || {
+                            // Built d, a, then the wrapper holding the lifted b, and declared
+                            // a, b, d.
+                            context()
+                                .document_order(vec![2, 0, 1])
+                                .child(stop("d", &last))
+                                .child(stop("a", &first))
+                                .child(
+                                    corner("w").child(
+                                        boxed("b", 20., 20., 50.)
+                                            .z_index(z)
+                                            .track_focus(&lifted)
+                                            .child(stop("c", &inner)),
+                                    ),
+                                )
+                                .into_any_element()
+                        }
+                    });
+                    assert_eq!(
+                        tab_order(
+                            &window,
+                            cx,
+                            &[("a", &first), ("b", &lifted), ("c", &inner), ("d", &last)]
+                        ),
+                        ["a", "b", "c", "d"],
+                        "z: {z}"
+                    );
+                }
+            }
+
+            #[gpui::test]
+            fn lifted_children_built_in_another_order_are_visited_in_document_order(
+                cx: &mut TestAppContext,
+            ) {
+                let [a, b, c] = handles(cx);
+                let window = open_scene(cx, true, {
+                    let (a, b, c) = (a.clone(), b.clone(), c.clone());
+                    move || {
+                        // Two lifted children, built b then a, with no in-flow stop around them.
+                        context()
+                            .document_order(vec![1, 0, 2])
+                            .child(boxed("b", 20., 20., 50.).z_index(1).track_focus(&b))
+                            .child(boxed("a", 20., 20., 50.).z_index(2).track_focus(&a))
+                            .child(stop("c", &c))
+                            .into_any_element()
+                    }
+                });
+                assert_eq!(
+                    tab_order(&window, cx, &[("a", &a), ("b", &b), ("c", &c)]),
+                    ["a", "b", "c"]
+                );
             }
 
             #[gpui::test]
