@@ -4770,3 +4770,5 @@ mod regression_tests;
 mod probe_tests;
 #[cfg(test)]
 mod replay_cost_tests;
+#[cfg(test)]
+mod culled_cost_tests;
