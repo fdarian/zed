@@ -1903,6 +1903,35 @@ mod insets_tests {
     }
 
     #[crate::test]
+    fn test_frames_that_look_nothing_up_keep_the_layouts_warm(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            shape(&text_system, "a label", Some(px(100.)), &[]);
+            text_system.finish_frame();
+            let shaped = text_system.text_counters();
+            assert!(shaped.shapes > 0);
+
+            // A frame that replays everything shapes and looks up nothing.
+            for _ in 0..4 {
+                text_system.finish_frame();
+            }
+            shape(&text_system, "a label", Some(px(100.)), &[]);
+            let again = text_system.text_counters();
+            assert_eq!(again.shapes, shaped.shapes);
+            assert_eq!(again.wrapped_layouts, shaped.wrapped_layouts);
+            assert_eq!(again.hits, shaped.hits + 1);
+
+            // A frame that looks something else up ages it as before.
+            text_system.finish_frame();
+            shape(&text_system, "another label", None, &[]);
+            text_system.finish_frame();
+            text_system.finish_frame();
+            shape(&text_system, "a label", Some(px(100.)), &[]);
+            assert!(text_system.text_counters().shapes > again.shapes);
+        });
+    }
+
+    #[crate::test]
     fn test_shaped_text_is_as_wide_as_its_insets_add(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let text_system = WindowTextSystem::new(cx.text_system().clone());

@@ -1687,6 +1687,19 @@ struct FrameCache {
     used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
 }
 
+impl FrameCache {
+    fn is_unused(&self) -> bool {
+        self.lines.is_empty()
+            && self.wrapped_lines.is_empty()
+            && self.lines_by_hash.is_empty()
+            && self.wrapped_lines_by_hash.is_empty()
+            && self.used_lines.is_empty()
+            && self.used_wrapped_lines.is_empty()
+            && self.used_lines_by_hash.is_empty()
+            && self.used_wrapped_lines_by_hash.is_empty()
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct LineLayoutIndex {
     lines_index: usize,
@@ -1804,6 +1817,11 @@ impl LineLayoutCache {
     pub fn finish_frame(&self) {
         let mut prev_frame = self.previous_frame.lock();
         let mut curr_frame = self.current_frame.write();
+        // A frame that replays everything looks nothing up, and swapping after it would drop
+        // the layouts the frame before looked up, which the next frame that measures needs.
+        if curr_frame.is_unused() {
+            return;
+        }
         std::mem::swap(&mut *prev_frame, &mut *curr_frame);
         curr_frame.lines.clear();
         curr_frame.wrapped_lines.clear();
