@@ -49,6 +49,8 @@ struct Node {
     clip: bool,
     rounded: bool,
     fade: bool,
+    /// `opacity: 0`, which the scene is not given anything of.
+    clear: bool,
     text: Option<u8>,
     clickable: bool,
     labelled: bool,
@@ -85,6 +87,7 @@ impl Node {
             clip: rng.random_bool(0.2),
             rounded: rng.random_bool(0.15),
             fade: rng.random_bool(0.15),
+            clear: rng.random_bool(0.08),
             text: rng.random_bool(0.2).then(|| rng.random_range(0..WORDS.len() as u8)),
             clickable: rng.random_bool(0.3),
             labelled: rng.random_bool(0.3),
@@ -104,8 +107,8 @@ impl Node {
 
     fn dump(&self, depth: usize, out: &mut String) {
         out.push_str(&format!(
-            "{}{} {}x{} retain {} reloc {} abs {:?} rel {:?} esc {} stack {} clip {} rounded {} fade {} grouped {} row {} pad {} text {:?} clickable {} labelled {} focusable {} cullable {}\n",
-            "  ".repeat(depth), self.id, self.width, self.height, self.retain, self.relocatable, self.absolute, self.relative, self.escaping, self.stacking, self.clip, self.rounded, self.fade, self.grouped, self.row, self.padding,
+            "{}{} {}x{} retain {} reloc {} abs {:?} rel {:?} esc {} stack {} clip {} rounded {} fade {} clear {} grouped {} row {} pad {} text {:?} clickable {} labelled {} focusable {} cullable {}\n",
+            "  ".repeat(depth), self.id, self.width, self.height, self.retain, self.relocatable, self.absolute, self.relative, self.escaping, self.stacking, self.clip, self.rounded, self.fade, self.clear, self.grouped, self.row, self.padding,
             self.text, self.clickable, self.labelled, self.focusable, self.cullable
         ));
         for child in &self.children {
@@ -124,7 +127,7 @@ impl Node {
                 }
             )*};
         }
-        differs!(color, row, padding, clip, rounded, fade, text, clickable, labelled, focusable, retain, absolute, stacking, escaping, relative, grouped, relocatable, cullable);
+        differs!(color, row, padding, clip, rounded, fade, clear, text, clickable, labelled, focusable, retain, absolute, stacking, escaping, relative, grouped, relocatable, cullable);
         let base = format!("Node {{ {fields}..Node::plain({}, {}, {}) }}", self.id, self.width, self.height);
         if self.children.is_empty() {
             base
@@ -166,7 +169,7 @@ impl Node {
     fn edit(&mut self, rng: &mut StdRng, ids: &mut usize) {
         let n = rng.random_range(0..self.count());
         let node = self.nth_mut(n);
-        match rng.random_range(0..18) {
+        match rng.random_range(0..19) {
             0 => node.width = *SIZES.choose(rng).unwrap(),
             1 => node.height = *SIZES.choose(rng).unwrap(),
             2 => node.color = rng.random_range(0..6),
@@ -204,6 +207,7 @@ impl Node {
                 }
             }
             16 => node.rounded = !node.rounded,
+            17 => node.clear = !node.clear,
             _ => {
                 node.children.pop();
             }
@@ -252,6 +256,9 @@ fn element(node: &Node, mode: Mode) -> AnyElement {
     }
     if node.fade {
         element = element.opacity(0.5);
+    }
+    if node.clear {
+        element = element.opacity(0.);
     }
     if node.cullable {
         element = element.cullable(Edges::all(px(400.)));
@@ -875,9 +882,10 @@ fn shrink(cx: &mut TestAppContext, mut script: Script, verify: bool) -> Script {
             all_ids(tree, &mut ids);
         }
         type Simplify = (&'static str, fn(&mut Node));
-        let simplifications: [Simplify; 12] = [
+        let simplifications: [Simplify; 13] = [
             ("rounded", |n| n.rounded = false),
             ("fade", |n| n.fade = false),
+            ("clear", |n| n.clear = false),
             ("grouped", |n| n.grouped = false),
             ("stacking", |n| n.stacking = false),
             ("clip", |n| n.clip = false),
@@ -1465,6 +1473,7 @@ fn plain(id: usize, width: u32, height: u32) -> Node {
         clip: false,
         rounded: false,
         fade: false,
+        clear: false,
         text: None,
         clickable: false,
         labelled: false,
@@ -2095,6 +2104,7 @@ impl Node {
             clip: false,
             rounded: false,
             fade: false,
+            clear: false,
             text: None,
             clickable: false,
             labelled: false,
@@ -2361,5 +2371,119 @@ fn a_root_whose_sub_pixel_origin_changed_is_built_and_one_moved_by_whole_pixels_
             assert_ne!(built, last_built, "the box inside snaps to another width at the other fraction");
         }
         last_built = built;
+    }
+}
+
+mod no_opacity {
+    use super::super::tests::{click, counters, draw, open};
+    use super::*;
+    use std::cell::Cell;
+
+    fn quads(window: AnyWindowHandle, cx: &mut TestAppContext) -> usize {
+        cx.update_window(window, |_, window, _| window.painted_quads().len()).unwrap()
+    }
+
+    fn drawn(window: AnyWindowHandle, cx: &mut TestAppContext) -> String {
+        cx.update_window(window, |_, window, _| window.rendered_frame.scene.describe_drawn()).unwrap()
+    }
+
+    fn verify(window: AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(window, |_, window, _| window.set_retention_verifier(Some(Rc::new(|_| String::new()))))
+            .unwrap();
+    }
+
+    /// A card and, in it, an element of no opacity with a background, text and a listener.
+    fn card(clicks: &Rc<Cell<usize>>) -> AnyElement {
+        let clicks = clicks.clone();
+        div()
+            .id("card")
+            .w(px(100.))
+            .h(px(60.))
+            .bg(crate::red())
+            .child(
+                div()
+                    .id("ghost")
+                    .opacity(0.)
+                    .w(px(80.))
+                    .h(px(20.))
+                    .bg(crate::green())
+                    .on_mouse_down(crate::MouseButton::Left, move |_, _, _| clicks.set(clicks.get() + 1))
+                    .child("ghost text"),
+            )
+            .into_any_element()
+    }
+
+    /// The recording of a root holds none of what an element of no opacity in it paints, and the
+    /// frame that replays it is what the build is: the same operations, and the element still
+    /// answers a click.
+    #[gpui::test]
+    fn a_root_holding_an_element_of_no_opacity_replays_with_none_of_its_primitives(cx: &mut TestAppContext) {
+        let clicks = Rc::new(Cell::new(0));
+        let window = open(cx, {
+            let clicks = clicks.clone();
+            Rc::new(move |_, _| {
+                div().id("page").size_full().child(retained("root", 1, {
+                    let clicks = clicks.clone();
+                    move |_, _| card(&clicks)
+                })).into_any_element()
+            })
+        });
+        let built = drawn(window, cx);
+        assert!(!built.contains("group"), "{built}");
+        assert_eq!(quads(window, cx), 1, "the card alone");
+
+        verify(window, cx);
+        let before = counters(window, cx);
+        draw(window, cx);
+        let after = counters(window, cx);
+        assert_eq!(after.replays, before.replays + 1, "the root is replayed");
+        assert_eq!(after.mismatches, 0);
+        assert!(after.verified > before.verified);
+        assert_eq!(drawn(window, cx), built);
+        assert_eq!(quads(window, cx), 1);
+
+        click(window, cx, 5., 5.);
+        assert_eq!(clicks.get(), 1, "the replay still answers where the element is");
+    }
+
+    /// A root recorded inside an element of no opacity holds nothing, and is not replayed once
+    /// that element shows: the opacity around is part of what a recording is good for.
+    #[gpui::test]
+    fn a_root_recorded_inside_no_opacity_is_not_replayed_when_the_opacity_returns(cx: &mut TestAppContext) {
+        let opacity = Rc::new(Cell::new(0.));
+        let clicks = Rc::new(Cell::new(0));
+        let window = open(cx, {
+            let (opacity, clicks) = (opacity.clone(), clicks.clone());
+            Rc::new(move |_, _| {
+                let clicks = clicks.clone();
+                div()
+                    .id("page")
+                    .size_full()
+                    .child(div().id("wrapper").opacity(opacity.get()).child(retained("root", 1, move |_, _| {
+                        div().id("card").w(px(100.)).h(px(60.)).bg(crate::red()).child("text").on_mouse_down(
+                            crate::MouseButton::Left,
+                            move |_, _, _| clicks.set(clicks.get() + 1),
+                        ).into_any_element()
+                    })))
+                    .into_any_element()
+            })
+        });
+        verify(window, cx);
+        draw(window, cx);
+        assert_eq!(quads(window, cx), 0);
+        assert!(!drawn(window, cx).contains("Quad"));
+
+        opacity.set(1.);
+        draw(window, cx);
+        assert_eq!(quads(window, cx), 1, "the card shows");
+        assert_eq!(counters(window, cx).mismatches, 0);
+
+        opacity.set(0.);
+        draw(window, cx);
+        assert_eq!(quads(window, cx), 0, "the card hides again");
+        assert_eq!(counters(window, cx).mismatches, 0);
+
+        click(window, cx, 5., 5.);
+        assert_eq!(clicks.get(), 1, "its hitbox answers while it is faded out");
     }
 }

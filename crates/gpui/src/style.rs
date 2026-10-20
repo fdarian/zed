@@ -1044,6 +1044,10 @@ impl Style {
         cx: &mut App,
         continuation: impl FnOnce(&mut Window, &mut App),
     ) {
+        // A group faded out to nothing shows nothing, whatever it filters, masks or sits over.
+        if self.is_faded_out() {
+            return window.with_faded_out(|window| self.paint(box_bounds, window, cx, continuation));
+        }
         match self.group_effect(bounds, window, cx) {
             Some(effect) => window.with_effect_group(effect, None, |window| {
                 self.paint(box_bounds, window, cx, continuation)
@@ -1052,6 +1056,11 @@ impl Style {
                 self.paint(box_bounds, window, cx, continuation)
             }),
         }
+    }
+
+    /// Whether the element shows nothing, because its opacity is 0.
+    pub(crate) fn is_faded_out(&self) -> bool {
+        self.opacity.is_some_and(|opacity| opacity <= 0.)
     }
 
     /// The offscreen group effect the style asks for, if any.

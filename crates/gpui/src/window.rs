@@ -5311,12 +5311,44 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         let previous = mem::replace(&mut self.visibility, visibility);
-        self.next_frame
-            .scene
-            .set_hidden(visibility == Visibility::Hidden);
+        self.sync_scene_hidden();
         let result = f(self);
         self.visibility = previous;
-        self.next_frame.scene.set_hidden(previous == Visibility::Hidden);
+        self.sync_scene_hidden();
+        result
+    }
+
+    /// The scene drops primitives while the visibility is hidden and while the element being drawn
+    /// is faded out to nothing: a `visible` element inside an `opacity: 0` one shows no more than
+    /// the one it is inside, and the other way round.
+    fn sync_scene_hidden(&mut self) {
+        let hidden = self.visibility == Visibility::Hidden || self.element_opacity == 0.;
+        self.next_frame.scene.set_hidden(hidden);
+    }
+
+    /// Whether what is painted now reaches no scene, because the visibility is hidden or the element
+    /// is faded out to nothing. A painter returns before it looks up a glyph or an image that would
+    /// only be dropped.
+    #[inline]
+    pub(crate) fn paints_nothing(&self) -> bool {
+        self.next_frame.scene.is_hidden()
+    }
+
+    /// [`Self::with_faded_out`] if `faded_out`, else just `f`.
+    pub(crate) fn with_faded_out_if<R>(&mut self, faded_out: bool, f: impl FnOnce(&mut Self) -> R) -> R {
+        if faded_out { self.with_faded_out(f) } else { f(self) }
+    }
+
+    /// Call a function with the element faded out to nothing (`opacity: 0`). Unlike an effect
+    /// group that is thrown away when it ends, the scene takes none of what `f` paints, while
+    /// everything else it does, like hitboxes, listeners and cursor styles, goes on.
+    pub(crate) fn with_faded_out<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        let previous = mem::replace(&mut self.element_opacity, 0.);
+        self.sync_scene_hidden();
+        let result = f(self);
+        self.element_opacity = previous;
+        self.sync_scene_hidden();
         result
     }
 
@@ -6332,6 +6364,10 @@ impl Window {
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return;
+        }
+
 
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
@@ -6372,6 +6408,10 @@ impl Window {
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return;
+        }
+
 
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
@@ -6437,6 +6477,10 @@ impl Window {
     /// Use [`CornerRadii::new`] if the radii should fit within the bounds.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return;
+        }
+
 
         let opacity = self.element_opacity();
         let quad = self.device_quad(quad, opacity);
@@ -6448,6 +6492,10 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_path(&mut self, mut path: Path<Pixels>, color: impl Into<Background>) {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return;
+        }
+
 
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
@@ -6527,6 +6575,10 @@ impl Window {
         style: TextDecorationStyle,
     ) {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return;
+        }
+
 
         let scale_factor = self.scale_factor();
         let thickness = self.snap_decoration_thickness(thickness, thickness_kind, style);
@@ -6580,6 +6632,10 @@ impl Window {
         color: Hsla,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return Ok(());
+        }
+
 
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
@@ -6677,6 +6733,10 @@ impl Window {
         font_size: Pixels,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return Ok(());
+        }
+
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
@@ -6737,6 +6797,10 @@ impl Window {
         cx: &App,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return Ok(());
+        }
+
 
         let element_opacity = self.element_opacity();
         let bounds = self.snap_bounds(bounds);
@@ -6849,6 +6913,10 @@ impl Window {
         nearest_neighbor: bool,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return Ok(());
+        }
+
         let sprite = self.image_sprite(
             bounds,
             image_bounds,
@@ -6975,6 +7043,10 @@ impl Window {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return;
+        }
+
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
@@ -7004,6 +7076,10 @@ impl Window {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
+
+        if self.paints_nothing() {
+            return;
+        }
 
         let scale_factor = self.scale_factor();
         let bounds = bounds.scale(scale_factor);

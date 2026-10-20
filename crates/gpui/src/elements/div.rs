@@ -3017,7 +3017,10 @@ impl Interactivity {
                     Visibility::Hidden => HitboxBehavior::PassThrough,
                     Visibility::Visible => self.hitbox_behavior,
                 };
+                // Prepaint sees the fade too, so that a retained subtree inside is recorded and
+                // replayed only where it was recorded faded out: see `ReplayKey`.
                 window.with_visibility(visibility, |window| {
+                    window.with_faded_out_if(style.is_faded_out(), |window| {
                     window.with_text_style(style.text_style().cloned(), |window| {
                         window.with_exact_hit_mask(
                             style.overflow_mask(bounds, window.rem_size()),
@@ -3046,6 +3049,7 @@ impl Interactivity {
                                 (result, element_state)
                             },
                         )
+                    })
                     })
                 })
             },
@@ -10844,6 +10848,125 @@ mod tests {
             });
 
             assert_eq!(painted_widths(&window, cx), [40]);
+        }
+
+        fn drawn(window: &AnyWindowHandle, cx: &mut TestAppContext) -> String {
+            cx.update_window(*window, |_, window, _| window.rendered_frame.scene.describe_drawn())
+                .unwrap()
+        }
+
+        #[gpui::test]
+        fn an_element_with_no_opacity_paints_no_primitives_and_keeps_answering(cx: &mut TestAppContext) {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let build = |faded: bool| {
+                let events = events.clone();
+                move || {
+                    let record = |name: &'static str| {
+                        let events = events.clone();
+                        move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                            events.borrow_mut().push((name, Some(bounds)));
+                        }
+                    };
+                    let target = boxed(60.)
+                        .on_painted(record("painted"))
+                        .on_mouse_down(MouseButton::Left, {
+                            let events = events.clone();
+                            move |_, _, _| events.borrow_mut().push(("clicked", None))
+                        })
+                        .child(boxed(30.).border_1().border_color(red()).child("text"))
+                        .child(crate::canvas(
+                            |_, _, _| (),
+                            {
+                                let events = events.clone();
+                                move |_, _, _, _| events.borrow_mut().push(("canvas", None))
+                            },
+                        ));
+                    let target = if faded { target.opacity(0.) } else { target.invisible() };
+                    div().child(boxed(10.)).child(target).child(boxed(70.)).into_any_element()
+                }
+            };
+            let faded_window = open_scene(cx, build(true));
+            let events_of = |name| {
+                events
+                    .borrow()
+                    .iter()
+                    .filter(|(event, _)| *event == name)
+                    .map(|(_, bounds)| *bounds)
+                    .collect::<Vec<_>>()
+            };
+            assert!(!events_of("canvas").is_empty(), "its canvases paint");
+            let painted = events_of("painted");
+            assert_eq!(painted[0].unwrap().size, size(px(60.), px(20.)), "it keeps its box");
+            assert_eq!(painted[0].unwrap().origin.y, px(20.));
+
+            let hidden_window = open_scene(cx, build(false));
+            let faded_drawn = drawn(&faded_window, cx);
+            assert!(!faded_drawn.contains("group"), "{faded_drawn}");
+            assert_eq!(faded_drawn, drawn(&hidden_window, cx), "it paints what a hidden element does");
+            assert_eq!(painted_widths(&faded_window, cx), [10, 70]);
+
+            events.borrow_mut().clear();
+            cx.update_window(faded_window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: point(px(5.), px(25.)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+            assert_eq!(events_of("clicked").len(), 1, "its hitbox is still hit");
+        }
+
+        #[gpui::test]
+        fn an_element_with_a_little_opacity_still_paints(cx: &mut TestAppContext) {
+            let window = open_scene(cx, || {
+                div().child(boxed(20.).opacity(0.01).child(boxed(30.))).into_any_element()
+            });
+
+            assert_eq!(painted_widths(&window, cx), [20, 30]);
+        }
+
+        #[gpui::test]
+        fn no_opacity_and_hidden_visibility_hide_what_is_inside_both(cx: &mut TestAppContext) {
+            let window = open_scene(cx, || {
+                div()
+                    .child(boxed(10.))
+                    // A visible element inside shows no more than the faded one it is in.
+                    .child(
+                        boxed(20.)
+                            .opacity(0.)
+                            .child(boxed(30.).invisible().child(boxed(31.)))
+                            .child(boxed(32.).visible().child(boxed(33.))),
+                    )
+                    // The faded element inside a hidden one ends where the hidden one goes on.
+                    .child(
+                        boxed(40.)
+                            .invisible()
+                            .child(boxed(50.).opacity(0.).child(boxed(51.).visible()))
+                            .child(boxed(52.)),
+                    )
+                    .child(boxed(60.))
+                    // The faded element inside a visible one in a hidden one: the hidden one's
+                    // visible descendants after it show again.
+                    .child(
+                        boxed(70.).invisible().child(
+                            boxed(71.)
+                                .visible()
+                                .child(boxed(72.).opacity(0.))
+                                .child(boxed(73.)),
+                        ),
+                    )
+                    .child(boxed(80.))
+                    .into_any_element()
+            });
+
+            assert_eq!(painted_widths(&window, cx), [10, 60, 71, 73, 80]);
         }
 
         #[gpui::test]

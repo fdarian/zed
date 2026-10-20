@@ -196,6 +196,10 @@ impl Scene {
         self.hidden = hidden;
     }
 
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         self.insert(primitive.into(), true);
     }
