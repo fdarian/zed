@@ -4768,3 +4768,5 @@ mod relocation_tests;
 mod regression_tests;
 #[cfg(test)]
 mod probe_tests;
+#[cfg(test)]
+mod replay_cost_tests;

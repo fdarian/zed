@@ -353,8 +353,22 @@ impl Deref for GlobalElementId {
 
 impl PartialEq for GlobalElementId {
     fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash && (Arc::ptr_eq(&self.ids, &other.ids) || self.ids == other.ids)
+        if self.hash != other.hash {
+            return false;
+        }
+        if Arc::ptr_eq(&self.ids, &other.ids) {
+            return true;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        FULL_PATH_COMPARES.with(|compares| compares.set(compares.get() + 1));
+        self.ids == other.ids
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// How many times two ids that did not share their path were compared element by element.
+    pub(crate) static FULL_PATH_COMPARES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Eq for GlobalElementId {}

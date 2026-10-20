@@ -2669,6 +2669,7 @@ mod tests {
                 nodes_created: after.nodes_created - before.nodes_created,
                 nodes_reused: after.nodes_reused - before.nodes_reused,
                 nodes_removed: after.nodes_removed - before.nodes_removed,
+                collections_walked: after.collections_walked - before.collections_walked,
                 styles_set: after.styles_set - before.styles_set,
                 children_set: after.children_set - before.children_set,
                 passes: after.passes - before.passes,

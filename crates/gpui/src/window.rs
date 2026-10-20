@@ -6175,15 +6175,23 @@ impl Window {
     {
         self.invalidator.debug_assert_paint_or_prepaint();
 
-        let key = (global_id.clone(), TypeId::of::<S>());
-        self.next_frame.accessed_element_states.push(key.clone());
-
-        if let Some(any) = self
+        let probe = (global_id.clone(), TypeId::of::<S>());
+        let existing = self
             .next_frame
             .element_states
-            .remove(&key)
-            .or_else(|| self.rendered_frame.element_states.remove(&key))
-        {
+            .remove_entry(&probe)
+            .or_else(|| self.rendered_frame.element_states.remove_entry(&probe));
+        // `with_global_id` builds the id again at every call, so `global_id` shares no storage with
+        // the one the state map holds. The id the state was first stored under is the one kept and
+        // recorded, so that every access to it in every frame holds that one path and moving the
+        // state between frames compares ids by pointer.
+        let key = match &existing {
+            Some((stored, _)) => stored.clone(),
+            None => probe,
+        };
+        self.next_frame.accessed_element_states.push(key.clone());
+
+        if let Some((_, any)) = existing {
             let ElementStateBox {
                 inner,
                 #[cfg(debug_assertions)]

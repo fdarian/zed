@@ -171,6 +171,8 @@ pub struct LayoutCounters {
     pub nodes_reused: u64,
     /// Nodes freed as garbage.
     pub nodes_removed: u64,
+    /// Collections that walked the trees from the roots to find the nodes nothing reaches.
+    pub collections_walked: u64,
     /// Times a style was given to taffy that differed from the one the node had.
     pub styles_set: u64,
     /// Times the children of a node were set to a list that differed from its own.
@@ -298,6 +300,11 @@ pub struct TaffyLayoutEngine {
     collection: u32,
     /// How many nodes the last collection found alive.
     alive_after_collection: usize,
+    /// The roots the last collection walked from. Every node was reached from one of them, so
+    /// while the roots and the trees under them are what they were, there is nothing to free.
+    roots_at_collection: FxHashSet<LayoutId>,
+    /// A node was made or left a tree since the last collection: something may be unreachable.
+    garbage_possible: bool,
     scratch_stack: Vec<LayoutId>,
     counters: LayoutCounters,
     /// How many times `compute_layout` ran.
@@ -356,6 +363,8 @@ impl TaffyLayoutEngine {
             stretched: Vec::new(),
             collection: 0,
             alive_after_collection: 0,
+            roots_at_collection: FxHashSet::default(),
+            garbage_possible: true,
             scratch_stack: Vec::new(),
             counters: LayoutCounters::default(),
             run: 0,
@@ -465,6 +474,7 @@ impl TaffyLayoutEngine {
             let index = (0..self.taffy.child_count(parent))
                 .find(|index| self.taffy.child_at_index(parent, *index) == Ok(id.0));
             if let Some(index) = index {
+                self.garbage_possible = true;
                 self.taffy
                     .remove_child_at_index(parent, index)
                     .expect(EXPECT_MESSAGE);
@@ -581,6 +591,12 @@ impl TaffyLayoutEngine {
     /// requested and then left out of every tree are garbage, so are the ones of an abandoned
     /// pass that the last pass did not ask for again.
     fn collect_garbage(&mut self) {
+        if !self.garbage_possible && self.roots_at_collection == self.computed_layouts {
+            return;
+        }
+        self.garbage_possible = false;
+        self.roots_at_collection.clone_from(&self.computed_layouts);
+        self.counters.collections_walked += 1;
         self.collection += 1;
         let collection = self.collection;
         let mut alive = 0;
@@ -736,6 +752,7 @@ impl TaffyLayoutEngine {
         let mut meta = self.node_meta(style, &taffy_style, rem_size, scale_factor);
         meta.key = key;
         self.counters.nodes_created += 1;
+        self.garbage_possible = true;
         if key.is_none() {
             self.unstable_requests += 1;
         }
@@ -808,6 +825,7 @@ impl TaffyLayoutEngine {
             return;
         }
         self.counters.children_set += 1;
+        self.garbage_possible = true;
         #[cfg(debug_assertions)]
         {
             let mut ancestor = Some(id.0);
@@ -959,6 +977,7 @@ impl TaffyLayoutEngine {
         meta.key = key;
         meta.measured = true;
         self.counters.nodes_created += 1;
+        self.garbage_possible = true;
         if key.is_none() {
             self.unstable_requests += 1;
         }
@@ -1233,6 +1252,7 @@ impl TaffyLayoutEngine {
         let index = (0..self.taffy.child_count(parent))
             .find(|index| self.taffy.child_at_index(parent, *index) == Ok(id.0));
         if let Some(index) = index {
+            self.garbage_possible = true;
             self.taffy
                 .remove_child_at_index(parent, index)
                 .expect(EXPECT_MESSAGE);
