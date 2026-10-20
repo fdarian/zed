@@ -682,30 +682,8 @@ impl WindowTextSystem {
 
                 let run_len_within_line = cmp::min(line_end - run_start, run.len);
 
-                let decoration_changed = if let Some(last_run) = decoration_runs.last_mut()
-                    && last_run.color == run.color
-                    && last_run.underline == run.underline
-                    && last_run.strikethrough == run.strikethrough
-                && last_run.overline == run.overline
-                && last_run.extra_decorations == run.extra_decorations
-                    && last_run.background_color == run.background_color
-                    && last_run.group == run.group
-                {
-                    last_run.len += run_len_within_line as u32;
-                    false
-                } else {
-                    decoration_runs.push(DecorationRun {
-                        len: run_len_within_line as u32,
-                        color: run.color,
-                        background_color: run.background_color,
-                        underline: run.underline,
-                        strikethrough: run.strikethrough,
-                        overline: run.overline,
-                        extra_decorations: run.extra_decorations.clone(),
-                        group: run.group,
-                    });
-                    true
-                };
+                let decoration_changed =
+                    push_decoration(&mut decoration_runs, run, run_len_within_line);
 
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
@@ -1356,6 +1334,119 @@ pub struct TextRun {
     pub group: u64,
 }
 
+impl TextRun {
+    /// Whether `self` is painted with the same decoration as `other`, which lets a line merge
+    /// their [`DecorationRun`]s and shape their text as one font run.
+    fn same_decoration(&self, other: &Self) -> bool {
+        self.color == other.color
+            && self.underline == other.underline
+            && self.strikethrough == other.strikethrough
+            && self.overline == other.overline
+            && self.extra_decorations == other.extra_decorations
+            && self.background_color == other.background_color
+            && self.group == other.group
+    }
+
+    /// Hashes what shaping and breaking the text read of `runs`, which is not what the text is
+    /// painted with: two lists of runs with equal hashes make the same lines, which differ only
+    /// in their [`DecorationRun`]s. Where the decoration changes is part of it, since a font
+    /// run is shaped on its own and the text breaks between two of them.
+    pub(crate) fn hash_measured(runs: &[TextRun], hasher: &mut impl Hasher) {
+        let mut previous: Option<&TextRun> = None;
+        for run in runs.iter().filter(|run| run.len > 0) {
+            run.len.hash(hasher);
+            run.font.hash(hasher);
+            run.font_size.hash(hasher);
+            run.line_height.hash(hasher);
+            previous
+                .is_none_or(|previous| !previous.same_decoration(run))
+                .hash(hasher);
+            previous = Some(run);
+        }
+    }
+
+    /// Hashes what [`Self::hash_measured`] leaves out.
+    pub(crate) fn hash_painted(runs: &[TextRun], hasher: &mut impl Hasher) {
+        for run in runs.iter().filter(|run| run.len > 0) {
+            run.color.hash(hasher);
+            run.background_color.hash(hasher);
+            run.underline.hash(hasher);
+            run.strikethrough.hash(hasher);
+            run.overline.hash(hasher);
+            run.extra_decorations.hash(hasher);
+            run.group.hash(hasher);
+        }
+    }
+}
+
+/// Adds `len` bytes of `run` to the end of `decoration_runs`, to the last one when it is
+/// decorated the same. Returns whether it started a decoration run.
+fn push_decoration(decoration_runs: &mut Vec<DecorationRun>, run: &TextRun, len: usize) -> bool {
+    if let Some(last_run) = decoration_runs.last_mut()
+        && last_run.color == run.color
+        && last_run.underline == run.underline
+        && last_run.strikethrough == run.strikethrough
+        && last_run.overline == run.overline
+        && last_run.extra_decorations == run.extra_decorations
+        && last_run.background_color == run.background_color
+        && last_run.group == run.group
+    {
+        last_run.len += len as u32;
+        return false;
+    }
+    decoration_runs.push(DecorationRun {
+        len: len as u32,
+        color: run.color,
+        background_color: run.background_color,
+        underline: run.underline,
+        strikethrough: run.strikethrough,
+        overline: run.overline,
+        extra_decorations: run.extra_decorations.clone(),
+        group: run.group,
+    });
+    true
+}
+
+/// `lines`, shaped from the text `runs` cover and from runs that differ from these only in how
+/// they are painted, decorated by `runs`. The lines share their layouts with `lines`.
+pub(crate) fn redecorate_lines(
+    lines: &[WrappedLine],
+    runs: &[TextRun],
+) -> SmallVec<[WrappedLine; 1]> {
+    let mut runs = runs.iter().filter(|run| run.len > 0).map(|run| (run, run.len)).peekable();
+    lines
+        .iter()
+        .map(|line| {
+            let mut decoration_runs = Vec::new();
+            let mut remaining = line.text.len();
+            while remaining > 0 {
+                let Some((run, run_len)) = runs.peek_mut() else {
+                    break;
+                };
+                let len = cmp::min(remaining, *run_len);
+                push_decoration(&mut decoration_runs, run, len);
+                *run_len -= len;
+                remaining -= len;
+                if *run_len == 0 {
+                    runs.next();
+                }
+            }
+            // The newline between two lines is covered by the runs too.
+            if let Some((_, run_len)) = runs.peek_mut() {
+                *run_len -= 1;
+                if *run_len == 0 {
+                    runs.next();
+                }
+            }
+            WrappedLine {
+                layout: line.layout.clone(),
+                text: line.text.clone(),
+                decoration_runs,
+            }
+        })
+        .collect()
+}
+
 #[cfg(all(target_os = "macos", test))]
 impl TextRun {
     fn with_len(&self, len: usize) -> Self {
@@ -1749,6 +1840,66 @@ mod insets_tests {
                 insets,
             )
             .unwrap()
+    }
+
+    fn measured_hash(runs: &[TextRun]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        TextRun::hash_measured(runs, &mut hasher);
+        hasher.finish()
+    }
+
+    fn colored(len: usize, color: Hsla) -> TextRun {
+        TextRun { color, ..run(len) }
+    }
+
+    #[test]
+    fn test_runs_measure_alike_when_only_their_paint_differs() {
+        let (red, blue) = (crate::red(), crate::blue());
+        let measured = measured_hash(&[colored(3, red), colored(4, blue)]);
+        assert_eq!(measured, measured_hash(&[colored(3, blue), colored(4, red)]));
+        assert_eq!(
+            measured,
+            measured_hash(&[TextRun { underline: Some(Default::default()), ..colored(3, red) }, colored(4, red)])
+        );
+        // Runs of one decoration are shaped as one font run, and two of them are not.
+        assert_ne!(measured, measured_hash(&[colored(3, red), colored(4, red)]));
+        assert_ne!(measured, measured_hash(&[colored(4, red), colored(3, blue)]));
+        let bold = TextRun {
+            font: font("Menlo").bold(),
+            ..colored(3, red)
+        };
+        assert_ne!(measured, measured_hash(&[bold, colored(4, blue)]));
+        let small = TextRun {
+            font_size: Some(px(8.)),
+            ..colored(3, red)
+        };
+        assert_ne!(measured, measured_hash(&[small, colored(4, blue)]));
+    }
+
+    #[crate::test]
+    fn test_lines_decorated_again_follow_the_new_runs_across_newlines(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let (red, blue, green) = (crate::red(), crate::blue(), crate::green());
+            let text: SharedString = "abc\nde\nfgh".into();
+            let lines = text_system
+                .shape_text(text, px(16.), &[colored(10, red)], None, None)
+                .unwrap();
+            let runs = [colored(2, blue), colored(5, green), colored(3, blue)];
+            let lines = redecorate_lines(&lines, &runs);
+            let decorations: Vec<Vec<(u32, Hsla)>> = lines
+                .iter()
+                .map(|line| line.decoration_runs.iter().map(|run| (run.len, run.color)).collect())
+                .collect();
+            assert_eq!(
+                decorations,
+                vec![
+                    vec![(2, blue), (1, green)],
+                    vec![(2, green)],
+                    vec![(3, blue)],
+                ]
+            );
+        });
     }
 
     #[crate::test]

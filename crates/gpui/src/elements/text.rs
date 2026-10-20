@@ -5,7 +5,7 @@ use crate::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     SharedString, Size, TextBoxMetrics, TextBoxTrim, TextInset, TextLayoutOptions, TextOverflow, TextRun,
     TextStyle, TooltipId, TruncateFrom,
-    WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
+    WhiteSpace, Window, WrappedLine, WrappedLineLayout, redecorate_lines, register_tooltip_mouse_handlers,
     point, set_tooltip_on_window,
 };
 use crate::util::{ceil_to_layout_unit, round_to_layout_unit};
@@ -825,6 +825,9 @@ struct TextLayoutInner {
     /// a box does not land a row off when the snap went the other way. The relocation of a
     /// retained root moves by whole pixels, which leaves it as it is.
     phase_y: Pixels,
+    /// A hash of what the lines are painted with ([`TextRun::hash_painted`]), which the layout
+    /// node keeps its measure across.
+    paint_hash: u64,
 }
 
 impl TextLayoutInner {
@@ -895,7 +898,13 @@ impl TextLayout {
             let mut hasher = DefaultHasher::new();
             atomic_digest.hash(&mut hasher);
             text.hash(&mut hasher);
-            runs.hash(&mut hasher);
+            if text_style.text_overflow.is_some() {
+                // A cut text is decorated by the runs it was cut with, which the lines kept
+                // cannot be decorated from again.
+                runs.hash(&mut hasher);
+            } else {
+                TextRun::hash_measured(&runs, &mut hasher);
+            }
             font_size.hash(&mut hasher);
             line_height.hash(&mut hasher);
             text_style.white_space.hash(&mut hasher);
@@ -914,6 +923,13 @@ impl TextLayout {
             window.text_system().font_generation().hash(&mut hasher);
             hasher.finish()
         });
+        let paint_hash = {
+            let mut hasher = DefaultHasher::new();
+            TextRun::hash_painted(&runs, &mut hasher);
+            hasher.finish()
+        };
+        let runs = Rc::new(runs);
+        let runs_for_paint = runs.clone();
         let measure = {
             let element_state = self.clone();
 
@@ -958,6 +974,7 @@ impl TextLayout {
                             size: Some(Size::default()),
                             bounds: None,
                             phase_y: Pixels::ZERO,
+                            paint_hash,
                         });
                     }
                     MeasuredLeaf::from(Size::default())
@@ -1026,7 +1043,7 @@ impl TextLayout {
 
                 let truncated = (|| -> anyhow::Result<_> {
                     let Some((text_overflow, width)) = truncation else {
-                        return Ok((text.clone(), Cow::Borrowed(&*runs)));
+                        return Ok((text.clone(), Cow::Borrowed(runs.as_slice())));
                     };
                     let mut line_wrapper =
                         cx.text_system().line_wrapper(text_style.font(), font_size);
@@ -1082,7 +1099,7 @@ impl TextLayout {
                                 // whenever the honestly-shaped text fits; the shaping comes
                                 // from the line layout cache when the same text was already
                                 // measured untruncated this frame.
-                                Ok((text.clone(), Cow::Borrowed(&*runs)))
+                                Ok((text.clone(), Cow::Borrowed(runs.as_slice())))
                             } else {
                                 Ok(line_wrapper.truncate_line(
                                     text.clone(),
@@ -1172,6 +1189,7 @@ impl TextLayout {
                     size: Some(size),
                     bounds: None,
                     phase_y: Pixels::ZERO,
+                    paint_hash,
                 };
                 let first_baseline = inner.first_baseline();
                 // A probe answers a size question at a width the text may never be laid out at.
@@ -1193,10 +1211,11 @@ impl TextLayout {
                     layout: self.clone(),
                     atomics: atomics_carry,
                 };
+                let runs = runs_for_paint;
                 let (layout_id, previous) =
                     window.request_keyed_measured_layout(measure_key, Default::default(), state, measure);
                 if let Some(previous) = previous {
-                    self.take_over_measure_of(&previous.layout);
+                    self.take_over_measure_of(&previous.layout, &runs, paint_hash);
                 }
                 layout_id
             }
@@ -1208,15 +1227,22 @@ impl TextLayout {
 
     /// Holds what `previous` measured: the layout node did not measure the text again because
     /// the same text was measured before.
-    fn take_over_measure_of(&self, previous: &TextLayout) {
-        if Rc::ptr_eq(&self.0, &previous.0) {
-            return;
+    /// The request that kept the measure had runs equal to `previous`'s in everything that
+    /// shapes the text, but not in how it is painted: its lines are decorated again from `runs`.
+    fn take_over_measure_of(&self, previous: &TextLayout, runs: &[TextRun], paint_hash: u64) {
+        if !Rc::ptr_eq(&self.0, &previous.0) {
+            let mut measured = previous.0.borrow().clone();
+            if let Some(measured) = &mut measured {
+                measured.bounds = None;
+            }
+            *self.0.borrow_mut() = measured;
         }
-        let mut measured = previous.0.borrow().clone();
-        if let Some(measured) = &mut measured {
-            measured.bounds = None;
+        if let Some(measured) = self.0.borrow_mut().as_mut()
+            && measured.paint_hash != paint_hash
+        {
+            measured.lines = Rc::new(redecorate_lines(&measured.lines, runs));
+            measured.paint_hash = paint_hash;
         }
-        *self.0.borrow_mut() = measured;
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, window: &mut Window) {
@@ -2176,6 +2202,7 @@ mod tests {
                     align: Default::default(),
                     size: None,
                     phase_y: Pixels::ZERO,
+                    paint_hash: 0,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
                         size(px(100.), px(90.)),
@@ -2249,6 +2276,7 @@ mod tests {
                     align: Default::default(),
                     size: None,
                     phase_y: Pixels::ZERO,
+                    paint_hash: 0,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
                         size(px(60.), px(200.)),
@@ -2832,6 +2860,129 @@ mod tests {
             set(cx, trim(false, false), edge(TextBoxOver::Ex));
             draw(cx);
             assert_eq!(draw(cx), untrimmed);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod painted_runs {
+        use super::*;
+        use crate::{
+            AppContext as _, Context, FontWeight, Hsla, InteractiveElement as _, ParentElement as _, Render, Styled as _,
+            TestAppContext, WindowHandle, blue, div, font, green, px, red,
+        };
+
+        const LABELS: [&str; 3] = ["first label", "second label", "third label"];
+
+        struct Labels {
+            color: Hsla,
+            weight: FontWeight,
+            layouts: Rc<RefCell<Vec<TextLayout>>>,
+        }
+
+        impl Render for Labels {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut layouts = self.layouts.borrow_mut();
+                layouts.clear();
+                let mut column = div()
+                    .id("column")
+                    .w(px(240.))
+                    .font_family(font("Menlo").family)
+                    .text_size(px(14.))
+                    .text_color(self.color)
+                    .font_weight(self.weight);
+                for (index, label) in LABELS.iter().enumerate() {
+                    let text = StyledText::new(*label);
+                    layouts.push(text.layout().clone());
+                    column = column.child(div().id(index).child(text));
+                }
+                column
+            }
+        }
+
+        struct Scene {
+            window: WindowHandle<Labels>,
+            layouts: Rc<RefCell<Vec<TextLayout>>>,
+        }
+
+        impl Scene {
+            fn new(cx: &mut TestAppContext) -> Self {
+                let layouts = Rc::new(RefCell::new(Vec::new()));
+                let window = cx.add_window({
+                    let layouts = layouts.clone();
+                    move |_, _| Labels {
+                        color: red(),
+                        weight: FontWeight::NORMAL,
+                        layouts,
+                    }
+                });
+                let scene = Self { window, layouts };
+                // The frames after the first find the nodes of the frame before.
+                for _ in 0..3 {
+                    scene.draw(cx);
+                }
+                scene
+            }
+
+            fn draw(&self, cx: &mut TestAppContext) -> (u64, u64) {
+                cx.update_window(self.window.into(), |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    (window.layout_counters().measures, window.text_system().text_counters().shapes)
+                })
+                .unwrap()
+            }
+
+            fn edit(&self, cx: &mut TestAppContext, edit: impl FnOnce(&mut Labels)) {
+                self.window
+                    .update(cx, |labels, _, cx| {
+                        edit(labels);
+                        cx.notify();
+                    })
+                    .unwrap();
+            }
+
+            /// The color each run of each label is painted with.
+            fn colors(&self) -> Vec<Hsla> {
+                self.layouts
+                    .borrow()
+                    .iter()
+                    .flat_map(|layout| {
+                        let inner = layout.0.borrow();
+                        let lines = inner.as_ref().expect("the label is measured").lines.clone();
+                        lines
+                            .iter()
+                            .flat_map(|line| line.decoration_runs.iter().map(|run| run.color))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            }
+        }
+
+        #[crate::test]
+        fn a_new_color_paints_the_text_it_kept_the_measure_of(cx: &mut TestAppContext) {
+            let scene = Scene::new(cx);
+            let before = scene.draw(cx);
+            assert_eq!(scene.colors(), vec![red(); LABELS.len()]);
+
+            scene.edit(cx, |labels| labels.color = blue());
+            let after = scene.draw(cx);
+            assert_eq!(after.0, before.0, "the labels were measured again");
+            assert_eq!(after.1, before.1, "the labels were shaped again");
+            assert_eq!(scene.colors(), vec![blue(); LABELS.len()]);
+
+            scene.edit(cx, |labels| labels.color = green());
+            scene.draw(cx);
+            assert_eq!(scene.colors(), vec![green(); LABELS.len()]);
+        }
+
+        #[crate::test]
+        fn a_new_weight_measures_the_text_again(cx: &mut TestAppContext) {
+            let scene = Scene::new(cx);
+            let before = scene.draw(cx);
+
+            scene.edit(cx, |labels| labels.weight = FontWeight::BOLD);
+            let after = scene.draw(cx);
+            // The test platform gives every weight the same font id, so only the measure tells.
+            assert_eq!(after.0, before.0 + LABELS.len() as u64);
         }
     }
 
