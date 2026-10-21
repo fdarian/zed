@@ -114,7 +114,7 @@ impl TextSystem {
     }
 
     /// How many times fonts were added to the text system.
-    pub(crate) fn font_generation(&self) -> u64 {
+    pub fn font_generation(&self) -> u64 {
         self.font_generation
             .load(std::sync::atomic::Ordering::Relaxed)
     }

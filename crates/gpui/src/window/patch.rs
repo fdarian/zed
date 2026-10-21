@@ -784,7 +784,15 @@ impl Window {
             (paint.end.root_key_listeners_index - paint.start.root_key_listeners_index, recorded_paint.end.root_key_listeners_index - recorded_paint.start.root_key_listeners_index),
             (paint.end.input_handlers_index - paint.start.input_handlers_index, recorded_paint.end.input_handlers_index - recorded_paint.start.input_handlers_index),
         ];
-        if frame.focus.is_some() || counts.iter().any(|(painted, recorded)| painted != recorded) {
+        // The focus is the window's: a unit that holds the focused element finds it again, as the
+        // recording did, and one that gains or loses it is not the recording.
+        let recorded_focus = self.focus.is_some_and(|focus| {
+            self.rendered_frame.dispatch_tree.range_has_focus(
+                recorded_prepaint.start.dispatch_tree_index..recorded_prepaint.end.dispatch_tree_index,
+                focus,
+            )
+        });
+        if frame.focus.is_some() != recorded_focus || counts.iter().any(|(painted, recorded)| painted != recorded) {
             return false;
         }
         let cursors = &frame.cursor_styles[paint.start.cursor_styles_index..paint.end.cursor_styles_index];

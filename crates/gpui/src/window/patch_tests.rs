@@ -3,7 +3,7 @@
 
 use crate::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Context, Element, ElementId, FrameWorkCounters, GlobalElementId, Hsla,
-    InspectorElementId, InteractiveElement, IntoElement, LayoutId, ParentElement, PatchCounters, PatchDecline, PatchOutcome, Pixels,
+    FocusHandle, InspectorElementId, InteractiveElement, IntoElement, LayoutId, ParentElement, PatchCounters, PatchDecline, PatchOutcome, Pixels,
     Render, Retained, RetainedCounters, ScrollHandle, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div, green,
     hsla, point, px, red, retained, size,
 };
@@ -36,6 +36,8 @@ struct Knobs {
     page_opacity: Cell<Option<f32>>,
     /// An animation of the unit's opacity is current, in the page and in the patcher.
     opacity_animation: Cell<bool>,
+    /// The box in the unit that tracks this focus handle.
+    focus: RefCell<Option<FocusHandle>>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -120,8 +122,19 @@ fn fade(tick: u32) -> f32 {
 
 /// The subtree of the unit for `tick`: a box that has a color of its own and a box in it that
 /// changes when the pointer is on it.
-fn unit_element(tick: u32, width: f32, opacity: Option<f32>, animated: bool, hot: Hot, lift: Lift) -> AnyElement {
+fn unit_element(
+    tick: u32,
+    width: f32,
+    opacity: Option<f32>,
+    animated: bool,
+    hot: Hot,
+    lift: Lift,
+    focus: Option<&FocusHandle>,
+) -> AnyElement {
     let mut hot_box = div().id("hot").w(px(20.)).h(px(20.)).bg(blue());
+    if let Some(focus) = focus {
+        hot_box = hot_box.track_focus(focus);
+    }
     if hot != Hot::NoHitbox {
         hot_box = hot_box.hover(|style| style.bg(green()));
         if hot != Hot::NoCursor {
@@ -143,10 +156,13 @@ fn unit_element(tick: u32, width: f32, opacity: Option<f32>, animated: bool, hot
     unit.into_any_element()
 }
 
-fn unit(tick: u32, lift: Lift, page_opacity: Option<f32>, animated: bool) -> Retained {
+fn unit(tick: u32, lift: Lift, page_opacity: Option<f32>, animated: bool, focus: Option<FocusHandle>) -> Retained {
     let lifted = lift != Lift::No;
     let opacity = lifted.then(|| page_opacity.unwrap_or_else(|| fade(tick)));
-    let root = retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., opacity, animated, Hot::Same, lift)).patchable();
+    let root = retained(UNIT, 1_000 + tick as u64, move |_, _| {
+        unit_element(tick, 100., opacity, animated, Hot::Same, lift, focus.as_ref())
+    })
+    .patchable();
     if lifted { root.lift_z(0) } else { root }
 }
 
@@ -219,11 +235,12 @@ impl Page {
         let page_opacity = self.knobs.page_opacity.get();
         let animated = self.knobs.opacity_animation.get();
         let lift = self.lift;
+        let focus = self.knobs.focus.borrow().clone();
         if lift != Lift::InsideRoot {
-            return self.around.wrap(unit(tick, lift, page_opacity, animated).into_any_element());
+            return self.around.wrap(unit(tick, lift, page_opacity, animated, focus).into_any_element());
         }
         retained("wrapper", 1, move |_, _| {
-            div().id("wrapper").flex_none().child(unit(tick, Lift::Alone, page_opacity, animated)).into_any_element()
+            div().id("wrapper").flex_none().child(unit(tick, Lift::Alone, page_opacity, animated, focus.clone())).into_any_element()
         })
         .into_any_element()
     }
@@ -289,6 +306,8 @@ struct Options {
     a11y: bool,
     lift: Lift,
     around: Around,
+    /// The box in the unit has the focus.
+    focused: bool,
 }
 
 impl Fixture {
@@ -300,6 +319,9 @@ impl Fixture {
         let knobs = Rc::new(Knobs::default());
         knobs.accept.set(true);
         let scroll = options.scroll.then(ScrollHandle::new);
+        if options.focused {
+            *knobs.focus.borrow_mut() = Some(cx.update(|cx| cx.focus_handle()));
+        }
         let window = cx.open_window(size(px(400.), px(2000.)), {
             let knobs = knobs.clone();
             let scroll = scroll.clone();
@@ -308,6 +330,9 @@ impl Fixture {
         let window = AnyWindowHandle::from(window);
         cx.update_window(window, |_, window, cx| {
             window.set_dom_hit_testing(true);
+            if let Some(focus) = knobs.focus.borrow().as_ref() {
+                window.focus(focus, cx);
+            }
             if options.a11y {
                 window.set_a11y_active_for_tests(true);
             }
@@ -325,7 +350,9 @@ impl Fixture {
                     .into_iter()
                     .map(|name| {
                         let opacity = knobs.opacity.get().or_else(|| lifted.then(|| fade(tick)));
-                        let mut element = unit_element(tick, width, opacity, knobs.opacity_animation.get(), knobs.hot.get(), lift);
+                        let focus = knobs.focus.borrow().clone();
+                        let mut element =
+                            unit_element(tick, width, opacity, knobs.opacity_animation.get(), knobs.hot.get(), lift, focus.as_ref());
                         if knobs.absolute.get() {
                             element = div().id(UNIT).absolute().w(px(100.)).h(px(30.)).bg(color(tick)).into_any_element();
                         }
@@ -523,6 +550,27 @@ fn a_tick_that_changes_one_root_costs_the_same_whatever_the_page_holds(cx: &mut 
     assert_eq!(large.1.patched_frames - patches.patched_frames, 5);
     assert_eq!(large.1.patched_units - patches.patched_units, 5);
     assert_eq!(large.1.total_declines(), 0);
+}
+
+#[gpui::test]
+fn a_unit_that_holds_the_focused_element_is_patched_and_one_that_stops_holding_it_is_not(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 10, Options { focused: true, ..Default::default() });
+    page.tick(cx);
+    let before = page.patches(cx);
+    for _ in 0..4 {
+        page.tick(cx);
+    }
+    let after = page.patches(cx);
+    assert_eq!(after.patched_frames - before.patched_frames, 4);
+    assert_eq!(after.total_declines(), 0);
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "the focused unit");
+
+    // The patcher builds the unit as if it did not track the focus: it is not the recording.
+    *page.knobs.focus.borrow_mut() = None;
+    page.tick(cx);
+    assert_eq!(page.patches(cx).declines(PatchDecline::Registrations), 1);
 }
 
 #[gpui::test]
@@ -1029,7 +1077,7 @@ fn a_lifted_root_that_moves_in_its_context_declines(cx: &mut TestAppContext) {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let tick = self.0.tick.get();
             div().id("page").stacking_context().w(px(400.)).h(px(2000.)).child(
-                retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., Some(fade(tick)), false, Hot::Same, Lift::Alone))
+                retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., Some(fade(tick)), false, Hot::Same, Lift::Alone, None))
                     .patchable()
                     .lift_z(0),
             )
@@ -1048,8 +1096,8 @@ fn a_lifted_root_that_moves_in_its_context_declines(cx: &mut TestAppContext) {
         window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
             let mut logged = log.take();
             // The same root, one z-index higher: the context orders it differently.
-            let element = unit_element(1, 100., Some(0.5), false, Hot::Same, Lift::Alone).into_any_element();
-            let raised = if logged.is_empty() { element } else { unit_element(1, 100., Some(0.5), false, Hot::Same, Lift::No) };
+            let element = unit_element(1, 100., Some(0.5), false, Hot::Same, Lift::Alone, None).into_any_element();
+            let raised = if logged.is_empty() { element } else { unit_element(1, 100., Some(0.5), false, Hot::Same, Lift::No, None) };
             let result = window.repaint_in_place(vec![(ElementId::from(UNIT), raised)], cx, |_, _| true);
             logged.push(result);
             log.set(logged);

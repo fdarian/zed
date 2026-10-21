@@ -311,6 +311,11 @@ impl DispatchTree {
         self.active_node().extras = source.extras.clone();
     }
 
+    /// Whether a node in `range` has the focus id `focus`.
+    pub(crate) fn range_has_focus(&self, range: Range<usize>, focus: FocusId) -> bool {
+        self.nodes[range].iter().any(|node| node.focus_id == Some(focus))
+    }
+
     pub fn reuse_subtree(
         &mut self,
         old_range: Range<usize>,
