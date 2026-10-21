@@ -219,8 +219,18 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.write().rasterize_glyph(params, raster_bounds)
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        self.0.write().layout_line(text, font_size, runs)
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        scale_factor: f32,
+    ) -> LineLayout {
+        // The metrics are not rounded in device pixels here; the layout only records the scale.
+        LineLayout {
+            scale_factor,
+            ..self.0.write().layout_line(text, font_size, runs)
+        }
     }
 
     fn recommended_rendering_mode(
@@ -695,6 +705,7 @@ impl CosmicTextSystemState {
                 width: Pixels::ZERO,
                 ascent: Pixels::ZERO,
                 descent: Pixels::ZERO,
+                scale_factor: 1.,
                 runs: Vec::new(),
                 len: text.len(),
                 boxes: Vec::new(),
@@ -757,6 +768,7 @@ impl CosmicTextSystemState {
             width: layout.w.into(),
             ascent: layout.max_ascent.into(),
             descent: layout.max_descent.into(),
+            scale_factor: 1.,
             runs,
             len: text.len(),
             boxes: Vec::new(),
@@ -1093,7 +1105,7 @@ mod tests {
             font_size: None,
             line_height: None,
         }];
-        Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
+        Ok(text_system.layout_line(text, gpui::px(14.0), &runs, 1.))
     }
 
     /// Mirrors the original crash: mixed-direction text reaching the shaper
@@ -1213,7 +1225,7 @@ mod tests {
                 line_height: None,
             },
         ];
-        let layout = text_system.layout_line(text, gpui::px(14.0), &runs);
+        let layout = text_system.layout_line(text, gpui::px(14.0), &runs, 1.);
 
         assert_eq!(layout.len, text.len());
         assert!(layout.width > Pixels::ZERO);

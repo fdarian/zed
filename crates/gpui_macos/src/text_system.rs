@@ -238,8 +238,16 @@ impl PlatformTextSystem for MacTextSystem {
         self.0.read().rasterize_glyph(glyph_id, raster_bounds)
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        self.0.write().layout_line(text, font_size, font_runs)
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+        scale_factor: f32,
+    ) -> LineLayout {
+        self.0
+            .write()
+            .layout_line(text, font_size, font_runs, scale_factor)
     }
 
     fn recommended_rendering_mode(
@@ -774,7 +782,13 @@ impl MacTextSystemState {
         }
     }
 
-    fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &mut self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+        scale_factor: f32,
+    ) -> LineLayout {
         // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
         let mut string = CFMutableAttributedString::new();
         let mut input_runs = Vec::<InputRun>::with_capacity(font_runs.len());
@@ -795,7 +809,7 @@ impl MacTextSystemState {
                 let cf_range = CFRange::init(utf16_start, length);
 
                 let run_font_size = run.font_size.unwrap_or(font_size);
-                let line_box = self.font_metrics[run.font_id.0].line_box(run_font_size);
+                let line_box = self.font_metrics[run.font_id.0].line_box(run_font_size, scale_factor);
                 let ct_font_size = if break_ligature {
                     px(f32::from(run_font_size).next_up())
                 } else {
@@ -895,13 +909,14 @@ impl MacTextSystemState {
         // it knows it. Without it the font of the first run stands for it.
         let strut = font_runs
             .first()
-            .map(|run| self.font_metrics[run.font_id.0].line_box(font_size));
+            .map(|run| self.font_metrics[run.font_id.0].line_box(font_size, scale_factor));
         LineLayout {
             runs,
             font_size,
             width: typographic_bounds.width.into(),
             ascent: strut.map_or(Pixels::ZERO, |strut| strut.ascent),
             descent: strut.map_or(Pixels::ZERO, |strut| strut.descent),
+            scale_factor,
             len: text.len(),
             boxes: Vec::new(),
         }
@@ -1131,13 +1146,13 @@ mod tests {
             line_height: None,
         };
 
-        let layout = fonts.layout_line(line, px(16.), &[style]);
+        let layout = fonts.layout_line(line, px(16.), &[style], 1.);
         assert_eq!(layout.len, line.len());
         assert!(layout.runs.is_empty());
 
         let line = "a\u{feff}b";
         style.len = line.len();
-        let layout = fonts.layout_line(line, px(16.), &[style]);
+        let layout = fonts.layout_line(line, px(16.), &[style], 1.);
         assert_eq!(layout.len, line.len());
         assert_eq!(layout.runs.len(), 1);
         assert_eq!(layout.runs[0].glyphs.len(), 2);
@@ -1160,7 +1175,7 @@ mod tests {
                 line_height: None,
             },
         ];
-        let layout = fonts.layout_line(line, px(16.), font_runs);
+        let layout = fonts.layout_line(line, px(16.), font_runs, 1.);
         assert_eq!(layout.len, line.len());
         assert_eq!(layout.runs.len(), 1);
         assert_eq!(layout.runs[0].glyphs.len(), 2);
@@ -1190,7 +1205,7 @@ mod tests {
             }, // " world"
         ];
 
-        let layout = fonts.layout_line(text, px(16.), font_runs);
+        let layout = fonts.layout_line(text, px(16.), font_runs, 1.);
         assert_eq!(layout.len, text.len());
 
         for run in &layout.runs {
@@ -1222,7 +1237,7 @@ mod tests {
             },
         ];
 
-        let layout2 = fonts.layout_line(text, px(16.), font_runs_different);
+        let layout2 = fonts.layout_line(text, px(16.), font_runs_different, 1.);
         assert_eq!(layout2.len, text.len());
 
         for run in &layout2.runs {
@@ -1249,7 +1264,7 @@ mod tests {
             font_size: None,
             line_height: None,
         }];
-        let layout = fonts.layout_line(text, px(16.), font_runs);
+        let layout = fonts.layout_line(text, px(16.), font_runs, 1.);
         assert_eq!(layout.len, text.len());
 
         let text = "abc";
@@ -1273,7 +1288,7 @@ mod tests {
                 line_height: None,
             }, // "c"
         ];
-        let layout = fonts.layout_line(text, px(16.), font_runs);
+        let layout = fonts.layout_line(text, px(16.), font_runs, 1.);
         assert_eq!(layout.len, text.len());
 
         for run in &layout.runs {
@@ -1290,7 +1305,7 @@ mod tests {
         // Test with empty text
         let text = "";
         let font_runs = &[];
-        let layout = fonts.layout_line(text, px(16.), font_runs);
+        let layout = fonts.layout_line(text, px(16.), font_runs, 1.);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
     }
@@ -1317,7 +1332,7 @@ mod tests {
             menlo_run(&fonts, 2, Some(px(32.)), None),
         ];
 
-        let layout = fonts.layout_line("aaaa", px(16.), &runs);
+        let layout = fonts.layout_line("aaaa", px(16.), &runs, 1.);
 
         assert_eq!(layout.runs.len(), 2);
         assert_eq!(layout.runs[0].font_size, px(16.));
@@ -1344,7 +1359,7 @@ mod tests {
     #[test]
     fn test_a_run_of_the_line_size_is_the_same_as_one_without_a_size() {
         let fonts = MacTextSystem::new();
-        let implicit = fonts.layout_line("aaaa", px(16.), &[menlo_run(&fonts, 4, None, None)]);
+        let implicit = fonts.layout_line("aaaa", px(16.), &[menlo_run(&fonts, 4, None, None)], 1.);
         let explicit = fonts.layout_line(
             "aaaa",
             px(16.),
@@ -1352,6 +1367,7 @@ mod tests {
                 menlo_run(&fonts, 2, Some(px(16.)), None),
                 menlo_run(&fonts, 2, Some(px(16.)), None),
             ],
+            1.,
         );
 
         assert_eq!(explicit.runs.len(), 1);
@@ -1370,6 +1386,7 @@ mod tests {
                 menlo_run(&fonts, 2, None, Some(px(20.))),
                 menlo_run(&fonts, 2, None, Some(px(20.))),
             ],
+            1.,
         );
         assert_eq!(same.runs.len(), 1);
         assert_eq!(same.runs[0].line_height, Some(px(20.)));
@@ -1381,6 +1398,7 @@ mod tests {
                 menlo_run(&fonts, 2, None, Some(px(20.))),
                 menlo_run(&fonts, 2, None, Some(px(40.))),
             ],
+            1.,
         );
         assert_eq!(different.runs.len(), 2);
         assert_eq!(different.runs[0].line_height, Some(px(20.)));
@@ -1486,7 +1504,7 @@ mod tests {
             font_size: None,
             line_height: None,
         };
-        f32::from(fonts.layout_line(text, px(40.), &[run]).width)
+        f32::from(fonts.layout_line(text, px(40.), &[run], 1.).width)
     }
 
     #[test]
@@ -1593,6 +1611,7 @@ mod tests {
                     line_height: None,
                 },
             ],
+            1.,
         );
         // They share a PostScript name, and each run still comes back in its own face.
         assert_eq!(
@@ -1617,6 +1636,7 @@ mod tests {
                 font_size: None,
                 line_height: None,
             }],
+            1.,
         );
         assert_eq!(layout.runs[1].glyphs[0].position.x, alone.width);
 
@@ -1670,6 +1690,7 @@ mod tests {
                     line_height: None,
                 },
             ],
+            1.,
         );
         assert_eq!(
             layout
@@ -1695,45 +1716,51 @@ mod tests {
 
     /// The content area and the line `line-height: normal` makes, in Chrome on macOS, of
     /// `Hxg` in a font at a size (`fixtures/line-box-oracle.json` of gpuix:
-    /// `<family>.<weight>.<size>.normal` and its `.text`). Helvetica, Times and Courier have their
-    /// ascent widened by a sixth of the content area, and the other fonts do not.
+    /// `<family>.<weight>.<size>.normal` and its `.text`; `line-box-oracle-x2.json` on a display of
+    /// device scale 2). Helvetica, Times and Courier have their ascent widened by a sixth of the
+    /// content area, and the other fonts do not. Chrome zooms the font to the display before it
+    /// measures it, so at scale 2 each metric is a whole device pixel: Helvetica Neue 20px is 23.5
+    /// CSS pixels of content where it is 23 at scale 1, and Times 14px is 16 where it is 17.
     #[test]
     fn test_the_line_box_of_a_font_is_the_one_chrome_makes() {
         let fonts = MacTextSystem::new();
-        let cases: &[(&str, f32, f32, f32, f32)] = &[
-            ("Helvetica Neue", 400., 20., 23., 24.),
-            ("Helvetica Neue", 700., 20., 24., 25.),
-            ("Helvetica Neue", 400., 24., 28., 29.),
-            ("Helvetica Neue", 700., 12., 15., 15.),
-            ("Helvetica", 400., 12., 14., 14.),
-            ("Helvetica", 700., 20., 23., 23.),
-            ("Helvetica", 400., 24., 28., 28.),
-            ("Menlo", 400., 16., 19., 19.),
-            ("Menlo", 700., 20., 24., 24.),
-            ("Menlo", 400., 24., 28., 28.),
-            ("Times", 400., 14., 17., 17.),
-            ("Times", 700., 16., 18., 18.),
-            ("Courier", 400., 20., 23., 23.),
-            ("Courier", 700., 12., 14., 14.),
+        // (family, weight, size, content and normal at scale 1, content and normal at scale 2)
+        let cases: &[(&str, f32, f32, (f32, f32), (f32, f32))] = &[
+            ("Helvetica Neue", 400., 20., (23., 24.), (23.5, 24.)),
+            ("Helvetica Neue", 700., 20., (24., 25.), (24., 24.5)),
+            ("Helvetica Neue", 400., 24., (28., 29.), (28., 28.5)),
+            ("Helvetica Neue", 700., 12., (15., 15.), (14., 14.5)),
+            ("Helvetica", 400., 12., (14., 14.), (14., 14.)),
+            ("Helvetica", 700., 20., (23., 23.), (23., 23.)),
+            ("Helvetica", 400., 24., (28., 28.), (27.5, 27.5)),
+            ("Menlo", 400., 16., (19., 19.), (19., 19.)),
+            ("Menlo", 700., 20., (24., 24.), (23., 23.)),
+            ("Menlo", 400., 24., (28., 28.), (28., 28.)),
+            ("Times", 400., 14., (17., 17.), (16., 16.)),
+            ("Times", 700., 16., (18., 18.), (18.5, 18.5)),
+            ("Courier", 400., 20., (23., 23.), (23., 23.)),
+            ("Courier", 700., 12., (14., 14.), (14., 14.)),
         ];
-        for (family, weight, size, content, normal) in cases {
+        for (family, weight, size, at_1, at_2) in cases {
             let font = Font {
                 weight: FontWeight(*weight),
                 ..font(*family)
             };
             let font_id = fonts.font_id(&font).unwrap();
-            let line_box = fonts.font_metrics(font_id).line_box(px(*size));
-            let label = format!("{family} {weight} {size}px");
-            assert_eq!(
-                f32::from(line_box.ascent + line_box.descent),
-                *content,
-                "{label}: the content area"
-            );
-            assert_eq!(
-                f32::from(line_box.normal_line_height()),
-                *normal,
-                "{label}: line-height: normal"
-            );
+            for (scale, (content, normal)) in [(1., at_1), (2., at_2)] {
+                let line_box = fonts.font_metrics(font_id).line_box(px(*size), scale);
+                let label = format!("{family} {weight} {size}px at scale {scale}");
+                assert_eq!(
+                    f32::from(line_box.ascent + line_box.descent),
+                    *content,
+                    "{label}: the content area"
+                );
+                assert_eq!(
+                    f32::from(line_box.normal_line_height()),
+                    *normal,
+                    "{label}: line-height: normal"
+                );
+            }
         }
     }
 
@@ -1773,6 +1800,7 @@ mod tests {
             "aabb",
             px(20.),
             &[run(helvetica, 2, None), run(bold, 2, None)],
+            1.,
         );
         // The strut is the font of the first run, and a run in another font has its own box.
         assert_eq!((layout.ascent, layout.descent), (px(18.), px(5.)));
@@ -1780,6 +1808,38 @@ mod tests {
         assert_eq!((layout.runs[0].ascent, layout.runs[0].descent), (px(18.), px(5.)));
         // Bold Helvetica Neue at 20px is 24px of content in Chrome.
         assert_eq!((layout.runs[1].ascent, layout.runs[1].descent), (px(20.), px(4.)));
+        assert_eq!(layout.scale_factor, 1.);
+    }
+
+    /// The same runs shaped for a display of scale 2 are measured in device pixels, as Chrome does
+    /// (Helvetica 20px: 37 and 9 device pixels, and a sixth of them more, where it is 18 and 5 CSS
+    /// pixels at scale 1), and the layout says which scale it is for.
+    #[test]
+    fn test_a_run_is_shaped_with_the_line_box_of_its_font_in_device_pixels() {
+        let fonts = MacTextSystem::new();
+        let helvetica = fonts.font_id(&font("Helvetica")).unwrap();
+        let bold = fonts
+            .font_id(&Font {
+                weight: FontWeight::BOLD,
+                ..font("Helvetica Neue")
+            })
+            .unwrap();
+        let run = |font_id, len| FontRun {
+            font_id,
+            len,
+            font_size: None,
+            line_height: None,
+        };
+        let layout = fonts.layout_line("aabb", px(20.), &[run(helvetica, 2), run(bold, 2)], 2.);
+        assert_eq!(layout.scale_factor, 2.);
+        // Helvetica 20px at scale 2: 31 + 9 device pixels, the ascent widened by 6.
+        assert_eq!((layout.ascent, layout.descent), (px(18.5), px(4.5)));
+        assert_eq!((layout.runs[0].ascent, layout.runs[0].descent), (px(18.5), px(4.5)));
+        // Bold Helvetica Neue 20px is 24 of content at scale 2 as well (24.5 of normal height).
+        assert_eq!(
+            f32::from(layout.runs[1].ascent + layout.runs[1].descent),
+            24.
+        );
     }
 
     /// Inter Variable cut down to "Hamburgefonstiv 0123": an `opsz` axis of 14 to 32, and a
@@ -1829,7 +1889,7 @@ mod tests {
                 line_height: None,
             };
             let advance =
-                f32::from(fonts.layout_line("Hamburgefonstiv 0123", px(size), &[run]).width);
+                f32::from(fonts.layout_line("Hamburgefonstiv 0123", px(size), &[run], 1.).width);
             assert!(
                 (advance - chrome).abs() < 0.02,
                 "{size}px wght {wght} opsz {opsz}: {advance}, Chrome {chrome}"

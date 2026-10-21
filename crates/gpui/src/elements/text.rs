@@ -801,6 +801,9 @@ struct TextLayoutInner {
     /// frame to the next.
     lines: Rc<SmallVec<[WrappedLine; 1]>>,
     line_height: Pixels,
+    /// The scale of the window the lines were laid out for: their rows are rounded in its
+    /// device pixels, so a layout of another scale is not the answer.
+    scale_factor: f32,
     wrap_width: Option<Pixels>,
     truncate_width: Option<Pixels>,
     /// The width the insets were asked for.
@@ -895,8 +898,11 @@ impl TextLayout {
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let scale_factor = window.scale_factor();
         let line_height = floor_to_layout_unit(
-            window.text_system().line_height(&text_style, window.rem_size()),
+            window
+                .text_system()
+                .line_height(&text_style, window.rem_size(), scale_factor),
         );
         let text_align = text_style.text_align;
         let mut options = text_style.layout_options(window.text_system());
@@ -932,6 +938,7 @@ impl TextLayout {
             }
             font_size.hash(&mut hasher);
             line_height.hash(&mut hasher);
+            scale_factor.to_bits().hash(&mut hasher);
             text_style.white_space.hash(&mut hasher);
             text_style.text_overflow.hash(&mut hasher);
             text_style.line_clamp.hash(&mut hasher);
@@ -988,6 +995,7 @@ impl TextLayout {
                             lines: Default::default(),
                             len: 0,
                             line_height,
+                            scale_factor,
                             wrap_width,
                             truncate_width,
                             inset_width: width,
@@ -1054,6 +1062,7 @@ impl TextLayout {
                 //    sizing with whatever width some earlier measure pass happened to use)
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
+                    && scale_factor == text_layout.scale_factor
                     && wrap_width == text_layout.wrap_width
                     && width == text_layout.inset_width
                     && atomic_measure == text_layout.atomic_measure
@@ -1204,6 +1213,7 @@ impl TextLayout {
                     lines: Rc::new(lines),
                     len,
                     line_height,
+                    scale_factor,
                     wrap_width,
                     truncate_width,
                     inset_width: width,
@@ -2237,6 +2247,7 @@ mod tests {
                     len: 5,
                     lines: Rc::new(lines),
                     line_height: px(30.),
+                    scale_factor: 1.,
                     wrap_width: None,
                     truncate_width: None,
                     inset_width: None,
@@ -2312,6 +2323,7 @@ mod tests {
                     len: text.len(),
                     lines: Rc::new(lines),
                     line_height: px(30.),
+                    scale_factor: 1.,
                     wrap_width: Some(px(60.)),
                     truncate_width: None,
                     inset_width: None,
@@ -2470,7 +2482,13 @@ mod tests {
 
             let layout = laid_out(cx, BOTH);
             let line = &layout.line_layouts()[0];
-            let baseline = crate::extent_in_line(line.ascent(), line.descent(), px(24.)).0;
+            let baseline = crate::extent_in_line(
+                line.ascent(),
+                line.descent(),
+                px(24.),
+                line.unwrapped_layout.scale_factor,
+            )
+            .0;
             let bounds = layout.bounds();
             // The box is the cap height to the layout unit; its edges are snapped to device pixels.
             assert!((bounds.size.height - cap).abs() <= px(0.5));
@@ -3494,20 +3512,43 @@ mod tests {
 
         #[test]
         fn a_trim_at_the_end_or_none_leaves_the_baselines_where_the_line_has_them() {
-            // Chrome's 17 at scale 1. At scale 2 it has 17.5, half-leading to the device pixel,
-            // which the line here still shares out in whole pixels: the baselines are the line's
-            // either way, whatever the trim.
-            for scale in [1., 2.] {
+            // Chrome's 17 at scale 1 and 17.5 at scale 2 (its half-leading, 5 device pixels, is
+            // floored to the device pixel): the baselines are the line's either way, whatever
+            // the trim.
+            for (scale, chrome) in [(1., 17.), (2., 17.5)] {
                 let (untrimmed, _, _) = baselines(scale, NONE, TextBoxOver::Cap, "Hello");
-                if scale == 1. {
-                    assert_chrome(untrimmed, 17., "baseline of a line");
-                }
+                assert_chrome(untrimmed, chrome, &format!("baseline of a line at {scale}x"));
                 for (trim, over) in [(END, TextBoxOver::Cap), (END, TextBoxOver::Ex)] {
                     let (first, last, _) = baselines(scale, trim, over, "Hello");
                     assert_chrome(first, untrimmed.0, &format!("first baseline at {scale}x"));
                     assert_chrome(last, untrimmed.0, &format!("last baseline at {scale}x"));
                 }
             }
+        }
+
+        #[test]
+        fn a_text_laid_out_again_after_a_scale_change_has_the_half_leading_of_the_new_scale() {
+            let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+            app.set_window_scale_factor(1.);
+            let layout = Rc::new(RefCell::new(None));
+            let mut window = app.open_window({
+                let layout = layout.clone();
+                move |_, _| Label {
+                    trim: NONE,
+                    over: TextBoxOver::Cap,
+                    text: "Hello",
+                    layout,
+                }
+            });
+            window.draw();
+            let baseline = || layout.borrow().clone().unwrap().first_baseline().unwrap();
+            assert_chrome(baseline(), 17., "baseline of a line at 1x");
+            window.update(|_, window, _| window.set_scale_factor(2.));
+            window.draw();
+            assert_chrome(baseline(), 17.5, "baseline of a line after the window went to 2x");
+            window.update(|_, window, _| window.set_scale_factor(1.));
+            window.draw();
+            assert_chrome(baseline(), 17., "baseline of a line after the window went back to 1x");
         }
 
         #[test]

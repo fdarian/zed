@@ -104,6 +104,7 @@ impl ShapedLine {
             width: layout.width,
             ascent: layout.ascent,
             descent: layout.descent,
+            scale_factor: layout.scale_factor,
             runs: layout.runs.clone(),
             len,
             boxes: layout.boxes.clone(),
@@ -1272,6 +1273,7 @@ mod tests {
                 width: px(width),
                 ascent: px(12.0),
                 descent: px(4.0),
+                scale_factor: 1.,
                 runs: vec![ShapedRun {
                     font_id: FontId(0),
                     font_size: px(16.0),
@@ -1352,6 +1354,7 @@ mod tests {
                 width: px(60.0),
                 ascent: px(12.0),
                 descent: px(4.0),
+                scale_factor: 1.,
                 runs: vec![
                     ShapedRun {
                         font_id: FontId(0),

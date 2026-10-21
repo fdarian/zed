@@ -92,15 +92,15 @@ fn bench_layout_line(c: &mut Criterion) {
     let mut group = c.benchmark_group("layout_line");
 
     group.bench_function("no_fallback", |b| {
-        b.iter(|| system.layout_line(&text, px(14.0), &runs_no_fallback))
+        b.iter(|| system.layout_line(&text, px(14.0), &runs_no_fallback, 1.))
     });
 
     group.bench_function("with_fallback_ascii", |b| {
-        b.iter(|| system.layout_line(&text, px(14.0), &runs_with_fallback))
+        b.iter(|| system.layout_line(&text, px(14.0), &runs_with_fallback, 1.))
     });
 
     group.bench_function("mixed_direction_paragraphs", |b| {
-        b.iter(|| system.layout_line(&text_mixed_direction, px(14.0), &runs_mixed_direction))
+        b.iter(|| system.layout_line(&text_mixed_direction, px(14.0), &runs_mixed_direction, 1.))
     });
 
     group.finish();

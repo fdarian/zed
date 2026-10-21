@@ -12,7 +12,7 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -223,7 +223,7 @@ fn advance_to_tab_stop(position: Pixels, stop: Pixels) -> Pixels {
 }
 
 /// A laid out and styled line of text
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct LineLayout {
     /// The font size for this line
     pub font_size: Pixels,
@@ -233,6 +233,11 @@ pub struct LineLayout {
     pub ascent: Pixels,
     /// The descent of the line
     pub descent: Pixels,
+    /// The device pixels to a pixel of the display this line was shaped for. The ascent and
+    /// descent of the line and of its runs are rounded to whole device pixels, and the
+    /// half-leading of a row is floored to one, so the rows of the line are only as Chrome's
+    /// at this scale.
+    pub scale_factor: f32,
     /// The shaped runs that make up this line
     pub runs: Vec<ShapedRun>,
     /// The length of the line in utf-8 bytes
@@ -240,6 +245,21 @@ pub struct LineLayout {
     /// The boxes with a [key](crate::InlineBox::key) that are on this line, and where
     /// they sit.
     pub boxes: Vec<PlacedBox>,
+}
+
+impl Default for LineLayout {
+    fn default() -> Self {
+        Self {
+            font_size: Pixels::default(),
+            width: Pixels::default(),
+            ascent: Pixels::default(),
+            descent: Pixels::default(),
+            scale_factor: 1.,
+            runs: Vec::new(),
+            len: 0,
+            boxes: Vec::new(),
+        }
+    }
 }
 
 /// A run of text that has been shaped .
@@ -397,7 +417,8 @@ impl LineLayout {
     /// tallest run aligned to its top or bottom.
     pub fn line_rows(&self, wrap_boundaries: &[WrapBoundary], line_height: Pixels) -> LineRows {
         let row_count = wrap_boundaries.len() + 1;
-        let (strut_above, strut_below) = extent_in_line(self.ascent, self.descent, line_height);
+        let (strut_above, strut_below) =
+            extent_in_line(self.ascent, self.descent, line_height, self.scale_factor);
         let strut = RowMetrics {
             height: line_height,
             baseline: strut_above,
@@ -431,7 +452,8 @@ impl LineLayout {
             }
 
             let run_line_height = run.line_height.unwrap_or(line_height);
-            let (run_above, run_below) = extent_in_line(run.ascent, run.descent, run_line_height);
+            let (run_above, run_below) =
+                extent_in_line(run.ascent, run.descent, run_line_height, self.scale_factor);
             // The boxes of its aligned group around an atomic inline are one with it.
             let (run_above, run_below) = match run.inline.aligned_strut {
                 Some(strut) => (run_above.max(strut.above), run_below.max(strut.below)),
@@ -645,6 +667,7 @@ impl LineLayout {
             width: x_offset,
             ascent: self.ascent,
             descent: self.descent,
+            scale_factor: self.scale_factor,
             runs: left_runs,
             len: byte_index,
             boxes: self.boxes.clone(),
@@ -655,6 +678,7 @@ impl LineLayout {
             width: self.width - x_offset,
             ascent: self.ascent,
             descent: self.descent,
+            scale_factor: self.scale_factor,
             runs: right_runs,
             len: self.len - byte_index,
             boxes: self.boxes.clone(),
@@ -930,6 +954,7 @@ impl LineLayout {
             width: *x.last().expect("the end of the line has an x"),
             ascent: self.ascent,
             descent: self.descent,
+            scale_factor: self.scale_factor,
             runs,
             len: self.len,
             boxes: self.boxes.clone(),
@@ -1677,6 +1702,9 @@ pub(crate) struct LineLayoutCache {
     /// the frame caches, and never while taking them.
     shape_store: Mutex<ShapeStore>,
     font_generation: Arc<AtomicU64>,
+    /// The device pixels to a pixel of the window's display, as `f32` bits: what lines are
+    /// shaped for, and part of the key of every layout.
+    scale_factor: AtomicU32,
 }
 
 #[derive(Default)]
@@ -1758,7 +1786,19 @@ impl LineLayoutCache {
             counters: AtomicTextCounters::default(),
             shape_store: Mutex::new(ShapeStore::new(SHAPE_STORE_BUDGET_BYTES)),
             font_generation,
+            scale_factor: AtomicU32::new(1f32.to_bits()),
         }
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        f32::from_bits(self.scale_factor.load(Ordering::Relaxed))
+    }
+
+    /// Lines shaped from now on are for a display of `scale_factor`; those of another scale
+    /// stay in the caches under their own key.
+    pub fn set_scale_factor(&self, scale_factor: f32) {
+        self.scale_factor
+            .store(scale_factor.to_bits(), Ordering::Relaxed);
     }
 
     fn font_generation(&self) -> u64 {
@@ -1909,6 +1949,7 @@ impl LineLayoutCache {
             nowrap: options.nowrap && wrap_width.is_some(),
         };
         let max_lines = max_lines.filter(|_| wrap_width.is_some());
+        let scale_factor = self.scale_factor();
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
@@ -1920,6 +1961,7 @@ impl LineLayoutCache {
             insets,
             inline,
             line_height,
+            scale_bits: scale_factor.to_bits(),
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -1967,6 +2009,7 @@ impl LineLayoutCache {
                 line_height,
                 options.strut_font,
                 !options.nowrap,
+                scale_factor,
             );
             let tab_stop = options
                 .tab_size
@@ -2015,6 +2058,7 @@ impl LineLayoutCache {
                 insets: insets.into(),
                 inline: inline.into(),
                 line_height,
+                scale_bits: scale_factor.to_bits(),
             });
 
             self.shape_store
@@ -2083,12 +2127,20 @@ impl LineLayoutCache {
         line_height: Pixels,
         strut_font: Option<FontId>,
         root_wraps: bool,
+        scale_factor: f32,
     ) -> Arc<LineLayout> {
         if inline.is_empty() {
             return self.layout_line::<&SharedString>(text, font_size, runs, None, strut_font);
         }
         let shaped = if inline.iter().any(|spec| spec.atomic().is_some()) {
-            Arc::new(self.layout_line_with_atomics(text, font_size, runs, inline, strut_font))
+            Arc::new(self.layout_line_with_atomics(
+                text,
+                font_size,
+                runs,
+                inline,
+                strut_font,
+                scale_factor,
+            ))
         } else {
             self.layout_line::<&SharedString>(text, font_size, runs, None, strut_font)
         };
@@ -2106,6 +2158,7 @@ impl LineLayoutCache {
                 ascent: shaped.ascent,
                 descent: shaped.descent,
                 x_height,
+                scale_factor,
             },
             line_height,
             &|font_id| self.platform_text_system.font_metrics(font_id),
@@ -2123,6 +2176,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         inline: &[InlineSpec],
         strut_font: Option<FontId>,
+        scale_factor: f32,
     ) -> LineLayout {
         let mut layout_runs: Vec<ShapedRun> = Vec::new();
         let mut x = Pixels::ZERO;
@@ -2190,7 +2244,7 @@ impl LineLayoutCache {
                     let strut = self
                         .platform_text_system
                         .font_metrics(strut_font.unwrap_or(run.font_id))
-                        .line_box(font_size);
+                        .line_box(font_size, scale_factor);
                     ascent = ascent.max(strut.ascent);
                     descent = descent.max(strut.descent);
                     layout_runs.push(ShapedRun {
@@ -2233,6 +2287,7 @@ impl LineLayoutCache {
             width: x,
             ascent,
             descent,
+            scale_factor,
             runs: layout_runs,
             len: text.len(),
             boxes: Vec::new(),
@@ -2255,6 +2310,7 @@ impl LineLayoutCache {
             strut_font,
             ..TextLayoutOptions::default()
         };
+        let scale_factor = self.scale_factor();
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
@@ -2266,6 +2322,7 @@ impl LineLayoutCache {
             insets: &[],
             inline: &[],
             line_height: Pixels::ZERO,
+            scale_bits: scale_factor.to_bits(),
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -2299,12 +2356,12 @@ impl LineLayoutCache {
             AtomicTextCounters::add(&self.counters.shapes);
             let mut layout = self
                 .platform_text_system
-                .layout_line(&text, font_size, runs);
+                .layout_line(&text, font_size, runs, scale_factor);
             if let Some(strut_font) = strut_font {
                 let strut = self
                     .platform_text_system
                     .font_metrics(strut_font)
-                    .line_box(font_size);
+                    .line_box(font_size, scale_factor);
                 layout.ascent = strut.ascent;
                 layout.descent = strut.descent;
             }
@@ -2324,6 +2381,7 @@ impl LineLayoutCache {
                 insets: Box::default(),
                 inline: Box::default(),
                 line_height: Pixels::ZERO,
+                scale_bits: scale_factor.to_bits(),
             });
             let layout = Arc::new(layout);
             self.shape_store
@@ -2351,6 +2409,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         force_width: Option<Pixels>,
     ) -> Option<Arc<LineLayout>> {
+        let scale_factor = self.scale_factor();
         let key_ref = HashedCacheKeyRef {
             text_hash,
             text_len,
@@ -2358,6 +2417,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            scale_bits: scale_factor.to_bits(),
         };
 
         let current_frame = self.current_frame.read();
@@ -2369,6 +2429,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                scale_bits: key.scale_bits,
             } == key_ref
         }) {
             return Some(layout.clone());
@@ -2383,6 +2444,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                scale_bits: key.scale_bits,
             } == key_ref
         }) {
             return Some(layout.clone());
@@ -2408,6 +2470,7 @@ impl LineLayoutCache {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
+        let scale_factor = self.scale_factor();
         let key_ref = HashedCacheKeyRef {
             text_hash,
             text_len,
@@ -2415,6 +2478,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            scale_bits: scale_factor.to_bits(),
         };
 
         // Fast path: already cached (no allocation).
@@ -2427,6 +2491,7 @@ impl LineLayoutCache {
                 runs: key.runs.as_slice(),
                 wrap_width: key.wrap_width,
                 force_width: key.force_width,
+                scale_bits: key.scale_bits,
             } == key_ref
         }) {
             AtomicTextCounters::add(&self.counters.hits);
@@ -2449,6 +2514,7 @@ impl LineLayoutCache {
                     runs: key.runs.as_slice(),
                     wrap_width: key.wrap_width,
                     force_width: key.force_width,
+                    scale_bits: key.scale_bits,
                 } == key_ref
             })
             .cloned()
@@ -2467,7 +2533,7 @@ impl LineLayoutCache {
         AtomicTextCounters::add(&self.counters.shapes);
         let mut layout = self
             .platform_text_system
-            .layout_line(&text, font_size, runs);
+            .layout_line(&text, font_size, runs, scale_factor);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -2480,6 +2546,7 @@ impl LineLayoutCache {
             runs: SmallVec::from(runs),
             wrap_width: None,
             force_width,
+            scale_bits: scale_factor.to_bits(),
         });
         let layout = Arc::new(layout);
         current_frame
@@ -2564,6 +2631,8 @@ struct CacheKey {
     insets: Box<[TextInset]>,
     inline: Box<[InlineSpec]>,
     line_height: Pixels,
+    /// `f32::to_bits` of the scale factor the line is shaped for.
+    scale_bits: u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -2579,6 +2648,7 @@ struct CacheKeyRef<'a> {
     insets: &'a [TextInset],
     inline: &'a [InlineSpec],
     line_height: Pixels,
+    scale_bits: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -2589,6 +2659,7 @@ struct HashedCacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    scale_bits: u32,
 }
 
 #[derive(Copy, Clone)]
@@ -2599,6 +2670,7 @@ struct HashedCacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    scale_bits: u32,
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
@@ -2615,6 +2687,7 @@ impl PartialEq for HashedCacheKey {
             && self.runs.as_slice() == other.runs.as_slice()
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.scale_bits == other.scale_bits
     }
 }
 
@@ -2628,6 +2701,7 @@ impl Hash for HashedCacheKey {
         self.runs.as_slice().hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.scale_bits.hash(state);
     }
 }
 
@@ -2639,6 +2713,7 @@ impl PartialEq for HashedCacheKeyRef<'_> {
             && self.runs == other.runs
             && self.wrap_width == other.wrap_width
             && self.force_width == other.force_width
+            && self.scale_bits == other.scale_bits
     }
 }
 
@@ -2652,6 +2727,7 @@ impl Hash for HashedCacheKeyRef<'_> {
         self.runs.hash(state);
         self.wrap_width.hash(state);
         self.force_width.hash(state);
+        self.scale_bits.hash(state);
     }
 }
 
@@ -2676,6 +2752,7 @@ impl AsCacheKeyRef for CacheKey {
             insets: &self.insets,
             inline: &self.inline,
             line_height: self.line_height,
+            scale_bits: self.scale_bits,
         }
     }
 }
@@ -2725,6 +2802,7 @@ mod tests {
             width: px(100.),
             ascent: px(12.),
             descent: px(4.),
+            scale_factor: 1.,
             runs: vec![ShapedRun {
                 font_id: FontId(0),
                 font_size: px(16.),
@@ -4374,12 +4452,18 @@ mod tests {
             let line_height = px(LINE_HEIGHT);
             RowMetrics {
                 height: line_height,
-                baseline: crate::extent_in_line(layout.ascent(), layout.descent(), line_height).0,
+                baseline: crate::extent_in_line(
+                    layout.ascent(),
+                    layout.descent(),
+                    line_height,
+                    layout.unwrapped_layout.scale_factor,
+                )
+                .0,
             }
         }
 
         fn above(run: &ShapedRun, line_height: Pixels) -> Pixels {
-            crate::extent_in_line(run.ascent, run.descent, line_height).0
+            crate::extent_in_line(run.ascent, run.descent, line_height, 1.).0
         }
 
         /// "aaaa " plain, "bbbb " big, "cc dd": plain "cc " and big "dd", which wraps into
@@ -4404,6 +4488,63 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(starts, vec![5, 10]);
             layout
+        }
+
+        /// Menlo 10px has a content area of 9 + 2 CSS pixels at scale 1 and 9.5 + 2.5 at scale 2, so a
+        /// line of 30px has 19 and 18 CSS pixels over it, half of which is 9 and 9 device pixels
+        /// above the text: the baseline is at 18 and at 18.5.
+        #[crate::test]
+        fn the_half_leading_of_a_row_is_floored_to_a_device_pixel_of_the_scale_it_was_shaped_for(
+            cx: &mut TestAppContext,
+        ) {
+            cx.update(|cx| {
+                let text_system = WindowTextSystem::new(cx.text_system().clone());
+                let line_height = px(30.);
+                let mut baselines = Vec::new();
+                for scale in [1., 2.] {
+                    text_system.set_scale_factor(scale);
+                    let lines = text_system
+                        .shape_text("aaaa".into(), px(10.), &[run(4, None, None)], None, None)
+                        .unwrap();
+                    let layout = &lines[0].layout;
+                    assert_eq!(layout.unwrapped_layout.scale_factor, scale);
+                    let row = layout.rows(line_height)[0];
+                    let (ascent, descent) = (layout.ascent(), layout.descent());
+                    assert_eq!(
+                        row.baseline,
+                        crate::extent_in_line(ascent, descent, line_height, scale).0
+                    );
+                    assert_eq!(row.height, line_height);
+                    // The half-leading is a whole number of device pixels above the text.
+                    let half_leading = (row.baseline - ascent).0 * scale;
+                    assert_eq!(half_leading, half_leading.floor(), "{half_leading} at scale {scale}");
+                    baselines.push(row.baseline);
+                }
+                assert_eq!(baselines, [px(18.), px(18.5)]);
+            });
+        }
+
+        #[crate::test]
+        fn a_layout_shaped_for_one_scale_is_not_the_answer_at_another(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                let text_system = WindowTextSystem::new(cx.text_system().clone());
+                let shape = |scale: f32| {
+                    text_system.set_scale_factor(scale);
+                    text_system
+                        .shape_text("aaaa".into(), px(10.), &[run(4, None, None)], None, None)
+                        .unwrap()[0]
+                        .layout
+                        .clone()
+                };
+                let at_1 = shape(1.);
+                let at_2 = shape(2.);
+                assert!(!Arc::ptr_eq(&at_1, &at_2));
+                assert_eq!(text_system.text_counters().wrapped_layouts, 2);
+                // Back at the first scale the first layout is found again, and the second is not shaped twice.
+                assert!(Arc::ptr_eq(&at_1, &shape(1.)));
+                assert!(Arc::ptr_eq(&at_2, &shape(2.)));
+                assert_eq!(text_system.text_counters().wrapped_layouts, 2);
+            });
         }
 
         #[crate::test]
@@ -5014,6 +5155,7 @@ mod line_box_tests {
             width: px(10.),
             ascent: px(19.),
             descent: px(4.),
+            scale_factor: 1.,
             runs,
             len: 1,
         }

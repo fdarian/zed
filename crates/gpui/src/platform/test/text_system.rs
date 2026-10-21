@@ -74,8 +74,14 @@ impl PlatformTextSystem for RasterizingTextSystem {
         Ok((raster_bounds.size, vec![0; 1]))
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        self.0.layout_line(text, font_size, runs)
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        scale_factor: f32,
+    ) -> LineLayout {
+        self.0.layout_line(text, font_size, runs, scale_factor)
     }
 
     fn recommended_rendering_mode(
@@ -182,7 +188,13 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
         Ok((raster_bounds.size, vec![0; 1]))
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        scale_factor: f32,
+    ) -> LineLayout {
         let mut x = px(0.);
         let mut shaped: Vec<ShapedRun> = Vec::new();
         let mut run_end = 0;
@@ -203,8 +215,14 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
                 shaped.push(ShapedRun {
                     font_id: FontId(0),
                     font_size: run_size,
-                    ascent: self.font_metrics(FontId(0)).line_box(run_size).ascent,
-                    descent: self.font_metrics(FontId(0)).line_box(run_size).descent,
+                    ascent: self
+                        .font_metrics(FontId(0))
+                        .line_box(run_size, scale_factor)
+                        .ascent,
+                    descent: self
+                        .font_metrics(FontId(0))
+                        .line_box(run_size, scale_factor)
+                        .descent,
                     line_height: font_run.line_height,
                     glyphs: Vec::new(),
                     inline: Default::default(),
@@ -226,8 +244,15 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
             boxes: Vec::new(),
             font_size,
             width: x,
-            ascent: self.font_metrics(FontId(0)).line_box(font_size).ascent,
-            descent: self.font_metrics(FontId(0)).line_box(font_size).descent,
+            ascent: self
+                .font_metrics(FontId(0))
+                .line_box(font_size, scale_factor)
+                .ascent,
+            descent: self
+                .font_metrics(FontId(0))
+                .line_box(font_size, scale_factor)
+                .descent,
+            scale_factor,
             runs: shaped,
             len: text.len(),
         }

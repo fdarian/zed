@@ -2134,6 +2134,7 @@ impl Window {
         let scale_factor = platform_window.scale_factor();
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
+        text_system.set_scale_factor(scale_factor);
         let invalidator = WindowInvalidator::new(handle.window_id());
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
@@ -3537,7 +3538,7 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
+        self.apply_scale_factor(self.platform_window.scale_factor());
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
         self.mouse_position = self.platform_window.mouse_position();
@@ -3841,8 +3842,14 @@ impl Window {
     /// Overrides the display scale factor for tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
-        self.scale_factor = scale_factor;
+        self.apply_scale_factor(scale_factor);
         self.refresh();
+    }
+
+    /// The text of the window is shaped for the scale it paints at, so the two change together.
+    fn apply_scale_factor(&mut self, scale_factor: f32) {
+        self.scale_factor = scale_factor;
+        self.text_system.set_scale_factor(scale_factor);
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -3919,7 +3926,7 @@ impl Window {
     /// The line height associated with the current text style.
     pub fn line_height(&self) -> Pixels {
         self.text_system()
-            .line_height(&self.text_style(), self.rem_size())
+            .line_height(&self.text_style(), self.rem_size(), self.scale_factor())
             .round()
     }
 

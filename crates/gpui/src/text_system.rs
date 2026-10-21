@@ -253,6 +253,7 @@ impl TextSystem {
     pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {
         let mut buffer = [0; 4];
         let buffer = ch.encode_utf8(&mut buffer);
+        // Only the width is read, which the scale does not change.
         self.platform_text_system
             .layout_line(
                 buffer,
@@ -263,6 +264,7 @@ impl TextSystem {
                     font_size: None,
                     line_height: None,
                 }],
+                1.,
             )
             .width
     }
@@ -323,19 +325,21 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.descent(font_size))
     }
 
-    /// The content area of an inline box in the given font and size, as Chrome measures it.
-    pub fn line_box(&self, font_id: FontId, font_size: Pixels) -> LineBox {
-        self.read_metrics(font_id, |metrics| metrics.line_box(font_size))
+    /// The content area of an inline box in the given font and size, as Chrome measures it
+    /// on a display of `scale_factor` device pixels to a pixel.
+    pub fn line_box(&self, font_id: FontId, font_size: Pixels, scale_factor: f32) -> LineBox {
+        self.read_metrics(font_id, |metrics| metrics.line_box(font_size, scale_factor))
     }
 
     /// The line height `style` asks for, in pixels, not yet laid out in whole
-    /// sixty-fourths of a pixel: `normal` is the height of its font.
-    pub fn line_height(&self, style: &TextStyle, rem_size: Pixels) -> Pixels {
+    /// sixty-fourths of a pixel: `normal` is the height of its font on a display of
+    /// `scale_factor` device pixels to a pixel.
+    pub fn line_height(&self, style: &TextStyle, rem_size: Pixels, scale_factor: f32) -> Pixels {
         let font_size = style.font_size.to_pixels(rem_size);
         style
             .line_height
             .to_pixels(style.font_size, rem_size, || {
-                self.line_box(self.resolve_font(&style.font()), font_size)
+                self.line_box(self.resolve_font(&style.font()), font_size, scale_factor)
                     .normal_line_height()
             })
     }
@@ -346,8 +350,11 @@ impl TextSystem {
         font_id: FontId,
         font_size: Pixels,
         line_height: Pixels,
+        scale_factor: f32,
     ) -> Pixels {
-        self.line_box(font_id, font_size).extent(line_height).0
+        self.line_box(font_id, font_size, scale_factor)
+            .extent(line_height, scale_factor)
+            .0
     }
 
     /// The underline thickness the font reports for `font_size`, zero when it has none.
@@ -444,6 +451,13 @@ impl WindowTextSystem {
             ),
             text_system,
         }
+    }
+
+    /// Sets the display scale lines are shaped for: the window's, which Chrome zooms its fonts
+    /// to before it rounds their metrics. Layouts shaped for another scale stay where they are,
+    /// under their own key.
+    pub(crate) fn set_scale_factor(&self, scale_factor: f32) {
+        self.line_layout_cache.set_scale_factor(scale_factor);
     }
 
     /// What the line layout cache has shaped and found since the window was made.
@@ -1621,8 +1635,9 @@ pub struct FontMetrics {
 }
 
 /// The content area of the inline box of a font at a size, and the leading its line gap
-/// adds to `line-height: normal`, as Chrome measures them: the whole pixel each is
-/// rounded to, so every line of the font is as tall as the next whatever the size.
+/// adds to `line-height: normal`, as Chrome measures them: the whole device pixel each is
+/// rounded to, so every line of the font is as tall as the next whatever the size. The
+/// lengths are in pixels, which are a device pixel at scale 1 and a half at scale 2.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LineBox {
     /// The distance from the baseline up to the top of the content area.
@@ -1640,18 +1655,24 @@ impl LineBox {
     }
 
     /// How far above the baseline an inline box with this content area reaches in a line
-    /// of `line_height`, and how far below it.
-    pub fn extent(&self, line_height: Pixels) -> (Pixels, Pixels) {
-        extent_in_line(self.ascent, self.descent, line_height)
+    /// of `line_height`, and how far below it, on a display of `scale_factor`.
+    pub fn extent(&self, line_height: Pixels, scale_factor: f32) -> (Pixels, Pixels) {
+        extent_in_line(self.ascent, self.descent, line_height, scale_factor)
     }
 }
 
 /// How far above the baseline an inline box reaches in a line of `line_height`, and how
 /// far below it, for a content area of `ascent` and `descent`: the line height is shared
 /// around the content area as half-leading, whose share above the box is rounded down to
-/// a whole pixel, as Chrome does.
-pub fn extent_in_line(ascent: Pixels, descent: Pixels, line_height: Pixels) -> (Pixels, Pixels) {
-    let above = ascent + ((line_height - ascent - descent) / 2.).floor();
+/// a whole device pixel (`scale_factor` of them to a pixel), as Chrome does.
+pub fn extent_in_line(
+    ascent: Pixels,
+    descent: Pixels,
+    line_height: Pixels,
+    scale_factor: f32,
+) -> (Pixels, Pixels) {
+    let half_leading = ((line_height - ascent - descent) * scale_factor / 2.).floor() / scale_factor;
+    let above = ascent + half_leading;
     (above, line_height - above)
 }
 
@@ -1662,18 +1683,21 @@ pub fn floor_to_layout_unit(length: Pixels) -> Pixels {
 }
 
 impl FontMetrics {
-    /// The content area of an inline box in this font at `font_size`.
-    pub fn line_box(&self, font_size: Pixels) -> LineBox {
-        let round = |length: Pixels| px((length.0 + 0.5).floor());
-        let mut ascent = round(self.ascent(font_size));
-        let descent = round(-self.descent(font_size));
+    /// The content area of an inline box in this font at `font_size`, on a display of
+    /// `scale_factor` device pixels to a pixel: Chrome zooms the font to the device before it
+    /// measures it, so the metrics are rounded in device pixels.
+    pub fn line_box(&self, font_size: Pixels, scale_factor: f32) -> LineBox {
+        let device_size = font_size * scale_factor;
+        let round = |length: Pixels| (length.0 + 0.5).floor();
+        let mut ascent = round(self.ascent(device_size));
+        let descent = round(-self.descent(device_size));
         if self.widens_ascent {
-            ascent += px(((ascent + descent).0 * 0.15 + 0.5).floor());
+            ascent += ((ascent + descent) * 0.15 + 0.5).floor();
         }
         LineBox {
-            ascent,
-            descent,
-            line_gap: round(self.line_gap(font_size)),
+            ascent: px(ascent / scale_factor),
+            descent: px(descent / scale_factor),
+            line_gap: px(round(self.line_gap(device_size)) / scale_factor),
         }
     }
 
@@ -2265,7 +2289,11 @@ mod line_box_tests {
     }
 
     fn content(metrics: &FontMetrics, size: f32) -> (f32, f32, f32) {
-        let line_box = metrics.line_box(px(size));
+        content_at(metrics, size, 1.)
+    }
+
+    fn content_at(metrics: &FontMetrics, size: f32, scale_factor: f32) -> (f32, f32, f32) {
+        let line_box = metrics.line_box(px(size), scale_factor);
         (
             line_box.ascent.0,
             line_box.descent.0,
@@ -2281,6 +2309,17 @@ mod line_box_tests {
         assert_eq!(content(&menlo(), 24.), (22., 6., 28.));
     }
 
+    /// The ascent and the descent are rounded in device pixels, as Chrome zooms the font to
+    /// the display before it measures it: Menlo 20px is 19 and 5 CSS pixels at scale 1, and
+    /// 37 and 9 device pixels at scale 2 (18.5 and 4.5).
+    #[test]
+    fn test_the_ascent_and_descent_are_each_rounded_to_a_device_pixel() {
+        assert_eq!(content_at(&menlo(), 16., 2.), (15., 4., 19.));
+        assert_eq!(content_at(&menlo(), 20., 2.), (18.5, 4.5, 23.));
+        assert_eq!(content_at(&menlo(), 24., 2.), (22.5, 5.5, 28.));
+        assert_eq!(content_at(&menlo(), 20., 1.), (19., 5., 24.));
+    }
+
     /// `helvetica.400.*`: the ascent is widened by 15% of the content area, rounded.
     #[test]
     fn test_the_ascent_of_a_widened_font_grows_by_a_sixth_of_the_content() {
@@ -2292,6 +2331,14 @@ mod line_box_tests {
             ..helvetica()
         };
         assert_eq!(content(&unwidened, 24.), (18., 6., 24.));
+    }
+
+    /// The 15% is of the content area in device pixels, rounded there: Helvetica 20px
+    /// gives 31 + 9 device pixels and 6 more, where at scale 1 it gives 15 + 5 and 3.
+    #[test]
+    fn test_the_widening_is_rounded_in_device_pixels() {
+        assert_eq!(content_at(&helvetica(), 20., 2.), (18.5, 4.5, 23.));
+        assert_eq!(content_at(&helvetica(), 12., 2.), (11., 3., 14.));
     }
 
     #[test]
@@ -2308,17 +2355,32 @@ mod line_box_tests {
     #[test]
     fn test_half_leading_is_floored_above_the_text() {
         // Menlo at 16px in a line of 20px: 1px over, so the ascent has none and the descent 1.
-        assert_eq!(extent_in_line(px(15.), px(4.), px(20.)), (px(15.), px(5.)));
+        assert_eq!(extent_in_line(px(15.), px(4.), px(20.), 1.), (px(15.), px(5.)));
         // 24px: 5px over, 2px above and 3 below.
-        assert_eq!(extent_in_line(px(15.), px(4.), px(24.)), (px(17.), px(7.)));
+        assert_eq!(extent_in_line(px(15.), px(4.), px(24.), 1.), (px(17.), px(7.)));
         // A line shorter than the text has a negative half-leading, floored toward the top:
         // `menlo.400.16.1` is 16px tall and its text starts 2px above it.
-        assert_eq!(extent_in_line(px(15.), px(4.), px(16.)), (px(13.), px(3.)));
+        assert_eq!(extent_in_line(px(15.), px(4.), px(16.), 1.), (px(13.), px(3.)));
         // A line height that is not a whole pixel gives the descent the rest.
         assert_eq!(
-            extent_in_line(px(15.), px(4.), px(20.390625)),
+            extent_in_line(px(15.), px(4.), px(20.390625), 1.),
             (px(15.), px(5.390625))
         );
+    }
+
+    /// The half-leading is floored in device pixels, so at scale 2 a line 5 CSS pixels
+    /// (10 device pixels) over the text puts 2.5 of them above it, and the 24px line around
+    /// Menlo 16px has its baseline at 17.5 (`atomic-trim-baseline-oracle.json`: 17.5).
+    #[test]
+    fn test_half_leading_is_floored_to_a_device_pixel() {
+        assert_eq!(extent_in_line(px(15.), px(4.), px(24.), 2.), (px(17.5), px(6.5)));
+        // 1 CSS pixel over is 2 device pixels: one above, at scale 1 none.
+        assert_eq!(extent_in_line(px(15.), px(4.), px(20.), 2.), (px(15.5), px(4.5)));
+        // 0.75 CSS pixel over is 1.5 device pixels: 0.75 floors to none.
+        assert_eq!(extent_in_line(px(15.), px(4.), px(19.75), 2.), (px(15.), px(4.75)));
+        // Below the text: -1.5 CSS pixels is -3 device pixels, -1.5 floors to -2.
+        assert_eq!(extent_in_line(px(15.), px(4.), px(16.), 2.), (px(13.5), px(2.5)));
+        assert_eq!(extent_in_line(px(15.), px(4.), px(24.), 4.), (px(17.5), px(6.5)));
     }
 
     #[test]

@@ -1154,8 +1154,17 @@ pub trait PlatformTextSystem: Send + Sync {
         params: &RenderGlyphParams,
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
-    /// Layout a line of text with the given font runs.
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
+    /// Layout a line of text with the given font runs, for a display of `scale_factor` device
+    /// pixels to a pixel: a shaper that measures the font as Chrome does rounds its ascent
+    /// and descent in device pixels ([`FontMetrics::line_box`]) and records the scale in the
+    /// layout.
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        scale_factor: f32,
+    ) -> LineLayout;
     /// Returns the recommended text rendering mode for the given font and size.
     fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
     -> TextRenderingMode;
@@ -1241,7 +1250,13 @@ impl PlatformTextSystem for NoopTextSystem {
         Ok((raster_bounds.size, Vec::new()))
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+        scale_factor: f32,
+    ) -> LineLayout {
         let mut position = px(0.);
         let metrics = self.font_metrics(FontId(0));
         let units_per_em = metrics.units_per_em as f32;
@@ -1270,8 +1285,8 @@ impl PlatformTextSystem for NoopTextSystem {
                     runs.push(ShapedRun {
                         font_id: FontId(0),
                         font_size: run_size,
-                        ascent: metrics.line_box(run_size).ascent,
-                        descent: metrics.line_box(run_size).descent,
+                        ascent: metrics.line_box(run_size, scale_factor).ascent,
+                        descent: metrics.line_box(run_size, scale_factor).descent,
                         line_height: font_run.line_height,
                         glyphs: Vec::new(),
                         inline: Default::default(),
@@ -1299,8 +1314,9 @@ impl PlatformTextSystem for NoopTextSystem {
         LineLayout {
             font_size,
             width: position,
-            ascent: metrics.line_box(font_size).ascent,
-            descent: metrics.line_box(font_size).descent,
+            ascent: metrics.line_box(font_size, scale_factor).ascent,
+            descent: metrics.line_box(font_size, scale_factor).descent,
+            scale_factor,
             runs,
             len: text.len(),
             boxes: Vec::new(),

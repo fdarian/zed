@@ -276,15 +276,27 @@ impl PlatformTextSystem for DirectWriteTextSystem {
             .rasterize_glyph(&self.components, params, raster_bounds)
     }
 
-    fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        self.state
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        scale_factor: f32,
+    ) -> LineLayout {
+        // The metrics are not rounded in device pixels here; the layout only records the scale.
+        let layout = self
+            .state
             .write()
             .layout_line(&self.components, text, font_size, runs)
             .log_err()
             .unwrap_or(LineLayout {
                 font_size,
                 ..Default::default()
-            })
+            });
+        LineLayout {
+            scale_factor,
+            ..layout
+        }
     }
 
     fn recommended_rendering_mode(
@@ -633,6 +645,7 @@ impl DirectWriteState {
                 width,
                 ascent,
                 descent,
+                scale_factor: 1.,
                 runs,
                 len: text.len(),
                 boxes: Vec::new(),

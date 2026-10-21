@@ -256,6 +256,7 @@ mod tests {
             insets: Box::default(),
             inline: Box::default(),
             line_height: Pixels::ZERO,
+            scale_bits: 1f32.to_bits(),
         })
     }
 

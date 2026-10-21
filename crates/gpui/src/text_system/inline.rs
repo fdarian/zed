@@ -260,6 +260,8 @@ pub(crate) struct LineMetrics {
     pub ascent: Pixels,
     pub descent: Pixels,
     pub x_height: Pixels,
+    /// The device pixels to a pixel the boxes are measured for.
+    pub scale_factor: f32,
 }
 
 struct Frame {
@@ -307,7 +309,7 @@ pub(crate) fn resolve_placements(
         let (font_size, ascent, descent, x_height) = match spec.content {
             SpecContent::Text { font_id, font_size } => {
                 let metrics = font_metrics(font_id);
-                let line_box = metrics.line_box(font_size);
+                let line_box = metrics.line_box(font_size, line.scale_factor);
                 (
                     font_size,
                     line_box.ascent,
@@ -320,7 +322,9 @@ pub(crate) fn resolve_placements(
         let own_line_height = spec.line_height.unwrap_or(line_height);
         // The extent of the inline box around the baseline of the box itself.
         let (above, below) = match spec.content {
-            SpecContent::Text { .. } => extent_in_line(ascent, descent, own_line_height),
+            SpecContent::Text { .. } => {
+                extent_in_line(ascent, descent, own_line_height, line.scale_factor)
+            }
             SpecContent::Atomic(extent) => (extent.ascent, extent.descent),
         };
 
@@ -509,6 +513,7 @@ pub(crate) fn apply_inline(
         width: layout.width,
         ascent: layout.ascent,
         descent: layout.descent,
+        scale_factor: layout.scale_factor,
         runs,
         len: layout.len,
         boxes: specs
