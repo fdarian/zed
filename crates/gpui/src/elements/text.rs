@@ -831,9 +831,10 @@ struct TextLayoutInner {
 }
 
 impl TextLayoutInner {
+    /// Counted from the top of the box, which `text-box-trim` starts below the top of the lines.
     fn first_baseline(&self) -> Option<Pixels> {
         let line = self.lines.first()?;
-        Some(line.rows(self.line_height).first()?.baseline)
+        Some(line.rows(self.line_height).first()?.baseline - self.trim_top)
     }
 
     /// Where the first line starts: above the unsnapped top of the bounds by the space the trim cut.
@@ -1387,13 +1388,15 @@ impl TextLayout {
     }
 
     /// The distance from the top of the text to the baseline of its first line, or `None`
-    /// for a text with no lines. It needs only the measure, not prepaint.
+    /// for a text with no lines. A trimmed text counts from the top of its trimmed box. It needs
+    /// only the measure, not prepaint.
     pub fn first_baseline(&self) -> Option<Pixels> {
         self.0.borrow().as_ref()?.first_baseline()
     }
 
     /// The distance from the top of the text to the baseline of its last line, or
-    /// `None` for a text with no lines. It needs only the measure, not prepaint.
+    /// `None` for a text with no lines. A trimmed text counts from the top of its trimmed box.
+    /// It needs only the measure, not prepaint.
     pub fn last_baseline(&self) -> Option<Pixels> {
         let element_state = self.0.borrow();
         let element_state = element_state.as_ref()?;
@@ -1406,7 +1409,7 @@ impl TextLayout {
         let row_top = rows[..rows.len() - 1]
             .iter()
             .fold(top, |top, row| top + row.height);
-        Some(row_top + last_row.baseline)
+        Some(row_top + last_row.baseline - element_state.trim_top)
     }
 
     /// The baseline of the run that the glyph at the byte `index` is in, as a y
@@ -3336,6 +3339,141 @@ mod tests {
             // The top is a whole pixel, so there is no phase: 9.457 and 8.73 round to 9.
             assert_eq!(painted_baseline(13., 28., false).0, 9.);
             assert_eq!(painted_baseline(12., 24., false).0, 9.);
+        }
+    }
+
+    /// The baselines of a trimmed text are counted from the top of its trimmed box, which is
+    /// where an `inline-block`, `inline-flex` or `inline-grid` holding it takes its own from (#66).
+    /// The numbers are from headless Chrome 155 on macOS, at device scale 1 and 2:
+    /// `<div style="font:16px/24px Menlo"><span style="display:inline-block"><div
+    /// style="text-box:{trim} {edge}"><span>Hello</span></div></span></div>`, the baseline being
+    /// 15 (the ascent of Menlo) plus how far the inner span's top is below the label's top. The
+    /// fixed text system here has the metrics of Menlo.
+    mod trimmed_baselines {
+        use super::*;
+        use crate::{
+            Context, FixedMetricsTextSystem, ParentElement as _, Render, Styled as _, TestApp,
+            TextBoxEdge, TextBoxOver, TextBoxUnder, div, px,
+        };
+
+        struct Label {
+            trim: TextBoxTrim,
+            over: TextBoxOver,
+            text: &'static str,
+            layout: Rc<RefCell<Option<TextLayout>>>,
+        }
+
+        impl Render for Label {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let text = StyledText::new(self.text).with_text_box_trim(self.trim);
+                *self.layout.borrow_mut() = Some(text.layout().clone());
+                let mut line = div().w(px(100.)).text_size(px(16.)).line_height(px(24.));
+                line.text_style().text_box_edge = Some(TextBoxEdge {
+                    over: self.over,
+                    under: TextBoxUnder::Alphabetic,
+                });
+                line.child(text)
+            }
+        }
+
+        fn baselines(
+            scale: f32,
+            trim: TextBoxTrim,
+            over: TextBoxOver,
+            text: &'static str,
+        ) -> (Pixels, Pixels, Pixels) {
+            let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+            app.set_window_scale_factor(scale);
+            let layout = Rc::new(RefCell::new(None));
+            let mut window = app.open_window({
+                let layout = layout.clone();
+                move |_, _| Label {
+                    trim,
+                    over,
+                    text,
+                    layout,
+                }
+            });
+            window.draw();
+            let layout = layout.borrow().clone().unwrap();
+            (
+                layout.first_baseline().unwrap(),
+                layout.last_baseline().unwrap(),
+                layout.bounds().size.height,
+            )
+        }
+
+        const NONE: TextBoxTrim = TextBoxTrim {
+            start: false,
+            end: false,
+        };
+        const START: TextBoxTrim = TextBoxTrim {
+            start: true,
+            end: false,
+        };
+        const END: TextBoxTrim = TextBoxTrim {
+            start: false,
+            end: true,
+        };
+        const BOTH: TextBoxTrim = TextBoxTrim {
+            start: true,
+            end: true,
+        };
+
+        fn assert_chrome(actual: Pixels, chrome: f32, what: &str) {
+            assert!(
+                (actual.0 - chrome).abs() <= 1. / 64. + 1e-4,
+                "{what}: {} != Chrome's {chrome}",
+                actual.0
+            );
+        }
+
+        #[test]
+        fn a_trim_at_the_start_moves_the_first_and_last_baseline_up_with_the_box() {
+            // [scale, trim, edge, baseline from the top of the box]
+            let cases = [
+                (1., BOTH, TextBoxOver::Cap, 11.671875),
+                (1., BOTH, TextBoxOver::Ex, 8.75),
+                (1., START, TextBoxOver::Cap, 11.671875),
+                (1., START, TextBoxOver::Ex, 8.75),
+                (2., BOTH, TextBoxOver::Cap, 11.6640625),
+                (2., BOTH, TextBoxOver::Ex, 8.75),
+                (2., START, TextBoxOver::Cap, 11.6640625),
+                (2., START, TextBoxOver::Ex, 8.75),
+            ];
+            for (scale, trim, over, chrome) in cases {
+                let (first, last, _) = baselines(scale, trim, over, "Hello");
+                assert_chrome(first, chrome, &format!("first baseline at {scale}x, {over:?}"));
+                assert_chrome(last, chrome, &format!("last baseline at {scale}x, {over:?}"));
+            }
+        }
+
+        #[test]
+        fn a_trim_at_the_end_or_none_leaves_the_baselines_where_the_line_has_them() {
+            // Chrome's 17 at scale 1. At scale 2 it has 17.5, half-leading to the device pixel,
+            // which the line here still shares out in whole pixels: the baselines are the line's
+            // either way, whatever the trim.
+            for scale in [1., 2.] {
+                let (untrimmed, _, _) = baselines(scale, NONE, TextBoxOver::Cap, "Hello");
+                if scale == 1. {
+                    assert_chrome(untrimmed, 17., "baseline of a line");
+                }
+                for (trim, over) in [(END, TextBoxOver::Cap), (END, TextBoxOver::Ex)] {
+                    let (first, last, _) = baselines(scale, trim, over, "Hello");
+                    assert_chrome(first, untrimmed.0, &format!("first baseline at {scale}x"));
+                    assert_chrome(last, untrimmed.0, &format!("last baseline at {scale}x"));
+                }
+            }
+        }
+
+        #[test]
+        fn the_last_baseline_of_wrapped_rows_is_a_line_height_per_row_below_the_first() {
+            // "Hello Hello" in 100px of Menlo's 9.6px advances is two rows.
+            for trim in [NONE, START, BOTH] {
+                let (first, last, height) = baselines(1., trim, TextBoxOver::Cap, "Hello Hello");
+                assert_chrome(last, (first + px(24.)).0, "last baseline one row below the first");
+                assert!(height >= px(24.), "two rows: {height:?}");
+            }
         }
     }
 
