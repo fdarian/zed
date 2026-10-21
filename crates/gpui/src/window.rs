@@ -89,6 +89,7 @@ use self::a11y::ROOT_NODE_ID;
 use crate::tab_stop::{LiftedMarker, LiftedTabStops, PaintedChild, TabStopOperation};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_down,
+    round_half_up,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_thickness_to_device_pixel,
     round_to_device_pixel, round_to_device_pixel_down, snap_border_width_to_device_pixel,
     split_glyph_origin,
@@ -1778,6 +1779,9 @@ pub struct Window {
     visibility: Visibility,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
+    /// How far each atomic inline being prepainted is from the device pixel it is painted on (see
+    /// [`Window::with_unsnapped_element_origin`]), innermost last.
+    pub(crate) origin_phase_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     /// How many boxes were prepainted so far that sit outside the clip they were prepainted in,
@@ -2555,6 +2559,7 @@ impl Window {
             visibility: Visibility::Visible,
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
+            origin_phase_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             escapes_prepainted: 0,
             exact_clips: None,
@@ -6007,6 +6012,33 @@ impl Window {
         result
     }
 
+    /// Runs `f`, the prepaint of an element placed at `origin`, the window position its layout
+    /// puts it at before it is snapped to a device pixel, as an atomic inline is placed on its
+    /// line. A box is painted where its position rounds half up to a device pixel, as Chrome
+    /// paints one, and [`Self::layout_unsnapped_bounds`] keeps the fraction: the element offset
+    /// is the device pixel and [`Self::element_origin_phase`] is what is left of `origin`. This
+    /// method should only be called during the prepaint phase of element drawing.
+    pub fn with_unsnapped_element_origin<R>(
+        &mut self,
+        origin: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+
+        let scale_factor = self.scale_factor();
+        let snapped = origin.map(|c| px(round_half_up(c.0 * scale_factor) / scale_factor));
+        self.origin_phase_stack.push(origin - snapped);
+        let result = self.with_absolute_element_offset(snapped, f);
+        self.origin_phase_stack.pop();
+        result
+    }
+
+    /// How far the atomic inline being prepainted is from the device pixel it is painted on, see
+    /// [`Self::with_unsnapped_element_origin`]. Zero outside one.
+    pub(crate) fn element_origin_phase(&self) -> Point<Pixels> {
+        self.origin_phase_stack.last().copied().unwrap_or_default()
+    }
+
     /// Paints `f` as a group that is composited as a whole with `effect`: its opacity, filters,
     /// mask and clip path apply to everything `f` paints, not to each primitive. `reserved` pins
     /// the group's place in the stacking order to those bounds rather than to what it covers
@@ -7605,7 +7637,9 @@ impl Window {
     /// The scroll offset around the box is the one the box is painted at, snapped to the device
     /// pixel as in [`Self::layout_bounds`], and not the raw one: it is also how far a relocated
     /// replay moves what was recorded (see [`Retained::on_replay_translated`]), so that bounds
-    /// kept from the build and moved by it are the ones a build reports.
+    /// kept from the build and moved by it are the ones a build reports. An atomic inline around
+    /// the box keeps the fraction of its origin ([`Self::with_unsnapped_element_origin`]), which a
+    /// move by whole device pixels leaves as it is.
     ///
     /// This method should only be called as part of element drawing.
     pub fn layout_unsnapped_bounds(&mut self, layout_id: LayoutId) -> Bounds<Pixels> {
@@ -7617,7 +7651,7 @@ impl Window {
             .as_mut()
             .unwrap()
             .layout_unsnapped_bounds(layout_id, scale_factor);
-        bounds.origin += self.pixel_snap_point(self.element_offset());
+        bounds.origin += self.pixel_snap_point(self.element_offset()) + self.element_origin_phase();
         bounds
     }
 

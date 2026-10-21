@@ -204,6 +204,7 @@ struct Surroundings {
     content_mask: ContentMask<Pixels>,
     exact_clips: Option<Rc<ExactClips>>,
     element_offset: Point<Pixels>,
+    origin_phase: Point<Pixels>,
     element_opacity: f32,
     positioned_frame: Option<PositionedFrame>,
     image_cache: Option<AnyImageCache>,
@@ -476,6 +477,7 @@ impl Window {
             exact_clips: self.exact_clips.clone(),
             // Read from the stack: painting has no use for the offset, and may not ask for it.
             element_offset: self.element_offset_stack.last().copied().unwrap_or_default(),
+            origin_phase: self.element_origin_phase(),
             element_opacity: self.element_opacity,
             positioned_frame: self.positioned_frames.last().copied(),
             image_cache: self.image_cache_stack.last().cloned(),
@@ -628,6 +630,7 @@ impl Window {
         self.rendered_entity_stack.push(unit.context.current_view);
         self.rem_size_override_stack.push(unit.context.rem_size);
         self.element_offset_stack.push(unit.element_offset);
+        self.origin_phase_stack.push(unit.origin_phase);
         self.content_mask_stack.push(unit.content_mask);
         if let Some(image_cache) = &unit.image_cache {
             self.image_cache_stack.push(image_cache.clone());
@@ -641,6 +644,7 @@ impl Window {
             self.image_cache_stack.pop();
         }
         self.content_mask_stack.pop();
+        self.origin_phase_stack.pop();
         self.element_offset_stack.pop();
         self.rem_size_override_stack.pop();
         self.rendered_entity_stack.pop();

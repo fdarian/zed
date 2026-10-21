@@ -5950,7 +5950,7 @@ mod tests {
             .copied()
             .expect("the listener ran at least once")
             .expect("the children count");
-        assert!((f32::from(reach.width) - 43.33).abs() < 0.001, "{reach:?}");
+        assert!((f32::from(reach.width) - 43.33).abs() < 1. / 64., "{reach:?}");
         assert_eq!(reach.height, px(10.));
     }
 

@@ -839,3 +839,71 @@ fn nowrap_text_with_atomic_has_min_content_of_its_boxes() {
     assert!(nowrap < max_content, "nowrap item is {nowrap} wide, the max-content size {max_content}");
     assert!((nowrap - expected).abs() < 0.02, "nowrap item is {nowrap} wide, not {expected}");
 }
+
+/// An atomic inline keeps the fraction of its place in the line in the box layout reports, and is
+/// painted where that place rounds half up to a device pixel, as Chrome does for an atomic inline
+/// whose line top is on a tie (`y = 100.5` at scale 1, the odd quarters at scale 2).
+#[test]
+fn atomic_inline_keeps_its_fraction_and_is_painted_half_up() {
+    use crate::AtomicInline;
+    for scale in [1., 2.] {
+        let mut base_offset = None;
+        for (left, top) in [(20., 100.), (20.5, 100.5), (20.25, 100.25), (20.75, 100.75), (20.5, 101.5)] {
+            let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+            app.set_window_scale_factor(scale);
+            let out = Out::default();
+            let mut window = app.open_window({
+                let out = out.clone();
+                move |_, _| Page {
+                    build: Box::new(move |out| {
+                        let object = crate::OBJECT_REPLACEMENT_CHARACTER;
+                        let styled = StyledText::new(format!("ab {object}"))
+                            .with_atomic_inlines(vec![AtomicInline::new(
+                                3,
+                                div()
+                                    .w(px(20.))
+                                    .h(px(20.))
+                                    .bg(crate::red())
+                                    .on_prepainted_layout({
+                                        let out = out.clone();
+                                        move |_, id, window, _| {
+                                            let bounds = window.layout_unsnapped_bounds(id);
+                                            out.borrow_mut().push((bounds, TextLayout::default()));
+                                        }
+                                    })
+                                    .into_any_element(),
+                            )]);
+                        div()
+                            .relative()
+                            .size(px(1000.))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(left))
+                                    .top(px(top))
+                                    .w(px(300.))
+                                    .text_size(px(14.))
+                                    .line_height(px(24.))
+                                    .child(styled),
+                            )
+                            .into_any_element()
+                    }),
+                    out,
+                }
+            });
+            window.draw();
+            let atomic = out.borrow().last().expect("the atomic was prepainted").0;
+            let quads = window.update(|_, window, _| window.painted_quads());
+            let painted = quads.iter().find(|quad| quad.bounds.size.height.0 == 20. * scale).expect("the atomic is painted");
+
+            let offset = (atomic.origin.x.0 - left, atomic.origin.y.0 - top);
+            let base = *base_offset.get_or_insert(offset);
+            assert!(
+                (offset.0 - base.0).abs() < 0.01 && (offset.1 - base.1).abs() < 0.01,
+                "scale {scale}, at ({left}, {top}) the atomic is ({offset:?}) from the paragraph, as it is at a whole pixel: {base:?}"
+            );
+            assert_eq!(painted.bounds.origin.x.0, (atomic.origin.x.0 * scale + 0.5).floor(), "scale {scale}, x at ({left}, {top})");
+            assert_eq!(painted.bounds.origin.y.0, (atomic.origin.y.0 * scale + 0.5).floor(), "scale {scale}, y at ({left}, {top})");
+        }
+    }
+}

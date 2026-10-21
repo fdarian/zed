@@ -825,6 +825,10 @@ struct TextLayoutInner {
     /// a box does not land a row off when the snap went the other way. The relocation of a
     /// retained root moves by whole pixels, which leaves it as it is.
     phase_y: Pixels,
+    /// How far the box origin is from the snapped one before taffy snaps it, in both axes and with
+    /// the fraction of the atomic inline around the text. Atomic inlines of the text are placed from
+    /// the origin this gives, as the layout puts it, and are snapped where they are painted.
+    phase: Point<Pixels>,
     /// A hash of what the lines are painted with ([`TextRun::hash_painted`]), which the layout
     /// node keeps its measure across.
     paint_hash: u64,
@@ -843,6 +847,13 @@ impl TextLayoutInner {
             bounds.origin.x,
             bounds.origin.y + self.phase_y - self.trim_top,
         )
+    }
+
+    /// How far the first line starts from [`Self::line_origin`] in layout: the fraction that
+    /// glyphs do not take, because they are placed on a device pixel (the x of the origin) or
+    /// rounded once from it (the y).
+    fn unsnapped_offset(&self) -> Point<Pixels> {
+        point(self.phase.x, self.phase.y - self.phase_y)
     }
 }
 
@@ -975,6 +986,7 @@ impl TextLayout {
                             size: Some(Size::default()),
                             bounds: None,
                             phase_y: Pixels::ZERO,
+                            phase: Point::default(),
                             paint_hash,
                         });
                     }
@@ -1190,6 +1202,7 @@ impl TextLayout {
                     size: Some(size),
                     bounds: None,
                     phase_y: Pixels::ZERO,
+                    phase: Point::default(),
                     paint_hash,
                 };
                 let first_baseline = inner.first_baseline();
@@ -1254,13 +1267,16 @@ impl TextLayout {
                 .with_context(|| format!("measurement has not been performed on {text}"))
                 .unwrap();
             element_state.bounds = Some(bounds);
-            element_state.phase_y = match self.1.get() {
+            element_state.phase = match self.1.get() {
                 Some(layout_id) => {
-                    window.layout_unsnapped_bounds(layout_id).origin.y
-                        - window.layout_bounds(layout_id).origin.y
+                    window.layout_unsnapped_bounds(layout_id).origin
+                        - window.layout_bounds(layout_id).origin
                 }
-                None => Pixels::ZERO,
+                None => Point::default(),
             };
+            // The glyphs of a text in an atomic inline are placed from the device pixel the atomic
+            // is painted on, as they were when its offset was snapped.
+            element_state.phase_y = element_state.phase.y - window.element_origin_phase().y;
         }
         if window.tracks_relocation() {
             let target = self.0.clone();
@@ -1357,9 +1373,21 @@ impl TextLayout {
         self.1.get()
     }
 
+    /// How far the first line starts from where layout puts the text, which is the origin of
+    /// its bounds before taffy and the atomic inline around it snap it to a device pixel, less
+    /// where glyphs are painted: the position of something measured from the painted lines (a
+    /// span's box) is that position moved by this one in layout. Needs prepaint.
+    pub fn unsnapped_offset(&self) -> Point<Pixels> {
+        self.0
+            .borrow()
+            .as_ref()
+            .expect("measurement has not been performed")
+            .unsnapped_offset()
+    }
+
     /// Where the top left corner of the margin box of each atomic inline is, in window
-    /// coordinates, with the byte of its placeholder. `align` is the text alignment the
-    /// text is painted with.
+    /// coordinates, with the byte of its placeholder, as layout puts it and not snapped to a
+    /// device pixel. `align` is the text alignment the text is painted with.
     pub fn atomic_origins(
         &self,
         align: crate::TextAlign,
@@ -1374,12 +1402,13 @@ impl TextLayout {
         let line_height = element_state.line_height;
 
         let mut origins = SmallVec::new();
+        let unsnapped_offset = element_state.unsnapped_offset();
         let mut line_origin = element_state.line_origin(bounds);
         let mut line_start_ix = 0;
         for line in element_state.lines.iter() {
             for (index, origin) in line.object_origins(line_origin, line_height, align, Some(bounds))
             {
-                origins.push((line_start_ix + index, origin));
+                origins.push((line_start_ix + index, origin + unsnapped_offset));
             }
             line_origin.y += line.size(line_height).height;
             line_start_ix += line.len() + 1;
@@ -2205,6 +2234,7 @@ mod tests {
                     align: Default::default(),
                     size: None,
                     phase_y: Pixels::ZERO,
+                    phase: Point::default(),
                     paint_hash: 0,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),
@@ -2279,6 +2309,7 @@ mod tests {
                     align: Default::default(),
                     size: None,
                     phase_y: Pixels::ZERO,
+                    phase: Point::default(),
                     paint_hash: 0,
                     bounds: Some(Bounds::new(
                         point(px(10.), px(100.)),

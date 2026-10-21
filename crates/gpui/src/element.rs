@@ -1001,6 +1001,23 @@ impl AnyElement {
         })
     }
 
+    /// [`Self::prepaint_at`] for an element placed at an origin that layout has not snapped to a
+    /// device pixel, such as an atomic inline in its line: the element is painted at the device
+    /// pixel the origin rounds half up to and reports bounds from the origin itself, see
+    /// [`Window::with_unsnapped_element_origin`].
+    pub fn prepaint_at_unsnapped(
+        &mut self,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<FocusHandle> {
+        window.with_unsnapped_element_origin(origin, |window| {
+            window.with_lift_barrier(|window| {
+                window.with_positioned_frame(|window| self.prepaint(window, cx))
+            })
+        })
+    }
+
     /// Performs layout on this element in the available space, then prepaints it at the given absolute origin.
     /// If any element in the subtree beneath this element is focused, its FocusHandle is returned.
     pub fn prepaint_as_root(

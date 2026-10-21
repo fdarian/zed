@@ -422,7 +422,7 @@ impl AtomicInlines {
                 let origin = *origin
                     + crate::point(slot.used_margin.left, slot.used_margin.top)
                     + offset;
-                slot.element.prepaint_at(origin, window, cx);
+                slot.element.prepaint_at_unsnapped(origin, window, cx);
             }
         });
     }
