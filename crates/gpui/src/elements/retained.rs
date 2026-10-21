@@ -68,7 +68,7 @@
 //! that before the subtree is built.
 
 use crate::{
-    Origin, StateOwner, AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
+    Origin, StateOwner, AnyElement, App, Bounds, Edges, Element, ElementId, Escape, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, NonReusable, PaintRecord, Pixels, Point, PrepaintRecord,
     Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
     blocker_bit, first_blocker, IsZero, SubtreeText, scene::PrimitiveCount,
@@ -470,6 +470,10 @@ struct Recorded {
     /// What [`Window::repaint_in_place`] needs of the surroundings, for a patchable subtree whose
     /// recording is plain.
     patch: Option<Rc<PatchUnit>>,
+    /// Whether the root is `position: absolute` against a containing block outside the subtree.
+    /// Layout rewrites its node from that block when it is requested in a pass, which a frame that
+    /// skips the subtree does not do, so the recording is a source for a patch and is not skipped.
+    root_escapes: bool,
 }
 
 impl Recorded {
@@ -763,6 +767,18 @@ pub(crate) fn replay_hole_paint(hole: &crate::window::Hole, window: &mut Window,
 }
 
 impl Retained {
+    /// Whether the root is `position: absolute` against a block outside it, so that layout places its
+    /// node after the request.
+    fn root_escapes(element: &AnyElement) -> bool {
+        element.escapes_to() == Some(Escape::ContainingBlock)
+    }
+
+    /// Whether the root escapes and the recording of it is of no use: only a patch repaints a root
+    /// that is placed by a block outside it, from the layout the frame it was recorded in left.
+    fn root_escapes_unrecorded(&self, element: &AnyElement) -> bool {
+        Self::root_escapes(element) && !(self.patchable && self.overscan.is_none())
+    }
+
     fn request_layout_in_scope(
         &mut self,
         global_id: &GlobalElementId,
@@ -804,7 +820,8 @@ impl Retained {
                 && state.engine == window.layout_engine_id()
                 && window.layout_node_alive(state.root)
                 && state.recorded.as_ref().is_some_and(|recorded| {
-                    recorded.is_placed_in(window.rendered_serial())
+                    !recorded.root_escapes
+                        && recorded.is_placed_in(window.rendered_serial())
                         && recorded.paint.is_some()
                         && recorded.key.shapes_layout_like(window)
                         && recorded.lifted_paint_from_recordings(window)
@@ -830,7 +847,8 @@ impl Retained {
                 })
             });
             let unreusable = (window.unstable_layout_requests() != unstable_before
-                || window.layout_requests_escape(root, escapable_before))
+                || window.layout_requests_escape(root, escapable_before)
+                || self.root_escapes_unrecorded(&element))
             .then_some(NonReusable::UnstableLayout);
             let state = RetainedState {
                 id,
@@ -897,10 +915,12 @@ impl Retained {
                 }
                 let root = self.root(global_id, window);
                 let key = window.replay_key(bounds, root);
+                let root_escapes = Self::root_escapes(&element);
                 let (record, relocation) = self.record_prepaint(
                     global_id,
                     key,
                     unreusable,
+                    root_escapes,
                     window,
                     cx,
                     |window, cx| {
@@ -941,8 +961,8 @@ fn request_subtree_layout(
         "the root of a retained subtree is lifted as its element says"
     );
     debug_assert!(
-        element.escapes_to().is_none(),
-        "the root of a retained subtree does not escape"
+        element.escapes_to().is_none_or(|escape| escape == Escape::ContainingBlock),
+        "the root of a retained subtree is not fixed to the viewport"
     );
     element.request_layout(window, cx)
 }
@@ -971,7 +991,8 @@ impl Retained {
                         && state.engine == window.layout_engine_id()
                         && window.layout_node_alive(state.root)
                         && state.recorded.as_ref().is_some_and(|recorded| {
-                            recorded.is_placed_in(window.rendered_serial())
+                            !recorded.root_escapes
+                                && recorded.is_placed_in(window.rendered_serial())
                                 && recorded.paint.is_some()
                                 && recorded.key.shapes_layout_like(window)
                                 && recorded.lifted_paint_from_recordings(window)
@@ -1331,7 +1352,8 @@ impl Retained {
             })
         });
         let unstable = window.unstable_layout_requests() != unstable_before
-            || window.layout_requests_escape(built_root, escapable_before);
+            || window.layout_requests_escape(built_root, escapable_before)
+            || self.root_escapes_unrecorded(&element);
         let counters_after = window.engine_counters();
         let mismatch = built_root != root
             || counters_after.nodes_created != counters_before.nodes_created
@@ -1399,8 +1421,9 @@ impl Retained {
                 relocation: None,
             };
         }
+        let root_escapes = Self::root_escapes(&element);
         let (record, relocation) =
-            self.record_prepaint(global_id, key, unreusable, window, cx, |window, cx| {
+            self.record_prepaint(global_id, key, unreusable, root_escapes, window, cx, |window, cx| {
                 element.prepaint(window, cx);
             });
         RetainedPrepaint::Built {
@@ -1417,6 +1440,7 @@ impl Retained {
         global_id: &GlobalElementId,
         key: ReplayKey,
         unreusable: Option<NonReusable>,
+        root_escapes: bool,
         window: &mut Window,
         cx: &mut App,
         prepaint: impl FnOnce(&mut Window, &mut App),
@@ -1480,6 +1504,7 @@ impl Retained {
                         delta: Point::default(),
                         lift_base: None,
                         patch,
+                        root_escapes,
                     });
                     window.note_retained_recording((state.id.clone(), TypeId::of::<RetainedState>()), origin);
                     true

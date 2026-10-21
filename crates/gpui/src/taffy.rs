@@ -674,15 +674,22 @@ impl TaffyLayoutEngine {
     }
 
     /// Whether an escapable node requested since `since` (an [`Self::escapable_requests`]) has a
-    /// containing block outside the subtree of `root`: it is `root` itself, it is fixed, or no
-    /// ancestor of it up to `root` is positioned. Such a node is rewritten after layout against a
-    /// box that the subtree does not hold, so a frame cannot keep the subtree's nodes. One
-    /// whose containing block is inside is rewritten against boxes that the subtree lays out
-    /// alone, and keeps what it was rewritten to for as long as the nodes do.
+    /// containing block outside the subtree of `root`: it is fixed, or no ancestor of it up to
+    /// `root` is positioned. Such a node is rewritten after layout against a box that the subtree
+    /// does not hold, so a frame cannot keep the subtree's nodes. One whose containing block is
+    /// inside is rewritten against boxes that the subtree lays out alone, and keeps what it was
+    /// rewritten to for as long as the nodes do.
+    ///
+    /// `root` itself, if it is `position: absolute`, does not count: whether its own box can be kept
+    /// is for the caller to decide, since only its parent and the nodes above it say where it is.
+    /// What is below it is positioned against it, or against a box inside it.
     pub(crate) fn escapes_subtree(&self, root: LayoutId, since: usize) -> bool {
         self.escapable_nodes[since..].iter().any(|&id| {
-            if id == root || self.meta(id).escapable().kind == containing_block::EscapableKind::Fixed {
+            if self.meta(id).escapable().kind == containing_block::EscapableKind::Fixed {
                 return true;
+            }
+            if id == root {
+                return false;
             }
             let Some(parent) = self.taffy.parent(id.0) else { return true };
             let mut current = LayoutId(parent);

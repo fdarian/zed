@@ -18,8 +18,10 @@
 //! later by the context, in the ones that are then, so it leaves both, and a patch prepaints it
 //! directly (it is not lifted again, and its new element must say the same `lift_z`) and paints it
 //! in the second. Its operations are inside the range the context painted for the element around
-//! it, and the patch overwrites its own. A positioned root that stays in its parent's box
-//! (`position: absolute`) is one too; a root that escapes to a block outside is not.
+//! it, and the patch overwrites its own. A positioned root (`position: relative`) is one too, and so
+//! is an `absolute` one, whose node layout rewrote against its containing block in the frame it was
+//! recorded in (a frame builds it whole every time, as it is never skipped); one fixed to the
+//! viewport is not.
 
 use super::*;
 use crate::elements::RetainedState;
@@ -676,9 +678,10 @@ impl Window {
         if matches!(around.placement, Placement::Deferred { paint: None }) {
             return Err(PatchDecline::StaleRecording);
         }
-        // A root that is lifted stays where the stacking context orders it, and one that escapes
-        // is placed by a block outside.
-        if unit.element.lift_z() != around.lift_z || unit.element.escapes_to().is_some() {
+        // A root that is lifted stays where the stacking context orders it. One that is fixed to the
+        // viewport is placed by a box this patch does not know; an absolute one is placed by its
+        // containing block, which the surroundings restore, at the node the recording's frame left.
+        if unit.element.lift_z() != around.lift_z || unit.element.escapes_to() == Some(Escape::Viewport) {
             return Err(PatchDecline::Surroundings);
         }
         let effects = self.effects();

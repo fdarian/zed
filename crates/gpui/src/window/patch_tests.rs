@@ -5,7 +5,7 @@ use crate::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Context, Element, ElementId, FrameWorkCounters, GlobalElementId, Hsla,
     FocusHandle, InspectorElementId, InteractiveElement, IntoElement, LayoutId, ParentElement, PatchCounters, PatchDecline, PatchOutcome, Pixels,
     Render, Retained, RetainedCounters, ScrollHandle, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div, green,
-    hsla, point, px, red, retained, size,
+    hsla, point, Position, px, red, retained, size,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -32,6 +32,10 @@ struct Knobs {
     nudge: Cell<bool>,
     /// The patcher gives the unit an absolute root.
     absolute: Cell<bool>,
+    /// The patcher gives the unit a root fixed to the viewport.
+    fixed: Cell<bool>,
+    /// How far the page is padded on the left, which moves a containing block in it.
+    shift: Cell<f32>,
     /// The opacity the page gives a lifted unit, if not the one that follows the tick.
     page_opacity: Cell<Option<f32>>,
     /// An animation of the unit's opacity is current, in the page and in the patcher.
@@ -151,6 +155,10 @@ fn unit_element(
     match lift {
         Lift::No => {}
         Lift::Absolute => unit = unit.absolute().left(px(10.)).top(px(2.)).z_index(0),
+        Lift::Escaping | Lift::Fixed => {
+            unit = unit.absolute().left(px(10.)).top(px(2.)).z_index(0);
+            unit.style().position = Some(if lift == Lift::Fixed { Position::Fixed } else { Position::AbsoluteInAncestor });
+        }
         _ => unit = unit.lifted(),
     }
     unit.into_any_element()
@@ -215,6 +223,10 @@ enum Lift {
     InsideRoot,
     /// Positioned in its parent.
     Absolute,
+    /// `position: absolute` against the nearest positioned ancestor, as CSS has it, wherever that is.
+    Escaping,
+    /// `position: fixed`.
+    Fixed,
 }
 
 struct Page {
@@ -249,7 +261,7 @@ impl Page {
 impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows;
-        let mut content = div().id("content").flex().flex_col().w(px(400.));
+        let mut content = div().id("content").flex().flex_col().w(px(400.)).pl(px(self.knobs.shift.get()));
         let tall = if self.scroll.is_some() { 30. } else { 1. };
         // In a scroller the unit is first, so that scrolling moves it.
         if self.scroll.is_some() {
@@ -355,6 +367,9 @@ impl Fixture {
                             unit_element(tick, width, opacity, knobs.opacity_animation.get(), knobs.hot.get(), lift, focus.as_ref());
                         if knobs.absolute.get() {
                             element = div().id(UNIT).absolute().w(px(100.)).h(px(30.)).bg(color(tick)).into_any_element();
+                        }
+                        if knobs.fixed.get() {
+                            element = unit_element(tick, width, opacity, false, Hot::Same, Lift::Fixed, focus.as_ref());
                         }
                         if knobs.nudge.get() {
                             element = Nudge(element).into_any_element();
@@ -1230,4 +1245,104 @@ fn a_root_under_a_lifted_box_keeps_the_hitboxes_the_frame_had(cx: &mut TestAppCo
         page.draw_whole(cx);
         assert_same(&patched, &page.snapshot(cx), &format!("case {at}: a hovered root under a lifted box"));
     }
+}
+
+/// Where the box the unit paints is, in the scene of the rendered frame: the quad of the size the
+/// unit has and the color of the tick.
+fn unit_origin(page: &Fixture, cx: &mut TestAppContext) -> (f32, f32) {
+    cx.update_window(page.window, |_, window, _| {
+        let scale = window.scale_factor();
+        let quad = window
+            .rendered_frame
+            .scene
+            .quads
+            .iter()
+            .find(|quad| (quad.bounds.size.width.0 - 100. * scale).abs() < 0.01 && (quad.bounds.size.height.0 - 30. * scale).abs() < 0.01)
+            .expect("the page paints the unit");
+        (quad.bounds.origin.x.0 / scale, quad.bounds.origin.y.0 / scale)
+    })
+    .unwrap()
+}
+
+const ESCAPING_IN: [Around; 6] =
+    [Around::Nothing, Around::Relative, Around::Nested, Around::Opacity, Around::Absolute, Around::Deep];
+
+#[gpui::test]
+fn an_absolute_root_is_repainted_in_place_wherever_its_containing_block_is(cx: &mut TestAppContext) {
+    for (at, around) in ESCAPING_IN.into_iter().enumerate() {
+        let options = Options { lift: Lift::Escaping, around, ..Default::default() };
+        let (small, patches, _) = ticks_on_a_page_with(cx, 3, options, 6);
+        assert_eq!(patches.total_declines(), 0, "case {at}");
+        let (large, _, _) = ticks_on_a_page_with(cx, 40, options, 6);
+        assert_eq!(
+            (small.prepainted, small.painted_primitives),
+            (large.prepainted, large.painted_primitives),
+            "case {at}: the work of a tick does not follow the page"
+        );
+    }
+}
+
+#[gpui::test]
+fn an_absolute_root_is_placed_by_its_containing_block_and_repainted_there(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 4, Options { lift: Lift::Escaping, around: Around::Relative, ..Default::default() });
+    page.tick(cx);
+    let (x, y) = unit_origin(&page, cx);
+    assert_eq!((x, y), (10., 4. + 2.), "10 and 2 inside the relative box, which is under four rows of one pixel");
+    for _ in 0..3 {
+        page.tick(cx);
+    }
+    assert_eq!(unit_origin(&page, cx), (x, y));
+
+    // The containing block moves: a frame built whole places the unit again, and the ticks after it
+    // paint it there.
+    page.knobs.shift.set(40.);
+    cx.update_window(page.window, |view, window, cx| {
+        view.downcast::<Page>().unwrap().update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    assert_eq!(unit_origin(&page, cx), (x + 40., y), "a retained root that is placed by a block is built by the frame");
+    let patched_before = page.patches(cx).patched_frames;
+    for _ in 0..3 {
+        page.tick(cx);
+    }
+    let patches = page.patches(cx);
+    assert_eq!((patches.patched_frames - patched_before, patches.total_declines()), (3, 0));
+    assert_eq!(unit_origin(&page, cx), (x + 40., y));
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "an absolute root after its containing block moved");
+}
+
+#[gpui::test]
+fn an_absolute_root_is_built_by_every_frame_and_never_skipped(cx: &mut TestAppContext) {
+    let builds = |cx: &mut TestAppContext, lift| {
+        let page = Fixture::with(cx, 3, Options { lift, around: Around::Relative, ..Default::default() });
+        let before = page.retained(cx);
+        for _ in 0..3 {
+            // The key of the root is the same: only a view that renders again asks for it.
+            cx.update_window(page.window, |view, window, cx| {
+                view.downcast::<Page>().unwrap().update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+        let after = page.retained(cx);
+        (after.hits - before.hits, after.builds - before.builds, after.replays - before.replays)
+    };
+    // The rows beside it are skipped and replayed in both pages.
+    let (hits_escaping, builds_escaping, replays_escaping) = builds(cx, Lift::Escaping);
+    let (hits_alone, builds_alone, replays_alone) = builds(cx, Lift::Alone);
+    assert_eq!((hits_alone - hits_escaping, replays_alone - replays_escaping), (3, 3), "a root that is skipped in each frame");
+    assert_eq!(builds_escaping - builds_alone, 3, "and the one that is placed by a block is built in each");
+}
+
+#[gpui::test]
+fn a_root_fixed_to_the_viewport_is_not_repainted_in_place(cx: &mut TestAppContext) {
+    // Recorded as an absolute root, given a fixed one.
+    let page = Fixture::with(cx, 3, Options { lift: Lift::Escaping, around: Around::Relative, ..Default::default() });
+    page.knobs.fixed.set(true);
+    page.tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!((patches.patched_frames, patches.declines(PatchDecline::Surroundings)), (0, 1));
 }
