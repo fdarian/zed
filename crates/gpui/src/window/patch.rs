@@ -13,11 +13,13 @@
 //! rendered scene are overwritten and its primitives are made again from the log, and nothing else
 //! of the frame is touched. Anything else declines, and the frame is drawn whole.
 //!
-//! A root that is handed to a stacking context ([`crate::Retained::lift_z`]) is prepainted in the
-//! surroundings of its parent and painted later by the context, in the ones that are then, so it
-//! leaves both, and a patch prepaints it directly (it is not lifted again, and its new element
-//! must say the same `lift_z`) and paints it in the second. A positioned root that stays in its
-//! parent's box (`position: absolute`) is one too; a root that escapes to a block outside is not.
+//! A root that is handed to a stacking context ([`crate::Retained::lift_z`]), or is inside an
+//! element that is, however many deep, is prepainted in the surroundings of its parent and painted
+//! later by the context, in the ones that are then, so it leaves both, and a patch prepaints it
+//! directly (it is not lifted again, and its new element must say the same `lift_z`) and paints it
+//! in the second. Its operations are inside the range the context painted for the element around
+//! it, and the patch overwrites its own. A positioned root that stays in its parent's box
+//! (`position: absolute`) is one too; a root that escapes to a block outside is not.
 
 use super::*;
 use crate::elements::RetainedState;
@@ -35,8 +37,7 @@ pub enum PatchDecline {
     Refreshing,
     /// No patchable root is registered under an id: it is not patchable, was not recorded in the
     /// rendered frame as a plain recording (no stacking context handed to, no relocation, not
-    /// culled, not lifted below another lifted element), shares its id with another, or is named
-    /// twice.
+    /// culled), shares its id with another, or is named twice.
     UnknownUnit,
     /// The recording of the root is not the one of the rendered frame, or its layout changed
     /// since.
@@ -178,6 +179,9 @@ pub(crate) enum PatchedFrame {
 pub(crate) struct PatchUnit {
     id: GlobalElementId,
     name: ElementId,
+    /// What the root says of itself, which its new element must say too: whether it is handed to
+    /// a stacking context depends on the parent, which a patch does not build.
+    lift_z: Option<i32>,
     prepaint: Surroundings,
     placement: Placement,
 }
@@ -192,9 +196,9 @@ impl PatchUnit {
 enum Placement {
     /// In the tree, under the surroundings it was prepainted in.
     InPlace,
-    /// Handed to the stacking context around it, which paints it later under the surroundings it
-    /// has then. `None` until the root has painted.
-    Lifted { z: i32, paint: Option<Surroundings> },
+    /// The root, or an element around it, is handed to a stacking context, which paints it later
+    /// under the surroundings it has then. `None` until the root has painted.
+    Deferred { paint: Option<Surroundings> },
 }
 
 /// The state of the window around a root while it is prepainted or painted.
@@ -423,40 +427,43 @@ impl Window {
     }
 
     /// What a retained root `id` needs to be painted again where it is being prepainted, if it can
-    /// be: the surroundings are plain, with nothing handed to a stacking context around it, unless
-    /// the root is the element that is (`lift_z`, see [`crate::Retained::lift_z`]) and the context
-    /// takes it, which paints it later: see [`Window::painted_patch_unit`].
+    /// be: the surroundings are plain. A root that is handed to a stacking context
+    /// ([`crate::Retained::lift_z`]) or is inside an element that is (`lifts_open`) is painted
+    /// later by the context: see [`Window::painted_patch_unit`].
     pub(crate) fn capture_patch_unit(
         &self,
         id: &GlobalElementId,
         name: &ElementId,
         lift_z: Option<i32>,
     ) -> Option<Rc<PatchUnit>> {
-        let placement = match lift_z {
-            None if self.lifts_open == 0 => Placement::InPlace,
-            Some(z) if self.lifts_open == 1 && self.lifting() => Placement::Lifted { z, paint: None },
-            _ => return None,
+        let placement = if self.lifts_open == 0 {
+            Placement::InPlace
+        } else {
+            Placement::Deferred { paint: None }
         };
         Some(Rc::new(PatchUnit {
             id: id.clone(),
             name: name.clone(),
+            lift_z,
             prepaint: self.capture_surroundings()?,
             placement,
         }))
     }
 
     /// `unit` with the surroundings the stacking context paints it in, which are the ones now, if
-    /// it is a root that is lifted and they are plain. The context restores the id stack, text
-    /// styles, view, rem size, visibility, content mask and image cache the root was handed over
-    /// with, and paints it in whatever else the elements around the context have set.
+    /// it is a root that is painted by one and they are plain. The context restores the id stack,
+    /// text styles, view, rem size, visibility, content mask and image cache the element it took
+    /// was handed over with, and paints it in whatever else the elements around the context have
+    /// set; the elements between that one and the root set the rest, as they do now.
     pub(crate) fn painted_patch_unit(&self, unit: &Rc<PatchUnit>) -> Option<Rc<PatchUnit>> {
-        let Placement::Lifted { z, .. } = unit.placement else {
+        let Placement::Deferred { .. } = unit.placement else {
             return Some(unit.clone());
         };
-        let placement = Placement::Lifted { z, paint: Some(self.capture_surroundings()?) };
+        let placement = Placement::Deferred { paint: Some(self.capture_surroundings()?) };
         Some(Rc::new(PatchUnit {
             id: unit.id.clone(),
             name: unit.name.clone(),
+            lift_z: unit.lift_z,
             prepaint: unit.prepaint.clone(),
             placement,
         }))
@@ -666,14 +673,12 @@ impl Window {
     fn patch_unit(&mut self, unit: &mut ResolvedUnit, cx: &mut App) -> Result<UnitRun, PatchDecline> {
         let source = &unit.source;
         let around = unit.unit.clone();
-        let lift_z = match &around.placement {
-            Placement::InPlace => None,
-            Placement::Lifted { z, paint: Some(_) } => Some(*z),
-            Placement::Lifted { paint: None, .. } => return Err(PatchDecline::StaleRecording),
-        };
+        if matches!(around.placement, Placement::Deferred { paint: None }) {
+            return Err(PatchDecline::StaleRecording);
+        }
         // A root that is lifted stays where the stacking context orders it, and one that escapes
         // is placed by a block outside.
-        if unit.element.lift_z() != lift_z || unit.element.escapes_to().is_some() {
+        if unit.element.lift_z() != around.lift_z || unit.element.escapes_to().is_some() {
             return Err(PatchDecline::Surroundings);
         }
         let effects = self.effects();
@@ -722,7 +727,7 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Paint);
         let paint_start = self.paint_index();
         let prepainted = match &around.placement {
-            Placement::Lifted { paint: Some(paint), .. } => Some(self.enter_surroundings(&around.id, paint)),
+            Placement::Deferred { paint: Some(paint) } => Some(self.enter_surroundings(&around.id, paint)),
             _ => None,
         };
         unit.element.paint(self, cx);
