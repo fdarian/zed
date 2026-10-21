@@ -1711,7 +1711,7 @@ fn removed_trees_leave_nothing_behind(mut rng: StdRng, cx: &mut TestAppContext) 
         let size = cx
             .update_window(window, |_, window, _| {
                 (
-                    window.rendered_frame.element_states.len(),
+                    window.element_states.len(),
                     window.rendered_frame.hitboxes.len(),
                     0usize,
                 )

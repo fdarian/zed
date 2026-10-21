@@ -59,7 +59,7 @@
 //! that before the subtree is built.
 
 use crate::{
-    AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
+    StateOwner, AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, NonReusable, PaintIndex, PaintRecord, Pixels, Point, PrepaintRecord,
     PrepaintStateIndex, Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
     blocker_bit, first_blocker, IsZero, SubtreeText, scene::PrimitiveCount,
@@ -267,8 +267,9 @@ pub(crate) struct RetainedState {
     /// The layout engine that made `root`.
     engine: u64,
     root: LayoutId,
-    /// The element states the subtree accessed while it requested its layout.
-    layout_states: Rc<[(GlobalElementId, TypeId)]>,
+    /// Owns the element states the subtree accessed the last time it was built, so that a frame
+    /// that replays it keeps them without visiting them.
+    owner: Rc<StateOwner>,
     /// Every entity the subtree read, so that a frame that does not build it still observes them.
     accessed_entities: FxHashSet<crate::EntityId>,
     recorded: Option<Recorded>,
@@ -351,7 +352,7 @@ impl RetainedState {
             paint: paint.range.clone(),
             hitboxes: recorded.prepaint.hitboxes.clone(),
             tab_stops: paint.tab_stops.clone(),
-            layout_states: self.layout_states.clone(),
+            owner: self.owner.clone(),
         })
     }
 
@@ -586,8 +587,11 @@ impl Element for Retained {
                     window.begin_relocation(relocation, true);
                 }
                 let accessed_entities = if *record {
+                    let owner = self.state_owner(global_id, window);
                     window
-                        .detect_observed_entities(cx, |window, cx| element.paint(window, cx))
+                        .with_state_owner(&owner, |window| {
+                            window.detect_observed_entities(cx, |window, cx| element.paint(window, cx))
+                        })
                         .1
                 } else {
                     element.paint(window, cx);
@@ -694,7 +698,7 @@ fn replay_recorded_paint(
             .paint
             .as_mut()
             .expect("a subtree is skipped only with its paint recorded");
-        paint.range = window.replay_paint(paint, &nested, delta, lift_base);
+        paint.range = window.replay_paint(paint, &nested, delta, lift_base, false);
         recorded.paint_serial = window.building_serial();
         window.log_painted_subtree(&state.id);
         if let Some(hook) = hook {
@@ -742,6 +746,7 @@ impl Retained {
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             // The map keeps the state under the id it was first stored with, not `global_id`.
             let id = state.as_ref().map_or_else(|| global_id.clone(), |state| state.id.clone());
+            let owner = state.as_ref().map_or_else(StateOwner::new, |state| state.owner.clone());
             if let Some(mut state) = state
                 && state.key == key
                 && !window.retained.reference
@@ -761,20 +766,22 @@ impl Retained {
                 })
             {
                 window.retained.counters.hits += 1;
-                window.keep_states(&state.layout_states);
+                state.owner.keep(window.retained.state_pass, window.current_state_owner());
                 cx.entities.extend_accessed(&state.accessed_entities);
                 return ((state.root, RetainedLayout::Skipped), state);
             }
 
             window.retained.counters.builds += 1;
-            let accessed_states_start = window.accessed_states_len();
+            owner.release(window.current_state_owner());
             let unstable_before = window.unstable_layout_requests();
             let escapable_before = window.escapable_layout_requests();
             let build = self.build();
-            let ((element, root), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
-                let mut element = build(window, cx);
-                let root = request_subtree_layout(&mut element, lift_z, window, cx);
-                (element, root)
+            let ((element, root), accessed_entities) = window.with_state_owner(&owner, |window| {
+                window.detect_observed_entities(cx, |window, cx| {
+                    let mut element = build(window, cx);
+                    let root = request_subtree_layout(&mut element, lift_z, window, cx);
+                    (element, root)
+                })
             });
             let unreusable = (window.unstable_layout_requests() != unstable_before
                 || window.layout_requests_escape(root, escapable_before))
@@ -784,7 +791,7 @@ impl Retained {
                 key,
                 engine: window.layout_engine_id(),
                 root,
-                layout_states: window.accessed_states_since(accessed_states_start),
+                owner,
                 accessed_entities,
                 recorded: None,
             };
@@ -908,14 +915,13 @@ impl Retained {
                                 && recorded.key.shapes_layout_like(window)
                                 && recorded.lifted_paint_from_recordings(window)
                         });
-                    fits.then(|| (state.root, state.layout_states.clone()))
+                    fits.then_some(state.root)
                 })
             })
             .flatten()
             .flatten();
-        if let Some((root, layout_states)) = skipped {
+        if let Some(root) = skipped {
             window.retained.counters.layout_skips += 1;
-            window.keep_states(&layout_states);
             return (root, RetainedLayout::Skipped);
         }
 
@@ -930,6 +936,13 @@ impl Retained {
                 record: false,
             },
         )
+    }
+
+    /// The owner of the element states of the subtree.
+    fn state_owner(&self, global_id: &GlobalElementId, window: &Window) -> Rc<StateOwner> {
+        window
+            .peek_element_state(global_id, |state: &RetainedState| state.owner.clone())
+            .expect("a subtree being built has its state")
     }
 
     /// The layout node of the subtree, which a frame that skipped it kept.
@@ -1075,22 +1088,24 @@ impl Retained {
         cx: &mut App,
     ) -> RetainedPrepaint {
         let lift_z = self.lift_z;
-        let root = window.with_element_state(global_id, |state: Option<RetainedState>, _| {
+        let (root, owner) = window.with_element_state(global_id, |state: Option<RetainedState>, _| {
             let state = state.expect("a skipped subtree has its state");
-            (state.root, state)
+            ((state.root, state.owner.clone()), state)
         });
+        // It was kept when layout skipped it, and is built after all: it owns what it accesses now.
+        owner.release(window.current_state_owner());
         let generation_before = window.layout_dirty_generation(root);
         let counters_before = window.engine_counters();
         let unstable_before = window.unstable_layout_requests();
         let escapable_before = window.escapable_layout_requests();
-        let accessed_states_start = window.accessed_states_len();
         let build = self.build();
-        let ((mut element, built_root), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
-            let mut element = build(window, cx);
-            let root = request_subtree_layout(&mut element, lift_z, window, cx);
-            (element, root)
+        let ((mut element, built_root), accessed_entities) = window.with_state_owner(&owner, |window| {
+            window.detect_observed_entities(cx, |window, cx| {
+                let mut element = build(window, cx);
+                let root = request_subtree_layout(&mut element, lift_z, window, cx);
+                (element, root)
+            })
         });
-        let layout_states = window.accessed_states_since(accessed_states_start);
         let unstable = window.unstable_layout_requests() != unstable_before
             || window.layout_requests_escape(built_root, escapable_before);
         let counters_after = window.engine_counters();
@@ -1102,7 +1117,6 @@ impl Retained {
 
         window.with_element_state(global_id, |state: Option<RetainedState>, _| {
             let mut state = state.expect("a skipped subtree has its state");
-            state.layout_states = layout_states;
             state.accessed_entities.extend(accessed_entities);
             state.root = built_root;
             ((), state)
@@ -1120,9 +1134,11 @@ impl Retained {
             // is laid out where it is, as a root of its own, as a cached view is.
             window.detach_layout_for_relayout(built_root);
             window.stretch_layout_root(built_root, bounds.size);
-            element.layout_as_root(bounds.size.into(), window, cx);
-            let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
-                element.prepaint_at(bounds.origin, window, cx);
+            let ((), accessed_entities) = window.with_state_owner(&owner, |window| {
+                element.layout_as_root(bounds.size.into(), window, cx);
+                window.detect_observed_entities(cx, |window, cx| {
+                    element.prepaint_at(bounds.origin, window, cx);
+                })
             });
             window.with_element_state(global_id, |state: Option<RetainedState>, _| {
                 let mut state = state.expect("a skipped subtree has its state");
@@ -1179,12 +1195,15 @@ impl Retained {
             .as_ref()
             .filter(|relocation| relocation.regional())
             .map(|relocation| relocation.ambient);
-        let mark = window.begin_prepaint_recording(self.on_replay.clone());
+        let owner = self.state_owner(global_id, window);
+        let mark = window.begin_prepaint_recording(self.on_replay.clone(), owner.clone());
         let relocating = relocation.is_some();
         if let Some(relocation) = relocation {
             window.begin_relocation(relocation, false);
         }
-        let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| prepaint(window, cx));
+        let ((), accessed_entities) = window.with_state_owner(&owner, |window| {
+            window.detect_observed_entities(cx, |window, cx| prepaint(window, cx))
+        });
         let relocation = relocating.then(|| window.end_relocation().0);
         let recording = window.finish_prepaint_recording(mark, surroundings.as_ref());
         let record = window.with_element_state(global_id, |state: Option<RetainedState>, window| {

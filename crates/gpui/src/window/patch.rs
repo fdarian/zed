@@ -50,8 +50,6 @@ pub enum PatchDecline {
     /// The listeners, tooltips, cursors, tab stops, input handlers, dispatch nodes or focus are
     /// not what was recorded.
     Registrations,
-    /// The element states the new element used are not the ones the recording used.
-    ElementStates,
     /// The operations painted differ in number or kind from the recorded ones.
     Operations,
     /// The embedder refused the patch.
@@ -60,7 +58,7 @@ pub enum PatchDecline {
 
 impl PatchDecline {
     /// Every reason.
-    pub const ALL: [PatchDecline; 13] = [
+    pub const ALL: [PatchDecline; 12] = [
         PatchDecline::PendingView,
         PatchDecline::Refreshing,
         PatchDecline::UnknownUnit,
@@ -71,7 +69,6 @@ impl PatchDecline {
         PatchDecline::Effects,
         PatchDecline::Hitboxes,
         PatchDecline::Registrations,
-        PatchDecline::ElementStates,
         PatchDecline::Operations,
         PatchDecline::Rejected,
     ];
@@ -190,7 +187,8 @@ pub(crate) struct PatchSource {
     pub(crate) paint: Range<PaintIndex>,
     pub(crate) hitboxes: Rc<RecordedHitboxes>,
     pub(crate) tab_stops: Rc<[TabStopOperation]>,
-    pub(crate) layout_states: Rc<[(GlobalElementId, TypeId)]>,
+    /// Owns the element states of the root.
+    pub(crate) owner: Rc<StateOwner>,
 }
 
 struct ResolvedUnit {
@@ -483,14 +481,11 @@ impl Window {
         }
     }
 
-    /// Puts the window back as it was before the patch, but for the states of the elements, which
-    /// are the rendered frame's again, and the layout engine, which ends its pass.
+    /// Puts the window back as it was before the patch, but for the layout engine, which ends its
+    /// pass.
     fn finish_scratch(&mut self, scratch: Scratch, cx: &mut App) {
         self.patch.hitbox_ids = None;
         self.invalidator.set_phase(DrawPhase::None);
-        for (key, state) in self.next_frame.element_states.drain() {
-            self.rendered_frame.element_states.insert(key, state);
-        }
         self.next_frame.clear();
         self.next_frame.scene.set_hidden(false);
         self.layout_engine
@@ -513,7 +508,8 @@ impl Window {
         let mut runs = Vec::with_capacity(units.len());
         for unit in units {
             let saved = self.enter_surroundings(&unit.unit);
-            let run = self.patch_unit(unit, cx);
+            let owner = unit.source.owner.clone();
+            let run = self.with_state_owner(&owner, |window| window.patch_unit(unit, cx));
             self.leave_surroundings(saved);
             runs.push(run?);
         }
@@ -576,7 +572,6 @@ impl Window {
         }
         let effects = self.effects();
         let scene_start = self.next_frame.scene.len();
-        let states_start = self.next_frame.accessed_element_states.len();
 
         self.invalidator.set_phase(DrawPhase::Prepaint);
         let root = source.root;
@@ -634,9 +629,6 @@ impl Window {
         }
         if !self.registrations_are(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end) {
             return Err(PatchDecline::Registrations);
-        }
-        if !self.states_are_recorded(source, states_start) {
-            return Err(PatchDecline::ElementStates);
         }
 
         let rendered = source.paint.start.scene_index..source.paint.end.scene_index;
@@ -696,18 +688,6 @@ impl Window {
                 (TabStopOperation::GroupEnd, TabStopOperation::GroupEnd) => true,
                 _ => false,
             })
-    }
-
-    /// Whether the states of elements that the root used, from the position `start` of the
-    /// accessed ones on, are among the ones its recording used, so that the next frame does not
-    /// lose one that only the patch made.
-    fn states_are_recorded(&self, source: &PatchSource, start: usize) -> bool {
-        let rendered = &self.rendered_frame.accessed_element_states;
-        let mut recorded: FxHashSet<&(GlobalElementId, TypeId)> = FxHashSet::default();
-        recorded.extend(source.layout_states.iter());
-        recorded.extend(&rendered[source.prepaint.start.accessed_element_states_index..source.prepaint.end.accessed_element_states_index]);
-        recorded.extend(&rendered[source.paint.start.accessed_element_states_index..source.paint.end.accessed_element_states_index]);
-        self.next_frame.accessed_element_states[start..].iter().all(|key| recorded.contains(key))
     }
 }
 

@@ -267,6 +267,51 @@ impl RetainedCounters {
     }
 }
 
+/// What a retained subtree stands for among the element states: the states its content accessed
+/// the last time it was built belong to it, and the frame that replays the subtree, or one that
+/// replays a subtree around it, keeps them without a step for each state. A state that is not
+/// accessed by a frame is dropped unless its owner is kept (see [`Window::release_unused_element_states`]).
+#[derive(Default)]
+pub(crate) struct StateOwner {
+    /// The pass in which the subtree was skipped for layout, which is to replay it.
+    kept_in: Cell<u64>,
+    /// The subtree around this one, as of the last pass that reached this one: replaying that one
+    /// replays this one with it.
+    parent: RefCell<Option<Rc<StateOwner>>>,
+    /// Whether [`Self::is_kept`] was `.1` in the pass `.0`.
+    memo: Cell<(u64, bool)>,
+}
+
+impl StateOwner {
+    pub(crate) fn new() -> Rc<Self> {
+        Rc::default()
+    }
+
+    /// The subtree is skipped in `pass`, below `parent`.
+    pub(crate) fn keep(&self, pass: u64, parent: Option<Rc<StateOwner>>) {
+        self.kept_in.set(pass);
+        *self.parent.borrow_mut() = parent;
+    }
+
+    /// The subtree is built in `pass`, below `parent`: its states are the ones it accesses.
+    pub(crate) fn release(&self, parent: Option<Rc<StateOwner>>) {
+        self.kept_in.set(0);
+        *self.parent.borrow_mut() = parent;
+    }
+
+    /// Whether this subtree, or one around it, is replayed in `pass`.
+    fn is_kept(&self, pass: u64) -> bool {
+        let (memo_pass, kept) = self.memo.get();
+        if memo_pass == pass {
+            return kept;
+        }
+        let kept = self.kept_in.get() == pass
+            || self.parent.borrow().as_ref().is_some_and(|parent| parent.is_kept(pass));
+        self.memo.set((pass, kept));
+        kept
+    }
+}
+
 /// What the window keeps for retained subtrees.
 #[derive(Default)]
 pub(crate) struct RetainedWindow {
@@ -277,6 +322,12 @@ pub(crate) struct RetainedWindow {
     /// Counts the frames that were drawn. A recording indexes the vectors of the frame it was
     /// made in, which is the rendered frame only in the draw that follows.
     pub(crate) rendered_serial: u64,
+    /// Counts the passes that built a frame, abandoned ones too. An element state is stamped with
+    /// the pass that accessed it.
+    pub(crate) state_pass: u64,
+    /// The retained subtrees whose content is being built, prepainted or painted, outermost
+    /// first: the element states accessed meanwhile belong to the innermost.
+    pub(crate) state_owners: Vec<Rc<StateOwner>>,
     /// The entities notified since the draw before, while a draw builds.
     pub(crate) notified: FxHashSet<EntityId>,
     /// What the embedder keeps outside the frame, as text, for the comparison of a replayed frame
@@ -336,6 +387,9 @@ struct OpenRecording {
     /// The ordinal that context gave the next element when the recording began.
     next_ordinal: u32,
     hook: Option<crate::elements::ReplayHook>,
+    /// Owns the element states that the elements handed to the stacking context access when it
+    /// paints them.
+    state_owner: Rc<StateOwner>,
 }
 
 /// A recording that was open when an element was handed to the stacking context it prepaints in:
@@ -344,6 +398,7 @@ struct OpenRecording {
 #[derive(Clone)]
 pub(crate) struct LiftOwner {
     pub(crate) hook: Option<crate::elements::ReplayHook>,
+    pub(crate) state_owner: Rc<StateOwner>,
     /// The ordinal of the element among the ones the recording was handed, counted from the first.
     pub(crate) rel: u32,
 }
@@ -1114,26 +1169,54 @@ impl Window {
         read: impl FnOnce(&S) -> R,
     ) -> Option<R> {
         let key = (global_id.clone(), TypeId::of::<S>());
-        let state = self
-            .next_frame
-            .element_states
-            .get(&key)
-            .or_else(|| self.rendered_frame.element_states.get(&key))?;
+        let state = self.element_states.get(&key)?;
         state.inner.downcast_ref::<Option<S>>()?.as_ref().map(read)
     }
 
-    /// Re-adds `states` to the frame being built, so that it keeps them.
-    pub(crate) fn keep_states(&mut self, states: &[(GlobalElementId, TypeId)]) {
-        self.next_frame.accessed_element_states.extend(states.iter().cloned());
+    /// Runs `build` with the states it accesses belonging to `owner`.
+    pub(crate) fn with_state_owner<R>(&mut self, owner: &Rc<StateOwner>, build: impl FnOnce(&mut Self) -> R) -> R {
+        self.retained.state_owners.push(owner.clone());
+        let result = build(self);
+        self.retained.state_owners.pop();
+        result
     }
 
-    /// The element states accessed since the position `start` of the frame being built.
-    pub(crate) fn accessed_states_since(&self, start: usize) -> Rc<[(GlobalElementId, TypeId)]> {
-        self.next_frame.accessed_element_states[start..].into()
+    /// The subtree whose content is being built, if one is.
+    pub(crate) fn current_state_owner(&self) -> Option<Rc<StateOwner>> {
+        self.retained.state_owners.last().cloned()
     }
 
-    pub(crate) fn accessed_states_len(&self) -> usize {
-        self.next_frame.accessed_element_states.len()
+    /// The owner of a state that was just accessed, which had `previous` before. A pass that
+    /// builds a subtree names the owner of what it accesses; a pass that records nothing leaves it.
+    pub(crate) fn state_owner_after_access(&self, previous: Option<Rc<StateOwner>>) -> Option<Rc<StateOwner>> {
+        match self.retained.state_owners.last() {
+            Some(owner) => Some(owner.clone()),
+            None if self.retention_records() => None,
+            None => previous,
+        }
+    }
+
+    /// Drops the element states that the frame just built did not use: the ones it did not
+    /// access, unless a subtree that owns them was replayed in it.
+    pub(crate) fn release_unused_element_states(&mut self) {
+        let pass = self.retained.state_pass;
+        self.element_states.retain(|_, state| {
+            state.stamp == pass || state.owner.as_ref().is_some_and(|owner| owner.is_kept(pass))
+        });
+    }
+
+    /// The frame being built uses the states that the range `keys` of the accessed ones of the
+    /// rendered frame names, as that frame did, and keeps them as if it had accessed them.
+    pub(crate) fn carry_element_states(&mut self, keys: Range<usize>) {
+        let pass = self.retained.state_pass;
+        for key in &self.rendered_frame.accessed_element_states[keys.clone()] {
+            if let Some(state) = self.element_states.get_mut(key) {
+                state.stamp = pass;
+            }
+        }
+        self.next_frame
+            .accessed_element_states
+            .extend_from_slice(&self.rendered_frame.accessed_element_states[keys]);
     }
 
     /// Treats any `auto` size of the layout root as filling `size`, see
@@ -1248,12 +1331,17 @@ impl Window {
     ///
     /// `hook` is the listener of the subtree, which is told what the elements it hands to the
     /// stacking context around it paint.
-    pub(crate) fn begin_prepaint_recording(&mut self, hook: Option<crate::elements::ReplayHook>) -> PrepaintMark {
+    pub(crate) fn begin_prepaint_recording(
+        &mut self,
+        hook: Option<crate::elements::ReplayHook>,
+        state_owner: Rc<StateOwner>,
+    ) -> PrepaintMark {
         self.invalidator.debug_assert_prepaint();
         self.retained.open_recordings.push(OpenRecording {
             depth: self.lift_lists.len(),
             next_ordinal: self.ambient_lift_ordinal(),
             hook,
+            state_owner,
         });
         PrepaintMark {
             index: self.prepaint_index(),
@@ -1341,6 +1429,7 @@ impl Window {
             .filter(|recording| recording.depth == depth)
             .map(|recording| LiftOwner {
                 hook: recording.hook.clone(),
+                state_owner: recording.state_owner.clone(),
                 rel: ordinal - recording.next_ordinal,
             })
             .collect()
@@ -1359,7 +1448,11 @@ impl Window {
         let mark = self.begin_paint_recording();
         let log_start = self.retained.paint_log.len();
         self.retained.logging_paint += 1;
+        // What the element accesses belongs to the subtrees that recorded it, innermost last.
+        self.retained.state_owners.extend(owners.iter().map(|owner| owner.state_owner.clone()));
         let ((), entities) = self.detect_observed_entities(cx, paint);
+        let remaining = self.retained.state_owners.len() - owners.len();
+        self.retained.state_owners.truncate(remaining);
         self.retained.logging_paint -= 1;
         let nested: Rc<[(GlobalElementId, TypeId)]> = self.retained.paint_log.split_off(log_start).into();
         let base = LiftBase {
@@ -1500,7 +1593,7 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
         let start = self.prepaint_index();
         let relocated = delta.map(|delta| (delta, self.content_mask()));
-        self.reuse_prepaint_with(record.range.clone(), Some((&record.hitboxes, relocated.as_ref())));
+        self.reuse_prepaint_with(record.range.clone(), Some((&record.hitboxes, relocated.as_ref())), false);
         if let Some(a11y) = &record.a11y {
             let scale_factor = self.scale_factor;
             self.a11y.replay(a11y, delta.unwrap_or_default(), scale_factor);
@@ -1617,7 +1710,7 @@ impl Window {
                 recorded.nested.clone(),
             )
         };
-        paint.range = self.replay_paint(&paint, &nested, Point::default(), Some(ordinal + 1));
+        paint.range = self.replay_paint(&paint, &nested, Point::default(), Some(ordinal + 1), false);
         {
             let mut recorded = cell.recorded.borrow_mut();
             recorded.paint = Some(paint);
@@ -1650,10 +1743,8 @@ impl Window {
 
     /// The retained state under `key`, in the frame being built or else the rendered frame.
     pub(crate) fn retained_state(&self, key: &(GlobalElementId, TypeId)) -> Option<&crate::elements::RetainedState> {
-        self.next_frame
-            .element_states
-            .get(key)
-            .or_else(|| self.rendered_frame.element_states.get(key))?
+        self.element_states
+            .get(key)?
             .inner
             .downcast_ref::<Option<crate::elements::RetainedState>>()?
             .as_ref()
@@ -1661,19 +1752,16 @@ impl Window {
 
     /// The retained state under `key`, in the frame being built or else the rendered frame.
     fn retained_state_mut(&mut self, key: &(GlobalElementId, TypeId)) -> Option<&mut crate::elements::RetainedState> {
-        self.next_frame
-            .element_states
-            .get_mut(key)
-            .or_else(|| self.rendered_frame.element_states.get_mut(key))?
+        self.element_states
+            .get_mut(key)?
             .inner
             .downcast_mut::<Option<crate::elements::RetainedState>>()?
             .as_mut()
     }
 
-    /// The retained state under `key`, in the rendered frame, if it is still there.
+    /// The retained state under `key`, if it is still there.
     fn rendered_state_mut(&mut self, key: &(GlobalElementId, TypeId)) -> Option<&mut crate::elements::RetainedState> {
-        self.rendered_frame
-            .element_states
+        self.element_states
             .get_mut(key)?
             .inner
             .downcast_mut::<Option<crate::elements::RetainedState>>()?
@@ -1793,12 +1881,16 @@ impl Window {
     ///
     /// `lift_base` is the ordinal the stacking context around gave the first element the subtree
     /// handed to it, when its prepaint was replayed.
+    ///
+    /// The element states the paint accessed are kept when `carry_states`; a retained subtree
+    /// leaves that to its owner of states (see [`StateOwner`]).
     pub(crate) fn replay_paint(
         &mut self,
         record: &PaintRecord,
         nested: &[(GlobalElementId, TypeId)],
         delta: Point<Pixels>,
         lift_base: Option<u32>,
+        carry_states: bool,
     ) -> Range<PaintIndex> {
         self.invalidator.debug_assert_paint();
         #[cfg(debug_assertions)]
@@ -1813,6 +1905,7 @@ impl Window {
             record.range.clone(),
             Some(&record.tab_stops),
             !record.moves,
+            carry_states,
         );
         if let Some(operations) = &record.operations {
             self.emit_relocated(operations, delta, PrimitiveCount::Replayed);
@@ -2378,8 +2471,7 @@ impl Window {
         subtrees
             .iter()
             .map(|key| {
-                self.next_frame
-                    .element_states
+                self.element_states
                     .get(key)
                     .and_then(|state| state.inner.downcast_ref::<Option<crate::elements::RetainedState>>())
                     .and_then(Option::as_ref)

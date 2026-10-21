@@ -5,8 +5,8 @@
 use super::*;
 use crate::element::FULL_PATH_COMPARES;
 use crate::{
-    AnyWindowHandle, AppContext as _, Context, Edges, InteractiveElement, ParentElement, Render, StatefulInteractiveElement,
-    Styled, TestAppContext, div, px, size,
+    ElementId, AnyWindowHandle, AppContext as _, Context, Edges, InteractiveElement, ParentElement, Render, StatefulInteractiveElement,
+    Styled, TestAppContext, canvas, div, px, size,
 };
 
 const GROUP: usize = 10;
@@ -138,4 +138,126 @@ fn state_carry_frame_time(cx: &mut TestAppContext) {
             compares / frames as u64,
         );
     }
+}
+
+/// Runs replay frames for `STATE_CARRY_SECONDS` seconds, for a sampling profiler to watch.
+#[gpui::test]
+#[ignore]
+fn state_carry_profile(cx: &mut TestAppContext) {
+    let seconds: u64 = std::env::var("STATE_CARRY_SECONDS").ok().and_then(|seconds| seconds.parse().ok()).unwrap_or(8);
+    let window = open(cx, 100, 100, true);
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < seconds {
+        frame(cx, window);
+    }
+}
+
+thread_local! {
+    /// What the canvas of the third root counted when it prepainted last.
+    static LAST_OF_THIRD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// What the canvases counted the times they prepainted, in order.
+    static SEEN: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A page of roots that each hold a root that holds an element with a state that counts how many
+/// times the element was prepainted.
+struct Counted {
+    roots: usize,
+    outer_key: u64,
+    inner_key: u64,
+    tick: u32,
+}
+
+impl Render for Counted {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (outer_key, inner_key) = (self.outer_key, self.inner_key);
+        let mut page = div().id("page").flex().flex_col().w(px(400.)).h(px(300.));
+        page = page.child(div().id("live").w(px(10. + (self.tick % 7) as f32)).h(px(10.)).bg(crate::red()));
+        for root in 0..self.roots {
+            page = page.child(retained(("outer", root), outer_key, move |_, _| {
+                div()
+                    .id(("outer-content", root))
+                    .child(retained(("inner", root), inner_key, move |_, _| {
+                        canvas(
+                            move |_, window, _| {
+                                let count = window.with_global_id(ElementId::from(("counted", root)), |id, window| {
+                                    window.with_element_state(id, |state: Option<u32>, _| {
+                                        let count = state.unwrap_or(0) + 1;
+                                        (count, count)
+                                    })
+                                });
+                                if root == 0 {
+                                    SEEN.with(|seen| seen.borrow_mut().push(count));
+                                }
+                                if root == 2 {
+                                    LAST_OF_THIRD.with(|last| last.set(count));
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .size_full()
+                        .into_any_element()
+                    }))
+                    .into_any_element()
+            }));
+        }
+        page
+    }
+}
+
+fn counted_frame(cx: &mut TestAppContext, window: AnyWindowHandle, edit: impl FnOnce(&mut Counted)) {
+    cx.update_window(window, |view, window, cx| {
+        view.downcast::<Counted>().unwrap().update(cx, |page, cx| {
+            page.tick += 1;
+            edit(page);
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn the_states_of_a_replayed_root_live_as_long_as_it_is_replayed(cx: &mut TestAppContext) {
+    SEEN.with(|seen| seen.borrow_mut().clear());
+    let window = cx.open_window(size(px(400.), px(300.)), |_, _| Counted { roots: 3, outer_key: 1, inner_key: 1, tick: 0 });
+    let window = AnyWindowHandle::from(window);
+    for _ in 0..8 {
+        counted_frame(cx, window, |_| {});
+    }
+    assert_eq!(SEEN.with(|seen| seen.borrow().clone()), vec![1], "built once, replayed after");
+
+    // The root around is built again and the one inside is replayed in it.
+    counted_frame(cx, window, |page| page.outer_key += 1);
+    for _ in 0..8 {
+        counted_frame(cx, window, |_| {});
+    }
+    assert_eq!(SEEN.with(|seen| seen.borrow().clone()), vec![1], "the root inside was not built");
+
+    counted_frame(cx, window, |page| {
+        page.outer_key += 1;
+        page.inner_key += 1;
+    });
+    assert_eq!(SEEN.with(|seen| seen.borrow().clone()), vec![1, 2], "the state outlived every replay");
+
+    let states = cx.update_window(window, |_, window, _| window.element_states.len()).unwrap();
+    counted_frame(cx, window, |page| page.roots = 1);
+    let fewer = cx.update_window(window, |_, window, _| window.element_states.len()).unwrap();
+    assert!(fewer < states, "the states of the roots that are gone are dropped: {states} then {fewer}");
+    counted_frame(cx, window, |page| page.roots = 3);
+    assert_eq!(LAST_OF_THIRD.with(|last| last.get()), 1, "a root that came back starts over");
+}
+
+#[gpui::test]
+fn a_replay_keeps_the_states_it_does_not_visit_without_naming_them(cx: &mut TestAppContext) {
+    fn accessed_by_a_replay_frame(cx: &mut TestAppContext, roots: usize, per_root: usize) -> usize {
+        let window = open(cx, roots, per_root, true);
+        for _ in 0..3 {
+            frame(cx, window);
+        }
+        cx.update_window(window, |_, window, _| window.rendered_frame.accessed_element_states.len()).unwrap()
+    }
+    let small = accessed_by_a_replay_frame(cx, 3, 10);
+    let large = accessed_by_a_replay_frame(cx, 3, 400);
+    assert_eq!(small, large, "a frame that replays roots names the states of the elements it builds and of the roots, not those inside the roots");
 }

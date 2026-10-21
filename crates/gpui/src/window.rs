@@ -77,7 +77,7 @@ pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMis
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
 pub(crate) use retained::{
     LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
-    RetainedWindow, SubtreeText, blocker_bit, first_blocker,
+    RetainedWindow, StateOwner, SubtreeText, blocker_bit, first_blocker,
 };
 
 use self::a11y::A11y;
@@ -1310,8 +1310,7 @@ type LayoutPublication = Box<dyn FnOnce(&mut Window, &mut App)>;
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
-    pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
-    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    pub(crate) accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     root_key_listeners: Vec<Option<KeyListener>>,
     pub(crate) dispatch_tree: DispatchTree,
@@ -1414,7 +1413,9 @@ impl PaintIndex {
     }
 
     /// Whether the range `inner` is inside `outer`, in every vector that a paint writes to the
-    /// frame but the ones only a test reads.
+    /// frame but the ones only a test reads. The accessed element states are not among them: a
+    /// retained subtree that is replayed copies none, so its range there does not say where its
+    /// paint is.
     pub(crate) fn range_is_within(inner: &Range<Self>, outer: &Range<Self>) -> bool {
         let within = |inner: &Range<usize>, outer: &Range<usize>| inner.start >= outer.start && inner.end <= outer.end;
         let axis = |index: fn(&Self) -> usize| {
@@ -1425,7 +1426,6 @@ impl PaintIndex {
             && axis(|index| index.root_key_listeners_index)
             && axis(|index| index.input_handlers_index)
             && axis(|index| index.cursor_styles_index)
-            && axis(|index| index.accessed_element_states_index)
             && axis(|index| index.tab_handle_index)
             && LineLayoutIndex::range_is_within(
                 &(inner.start.line_layout_index.clone()..inner.end.line_layout_index.clone()),
@@ -1514,7 +1514,6 @@ impl Frame {
         Frame {
             focus: None,
             window_active: false,
-            element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
             mouse_listeners: Vec::new(),
             root_key_listeners: Vec::new(),
@@ -1547,7 +1546,6 @@ impl Frame {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.element_states.clear();
         self.accessed_element_states.clear();
         self.mouse_listeners.clear();
         self.root_key_listeners.clear();
@@ -1712,15 +1710,7 @@ impl Frame {
             .unwrap_or_default()
     }
 
-    pub(crate) fn finish(&mut self, prev_frame: &mut Self) {
-        for element_state_key in &self.accessed_element_states {
-            if let Some((element_state_key, element_state)) =
-                prev_frame.element_states.remove_entry(element_state_key)
-            {
-                self.element_states.insert(element_state_key, element_state);
-            }
-        }
-
+    pub(crate) fn finish(&mut self) {
         self.scene.finish();
     }
 }
@@ -1812,6 +1802,10 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    /// The state of the elements, by the id of the element and the type of the state. It outlives
+    /// the frames: a state is dropped when a frame that is presented has neither accessed it nor
+    /// kept it through the retained subtree it belongs to, see [`StateOwner`].
+    pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -1988,6 +1982,10 @@ pub(crate) struct ElementStateBox {
     pub(crate) inner: Box<dyn Any>,
     #[cfg(debug_assertions)]
     pub(crate) type_name: &'static str,
+    /// The pass that last accessed the state, see [`Window::release_unused_element_states`].
+    pub(crate) stamp: u64,
+    /// The retained subtree that was being built when the state was last accessed there.
+    pub(crate) owner: Option<Rc<StateOwner>>,
 }
 
 fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
@@ -2564,6 +2562,7 @@ impl Window {
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            element_states: FxHashMap::default(),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -4398,11 +4397,6 @@ impl Window {
         self.mouse_hit_test = mouse_hit_test;
 
         self.layout_engine.as_mut().unwrap().end_pass();
-        // An element's state was moved out of `rendered_frame` when the pass reached it. Hand
-        // it back, updated, or the next draw would find it gone and start the element over.
-        for (key, state) in self.next_frame.element_states.drain() {
-            self.rendered_frame.element_states.insert(key, state);
-        }
         self.next_frame.clear();
         self.invalidator.set_phase(DrawPhase::None);
         self.measured_at = Some((self.invalidator.update_count(), paint));
@@ -4500,7 +4494,8 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().end_frame();
         self.text_system().finish_frame();
-        self.next_frame.finish(&mut self.rendered_frame);
+        self.release_unused_element_states();
+        self.next_frame.finish();
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -4653,6 +4648,7 @@ impl Window {
 
     /// One build of `next_frame`. Returns false when the pass was abandoned before paint.
     fn build_pass(&mut self, cx: &mut App) -> bool {
+        self.retained.state_pass += 1;
         self.captured_hitbox = None;
         let effect_groups = self.platform_window.supports_effect_groups() || self.effect_groups_forced();
         self.next_frame
@@ -4678,11 +4674,6 @@ impl Window {
     /// What a pass publishes outside the frame stays published.
     fn discard_pass(&mut self, cx: &mut App) {
         self.layout_engine.as_mut().unwrap().end_pass();
-        // An element's state was moved out of `rendered_frame` when the pass reached it. Hand
-        // it back, updated, or the next pass would find it gone and start the element over.
-        for (key, state) in self.next_frame.element_states.drain() {
-            self.rendered_frame.element_states.insert(key, state);
-        }
         self.next_frame.clear();
         self.tooltip_bounds.take();
         self.requested_autoscroll = None;
@@ -5184,16 +5175,20 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
-        self.reuse_prepaint_with(range, None);
+        self.reuse_prepaint_with(range, None, true);
     }
 
     /// [`Self::reuse_prepaint`], taking the hitboxes from `recorded` instead of from the range of
     /// the rendered frame when it is `Some`: a recording that must outlive the frame's reordering
     /// of its hitboxes holds them by value.
+    ///
+    /// The element states the range accessed are kept when `carry_states`. A retained subtree
+    /// leaves that to its owner of states (see [`StateOwner`]).
     pub(crate) fn reuse_prepaint_with(
         &mut self,
         range: Range<PrepaintStateIndex>,
         recorded: Option<(&RecordedHitboxes, Option<&(Point<Pixels>, ContentMask<Pixels>)>)>,
+        carry_states: bool,
     ) {
         // Hitboxes keep their ids across frames but the enclosing hitbox is re-inserted, with a
         // new id, every time its element prepaints. The reused hitboxes that hung off the old
@@ -5223,12 +5218,11 @@ impl Window {
                 .iter_mut()
                 .map(|request| request.take()),
         );
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
-        );
+        if carry_states {
+            self.carry_element_states(
+                range.start.accessed_element_states_index..range.end.accessed_element_states_index,
+            );
+        }
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
 
@@ -5277,17 +5271,21 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
-        self.reuse_paint_with(range, None, true);
+        self.reuse_paint_with(range, None, true, true);
     }
 
     /// [`Self::reuse_paint`], taking the tab stops from `recorded` instead of from the range of
     /// the rendered frame when it is `Some`: the stacking context that holds a recording moves
     /// the tab stops it painted about once it is done.
+    ///
+    /// The element states the range accessed are kept when `carry_states`, see
+    /// [`Self::reuse_prepaint_with`].
     pub(crate) fn reuse_paint_with(
         &mut self,
         range: Range<PaintIndex>,
         recorded_tab_stops: Option<&[TabStopOperation]>,
         from_scene: bool,
+        carry_states: bool,
     ) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
@@ -5313,12 +5311,11 @@ impl Window {
                 .iter_mut()
                 .map(|listener| listener.take()),
         );
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
-        );
+        if carry_states {
+            self.carry_element_states(
+                range.start.accessed_element_states_index..range.end.accessed_element_states_index,
+            );
+        }
         self.next_frame.tab_stops.replay(match recorded_tab_stops {
             Some(operations) => operations,
             None => {
@@ -6070,7 +6067,7 @@ impl Window {
                 .retained_recordings
                 .drain(index.retained_recordings_index..)
             {
-                self.next_frame.element_states.remove(&key);
+                self.element_states.remove(&key);
             }
             self.text_system.truncate_layouts(index.line_layout_index);
         }
@@ -6244,11 +6241,7 @@ impl Window {
         self.invalidator.debug_assert_paint_or_prepaint();
 
         let probe = (global_id.clone(), TypeId::of::<S>());
-        let existing = self
-            .next_frame
-            .element_states
-            .remove_entry(&probe)
-            .or_else(|| self.rendered_frame.element_states.remove_entry(&probe));
+        let existing = self.element_states.remove_entry(&probe);
         // `with_global_id` builds the id again at every call, so `global_id` shares no storage with
         // the one the state map holds. The id the state was first stored under is the one kept and
         // recorded, so that every access to it in every frame holds that one path and moving the
@@ -6258,12 +6251,15 @@ impl Window {
             None => probe,
         };
         self.next_frame.accessed_element_states.push(key.clone());
+        let stamp = self.retained.state_pass;
 
         if let Some((_, any)) = existing {
             let ElementStateBox {
                 inner,
                 #[cfg(debug_assertions)]
                 type_name,
+                owner: previous_owner,
+                ..
             } = any;
             // Using the extra inner option to avoid needing to reallocate a new box.
             let mut state_box = inner
@@ -6293,23 +6289,29 @@ impl Window {
             );
             let (result, state) = f(Some(state), self);
             state_box.replace(state);
-            self.next_frame.element_states.insert(
+            let owner = self.state_owner_after_access(previous_owner);
+            self.element_states.insert(
                 key,
                 ElementStateBox {
                     inner: state_box,
                     #[cfg(debug_assertions)]
                     type_name,
+                    stamp,
+                    owner,
                 },
             );
             result
         } else {
             let (result, state) = f(None, self);
-            self.next_frame.element_states.insert(
+            let owner = self.state_owner_after_access(None);
+            self.element_states.insert(
                 key,
                 ElementStateBox {
                     inner: Box::new(Some(state)),
                     #[cfg(debug_assertions)]
                     type_name: std::any::type_name::<S>(),
+                    stamp,
+                    owner,
                 },
             );
             result
