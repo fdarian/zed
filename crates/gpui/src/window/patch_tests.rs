@@ -32,6 +32,8 @@ struct Knobs {
     nudge: Cell<bool>,
     /// The patcher gives the unit an absolute root.
     absolute: Cell<bool>,
+    /// The opacity the page gives a lifted unit, if not the one that follows the tick.
+    page_opacity: Cell<Option<f32>>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -109,9 +111,14 @@ fn color(tick: u32) -> Hsla {
     hsla((tick % 50) as f32 / 50., 0.8, 0.5, 1.)
 }
 
+/// The opacity of a lifted unit at `tick`, always below 1.
+fn fade(tick: u32) -> f32 {
+    0.3 + 0.5 * ((tick % 50) as f32 / 50.)
+}
+
 /// The subtree of the unit for `tick`: a box that has a color of its own and a box in it that
 /// changes when the pointer is on it.
-fn unit_element(tick: u32, width: f32, opacity: Option<f32>, hot: Hot) -> AnyElement {
+fn unit_element(tick: u32, width: f32, opacity: Option<f32>, hot: Hot, lift: Lift) -> AnyElement {
     let mut hot_box = div().id("hot").w(px(20.)).h(px(20.)).bg(blue());
     if hot != Hot::NoHitbox {
         hot_box = hot_box.hover(|style| style.bg(green()));
@@ -123,11 +130,33 @@ fn unit_element(tick: u32, width: f32, opacity: Option<f32>, hot: Hot) -> AnyEle
     if let Some(opacity) = opacity {
         unit = unit.opacity(opacity);
     }
+    match lift {
+        Lift::No => {}
+        Lift::Absolute => unit = unit.absolute().left(px(10.)).top(px(2.)).z_index(0),
+        _ => unit = unit.lifted(),
+    }
     unit.into_any_element()
 }
 
-fn unit(tick: u32) -> Retained {
-    retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., None, Hot::Same)).patchable()
+fn unit(tick: u32, lift: Lift, page_opacity: Option<f32>) -> Retained {
+    let lifted = lift != Lift::No;
+    let opacity = lifted.then(|| page_opacity.unwrap_or_else(|| fade(tick)));
+    let root = retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., opacity, Hot::Same, lift)).patchable();
+    if lifted { root.lift_z(0) } else { root }
+}
+
+/// Whether the unit is handed to the stacking context of the page, and what else is.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Lift {
+    #[default]
+    No,
+    Alone,
+    /// With a lifted box over it and one under it, in the same context.
+    Between,
+    /// Inside a retained root that is replayed.
+    InsideRoot,
+    /// Positioned in its parent.
+    Absolute,
 }
 
 struct Page {
@@ -137,6 +166,23 @@ struct Page {
     plain: bool,
     /// The page is in a scroller, which is scrolled.
     scroll: Option<ScrollHandle>,
+    lift: Lift,
+}
+
+impl Page {
+    /// What the page holds for the unit: the root itself, or a root that holds it.
+    fn unit_child(&self) -> AnyElement {
+        let tick = self.knobs.tick.get();
+        let page_opacity = self.knobs.page_opacity.get();
+        let lift = self.lift;
+        if lift != Lift::InsideRoot {
+            return unit(tick, lift, page_opacity).into_any_element();
+        }
+        retained("wrapper", 1, move |_, _| {
+            div().id("wrapper").flex_none().child(unit(tick, Lift::Alone, page_opacity)).into_any_element()
+        })
+        .into_any_element()
+    }
 }
 
 impl Render for Page {
@@ -146,7 +192,7 @@ impl Render for Page {
         let tall = if self.scroll.is_some() { 30. } else { 1. };
         // In a scroller the unit is first, so that scrolling moves it.
         if self.scroll.is_some() {
-            content = content.child(unit(self.knobs.tick.get()));
+            content = content.child(self.unit_child());
         }
         for row in 0..rows {
             content = content.child(retained(("row", row), 1, move |_, _| {
@@ -154,7 +200,15 @@ impl Render for Page {
             }));
         }
         if self.scroll.is_none() {
-            content = content.child(unit(self.knobs.tick.get()));
+            content = content.child(self.unit_child());
+        }
+        if self.lift == Lift::Between {
+            // They cover the unit but for the box in it that the pointer is on.
+            for (name, z, color) in [("under", -1, green()), ("over", 2, red())] {
+                content = content.child(
+                    div().id(name).absolute().left(px(60.)).top(px(rows as f32)).w(px(100.)).h(px(30.)).z_index(z).bg(color),
+                );
+            }
         }
         if self.plain {
             let tick = self.knobs.tick.get();
@@ -162,16 +216,19 @@ impl Render for Page {
                 div().id("plain-body").flex_none().w(px(50.)).h(px(10.)).bg(color(tick)).into_any_element()
             }));
         }
+        let mut page = div().id("page");
+        if self.lift != Lift::No {
+            page = page.stacking_context();
+        }
         match &self.scroll {
-            Some(handle) => div()
-                .id("page")
+            Some(handle) => page
                 .w(px(400.))
                 .h(px(100.))
                 .overflow_y_scroll()
                 .track_scroll(handle)
                 .child(content)
                 .into_any_element(),
-            None => div().id("page").w(px(400.)).h(px(2000.)).overflow_hidden().child(content).into_any_element(),
+            None => page.w(px(400.)).h(px(2000.)).overflow_hidden().child(content).into_any_element(),
         }
     }
 }
@@ -186,6 +243,7 @@ struct Options {
     plain: bool,
     scroll: bool,
     a11y: bool,
+    lift: Lift,
 }
 
 impl Fixture {
@@ -200,7 +258,7 @@ impl Fixture {
         let window = cx.open_window(size(px(400.), px(2000.)), {
             let knobs = knobs.clone();
             let scroll = scroll.clone();
-            move |_, _| Page { rows, knobs, plain: options.plain, scroll }
+            move |_, _| Page { rows, knobs, plain: options.plain, scroll, lift: options.lift }
         });
         let window = AnyWindowHandle::from(window);
         cx.update_window(window, |_, window, cx| {
@@ -209,6 +267,11 @@ impl Fixture {
                 window.set_a11y_active_for_tests(true);
             }
             let knobs = knobs.clone();
+            let lift = match options.lift {
+                Lift::InsideRoot => Lift::Alone,
+                lift => lift,
+            };
+            let lifted = lift != Lift::No;
             window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
                 let tick = if knobs.wrong_color.get() { knobs.tick.get() + 7 } else { knobs.tick.get() };
                 let width = knobs.width.get().unwrap_or(100.);
@@ -216,7 +279,8 @@ impl Fixture {
                 let units = names
                     .into_iter()
                     .map(|name| {
-                        let mut element = unit_element(tick, width, knobs.opacity.get(), knobs.hot.get());
+                        let opacity = knobs.opacity.get().or_else(|| lifted.then(|| fade(tick)));
+                        let mut element = unit_element(tick, width, opacity, knobs.hot.get(), lift);
                         if knobs.absolute.get() {
                             element = div().id(UNIT).absolute().w(px(100.)).h(px(30.)).bg(color(tick)).into_any_element();
                         }
@@ -355,7 +419,16 @@ fn spent(after: FrameWorkCounters, before: FrameWorkCounters) -> FrameWorkCounte
 
 /// What `ticks` ticks of the unit cost a page of `rows` static roots, and what they left.
 fn ticks_on_a_page(cx: &mut TestAppContext, rows: usize, ticks: u32) -> (FrameWorkCounters, PatchCounters, (u64, u64, u64)) {
-    let page = Fixture::new(cx, rows);
+    ticks_on_a_page_with(cx, rows, Options::default(), ticks)
+}
+
+fn ticks_on_a_page_with(
+    cx: &mut TestAppContext,
+    rows: usize,
+    options: Options,
+    ticks: u32,
+) -> (FrameWorkCounters, PatchCounters, (u64, u64, u64)) {
+    let page = Fixture::with(cx, rows, options);
     page.tick(cx);
     let (work, patches, retained) = (page.work(cx), page.patches(cx), page.retained(cx));
     for _ in 0..ticks {
@@ -582,7 +655,7 @@ fn a_root_that_is_lifted_itself_is_not_registered(cx: &mut TestAppContext) {
         let patched = Rc::new(Cell::new(None::<Result<PatchOutcome, PatchDecline>>));
         let seen = patched.clone();
         window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
-            let result = window.repaint_in_place(vec![(ElementId::from(UNIT), unit_element(1, 100., None, Hot::Same))], cx, |_, _| true);
+            let result = window.repaint_in_place(vec![(ElementId::from(UNIT), unit_element(1, 100., None, Hot::Same, Lift::No))], cx, |_, _| true);
             seen.set(Some(result));
             result.is_ok()
         })));
@@ -724,4 +797,184 @@ fn the_frame_after_a_patch_replays_what_it_can_and_builds_the_unit(cx: &mut Test
     // And it can be patched again.
     page.tick(cx);
     assert_eq!(page.patches(cx).patched_frames, 4);
+}
+
+#[gpui::test]
+fn a_lifted_root_is_repainted_where_the_stacking_context_paints_it(cx: &mut TestAppContext) {
+    for lift in [Lift::Alone, Lift::Between, Lift::Absolute] {
+        let options = Options { lift, ..Default::default() };
+        let small = ticks_on_a_page_with(cx, 10, options, 6);
+        let large = ticks_on_a_page_with(cx, 1000, options, 6);
+        assert_eq!(small.0, large.0, "the work of a tick is the work of the root, not of the page");
+        assert_eq!(small.1, large.1);
+        assert_eq!(small.2, (0, 0, 0), "no root is replayed or built by a patch");
+        assert_eq!((small.0.prepainted, small.0.painted), (12, 12), "the box and the box in it, for 6 ticks");
+        assert_eq!(small.1.patched_units, 7);
+    }
+}
+
+#[gpui::test]
+fn a_lifted_root_keeps_its_place_among_the_boxes_lifted_around_it(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 4, Options { lift: Lift::Between, ..Default::default() });
+    let order = |page: &Fixture, cx: &mut TestAppContext| {
+        cx.update_window(page.window, |_, window, _| {
+            window.rendered_frame.hitboxes.iter().map(|hitbox| format!("{:?}", hitbox.identity)).collect::<Vec<_>>()
+        })
+        .unwrap()
+    };
+    let before = order(&page, cx);
+    for _ in 0..5 {
+        page.tick(cx);
+    }
+    assert_eq!(page.patches(cx).patched_frames, 5);
+    assert_eq!(order(&page, cx), before, "a patch leaves the hitboxes in the order the context made");
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "a lifted root between two lifted boxes");
+}
+
+#[gpui::test]
+fn the_pointer_on_a_hitbox_in_a_lifted_root_stays_on_it(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 5, Options { lift: Lift::Between, ..Default::default() });
+    cx.update_window(page.window, |_, window, cx| {
+        window.simulate_mouse_move(point(px(5.), px(10.)), cx);
+    })
+    .unwrap();
+    page.tick(cx);
+    let ids = page.hitbox_ids(cx);
+    for _ in 0..3 {
+        page.tick(cx);
+    }
+    assert_eq!(page.patches(cx).patched_frames, 4);
+    assert_eq!(page.hitbox_ids(cx), ids, "the hitboxes of the root are the ones the frame had");
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "a hovered lifted root");
+    cx.update_window(page.window, |_, window, _| {
+        let hot = window
+            .rendered_frame
+            .hitboxes
+            .iter()
+            .find(|hitbox| format!("{:?}", hitbox.identity).contains("hot"))
+            .map(|hitbox| hitbox.id)
+            .expect("the box is in the frame");
+        assert!(hot.is_hovered(window), "the pointer is on the box before and after");
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn a_lifted_root_that_fades_to_full_opacity_declines_and_patching_resumes(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 3, Options { lift: Lift::Alone, ..Default::default() });
+    page.tick(cx);
+    assert_eq!(page.patches(cx).patched_frames, 1);
+
+    // The patcher paints it with no group where the recording has one.
+    page.knobs.opacity.set(Some(1.));
+    page.tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!((patches.patched_frames, patches.declines(PatchDecline::Operations)), (1, 1));
+    page.knobs.opacity.set(None);
+    page.tick(cx);
+    assert_eq!(page.patches(cx).patched_frames, 2, "the frame built whole has the recording the next tick fits");
+
+    // And the other way round: the recording has none.
+    page.knobs.page_opacity.set(Some(1.));
+    page.draw_whole(cx);
+    page.tick(cx);
+    assert_eq!(page.patches(cx).declines(PatchDecline::Operations), 2);
+    page.knobs.page_opacity.set(None);
+    page.draw_whole(cx);
+    page.tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!((patches.patched_frames, patches.total_declines()), (3, 2));
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "after the declines");
+}
+
+#[gpui::test]
+fn a_patched_lifted_root_is_the_frame_built_whole_under_the_verifier(cx: &mut TestAppContext) {
+    for lift in [Lift::Alone, Lift::Between, Lift::InsideRoot, Lift::Absolute] {
+        let page = Fixture::with(cx, 6, Options { lift, ..Default::default() });
+        cx.update_window(page.window, |_, window, _| {
+            window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        })
+        .unwrap();
+        for _ in 0..8 {
+            page.tick(cx);
+        }
+        let counters = page.retained(cx);
+        assert_eq!(page.patches(cx).patched_frames, 8);
+        assert_eq!((counters.verified, counters.mismatches), (8, 0));
+    }
+}
+
+#[gpui::test]
+fn a_lifted_root_in_a_root_that_is_replayed_is_repainted_in_place(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 6, Options { lift: Lift::InsideRoot, ..Default::default() });
+    for _ in 0..3 {
+        page.tick(cx);
+    }
+    assert_eq!(page.patches(cx).patched_frames, 3);
+    // A frame that is not a tick replays the root around the lifted one and hands it over again.
+    cx.update_window(page.window, |view, window, cx| {
+        view.downcast::<Page>().unwrap().update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let replays = page.retained(cx).replays;
+    for _ in 0..3 {
+        page.tick(cx);
+    }
+    let patches = page.patches(cx);
+    assert_eq!((patches.patched_frames, patches.total_declines()), (6, 0));
+    assert_eq!(page.retained(cx).replays, replays);
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "a lifted root in a root that is replayed");
+}
+
+#[gpui::test]
+fn a_lifted_root_that_moves_in_its_context_declines(cx: &mut TestAppContext) {
+    struct Elevated(Rc<Knobs>);
+    impl Render for Elevated {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let tick = self.0.tick.get();
+            div().id("page").stacking_context().w(px(400.)).h(px(2000.)).child(
+                retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., Some(fade(tick)), Hot::Same, Lift::Alone))
+                    .patchable()
+                    .lift_z(0),
+            )
+        }
+    }
+    let knobs = Rc::new(Knobs::default());
+    let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(2000.)), {
+        let knobs = knobs.clone();
+        move |_, _| Elevated(knobs)
+    }));
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
+        let seen = Rc::new(Cell::new(Vec::<Result<PatchOutcome, PatchDecline>>::new()));
+        let log = seen.clone();
+        window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+            let mut logged = log.take();
+            // The same root, one z-index higher: the context orders it differently.
+            let element = unit_element(1, 100., Some(0.5), Hot::Same, Lift::Alone).into_any_element();
+            let raised = if logged.is_empty() { element } else { unit_element(1, 100., Some(0.5), Hot::Same, Lift::No) };
+            let result = window.repaint_in_place(vec![(ElementId::from(UNIT), raised)], cx, |_, _| true);
+            logged.push(result);
+            log.set(logged);
+            result.is_ok()
+        })));
+        window.request_tick();
+        window.draw(cx).clear(cx);
+        window.request_tick();
+        window.draw(cx).clear(cx);
+        let results = seen.take();
+        assert!(results[0].is_ok(), "{results:?}");
+        assert_eq!(results[1], Err(PatchDecline::Surroundings), "a root that is not lifted is not the one that was");
+    })
+    .unwrap();
 }

@@ -146,8 +146,10 @@ impl Retained {
     /// Says that a tick which changes only how the subtree paints may repaint it in place, with
     /// [`Window::repaint_in_place`], leaving the rest of the frame as it is. A frame that records
     /// the subtree leaves what that needs of its surroundings, if the recording is a plain one: not
-    /// [relocatable](Self::relocatable), not [lifted](Self::lift_z), nothing in it handed to a
-    /// stacking context outside, not culled and with no deferred draw.
+    /// [relocatable](Self::relocatable), nothing in it handed to a stacking context outside, not
+    /// culled and with no deferred draw. A subtree that is [lifted](Self::lift_z) is repainted
+    /// where the stacking context paints it, if the context takes it from the parent that
+    /// prepaints it and nothing else is lifted around it.
     pub fn patchable(mut self) -> Self {
         self.patchable = true;
         self
@@ -282,6 +284,12 @@ impl RetainedState {
         if let Some(recorded) = self.recorded.as_mut() {
             recorded.lift_base = Some(base);
         }
+    }
+
+    /// What [`Window::repaint_in_place`] needs of the surroundings, for a patchable subtree whose
+    /// recording is plain.
+    pub(crate) fn patch_unit(&self) -> Option<Rc<PatchUnit>> {
+        self.recorded.as_ref()?.patch.clone()
     }
 
     /// Whether a frame that is built from the rendered one can have this subtree paint itself from
@@ -610,6 +618,7 @@ impl Element for Retained {
                                 if !paint.is_plain() {
                                     recorded.patch = None;
                                 }
+                                recorded.patch = recorded.patch.take().and_then(|unit| window.painted_patch_unit(&unit));
                                 recorded.paint = Some(paint);
                                 if let Some(unit) = &recorded.patch {
                                     window.register_patch_unit(&self.id, unit);
@@ -1156,8 +1165,8 @@ impl Retained {
         prepaint: impl FnOnce(&mut Window, &mut App),
     ) -> (bool, Option<Relocation>) {
         let publishes = self.on_replay.is_some();
-        let patch = (self.patchable && self.overscan.is_none() && self.lift_z.is_none())
-            .then(|| window.capture_patch_unit(global_id))
+        let patch = (self.patchable && self.overscan.is_none())
+            .then(|| window.capture_patch_unit(global_id, &self.id, self.lift_z))
             .flatten();
         let (relocation, unmovable_at_start) = self.plan_relocation(window);
         if relocation.as_ref().is_some_and(|relocation| !relocation.direct) {

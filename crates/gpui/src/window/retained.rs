@@ -1722,9 +1722,14 @@ impl Window {
                 StubKind::Hole(hole) => {
                     let key = (hole.id.clone(), TypeId::of::<crate::elements::RetainedState>());
                     // What the subtree handed over itself is ordered right after it.
-                    self.retained_state_mut(&key)
-                        .expect("a subtree that is replayed with its holes has their states")
-                        .set_lift_base(ordinal + 1);
+                    let state = self
+                        .retained_state_mut(&key)
+                        .expect("a subtree that is replayed with its holes has their states");
+                    state.set_lift_base(ordinal + 1);
+                    // The hole is not prepainted by the replay, so it says here that it is where it was.
+                    if let Some(unit) = state.patch_unit() {
+                        self.register_patch_unit(&unit.name().clone(), &unit);
+                    }
                     let hole = hole.clone();
                     let replay = {
                         let hole = hole.clone();
