@@ -58,7 +58,6 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
-    mem,
     ops::Range,
     rc::Rc,
 };
@@ -79,15 +78,44 @@ pub(crate) struct DispatchTree {
     action_registry: Rc<ActionRegistry>,
 }
 
+/// What a node has that most nodes do not: put behind a pointer, so that a node that has none is
+/// small to put into the tree again, and shared by the node of the frame before when that is.
+#[derive(Default, Clone)]
+struct NodeExtras {
+    key_listeners: Vec<KeyListener>,
+    action_listeners: Vec<DispatchActionListener>,
+    modifiers_changed_listeners: Vec<ModifiersChangedListener>,
+    context: Option<KeyContext>,
+}
+
 #[derive(Default)]
 pub(crate) struct DispatchNode {
-    pub key_listeners: Vec<KeyListener>,
-    pub action_listeners: Vec<DispatchActionListener>,
-    pub modifiers_changed_listeners: Vec<ModifiersChangedListener>,
-    pub context: Option<KeyContext>,
+    extras: Option<Rc<NodeExtras>>,
     pub focus_id: Option<FocusId>,
     view_id: Option<EntityId>,
     parent: Option<DispatchNodeId>,
+}
+
+impl DispatchNode {
+    fn extras_mut(&mut self) -> &mut NodeExtras {
+        Rc::make_mut(self.extras.get_or_insert_default())
+    }
+
+    pub fn key_listeners(&self) -> &[KeyListener] {
+        self.extras.as_ref().map_or(&[], |extras| &extras.key_listeners)
+    }
+
+    pub fn action_listeners(&self) -> &[DispatchActionListener] {
+        self.extras.as_ref().map_or(&[], |extras| &extras.action_listeners)
+    }
+
+    pub fn modifiers_changed_listeners(&self) -> &[ModifiersChangedListener] {
+        self.extras.as_ref().map_or(&[], |extras| &extras.modifiers_changed_listeners)
+    }
+
+    pub fn context(&self) -> Option<&KeyContext> {
+        self.extras.as_ref()?.context.as_ref()
+    }
 }
 
 pub(crate) struct ReusedSubtree {
@@ -150,13 +178,13 @@ impl DispatchTree {
                 write!(
                     out,
                     "keys {} actions {:?} modifiers {} ",
-                    node.key_listeners.len(),
-                    node.action_listeners.iter().map(|listener| listener.action_type).collect::<Vec<_>>(),
-                    node.modifiers_changed_listeners.len(),
+                    node.key_listeners().len(),
+                    node.action_listeners().iter().map(|listener| listener.action_type).collect::<Vec<_>>(),
+                    node.modifiers_changed_listeners().len(),
                 )
                 .ok();
             }
-            writeln!(out, "context {:?} focus {:?} view {:?}", node.context, node.focus_id, node.view_id).ok();
+            writeln!(out, "context {:?} focus {:?} view {:?}", node.context(), node.focus_id, node.view_id).ok();
         }
         out
     }
@@ -211,7 +239,7 @@ impl DispatchTree {
             if let Some(view_id) = active_node.view_id {
                 self.view_stack.push(view_id)
             }
-            if let Some(context) = active_node.context.clone() {
+            if let Some(context) = active_node.context().cloned() {
                 self.context_stack.push(context);
             }
         } else {
@@ -220,7 +248,7 @@ impl DispatchTree {
             let mut current_node_id = Some(node_id);
             while let Some(node_id) = current_node_id {
                 let node = &self.nodes[node_id.0];
-                if let Some(context) = node.context.clone() {
+                if let Some(context) = node.context().cloned() {
                     self.context_stack.push(context);
                 }
                 if let Some(view_id) = node.view_id {
@@ -237,7 +265,7 @@ impl DispatchTree {
     }
 
     pub fn set_key_context(&mut self, context: KeyContext) {
-        self.active_node().context = Some(context.clone());
+        self.active_node().extras_mut().context = Some(context.clone());
         self.context_stack.push(context);
     }
 
@@ -258,7 +286,7 @@ impl DispatchTree {
 
     pub fn pop_node(&mut self) {
         let node = &self.nodes[self.active_node_id().unwrap().0];
-        if node.context.is_some() {
+        if node.context().is_some() {
             self.context_stack.pop();
         }
         if node.view_id.is_some() {
@@ -269,7 +297,7 @@ impl DispatchTree {
 
     fn move_node(&mut self, source: &mut DispatchNode) {
         self.push_node();
-        if let Some(context) = source.context.clone() {
+        if let Some(context) = source.context().cloned() {
             self.set_key_context(context);
         }
         if let Some(focus_id) = source.focus_id {
@@ -279,10 +307,8 @@ impl DispatchTree {
             self.set_view_id(view_id);
         }
 
-        let target = self.active_node();
-        target.key_listeners = mem::take(&mut source.key_listeners);
-        target.action_listeners = mem::take(&mut source.action_listeners);
-        target.modifiers_changed_listeners = mem::take(&mut source.modifiers_changed_listeners);
+        // The node of the frame before keeps what it has. The tree it is in is thrown away.
+        self.active_node().extras = source.extras.clone();
     }
 
     pub fn reuse_subtree(
@@ -326,10 +352,7 @@ impl DispatchTree {
                 self.focusable_node_ids.insert(focus_id, DispatchNodeId(new_start + offset));
             }
             self.nodes.push(DispatchNode {
-                key_listeners: mem::take(&mut source_node.key_listeners),
-                action_listeners: mem::take(&mut source_node.action_listeners),
-                modifiers_changed_listeners: mem::take(&mut source_node.modifiers_changed_listeners),
-                context: source_node.context.clone(),
+                extras: source_node.extras.clone(),
                 focus_id: source_node.focus_id,
                 view_id: None,
                 parent,
@@ -386,11 +409,12 @@ impl DispatchTree {
     }
 
     pub fn on_key_event(&mut self, listener: KeyListener) {
-        self.active_node().key_listeners.push(listener);
+        self.active_node().extras_mut().key_listeners.push(listener);
     }
 
     pub fn on_modifiers_changed(&mut self, listener: ModifiersChangedListener) {
         self.active_node()
+            .extras_mut()
             .modifiers_changed_listeners
             .push(listener);
     }
@@ -401,6 +425,7 @@ impl DispatchTree {
         listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>,
     ) {
         self.active_node()
+            .extras_mut()
             .action_listeners
             .push(DispatchActionListener {
                 action_type,
@@ -429,7 +454,7 @@ impl DispatchTree {
         let mut actions = Vec::<Box<dyn Action>>::new();
         for node_id in self.dispatch_path(target) {
             let node = &self.nodes[node_id.0];
-            for DispatchActionListener { action_type, .. } in &node.action_listeners {
+            for DispatchActionListener { action_type, .. } in node.action_listeners() {
                 if let Err(ix) = actions.binary_search_by_key(action_type, |a| a.as_any().type_id())
                 {
                     // Intentionally silence these errors without logging.
@@ -448,7 +473,7 @@ impl DispatchTree {
         for node_id in self.dispatch_path(target) {
             let node = &self.nodes[node_id.0];
             if node
-                .action_listeners
+                .action_listeners()
                 .iter()
                 .any(|listener| listener.action_type == action.as_any().type_id())
             {
@@ -517,7 +542,7 @@ impl DispatchTree {
     ) -> (SmallVec<[KeyBinding; 1]>, bool, Vec<KeyContext>) {
         let context_stack: Vec<KeyContext> = dispatch_path
             .iter()
-            .filter_map(|node_id| self.node(*node_id).context.clone())
+            .filter_map(|node_id| self.node(*node_id).context().cloned())
             .collect();
 
         let (bindings, partial) = self
