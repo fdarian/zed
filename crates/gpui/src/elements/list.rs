@@ -7,6 +7,7 @@
 //!
 //! If all of your elements are the same height, see [`crate::UniformList`] for a simpler API
 
+use super::div::{max_scroll_offset, round_to_device_half_up};
 use crate::taffy::hash_measure_key;
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
@@ -63,9 +64,30 @@ impl std::fmt::Debug for ListState {
     }
 }
 
+/// A list's scroll position and the extent of what it scrolls in, see [`ListState::dom_scroll`].
+#[derive(Clone, Copy, Debug)]
+pub struct ListDomScroll {
+    /// How far the rows have moved up: `scrollTop`.
+    pub top: Pixels,
+    /// The rows and the padding around them: what `scrollHeight` rounds.
+    pub content_height: Pixels,
+    /// The list as layout sized it: what `clientWidth` and `clientHeight` round.
+    pub client: Size<Pixels>,
+}
+
+/// What the list measures its scroll range against, from the last layout.
+#[derive(Clone, Copy)]
+struct ScrollClient {
+    /// The size of the list as layout computed it, before it is snapped to a device pixel: what
+    /// a scroller's client size is.
+    size: Size<Pixels>,
+    scale_factor: f32,
+}
+
 struct StateInner {
     last_layout_bounds: Option<Bounds<Pixels>>,
     last_padding: Option<Edges<Pixels>>,
+    last_client: Option<ScrollClient>,
     items: SumTree<ListItem>,
     logical_scroll_top: Option<ListOffset>,
     alignment: ListAlignment,
@@ -329,6 +351,7 @@ impl ListState {
         let this = Self(Rc::new(RefCell::new(StateInner {
             last_layout_bounds: None,
             last_padding: None,
+            last_client: None,
             items: SumTree::default(),
             logical_scroll_top: None,
             alignment,
@@ -791,7 +814,7 @@ impl ListState {
     /// This value remains constant while dragging to prevent the scrollbar from moving away unexpectedly.
     pub fn max_offset_for_scrollbar(&self) -> Point<Pixels> {
         let state = self.0.borrow();
-        point(Pixels::ZERO, state.max_scroll_offset())
+        point(Pixels::ZERO, state.max_scroll_offset().unwrap_or_default())
     }
 
     /// Returns the current scroll offset adjusted for the scrollbar.
@@ -802,7 +825,7 @@ impl ListState {
         let state = &self.0.borrow();
 
         if state.logical_scroll_top.is_none() && state.alignment == ListAlignment::Bottom {
-            return Point::new(px(0.), -state.max_scroll_offset());
+            return Point::new(px(0.), -state.max_scroll_offset().unwrap_or_default());
         }
 
         let logical_scroll_top = state.logical_scroll_top();
@@ -813,6 +836,27 @@ impl ListState {
         let offset = summary.height + logical_scroll_top.offset_in_item;
 
         Point::new(px(0.), -offset)
+    }
+
+    /// Where the list is scrolled and how much there is to scroll in, as the DOM reports a
+    /// scroller's `scrollTop` and `scrollHeight`, from the last layout. `None` until the list has
+    /// been laid out.
+    pub fn dom_scroll(&self) -> Option<ListDomScroll> {
+        let state = self.0.borrow();
+        let client = state.last_client?;
+        let max_top = state.scroll_max(state.items.summary().height)?;
+        let padding = state.last_padding.unwrap_or_default();
+        let top = if state.logical_scroll_top.is_none() && state.alignment == ListAlignment::Bottom
+        {
+            max_top
+        } else {
+            state.scroll_top(&state.logical_scroll_top()).min(max_top)
+        };
+        Some(ListDomScroll {
+            top,
+            content_height: state.items.summary().height + padding.top + padding.bottom,
+            client: client.size,
+        })
     }
 
     /// How far the list can scroll and how far it has, for a scrollbar, with rows that
@@ -829,8 +873,7 @@ impl ListState {
         }
         let average = summary.measured_height / summary.rendered_count as f32;
         let total = summary.measured_height + average * summary.unrendered_count as f32;
-        let viewport = state.last_layout_bounds.unwrap_or_default().size.height;
-        let max = (total - viewport).max(px(0.));
+        let max = state.scroll_max(total).unwrap_or_default();
         let offset = if state.logical_scroll_top.is_none()
             && state.alignment == ListAlignment::Bottom
         {
@@ -924,12 +967,38 @@ impl StateInner {
         };
     }
 
-    fn max_scroll_offset(&self) -> Pixels {
-        let bounds = self.last_layout_bounds.unwrap_or_default();
-        let height = self
-            .scrollbar_drag_start_height
-            .unwrap_or_else(|| self.items.summary().height);
-        (height - bounds.size.height).max(px(0.))
+    /// How far a list with `rows_height` of rows scrolls, by the rule every scroller follows
+    /// (`max_scroll_offset` in div.rs) for the rows with the padding around them. `None` until the
+    /// list has been laid out, since nothing it scrolls in is known before.
+    fn scroll_max(&self, rows_height: Pixels) -> Option<Pixels> {
+        let client = self.last_client?;
+        let padding = self.last_padding.unwrap_or_default();
+        Some(max_scroll_offset(
+            rows_height + padding.top + padding.bottom,
+            client.size.height,
+            client.scale_factor,
+        ))
+    }
+
+    /// Whether `rows_below_top` of rows from the top of the viewport reach its bottom. The ends
+    /// are measured as the scroll range is, so an offset the range allows is never pulled back.
+    fn fills_viewport(&self, rows_below_top: Pixels, available_height: Pixels) -> bool {
+        match self.last_client {
+            Some(client) => {
+                round_to_device_half_up(rows_below_top, client.scale_factor)
+                    >= round_to_device_half_up(client.size.height, client.scale_factor)
+            }
+            None => rows_below_top >= available_height,
+        }
+    }
+
+    /// [`Self::scroll_max`] for the rows as the scrollbar sees them: frozen at the height they had
+    /// when it was grabbed.
+    fn max_scroll_offset(&self) -> Option<Pixels> {
+        self.scroll_max(
+            self.scrollbar_drag_start_height
+                .unwrap_or_else(|| self.items.summary().height),
+        )
     }
 
     fn visible_range(
@@ -945,10 +1014,8 @@ impl StateInner {
     }
 
     /// The scroll position of the list's first visible edge, and the furthest it can go.
-    fn scroll_extent(&self, scroll_top: &ListOffset, height: Pixels) -> (Pixels, Pixels) {
-        let padding = self.last_padding.unwrap_or_default();
-        let scroll_max =
-            (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
+    fn scroll_extent(&self, scroll_top: &ListOffset) -> (Pixels, Pixels) {
+        let scroll_max = self.scroll_max(self.items.summary().height).unwrap_or_default();
         (self.scroll_top(scroll_top), scroll_max)
     }
 
@@ -967,9 +1034,7 @@ impl StateInner {
             return;
         }
 
-        let padding = self.last_padding.unwrap_or_default();
-        let scroll_max =
-            (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
+        let scroll_max = self.scroll_max(self.items.summary().height).unwrap_or_default();
         let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
             .max(px(0.))
             .min(scroll_max);
@@ -1210,7 +1275,7 @@ impl StateInner {
 
         // If the rendered items do not fill the visible region, then adjust
         // the scroll top upward.
-        if rendered_height - scroll_top.offset_in_item < available_height {
+        if !self.fills_viewport(rendered_height - scroll_top.offset_in_item, available_height) {
             while rendered_height < available_height {
                 cursor.prev();
                 if let Some(item) = cursor.item() {
@@ -1450,19 +1515,19 @@ impl StateInner {
     // Scrollbar support
 
     fn set_offset_from_scrollbar(&mut self, point: Point<Pixels>) {
-        let Some(bounds) = self.last_layout_bounds else {
-            return;
-        };
-        let height = bounds.size.height;
-
-        let padding = self.last_padding.unwrap_or_default();
+        let new_scroll_top = (-point.y).max(px(0.));
         // Scrollbar drag positions are computed from the content height
         // captured at drag start, so map them back using the same height.
-        let content_height = self
-            .scrollbar_drag_start_height
-            .unwrap_or_else(|| self.items.summary().height);
-        let scroll_max = (content_height + padding.top + padding.bottom - height).max(px(0.));
-        let new_scroll_top = (-point.y).max(px(0.)).min(scroll_max);
+        // Before the first layout the range is not known: the offset is kept, and that layout
+        // holds it to the rows there are.
+        let Some(scroll_max) = self.max_scroll_offset() else {
+            self.follow_state.stop_following();
+            let scroll_top = self.offset_at(new_scroll_top);
+            self.rebase_pending_scroll(scroll_top);
+            self.logical_scroll_top = Some(scroll_top);
+            return;
+        };
+        let new_scroll_top = new_scroll_top.min(scroll_max);
 
         // If content grew during the drag, the frozen bottom is below the
         // live bottom. Treat dragging to the frozen end as resuming tail follow.
@@ -1485,16 +1550,20 @@ impl StateInner {
             self.pending_scroll = None;
             self.logical_scroll_top = None;
         } else {
-            let (start, _, _) =
-                self.items
-                    .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
-
-            let scroll_top = ListOffset {
-                item_ix: start.count,
-                offset_in_item: new_scroll_top - start.height,
-            };
+            let scroll_top = self.offset_at(new_scroll_top);
             self.rebase_pending_scroll(scroll_top);
             self.logical_scroll_top = Some(scroll_top);
+        }
+    }
+
+    /// The anchor of the row at `scroll_top` from the start of the rows.
+    fn offset_at(&self, scroll_top: Pixels) -> ListOffset {
+        let (start, _, _) = self
+            .items
+            .find::<ListItemSummary, _>((), &Height(scroll_top), Bias::Right);
+        ListOffset {
+            item_ix: start.count,
+            offset_in_item: scroll_top - start.height,
         }
     }
 }
@@ -1684,6 +1753,18 @@ impl Element for List {
             state.measuring_behavior.reset();
         }
 
+        let client_size = window
+            .layout_unsnapped_bounds(
+                self.interactivity
+                    .layout_id
+                    .expect("a list requests layout before it prepaints"),
+            )
+            .size;
+        state.last_client = Some(ScrollClient {
+            size: client_size,
+            scale_factor: window.scale_factor(),
+        });
+
         let escapes_before = window.escapes_prepainted();
         let layout = window.with_hitbox_parent(&hitbox, |window| {
             match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
@@ -1756,7 +1837,7 @@ impl Element for List {
             if phase != DispatchPhase::Bubble {
                 return;
             }
-            let (base_top, scroll_max) = list_state.0.borrow().scroll_extent(&scroll_top, height);
+            let (base_top, scroll_max) = list_state.0.borrow().scroll_extent(&scroll_top);
             let offset = point(Pixels::ZERO, moved - base_top);
             let claim = scroll_routing::Claim {
                 scroller,
@@ -3253,5 +3334,98 @@ mod test {
             offset_in_item: px(0.),
         });
         assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(-3200.));
+    }
+
+    struct PaddedList(ListState);
+    impl Render for PaddedList {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            list(self.0.clone(), |_, _, _| div().h(px(20.)).w_full().into_any())
+                .w_full()
+                .h_full()
+                .pt(px(10.25))
+                .pb(px(15.125))
+        }
+    }
+
+    fn draw_padded_list(state: &ListState, cx: &mut crate::VisualTestContext) {
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| PaddedList(state.clone())).into_any_element()
+        });
+    }
+
+    /// 20 rows of 20 with 10.25 above and 15.125 below are 425.375 long: Chrome's maximum
+    /// offset in a 100 box is 425 - 100 at scale 1 and 425.5 - 100 at scale 2.
+    #[gpui::test]
+    fn test_every_maximum_offset_is_the_one_scrollers_have(cx: &mut TestAppContext) {
+        for (scale, max) in [(1.0, 325.0), (2.0, 325.5)] {
+            let cx = cx.add_empty_window();
+            cx.update(|window, _| window.set_scale_factor(scale));
+            let state = ListState::new(20, crate::ListAlignment::Top, px(0.))
+                .with_uniform_item_height(px(20.));
+            draw_padded_list(&state, cx);
+
+            assert_eq!(
+                state.max_offset_for_scrollbar().y,
+                px(max),
+                "scrollbar range at scale {scale}"
+            );
+            let (averaged_max, _) = state.averaged_scroll_extent().expect("rows are measured");
+            assert_eq!(averaged_max, px(max), "averaged range at scale {scale}");
+
+            state.set_offset_from_scrollbar(point(px(0.), px(-1e6)));
+            assert_eq!(
+                state.scroll_px_offset_for_scrollbar().y,
+                px(-max),
+                "a scrollbar write stops at the maximum at scale {scale}"
+            );
+            draw_padded_list(&state, cx);
+            assert_eq!(
+                state.scroll_px_offset_for_scrollbar().y,
+                px(-max),
+                "and the layout leaves it there at scale {scale}"
+            );
+            let dom = state.dom_scroll().expect("the list was laid out");
+            assert_eq!(dom.top, px(max));
+            assert_eq!(dom.content_height, px(425.375));
+            assert_eq!(dom.client, size(px(100.), px(100.)));
+
+            state.set_offset_from_scrollbar(point(px(0.), px(0.)));
+            draw_padded_list(&state, cx);
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(50.), px(50.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-1e6))),
+                ..Default::default()
+            });
+            assert_eq!(
+                state.scroll_px_offset_for_scrollbar().y,
+                px(-max),
+                "a wheel stops at the maximum at scale {scale}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_a_write_before_the_first_layout_is_kept(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| window.set_scale_factor(1.));
+        let state = ListState::new(50, crate::ListAlignment::Top, px(0.))
+            .with_uniform_item_height(px(20.));
+        state.set_offset_from_scrollbar(point(px(0.), px(-100.)));
+        assert!(state.dom_scroll().is_none(), "nothing is laid out yet");
+
+        draw_padded_list(&state, cx);
+        assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(-100.));
+
+        let far = ListState::new(50, crate::ListAlignment::Top, px(0.))
+            .with_uniform_item_height(px(20.));
+        far.set_offset_from_scrollbar(point(px(0.), px(-1e6)));
+        draw_padded_list(&far, cx);
+        let max = far.max_offset_for_scrollbar().y;
+        assert_eq!(max, px(925.));
+        assert_eq!(
+            far.dom_scroll().expect("the list was laid out").top,
+            max,
+            "a write past the end is held to the range"
+        );
     }
 }

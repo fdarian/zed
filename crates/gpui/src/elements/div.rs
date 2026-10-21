@@ -2719,6 +2719,21 @@ pub(crate) struct AriaProperties {
     pub(crate) node_hook: Option<std::rc::Rc<dyn Fn(&mut accesskit::Node)>>,
 }
 
+/// A length in logical pixels rounded half up to a device pixel, which is how Chrome measures
+/// the ends of a scroll range.
+pub(crate) fn round_to_device_half_up(length: Pixels, scale_factor: f32) -> Pixels {
+    Pixels(crate::util::round_half_up(length.0 * scale_factor) / scale_factor)
+}
+
+/// How far a scroller scrolls along an axis, for `content` (the scrollable overflow including the
+/// padding after the children) and `client` (the padding box less the scrollbars), as Chrome has
+/// it: both ends rounded to a device pixel, so the maximum does not depend on where the box sits.
+/// At scale 1 it is `scrollHeight - clientHeight`. A div and a list both scroll by this.
+pub(crate) fn max_scroll_offset(content: Pixels, client: Pixels, scale_factor: f32) -> Pixels {
+    (round_to_device_half_up(content, scale_factor) - round_to_device_half_up(client, scale_factor))
+        .max(Pixels::ZERO)
+}
+
 /// Both measured from the origin of the padding box, in logical pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ScrollExtent {
@@ -3286,18 +3301,11 @@ impl Interactivity {
             let border = style.border_widths.to_pixels(rem_size);
             let scroll_max = match self.scroll_extent {
                 Some(extent) => {
-                    // Chrome measures both ends in device pixels, each rounded half up, so the
-                    // maximum does not depend on where the box sits. At scale 1 it is
-                    // `scrollHeight - clientHeight`.
                     let scale_factor = window.scale_factor();
-                    let to_device = |pixels: Pixels| {
-                        Pixels(crate::util::round_half_up(pixels.0 * scale_factor) / scale_factor)
-                    };
                     point(
-                        to_device(extent.content.width) - to_device(extent.client.width),
-                        to_device(extent.content.height) - to_device(extent.client.height),
+                        max_scroll_offset(extent.content.width, extent.client.width, scale_factor),
+                        max_scroll_offset(extent.content.height, extent.client.height, scale_factor),
                     )
-                    .max(&Default::default())
                 }
                 // A scroller that is not a `Div` (a list) knows only the size of its content.
                 None => {
