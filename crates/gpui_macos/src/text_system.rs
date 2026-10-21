@@ -38,7 +38,7 @@ use gpui::{
     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
     Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
     rect::{RectF, RectI},
     transform2d::Transform2F,
@@ -48,7 +48,8 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
 
 use crate::open_type::{
-    apply_features_and_fallbacks, apply_variations, current_variations, variation_axes,
+    VariationAxis, apply_features_and_fallbacks, apply_variations, current_variations,
+    variation_axes,
 };
 
 #[allow(non_upper_case_globals)]
@@ -78,7 +79,22 @@ struct MacTextSystemState {
     /// axes set. They are not in `font_ids_by_postscript_name`: they keep the name
     /// of the face they were made from.
     varied_fonts: HashMap<(FontId, FontVariations), FontId>,
+    /// What each of `varied_fonts` was asked for, to set again on a copy of it at another size.
+    varied_faces: HashMap<FontId, VariedFace>,
+    /// The varied faces at a size, by face and the bits of the size. Rasterising asks for
+    /// one per glyph, and making a CTFont and setting its axes costs more than a lookup.
+    sized_varied_fonts: Mutex<HashMap<(FontId, u32), CTFont>>,
 }
+
+struct VariedFace {
+    source: FontId,
+    requested: Vec<(u32, f32)>,
+    axes: Vec<VariationAxis>,
+}
+
+/// More sizes than a page of text uses; an animated `font-size` would otherwise grow
+/// the cache for as long as it runs.
+const SIZED_VARIED_FONTS_LIMIT: usize = 256;
 
 impl MacTextSystem {
     /// Create a new MacTextSystem.
@@ -93,6 +109,8 @@ impl MacTextSystem {
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
             varied_fonts: HashMap::default(),
+            varied_faces: HashMap::default(),
+            sized_varied_fonts: Mutex::new(HashMap::default()),
         }))
     }
 }
@@ -402,6 +420,11 @@ impl MacTextSystemState {
     /// unless `variations` names it, as CSS font matching does for a variable font.
     /// An axis the face does not have is ignored. `font_id` itself when that changes
     /// nothing, as for a face that already has those values.
+    ///
+    /// `opsz` is the exception: CoreText sets it from the point size a font is made at
+    /// and again at every copy at another size, and the value it reports does not tell
+    /// an explicit one from the automatic one. An explicit `opsz` is always set, and the
+    /// copies at a size set it again, see `sized_font`.
     fn varied_font(
         &mut self,
         font_id: FontId,
@@ -413,6 +436,7 @@ impl MacTextSystemState {
             return font_id;
         }
         let weight_tag = FontVariations::tag(*b"wght");
+        let optical_size_tag = FontVariations::tag(*b"opsz");
         let automatic = [(weight_tag, weight.0)];
         let automatic = (variations.get(weight_tag).is_none()).then_some(automatic.as_slice());
         let current = current_variations(&self.fonts[font_id.0], &axes);
@@ -424,7 +448,7 @@ impl MacTextSystemState {
                 let axis = axes.iter().find(|axis| axis.tag == *tag)?;
                 let value = value.clamp(axis.min, axis.max);
                 let has = current.iter().find(|(current, _)| current == tag)?.1;
-                (has != value).then_some((*tag, value))
+                (has != value || *tag == optical_size_tag).then_some((*tag, value))
             })
             .collect::<Vec<_>>();
         if wanted.is_empty() {
@@ -442,8 +466,44 @@ impl MacTextSystemState {
             self.postscript_names_by_font_id
                 .insert(varied, postscript_name);
         }
+        self.varied_faces.insert(
+            varied,
+            VariedFace {
+                source: font_id,
+                requested: key.1.tag_value_list().to_vec(),
+                axes,
+            },
+        );
         self.varied_fonts.insert(key, varied);
         varied
+    }
+
+    /// The CoreText font of `font_id` at `size`. A copy at another size gets its
+    /// automatic axes for that size, so a varied face is made again from the face it
+    /// came from at the size, with its axes set. It is not set again on a copy of itself:
+    /// CoreText takes a value equal to what the font has as no change and gives the
+    /// axis its automatic value.
+    fn sized_font(&self, font_id: FontId, size: f32) -> CTFont {
+        let Some(face) = self.varied_faces.get(&font_id) else {
+            return self.fonts[font_id.0]
+                .native_font()
+                .clone_with_font_size(size as CGFloat);
+        };
+        let key = (font_id, size.to_bits());
+        let mut sized = self.sized_varied_fonts.lock();
+        if let Some(cached) = sized.get(&key) {
+            return cached.clone();
+        }
+        let source = self.fonts[face.source.0].native_font();
+        let mut copy =
+            unsafe { FontKitFont::from_native_font(&source.clone_with_font_size(size as CGFloat)) };
+        apply_variations(&mut copy, &face.requested, &face.axes);
+        let copy = copy.native_font();
+        if sized.len() >= SIZED_VARIED_FONTS_LIMIT {
+            sized.clear();
+        }
+        sized.insert(key, copy.clone());
+        copy
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
@@ -573,9 +633,7 @@ impl MacTextSystemState {
             } else {
                 cx.set_gray_fill_color(0.0, 1.0);
             }
-            self.fonts[params.font_id.0]
-                .native_font()
-                .clone_with_font_size(f32::from(params.font_size) as CGFloat)
+            self.sized_font(params.font_id, f32::from(params.font_size))
                 .draw_glyphs(
                     &[params.glyph_id.0 as CGGlyph],
                     &[CGPoint::new(
@@ -615,7 +673,6 @@ impl MacTextSystemState {
 
                 let length = utf16_end - utf16_start;
                 let cf_range = CFRange::init(utf16_start, length);
-                let font = &self.fonts[run.font_id.0];
 
                 let run_font_size = run.font_size.unwrap_or(font_size);
                 let line_box = self.font_metrics[run.font_id.0].line_box(run_font_size);
@@ -624,7 +681,7 @@ impl MacTextSystemState {
                 } else {
                     run_font_size
                 };
-                let ct_font = font.native_font().clone_with_font_size(ct_font_size.into());
+                let ct_font = self.sized_font(run.font_id, f32::from(ct_font_size));
                 input_runs.push(InputRun {
                     font_id: run.font_id,
                     postscript_name: ct_font.postscript_name(),
@@ -889,8 +946,8 @@ mod lenient_font_attributes {
 mod tests {
     use crate::MacTextSystem;
     use gpui::{
-        Font, FontFeatures, FontRun, FontVariations, FontWeight, GlyphId, PlatformTextSystem,
-        RenderGlyphParams, font, px,
+        Font, FontFeatures, FontRun, FontSmoothing, FontVariations, FontWeight, GlyphId,
+        PlatformTextSystem, RenderGlyphParams, font, px,
     };
     use std::sync::Arc;
 
@@ -1555,5 +1612,60 @@ mod tests {
         assert_eq!((layout.runs[0].ascent, layout.runs[0].descent), (px(18.), px(5.)));
         // Bold Helvetica Neue at 20px is 24px of content in Chrome.
         assert_eq!((layout.runs[1].ascent, layout.runs[1].descent), (px(20.), px(4.)));
+    }
+
+    /// Inter Variable cut down to "Hamburgefonstiv 0123": an `opsz` axis of 14 to 32, and a
+    /// font that is not the UI font, whose optical size CoreText always sets from the size.
+    /// The file is the fixture of gpuix's font-smoothing test, so the test needs the checkout
+    /// this crate is a submodule of.
+    const INTER_SUBSET: &str =
+        "../../../packages/react/src/__tests__/fixtures/inter-subset.ttf";
+
+    /// What Chrome lays "Hamburgefonstiv 0123" out as in `fixtures/inter-subset.ttf`, by
+    /// font size, `wght` and `opsz` (`font-smoothing-oracle.json`, scale 1).
+    const CHROME_ADVANCES: [(f32, f32, f32, f32); 8] = [
+        (14., 400., 14., 149.484375),
+        (14., 500., 16., 150.484375),
+        (14., 550., 18., 150.53125),
+        (14., 700., 25., 150.96875),
+        (24., 400., 14., 256.265625),
+        (24., 500., 16., 257.96875),
+        (24., 550., 18., 258.0625),
+        (24., 700., 25., 258.796875),
+    ];
+
+    #[test]
+    fn test_an_explicit_opsz_is_the_one_the_text_is_drawn_with() {
+        let fonts = MacTextSystem::new();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(INTER_SUBSET);
+        let Ok(file) = std::fs::read(&path) else {
+            eprintln!("skipped: {} is not in this checkout", path.display());
+            return;
+        };
+        fonts.add_fonts(vec![file.into()]).unwrap();
+        let inter = |wght, opsz| Font {
+            weight: FontWeight(wght),
+            variations: FontVariations::new([
+                (FontVariations::tag(*b"wght"), wght),
+                (FontVariations::tag(*b"opsz"), opsz),
+            ]),
+            ..font("Inter Variable")
+        };
+        for (size, wght, opsz, chrome) in CHROME_ADVANCES {
+            let font_id = fonts.font_id(&inter(wght, opsz)).unwrap();
+            let font_id = fonts.font_id(&inter(wght, opsz)).unwrap();
+            let run = FontRun {
+                font_id,
+                len: "Hamburgefonstiv 0123".len(),
+                font_size: None,
+                line_height: None,
+            };
+            let advance =
+                f32::from(fonts.layout_line("Hamburgefonstiv 0123", px(size), &[run]).width);
+            assert!(
+                (advance - chrome).abs() < 0.02,
+                "{size}px wght {wght} opsz {opsz}: {advance}, Chrome {chrome}"
+            );
+        }
     }
 }
