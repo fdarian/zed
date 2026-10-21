@@ -20,11 +20,23 @@ impl Render for Page {
     }
 }
 
+/// The scales the sweeps run at: text is measured in the layout units of the window's.
+const SCALES: [f32; 2] = [1., 2.];
+
 pub(super) fn laid_out(
     system: Arc<dyn PlatformTextSystem>,
     build: impl Fn(&Out) -> AnyElement + 'static,
 ) -> Vec<(Bounds<Pixels>, TextLayout)> {
+    laid_out_at(system, 2., build)
+}
+
+pub(super) fn laid_out_at(
+    system: Arc<dyn PlatformTextSystem>,
+    scale: f32,
+    build: impl Fn(&Out) -> AnyElement + 'static,
+) -> Vec<(Bounds<Pixels>, TextLayout)> {
     let mut app = TestApp::with_text_system(system);
+    app.set_window_scale_factor(scale);
     let out = Out::default();
     let mut window = app.open_window({
         let out = out.clone();
@@ -75,10 +87,10 @@ const TEXTS: [&str; 11] = [
 fn own_width_never_wraps_sweep() {
     let mut failures = Vec::new();
     for (name, system) in systems() {
-        for text in TEXTS {
+        for (text, scale) in TEXTS.into_iter().flat_map(|text| SCALES.map(|scale| (text, scale))) {
             for step in 0..400 {
                 let size = 8. + step as f32 * 0.0731;
-                let found = laid_out(system.clone(), move |out| {
+                let found = laid_out_at(system.clone(), scale, move |out| {
                     let styled = StyledText::new(text);
                     let layout = styled.layout().clone();
                     div()
@@ -99,7 +111,7 @@ fn own_width_never_wraps_sweep() {
                 let (bounds, layout) = &found[0];
                 if bounds.size.height != px(20.) || layout.wrapped_text().contains('\n') {
                     failures.push(format!(
-                        "{name} {text:?} size {size}: {:?} {:?}",
+                        "{name} {text:?} scale {scale} size {size}: {:?} {:?}",
                         bounds.size,
                         layout.wrapped_text()
                     ));
@@ -113,10 +125,10 @@ fn own_width_never_wraps_sweep() {
 fn cut_by_own_width(ellipsis: &'static str) -> Vec<String> {
     let mut failures = Vec::new();
     for (name, system) in systems() {
-        for text in TEXTS {
+        for (text, scale) in TEXTS.into_iter().flat_map(|text| SCALES.map(|scale| (text, scale))) {
             for step in 0..400 {
                 let size = 8. + step as f32 * 0.0731;
-                let found = laid_out(system.clone(), move |out| {
+                let found = laid_out_at(system.clone(), scale, move |out| {
                     let styled = StyledText::new(text);
                     let layout = styled.layout().clone();
                     let mut item = div()
@@ -140,7 +152,7 @@ fn cut_by_own_width(ellipsis: &'static str) -> Vec<String> {
                 });
                 let (_, layout) = &found[0];
                 if layout.text() != text {
-                    failures.push(format!("{name} {text:?} size {size}: cut to {:?}", layout.text()));
+                    failures.push(format!("{name} {text:?} scale {scale} size {size}: cut to {:?}", layout.text()));
                 }
             }
         }
@@ -175,7 +187,18 @@ fn in_box(
     size: f32,
     style: fn(gpui_div::Div) -> gpui_div::Div,
 ) -> (Bounds<Pixels>, TextLayout) {
-    let found = laid_out(system, move |out| {
+    in_box_at(system, 2., text, width, size, style)
+}
+
+fn in_box_at(
+    system: Arc<dyn PlatformTextSystem>,
+    scale: f32,
+    text: &'static str,
+    width: f32,
+    size: f32,
+    style: fn(gpui_div::Div) -> gpui_div::Div,
+) -> (Bounds<Pixels>, TextLayout) {
+    let found = laid_out_at(system, scale, move |out| {
         let styled = StyledText::new(text);
         let layout = styled.layout().clone();
         let item = style(
@@ -253,16 +276,17 @@ fn line_clamp_boundary() {
     assert!(failures.is_empty(), "{} wrong, first {:?}", failures.len(), &failures[..failures.len().min(4)]);
 }
 
-/// A box (its width is a device pixel, 1/2 here) holds the text on a line iff the width the text
-/// measured at is not over the box.
+/// A box (its width is a device pixel) holds the text on a line when the width the text measured at
+/// is not over the box, and does not when that is over it by more than the unit the width was ceiled
+/// to (the text itself is somewhere in that unit, and what wrapping forgives is a hair).
 #[test]
 fn wrap_follows_measured_width() {
     let text = "alpha beta gamma";
     let mut failures = Vec::new();
     for (name, system) in systems() {
-        for step in 0..300 {
+        for (step, scale) in (0..300).flat_map(|step| SCALES.map(|scale| (step, scale))) {
             let size = 9. + step as f32 * 0.0613;
-            let found = laid_out(system.clone(), move |out| {
+            let found = laid_out_at(system.clone(), scale, move |out| {
                 let styled = StyledText::new(text);
                 let layout = styled.layout().clone();
                 div()
@@ -275,13 +299,15 @@ fn wrap_follows_measured_width() {
                     .into_any_element()
             });
             let own = found[0].0.size.width.0;
-            let below = (own * 2.).floor() / 2.;
-            for width in [below, below + 0.5] {
-                let (_, laid) = in_box(system.clone(), text, width, size, |d| d);
+            let below = (own * scale).floor() / scale;
+            for width in [below, below + 1. / scale] {
+                let (_, laid) = in_box_at(system.clone(), scale, text, width, size, |d| d);
                 let wraps = laid.wrapped_text().contains('\n');
-                let should_wrap = own > width + 1. / 1024.;
-                if wraps != should_wrap {
-                    failures.push(format!("{name} size {size}: measured {own}, box {width}, wraps {wraps}"));
+                let unit = 1. / (64. * scale);
+                let fits = own <= width + 1. / 1024.;
+                let over = own > width + unit + 1. / 1024.;
+                if (fits && wraps) || (over && !wraps) {
+                    failures.push(format!("{name} scale {scale} size {size}: measured {own}, box {width}, wraps {wraps}"));
                 }
             }
         }
@@ -906,4 +932,42 @@ fn atomic_inline_keeps_its_fraction_and_is_painted_half_up() {
             assert_eq!(painted.bounds.origin.y.0, (atomic.origin.y.0 * scale + 0.5).floor(), "scale {scale}, y at ({left}, {top})");
         }
     }
+}
+
+/// A text is measured in the layout units of the scale of its window, so the window going to
+/// another scale with the text and everything else as it was measures it again. The line height
+/// is a length, which is the same at both scales, so only the width tells the scales apart.
+#[test]
+fn a_text_is_measured_again_when_only_the_window_scale_changes() {
+    let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+    app.set_window_scale_factor(1.);
+    let out = Out::default();
+    let mut window = app.open_window({
+        let out = out.clone();
+        move |_, _| Page {
+            build: Box::new(|out| {
+                let styled = StyledText::new("Hello world");
+                let layout = styled.layout().clone();
+                div()
+                    .w(px(600.))
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .text_size(px(12.))
+                    .line_height(px(20.))
+                    .child(div().flex().on_prepainted_layout(tagged(out, layout)).child(styled))
+                    .into_any_element()
+            }),
+            out,
+        }
+    });
+    let mut width = |scale: f32| {
+        window.update(|_, window, _| window.set_scale_factor(scale));
+        window.draw();
+        out.borrow()[0].0.size.width.0
+    };
+    // "Hello world" is 79.4707 wide: the next 1/64 above is 79.484375, the next 1/128 79.4765625.
+    assert_eq!(width(1.), 79.484375);
+    assert_eq!(width(2.), 79.4765625);
+    assert_eq!(width(1.), 79.484375);
 }

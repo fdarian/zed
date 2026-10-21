@@ -1,5 +1,5 @@
 use crate::{
-    ActiveTooltip, floor_to_layout_unit, AnyView, App, AtomicCarry, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
+    ActiveTooltip, AnyView, App, AtomicCarry, AtomicInline, AtomicInlines, AtomicMeasure, Bounds,
     DispatchPhase, Element, ElementId, EndTruncation, GlobalElementId, GlyphInset,
     HighlightStyle, Hitbox, HitboxBehavior, InlineBox, InspectorElementId, IntoElement, LayoutId, MeasureRun, MeasuredLeaf,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
@@ -853,7 +853,7 @@ impl TextLayoutInner {
         if self.trim_top.0 == 0. && self.trim_bottom.0 == 0. {
             baseline
         } else {
-            Pixels(round_to_layout_unit(baseline.0))
+            Pixels(round_to_layout_unit(baseline.0, self.scale_factor))
         }
     }
 
@@ -899,11 +899,9 @@ impl TextLayout {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let scale_factor = window.scale_factor();
-        let line_height = floor_to_layout_unit(
-            window
-                .text_system()
-                .line_height(&text_style, window.rem_size(), scale_factor),
-        );
+        let line_height = window
+            .text_system()
+            .line_height(&text_style, window.rem_size(), scale_factor);
         let text_align = text_style.text_align;
         let mut options = text_style.layout_options(window.text_system());
         // A box that wraps in text that does not makes lines, and the spaces at the end
@@ -1031,7 +1029,7 @@ impl TextLayout {
                                 &inline,
                                 line_height,
                             ) {
-                                Ok(width) => Some(Pixels(ceil_to_layout_unit(width.0))),
+                                Ok(width) => Some(Pixels(ceil_to_layout_unit(width.0, scale_factor))),
                                 Err(error) => {
                                     log::error!("measuring the min-content width: {error:#}");
                                     return unmeasurable(None, None);
@@ -1206,8 +1204,8 @@ impl TextLayout {
                 size.height -= trim_top + trim_bottom;
                 // As Chrome lays a text out: the width above its advance, the height at the
                 // layout unit nearest to it.
-                size.width = Pixels(ceil_to_layout_unit(size.width.0));
-                size.height = Pixels(round_to_layout_unit(size.height.0));
+                size.width = Pixels(ceil_to_layout_unit(size.width.0, scale_factor));
+                size.height = Pixels(round_to_layout_unit(size.height.0, scale_factor));
 
                 let inner = TextLayoutInner {
                     lines: Rc::new(lines),
@@ -3124,8 +3122,9 @@ mod tests {
     }
 
     /// Boxes of text are laid out in fractions of a pixel and painted on device pixels, as in
-    /// Chrome: a width is the advance of the text up to 1/64 of a pixel, and the height of a
-    /// trimmed text is the metric of its font to the nearest 1/64. The numbers are from headless
+    /// Chrome: a width is the advance of the text up to 1/64 of a device pixel, and the height of a
+    /// trimmed text is the metric of its font to the nearest 1/64 (these are laid out at scale 1;
+    /// the scale-2 rows are in gpuix's `text-measure.test.tsx`). The numbers are from headless
     /// Chrome 155 on macOS (`getBoundingClientRect` of the same boxes in HTML, with Menlo, whose
     /// advance and cap height `FixedMetricsTextSystem::menlo` has), each case saying which. The
     /// layout is read before it is snapped.
@@ -3165,6 +3164,7 @@ mod tests {
 
         fn laid_out(build: fn(&Probe) -> AnyElement) -> HashMap<&'static str, Bounds<Pixels>> {
             let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+            app.set_window_scale_factor(1.);
             let probe = Probe::default();
             let mut window = app.open_window({
                 let probe = probe.clone();
@@ -3305,6 +3305,64 @@ mod tests {
                 let text = boxes[name];
                 assert_eq!(text.size.height, px(20.), "text {name} wrapped: {text:?}");
             }
+        }
+    }
+
+    /// A text element that keeps its layout from one frame to the next (the handle of a text a
+    /// view holds on to) measures again when the window changes scale: the size it measured at
+    /// one scale is not the one it has at the next, in width (the unit of the ceil) and in height
+    /// (a number line height is cut to the unit).
+    mod kept_across_a_scale_change {
+        use super::*;
+        use crate::{
+            Context, FixedMetricsTextSystem, InteractiveElement as _, ParentElement as _, Render,
+            Styled as _, TestApp, div, px,
+        };
+
+        struct Kept {
+            layout: TextLayout,
+            bounds: Rc<Cell<Bounds<Pixels>>>,
+        }
+
+        impl Render for Kept {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut text = StyledText::new("Hello world");
+                text.layout = self.layout.clone();
+                let bounds = self.bounds.clone();
+                // A box with a width of its own asks the text for the same width at both scales,
+                // which is what a layout kept from the frame before answers.
+                div().text_size(px(12.)).line_height(crate::relative(1.2)).child(
+                    div()
+                        .w(px(200.))
+                        .on_prepainted_layout(move |_, id, window, _| {
+                            bounds.set(window.layout_unsnapped_bounds(id));
+                        })
+                        .child(text),
+                )
+            }
+        }
+
+        #[test]
+        fn a_kept_layout_is_not_the_answer_at_another_scale() {
+            let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+            app.set_window_scale_factor(1.);
+            let layout = TextLayout::default();
+            let bounds = Rc::new(Cell::new(Bounds::default()));
+            let mut window = app.open_window({
+                let layout = layout.clone();
+                let bounds = bounds.clone();
+                move |_, _| Kept { layout, bounds }
+            });
+            let size = |window: &mut crate::TestAppWindow<Kept>, scale: f32| {
+                window.update(|_, window, _| window.set_scale_factor(scale));
+                window.draw();
+                let measured = layout.0.borrow().as_ref().unwrap().size.unwrap();
+                (measured.width.0, bounds.get().size.height.0)
+            };
+            // 12px Menlo "Hello world" is 79.4707 wide; 12px at 1.2 is 14.4 high.
+            assert_eq!(size(&mut window, 1.), (79.484375, 14.390625));
+            assert_eq!(size(&mut window, 2.), (79.4765625, 14.3984375));
+            assert_eq!(size(&mut window, 1.), (79.484375, 14.390625));
         }
     }
 
@@ -3571,9 +3629,9 @@ mod tests {
         };
 
         /// What the box is as wide as when it holds `characters` of the space: their advances,
-        /// up to the layout unit.
-        fn wide(space: Pixels, characters: f32) -> Pixels {
-            Pixels(ceil_to_layout_unit((space * characters).0))
+        /// up to the layout unit of a window of `scale`.
+        fn wide(space: Pixels, characters: f32, scale: f32) -> Pixels {
+            Pixels(ceil_to_layout_unit((space * characters).0, scale))
         }
 
         struct MinContentText {
@@ -3604,6 +3662,7 @@ mod tests {
         /// a box whose width is `min-content`, with `style` applied to the box.
         fn laid_out(
             cx: &mut TestAppContext,
+            scale: f32,
             text: &'static str,
             style: fn(&mut crate::StyleRefinement),
         ) -> (Pixels, usize) {
@@ -3619,8 +3678,11 @@ mod tests {
                     width,
                 }
             });
-            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
-                .unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.set_scale_factor(scale);
+                window.draw(cx).clear(cx)
+            })
+            .unwrap();
             let layout = layout.borrow().clone().unwrap();
             let lines = layout.wrapped_text().split('\n').count();
             (width.get(), lines)
@@ -3638,47 +3700,55 @@ mod tests {
 
         #[crate::test]
         fn a_box_is_as_wide_as_the_longest_word_and_the_text_wraps_in_it(cx: &mut TestAppContext) {
-            let (width, lines) = laid_out(cx, "aa bbbbbb cccc", |_| {});
-            assert_eq!(width, wide(space(cx), 7.));
-            assert_eq!(lines, 3);
+            for scale in [1., 2.] {
+                let (width, lines) = laid_out(cx, scale, "aa bbbbbb cccc", |_| {});
+                assert_eq!(width, wide(space(cx), 7., scale), "scale {scale}");
+                assert_eq!(lines, 3);
+            }
         }
 
         #[crate::test]
         fn overflow_wrap_anywhere_shrinks_the_box_and_break_word_does_not(cx: &mut TestAppContext) {
-            let (normal, normal_lines) = laid_out(cx, "aa bbbbbb cccc", |style| {
-                style.text_style().overflow_wrap = Some(OverflowWrap::Normal);
-            });
-            let (break_word, _) = laid_out(cx, "aa bbbbbb cccc", |style| {
-                style.text_style().overflow_wrap = Some(OverflowWrap::BreakWord);
-            });
-            let (anywhere, anywhere_lines) = laid_out(cx, "aa bbbbbb cccc", |style| {
-                style.text_style().overflow_wrap = Some(OverflowWrap::Anywhere);
-            });
-            let space = space(cx);
-            assert_eq!(normal, wide(space, 7.));
-            assert_eq!(break_word, normal);
-            assert_eq!(anywhere, wide(space, 1.));
-            assert_eq!(normal_lines, 3);
-            assert!(anywhere_lines > normal_lines);
+            for scale in [1., 2.] {
+                let (normal, normal_lines) = laid_out(cx, scale, "aa bbbbbb cccc", |style| {
+                    style.text_style().overflow_wrap = Some(OverflowWrap::Normal);
+                });
+                let (break_word, _) = laid_out(cx, scale, "aa bbbbbb cccc", |style| {
+                    style.text_style().overflow_wrap = Some(OverflowWrap::BreakWord);
+                });
+                let (anywhere, anywhere_lines) = laid_out(cx, scale, "aa bbbbbb cccc", |style| {
+                    style.text_style().overflow_wrap = Some(OverflowWrap::Anywhere);
+                });
+                let space = space(cx);
+                assert_eq!(normal, wide(space, 7., scale), "scale {scale}");
+                assert_eq!(break_word, normal);
+                assert_eq!(anywhere, wide(space, 1., scale), "scale {scale}");
+                assert_eq!(normal_lines, 3);
+                assert!(anywhere_lines > normal_lines);
+            }
         }
 
         #[crate::test]
         fn hanging_spaces_do_not_widen_the_box(cx: &mut TestAppContext) {
-            let (hung, _) = laid_out(cx, "aaaa bb", |style| {
-                style.text_style().hang_trailing_spaces = Some(true);
-            });
-            let (kept, _) = laid_out(cx, "aaaa bb", |_| {});
-            let space = space(cx);
-            assert_eq!(hung, wide(space, 4.));
-            assert_eq!(kept, wide(space, 5.));
+            for scale in [1., 2.] {
+                let (hung, _) = laid_out(cx, scale, "aaaa bb", |style| {
+                    style.text_style().hang_trailing_spaces = Some(true);
+                });
+                let (kept, _) = laid_out(cx, scale, "aaaa bb", |_| {});
+                let space = space(cx);
+                assert_eq!(hung, wide(space, 4., scale), "scale {scale}");
+                assert_eq!(kept, wide(space, 5., scale), "scale {scale}");
+            }
         }
 
         #[crate::test]
         fn break_all_makes_the_box_one_letter_wide(cx: &mut TestAppContext) {
-            let (width, _) = laid_out(cx, "abcdef ghi", |style| {
-                style.text_style().word_break = Some(WordBreak::BreakAll);
-            });
-            assert_eq!(width, wide(space(cx), 1.));
+            for scale in [1., 2.] {
+                let (width, _) = laid_out(cx, scale, "abcdef ghi", |style| {
+                    style.text_style().word_break = Some(WordBreak::BreakAll);
+                });
+                assert_eq!(width, wide(space(cx), 1., scale), "scale {scale}");
+            }
         }
     }
 

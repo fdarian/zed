@@ -223,8 +223,8 @@ pub(crate) fn floor_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor).floor()
 }
 
-/// Chrome's `LayoutUnit`: boxes are laid out in 1/64 of a device pixel and painted on whole ones
-/// (the text measures of gpuix are 1/64 of a logical pixel). Text takes the unit above its advance and the one nearest its height.
+/// Chrome's `LayoutUnit`: boxes are laid out in 1/64 of a device pixel and painted on whole ones.
+/// Text is measured in the same unit, at the scale of its window: 1/128 of a logical pixel at scale 2.
 pub(crate) const LAYOUT_UNIT: f32 = 1. / 64.;
 
 /// How far text may stand over the width it is laid out in and still fit, in logical pixels. A
@@ -239,18 +239,33 @@ pub(crate) fn truncate_to_layout_unit(length: f32) -> f32 {
     (length / LAYOUT_UNIT).trunc() * LAYOUT_UNIT
 }
 
-/// The first multiple of [`LAYOUT_UNIT`] at or above `logical`, for a size that must hold its
-/// content: a width the text is laid out in must not wrap the text. A sum of advances a hair above
-/// a multiple of the unit is that multiple.
+/// How far above a multiple of [`LAYOUT_UNIT`] the float sum of a text's advances may be and still
+/// be that multiple, in device pixels: the noise of the sum (a few `f32` steps at the width of a
+/// line), not a tolerance. Chrome ceils its float sum as it is, so a width a hair over a unit is
+/// the next one there too.
+const SUM_NOISE: f32 = 1. / 8192.;
+
+/// The first multiple of a layout unit of a window of `scale_factor` at or above `logical`, as
+/// Chrome takes the inline size of a text (`ShapeResult::SnappedWidth` is `LayoutUnit::FromFloatCeil`
+/// of its width in device pixels). The result is in logical pixels: a multiple of 1/128 at scale 2.
 #[inline]
-pub(crate) fn ceil_to_layout_unit(logical: f32) -> f32 {
-    (logical / LAYOUT_UNIT - FIT_SLACK / LAYOUT_UNIT).ceil() * LAYOUT_UNIT
+pub(crate) fn ceil_to_layout_unit(logical: f32, scale_factor: f32) -> f32 {
+    ((logical * scale_factor - SUM_NOISE) / LAYOUT_UNIT).ceil() * LAYOUT_UNIT / scale_factor
 }
 
-/// The multiple of [`LAYOUT_UNIT`] nearest to `logical`, for a size that is a measure of the font.
+/// A size a node measured, which is a multiple of the layout unit of the window, in device pixels:
+/// it comes back from logical pixels as a float, a hair either side of the multiple, which
+/// [`FIT_SLACK`] (a length in logical pixels) forgives.
 #[inline]
-pub(crate) fn round_to_layout_unit(logical: f32) -> f32 {
-    (logical / LAYOUT_UNIT).round() * LAYOUT_UNIT
+pub(crate) fn ceil_measured_size_to_layout_unit(device: f32, scale_factor: f32) -> f32 {
+    ((device - FIT_SLACK * scale_factor) / LAYOUT_UNIT).ceil() * LAYOUT_UNIT
+}
+
+/// The multiple of a layout unit of a window of `scale_factor` nearest to `logical` (a half away
+/// from zero), for a size that is a measure of the font or a length (`LayoutUnit::FromFloatRound`).
+#[inline]
+pub(crate) fn round_to_layout_unit(logical: f32, scale_factor: f32) -> f32 {
+    (logical * scale_factor / LAYOUT_UNIT).round() * LAYOUT_UNIT / scale_factor
 }
 
 /// Whether text `width` wide stands over `available`: the slack is for the float that a width

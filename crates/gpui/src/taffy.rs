@@ -2,7 +2,7 @@ use crate::{
     AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
     Style, Window, point, size,
     util::{
-        LAYOUT_UNIT, ceil_to_layout_unit, round_half_up, round_to_device_pixel,
+        LAYOUT_UNIT, ceil_measured_size_to_layout_unit, round_half_up, round_to_device_pixel,
         snap_border_width_to_device_pixel, truncate_to_layout_unit,
     },
 };
@@ -1993,7 +1993,7 @@ fn measure_leaf(
 }
 
 fn measured_size_in_device_pixels(size: Size<Pixels>, scale_factor: f32) -> Size<f32> {
-    size.map(|d| ceil_to_layout_unit(d.0.max(0.0)) * scale_factor)
+    size.map(|d| ceil_measured_size_to_layout_unit(d.0.max(0.0) * scale_factor, scale_factor))
 }
 
 /// `exact` keeps the widths as they are, in device pixels, where the others are whole ones: a

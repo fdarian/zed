@@ -331,14 +331,14 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.line_box(font_size, scale_factor))
     }
 
-    /// The line height `style` asks for, in pixels, not yet laid out in whole
-    /// sixty-fourths of a pixel: `normal` is the height of its font on a display of
-    /// `scale_factor` device pixels to a pixel.
+    /// The line height `style` asks for, in pixels, laid out in 1/64 of a device pixel as
+    /// [`LineHeight::to_laid_out_pixels`] does: `normal` is the height of its font on a display
+    /// of `scale_factor` device pixels to a pixel.
     pub fn line_height(&self, style: &TextStyle, rem_size: Pixels, scale_factor: f32) -> Pixels {
         let font_size = style.font_size.to_pixels(rem_size);
         style
             .line_height
-            .to_pixels(style.font_size, rem_size, || {
+            .to_laid_out_pixels(style.font_size, rem_size, scale_factor, || {
                 self.line_box(self.resolve_font(&style.font()), font_size, scale_factor)
                     .normal_line_height()
             })
@@ -1676,12 +1676,6 @@ pub fn extent_in_line(
     (above, line_height - above)
 }
 
-/// The largest multiple of a sixty-fourth of a pixel, Chrome's `LayoutUnit`, that does
-/// not exceed `length`: how a line height is laid out.
-pub fn floor_to_layout_unit(length: Pixels) -> Pixels {
-    px((length.0 * 64.).floor() / 64.)
-}
-
 impl FontMetrics {
     /// The content area of an inline box in this font at `font_size`, on a display of
     /// `scale_factor` device pixels to a pixel: Chrome zooms the font to the device before it
@@ -2384,11 +2378,35 @@ mod line_box_tests {
     }
 
     #[test]
-    fn test_a_line_height_is_laid_out_in_sixty_fourths_of_a_pixel() {
-        assert_eq!(floor_to_layout_unit(px(14.4)), px(14.390625));
-        assert_eq!(floor_to_layout_unit(px(15.6)), px(15.59375));
-        assert_eq!(floor_to_layout_unit(px(24.)), px(24.));
-        assert_eq!(floor_to_layout_unit(px(0.01)), px(0.));
+    fn test_a_line_height_is_laid_out_in_sixty_fourths_of_a_device_pixel_as_chrome_does() {
+        // Headless Chrome (`getBoundingClientRect().height` of a block of one line, Helvetica Neue):
+        // a multiple of the font size is cut, a length and a percentage are rounded, in the device
+        // pixels of the display (`--force-device-scale-factor`).
+        let lay_out = |line_height: LineHeight, size: f32, scale: f32| {
+            line_height
+                .to_laid_out_pixels(px(size).into(), px(16.), scale, || unreachable!())
+                .0
+        };
+        let number = |value: f32| LineHeight::from(crate::relative(value));
+        assert_eq!(lay_out(number(1.2), 12., 1.), 14.390625);
+        assert_eq!(lay_out(number(1.2), 12., 2.), 14.3984375);
+        assert_eq!(lay_out(number(1.15), 13., 1.), 14.9375);
+        assert_eq!(lay_out(number(1.15), 13., 2.), 14.9453125);
+        assert_eq!(lay_out(number(1.3), 15.5, 2.), 20.1484375);
+        assert_eq!(lay_out(number(1.2), 13., 2.), 15.59375);
+        // 14.95px is 956.8 sixty-fourths at scale 1: rounded up, where a number is cut.
+        assert_eq!(lay_out(px(14.95).into(), 13., 1.), 14.953125);
+        assert_eq!(lay_out(px(14.95).into(), 13., 2.), 14.953125);
+        assert_eq!(lay_out(px(15.3).into(), 13., 2.), 15.296875);
+        // A percentage computes to a length: 115% of 13px is 14.95px, 120% is 15.6px.
+        assert_eq!(lay_out(px(13. * 1.15).into(), 13., 1.), 14.953125);
+        assert_eq!(lay_out(px(13. * 1.2).into(), 13., 2.), 15.6015625);
+        assert_eq!(lay_out(px(24.).into(), 13., 2.), 24.);
+        assert_eq!(lay_out(px(0.001).into(), 13., 1.), 0.);
+        assert_eq!(
+            LineHeight::Normal.to_laid_out_pixels(px(11.).into(), px(16.), 2., || px(13.5)),
+            px(13.5)
+        );
     }
 
     #[test]

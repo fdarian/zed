@@ -662,6 +662,35 @@ impl LineHeight {
     }
 }
 
+impl LineHeight {
+    /// [`Self::to_pixels`] laid out as Chrome lays a line height out, in 1/64 of a device pixel
+    /// of a display of `scale_factor` device pixels to a pixel: a multiple of the font size is
+    /// cut (`LayoutUnit` of the float, `12px` at `1.2` is 14.390625px at scale 1 and 14.3984375px
+    /// at scale 2), a length is rounded (`FromFloatRound`, and so is a percentage, which computes
+    /// to a length), and `normal`, whole device pixels, is as it is.
+    pub fn to_laid_out_pixels(
+        self,
+        font_size: AbsoluteLength,
+        rem_size: Pixels,
+        scale_factor: f32,
+        normal: impl FnOnce() -> Pixels,
+    ) -> Pixels {
+        match self {
+            Self::Length(DefiniteLength::Fraction(fraction)) => {
+                let device_font_size = font_size.to_pixels(rem_size).0 * scale_factor;
+                // The float arithmetic of `MinimumValueForLength` on a percentage, so that a
+                // product that is exactly a multiple of the unit is cut as Chrome cuts it.
+                let device = device_font_size * (fraction * 100.) / 100.;
+                Pixels(crate::util::truncate_to_layout_unit(device) / scale_factor)
+            }
+            _ => Pixels(crate::util::round_to_layout_unit(
+                self.to_pixels(font_size, rem_size, normal).0,
+                scale_factor,
+            )),
+        }
+    }
+}
+
 impl Default for LineHeight {
     fn default() -> Self {
         Self::Normal
