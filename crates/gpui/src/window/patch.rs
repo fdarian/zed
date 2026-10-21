@@ -161,6 +161,9 @@ impl RecordedHitboxIds {
 /// to be compared with.
 pub(crate) struct PatchTrace {
     units: Vec<(GlobalElementId, Vec<PaintOperation>)>,
+    /// The counters when the patch was made, for what the frame built whole did to the recordings.
+    counters: RetainedCounters,
+    redraw_requests: u32,
 }
 
 pub(crate) enum PatchedFrame {
@@ -369,7 +372,10 @@ impl Window {
                 .peek_element_state(id, |state: &RetainedState| state.scene_range())
                 .flatten();
             let Some(range) = range else {
-                differences.push(format!("{id:?}\nthe frame built whole did not record the root"));
+                differences.push(format!(
+                    "{id:?}\nthe frame built whole did not record the root{}",
+                    self.recordings_lost_since(&trace)
+                ));
                 continue;
             };
             let built = &self.rendered_frame.scene.paint_operations[range];
@@ -395,6 +401,24 @@ impl Window {
         if self.retained.mismatches.len() < 32 {
             self.retained.mismatches.push(message);
         }
+    }
+
+    /// What the frame built since `before` could not keep a recording of, as text for a message:
+    /// no reason at all means that the root was not built as a retained root.
+    fn recordings_lost_since(&self, trace: &PatchTrace) -> String {
+        let before = &trace.counters;
+        let now = self.retained.counters;
+        let lost: Vec<String> = NonReusable::ALL
+            .into_iter()
+            .filter(|reason| now.non_reusable(*reason) > before.non_reusable(*reason))
+            .map(|reason| format!("{reason:?} x{}", now.non_reusable(reason) - before.non_reusable(reason)))
+            .collect();
+        let reasons = if lost.is_empty() { "none".to_string() } else { lost.join(", ") };
+        format!(
+            " (recordings not kept since the patch: {reasons}; subtrees built {}; redraws before present requested {})",
+            now.builds - before.builds,
+            self.retained.redraw_requests.wrapping_sub(trace.redraw_requests)
+        )
     }
 
     /// What a retained root `id` needs to be painted again where it is being prepainted, if it can
@@ -518,6 +542,8 @@ impl Window {
                     .zip(&runs)
                     .map(|(unit, run)| (unit.unit.id.clone(), operations[run.scratch.clone()].to_vec()))
                     .collect(),
+                counters: self.retained.counters,
+                redraw_requests: self.retained.redraw_requests,
             });
         }
         if changed {
