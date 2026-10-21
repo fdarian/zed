@@ -82,7 +82,8 @@ use crate::tab_stop::{LiftedMarker, LiftedTabStops, PaintedChild, TabStopOperati
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_down,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_thickness_to_device_pixel,
-    round_to_device_pixel, round_to_device_pixel_down, split_glyph_origin,
+    round_to_device_pixel, round_to_device_pixel_down, snap_border_width_to_device_pixel,
+    split_glyph_origin,
 };
 pub use prompts::*;
 
@@ -3907,7 +3908,7 @@ impl Window {
         )
     }
 
-    /// Rounds half-to-zero but clamps any non-zero input up to 1 dp so thin strokes do not disappear.
+    /// The length of a line along its direction, rounded half-to-zero, at least 1 dp unless none.
     #[inline]
     fn snap_stroke(&self, value: Pixels) -> ScaledPixels {
         ScaledPixels(round_stroke_to_device_pixel(value.0, self.scale_factor()))
@@ -3934,7 +3935,7 @@ impl Window {
 
     #[inline]
     fn snap_border_widths(&self, edges: Edges<Pixels>) -> Edges<ScaledPixels> {
-        edges.map(|e| self.snap_stroke(*e))
+        edges.map(|e| ScaledPixels(snap_border_width_to_device_pixel(e.0, self.scale_factor())))
     }
 
     /// Floors the near edge and ceils the far edge, producing a strict superset of the raw region.

@@ -1026,7 +1026,8 @@ fn the_grid_of_a_table_starts_after_the_captions_above_and_ends_before_those_bel
 
 /// The half widths of a collapsed border are laid out as they are. The test window has two device pixels to a
 /// pixel, so an eighth of a pixel is a quarter of a device pixel, which would be a whole one when rounded like other
-/// borders: the table would be 63 wide and 11 tall, not 60.75 and 10.5 (boxes are snapped to device pixels).
+/// borders: the table would be 63 wide and 11 tall, not 61 and 10.5 (boxes are snapped to device pixels: 60.75 is
+/// 121.5 of them, which rounds up).
 #[gpui::test]
 fn collapsed_half_borders_are_not_rounded_to_whole_pixels(cx: &mut TestAppContext) {
     fn half(style: &mut StyleRefinement) {
@@ -1057,5 +1058,5 @@ fn collapsed_half_borders_are_not_rounded_to_whole_pixels(cx: &mut TestAppContex
                 .into_any_element(),
         ]
     });
-    assert_boxes(cx, &[("t", [0.0, 0.0, 60.5, 10.5]), ("a", [0.0, 0.0, 30.5, 10.5]), ("b", [30.5, 0.0, 30.0, 10.5])]);
+    assert_boxes(cx, &[("t", [0.0, 0.0, 61.0, 10.5]), ("a", [0.0, 0.0, 30.5, 10.5]), ("b", [30.5, 0.0, 30.0, 10.5])]);
 }

@@ -141,6 +141,14 @@ pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     round_half_toward_zero(logical * scale_factor)
 }
 
+/// Rounds to the nearest integer with 0.5 ties toward positive infinity, as Chrome rounds a
+/// `LayoutUnit` to the pixel it paints on. It commutes with whole-number shifts like
+/// [`round_half_down`] does, also across zero.
+#[inline]
+pub(crate) fn round_half_up(value: f32) -> f32 {
+    (value + 0.5).floor()
+}
+
 /// Rounds to the nearest integer with 0.5 ties toward negative infinity.
 ///
 /// Unlike [`round_half_toward_zero`] this commutes with whole-number shifts,
@@ -172,12 +180,29 @@ pub(crate) fn split_glyph_origin(origin: f32, variants: u8) -> (f32, u8) {
     (whole, ((quantized - whole) * variants as f32) as u8)
 }
 
+/// A stroke length rounded to the nearest device pixel (a half toward zero) and at least one: only
+/// none at all stays none. This is for the length of a line along its direction; the thickness of
+/// a border is [`snap_border_width_to_device_pixel`].
 #[inline]
 pub(crate) fn round_stroke_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     if logical == 0.0 {
         0.0
     } else {
         round_to_device_pixel(logical.max(0.0), scale_factor).max(1.0)
+    }
+}
+
+/// A border width in whole device pixels, as Chrome snaps one: floored, except that a width of
+/// less than a device pixel is one and none stays none. `1.6px` is a pixel on a display of scale
+/// 1 and `0.3px` is a pixel on any display. The few thousandths added are for the float that a
+/// width of whole pixels comes back as.
+#[inline]
+pub(crate) fn snap_border_width_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
+    let device = logical.max(0.0) * scale_factor;
+    if device == 0.0 {
+        0.0
+    } else {
+        (device + FIT_SLACK).floor().max(1.0)
     }
 }
 
@@ -198,13 +223,21 @@ pub(crate) fn floor_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor).floor()
 }
 
-/// Chrome's `LayoutUnit`: boxes are laid out in 1/64 of a logical pixel and painted on device
-/// pixels. Text takes the unit above its advance and the one nearest its height.
+/// Chrome's `LayoutUnit`: boxes are laid out in 1/64 of a device pixel and painted on whole ones
+/// (the text measures of gpuix are 1/64 of a logical pixel). Text takes the unit above its advance and the one nearest its height.
 pub(crate) const LAYOUT_UNIT: f32 = 1. / 64.;
 
 /// How far text may stand over the width it is laid out in and still fit, in logical pixels. A
 /// width measured up to a layout unit crosses layout in device pixels and comes back as a float.
 const FIT_SLACK: f32 = 1. / 1024.;
+
+/// `length` cut toward zero to a multiple of [`LAYOUT_UNIT`], as Chrome makes a `LayoutUnit` of a
+/// length: `100.4` is `100.390625` and `-10.01` is `-10`. Layout takes lengths in device pixels, so
+/// that is the unit a length is cut to, and the whole of a resolved length is cut, not its terms.
+#[inline]
+pub(crate) fn truncate_to_layout_unit(length: f32) -> f32 {
+    (length / LAYOUT_UNIT).trunc() * LAYOUT_UNIT
+}
 
 /// The first multiple of [`LAYOUT_UNIT`] at or above `logical`, for a size that must hold its
 /// content: a width the text is laid out in must not wrap the text. A sum of advances a hair above
@@ -302,6 +335,29 @@ mod tests {
         assert_eq!(round_stroke_to_device_pixel(1.0, 1.5), 1.0);
         assert_eq!(round_stroke_to_device_pixel(1.6, 1.0), 2.0);
 
+        // Chrome, `fixtures/fractional-lengths-oracle.json`: a border is floored to whole device
+        // pixels, and one of less than a pixel is one.
+        for (width, scale, expected) in [
+            (0.0, 1.0, 0.0),
+            (-1.0, 1.0, 0.0),
+            (0.1, 1.0, 1.0),
+            (0.9, 1.0, 1.0),
+            (1.4, 1.0, 1.0),
+            (1.6, 1.0, 1.0),
+            (2.5, 1.0, 2.0),
+            (3.99, 1.0, 3.0),
+            (0.3, 2.0, 1.0),
+            (1.4, 2.0, 2.0),
+            (1.6, 2.0, 3.0),
+            (2.5, 2.0, 5.0),
+            (3.99, 2.0, 7.0),
+            // a width of whole pixels that is a hair under in a float
+            (2.0, 1.5, 3.0),
+            (3.0 - 1e-5, 1.0, 3.0),
+        ] {
+            assert_eq!(snap_border_width_to_device_pixel(width, scale), expected, "{width} at {scale}");
+        }
+
         // Cover's near edge floors, far edge ceils. Together they form a strict superset.
         assert_eq!(floor_to_device_pixel(0.3, 2.0), 0.0);
         assert_eq!(ceil_to_device_pixel(0.3, 2.0), 1.0);
@@ -312,6 +368,34 @@ mod tests {
         assert_eq!(round_to_device_pixel(2.0, 2.0), 4.0);
         assert_eq!(floor_to_device_pixel(2.0, 2.0), 4.0);
         assert_eq!(ceil_to_device_pixel(2.0, 2.0), 4.0);
+    }
+
+    #[test]
+    fn rounding_half_up_ties_go_up_also_across_zero() {
+        assert_eq!(round_half_up(0.5), 1.0);
+        assert_eq!(round_half_up(110.5), 111.0);
+        assert_eq!(round_half_up(-0.5), 0.0);
+        assert_eq!(round_half_up(-2.5), -2.0);
+        assert_eq!(round_half_up(-2.51), -3.0);
+        assert_eq!(round_half_up(2.49), 2.0);
+        for value in [-7.5, -2.5, -0.5, 0.0, 0.25, 0.5, 1.5, 33.296875, 66.59375] {
+            for shift in [-3.0, 1.0, 10.0] {
+                assert_eq!(round_half_up(value + shift), round_half_up(value) + shift);
+            }
+        }
+    }
+
+    #[test]
+    fn a_length_is_cut_toward_zero_to_a_64th() {
+        // Chrome: `getBoundingClientRect` of a box 100.4px wide at scale 1 and 2.
+        assert_eq!(truncate_to_layout_unit(100.4), 100.390625);
+        assert_eq!(truncate_to_layout_unit(100.4 * 2.0) / 2.0, 100.3984375);
+        assert_eq!(truncate_to_layout_unit(-10.01), -10.0);
+        assert_eq!(truncate_to_layout_unit(-10.01 * 2.0) / 2.0, -10.0078125);
+        assert_eq!(truncate_to_layout_unit(31.7), 31.6875);
+        assert_eq!(truncate_to_layout_unit(0.4), 0.390625);
+        assert_eq!(truncate_to_layout_unit(0.01), 0.0);
+        assert_eq!(truncate_to_layout_unit(33.296875), 33.296875);
     }
 
     #[test]

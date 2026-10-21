@@ -2251,7 +2251,7 @@ fn focusable_culled_boxes_of_a_relocatable_root_in_a_nested_scroller_replay_as_b
 }
 
 /// A relocatable root in a scroller, after a sibling of a width in `lead`, with a box inside that is
-/// 43.4 wide (the widths are percentages, since a length is rounded before layout): its edges snap from the root's sub-pixel origin, to 43 wide where the root begins at
+/// 43.4 wide (the width is a percentage, as a length of 43.4 is 43.390625): its edges snap from the root's sub-pixel origin, to 43 wide where the root begins at
 /// 10 and to 44 where it begins at 10.4, though the snapped box of the root is the same.
 struct Phased {
     mode: Mode,

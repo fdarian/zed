@@ -82,17 +82,28 @@ impl Calc {
         Self { value: LinearCalc { length, percent }, floor: None, ceiling: None }
     }
 
-    /// The value for a basis of `basis`.
+    /// The value for a basis of `basis`, cut toward zero to 1/64 as Chrome cuts a resolved length
+    /// to a `LayoutUnit` (`calc(2rem - 0.3px)` is `31.6875`). `value` of a calc with bounds is a
+    /// content size, which text must still fit in: only what the bounds resolve to is cut.
     pub fn resolve(self, basis: f32) -> f32 {
+        let bounded = self.floor.is_some() || self.ceiling.is_some();
         let mut value = self.value.resolve(basis);
+        if !bounded {
+            value = cut_to_layout_unit(value);
+        }
         if let Some(ceiling) = self.ceiling {
-            value = value.min(ceiling.resolve(basis));
+            value = value.min(cut_to_layout_unit(ceiling.resolve(basis)));
         }
         if let Some(floor) = self.floor {
-            value = value.max(floor.resolve(basis));
+            value = value.max(cut_to_layout_unit(floor.resolve(basis)));
         }
         value
     }
+}
+
+fn cut_to_layout_unit(length: f32) -> f32 {
+    const UNIT: f32 = 1.0 / 64.0;
+    (length / UNIT).trunc() * UNIT
 }
 
 /// `inputs` for a node with size containment: a contained axis that layout would size from the
@@ -2021,6 +2032,27 @@ mod tests {
 
         fn ptr(calc: &Calc) -> *const () {
             calc as *const Calc as *const ()
+        }
+
+        #[test]
+        fn a_calc_is_cut_toward_zero_to_a_64th_after_it_is_resolved() {
+            // Chrome: `calc(2rem - 0.3px)` is 31.6875, and 0.3px and half of 101.6 is 51.1, which is 51.09375.
+            assert_eq!(Calc::linear(31.7, 0.0).resolve(0.0), 31.6875);
+            assert_eq!(Calc::linear(-31.7, 0.0).resolve(0.0), -31.6875);
+            assert_eq!(Calc::linear(0.3, 0.5).resolve(101.6), 51.09375);
+            // The terms are not cut but their sum is.
+            assert_eq!(Calc::linear(0.01, 1.0).resolve(0.01), 0.015625);
+        }
+
+        #[test]
+        fn a_calc_with_bounds_cuts_the_bounds_and_not_the_content_it_holds() {
+            let limit = LinearCalc { length: 0.0, percent: 0.5 };
+            let content = LinearCalc { length: 10.01, percent: 0.0 };
+            let ceiling = Calc { value: content, floor: None, ceiling: Some(limit) };
+            assert_eq!(ceiling.resolve(100.0), 10.01);
+            assert_eq!(ceiling.resolve(10.01), 5.0);
+            let floor = Calc { value: content, floor: Some(LinearCalc { length: 0.0, percent: 0.2 }), ceiling: None };
+            assert_eq!(floor.resolve(100.0), 20.0);
         }
 
         #[test]
