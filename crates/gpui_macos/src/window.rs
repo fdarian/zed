@@ -77,6 +77,11 @@ use std::{
 
 const WINDOW_STATE_IVAR: &str = "windowState";
 
+/// How many display-link steps in a row may find nothing to do before the link stops. Every step
+/// is a wake of the embedder, so a window that asked for one frame (a caret toggle) costs this
+/// many wakes after the frame that was asked for; an animation asks again in every step.
+const IDLE_STEPS_BEFORE_STOP: u32 = 2;
+
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
@@ -612,6 +617,10 @@ struct MacWindowState {
     cursor_hide: CursorHide,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    /// Set by `schedule_frame` and the frame waker, cleared by `step`.
+    frame_requested: bool,
+    /// Consecutive `step`s in which nobody asked for another frame.
+    idle_steps: u32,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -792,8 +801,16 @@ impl MacWindowState {
         }
     }
 
+    /// Subscribes to the display's link unless this window already is. A window that is not
+    /// visible never starts one.
     fn start_display_link(&mut self) {
-        self.stop_display_link();
+        if self
+            .frame_source
+            .as_ref()
+            .is_some_and(WindowFrameSource::is_running)
+        {
+            return;
+        }
         unsafe {
             if !self
                 .native_window
@@ -807,6 +824,7 @@ impl MacWindowState {
             // AppKit can temporarily report no screen while displays are being reconfigured.
             return;
         };
+        self.idle_steps = 0;
         let data = self.native_view.as_ptr() as *mut c_void;
         self.frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
@@ -814,10 +832,47 @@ impl MacWindowState {
             .log_err();
     }
 
-    fn stop_display_link(&mut self) {
-        if let Some(frame_source) = self.frame_source.as_mut() {
-            frame_source.stop();
+    /// Follows the window to the display it is on now. A stopped link stays stopped: the next
+    /// frame request starts it on the right display.
+    fn resubscribe_display_link(&mut self) {
+        if self.stop_display_link() {
+            self.start_display_link();
         }
+    }
+
+    /// Returns whether the link was running.
+    fn stop_display_link(&mut self) -> bool {
+        match self.frame_source.as_mut() {
+            Some(frame_source) => frame_source.stop(),
+            None => false,
+        }
+    }
+
+    /// Brings the link back after a frame that was drawn with it stopped: if it ran before, or
+    /// if that frame asked for another one.
+    fn restart_display_link(&mut self, was_running: bool) {
+        if was_running || self.frame_requested {
+            self.start_display_link();
+        }
+    }
+
+    /// Called after every `step`: the link stops once nothing has asked for a frame for
+    /// `IDLE_STEPS_BEFORE_STOP` steps in a row, and the next `schedule_frame` starts it again.
+    fn count_step(&mut self) {
+        if std::mem::take(&mut self.frame_requested) {
+            self.idle_steps = 0;
+            return;
+        }
+        self.idle_steps += 1;
+        if self.idle_steps >= IDLE_STEPS_BEFORE_STOP {
+            self.stop_display_link();
+            self.idle_steps = 0;
+        }
+    }
+
+    fn request_frames(&mut self) {
+        self.frame_requested = true;
+        self.start_display_link();
     }
 
     fn is_maximized(&self) -> bool {
@@ -1059,6 +1114,8 @@ impl MacWindow {
                 cursor_hide: CursorHide::new(),
                 cursor_visible,
                 frame_source: None,
+                frame_requested: false,
+                idle_steps: 0,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1895,6 +1952,19 @@ impl PlatformWindow for MacWindow {
                 .styleMask()
                 .contains(NSWindowStyleMask::NSFullScreenWindowMask)
         }
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let state = Arc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if let Some(state) = state.upgrade() {
+                state.lock().request_frames();
+            }
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        self.0.lock().request_frames();
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
@@ -2940,7 +3010,7 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
 extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
-    lock.start_display_link();
+    lock.resubscribe_display_link();
     drop(lock);
     update_window_scale_factor(&window_state);
 }
@@ -3000,14 +3070,14 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
                 lock.renderer.set_presents_with_transaction(true);
-                lock.stop_display_link();
+                let was_running = lock.stop_display_link();
                 drop(lock);
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
                 lock.renderer.set_presents_with_transaction(false);
-                lock.start_display_link();
+                lock.restart_display_link(was_running);
             }
         } else {
             lock.activated_least_once = true;
@@ -3122,14 +3192,14 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
         lock.renderer.set_presents_with_transaction(true);
-        lock.stop_display_link();
+        let was_running = lock.stop_display_link();
         drop(lock);
         callback(Default::default());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
         lock.renderer.set_presents_with_transaction(false);
-        lock.start_display_link();
+        lock.restart_display_link(was_running);
     }
 }
 
@@ -3141,7 +3211,9 @@ extern "C" fn step(view: *mut c_void) {
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
         callback(Default::default());
-        window_state.lock().request_frame_callback = Some(callback);
+        let mut lock = window_state.lock();
+        lock.request_frame_callback = Some(callback);
+        lock.count_step();
     }
 }
 

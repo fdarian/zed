@@ -264,9 +264,18 @@ impl WindowFrameSource {
         Ok(())
     }
 
-    pub fn stop(&mut self) {
-        if let Some((display_id, subscriber_id)) = self.registration.take() {
-            unsubscribe(display_id, subscriber_id);
+    pub fn is_running(&self) -> bool {
+        self.registration.is_some()
+    }
+
+    /// Returns whether the source was subscribed.
+    pub fn stop(&mut self) -> bool {
+        match self.registration.take() {
+            Some((display_id, subscriber_id)) => {
+                unsubscribe(display_id, subscriber_id);
+                true
+            }
+            None => false,
         }
     }
 }
