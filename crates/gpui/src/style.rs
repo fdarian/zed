@@ -293,6 +293,12 @@ pub struct Style {
     /// child, say) turns it off to keep its place in the tree, see [`crate::Styled::unlifted`]. A
     /// static element is not, unless this is turned on, see [`crate::Styled::lifted`].
     pub lifts: bool,
+    /// Whether an animation or a transition of the element's `opacity` is current. The element
+    /// then paints as its own group whatever the opacity it has this frame, 1 and 0 included, the
+    /// way Chrome keeps the layer of an element with an active opacity animation: the paint
+    /// operations keep their shape from frame to frame, so a frame can repaint just the element
+    /// (see [`crate::Styled::has_active_opacity_animation`]).
+    pub has_active_opacity_animation: bool,
     /// How should the position of this element be tweaked relative to the layout defined?
     #[refineable]
     pub inset: Edges<Length>,
@@ -1107,14 +1113,18 @@ impl Style {
     }
 
     /// Whether the element shows nothing, because its opacity is 0.
+    ///
+    /// Not while an opacity animation is current: the element paints as a group of opacity 0, which
+    /// keeps every operation it has at other opacities.
     pub(crate) fn is_faded_out(&self) -> bool {
-        self.opacity.is_some_and(|opacity| opacity <= 0.)
+        !self.has_active_opacity_animation && self.opacity.is_some_and(|opacity| opacity <= 0.)
     }
 
     /// The offscreen group effect the style asks for, if any.
     fn group_effect(&self, bounds: Bounds<Pixels>, window: &Window, cx: &App) -> Option<GroupEffect> {
         let opacity = self.opacity.unwrap_or(1.).clamp(0., 1.);
         if opacity >= 1.
+            && !self.has_active_opacity_animation
             && self.filter.is_empty()
             && self.backdrop_filter.is_empty()
             && self.mask_layers.is_empty()
@@ -1584,6 +1594,7 @@ impl Default for Style {
             position: Position::Relative,
             z_index: 0,
             lifts: true,
+            has_active_opacity_animation: false,
             inset: Edges::auto(),
             margin: Edges::<Length>::zero(),
             padding: Edges::<DefiniteLength>::zero(),

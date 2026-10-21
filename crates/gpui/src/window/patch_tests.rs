@@ -34,6 +34,8 @@ struct Knobs {
     absolute: Cell<bool>,
     /// The opacity the page gives a lifted unit, if not the one that follows the tick.
     page_opacity: Cell<Option<f32>>,
+    /// An animation of the unit's opacity is current, in the page and in the patcher.
+    opacity_animation: Cell<bool>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -118,7 +120,7 @@ fn fade(tick: u32) -> f32 {
 
 /// The subtree of the unit for `tick`: a box that has a color of its own and a box in it that
 /// changes when the pointer is on it.
-fn unit_element(tick: u32, width: f32, opacity: Option<f32>, hot: Hot, lift: Lift) -> AnyElement {
+fn unit_element(tick: u32, width: f32, opacity: Option<f32>, animated: bool, hot: Hot, lift: Lift) -> AnyElement {
     let mut hot_box = div().id("hot").w(px(20.)).h(px(20.)).bg(blue());
     if hot != Hot::NoHitbox {
         hot_box = hot_box.hover(|style| style.bg(green()));
@@ -130,6 +132,9 @@ fn unit_element(tick: u32, width: f32, opacity: Option<f32>, hot: Hot, lift: Lif
     if let Some(opacity) = opacity {
         unit = unit.opacity(opacity);
     }
+    if animated {
+        unit = unit.has_active_opacity_animation();
+    }
     match lift {
         Lift::No => {}
         Lift::Absolute => unit = unit.absolute().left(px(10.)).top(px(2.)).z_index(0),
@@ -138,10 +143,10 @@ fn unit_element(tick: u32, width: f32, opacity: Option<f32>, hot: Hot, lift: Lif
     unit.into_any_element()
 }
 
-fn unit(tick: u32, lift: Lift, page_opacity: Option<f32>) -> Retained {
+fn unit(tick: u32, lift: Lift, page_opacity: Option<f32>, animated: bool) -> Retained {
     let lifted = lift != Lift::No;
     let opacity = lifted.then(|| page_opacity.unwrap_or_else(|| fade(tick)));
-    let root = retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., opacity, Hot::Same, lift)).patchable();
+    let root = retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., opacity, animated, Hot::Same, lift)).patchable();
     if lifted { root.lift_z(0) } else { root }
 }
 
@@ -174,12 +179,13 @@ impl Page {
     fn unit_child(&self) -> AnyElement {
         let tick = self.knobs.tick.get();
         let page_opacity = self.knobs.page_opacity.get();
+        let animated = self.knobs.opacity_animation.get();
         let lift = self.lift;
         if lift != Lift::InsideRoot {
-            return unit(tick, lift, page_opacity).into_any_element();
+            return unit(tick, lift, page_opacity, animated).into_any_element();
         }
         retained("wrapper", 1, move |_, _| {
-            div().id("wrapper").flex_none().child(unit(tick, Lift::Alone, page_opacity)).into_any_element()
+            div().id("wrapper").flex_none().child(unit(tick, Lift::Alone, page_opacity, animated)).into_any_element()
         })
         .into_any_element()
     }
@@ -280,7 +286,7 @@ impl Fixture {
                     .into_iter()
                     .map(|name| {
                         let opacity = knobs.opacity.get().or_else(|| lifted.then(|| fade(tick)));
-                        let mut element = unit_element(tick, width, opacity, knobs.hot.get(), lift);
+                        let mut element = unit_element(tick, width, opacity, knobs.opacity_animation.get(), knobs.hot.get(), lift);
                         if knobs.absolute.get() {
                             element = div().id(UNIT).absolute().w(px(100.)).h(px(30.)).bg(color(tick)).into_any_element();
                         }
@@ -655,7 +661,7 @@ fn a_root_that_is_lifted_itself_is_not_registered(cx: &mut TestAppContext) {
         let patched = Rc::new(Cell::new(None::<Result<PatchOutcome, PatchDecline>>));
         let seen = patched.clone();
         window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
-            let result = window.repaint_in_place(vec![(ElementId::from(UNIT), unit_element(1, 100., None, Hot::Same, Lift::No))], cx, |_, _| true);
+            let result = window.repaint_in_place(vec![(ElementId::from(UNIT), unit_element(1, 100., None, false, Hot::Same, Lift::No))], cx, |_, _| true);
             seen.set(Some(result));
             result.is_ok()
         })));
@@ -893,6 +899,50 @@ fn a_lifted_root_that_fades_to_full_opacity_declines_and_patching_resumes(cx: &m
     assert_same(&patched, &page.snapshot(cx), "after the declines");
 }
 
+/// The first line of a snapshot: how many operations the frame recorded.
+fn operations_of(snapshot: &str) -> &str {
+    snapshot.lines().next().expect("a snapshot has a first line")
+}
+
+#[gpui::test]
+fn a_lifted_root_in_an_opacity_animation_keeps_its_operations_at_opacity_1_and_0(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 3, Options { lift: Lift::Alone, ..Default::default() });
+    page.knobs.opacity_animation.set(true);
+    let mut operations: Option<String> = None;
+    let mut patched_frames = 0;
+    for opacity in [0.5, 1., 0., 0.25, 0., 1., 0.5] {
+        page.knobs.page_opacity.set(Some(opacity));
+        page.knobs.opacity.set(Some(opacity));
+        page.draw_whole(cx);
+        let whole = page.snapshot(cx);
+        let operations = operations.get_or_insert_with(|| operations_of(&whole).to_owned()).clone();
+        assert_eq!(operations_of(&whole), operations.as_str(), "a frame at opacity {opacity} has the operations of the others");
+        page.tick(cx);
+        patched_frames += 1;
+        let patches = page.patches(cx);
+        assert_eq!((patches.patched_frames, patches.total_declines()), (patched_frames, 0), "the tick at opacity {opacity}");
+        // The tick moved the colour on: the whole frame has to be of the same tick.
+        let patched = page.snapshot(cx);
+        assert_eq!(operations_of(&patched), operations.as_str(), "the patched frame at opacity {opacity}");
+        page.draw_whole(cx);
+        assert_same(&patched, &page.snapshot(cx), &format!("a lifted root in an opacity animation at {opacity}"));
+    }
+}
+
+#[gpui::test]
+fn a_lifted_root_that_is_faded_out_without_an_opacity_animation_paints_nothing(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 3, Options { lift: Lift::Alone, ..Default::default() });
+    page.knobs.page_opacity.set(Some(0.5));
+    page.draw_whole(cx);
+    let shown = operations_of(&page.snapshot(cx)).to_owned();
+    page.knobs.page_opacity.set(Some(0.));
+    page.draw_whole(cx);
+    assert_ne!(operations_of(&page.snapshot(cx)), shown, "static opacity 0 drops the operations of the unit");
+    page.knobs.opacity_animation.set(true);
+    page.draw_whole(cx);
+    assert_eq!(operations_of(&page.snapshot(cx)), shown, "an opacity animation keeps them");
+}
+
 #[gpui::test]
 fn a_patched_lifted_root_is_the_frame_built_whole_under_the_verifier(cx: &mut TestAppContext) {
     for lift in [Lift::Alone, Lift::Between, Lift::InsideRoot, Lift::Absolute] {
@@ -942,7 +992,7 @@ fn a_lifted_root_that_moves_in_its_context_declines(cx: &mut TestAppContext) {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let tick = self.0.tick.get();
             div().id("page").stacking_context().w(px(400.)).h(px(2000.)).child(
-                retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., Some(fade(tick)), Hot::Same, Lift::Alone))
+                retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., Some(fade(tick)), false, Hot::Same, Lift::Alone))
                     .patchable()
                     .lift_z(0),
             )
@@ -961,8 +1011,8 @@ fn a_lifted_root_that_moves_in_its_context_declines(cx: &mut TestAppContext) {
         window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
             let mut logged = log.take();
             // The same root, one z-index higher: the context orders it differently.
-            let element = unit_element(1, 100., Some(0.5), Hot::Same, Lift::Alone).into_any_element();
-            let raised = if logged.is_empty() { element } else { unit_element(1, 100., Some(0.5), Hot::Same, Lift::No) };
+            let element = unit_element(1, 100., Some(0.5), false, Hot::Same, Lift::Alone).into_any_element();
+            let raised = if logged.is_empty() { element } else { unit_element(1, 100., Some(0.5), false, Hot::Same, Lift::No) };
             let result = window.repaint_in_place(vec![(ElementId::from(UNIT), raised)], cx, |_, _| true);
             logged.push(result);
             log.set(logged);

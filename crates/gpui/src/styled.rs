@@ -680,6 +680,17 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Says an animation or a transition of the element's `opacity` is current. Whatever opacity
+    /// the element has, 1 and 0 included, it paints as a group of that opacity, as Chrome keeps the
+    /// compositor layer of such an element: what it paints keeps its shape from frame to frame, and
+    /// an opacity of 0 does not drop what the element paints. Without it an element at opacity 1
+    /// has no group and one at 0 paints nothing. This does not lift the element, see
+    /// [`Styled::lifted`].
+    fn has_active_opacity_animation(mut self) -> Self {
+        self.style().has_active_opacity_animation = Some(true);
+        self
+    }
+
     /// Sets the aspect ratio of the element.
     /// [Docs](https://tailwindcss.com/docs/aspect-ratio)
     fn aspect_ratio(mut self, ratio: f32) -> Self {
