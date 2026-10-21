@@ -466,7 +466,7 @@ impl CompactLength {
         calc_resolver: impl Fn(*const (), f32) -> f32,
     ) -> Option<f32> {
         match self.tag() {
-            CompactLength::PERCENT_TAG => Some(self.value() * parent_size),
+            CompactLength::PERCENT_TAG => Some(crate::util::resolve_percentage(self.value(), parent_size)),
             #[cfg(feature = "calc")]
             _ if self.is_calc() => Some(calc_resolver(self.0.ptr(), parent_size)),
             _ => None,

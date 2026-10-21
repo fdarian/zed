@@ -8,7 +8,7 @@
 use crate::{
     AnyElement, App, Bounds, Context, DefiniteLength, Div, InteractiveElement as _, IntoElement,
     LayoutId, ParentElement as _, Pixels, Render, Styled as _, TestApp, Window, black, blue, div,
-    px, red, rems,
+    px, red, relative, rems,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -280,6 +280,48 @@ fn adjacent_boxes_of_33_3_33_3_and_33_4_paint_33_34_and_33_pixels() {
 fn margins_and_paddings_of_a_fraction_add_up_through_nesting_as_in_chrome() {
     matches_chrome(&NESTED_BLOCK, nested(false));
     matches_chrome(&NESTED_FLEX, nested(true));
+}
+
+#[test]
+fn a_percentage_is_cut_to_a_64th_of_a_device_pixel_after_the_multiply() {
+    // 25% of 101.3px is 25.3125 at scale 1 and 25.3203125 at scale 2, as is 7% as a margin and 25% as a padding
+    matches_chrome(&PERCENT_25_OF_101_3, |found| {
+        marked(div().w(px(101.3)).h(px(101.3)), found, "o")
+            .child(marked(div().w(relative(0.25)).h(relative(0.25)), found, "a"))
+            .child(marked(div().w(relative(0.33333)).h(relative(0.33333)), found, "b"))
+            .child(marked(
+                div().pl(relative(0.25)).pr(relative(0.125)).ml(relative(0.07)).h(px(5.)),
+                found,
+                "c",
+            ))
+            .into_any_element()
+    });
+}
+
+#[test]
+fn a_negative_percentage_is_cut_toward_zero() {
+    matches_chrome(&PERCENT_MARGIN_NEGATIVE_OF_77_7, |found| {
+        let negative = |name| {
+            marked(
+                div()
+                    .mt(relative(-0.055))
+                    .mr(relative(-0.033))
+                    .mb(relative(-0.077))
+                    .ml(relative(-0.073))
+                    .h(px(10.)),
+                found,
+                name,
+            )
+        };
+        div()
+            .w(px(360.))
+            .child(
+                marked(div().overflow_hidden().w(px(77.7)), found, "o")
+                    .child(negative("a"))
+                    .child(negative("b")),
+            )
+            .into_any_element()
+    });
 }
 
 #[test]
@@ -753,5 +795,33 @@ const CALC_FRACTION: Case = [
         ("o", [0.0, 0.0, 101.0, 61.0], None),
         ("a", [0.0, 0.0, 50.796875, 30.796875], None),
         ("b", [0.0, 30.796875, 100.296875, 14.9453125], None),
+    ],
+];
+
+const PERCENT_25_OF_101_3: Case = [
+    &[
+        ("o", [0.0, 0.0, 101.296875, 101.296875], None),
+        ("a", [0.0, 0.0, 25.3125, 25.3125], None),
+        ("b", [0.0, 25.3125, 33.75, 33.75], None),
+        ("c", [7.078125, 59.0625, 94.21875, 5.0], None),
+    ],
+    &[
+        ("o", [0.0, 0.0, 101.296875, 101.296875], None),
+        ("a", [0.0, 0.0, 25.3203125, 25.3203125], None),
+        ("b", [0.0, 25.3203125, 33.7578125, 33.7578125], None),
+        ("c", [7.0859375, 59.078125, 94.2109375, 5.0], None),
+    ],
+];
+
+const PERCENT_MARGIN_NEGATIVE_OF_77_7: Case = [
+    &[
+        ("o", [0.0, 0.0, 77.6875, 3.796875], None),
+        ("a", [-5.65625, -4.265625, 85.90625, 10.0], None),
+        ("b", [-5.65625, -0.234375, 85.90625, 10.0], None),
+    ],
+    &[
+        ("o", [0.0, 0.0, 77.6953125, 3.78125], None),
+        ("a", [-5.6640625, -4.265625, 85.921875, 10.0], None),
+        ("b", [-5.6640625, -0.2421875, 85.921875, 10.0], None),
     ],
 ];

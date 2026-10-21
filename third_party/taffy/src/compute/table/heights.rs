@@ -3,6 +3,7 @@ use super::{CellFit, RowHeight, SectionHeight, Specified, Table};
 use crate::geometry::{AbsoluteAxis, Line, Size};
 use crate::style::{AvailableSpace, CoreStyle, VerticalAlign};
 use crate::tree::{LayoutPartialTreeExt, SizingMode};
+use crate::util::resolve_percentage;
 use crate::util::sys::{Vec, f32_max, f32_min};
 use crate::LayoutTableContainer;
 
@@ -67,7 +68,7 @@ fn distribute_to_rows(rows: &mut [RowHeight], extra: f32, section_height: f32) {
         if let Some(percent) = row.percent {
             let percent = f32_max(f32_min(percent, percent_left), 0.0);
             percent_left -= percent;
-            wanted.push((index, percent * section_height));
+            wanted.push((index, resolve_percentage(percent, section_height)));
         }
     }
     let remaining = fill_shortages(&mut heights, &wanted, extra);
@@ -252,7 +253,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
         if extra > 0.0 {
             let wanted: Vec<(usize, f32)> = (0..sections.len())
                 .filter(with_rows)
-                .filter_map(|index| section_heights[index].percent.map(|percent| (index, percent * percent_base)))
+                .filter_map(|index| section_heights[index].percent.map(|percent| (index, resolve_percentage(percent, percent_base))))
                 .collect();
             let remaining = fill_shortages(&mut heights, &wanted, extra);
 

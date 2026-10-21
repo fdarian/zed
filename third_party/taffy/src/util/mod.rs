@@ -4,6 +4,7 @@ mod resolve;
 pub(crate) mod sys;
 
 pub use math::MaybeMath;
+pub(crate) use resolve::{cut_to_layout_unit, resolve_percentage};
 pub use resolve::{MaybeResolve, ResolveOrZero};
 
 #[doc(hidden)]

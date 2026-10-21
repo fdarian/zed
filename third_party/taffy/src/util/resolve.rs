@@ -5,6 +5,20 @@ use crate::style::{Dimension, LengthPercentage, LengthPercentageAuto};
 use crate::style_helpers::TaffyZero;
 use crate::CompactLength;
 
+// fdarian fork patch: Chrome stores a length as a `LayoutUnit`, 1/64 of a device pixel, and
+// converts a float to one by cutting toward zero.
+/// `length` cut toward zero to 1/64.
+pub(crate) fn cut_to_layout_unit(length: f32) -> f32 {
+    const UNIT: f32 = 1.0 / 64.0;
+    (length / UNIT).trunc() * UNIT
+}
+
+/// A percentage of `basis` as Blink resolves it (`MinimumValueForLength`): `basis * fraction` in f32,
+/// cut toward zero to 1/64, so `25%` of `101.296875` is `25.3125`.
+pub(crate) fn resolve_percentage(fraction: f32, basis: f32) -> f32 {
+    cut_to_layout_unit(basis * fraction)
+}
+
 /// Trait to encapsulate behaviour where we need to resolve from a
 /// potentially context-dependent size or dimension into
 /// a context-independent size or dimension.
@@ -31,7 +45,7 @@ impl MaybeResolve<Option<f32>, Option<f32>> for LengthPercentage {
     fn maybe_resolve(self, context: Option<f32>, calc: impl Fn(*const (), f32) -> f32) -> Option<f32> {
         match self.0.tag() {
             CompactLength::LENGTH_TAG => Some(self.0.value()),
-            CompactLength::PERCENT_TAG => context.map(|dim| dim * self.0.value()),
+            CompactLength::PERCENT_TAG => context.map(|dim| resolve_percentage(self.0.value(), dim)),
             #[cfg(feature = "calc")]
             _ if self.0.is_calc() => context.map(|dim| calc(self.0.calc_value(), dim)),
             _ => unreachable!(),
@@ -46,7 +60,7 @@ impl MaybeResolve<Option<f32>, Option<f32>> for LengthPercentageAuto {
         match self.0.tag() {
             CompactLength::AUTO_TAG => None,
             CompactLength::LENGTH_TAG => Some(self.0.value()),
-            CompactLength::PERCENT_TAG => context.map(|dim| dim * self.0.value()),
+            CompactLength::PERCENT_TAG => context.map(|dim| resolve_percentage(self.0.value(), dim)),
             #[cfg(feature = "calc")]
             _ if self.0.is_calc() => context.map(|dim| calc(self.0.calc_value(), dim)),
             _ => unreachable!(),
@@ -62,7 +76,7 @@ impl MaybeResolve<Option<f32>, Option<f32>> for Dimension {
         match self.0.tag() {
             CompactLength::AUTO_TAG => None,
             CompactLength::LENGTH_TAG => Some(self.0.value()),
-            CompactLength::PERCENT_TAG => context.map(|dim| dim * self.0.value()),
+            CompactLength::PERCENT_TAG => context.map(|dim| resolve_percentage(self.0.value(), dim)),
             #[cfg(feature = "calc")]
             _ if self.0.is_calc() => context.map(|dim| calc(self.0.calc_value(), dim)),
             _ => unreachable!(),
@@ -360,5 +374,20 @@ mod tests {
             roz_case(Rect::from_percent(5.0, 5.0, 5.0, 5.0), Some(-5.0), Rect::new(-25.0, -25.0, -25.0, -25.0));
             roz_case(Rect::from_percent(5.0, 5.0, 5.0, 5.0), Some(0.0), Rect::zero());
         }
+    }
+}
+
+#[cfg(test)]
+mod percentage_tests {
+    use super::resolve_percentage;
+
+    /// The numbers are headless Chrome's: `25%` of `101.296875` and of `202.59375` (`101.3px` at scale 1 and 2).
+    #[test]
+    fn a_percentage_is_cut_toward_zero_to_a_64th() {
+        assert_eq!(resolve_percentage(0.25, 101.296875), 25.3125);
+        assert_eq!(resolve_percentage(0.25, 202.59375), 50.640625);
+        assert_eq!(resolve_percentage(0.33333, 101.296875), 33.75);
+        assert_eq!(resolve_percentage(-0.055, 77.6875), -4.265625);
+        assert_eq!(resolve_percentage(0.5, 100.0), 50.0);
     }
 }

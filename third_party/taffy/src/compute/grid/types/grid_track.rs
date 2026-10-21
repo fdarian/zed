@@ -131,7 +131,7 @@ impl GridTrack {
         match self.max_track_sizing_function.0.tag() {
             CompactLength::FIT_CONTENT_PX_TAG => self.max_track_sizing_function.0.value(),
             CompactLength::FIT_CONTENT_PERCENT_TAG => match axis_available_grid_space {
-                Some(space) => space * self.max_track_sizing_function.0.value(),
+                Some(space) => crate::util::resolve_percentage(self.max_track_sizing_function.0.value(), space),
                 None => f32::INFINITY,
             },
             _ => f32::INFINITY,

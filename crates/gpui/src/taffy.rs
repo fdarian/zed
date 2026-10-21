@@ -1452,9 +1452,10 @@ impl TaffyLayoutEngine {
     // Pixel snapping
     //
     // Layout follows Chrome: lengths are in device pixels, each cut toward zero to 1/64 of one
-    // when it is made or resolved (`AbsoluteLength::to_taffy`, `Calc::resolve`), so a box keeps
-    // the fraction its author gave it (`100.4px` is `100.390625`). Percentages are not cut
-    // (Chrome cuts them), and a measured leaf is rounded up to a layout unit of a logical pixel.
+    // when it is made or resolved (`AbsoluteLength::to_taffy`, `Calc::resolve`, taffy's
+    // `resolve_percentage`), so a box keeps the fraction its author gave it (`100.4px` is
+    // `100.390625`, `25%` of `101.296875` is `25.3125`). A measured leaf is rounded up to a layout
+    // unit of a logical pixel.
     //
     // Only the end of layout snaps. `layout_bounds` puts every box's near and far edge at the
     // device pixel nearest its absolute position, a half up, as Blink paints a `LayoutUnit` box,

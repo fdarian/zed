@@ -999,7 +999,7 @@ impl MaxTrackSizingFunction {
     ) -> Option<f32> {
         match self.0.tag() {
             CompactLength::LENGTH_TAG => Some(self.0.value()),
-            CompactLength::PERCENT_TAG => parent_size.map(|size| self.0.value() * size),
+            CompactLength::PERCENT_TAG => parent_size.map(|size| crate::util::resolve_percentage(self.0.value(), size)),
             #[cfg(feature = "calc")]
             _ if self.0.is_calc() => parent_size.map(|size| calc_resolver(self.0.calc_value(), size)),
             _ => None,
@@ -1020,7 +1020,7 @@ impl MaxTrackSizingFunction {
     ) -> Option<f32> {
         match self.0.tag() {
             CompactLength::FIT_CONTENT_PX_TAG => Some(self.0.value()),
-            CompactLength::FIT_CONTENT_PERCENT_TAG => parent_size.map(|size| self.0.value() * size),
+            CompactLength::FIT_CONTENT_PERCENT_TAG => parent_size.map(|size| crate::util::resolve_percentage(self.0.value(), size)),
             _ => self.definite_value(parent_size, calc_resolver),
         }
     }
@@ -1251,7 +1251,7 @@ impl MinTrackSizingFunction {
     ) -> Option<f32> {
         match self.0.tag() {
             CompactLength::LENGTH_TAG => Some(self.0.value()),
-            CompactLength::PERCENT_TAG => parent_size.map(|size| self.0.value() * size),
+            CompactLength::PERCENT_TAG => parent_size.map(|size| crate::util::resolve_percentage(self.0.value(), size)),
             #[cfg(feature = "calc")]
             _ if self.0.is_calc() => parent_size.map(|size| calc_resolver(self.0.calc_value(), size)),
             _ => None,

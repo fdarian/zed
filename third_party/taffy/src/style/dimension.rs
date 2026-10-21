@@ -190,7 +190,7 @@ impl LengthPercentageAuto {
     pub fn resolve_to_option(self, context: f32, calc_resolver: impl Fn(*const (), f32) -> f32) -> Option<f32> {
         match self.0.tag() {
             CompactLength::LENGTH_TAG => Some(self.0.value()),
-            CompactLength::PERCENT_TAG => Some(context * self.0.value()),
+            CompactLength::PERCENT_TAG => Some(crate::util::resolve_percentage(self.0.value(), context)),
             CompactLength::AUTO_TAG => None,
             #[cfg(feature = "calc")]
             _ if self.0.is_calc() => Some(calc_resolver(self.0.calc_value(), context)),

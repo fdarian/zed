@@ -1,4 +1,5 @@
 //! Column widths: what every column asks for, and how the width of the table is shared out between them
+use crate::util::resolve_percentage;
 use crate::util::sys::{Vec, f32_max, f32_min};
 
 /// What the cells and `<col>`s of a column ask of its width
@@ -123,7 +124,7 @@ pub(super) fn clamp_percentages(columns: &mut [Column]) {
 /// with a percentage, else to all of them equally. When `excess_to_fixed` is not set the columns with a width do not
 /// take any, and nothing is left to the others the width of the columns stays where they like it.
 pub(super) fn distribute(target: f32, columns: &[Column], excess_to_fixed: bool) -> Vec<f32> {
-    let percent_width = |column: &Column| column.percent.map(|percent| percent * target);
+    let percent_width = |column: &Column| column.percent.map(|percent| resolve_percentage(percent, target));
 
     let min_guess: Vec<f32> = columns.iter().map(|column| column.min).collect();
     let percent_guess: Vec<f32> = columns

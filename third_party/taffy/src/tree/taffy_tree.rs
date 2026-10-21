@@ -14,6 +14,7 @@ use crate::tree::{
     Cache, ClearState, Layout, LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, PrintTree, RoundTree, RunMode,
     SizingMode, TraversePartialTree, TraverseTree,
 };
+use crate::util::cut_to_layout_unit;
 use crate::util::debug::{debug_log, debug_log_node};
 use crate::util::sys::{new_vec_with_capacity, ChildrenVec, Vec};
 
@@ -99,11 +100,6 @@ impl Calc {
         }
         value
     }
-}
-
-fn cut_to_layout_unit(length: f32) -> f32 {
-    const UNIT: f32 = 1.0 / 64.0;
-    (length / UNIT).trunc() * UNIT
 }
 
 /// `inputs` for a node with size containment: a contained axis that layout would size from the
