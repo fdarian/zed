@@ -69,7 +69,7 @@ pub struct TextSystem {
     fallback_font_stack: SmallVec<[Font; 2]>,
     /// Counts the times fonts were added, which can change what text in a family that did not
     /// resolve before looks like.
-    font_generation: std::sync::atomic::AtomicU64,
+    font_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl TextSystem {
@@ -82,7 +82,7 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
-            font_generation: std::sync::atomic::AtomicU64::new(0),
+            font_generation: Arc::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -438,7 +438,10 @@ impl WindowTextSystem {
     /// Create a new WindowTextSystem with the given TextSystem.
     pub fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
-            line_layout_cache: LineLayoutCache::new(text_system.platform_text_system.clone()),
+            line_layout_cache: LineLayoutCache::new(
+                text_system.platform_text_system.clone(),
+                text_system.font_generation.clone(),
+            ),
             text_system,
         }
     }
@@ -2005,6 +2008,45 @@ mod insets_tests {
             text_system.finish_frame();
             shape(&text_system, "a label", Some(px(100.)), &[]);
             assert!(text_system.text_counters().shapes > again.shapes);
+        });
+    }
+
+    #[crate::test]
+    fn test_a_line_survives_the_frames_that_shape_other_text_in_the_shape_store(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let first = shape(&text_system, "a label", Some(px(100.)), &[]);
+            let unwrapped = text_system.layout_line("a plain line", px(16.), &[run(12)], None);
+            text_system.finish_frame();
+            for frame in 0..30 {
+                shape(&text_system, &format!("other text {frame}"), None, &[]);
+                text_system.finish_frame();
+            }
+            let before = text_system.text_counters();
+
+            let again = shape(&text_system, "a label", Some(px(100.)), &[]);
+            let counters = text_system.text_counters();
+            assert_eq!(counters.shapes, before.shapes);
+            assert_eq!(counters.wrapped_layouts, before.wrapped_layouts);
+            assert_eq!(counters.hits, before.hits);
+            assert_eq!(counters.shape_cache_hits, before.shape_cache_hits + 1);
+            assert!(Arc::ptr_eq(&first[0].layout, &again[0].layout));
+
+            let unwrapped_again =
+                text_system.layout_line("a plain line", px(16.), &[run(12)], None);
+            let counters_after = text_system.text_counters();
+            assert_eq!(counters_after.shapes, counters.shapes);
+            assert_eq!(counters_after.shape_cache_hits, counters.shape_cache_hits + 1);
+            assert!(Arc::ptr_eq(&unwrapped, &unwrapped_again));
+
+            // The hit is in this frame like a shape would be: the frame after finds it as a hit.
+            text_system.finish_frame();
+            shape(&text_system, "a label", Some(px(100.)), &[]);
+            let next = text_system.text_counters();
+            assert_eq!(next.hits, counters_after.hits + 1);
+            assert_eq!(next.shape_cache_hits, counters_after.shape_cache_hits);
         });
     }
 

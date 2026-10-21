@@ -16,6 +16,9 @@ use std::{
     },
 };
 
+mod shape_store;
+
+use self::shape_store::{SHAPE_STORE_BUDGET_BYTES, ShapeStore};
 use super::line_break::LineBreaks;
 use super::{
     InlineRun, InlineSpec, PlacedBox, RunWrap, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
@@ -1646,6 +1649,9 @@ pub struct TextCounters {
     pub wrapped_layouts: u64,
     /// Lookups that found a layout of this frame or of the frame before.
     pub hits: u64,
+    /// Lookups that found neither but a layout the window shaped some frames ago, which the
+    /// per-window shape store kept. They are not shapes.
+    pub shape_cache_hits: u64,
 }
 
 #[derive(Default)]
@@ -1653,6 +1659,7 @@ struct AtomicTextCounters {
     shapes: AtomicU64,
     wrapped_layouts: AtomicU64,
     hits: AtomicU64,
+    shape_cache_hits: AtomicU64,
 }
 
 impl AtomicTextCounters {
@@ -1666,6 +1673,10 @@ pub(crate) struct LineLayoutCache {
     current_frame: RwLock<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
     counters: AtomicTextCounters,
+    /// Behind the frame caches: what was shaped, for as long as the budget allows. Locked after
+    /// the frame caches, and never while taking them.
+    shape_store: Mutex<ShapeStore>,
+    font_generation: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -1734,13 +1745,24 @@ impl LineLayoutIndex {
 }
 
 impl LineLayoutCache {
-    pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
+    /// `font_generation` counts the times fonts were added to the text system, which empties the
+    /// shape store.
+    pub fn new(
+        platform_text_system: Arc<dyn PlatformTextSystem>,
+        font_generation: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
             platform_text_system,
             counters: AtomicTextCounters::default(),
+            shape_store: Mutex::new(ShapeStore::new(SHAPE_STORE_BUDGET_BYTES)),
+            font_generation,
         }
+    }
+
+    fn font_generation(&self) -> u64 {
+        self.font_generation.load(Ordering::Relaxed)
     }
 
     pub fn counters(&self) -> TextCounters {
@@ -1748,6 +1770,7 @@ impl LineLayoutCache {
             shapes: self.counters.shapes.load(Ordering::Relaxed),
             wrapped_layouts: self.counters.wrapped_layouts.load(Ordering::Relaxed),
             hits: self.counters.hits.load(Ordering::Relaxed),
+            shape_cache_hits: self.counters.shape_cache_hits.load(Ordering::Relaxed),
         }
     }
 
@@ -1906,8 +1929,26 @@ impl LineLayoutCache {
         }
 
         let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
+        let stored = match previous_frame_entry {
+            Some(_) => None,
+            None => {
+                let font_generation = self.font_generation();
+                self.shape_store.lock().wrapped_line(key, font_generation)
+            }
+        };
         if let Some((key, layout)) = previous_frame_entry {
             AtomicTextCounters::add(&self.counters.hits);
+            self.shape_store
+                .lock()
+                .keep_wrapped_line(&key, &layout, self.font_generation());
+            let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
+            current_frame
+                .wrapped_lines
+                .insert(key.clone(), layout.clone());
+            current_frame.used_wrapped_lines.push(key);
+            layout
+        } else if let Some((key, layout)) = stored {
+            AtomicTextCounters::add(&self.counters.shape_cache_hits);
             let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
             current_frame
                 .wrapped_lines
@@ -1976,6 +2017,9 @@ impl LineLayoutCache {
                 line_height,
             });
 
+            self.shape_store
+                .lock()
+                .keep_wrapped_line(&key, &layout, self.font_generation());
             let mut current_frame = self.current_frame.write();
             current_frame
                 .wrapped_lines
@@ -2231,8 +2275,22 @@ impl LineLayoutCache {
         }
 
         let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
-        if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
+        let previous_frame_entry = self.previous_frame.lock().lines.remove_entry(key);
+        let font_generation = self.font_generation();
+        let stored = match previous_frame_entry {
+            Some(_) => None,
+            None => self.shape_store.lock().line(key, font_generation),
+        };
+        if let Some((key, layout)) = previous_frame_entry {
             AtomicTextCounters::add(&self.counters.hits);
+            self.shape_store
+                .lock()
+                .keep_line(&key, &layout, font_generation);
+            current_frame.lines.insert(key.clone(), layout.clone());
+            current_frame.used_lines.push(key);
+            layout
+        } else if let Some((key, layout)) = stored {
+            AtomicTextCounters::add(&self.counters.shape_cache_hits);
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
@@ -2268,6 +2326,9 @@ impl LineLayoutCache {
                 line_height: Pixels::ZERO,
             });
             let layout = Arc::new(layout);
+            self.shape_store
+                .lock()
+                .keep_line(&key, &layout, font_generation);
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
