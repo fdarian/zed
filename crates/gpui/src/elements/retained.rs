@@ -59,9 +59,9 @@
 //! that before the subtree is built.
 
 use crate::{
-    StateOwner, AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, NonReusable, PaintIndex, PaintRecord, Pixels, Point, PrepaintRecord,
-    PrepaintStateIndex, Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
+    Origin, StateOwner, AnyElement, App, Bounds, Edges, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, NonReusable, PaintRecord, Pixels, Point, PrepaintRecord,
+    Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
     blocker_bit, first_blocker, IsZero, SubtreeText, scene::PrimitiveCount,
     PatchUnit, PatchSource,
 };
@@ -276,40 +276,6 @@ pub(crate) struct RetainedState {
 }
 
 impl RetainedState {
-    /// Where the prepaint of the subtree is, now that the range of the frame it was recorded in
-    /// that starts at `from` was copied to `to`, where the frame being built has it.
-    pub(crate) fn move_prepaint(&mut self, from: &PrepaintStateIndex, to: &PrepaintStateIndex, serial: u64) {
-        if let Some(recorded) = self.recorded.as_mut() {
-            let range = &recorded.prepaint.range;
-            recorded.prepaint.range = range.start.moved(from, to)..range.end.moved(from, to);
-            recorded.serial = serial;
-        }
-    }
-
-    /// Where the paint of the subtree is, now that the range `from` of the frame `rendered`, which
-    /// holds it, was copied to start at `to` in the frame `serial`. The elements the subtree handed to a
-    /// stacking context were painted by it, and so are in the range only when that context was
-    /// being painted inside it.
-    pub(crate) fn move_paint(&mut self, from: &Range<PaintIndex>, rendered: u64, to: &PaintIndex, serial: u64) {
-        let Some(recorded) = self.recorded.as_mut() else {
-            return;
-        };
-        recorded.paint_serial = serial;
-        if let Some(paint) = recorded.paint.as_mut() {
-            paint.range = paint.range.start.moved(&from.start, to)..paint.range.end.moved(&from.start, to);
-        }
-        if let Some(lifts) = &recorded.prepaint.lifts {
-            for cell in lifts.cells() {
-                cell.move_within(from, rendered, to, serial);
-            }
-        }
-    }
-
-    /// The subtrees recorded inside this one.
-    pub(crate) fn nested_recordings(&self) -> Option<Rc<[(GlobalElementId, TypeId)]>> {
-        self.recorded.as_ref().map(|recorded| recorded.prepaint.nested.clone())
-    }
-
     /// Says what ordinal the stacking context gave the first element this subtree handed to it
     /// in the frame being built.
     pub(crate) fn set_lift_base(&mut self, base: u32) {
@@ -321,13 +287,11 @@ impl RetainedState {
     /// Whether a frame that is built from the rendered one can have this subtree paint itself from
     /// its recording alone: nothing it read, also while it painted, has changed.
     fn paints_from_its_recording(&self, window: &Window) -> bool {
-        let rendered_serial = window.rendered_serial();
         !self.accessed_entities.iter().any(|entity| window.retained.notified.contains(entity))
-            && self.recorded.as_ref().is_some_and(|recorded| {
-                recorded.serial == rendered_serial
-                    && recorded.paint_serial == rendered_serial
-                    && recorded.paint.is_some()
-            })
+            && self
+                .recorded
+                .as_ref()
+                .is_some_and(|recorded| recorded.paint.is_some() && recorded.is_placed_in(window.rendered_serial()))
     }
 
     /// What [`Window::repaint_in_place`] needs of the recording, if the subtree is a plain one
@@ -340,16 +304,15 @@ impl RetainedState {
             && paint.is_plain()
             && recorded.relocation.is_none()
             && recorded.prepaint.lifts.is_none()
-            && recorded.serial == rendered
-            && recorded.paint_serial == rendered
+            && recorded.is_placed_in(rendered)
             && self.engine == window.layout_engine_id()
             && window.layout_node_alive(self.root)
             && recorded.generation == window.layout_generation(self.root)
             && !window.layout_is_dirty(self.root))
         .then(|| PatchSource {
             root: self.root,
-            prepaint: recorded.prepaint.range.clone(),
-            paint: paint.range.clone(),
+            prepaint: recorded.prepaint.range_now(),
+            paint: paint.range_now(),
             hitboxes: recorded.prepaint.hitboxes.clone(),
             tab_stops: paint.tab_stops.clone(),
             owner: self.owner.clone(),
@@ -363,8 +326,8 @@ impl RetainedState {
 
     /// Where the operations of the paint of the subtree are in the scene of the frame it is in.
     pub(crate) fn scene_range(&self) -> Option<Range<usize>> {
-        let paint = self.recorded.as_ref()?.paint.as_ref()?;
-        Some(paint.range.start.scene_index()..paint.range.end.scene_index())
+        let range = self.recorded.as_ref()?.paint.as_ref()?.range_now();
+        Some(range.start.scene_index()..range.end.scene_index())
     }
 
     /// What the last prepaint and paint of the subtree left in the frame being built, as text.
@@ -376,13 +339,7 @@ impl RetainedState {
         // seen or hit is not compared.
         // The same goes for a subtree that holds one, which put what it recorded into the frame
         // when it was replayed inside it.
-        let loose = recorded.relocation.is_some()
-            || recorded.prepaint.nested.iter().any(|key| {
-                window
-                    .retained_state(key)
-                    .and_then(|state| state.recorded.as_ref())
-                    .is_some_and(|recorded| recorded.relocation.is_some())
-            });
+        let loose = recorded.relocation.is_some() || recorded.prepaint.relocated_inside;
         let describe = |loose: bool| {
             let mut text = format!(
                 "{}\n{}",
@@ -403,11 +360,9 @@ impl RetainedState {
     }
 }
 
-/// What the prepaint and paint of the subtree left in the frames `serial` and `paint_serial`,
-/// which are one when both ran in the last frame that drew the subtree.
+/// What the prepaint and paint of the subtree left in the frames they are placed in (see
+/// [`Origin`]), which are one when both ran in the last frame that drew the subtree.
 struct Recorded {
-    serial: u64,
-    paint_serial: u64,
     /// The layout generation of the root after layout: layout results of the subtree below
     /// are the ones recorded while it has not changed.
     generation: u64,
@@ -433,6 +388,11 @@ struct Recorded {
 }
 
 impl Recorded {
+    /// Whether the prepaint and the paint are where the frame with this serial has them.
+    fn is_placed_in(&self, serial: u64) -> bool {
+        self.prepaint.origin.prepaint_now().1 == serial && self.prepaint.origin.paint_now().1 == serial
+    }
+
     /// Whether every subtree and every element this one handed to the stacking context around it
     /// can paint itself from its recording, which a replay of this one leaves it to do.
     fn lifted_paint_from_recordings(&self, window: &Window) -> bool {
@@ -582,7 +542,8 @@ impl Element for Retained {
                 let regional = relocation.as_ref().is_some_and(Relocation::regional);
                 let moves = relocation.as_ref().is_some_and(|relocation| !relocation.direct);
                 let relocating = relocation.is_some();
-                let mark = record.then(|| window.begin_paint_recording());
+                let origin = record.then(|| self.recorded_origin(global_id, window));
+                let mark = origin.as_ref().map(|origin| window.begin_paint_recording(origin));
                 if let Some(relocation) = relocation {
                     window.begin_relocation(relocation, true);
                 }
@@ -650,8 +611,6 @@ impl Element for Retained {
                                     recorded.patch = None;
                                 }
                                 recorded.paint = Some(paint);
-                                recorded.paint_serial = window.building_serial();
-                                window.log_painted_subtree(&state.id);
                                 if let Some(unit) = &recorded.patch {
                                     window.register_patch_unit(&self.id, unit);
                                 }
@@ -686,7 +645,6 @@ fn replay_recorded_paint(
             .recorded
             .as_mut()
             .expect("a replayed subtree has its recording");
-        let nested = recorded.prepaint.paint_nested(window);
         let delta = recorded.delta;
         let lift_base = recorded.lift_base;
         debug_assert!(
@@ -698,9 +656,8 @@ fn replay_recorded_paint(
             .paint
             .as_mut()
             .expect("a subtree is skipped only with its paint recorded");
-        paint.range = window.replay_paint(paint, &nested, delta, lift_base, false);
-        recorded.paint_serial = window.building_serial();
-        window.log_painted_subtree(&state.id);
+        let range = window.replay_paint(paint, delta, lift_base, false);
+        paint.set_range(range);
         if let Some(hook) = hook {
             window.retained.replayed_root = Some(state.root);
             hook(RetainedPhase::Paint, delta, window, cx);
@@ -758,8 +715,7 @@ impl Retained {
                 && state.engine == window.layout_engine_id()
                 && window.layout_node_alive(state.root)
                 && state.recorded.as_ref().is_some_and(|recorded| {
-                    recorded.serial == window.rendered_serial()
-                        && recorded.paint_serial == window.rendered_serial()
+                    recorded.is_placed_in(window.rendered_serial())
                         && recorded.paint.is_some()
                         && recorded.key.shapes_layout_like(window)
                         && recorded.lifted_paint_from_recordings(window)
@@ -909,8 +865,7 @@ impl Retained {
                         && state.engine == window.layout_engine_id()
                         && window.layout_node_alive(state.root)
                         && state.recorded.as_ref().is_some_and(|recorded| {
-                            recorded.serial == window.rendered_serial()
-                                && recorded.paint_serial == window.rendered_serial()
+                            recorded.is_placed_in(window.rendered_serial())
                                 && recorded.paint.is_some()
                                 && recorded.key.shapes_layout_like(window)
                                 && recorded.lifted_paint_from_recordings(window)
@@ -936,6 +891,16 @@ impl Retained {
                 record: false,
             },
         )
+    }
+
+    /// Where the recording of the subtree that is being made is.
+    fn recorded_origin(&self, global_id: &GlobalElementId, window: &Window) -> Rc<Origin> {
+        window
+            .peek_element_state(global_id, |state: &RetainedState| {
+                state.recorded.as_ref().map(|recorded| recorded.prepaint.origin.clone())
+            })
+            .flatten()
+            .expect("a subtree that records its paint has recorded its prepaint")
     }
 
     /// The owner of the element states of the subtree.
@@ -978,13 +943,20 @@ impl Retained {
                 return (false, state);
             };
             recorded.delta = delta;
-            (recorded.prepaint.range, recorded.lift_base) =
+            let (range, lift_base) =
                 window.replay_prepaint(&recorded.prepaint, recorded.is_regional().then_some(delta), hook.as_ref());
+            recorded.prepaint.set_range(range);
+            recorded.lift_base = lift_base;
             if let Some(relocation) = &recorded.relocation {
                 relocation.apply(delta);
             }
-            recorded.serial = window.building_serial();
-            window.note_retained_recording((state.id.clone(), TypeId::of::<RetainedState>()));
+            window.note_retained_recording(
+                (state.id.clone(), TypeId::of::<RetainedState>()),
+                recorded.prepaint.origin.clone(),
+            );
+            if recorded.relocation.is_some() || recorded.prepaint.relocated_inside {
+                window.retained.relocated_inside += 1;
+            }
             if delta.is_zero()
                 && let Some(unit) = &recorded.patch
             {
@@ -1227,9 +1199,11 @@ impl Retained {
             let record = match reason {
                 Ok(prepaint) => {
                     let patch = patch.filter(|_| prepaint.lifts.is_none());
+                    if relocating || prepaint.relocated_inside {
+                        window.retained.relocated_inside += 1;
+                    }
+                    let origin = prepaint.origin.clone();
                     state.recorded = Some(Recorded {
-                        serial: window.building_serial(),
-                        paint_serial: 0,
                         generation: window.layout_generation(root),
                         key,
                         prepaint,
@@ -1241,7 +1215,7 @@ impl Retained {
                         lift_base: None,
                         patch,
                     });
-                    window.note_retained_recording((state.id.clone(), TypeId::of::<RetainedState>()));
+                    window.note_retained_recording((state.id.clone(), TypeId::of::<RetainedState>()), origin);
                     true
                 }
                 Err(reason) => {

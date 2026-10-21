@@ -77,8 +77,11 @@ pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMis
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
 pub(crate) use retained::{
     LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
-    RetainedWindow, StateOwner, SubtreeText, blocker_bit, first_blocker,
+    Origin, RetainedWindow, StateOwner, SubtreeText, blocker_bit, first_blocker,
 };
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use retained::PLACEMENTS;
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -1330,7 +1333,7 @@ pub(crate) struct Frame {
     layout_publications: Vec<LayoutPublication>,
     /// The element states of the retained subtrees (see [`crate::retained`]) recorded this
     /// frame, so that a rolled-back prepaint can drop the recordings it made.
-    retained_recordings: Vec<(GlobalElementId, TypeId)>,
+    retained_recordings: Vec<((GlobalElementId, TypeId), Rc<Origin>)>,
     /// The retained roots of this frame that [`Window::repaint_in_place`] can repaint, by the id
     /// of the root; `None` for an id that two of them have. Good for the frame that holds it, and
     /// only while it is the rendered one.
@@ -1410,27 +1413,6 @@ impl PaintIndex {
     /// Where the scene of the frame is, in operations.
     pub(crate) fn scene_index(&self) -> usize {
         self.scene_index
-    }
-
-    /// Whether the range `inner` is inside `outer`, in every vector that a paint writes to the
-    /// frame but the ones only a test reads. The accessed element states are not among them: a
-    /// retained subtree that is replayed copies none, so its range there does not say where its
-    /// paint is.
-    pub(crate) fn range_is_within(inner: &Range<Self>, outer: &Range<Self>) -> bool {
-        let within = |inner: &Range<usize>, outer: &Range<usize>| inner.start >= outer.start && inner.end <= outer.end;
-        let axis = |index: fn(&Self) -> usize| {
-            within(&(index(&inner.start)..index(&inner.end)), &(index(&outer.start)..index(&outer.end)))
-        };
-        axis(|index| index.scene_index)
-            && axis(|index| index.mouse_listeners_index)
-            && axis(|index| index.root_key_listeners_index)
-            && axis(|index| index.input_handlers_index)
-            && axis(|index| index.cursor_styles_index)
-            && axis(|index| index.tab_handle_index)
-            && LineLayoutIndex::range_is_within(
-                &(inner.start.line_layout_index.clone()..inner.end.line_layout_index.clone()),
-                &(outer.start.line_layout_index.clone()..outer.end.line_layout_index.clone()),
-            )
     }
 
     /// Where the index `self`, which is inside the range that started at `from`, is once that
@@ -6062,12 +6044,13 @@ impl Window {
                 .layout_publications
                 .truncate(index.layout_publications_index);
             // What a retained subtree recorded in the attempt indexes the vectors truncated above.
-            for key in self
+            for (key, origin) in self
                 .next_frame
                 .retained_recordings
                 .drain(index.retained_recordings_index..)
             {
                 self.element_states.remove(&key);
+                origin.drop_placement();
             }
             self.text_system.truncate_layouts(index.line_layout_index);
         }

@@ -312,6 +312,115 @@ impl StateOwner {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// How many times a recording was put somewhere, by a record or a replay.
+    pub(crate) static PLACEMENTS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// An index into the vectors of a frame, which a range of a recording is made of.
+pub(crate) trait FrameIndex: Clone {
+    /// Where the index, which is inside the range that started at `from`, is once that range was
+    /// copied to `to`.
+    fn moved(&self, from: &Self, to: &Self) -> Self;
+}
+
+impl FrameIndex for PrepaintStateIndex {
+    fn moved(&self, from: &Self, to: &Self) -> Self {
+        PrepaintStateIndex::moved(self, from, to)
+    }
+}
+
+impl FrameIndex for PaintIndex {
+    fn moved(&self, from: &Self, to: &Self) -> Self {
+        PaintIndex::moved(self, from, to)
+    }
+}
+
+/// Where a recording started in the frame `serial`, either as it was put there or as the
+/// recording around it, which it was inside of, was put: `within` names that one and where it
+/// started when this was noted.
+struct Placed<I> {
+    start: I,
+    serial: u64,
+    within: Option<(Rc<Origin>, I)>,
+}
+
+impl<I: FrameIndex + Default> Default for Placed<I> {
+    fn default() -> Self {
+        Self {
+            start: I::default(),
+            serial: u64::MAX,
+            within: None,
+        }
+    }
+}
+
+/// Where the prepaint and the paint of a recording are. A recording that is replayed is put
+/// somewhere by the frame, and the recordings made inside it are where they were in it, so that
+/// putting it takes one step and not one for each of them: they ask where it is when they are
+/// needed. (A recording that is not placed in the frame being built or rendered, or is dropped,
+/// is placed in no frame.)
+#[derive(Default)]
+pub(crate) struct Origin {
+    prepaint: RefCell<Placed<PrepaintStateIndex>>,
+    paint: RefCell<Placed<PaintIndex>>,
+}
+
+impl Origin {
+    pub(crate) fn new() -> Rc<Self> {
+        Rc::default()
+    }
+
+    fn now<I: FrameIndex>(&self, side: fn(&Origin) -> &RefCell<Placed<I>>) -> (I, u64) {
+        let placed = side(self).borrow();
+        match &placed.within {
+            None => (placed.start.clone(), placed.serial),
+            Some((outer, base)) => {
+                let (outer_start, serial) = outer.now(side);
+                (placed.start.moved(base, &outer_start), serial)
+            }
+        }
+    }
+
+    fn place<I: FrameIndex>(
+        &self,
+        side: fn(&Origin) -> &RefCell<Placed<I>>,
+        start: I,
+        serial: u64,
+        within: Option<&Rc<Origin>>,
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        PLACEMENTS.with(|placements| placements.set(placements.get() + 1));
+        let within = within.map(|outer| (outer.clone(), outer.now(side).0));
+        *side(self).borrow_mut() = Placed { start, serial, within };
+    }
+
+    /// Where the prepaint starts, and the serial of the frame it is in.
+    pub(crate) fn prepaint_now(&self) -> (PrepaintStateIndex, u64) {
+        self.now(|origin| &origin.prepaint)
+    }
+
+    /// Where the paint starts, and the serial of the frame it is in.
+    pub(crate) fn paint_now(&self) -> (PaintIndex, u64) {
+        self.now(|origin| &origin.paint)
+    }
+
+    pub(crate) fn place_prepaint(&self, start: PrepaintStateIndex, serial: u64, within: Option<&Rc<Origin>>) {
+        self.place(|origin| &origin.prepaint, start, serial, within);
+    }
+
+    pub(crate) fn place_paint(&self, start: PaintIndex, serial: u64, within: Option<&Rc<Origin>>) {
+        self.place(|origin| &origin.paint, start, serial, within);
+    }
+
+    /// The recording is in no frame, nor are the ones inside it.
+    pub(crate) fn drop_placement(&self) {
+        *self.prepaint.borrow_mut() = Placed::default();
+        *self.paint.borrow_mut() = Placed::default();
+    }
+}
+
 /// What the window keeps for retained subtrees.
 #[derive(Default)]
 pub(crate) struct RetainedWindow {
@@ -372,11 +481,10 @@ pub(crate) struct RetainedWindow {
     pub(crate) own_masks: Vec<bool>,
     /// The recordings of prepaint that are open, outermost first.
     open_recordings: Vec<OpenRecording>,
-    /// While an element handed to a stacking context is painted for its recording, the retained
-    /// subtrees that painted or were replayed in it, in order.
-    paint_log: Vec<(GlobalElementId, TypeId)>,
-    /// How many recordings of such a paint are open.
-    logging_paint: u32,
+    /// The recordings of paint that are open, outermost first.
+    open_paints: Vec<Rc<Origin>>,
+    /// How many recordings that were made in a region or hold one were recorded or replayed.
+    pub(crate) relocated_inside: u32,
 }
 
 /// A recording of prepaint that has begun and not finished.
@@ -390,6 +498,7 @@ struct OpenRecording {
     /// Owns the element states that the elements handed to the stacking context access when it
     /// paints them.
     state_owner: Rc<StateOwner>,
+    origin: Rc<Origin>,
 }
 
 /// A recording that was open when an element was handed to the stacking context it prepaints in:
@@ -409,16 +518,14 @@ pub(crate) struct LiftOwner {
 pub(crate) struct PlainPaint {
     /// How many elements were handed over while the element was prepainted, after it.
     descendants: u32,
+    /// Where the paint is, and so where the subtrees that painted inside it are.
+    origin: Rc<Origin>,
     recorded: RefCell<PlainRecord>,
 }
 
 struct PlainRecord {
     /// `None` until the context paints the element, and when what it painted cannot be repeated.
     paint: Option<PaintRecord>,
-    /// The retained subtrees that painted inside the element.
-    nested: Rc<[(GlobalElementId, TypeId)]>,
-    /// The serial of the frame `paint` indexes.
-    serial: u64,
     /// The entities the paint read.
     entities: FxHashSet<EntityId>,
 }
@@ -429,30 +536,15 @@ impl PlainPaint {
     pub(crate) fn paints_from_its_recording(&self, window: &Window) -> bool {
         let recorded = self.recorded.borrow();
         recorded.paint.is_some()
-            && recorded.serial == window.rendered_serial()
+            && self.origin.paint_now().1 == window.rendered_serial()
             && !recorded.entities.iter().any(|entity| window.retained.notified.contains(entity))
-    }
-
-    /// Where the paint is, if it was inside the range `from` of the frame `rendered`, which was
-    /// copied to start at `to`.
-    pub(crate) fn move_within(&self, from: &Range<PaintIndex>, rendered: u64, to: &PaintIndex, serial: u64) {
-        let mut recorded = self.recorded.borrow_mut();
-        if recorded.serial != rendered {
-            return;
-        }
-        if let Some(paint) = recorded.paint.as_mut()
-            && PaintIndex::range_is_within(&paint.range, from)
-        {
-            paint.range = paint.range.start.moved(&from.start, to)..paint.range.end.moved(&from.start, to);
-            recorded.serial = serial;
-        }
     }
 
     /// What the element painted, as text, if it painted in the frame being built.
     pub(crate) fn describe(&self, window: &Window, loose: bool) -> String {
         let recorded = self.recorded.borrow();
         match &recorded.paint {
-            Some(paint) if recorded.serial == window.building_serial() => {
+            Some(paint) if self.origin.paint_now().1 == window.building_serial() => {
                 format!("\nlifted\n{}", paint.describe(window, loose))
             }
             _ => "\nlifted (not painted)".to_owned(),
@@ -462,10 +554,9 @@ impl PlainPaint {
     pub(crate) fn new(descendants: u32) -> Self {
         Self {
             descendants,
+            origin: Origin::new(),
             recorded: RefCell::new(PlainRecord {
                 paint: None,
-                nested: Rc::default(),
-                serial: 0,
                 entities: FxHashSet::default(),
             }),
         }
@@ -677,6 +768,8 @@ impl LiftRecord {
 /// Where the state of the frame was when the prepaint of a retained subtree started.
 pub(crate) struct PrepaintMark {
     index: PrepaintStateIndex,
+    origin: Rc<Origin>,
+    relocated_inside: u32,
     effects: Effects,
     a11y: Option<a11y::A11yMark>,
     lifts: Option<LiftMark>,
@@ -685,16 +778,13 @@ pub(crate) struct PrepaintMark {
 /// What the prepaint of a retained subtree left in the frame, in a form that outlives the frame
 /// it was made in for the one after.
 pub(crate) struct PrepaintRecord {
-    pub(crate) range: Range<PrepaintStateIndex>,
-    /// The retained subtrees inside this one that were recorded or replayed while it prepainted.
-    /// Their recordings are of the ranges of the frame this was recorded in, and move with this
-    /// one when it is replayed.
-    pub(crate) nested: Rc<[(GlobalElementId, TypeId)]>,
-    /// [`Self::nested`] but for the ones that were handed to a stacking context outside, and
-    /// the ones inside those, and the ones that painted inside an element that was: what they
-    /// paint is not in the paint of this one. Known once the context has painted, see
-    /// [`PrepaintRecord::paint_nested`].
-    paint_nested: std::cell::OnceCell<Rc<[(GlobalElementId, TypeId)]>>,
+    /// Where the prepaint was when the range was noted: see [`Self::range_now`].
+    range: Range<PrepaintStateIndex>,
+    /// Where the prepaint is now, and so where the retained subtrees recorded or replayed inside
+    /// it are, which are placed in it and not by it.
+    pub(crate) origin: Rc<Origin>,
+    /// A subtree recorded in a region, or one that holds one, was recorded or replayed inside.
+    pub(crate) relocated_inside: bool,
     pub(crate) lifts: Option<Rc<LiftRecord>>,
     pub(crate) hitboxes: Rc<RecordedHitboxes>,
     a11y: Option<Rc<a11y::A11yRecording>>,
@@ -707,6 +797,7 @@ pub(crate) struct PrepaintRecord {
 /// Where the state of the frame was when the paint of a retained subtree started.
 pub(crate) struct PaintMark {
     index: PaintIndex,
+    origin: Rc<Origin>,
     effects: Effects,
     a11y: Option<a11y::A11yMark>,
     /// The stacking context being painted, by its place among them, and how many places in the tab
@@ -716,7 +807,10 @@ pub(crate) struct PaintMark {
 
 /// What the paint of a retained subtree left in the frame.
 pub(crate) struct PaintRecord {
-    pub(crate) range: Range<PaintIndex>,
+    /// Where the paint was when the range was noted: see [`Self::range_now`].
+    range: Range<PaintIndex>,
+    /// Where the paint is now, and so where the retained subtrees that painted inside it are.
+    pub(crate) origin: Rc<Origin>,
     pub(crate) tab_stops: Rc<[TabStopOperation]>,
     /// Where in `tab_stops` the paint skipped an element that was handed to the stacking context
     /// around it (so that its tab stops go there), and which of the ones the prepaint handed over,
@@ -1229,9 +1323,10 @@ impl Window {
             .stretch_auto_size_to_fill(id, size, scale_factor);
     }
 
-    /// Records that the element state under `key` holds a recording of the frame being built.
-    pub(crate) fn note_retained_recording(&mut self, key: (GlobalElementId, TypeId)) {
-        self.next_frame.retained_recordings.push(key);
+    /// Records that the element state under `key` holds a recording of the frame being built,
+    /// which is `origin` in it.
+    pub(crate) fn note_retained_recording(&mut self, key: (GlobalElementId, TypeId), origin: Rc<Origin>) {
+        self.next_frame.retained_recordings.push((key, origin));
     }
 
     fn layout_engine(&self) -> &TaffyLayoutEngine {
@@ -1337,14 +1432,24 @@ impl Window {
         state_owner: Rc<StateOwner>,
     ) -> PrepaintMark {
         self.invalidator.debug_assert_prepaint();
+        let index = self.prepaint_index();
+        let origin = Origin::new();
+        origin.place_prepaint(
+            index.clone(),
+            self.building_serial(),
+            self.retained.open_recordings.last().map(|recording| &recording.origin),
+        );
         self.retained.open_recordings.push(OpenRecording {
             depth: self.lift_lists.len(),
             next_ordinal: self.ambient_lift_ordinal(),
             hook,
             state_owner,
+            origin: origin.clone(),
         });
         PrepaintMark {
-            index: self.prepaint_index(),
+            index,
+            origin,
+            relocated_inside: self.retained.relocated_inside,
             effects: self.effects(),
             a11y: self.a11y.is_active().then(|| self.a11y.begin_recording()),
             lifts: self.lift_mark(),
@@ -1400,17 +1505,14 @@ impl Window {
             .filter(|(_, hitbox)| hitbox.parent == stale_parent)
             .map(|(position, _)| position)
             .collect();
-        let nested: Rc<[(GlobalElementId, TypeId)]> = self.next_frame.retained_recordings
-            [mark.index.retained_recordings_index..end.retained_recordings_index]
-            .into();
         let mut blockers = mark.effects.blockers(&effects);
         if lifts.is_some() {
             blockers |= blocker_bit(NonRelocatable::Hole);
         }
         Ok(PrepaintRecord {
             range: mark.index..end,
-            nested,
-            paint_nested: std::cell::OnceCell::new(),
+            origin: mark.origin,
+            relocated_inside: self.retained.relocated_inside != mark.relocated_inside,
             lifts,
             hitboxes: Rc::new(RecordedHitboxes { hitboxes, roots }),
             a11y: a11y.map(Rc::new),
@@ -1445,16 +1547,12 @@ impl Window {
         cx: &mut App,
         paint: impl FnOnce(&mut Window, &mut App),
     ) {
-        let mark = self.begin_paint_recording();
-        let log_start = self.retained.paint_log.len();
-        self.retained.logging_paint += 1;
+        let mark = self.begin_paint_recording(&cell.origin);
         // What the element accesses belongs to the subtrees that recorded it, innermost last.
         self.retained.state_owners.extend(owners.iter().map(|owner| owner.state_owner.clone()));
         let ((), entities) = self.detect_observed_entities(cx, paint);
         let remaining = self.retained.state_owners.len() - owners.len();
         self.retained.state_owners.truncate(remaining);
-        self.retained.logging_paint -= 1;
-        let nested: Rc<[(GlobalElementId, TypeId)]> = self.retained.paint_log.split_off(log_start).into();
         let base = LiftBase {
             base: ordinal + 1,
             count: cell.descendants,
@@ -1472,24 +1570,12 @@ impl Window {
         match recorded {
             Ok(paint) => {
                 cell.paint = Some(paint);
-                cell.nested = nested;
-                cell.serial = self.building_serial();
                 cell.entities = entities;
             }
             Err(reason) => {
                 cell.paint = None;
                 self.retained.counters.count_non_reusable(reason);
             }
-        }
-    }
-
-    /// Notes that the subtree `global_id` painted, or was replayed, for the cell that records the
-    /// element being painted, if there is one.
-    pub(crate) fn log_painted_subtree(&mut self, global_id: &GlobalElementId) {
-        if self.retained.logging_paint > 0 {
-            self.retained
-                .paint_log
-                .push((global_id.clone(), TypeId::of::<crate::elements::RetainedState>()));
         }
     }
 
@@ -1593,7 +1679,7 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
         let start = self.prepaint_index();
         let relocated = delta.map(|delta| (delta, self.content_mask()));
-        self.reuse_prepaint_with(record.range.clone(), Some((&record.hitboxes, relocated.as_ref())), false);
+        self.reuse_prepaint_with(record.range_now(), Some((&record.hitboxes, relocated.as_ref())), false);
         if let Some(a11y) = &record.a11y {
             let scale_factor = self.scale_factor;
             self.a11y.replay(a11y, delta.unwrap_or_default(), scale_factor);
@@ -1601,14 +1687,12 @@ impl Window {
         if record.has_publications {
             self.note_publication();
         }
-        // The subtrees inside are where this one put them, as of this frame.
-        let serial = self.building_serial();
-        for key in record.nested.iter() {
-            if let Some(state) = self.rendered_state_mut(key) {
-                state.move_prepaint(&record.range.start, &start, serial);
-                self.next_frame.retained_recordings.push(key.clone());
-            }
-        }
+        // The subtrees inside are where this one puts them, as of this frame.
+        record.origin.place_prepaint(
+            start.clone(),
+            self.building_serial(),
+            self.retained.open_recordings.last().map(|recording| &recording.origin),
+        );
         let lift_base = record.lifts.as_ref().map(|lifts| {
             debug_assert!(delta.is_none(), "a subtree that hands elements to a stacking context is not put elsewhere");
             self.replay_lifts(lifts, hook)
@@ -1701,21 +1785,14 @@ impl Window {
         hook: Option<&crate::elements::ReplayHook>,
         cx: &mut App,
     ) {
-        // Taken out so that nothing borrows the cell while the subtrees inside it move.
-        let (mut paint, nested) = {
+        // Taken out so that nothing borrows the cell while its paint is put into the frame.
+        let mut paint = {
             let mut recorded = cell.recorded.borrow_mut();
             cx.entities.extend_accessed(&recorded.entities);
-            (
-                recorded.paint.take().expect("a cell is replayed with its paint recorded"),
-                recorded.nested.clone(),
-            )
+            recorded.paint.take().expect("a cell is replayed with its paint recorded")
         };
-        paint.range = self.replay_paint(&paint, &nested, Point::default(), Some(ordinal + 1), false);
-        {
-            let mut recorded = cell.recorded.borrow_mut();
-            recorded.paint = Some(paint);
-            recorded.serial = self.building_serial();
-        }
+        paint.range = self.replay_paint(&paint, Point::default(), Some(ordinal + 1), false);
+        cell.recorded.borrow_mut().paint = Some(paint);
         if let Some(hook) = hook {
             hook(crate::elements::RetainedPhase::LiftedPaint(rel), Point::default(), self, cx);
         }
@@ -1741,26 +1818,8 @@ impl Window {
         }
     }
 
-    /// The retained state under `key`, in the frame being built or else the rendered frame.
-    pub(crate) fn retained_state(&self, key: &(GlobalElementId, TypeId)) -> Option<&crate::elements::RetainedState> {
-        self.element_states
-            .get(key)?
-            .inner
-            .downcast_ref::<Option<crate::elements::RetainedState>>()?
-            .as_ref()
-    }
-
-    /// The retained state under `key`, in the frame being built or else the rendered frame.
+    /// The retained state under `key`.
     fn retained_state_mut(&mut self, key: &(GlobalElementId, TypeId)) -> Option<&mut crate::elements::RetainedState> {
-        self.element_states
-            .get_mut(key)?
-            .inner
-            .downcast_mut::<Option<crate::elements::RetainedState>>()?
-            .as_mut()
-    }
-
-    /// The retained state under `key`, if it is still there.
-    fn rendered_state_mut(&mut self, key: &(GlobalElementId, TypeId)) -> Option<&mut crate::elements::RetainedState> {
         self.element_states
             .get_mut(key)?
             .inner
@@ -1805,10 +1864,14 @@ impl Window {
 
     /// Starts recording the paint of a retained subtree. Pair with
     /// [`Self::finish_paint_recording`].
-    pub(crate) fn begin_paint_recording(&mut self) -> PaintMark {
+    pub(crate) fn begin_paint_recording(&mut self, origin: &Rc<Origin>) -> PaintMark {
         self.invalidator.debug_assert_paint();
+        let index = self.paint_index();
+        origin.place_paint(index.clone(), self.building_serial(), self.retained.open_paints.last());
+        self.retained.open_paints.push(origin.clone());
         PaintMark {
-            index: self.paint_index(),
+            index,
+            origin: origin.clone(),
             effects: self.effects(),
             a11y: self.a11y.is_active().then(|| self.a11y.begin_recording()),
             lift_markers: self
@@ -1830,6 +1893,7 @@ impl Window {
         moves: bool,
         lift_base: Option<LiftBase>,
     ) -> Result<PaintRecord, NonReusable> {
+        self.retained.open_paints.pop().expect("a recording that finishes began");
         let end = self.paint_index();
         let effects = self.effects();
         let a11y = mark.a11y.map(|mark| self.a11y.end_recording(mark));
@@ -1861,6 +1925,7 @@ impl Window {
         };
         Ok(PaintRecord {
             range: mark.index..end,
+            origin: mark.origin,
             tab_stops,
             lift_markers: lift_markers.into(),
             a11y: a11y.map(Rc::new),
@@ -1887,7 +1952,6 @@ impl Window {
     pub(crate) fn replay_paint(
         &mut self,
         record: &PaintRecord,
-        nested: &[(GlobalElementId, TypeId)],
         delta: Point<Pixels>,
         lift_base: Option<u32>,
         carry_states: bool,
@@ -1902,7 +1966,7 @@ impl Window {
         );
         let start = self.paint_index();
         self.reuse_paint_with(
-            record.range.clone(),
+            record.range_now(),
             Some(&record.tab_stops),
             !record.moves,
             carry_states,
@@ -1937,15 +2001,8 @@ impl Window {
         if record.has_publications {
             self.note_publication();
         }
-        let (rendered, serial) = (self.rendered_serial(), self.building_serial());
-        for key in nested {
-            if let Some(state) = self.rendered_state_mut(key) {
-                state.move_paint(&record.range, rendered, &start, serial);
-                if self.retained.logging_paint > 0 {
-                    self.retained.paint_log.push(key.clone());
-                }
-            }
-        }
+        // The subtrees that painted inside are where this one puts them, as of this frame.
+        record.origin.place_paint(start.clone(), self.building_serial(), self.retained.open_paints.last());
         start..self.paint_index()
     }
 
@@ -2257,32 +2314,15 @@ impl Window {
 }
 
 impl PrepaintRecord {
-    /// The retained subtrees inside this one whose paint is in the paint of this one: the ones
-    /// recorded inside it but for the subtrees that were handed to the stacking context in
-    /// `lifts`, the ones recorded inside those, and the ones that painted in an element that was
-    /// handed over. The recording of this one paints none of that.
-    pub(crate) fn paint_nested(&self, window: &Window) -> Rc<[(GlobalElementId, TypeId)]> {
-        self.paint_nested
-            .get_or_init(|| {
-                let Some(lifts) = &self.lifts else {
-                    return self.nested.clone();
-                };
-                let mut excluded: FxHashSet<(GlobalElementId, TypeId)> = FxHashSet::default();
-                for hole in lifts.holes() {
-                    excluded.insert((hole.clone(), TypeId::of::<crate::elements::RetainedState>()));
-                    if let Some(inside) = window
-                        .peek_element_state(hole, |state: &crate::elements::RetainedState| state.nested_recordings())
-                        .flatten()
-                    {
-                        excluded.extend(inside.iter().cloned());
-                    }
-                }
-                for cell in lifts.cells() {
-                    excluded.extend(cell.recorded.borrow().nested.iter().cloned());
-                }
-                self.nested.iter().filter(|key| !excluded.contains(*key)).cloned().collect()
-            })
-            .clone()
+    /// Where the prepaint is in the frame it was last put in.
+    pub(crate) fn range_now(&self) -> Range<PrepaintStateIndex> {
+        let (start, _) = self.origin.prepaint_now();
+        self.range.start.moved(&self.range.start, &start)..self.range.end.moved(&self.range.start, &start)
+    }
+
+    /// Notes where the prepaint is, which the origin knows.
+    pub(crate) fn set_range(&mut self, range: Range<PrepaintStateIndex>) {
+        self.range = range;
     }
 
     /// What the prepaint left in the frame being built, as text. `loose` leaves out what cannot be
@@ -2333,6 +2373,17 @@ impl PrepaintRecord {
 }
 
 impl PaintRecord {
+    /// Where the paint is in the frame it was last put in.
+    pub(crate) fn range_now(&self) -> Range<PaintIndex> {
+        let (start, _) = self.origin.paint_now();
+        self.range.start.moved(&self.range.start, &start)..self.range.end.moved(&self.range.start, &start)
+    }
+
+    /// Notes where the paint is, which the origin knows.
+    pub(crate) fn set_range(&mut self, range: Range<PaintIndex>) {
+        self.range = range;
+    }
+
     /// Whether the paint is one that can be painted again where it is: it handed no element to a
     /// stacking context outside and put nothing into a scene of its own.
     pub(crate) fn is_plain(&self) -> bool {
@@ -2345,9 +2396,10 @@ impl PaintRecord {
         use std::fmt::Write as _;
 
         let frame = &window.next_frame;
+        let range = self.range_now();
         let mut out = frame
             .scene
-            .describe_operations(self.range.start.scene_index..self.range.end.scene_index, loose);
+            .describe_operations(range.start.scene_index..range.end.scene_index, loose);
         let reachable = |id: Option<HitboxId>| {
             id.and_then(|id| frame.hitboxes.iter().find(|hitbox| hitbox.id == id))
                 .is_none_or(Hitbox::is_reachable)
@@ -2356,7 +2408,7 @@ impl PaintRecord {
             id.and_then(|id| frame.hitboxes.iter().find(|hitbox| hitbox.id == id))
                 .map_or_else(|| "(window)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
         };
-        let cursors = self.range.start.cursor_styles_index..self.range.end.cursor_styles_index;
+        let cursors = range.start.cursor_styles_index..range.end.cursor_styles_index;
         for request in frame.cursor_styles.get(cursors).unwrap_or_default() {
             if loose && !reachable(request.hitbox_id) {
                 continue;
@@ -2367,9 +2419,9 @@ impl PaintRecord {
             writeln!(
                 out,
                 "listeners {} {} handlers {}",
-                self.range.end.mouse_listeners_index - self.range.start.mouse_listeners_index,
-                self.range.end.root_key_listeners_index - self.range.start.root_key_listeners_index,
-                self.range.end.input_handlers_index - self.range.start.input_handlers_index,
+                range.end.mouse_listeners_index - range.start.mouse_listeners_index,
+                range.end.root_key_listeners_index - range.start.root_key_listeners_index,
+                range.end.input_handlers_index - range.start.input_handlers_index,
             )
             .ok();
         }

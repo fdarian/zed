@@ -266,3 +266,108 @@ fn a_replay_keeps_the_states_it_does_not_visit_without_naming_them(cx: &mut Test
     let large = accessed_by_a_replay_frame(cx, 3, 400);
     assert_eq!(small, large, "a frame that replays roots names the states of the elements it builds and of the roots, not those inside the roots");
 }
+
+fn placements_of_a_replay_frame(cx: &mut TestAppContext, roots: usize, per_root: usize) -> u64 {
+    let window = open(cx, roots, per_root, true);
+    for _ in 0..3 {
+        frame(cx, window);
+    }
+    let before = crate::window::PLACEMENTS.with(|placements| placements.get());
+    frame(cx, window);
+    crate::window::PLACEMENTS.with(|placements| placements.get()) - before
+}
+
+#[gpui::test]
+fn replaying_a_root_places_it_alone_whatever_roots_are_inside_it(cx: &mut TestAppContext) {
+    let few = placements_of_a_replay_frame(cx, 3, 10);
+    let many = placements_of_a_replay_frame(cx, 3, 400);
+    assert_eq!(few, many, "the roots inside a replayed one are not touched");
+    // The prepaint and the paint of each root, and of the live box's parent being built.
+    assert_eq!(few, 3 * 2);
+}
+
+thread_local! {
+    /// How many times the root at each depth was built.
+    static BUILDS: std::cell::RefCell<[u32; 3]> = const { std::cell::RefCell::new([0; 3]) };
+}
+
+/// Three roots inside each other.
+struct Deep {
+    keys: [u64; 3],
+    tick: u32,
+}
+
+impl Render for Deep {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let keys = self.keys;
+        div()
+            .id("page")
+            .flex()
+            .flex_col()
+            .w(px(400.))
+            .h(px(300.))
+            .child(div().id("live").w(px(10. + (self.tick % 7) as f32)).h(px(10.)).bg(crate::red()))
+            .child(retained("level-0", keys[0], move |_, _| {
+                BUILDS.with(|builds| builds.borrow_mut()[0] += 1);
+                div()
+                    .id("zero")
+                    .child(retained("level-1", keys[1], move |_, _| {
+                        BUILDS.with(|builds| builds.borrow_mut()[1] += 1);
+                        div()
+                            .id("one")
+                            .child(retained("level-2", keys[2], move |_, _| {
+                                BUILDS.with(|builds| builds.borrow_mut()[2] += 1);
+                                div().id("two").w(px(50.)).h(px(20.)).bg(crate::blue()).on_click(|_, _, _| {}).into_any_element()
+                            }))
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            }))
+    }
+}
+
+#[gpui::test]
+fn roots_inside_roots_follow_the_ones_that_are_replayed_around_them(cx: &mut TestAppContext) {
+    BUILDS.with(|builds| *builds.borrow_mut() = [0; 3]);
+    let window = cx.open_window(size(px(400.), px(300.)), |_, _| Deep { keys: [1; 3], tick: 0 });
+    let window = AnyWindowHandle::from(window);
+    let deep = |cx: &mut TestAppContext, window, edit: &dyn Fn(&mut Deep)| {
+        cx.update_window(window, |view, window, cx| {
+            view.downcast::<Deep>().unwrap().update(cx, |page, cx| {
+                page.tick += 1;
+                edit(page);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    };
+    let builds = || BUILDS.with(|builds| *builds.borrow());
+    for _ in 0..4 {
+        deep(cx, window, &|_| {});
+    }
+    assert_eq!(builds(), [1, 1, 1]);
+    // The outermost is built and the two inside it are replayed, the second one without being
+    // asked for, for 6 frames.
+    deep(cx, window, &|page| page.keys[0] += 1);
+    assert_eq!(builds(), [2, 1, 1]);
+    for _ in 0..6 {
+        deep(cx, window, &|_| {});
+    }
+    assert_eq!(builds(), [2, 1, 1]);
+    // The first two are built, the third one is replayed in them.
+    deep(cx, window, &|page| {
+        page.keys[0] += 1;
+        page.keys[1] += 1;
+    });
+    assert_eq!(builds(), [3, 2, 1]);
+    for _ in 0..6 {
+        deep(cx, window, &|_| {});
+    }
+    assert_eq!(builds(), [3, 2, 1]);
+    deep(cx, window, &|page| page.keys = [9, 9, 9]);
+    assert_eq!(builds(), [4, 3, 2]);
+    let hits = cx.update_window(window, |_, window, _| window.retained_counters().hits).unwrap();
+    deep(cx, window, &|_| {});
+    assert_eq!(cx.update_window(window, |_, window, _| window.retained_counters().hits).unwrap(), hits + 1);
+}
