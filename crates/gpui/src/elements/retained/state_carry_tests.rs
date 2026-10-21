@@ -118,15 +118,20 @@ fn state_carry_frame_time(cx: &mut TestAppContext) {
         }
         let before = cx.update_window(window, |_, window, _| window.retained_counters()).unwrap();
         let compares = FULL_PATH_COMPARES.with(|compares| compares.get());
-        let frames = 100;
-        let start = std::time::Instant::now();
-        for _ in 0..frames {
-            frame(cx, window);
+        // The fastest of several batches: the machine is shared.
+        let (batches, frames) = (7, 50);
+        let mut best = f64::MAX;
+        for _ in 0..batches {
+            let start = std::time::Instant::now();
+            for _ in 0..frames {
+                frame(cx, window);
+            }
+            best = best.min(start.elapsed().as_secs_f64() * 1e6 / frames as f64);
         }
-        let elapsed = start.elapsed();
+        let frames = batches * frames;
         let compares = FULL_PATH_COMPARES.with(|compares| compares.get()) - compares;
         let after = cx.update_window(window, |_, window, _| window.retained_counters()).unwrap();
-        let per_frame = elapsed.as_secs_f64() * 1e6 / frames as f64;
+        let per_frame = best;
         let elements = (roots * per_root) as f64;
         println!(
             "{roots} roots x {per_root} (clipped {clipped}): {:.0} us/frame, {:.2} us/root, {:.3} us/element, hits/frame {}, builds {}, path compares/frame {}",

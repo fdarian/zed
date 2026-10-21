@@ -292,7 +292,53 @@ impl DispatchTree {
         focus: Option<FocusId>,
     ) -> ReusedSubtree {
         let new_range = self.nodes.len()..self.nodes.len() + old_range.len();
+        // A node that names a view is given the name only where the view around it differs, which
+        // a node at a time can tell and a copy of the whole range cannot.
+        let contains_focus = if source.nodes[old_range.clone()].iter().any(|node| node.view_id.is_some()) {
+            self.move_subtree_by_node(old_range.clone(), source, focus)
+        } else {
+            self.move_subtree_whole(old_range.clone(), source, focus)
+        };
+        ReusedSubtree {
+            old_range,
+            new_range,
+            contains_focus,
+        }
+    }
 
+    /// Puts the nodes of `old_range` of `source` after the ones here with their listeners, under
+    /// the active node, without the view of any of them. Returns whether one has the focus.
+    fn move_subtree_whole(&mut self, old_range: Range<usize>, source: &mut Self, focus: Option<FocusId>) -> bool {
+        let old_start = old_range.start;
+        let new_start = self.nodes.len();
+        let root_parent = self.node_stack.last().copied();
+        let mut contains_focus = false;
+        self.nodes.reserve(old_range.len());
+        for (offset, source_node) in source.nodes[old_range].iter_mut().enumerate() {
+            let parent = match source_node.parent {
+                Some(parent) if parent.0 >= old_start && parent.0 < old_start + offset => {
+                    Some(DispatchNodeId(parent.0 - old_start + new_start))
+                }
+                _ => root_parent,
+            };
+            if let Some(focus_id) = source_node.focus_id {
+                contains_focus |= Some(focus_id) == focus;
+                self.focusable_node_ids.insert(focus_id, DispatchNodeId(new_start + offset));
+            }
+            self.nodes.push(DispatchNode {
+                key_listeners: mem::take(&mut source_node.key_listeners),
+                action_listeners: mem::take(&mut source_node.action_listeners),
+                modifiers_changed_listeners: mem::take(&mut source_node.modifiers_changed_listeners),
+                context: source_node.context.clone(),
+                focus_id: source_node.focus_id,
+                view_id: None,
+                parent,
+            });
+        }
+        contains_focus
+    }
+
+    fn move_subtree_by_node(&mut self, old_range: Range<usize>, source: &mut Self, focus: Option<FocusId>) -> bool {
         let mut contains_focus = false;
         let mut source_stack = vec![];
         for (source_node_id, source_node) in source
@@ -323,12 +369,7 @@ impl DispatchTree {
             source_stack.pop();
             self.pop_node();
         }
-
-        ReusedSubtree {
-            old_range,
-            new_range,
-            contains_focus,
-        }
+        contains_focus
     }
 
     pub fn truncate(&mut self, index: usize) {
@@ -672,6 +713,57 @@ mod tests {
             Rc::new(RefCell::new(Keymap::new(bindings))),
             Rc::new(registry),
         )
+    }
+
+    /// A tree of an outer node with the context `outer`, and under it a node with a context, a
+    /// focus and a key listener that holds two more, then a node beside them.
+    fn tree_with_a_subtree(focus: &FocusHandle) -> DispatchTree {
+        let mut tree = test_dispatch_tree(vec![]);
+        tree.push_node();
+        tree.set_key_context(KeyContext::parse("outer").unwrap());
+        tree.push_node();
+        tree.set_key_context(KeyContext::parse("inner").unwrap());
+        tree.set_focus_id(focus.id);
+        tree.on_key_event(Rc::new(|_, _, _, _| {}));
+        tree.push_node();
+        tree.on_key_event(Rc::new(|_, _, _, _| {}));
+        tree.pop_node();
+        tree.push_node();
+        tree.on_action(std::any::TypeId::of::<TestAction>(), Rc::new(|_, _, _, _| {}));
+        tree.pop_node();
+        tree.pop_node();
+        tree.push_node();
+        tree.pop_node();
+        tree.pop_node();
+        tree
+    }
+
+    #[gpui::test]
+    fn test_reusing_a_subtree_whole_is_reusing_it_by_node(cx: &mut TestAppContext) {
+        let focus = cx.update(|cx| cx.focus_handle());
+        let reuse = |whole: bool| {
+            let mut source = tree_with_a_subtree(&focus);
+            let mut target = test_dispatch_tree(vec![]);
+            // Two nodes of the target are before the ones that are reused, which hang from the
+            // active one.
+            target.push_node();
+            target.push_node();
+            let range = 1..4;
+            let contains_focus = if whole {
+                target.move_subtree_whole(range, &mut source, Some(focus.id))
+            } else {
+                target.move_subtree_by_node(range, &mut source, Some(focus.id))
+            };
+            (target, source, contains_focus)
+        };
+        let (whole, whole_source, whole_focus) = reuse(true);
+        let (by_node, by_node_source, by_node_focus) = reuse(false);
+        assert!(whole_focus && by_node_focus);
+        assert_eq!(whole.describe(false), by_node.describe(false));
+        assert_eq!(whole_source.describe(false), by_node_source.describe(false));
+        assert_eq!(whole.focusable_node_ids, by_node.focusable_node_ids);
+        assert_eq!(whole.node_stack, by_node.node_stack);
+        assert_eq!(whole.context_stack, by_node.context_stack);
     }
 
     #[test]
