@@ -11,6 +11,11 @@ workspace = true
 [lib]
 path = "src/gpui_macos.rs"
 
+[[test]]
+name = "run_loop_wake"
+path = "tests/run_loop_wake.rs"
+harness = false
+
 [features]
 default = ["gpui/default"]
 test-support = ["gpui/test-support", "gpui_apple/test-support"]

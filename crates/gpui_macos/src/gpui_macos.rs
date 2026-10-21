@@ -11,6 +11,7 @@ mod display_link;
 mod events;
 mod keyboard;
 mod pasteboard;
+mod run_loop_wake;
 mod system_notifications;
 
 #[cfg(feature = "screen-capture")]
@@ -56,8 +57,8 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use display::{MacDisplay, MacScreen};
-pub use display_link::set_frame_wake_hook;
 pub use platform::MacPlatform;
+pub use run_loop_wake::{run_loop_pumped, set_run_loop_wake_hook};
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;

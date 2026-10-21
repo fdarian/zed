@@ -59,7 +59,7 @@ use gpui_util::ResultExt;
 use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
@@ -67,7 +67,6 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
 struct Registry {
     displays: BTreeMap<CGDirectDisplayID, DisplayEntry>,
     next_subscriber_id: u64,
-    frame_wake_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Registry {
@@ -75,7 +74,6 @@ impl Registry {
         Registry {
             displays: BTreeMap::new(),
             next_subscriber_id: 0,
-            frame_wake_hook: None,
         }
     }
 }
@@ -104,14 +102,6 @@ fn lock_registry() -> MutexGuard<'static, Registry> {
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-pub fn set_frame_wake_hook(hook: Option<Arc<dyn Fn() + Send + Sync>>) {
-    let previous = {
-        let mut registry = lock_registry();
-        std::mem::replace(&mut registry.frame_wake_hook, hook)
-    };
-    drop(previous);
-}
-
 fn debug_assert_main_thread() {
     #[cfg(debug_assertions)]
     {
@@ -135,21 +125,13 @@ unsafe extern "C" fn display_link_output_callback(
     display_id: *mut c_void,
 ) -> i32 {
     let display_id = display_id as usize as CGDirectDisplayID;
-    let hook = {
-        let registry = lock_registry();
-        let Some(entry) = registry.displays.get(&display_id) else {
-            return 0;
-        };
-        if entry.subscribers.is_empty() {
-            return 0;
-        }
-        for (_, frame_requests) in &entry.subscribers {
-            frame_requests.merge_data(1);
-        }
-        registry.frame_wake_hook.clone()
+    let registry = lock_registry();
+    let Some(entry) = registry.displays.get(&display_id) else {
+        return 0;
     };
-    if let Some(hook) = hook {
-        hook();
+    // The merge into the main queue is what wakes the run loop; see `run_loop_wake`.
+    for (_, frame_requests) in &entry.subscribers {
+        frame_requests.merge_data(1);
     }
     0
 }
