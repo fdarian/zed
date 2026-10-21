@@ -5,6 +5,7 @@ use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,
     base::{CFIndex, CFRange, CFType, TCFType},
+    data::CFData,
     number::CFNumber,
     string::CFString,
 };
@@ -347,6 +348,30 @@ fn font_smoothing_allowed_by_user() -> bool {
     })
 }
 
+/// Hands `bytes` to Core Text without copying them: the `CFData` over the
+/// buffer is the only copy of the file. font-kit's `Handle::from_memory` keeps
+/// the bytes in an `Arc` and builds a `CFData` copy from them for the font
+/// and for every `load()` of its handle.
+///
+/// Collections and Mac resource-fork fonts have no descriptor-from-data path
+/// (font-kit unpacks them into a new buffer), so they keep font-kit's.
+fn owned_font_handle(bytes: Vec<u8>) -> Result<Handle> {
+    const OTTO: &[u8] = b"OTTO";
+    const TRUETYPE: &[u8] = &[0, 1, 0, 0];
+    if !(bytes.starts_with(OTTO) || bytes.starts_with(TRUETYPE)) {
+        return Ok(Handle::from_memory(Arc::new(bytes), 0));
+    }
+
+    let descriptor = core_text::font_manager::create_font_descriptor_with_data(CFData::from_arc(
+        Arc::new(bytes),
+    ))
+    .map_err(|()| anyhow!("Could not load a font."))?;
+    let font = core_text::font::new_from_descriptor(&descriptor, 16.0);
+    // SAFETY: `font` is a valid CTFont, and the handle holds its own reference.
+    let font = unsafe { font_kit::loaders::core_text::Font::from_native_font(&font) };
+    Ok(Handle::from_native(&font))
+}
+
 impl MacTextSystemState {
     fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         let fonts = fonts
@@ -361,7 +386,7 @@ impl MacTextSystemState {
                     let font = font_kit::loaders::core_text::Font::from_core_graphics_font(font);
                     Ok(Handle::from_native(&font))
                 }
-                Cow::Owned(bytes) => Ok(Handle::from_memory(Arc::new(bytes), 0)),
+                Cow::Owned(bytes) => owned_font_handle(bytes),
             })
             .collect::<Result<Vec<_>>>()?;
         self.memory_source.add_fonts(fonts.into_iter())?;
@@ -1805,5 +1830,24 @@ mod tests {
                 "{size}px wght {wght} opsz {opsz}: {advance}, Chrome {chrome}"
             );
         }
+    }
+
+    #[test]
+    fn test_a_registered_single_font_is_held_by_core_text_alone() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(INTER_SUBSET);
+        let Ok(file) = std::fs::read(&path) else {
+            eprintln!("skipped: {} is not in this checkout", path.display());
+            return;
+        };
+        assert!(matches!(
+            super::owned_font_handle(file).unwrap(),
+            font_kit::handle::Handle::Native { .. }
+        ));
+        // A collection has no descriptor-from-data path, so font-kit unpacks it.
+        let collection = b"ttcf\0\x01\0\0\0\0\0\0".to_vec();
+        assert!(matches!(
+            super::owned_font_handle(collection).unwrap(),
+            font_kit::handle::Handle::Memory { .. }
+        ));
     }
 }
