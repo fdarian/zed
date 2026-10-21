@@ -419,7 +419,7 @@ impl PlainPaint {
 
 /// What a recording of a retained subtree could not repeat happened, if the counts differ.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Effects {
+pub(super) struct Effects {
     /// How many elements the stacking context around the recording was handed, by the next
     /// ordinal it gives. The ones handed to a context that begins inside the recording are
     /// not counted: the recording holds their paint.
@@ -465,7 +465,7 @@ impl Effects {
 
     /// The reasons the counts of `self` and `later` differ in, as a set of [`NonReusable`]
     /// indices.
-    fn reasons(&self, later: &Effects) -> u16 {
+    pub(super) fn reasons(&self, later: &Effects) -> u16 {
         let mut reasons = 0u16;
         let mut add = |differs: bool, reason: NonReusable| {
             if differs {
@@ -535,7 +535,7 @@ pub(crate) fn blocker_bit(reason: NonRelocatable) -> u16 {
 /// The hitboxes a retained subtree inserted, by value: a stacking context around the subtree
 /// moves the hitboxes of a frame about once it has them all.
 pub(crate) struct RecordedHitboxes {
-    hitboxes: Vec<Hitbox>,
+    pub(crate) hitboxes: Vec<Hitbox>,
     /// The positions in `hitboxes` of those whose parent was the hitbox enclosing the subtree.
     /// Each frame that replays them has another enclosing hitbox.
     roots: Vec<usize>,
@@ -641,7 +641,7 @@ pub(crate) struct PrepaintRecord {
     /// [`PrepaintRecord::paint_nested`].
     paint_nested: std::cell::OnceCell<Rc<[(GlobalElementId, TypeId)]>>,
     pub(crate) lifts: Option<Rc<LiftRecord>>,
-    hitboxes: Rc<RecordedHitboxes>,
+    pub(crate) hitboxes: Rc<RecordedHitboxes>,
     a11y: Option<Rc<a11y::A11yRecording>>,
     /// A listener that reports to its owner ran, and a replay does not run it again.
     pub(crate) has_publications: bool,
@@ -662,7 +662,7 @@ pub(crate) struct PaintMark {
 /// What the paint of a retained subtree left in the frame.
 pub(crate) struct PaintRecord {
     pub(crate) range: Range<PaintIndex>,
-    tab_stops: Rc<[TabStopOperation]>,
+    pub(crate) tab_stops: Rc<[TabStopOperation]>,
     /// Where in `tab_stops` the paint skipped an element that was handed to the stacking context
     /// around it (so that its tab stops go there), and which of the ones the prepaint handed over,
     /// counted from the first.
@@ -1220,7 +1220,7 @@ impl Window {
         self.layout_engine().escapes_subtree(root, since)
     }
 
-    fn effects(&self) -> Effects {
+    pub(super) fn effects(&self) -> Effects {
         let engine = self.layout_engine();
         Effects {
             ambient_lifts: self.ambient_lift_ordinal(),
@@ -2240,6 +2240,12 @@ impl PrepaintRecord {
 }
 
 impl PaintRecord {
+    /// Whether the paint is one that can be painted again where it is: it handed no element to a
+    /// stacking context outside and put nothing into a scene of its own.
+    pub(crate) fn is_plain(&self) -> bool {
+        self.lift_markers.is_empty() && self.operations.is_none() && !self.moves
+    }
+
     /// What the paint left in the frame being built, as text. `loose` leaves out what only a hitbox
     /// that cannot be reached has, see [`PrepaintRecord::describe`].
     pub(crate) fn describe(&self, window: &Window, loose: bool) -> String {
@@ -2555,7 +2561,7 @@ fn strip_draw_orders(text: &str) -> String {
 }
 
 /// Both texts from a little before the first byte where they differ.
-fn first_difference(replayed: &str, built: &str) -> String {
+pub(super) fn first_difference(replayed: &str, built: &str) -> String {
     let at = replayed
         .bytes()
         .zip(built.bytes())

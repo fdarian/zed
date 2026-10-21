@@ -65,11 +65,16 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+mod patch;
+#[cfg(test)]
+mod patch_tests;
 mod prompts;
 mod retained;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
+pub use patch::{PatchCounters, PatchDecline, PatchOutcome};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
+pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
 pub(crate) use retained::{
     LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
     RetainedWindow, SubtreeText, blocker_bit, first_blocker,
@@ -207,6 +212,25 @@ impl WindowInvalidator {
 
     pub fn is_dirty(&self) -> bool {
         self.inner.borrow().dirty
+    }
+
+    /// Marks the window dirty for a frame whose layout is the one already built: no view is
+    /// queued and the update count does not move, so a layout read between the tick and the
+    /// frame finds the layout current.
+    pub fn request_tick(&self) {
+        let mut inner = self.inner.borrow_mut();
+        let became_dirty = !inner.dirty;
+        inner.dirty = true;
+        let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+        drop(inner);
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    /// Whether a view is queued to render again in the next frame.
+    pub fn has_views(&self) -> bool {
+        !self.inner.borrow().dirty_views.is_empty()
     }
 
     pub fn set_dirty(&self, dirty: bool) {
@@ -1308,6 +1332,10 @@ pub(crate) struct Frame {
     /// The element states of the retained subtrees (see [`crate::retained`]) recorded this
     /// frame, so that a rolled-back prepaint can drop the recordings it made.
     retained_recordings: Vec<(GlobalElementId, TypeId)>,
+    /// The retained roots of this frame that [`Window::repaint_in_place`] can repaint, by the id
+    /// of the root; `None` for an id that two of them have. Good for the frame that holds it, and
+    /// only while it is the rendered one.
+    pub(crate) patchable: FxHashMap<ElementId, Option<Rc<PatchUnit>>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     /// Every insertion into `debug_bounds`, in order, for a replay to repeat.
@@ -1380,6 +1408,11 @@ pub(crate) struct PaintIndex {
 }
 
 impl PaintIndex {
+    /// Where the scene of the frame is, in operations.
+    pub(crate) fn scene_index(&self) -> usize {
+        self.scene_index
+    }
+
     /// Whether the range `inner` is inside `outer`, in every vector that a paint writes to the
     /// frame but the ones only a test reads.
     pub(crate) fn range_is_within(inner: &Range<Self>, outer: &Range<Self>) -> bool {
@@ -1496,6 +1529,7 @@ impl Frame {
             cursor_styles: Vec::new(),
             layout_publications: Vec::new(),
             retained_recordings: Vec::new(),
+            patchable: FxHashMap::default(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -1524,6 +1558,7 @@ impl Frame {
         self.cursor_styles.clear();
         self.layout_publications.clear();
         self.retained_recordings.clear();
+        self.patchable.clear();
         self.hitboxes.clear();
         self.hitboxes_changed();
         self.window_control_hitboxes.clear();
@@ -1879,6 +1914,7 @@ pub struct Window {
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
     pub(crate) retained: RetainedWindow,
+    pub(crate) patch: PatchWindow,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2311,7 +2347,11 @@ impl Window {
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
-                                window.present();
+                                // A tick that patched nothing visible leaves the last picture
+                                // as it is.
+                                if window.needs_present.get() || request_frame_options.require_presentation {
+                                    window.present();
+                                }
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
@@ -2595,6 +2635,7 @@ impl Window {
                 initial_window_title,
             ),
             retained: RetainedWindow::default(),
+            patch: PatchWindow::default(),
         })
     }
 
@@ -4388,6 +4429,24 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
+        let mut patched = None;
+        if mem::take(&mut self.patch.tick) {
+            match self.patch_frame(cx) {
+                PatchedFrame::Declined => {}
+                PatchedFrame::Patched => {
+                    #[cfg(feature = "profiler")]
+                    {
+                        let draw_duration = self
+                            .window_profiler
+                            .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
+                        self.debug_frame_overlay.record_frame(draw_duration);
+                    }
+                    return arena_scope.exit(&cx.element_arena);
+                }
+                PatchedFrame::Verify(trace) => patched = Some(trace),
+            }
+        }
+
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -4413,8 +4472,13 @@ impl Window {
                 self.rendered_frame.input_handlers.push(Some(input_handler));
             }
         }
+        // The frame that checks a patch builds every subtree, as the one a replay is compared with.
+        self.retained.reference |= patched.is_some();
         if !cx.mode.skip_drawing() {
             self.build_next_frame(cx);
+        }
+        if patched.is_some() {
+            self.retained.reference = false;
         }
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
@@ -4444,6 +4508,9 @@ impl Window {
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.retained.rendered_serial += 1;
         self.next_frame.clear();
+        if let Some(trace) = patched {
+            self.verify_patch(trace);
+        }
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -7617,11 +7684,17 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
-        let mut id = self.next_hitbox_id;
-        self.next_hitbox_id = self.next_hitbox_id.next();
+        let id = match self.patch.hitbox_ids.as_mut() {
+            Some(recorded) => recorded.next(),
+            None => {
+                let id = self.next_hitbox_id;
+                self.next_hitbox_id = self.next_hitbox_id.next();
+                id
+            }
+        };
         let identity = (!self.element_id_stack.is_empty())
             .then(|| GlobalElementId::new(&self.element_id_stack));
-        if identity.is_some() && self.captured_identity == identity {
+        if identity.is_some() && self.captured_identity == identity && self.patch.hitbox_ids.is_none() {
             self.captured_hitbox = Some(id);
         }
         let hitbox = Hitbox {

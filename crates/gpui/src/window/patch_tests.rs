@@ -1,0 +1,727 @@
+//! Patch frames (see [`super::patch`]): a tick that changes how one retained root paints repaints
+//! that root in the frame that is rendered, whatever the page around it holds.
+
+use crate::{
+    AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Context, Element, ElementId, FrameWorkCounters, GlobalElementId, Hsla,
+    InspectorElementId, InteractiveElement, IntoElement, LayoutId, ParentElement, PatchCounters, PatchDecline, PatchOutcome, Pixels,
+    Render, Retained, RetainedCounters, ScrollHandle, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div, green,
+    hsla, point, px, red, retained, size,
+};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+const UNIT: &str = "unit";
+
+/// What the test changes between frames, and the patcher reads.
+#[derive(Default)]
+struct Knobs {
+    /// The color the unit paints: a tick moves it, as an animation does.
+    tick: Cell<u32>,
+    /// The width the patcher gives the unit, if not the page's.
+    width: Cell<Option<f32>>,
+    /// The opacity the patcher gives the unit.
+    opacity: Cell<Option<f32>>,
+    /// The patcher builds the unit with another color than the page does.
+    wrong_color: Cell<bool>,
+    accept: Cell<bool>,
+    /// Ids the patcher names, if not the unit.
+    ids: RefCell<Option<Vec<&'static str>>>,
+    /// How the box in the unit that the pointer changes is built by the patcher.
+    hot: Cell<Hot>,
+    /// The patcher wraps the unit in an element that asks for another pass before present.
+    nudge: Cell<bool>,
+    /// The patcher gives the unit an absolute root.
+    absolute: Cell<bool>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Hot {
+    #[default]
+    Same,
+    /// It has no hitbox.
+    NoHitbox,
+    /// It has a hitbox and no cursor.
+    NoCursor,
+}
+
+/// An element that is its child, and asks for another pass before present when it is prepainted:
+/// something the recording of a root never holds.
+struct Nudge(AnyElement);
+
+impl Element for Nudge {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.0.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.request_redraw_before_present();
+        self.0.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.paint(window, cx);
+    }
+}
+
+impl IntoElement for Nudge {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+fn color(tick: u32) -> Hsla {
+    hsla((tick % 50) as f32 / 50., 0.8, 0.5, 1.)
+}
+
+/// The subtree of the unit for `tick`: a box that has a color of its own and a box in it that
+/// changes when the pointer is on it.
+fn unit_element(tick: u32, width: f32, opacity: Option<f32>, hot: Hot) -> AnyElement {
+    let mut hot_box = div().id("hot").w(px(20.)).h(px(20.)).bg(blue());
+    if hot != Hot::NoHitbox {
+        hot_box = hot_box.hover(|style| style.bg(green()));
+        if hot != Hot::NoCursor {
+            hot_box = hot_box.cursor_pointer();
+        }
+    }
+    let mut unit = div().id(UNIT).w(px(width)).h(px(30.)).flex_none().bg(color(tick)).child(hot_box);
+    if let Some(opacity) = opacity {
+        unit = unit.opacity(opacity);
+    }
+    unit.into_any_element()
+}
+
+fn unit(tick: u32) -> Retained {
+    retained(UNIT, 1_000 + tick as u64, move |_, _| unit_element(tick, 100., None, Hot::Same)).patchable()
+}
+
+struct Page {
+    rows: usize,
+    knobs: Rc<Knobs>,
+    /// A retained root beside the unit that is not patchable.
+    plain: bool,
+    /// The page is in a scroller, which is scrolled.
+    scroll: Option<ScrollHandle>,
+}
+
+impl Render for Page {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows;
+        let mut content = div().id("content").flex().flex_col().w(px(400.));
+        let tall = if self.scroll.is_some() { 30. } else { 1. };
+        // In a scroller the unit is first, so that scrolling moves it.
+        if self.scroll.is_some() {
+            content = content.child(unit(self.knobs.tick.get()));
+        }
+        for row in 0..rows {
+            content = content.child(retained(("row", row), 1, move |_, _| {
+                div().id(("row-body", row)).flex_none().h(px(tall)).bg(red()).into_any_element()
+            }));
+        }
+        if self.scroll.is_none() {
+            content = content.child(unit(self.knobs.tick.get()));
+        }
+        if self.plain {
+            let tick = self.knobs.tick.get();
+            content = content.child(retained("plain", 1_000 + tick as u64, move |_, _| {
+                div().id("plain-body").flex_none().w(px(50.)).h(px(10.)).bg(color(tick)).into_any_element()
+            }));
+        }
+        match &self.scroll {
+            Some(handle) => div()
+                .id("page")
+                .w(px(400.))
+                .h(px(100.))
+                .overflow_y_scroll()
+                .track_scroll(handle)
+                .child(content)
+                .into_any_element(),
+            None => div().id("page").w(px(400.)).h(px(2000.)).overflow_hidden().child(content).into_any_element(),
+        }
+    }
+}
+
+struct Fixture {
+    window: AnyWindowHandle,
+    knobs: Rc<Knobs>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Options {
+    plain: bool,
+    scroll: bool,
+    a11y: bool,
+}
+
+impl Fixture {
+    fn new(cx: &mut TestAppContext, rows: usize) -> Self {
+        Self::with(cx, rows, Options::default())
+    }
+
+    fn with(cx: &mut TestAppContext, rows: usize, options: Options) -> Self {
+        let knobs = Rc::new(Knobs::default());
+        knobs.accept.set(true);
+        let scroll = options.scroll.then(ScrollHandle::new);
+        let window = cx.open_window(size(px(400.), px(2000.)), {
+            let knobs = knobs.clone();
+            let scroll = scroll.clone();
+            move |_, _| Page { rows, knobs, plain: options.plain, scroll }
+        });
+        let window = AnyWindowHandle::from(window);
+        cx.update_window(window, |_, window, cx| {
+            window.set_dom_hit_testing(true);
+            if options.a11y {
+                window.set_a11y_active_for_tests(true);
+            }
+            let knobs = knobs.clone();
+            window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                let tick = if knobs.wrong_color.get() { knobs.tick.get() + 7 } else { knobs.tick.get() };
+                let width = knobs.width.get().unwrap_or(100.);
+                let names = knobs.ids.borrow().clone().unwrap_or_else(|| vec![UNIT]);
+                let units = names
+                    .into_iter()
+                    .map(|name| {
+                        let mut element = unit_element(tick, width, knobs.opacity.get(), knobs.hot.get());
+                        if knobs.absolute.get() {
+                            element = div().id(UNIT).absolute().w(px(100.)).h(px(30.)).bg(color(tick)).into_any_element();
+                        }
+                        if knobs.nudge.get() {
+                            element = Nudge(element).into_any_element();
+                        }
+                        (ElementId::from(name), element)
+                    })
+                    .collect();
+                let accept = knobs.accept.get();
+                window.repaint_in_place(units, cx, move |_, _| accept).is_ok()
+            })));
+            // The second frame replays the unit, which registers it again.
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            if let Some(scroll) = &scroll {
+                scroll.set_offset(point(px(0.), px(-10.)));
+                window.refresh();
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+            }
+            window.present_cached_frame();
+        })
+        .unwrap();
+        Self { window, knobs }
+    }
+
+    /// Moves the color on and draws the frame for the tick, which patches.
+    fn tick(&self, cx: &mut TestAppContext) {
+        self.knobs.tick.set(self.knobs.tick.get() + 1);
+        self.request_tick(cx);
+    }
+
+    fn request_tick(&self, cx: &mut TestAppContext) {
+        cx.update_window(self.window, |_, window, cx| {
+            window.request_tick();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    /// Draws a frame built whole at the state the page is in now.
+    fn draw_whole(&self, cx: &mut TestAppContext) {
+        cx.update_window(self.window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn work(&self, cx: &mut TestAppContext) -> FrameWorkCounters {
+        cx.update_window(self.window, |_, window, _| window.frame_work_counters()).unwrap()
+    }
+
+    fn patches(&self, cx: &mut TestAppContext) -> PatchCounters {
+        cx.update_window(self.window, |_, window, _| window.patch_counters()).unwrap()
+    }
+
+    fn retained(&self, cx: &mut TestAppContext) -> RetainedCounters {
+        cx.update_window(self.window, |_, window, _| window.retained_counters()).unwrap()
+    }
+
+    /// What the rendered frame paints and answers, in the order it does.
+    fn snapshot(&self, cx: &mut TestAppContext) -> String {
+        cx.update_window(self.window, |_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            let hitboxes: Vec<String> = window.rendered_frame.hitboxes.iter().map(|hitbox| hitbox.describe()).collect();
+            format!(
+                "{} operations\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{} groups\n{:#?}\n{:?}",
+                scene.len(),
+                scene.shadows,
+                scene.quads,
+                scene.paths,
+                scene.underlines,
+                scene.monochrome_sprites,
+                scene.subpixel_sprites,
+                scene.polychrome_sprites,
+                scene.groups.len(),
+                hitboxes,
+                window
+                    .rendered_frame
+                    .cursor_styles
+                    .iter()
+                    .map(|request| {
+                        let at = request.hitbox_id.and_then(|id| window.rendered_frame.hitboxes.iter().position(|hitbox| hitbox.id == id));
+                        (at, request.style)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap()
+    }
+
+    fn hitbox_ids(&self, cx: &mut TestAppContext) -> Vec<String> {
+        cx.update_window(self.window, |_, window, _| {
+            window
+                .rendered_frame
+                .hitboxes
+                .iter()
+                .map(|hitbox| format!("{:?} {:?}", hitbox.id, hitbox.identity))
+                .collect()
+        })
+        .unwrap()
+    }
+
+    fn needs_present(&self, cx: &mut TestAppContext) -> bool {
+        cx.update_window(self.window, |_, window, _| window.needs_present.get()).unwrap()
+    }
+
+    fn present(&self, cx: &mut TestAppContext) {
+        cx.update_window(self.window, |_, window, _| window.present_cached_frame()).unwrap();
+    }
+}
+
+/// Asserts that two snapshots are equal, and says where they differ if not.
+#[track_caller]
+fn assert_same(patched: &str, whole: &str, what: &str) {
+    if patched == whole {
+        return;
+    }
+    let line = patched.lines().zip(whole.lines()).position(|(patched, whole)| patched != whole).unwrap_or(0);
+    let around = |text: &str| text.lines().skip(line.saturating_sub(12)).take(24).collect::<Vec<_>>().join("\n");
+    panic!("{what}: differ at line {line}\npatched:\n{}\nwhole:\n{}", around(patched), around(whole));
+}
+
+fn spent(after: FrameWorkCounters, before: FrameWorkCounters) -> FrameWorkCounters {
+    FrameWorkCounters {
+        prepainted: after.prepainted - before.prepainted,
+        culled_prepainted: after.culled_prepainted - before.culled_prepainted,
+        painted: after.painted - before.painted,
+        culled_painted: after.culled_painted - before.culled_painted,
+        painted_primitives: after.painted_primitives - before.painted_primitives,
+        replayed_primitives: after.replayed_primitives - before.replayed_primitives,
+    }
+}
+
+/// What `ticks` ticks of the unit cost a page of `rows` static roots, and what they left.
+fn ticks_on_a_page(cx: &mut TestAppContext, rows: usize, ticks: u32) -> (FrameWorkCounters, PatchCounters, (u64, u64, u64)) {
+    let page = Fixture::new(cx, rows);
+    page.tick(cx);
+    let (work, patches, retained) = (page.work(cx), page.patches(cx), page.retained(cx));
+    for _ in 0..ticks {
+        page.tick(cx);
+    }
+    let (spent_work, spent_patches, after) = (spent(page.work(cx), work), page.patches(cx), page.retained(cx));
+    assert_eq!(spent_patches.patched_frames - patches.patched_frames, ticks as u64, "every tick is patched");
+    assert_eq!(spent_patches.total_declines(), 0);
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "a patched frame is the frame built whole");
+    (
+        spent_work,
+        spent_patches,
+        (after.hits - retained.hits, after.builds - retained.builds, after.replays - retained.replays),
+    )
+}
+
+#[gpui::test]
+fn a_tick_that_changes_one_root_costs_the_same_whatever_the_page_holds(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 10);
+    page.tick(cx);
+    let (work, patches) = (page.work(cx), page.patches(cx));
+    let small = {
+        for _ in 0..5 {
+            page.tick(cx);
+        }
+        (spent(page.work(cx), work), page.patches(cx))
+    };
+    assert_eq!(small.1.patched_frames - patches.patched_frames, 5);
+    assert_eq!(small.1.patched_units - patches.patched_units, 5);
+    assert_eq!(small.1.total_declines(), 0);
+    // The unit: its box and the box in it.
+    assert_eq!(small.0.prepainted, 10);
+    assert_eq!(small.0.painted, 10);
+    assert_eq!(small.0.painted_primitives, 10);
+    assert_eq!(small.0.replayed_primitives, 0);
+
+    let page = Fixture::new(cx, 1000);
+    page.tick(cx);
+    let (work, patches) = (page.work(cx), page.patches(cx));
+    for _ in 0..5 {
+        page.tick(cx);
+    }
+    let large = (spent(page.work(cx), work), page.patches(cx));
+    assert_eq!(large.0, small.0, "the work of a tick is the work of the root, not of the page");
+    assert_eq!(large.1.patched_frames - patches.patched_frames, 5);
+    assert_eq!(large.1.patched_units - patches.patched_units, 5);
+    assert_eq!(large.1.total_declines(), 0);
+}
+
+#[gpui::test]
+fn a_patched_frame_leaves_the_page_as_the_frame_built_whole_does(cx: &mut TestAppContext) {
+    let small = ticks_on_a_page(cx, 10, 6);
+    let large = ticks_on_a_page(cx, 1000, 6);
+    assert_eq!(small.0, large.0);
+    assert_eq!(small.1, large.1);
+    assert_eq!(small.2, large.2, "no root is replayed or built by a patch");
+    assert_eq!(small.2, (0, 0, 0));
+}
+
+#[gpui::test]
+fn a_patched_frame_repaints_the_unit_beside_a_root_a_full_frame_would_build(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 4, Options { plain: true, ..Default::default() });
+    for _ in 0..4 {
+        page.tick(cx);
+    }
+    assert_eq!(page.patches(cx).patched_frames, 4);
+    // The root beside the unit that is not patchable keeps the color it was built with, as the page
+    // that did not tick that root.
+    let patched = page.snapshot(cx);
+    assert!(patched.contains("Quad"));
+    page.draw_whole(cx);
+    let whole = page.snapshot(cx);
+    assert_ne!(patched, whole, "the plain root is built by the frame built whole, and not by a tick");
+}
+
+#[gpui::test]
+fn a_hovered_hitbox_in_the_unit_keeps_its_id_and_its_look(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 5);
+    // The box that changes when the pointer is on it is at the top left of the unit, below the rows.
+    cx.update_window(page.window, |_, window, cx| {
+        window.simulate_mouse_move(point(px(5.), px(10.)), cx);
+    })
+    .unwrap();
+    page.tick(cx);
+    let ids = page.hitbox_ids(cx);
+    let hovered = page.snapshot(cx);
+    assert!(hovered.contains("hot") || !ids.is_empty());
+    for _ in 0..3 {
+        page.tick(cx);
+    }
+    assert_eq!(page.patches(cx).patched_frames, 4);
+    assert_eq!(page.hitbox_ids(cx), ids, "the hitboxes of the unit are the ones the frame had");
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    let whole = page.snapshot(cx);
+    assert_same(&patched, &whole, "the hovered unit");
+    cx.update_window(page.window, |_, window, _| {
+        let hot = window
+            .rendered_frame
+            .hitboxes
+            .iter()
+            .find(|hitbox| format!("{:?}", hitbox.identity).contains("hot"))
+            .map(|hitbox| hitbox.id)
+            .expect("the box is in the frame");
+        assert!(hot.is_hovered(window), "the pointer is on the hitbox of the box, before and after");
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn a_tick_that_changes_no_operation_presents_nothing(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.present(cx);
+    assert!(!page.needs_present(cx));
+    // The color of the unit is the one it has.
+    page.request_tick(cx);
+    assert_eq!(page.patches(cx).patched_frames, 1);
+    assert!(!page.needs_present(cx), "nothing that shows changed");
+    page.tick(cx);
+    assert!(page.needs_present(cx), "a color that moved is presented");
+}
+
+#[gpui::test]
+fn a_unit_that_changes_size_declines(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.tick(cx);
+    page.knobs.width.set(Some(120.));
+    let builds = page.retained(cx).builds;
+    page.tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!(patches.patched_frames, 1);
+    assert_eq!(patches.declines(PatchDecline::LayoutMismatch), 1);
+    assert_eq!(patches.total_declines(), 1);
+    assert!(page.retained(cx).builds > builds, "the frame is built whole");
+}
+
+#[gpui::test]
+fn a_unit_that_fades_out_declines_for_its_operations(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.knobs.opacity.set(Some(0.));
+    page.tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!(patches.patched_frames, 0);
+    assert_eq!(patches.declines(PatchDecline::Operations), 1);
+    assert_eq!(patches.total_declines(), 1);
+}
+
+#[gpui::test]
+fn a_view_that_is_notified_has_the_frame_built_whole(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.tick(cx);
+    let builds = page.retained(cx).builds;
+    page.knobs.tick.set(page.knobs.tick.get() + 1);
+    cx.update_window(page.window, |view, window, cx| {
+        view.downcast::<Page>().unwrap().update(cx, |_, cx| cx.notify());
+        window.request_tick();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let patches = page.patches(cx);
+    assert_eq!(patches.patched_frames, 1);
+    assert_eq!(patches.declines(PatchDecline::PendingView), 1);
+    assert!(page.retained(cx).builds > builds);
+}
+
+#[gpui::test]
+fn a_refresh_has_the_frame_built_whole(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.knobs.tick.set(page.knobs.tick.get() + 1);
+    cx.update_window(page.window, |_, window, cx| {
+        window.refresh();
+        window.request_tick();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let patches = page.patches(cx);
+    assert_eq!(patches.patched_frames, 0);
+    assert_eq!(patches.declines(PatchDecline::Refreshing), 1);
+}
+
+#[gpui::test]
+fn a_root_that_is_not_registered_is_not_repainted(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 3, Options { plain: true, ..Default::default() });
+    // A root that is not patchable, and one that does not exist.
+    for name in ["plain", "nothing"] {
+        *page.knobs.ids.borrow_mut() = Some(vec![name]);
+        page.tick(cx);
+    }
+    let patches = page.patches(cx);
+    assert_eq!(patches.patched_frames, 0);
+    assert_eq!(patches.declines(PatchDecline::UnknownUnit), 2);
+    // The same root twice is not either.
+    *page.knobs.ids.borrow_mut() = Some(vec![UNIT, UNIT]);
+    page.tick(cx);
+    assert_eq!(page.patches(cx).declines(PatchDecline::UnknownUnit), 3);
+}
+
+#[gpui::test]
+fn a_root_that_is_lifted_itself_is_not_registered(cx: &mut TestAppContext) {
+    struct Lifted(Rc<Knobs>);
+    impl Render for Lifted {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let tick = self.0.tick.get();
+            div().id("page").relative().w(px(400.)).h(px(2000.)).child(
+                retained(UNIT, 1_000 + tick as u64, move |_, _| {
+                    div().id(UNIT).absolute().z_index(1).w(px(100.)).h(px(30.)).bg(color(tick)).into_any_element()
+                })
+                .patchable()
+                .lift_z(1),
+            )
+        }
+    }
+    let knobs = Rc::new(Knobs::default());
+    knobs.accept.set(true);
+    let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(2000.)), {
+        let knobs = knobs.clone();
+        move |_, _| Lifted(knobs)
+    }));
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
+        let patched = Rc::new(Cell::new(None::<Result<PatchOutcome, PatchDecline>>));
+        let seen = patched.clone();
+        window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+            let result = window.repaint_in_place(vec![(ElementId::from(UNIT), unit_element(1, 100., None, Hot::Same))], cx, |_, _| true);
+            seen.set(Some(result));
+            result.is_ok()
+        })));
+        window.request_tick();
+        window.draw(cx).clear(cx);
+        assert_eq!(patched.get(), Some(Err(PatchDecline::UnknownUnit)));
+        assert_eq!(window.patch_counters().patched_frames, 0);
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn a_patch_the_embedder_refuses_changes_nothing(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.tick(cx);
+    let before = page.snapshot(cx);
+    page.knobs.accept.set(false);
+    page.knobs.tick.set(page.knobs.tick.get() + 1);
+    page.request_tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!(patches.patched_frames, 1);
+    assert_eq!(patches.declines(PatchDecline::Rejected), 1);
+    // The frame built whole instead shows the new color.
+    assert_ne!(page.snapshot(cx), before);
+    page.knobs.accept.set(true);
+    page.tick(cx);
+    assert_eq!(page.patches(cx).patched_frames, 2);
+}
+
+#[gpui::test]
+fn a_patch_that_paints_another_color_than_the_frame_built_whole_is_reported(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    cx.update_window(page.window, |_, window, _| {
+        window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+    })
+    .unwrap();
+    page.tick(cx);
+    let (verified, mismatches) = cx
+        .update_window(page.window, |_, window, _| (window.retained_counters().verified, window.retention_mismatches().len()))
+        .unwrap();
+    assert_eq!(page.patches(cx).patched_frames, 1);
+    assert_eq!((verified, mismatches), (1, 0), "a patch that is what a build shows is verified");
+
+    page.knobs.wrong_color.set(true);
+    page.tick(cx);
+    let counters = page.retained(cx);
+    assert_eq!(page.patches(cx).patched_frames, 2);
+    assert_eq!(counters.verified, 2);
+    assert_eq!(counters.mismatches, 1);
+    cx.update_window(page.window, |_, window, _| {
+        assert_eq!(window.retention_mismatches().len(), 1);
+        assert!(window.retention_mismatches()[0].contains("patched frame differs"));
+    })
+    .unwrap();
+}
+
+#[gpui::test]
+fn a_unit_that_asks_for_another_pass_declines(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.knobs.nudge.set(true);
+    page.tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!(patches.patched_frames, 0);
+    assert_eq!(patches.declines(PatchDecline::Effects), 1);
+    assert_eq!(patches.total_declines(), 1);
+}
+
+#[gpui::test]
+fn a_unit_with_other_hitboxes_or_cursors_than_the_recording_declines(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.knobs.hot.set(Hot::NoHitbox);
+    page.tick(cx);
+    assert_eq!(page.patches(cx).declines(PatchDecline::Hitboxes), 1);
+    // The frame built whole has the recording the patcher builds the unit like now; the unit the
+    // page builds has the hitbox, so the patch that follows is the same as the one before.
+    page.knobs.hot.set(Hot::NoCursor);
+    page.tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!(patches.declines(PatchDecline::Registrations), 1);
+    assert_eq!(patches.patched_frames, 0);
+}
+
+#[gpui::test]
+fn a_root_that_is_positioned_is_not_the_root_that_was_recorded(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.knobs.absolute.set(true);
+    page.tick(cx);
+    assert_eq!(page.patches(cx).declines(PatchDecline::Surroundings), 1);
+}
+
+#[gpui::test]
+fn a_unit_in_a_scroller_that_is_scrolled_is_repainted_in_place(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 6, Options { scroll: true, ..Default::default() });
+    page.tick(cx);
+    let work = page.work(cx);
+    for _ in 0..4 {
+        page.tick(cx);
+    }
+    let work = spent(page.work(cx), work);
+    assert_eq!((work.painted_primitives, work.prepainted), (8, 8), "the part of the unit that shows is painted");
+    let patches = page.patches(cx);
+    assert_eq!((patches.patched_frames, patches.total_declines()), (5, 0));
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "a unit in a scroller");
+}
+
+#[gpui::test]
+fn a_patch_with_the_accessibility_tree_on_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 6, Options { a11y: true, ..Default::default() });
+    page.draw_whole(cx);
+    for _ in 0..3 {
+        page.tick(cx);
+    }
+    let patches = page.patches(cx);
+    assert_eq!((patches.patched_frames, patches.total_declines()), (3, 0));
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "with the accessibility tree on");
+}
+
+#[gpui::test]
+fn the_frame_after_a_patch_replays_what_it_can_and_builds_the_unit(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 20);
+    for _ in 0..3 {
+        page.tick(cx);
+    }
+    let before = page.retained(cx);
+    // A frame that is not a tick, with the unit's key moved on by the patches: the rows replay.
+    page.knobs.tick.set(page.knobs.tick.get() + 1);
+    cx.update_window(page.window, |view, window, cx| {
+        view.downcast::<Page>().unwrap().update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let after = page.retained(cx);
+    assert_eq!(after.replays - before.replays, 20, "the rows are replayed");
+    assert_eq!(after.builds - before.builds, 1, "the unit is built");
+    // And it can be patched again.
+    page.tick(cx);
+    assert_eq!(page.patches(cx).patched_frames, 4);
+}

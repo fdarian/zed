@@ -63,6 +63,7 @@ use crate::{
     IntoElement, LayoutId, NonReusable, PaintIndex, PaintRecord, Pixels, Point, PrepaintRecord,
     PrepaintStateIndex, Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
     blocker_bit, first_blocker, IsZero, SubtreeText, scene::PrimitiveCount,
+    PatchUnit, PatchSource,
 };
 use collections::FxHashSet;
 use std::{any::TypeId, ops::Range, rc::Rc};
@@ -83,6 +84,7 @@ pub fn retained(
         lift_z: None,
         cull_outset: None,
         overscan: None,
+        patchable: false,
     }
 }
 
@@ -137,9 +139,20 @@ pub struct Retained {
     lift_z: Option<i32>,
     cull_outset: Option<Edges<Pixels>>,
     overscan: Option<Pixels>,
+    patchable: bool,
 }
 
 impl Retained {
+    /// Says that a tick which changes only how the subtree paints may repaint it in place, with
+    /// [`Window::repaint_in_place`], leaving the rest of the frame as it is. A frame that records
+    /// the subtree leaves what that needs of its surroundings, if the recording is a plain one: not
+    /// [relocatable](Self::relocatable), not [lifted](Self::lift_z), nothing in it handed to a
+    /// stacking context outside, not culled and with no deferred draw.
+    pub fn patchable(mut self) -> Self {
+        self.patchable = true;
+        self
+    }
+
     /// Says how far past its box the subtree draws and is hit, for a parent to skip it when it is
     /// outside its clip, as it would skip the element the subtree is made of
     /// ([`Element::cull_outset`]). The owner vouches for the whole subtree, as that asks.
@@ -312,6 +325,43 @@ impl RetainedState {
             })
     }
 
+    /// What [`Window::repaint_in_place`] needs of the recording, if the subtree is a plain one
+    /// recorded in the frame that is rendered, with the layout it was recorded with.
+    pub(crate) fn patch_source(&self, window: &Window) -> Option<PatchSource> {
+        let recorded = self.recorded.as_ref()?;
+        let paint = recorded.paint.as_ref()?;
+        let rendered = window.rendered_serial();
+        (recorded.patch.is_some()
+            && paint.is_plain()
+            && recorded.relocation.is_none()
+            && recorded.prepaint.lifts.is_none()
+            && recorded.serial == rendered
+            && recorded.paint_serial == rendered
+            && self.engine == window.layout_engine_id()
+            && window.layout_node_alive(self.root)
+            && recorded.generation == window.layout_generation(self.root)
+            && !window.layout_is_dirty(self.root))
+        .then(|| PatchSource {
+            root: self.root,
+            prepaint: recorded.prepaint.range.clone(),
+            paint: paint.range.clone(),
+            hitboxes: recorded.prepaint.hitboxes.clone(),
+            tab_stops: paint.tab_stops.clone(),
+            layout_states: self.layout_states.clone(),
+        })
+    }
+
+    /// Whether the subtree was recorded with `key`.
+    pub(crate) fn recorded_key_is(&self, key: &ReplayKey) -> bool {
+        self.recorded.as_ref().is_some_and(|recorded| recorded.key == *key)
+    }
+
+    /// Where the operations of the paint of the subtree are in the scene of the frame it is in.
+    pub(crate) fn scene_range(&self) -> Option<Range<usize>> {
+        let paint = self.recorded.as_ref()?.paint.as_ref()?;
+        Some(paint.range.start.scene_index()..paint.range.end.scene_index())
+    }
+
     /// What the last prepaint and paint of the subtree left in the frame being built, as text.
     pub(crate) fn describe(&self, window: &Window) -> Option<SubtreeText> {
         let recorded = self.recorded.as_ref()?;
@@ -372,6 +422,9 @@ struct Recorded {
     /// The ordinal the stacking context gave the first element the subtree handed to it, when the
     /// prepaint was last replayed.
     lift_base: Option<u32>,
+    /// What [`Window::repaint_in_place`] needs of the surroundings, for a patchable subtree whose
+    /// recording is plain.
+    patch: Option<Rc<PatchUnit>>,
 }
 
 impl Recorded {
@@ -582,9 +635,15 @@ impl Element for Retained {
                             if let Some(recorded) = state.recorded.as_mut() {
                                 recorded.relocation = relocation;
                                 recorded.settle_movability(&paint, translates, relocatable, window);
+                                if !paint.is_plain() {
+                                    recorded.patch = None;
+                                }
                                 recorded.paint = Some(paint);
                                 recorded.paint_serial = window.building_serial();
                                 window.log_painted_subtree(global_id);
+                                if let Some(unit) = &recorded.patch {
+                                    window.register_patch_unit(&self.id, unit);
+                                }
                             }
                         }
                         Err(reason) => {
@@ -882,6 +941,7 @@ impl Retained {
         let root = self.root(global_id, window);
         let key = window.replay_key(bounds, root);
         let hook = self.on_replay.clone();
+        let id = self.id.clone();
         let ambient = window.content_mask();
         let replayed = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a skipped subtree has its state");
@@ -902,6 +962,11 @@ impl Retained {
             }
             recorded.serial = window.building_serial();
             window.note_retained_recording((global_id.clone(), TypeId::of::<RetainedState>()));
+            if delta.is_zero()
+                && let Some(unit) = &recorded.patch
+            {
+                window.register_patch_unit(&id, unit);
+            }
             window.retained.counters.replays += 1;
             if !delta.is_zero() {
                 window.retained.counters.relocations += 1;
@@ -1093,6 +1158,9 @@ impl Retained {
         prepaint: impl FnOnce(&mut Window, &mut App),
     ) -> (bool, Option<Relocation>) {
         let publishes = self.on_replay.is_some();
+        let patch = (self.patchable && self.overscan.is_none() && self.lift_z.is_none())
+            .then(|| window.capture_patch_unit(global_id))
+            .flatten();
         let (relocation, unmovable_at_start) = self.plan_relocation(window);
         if relocation.as_ref().is_some_and(|relocation| !relocation.direct) {
             window.retained.recorded_relocatably += 1;
@@ -1129,6 +1197,7 @@ impl Retained {
             };
             let record = match reason {
                 Ok(prepaint) => {
+                    let patch = patch.filter(|_| prepaint.lifts.is_none());
                     state.recorded = Some(Recorded {
                         serial: window.building_serial(),
                         paint_serial: 0,
@@ -1141,6 +1210,7 @@ impl Retained {
                         unmovable_at_start,
                         delta: Point::default(),
                         lift_base: None,
+                        patch,
                     });
                     window
                         .note_retained_recording((global_id.clone(), TypeId::of::<RetainedState>()));

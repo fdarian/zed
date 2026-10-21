@@ -802,10 +802,25 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        self.replay_operations(&prev_scene.paint_operations[range], PrimitiveCount::Replayed);
+    }
+
+    /// Makes the scene what painting `operations` in order makes of an empty one: the log, the
+    /// typed vectors and the draw orders, the way a frame that had painted them would have. For a
+    /// log in which some operations were overwritten in place (see
+    /// [`Window::repaint_in_place`]). Not counted as work.
+    pub(crate) fn rebuild_from_operations(&mut self) {
+        let operations = mem::take(&mut self.paint_operations);
+        self.clear();
+        self.replay_operations(&operations, PrimitiveCount::Uncounted);
+        self.finish();
+    }
+
+    fn replay_operations(&mut self, operations: &[PaintOperation], count: PrimitiveCount) {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
-        let inserting = mem::replace(&mut self.inserting, PrimitiveCount::Replayed);
-        for operation in &prev_scene.paint_operations[range] {
+        let inserting = mem::replace(&mut self.inserting, count);
+        for operation in operations {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::Quad(quad) => self.insert_quad(*quad),
@@ -1010,7 +1025,7 @@ pub(crate) enum PrimitiveKind {
     EffectGroup,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     /// A quad before a border-only one is split around its empty interior, which depends on the
@@ -1036,6 +1051,20 @@ pub(crate) enum PaintOperation {
         derived: bool,
     },
     EndReplaced,
+}
+
+impl PaintOperation {
+    /// Whether `other` is the same kind of operation: what a patch must keep, since the operations
+    /// around it are not rebuilt.
+    pub(crate) fn same_kind(&self, other: &PaintOperation) -> bool {
+        mem::discriminant(self) == mem::discriminant(other)
+    }
+
+    /// Whether the operations paint differently, compared field by field through their debug
+    /// form: most of what they hold has no equality, and an effect that fades is not a box.
+    pub(crate) fn differs_from(&self, other: &PaintOperation) -> bool {
+        !self.same_kind(other) || format!("{self:?}") != format!("{other:?}")
+    }
 }
 
 fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
@@ -1107,7 +1136,7 @@ fn limit_group_bounds(
     Some(limited)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[expect(missing_docs)]
 pub enum Primitive {
     Shadow(Shadow),
