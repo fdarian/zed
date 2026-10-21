@@ -1849,6 +1849,8 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// Whether the draw that is running answers the platform's frame request, which presents it.
+    drawing_for_frame_request: bool,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -2347,7 +2349,9 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
+                                window.drawing_for_frame_request = true;
                                 let arena_clear_needed = window.draw(cx);
+                                window.drawing_for_frame_request = false;
                                 // A tick that patched nothing visible leaves the last picture
                                 // as it is.
                                 if window.needs_present.get() || request_frame_options.require_presentation {
@@ -2596,6 +2600,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            drawing_for_frame_request: false,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -4578,6 +4583,11 @@ impl Window {
             self.refresh();
         }
         self.needs_present.set(true);
+        // A draw outside a frame request leaves a picture that only a frame request presents,
+        // and a platform that stops its frame source when idle has to be asked for one.
+        if !self.drawing_for_frame_request {
+            self.platform_window.schedule_frame();
+        }
 
         #[cfg(feature = "profiler")]
         {
@@ -10601,6 +10611,43 @@ mod tests {
             test_window.frame_scheduled(),
             "a rendered scene awaiting presentation must wake the render loop"
         );
+    }
+
+    /// The platform's frame source may be stopped while the window is idle, so every way of
+    /// giving the next frame request work has to ask for one itself, and not rely on the
+    /// `flush_effects` that ends the update (which is what the tests above see).
+    #[gpui::test]
+    fn test_a_draw_outside_a_frame_request_asks_for_a_frame(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let test_window = cx.test_window(window.into());
+        while test_window.simulate_scheduled_frame() {}
+        assert!(!test_window.frame_scheduled());
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.needs_present.get());
+            assert!(
+                test_window.frame_scheduled(),
+                "a draw leaves a picture that only a frame request presents"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_on_next_frame_asks_for_a_frame(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let test_window = cx.test_window(window.into());
+        while test_window.simulate_scheduled_frame() {}
+        assert!(!test_window.frame_scheduled());
+        let wakes = test_window.frame_wake_count();
+
+        cx.update_window(window.into(), |_, window, _| {
+            window.on_next_frame(|_, _| {});
+            assert!(test_window.frame_scheduled());
+            assert!(test_window.frame_wake_count() > wakes);
+        })
+        .unwrap();
     }
 
     #[gpui::test]
