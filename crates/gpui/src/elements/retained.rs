@@ -259,6 +259,10 @@ impl IntoElement for Retained {
 
 /// What a retained element keeps from one frame to the next.
 pub(crate) struct RetainedState {
+    /// The id the element state map holds this state under. A recording that names the state
+    /// (the nested ones, the painted ones) holds this one and not the id of the frame it was made
+    /// in, so that looking the state up compares ids by pointer.
+    id: GlobalElementId,
     key: u64,
     /// The layout engine that made `root`.
     engine: u64,
@@ -541,8 +545,11 @@ impl Element for Retained {
                 RetainedPrepaint::Built { record, .. } => *record,
             };
             if recorded {
+                let id = window
+                    .peek_element_state(global_id, |state: &RetainedState| state.id.clone())
+                    .expect("a recorded subtree has its state");
                 window.retained.pending_hole = Some(crate::window::Hole {
-                    id: global_id.clone(),
+                    id,
                     hook: self.on_replay.clone(),
                 });
             }
@@ -640,7 +647,7 @@ impl Element for Retained {
                                 }
                                 recorded.paint = Some(paint);
                                 recorded.paint_serial = window.building_serial();
-                                window.log_painted_subtree(global_id);
+                                window.log_painted_subtree(&state.id);
                                 if let Some(unit) = &recorded.patch {
                                     window.register_patch_unit(&self.id, unit);
                                 }
@@ -689,7 +696,7 @@ fn replay_recorded_paint(
             .expect("a subtree is skipped only with its paint recorded");
         paint.range = window.replay_paint(paint, &nested, delta, lift_base);
         recorded.paint_serial = window.building_serial();
-        window.log_painted_subtree(global_id);
+        window.log_painted_subtree(&state.id);
         if let Some(hook) = hook {
             window.retained.replayed_root = Some(state.root);
             hook(RetainedPhase::Paint, delta, window, cx);
@@ -733,6 +740,8 @@ impl Retained {
 
         let key = self.key;
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+            // The map keeps the state under the id it was first stored with, not `global_id`.
+            let id = state.as_ref().map_or_else(|| global_id.clone(), |state| state.id.clone());
             if let Some(mut state) = state
                 && state.key == key
                 && !window.retained.reference
@@ -771,6 +780,7 @@ impl Retained {
                 || window.layout_requests_escape(root, escapable_before))
             .then_some(NonReusable::UnstableLayout);
             let state = RetainedState {
+                id,
                 key,
                 engine: window.layout_engine_id(),
                 root,
@@ -961,7 +971,7 @@ impl Retained {
                 relocation.apply(delta);
             }
             recorded.serial = window.building_serial();
-            window.note_retained_recording((global_id.clone(), TypeId::of::<RetainedState>()));
+            window.note_retained_recording((state.id.clone(), TypeId::of::<RetainedState>()));
             if delta.is_zero()
                 && let Some(unit) = &recorded.patch
             {
@@ -972,7 +982,7 @@ impl Retained {
                 window.retained.counters.relocations += 1;
             }
             if window.retained.verifier.is_some() {
-                window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
+                window.retained.replayed.push((state.id.clone(), TypeId::of::<RetainedState>()));
             }
             state.recorded = Some(recorded);
             if let Some(hook) = hook {
@@ -1212,8 +1222,7 @@ impl Retained {
                         lift_base: None,
                         patch,
                     });
-                    window
-                        .note_retained_recording((global_id.clone(), TypeId::of::<RetainedState>()));
+                    window.note_retained_recording((state.id.clone(), TypeId::of::<RetainedState>()));
                     true
                 }
                 Err(reason) => {
@@ -4843,3 +4852,5 @@ mod probe_tests;
 mod replay_cost_tests;
 #[cfg(test)]
 mod culled_cost_tests;
+#[cfg(test)]
+mod state_carry_tests;
