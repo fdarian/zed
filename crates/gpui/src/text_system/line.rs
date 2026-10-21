@@ -1,5 +1,5 @@
 use crate::{
-    App, Bounds, DecorationThickness, DevicePixels, ExtraDecoration, FontId, GlyphInset, Half, Hsla, LineLayout, RowMetrics,
+    App, Bounds, DecorationThickness, DevicePixels, ExtraDecoration, FontId, FontSmoothing, GlyphInset, Half, Hsla, LineLayout, RowMetrics,
     OverlineStyle, Pixels, Point, RenderGlyphParams, Result, ShapedRun, SharedString,
     StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
@@ -28,6 +28,9 @@ pub struct DecorationRun {
 
     /// The color for this run
     pub color: Hsla,
+
+    /// How the glyphs of this run are rasterised
+    pub font_smoothing: FontSmoothing,
 
     /// The background color for this run
     pub background_color: Option<Hsla>,
@@ -194,6 +197,7 @@ impl ShapedLine {
                 left_decorations.push(DecorationRun {
                     len: left_len,
                     color: decoration.color,
+                    font_smoothing: decoration.font_smoothing,
                     background_color: decoration.background_color,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
@@ -204,6 +208,7 @@ impl ShapedLine {
                 right_decorations.push(DecorationRun {
                     len: right_len,
                     color: decoration.color,
+                    font_smoothing: decoration.font_smoothing,
                     background_color: decoration.background_color,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
@@ -583,6 +588,7 @@ fn paint_line(
         let mut line_ix = 0;
         let mut run_end = 0;
         let mut color = black();
+        let mut font_smoothing = FontSmoothing::default();
         let mut group = 0;
         let mut open: Vec<OpenDecoration> = Vec::new();
         let mut finished: Vec<FinishedDecoration> = Vec::new();
@@ -720,6 +726,7 @@ fn paint_line(
                         }
                         run_end += style_run.len as usize;
                         color = style_run.color;
+                        font_smoothing = style_run.font_smoothing;
                     } else {
                         run_end = layout.len;
                     }
@@ -784,6 +791,7 @@ fn paint_line(
                             glyph.id,
                             run.font_size,
                             color,
+                            font_smoothing,
                         )?;
                     }
                 }
@@ -1477,6 +1485,7 @@ mod tests {
                 DecorationRun {
                     len: 2,
                     color: red,
+                    font_smoothing: FontSmoothing::default(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -1487,6 +1496,7 @@ mod tests {
                 DecorationRun {
                     len: 3,
                     color: green,
+                    font_smoothing: FontSmoothing::default(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -1497,6 +1507,7 @@ mod tests {
                 DecorationRun {
                     len: 1,
                     color: blue,
+                    font_smoothing: FontSmoothing::default(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,

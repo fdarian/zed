@@ -481,6 +481,7 @@ impl WindowTextSystem {
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
                 && last_run.color == run.color
+                && last_run.font_smoothing == run.font_smoothing
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
@@ -494,6 +495,7 @@ impl WindowTextSystem {
             decoration_runs.push(DecorationRun {
                 len: run.len as u32,
                 color: run.color,
+                font_smoothing: run.font_smoothing,
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
@@ -535,6 +537,7 @@ impl WindowTextSystem {
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
                 && last_run.color == run.color
+                && last_run.font_smoothing == run.font_smoothing
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
@@ -548,6 +551,7 @@ impl WindowTextSystem {
             decoration_runs.push(DecorationRun {
                 len: run.len as u32,
                 color: run.color,
+                font_smoothing: run.font_smoothing,
                 background_color: run.background_color,
                 underline: run.underline,
                 strikethrough: run.strikethrough,
@@ -899,6 +903,7 @@ impl WindowTextSystem {
         for run in runs.iter() {
             let decoration_changed = if let Some(last_run) = last_run
                 && last_run.color == run.color
+                && last_run.font_smoothing == run.font_smoothing
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
@@ -991,6 +996,7 @@ impl WindowTextSystem {
         for run in runs.iter() {
             let decoration_changed = if let Some(last_run) = last_run
                 && last_run.color == run.color
+                && last_run.font_smoothing == run.font_smoothing
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
@@ -1059,6 +1065,7 @@ impl WindowTextSystem {
         for run in runs.iter() {
             let decoration_changed = if let Some(last_run) = last_run
                 && last_run.color == run.color
+                && last_run.font_smoothing == run.font_smoothing
                 && last_run.underline == run.underline
                 && last_run.strikethrough == run.strikethrough
                 && last_run.overline == run.overline
@@ -1303,6 +1310,17 @@ impl Display for FontStyle {
     }
 }
 
+/// How a glyph is rasterised, as CSS `-webkit-font-smoothing` on macOS.
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, Serialize, Deserialize, JsonSchema)]
+pub enum FontSmoothing {
+    /// The platform's font smoothing: on macOS, CoreGraphics smoothing, which thickens glyph
+    /// strokes (more for light text on a dark ground), unless the user turned it off.
+    #[default]
+    Auto,
+    /// Plain greyscale coverage with no smoothing, the same ink for dark text and light text.
+    Antialiased,
+}
+
 /// A styled run of text, for use in [`crate::TextLayout`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct TextRun {
@@ -1312,6 +1330,9 @@ pub struct TextRun {
     pub font: Font,
     /// The color
     pub color: Hsla,
+    /// How the glyphs of this run are rasterised. It changes how they are painted and not
+    /// what they measure.
+    pub font_smoothing: FontSmoothing,
     /// The background color (if any)
     pub background_color: Option<Hsla>,
     /// The underline style (if any)
@@ -1339,6 +1360,7 @@ impl TextRun {
     /// their [`DecorationRun`]s and shape their text as one font run.
     fn same_decoration(&self, other: &Self) -> bool {
         self.color == other.color
+            && self.font_smoothing == other.font_smoothing
             && self.underline == other.underline
             && self.strikethrough == other.strikethrough
             && self.overline == other.overline
@@ -1369,6 +1391,7 @@ impl TextRun {
     pub(crate) fn hash_painted(runs: &[TextRun], hasher: &mut impl Hasher) {
         for run in runs.iter().filter(|run| run.len > 0) {
             run.color.hash(hasher);
+            run.font_smoothing.hash(hasher);
             run.background_color.hash(hasher);
             run.underline.hash(hasher);
             run.strikethrough.hash(hasher);
@@ -1384,6 +1407,7 @@ impl TextRun {
 fn push_decoration(decoration_runs: &mut Vec<DecorationRun>, run: &TextRun, len: usize) -> bool {
     if let Some(last_run) = decoration_runs.last_mut()
         && last_run.color == run.color
+                && last_run.font_smoothing == run.font_smoothing
         && last_run.underline == run.underline
         && last_run.strikethrough == run.strikethrough
         && last_run.overline == run.overline
@@ -1397,6 +1421,7 @@ fn push_decoration(decoration_runs: &mut Vec<DecorationRun>, run: &TextRun, len:
     decoration_runs.push(DecorationRun {
         len: len as u32,
         color: run.color,
+        font_smoothing: run.font_smoothing,
         background_color: run.background_color,
         underline: run.underline,
         strikethrough: run.strikethrough,
@@ -1477,6 +1502,7 @@ pub struct RenderGlyphParams {
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
     pub dilation: u8,
+    pub font_smoothing: FontSmoothing,
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1491,6 +1517,7 @@ impl Hash for RenderGlyphParams {
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
         self.dilation.hash(state);
+        self.font_smoothing.hash(state);
     }
 }
 
@@ -1781,6 +1808,55 @@ mod tests {
             split_font_run_at(&mut runs, at);
         }
         assert_eq!(lens(&runs), vec![2, 2, 3, 3]);
+    }
+
+    fn hash_of(value: &impl Hash) -> u64 {
+        use std::hash::{DefaultHasher, Hasher as _};
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn test_glyphs_rasterised_both_ways_do_not_share_a_cache_key() {
+        let glyph = |font_smoothing| RenderGlyphParams {
+            font_id: FontId(0),
+            glyph_id: GlyphId(7),
+            font_size: px(14.),
+            subpixel_variant: Default::default(),
+            scale_factor: 1.,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+            font_smoothing,
+        };
+        let (auto, antialiased) = (glyph(FontSmoothing::Auto), glyph(FontSmoothing::Antialiased));
+        assert_eq!(auto, glyph(FontSmoothing::Auto));
+        assert_eq!(hash_of(&auto), hash_of(&glyph(FontSmoothing::Auto)));
+        assert_ne!(auto, antialiased);
+        assert_ne!(hash_of(&auto), hash_of(&antialiased));
+    }
+
+    #[test]
+    fn test_runs_differing_in_font_smoothing_are_painted_differently_and_measure_alike() {
+        let smoothed = |font_smoothing| TextRun {
+            len: 3,
+            font_smoothing,
+            ..Default::default()
+        };
+        let painted = |runs: &[TextRun]| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            TextRun::hash_painted(runs, &mut hasher);
+            hasher.finish()
+        };
+        let measured = |runs: &[TextRun]| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            TextRun::hash_measured(runs, &mut hasher);
+            hasher.finish()
+        };
+        let (auto, antialiased) = ([smoothed(FontSmoothing::Auto)], [smoothed(FontSmoothing::Antialiased)]);
+        assert_ne!(painted(&auto), painted(&antialiased));
+        assert_eq!(measured(&auto), measured(&antialiased));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
     Capslock, Context, CornerRadii, Corners, CursorHideMode, CursorStyle, Escape, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragOperation, Edges, Effect, Entity,
-    EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, FontSmoothing, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
     Keystroke, KeystrokeEvent, LayoutCounters, LayoutId, LayoutInsets, LineLayoutIndex, MeasureRun, MeasuredLeaf, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, OverlineStyle, Path, Pixels,
@@ -6726,6 +6726,7 @@ impl Window {
         glyph_id: GlyphId,
         font_size: Pixels,
         color: Hsla,
+        font_smoothing: FontSmoothing,
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
         if self.paints_nothing() {
@@ -6742,7 +6743,10 @@ impl Window {
         let subpixel_variant = Point::new(subpixel_x, subpixel_y);
         let integer_origin = point(ScaledPixels(integer_x), ScaledPixels(integer_y));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let dilation = match font_smoothing {
+            FontSmoothing::Auto => self.text_system().glyph_dilation_for_color(color),
+            FontSmoothing::Antialiased => 0,
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -6752,6 +6756,7 @@ impl Window {
             is_emoji: false,
             subpixel_rendering,
             dilation,
+            font_smoothing,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -6846,6 +6851,7 @@ impl Window {
             is_emoji: true,
             subpixel_rendering: false,
             dilation: 0,
+            font_smoothing: FontSmoothing::Auto,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -12555,7 +12561,7 @@ mod tests {
                                     );
                                 let glyph_font = FontId(0);
                                 window
-                                    .paint_glyph(at, glyph_font, GlyphId(1), px(16.), crate::black())
+                                    .paint_glyph(at, glyph_font, GlyphId(1), px(16.), crate::black(), crate::FontSmoothing::Auto)
                                     .unwrap();
                                 window
                                     .paint_emoji(

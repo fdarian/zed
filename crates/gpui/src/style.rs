@@ -9,7 +9,7 @@ use crate::{
     BackgroundLayer, BackgroundTag, MaskBorder, MaskLayer, MaskMode,
     BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, CornerRadii,
     CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
+    FontFallbacks, FontFeatures, FontSmoothing, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions, TextWrapStyle,
     TextRun, TextSystem, Window, OverflowWrap, TextBoxEdge, WordBreak, black, point, px, quad, rems, size,
@@ -683,6 +683,9 @@ pub struct TextStyle {
     /// The variation axes of a variable font to set
     pub font_variations: FontVariations,
 
+    /// How the glyphs are rasterised, as CSS `-webkit-font-smoothing`
+    pub font_smoothing: FontSmoothing,
+
     /// The fallback fonts to use
     pub font_fallbacks: Option<FontFallbacks>,
 
@@ -765,6 +768,7 @@ impl Default for TextStyle {
             font_family: ".SystemUIFont".into(),
             font_features: FontFeatures::default(),
             font_variations: FontVariations::default(),
+            font_smoothing: FontSmoothing::default(),
             font_fallbacks: None,
             font_size: rems(1.).into(),
             line_height: LineHeight::Normal,
@@ -896,6 +900,7 @@ impl TextStyle {
                 style: self.font_style,
             },
             color: self.color,
+            font_smoothing: self.font_smoothing,
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,

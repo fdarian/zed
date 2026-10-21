@@ -34,7 +34,7 @@ use font_kit::{
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontStyle, FontVariations, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
+    FontSmoothing, FontStyle, FontVariations, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
     Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
@@ -561,7 +561,12 @@ impl MacTextSystemState {
             cx.set_allows_font_subpixel_quantization(false);
             cx.set_should_subpixel_quantize_fonts(false);
 
-            if params.dilation > 0 {
+            if params.font_smoothing == FontSmoothing::Antialiased {
+                // CoreGraphics smooths a glyph by default, and `-webkit-font-smoothing:
+                // antialiased` is the plain coverage without it, for dark and light text alike.
+                cx.set_should_smooth_fonts(false);
+                cx.set_gray_fill_color(0.0, 1.0);
+            } else if params.dilation > 0 {
                 let luminance = params.dilation as f64 * 0.25;
                 cx.set_should_smooth_fonts(true);
                 cx.set_gray_fill_color(luminance, 1.0);
@@ -1401,6 +1406,7 @@ mod tests {
                     is_emoji: false,
                     subpixel_rendering: false,
                     dilation: 0,
+                    font_smoothing: FontSmoothing::Auto,
                 })
                 .unwrap()
                 .size

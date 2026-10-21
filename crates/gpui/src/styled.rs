@@ -1,7 +1,7 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle,
     CellVerticalAlign, CursorStyle,
-    DefiniteLength, Direction, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
+    DefiniteLength, Direction, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontSmoothing, FontStyle,
     FontVariations,
     FlexBasisKeyword, FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
     JustifyContent, Length, LineHeight, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
@@ -976,6 +976,12 @@ pub trait Styled: Sized {
     /// Sets the variation axes of this element and its children.
     fn font_variations(mut self, variations: FontVariations) -> Self {
         self.text_style().font_variations = Some(variations);
+        self
+    }
+
+    /// Sets how the glyphs of this element and its children are rasterised.
+    fn font_smoothing(mut self, smoothing: FontSmoothing) -> Self {
+        self.text_style().font_smoothing = Some(smoothing);
         self
     }
 

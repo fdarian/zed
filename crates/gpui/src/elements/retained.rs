@@ -3404,6 +3404,13 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_font_smoothing_around_a_subtree_is_part_of_what_it_was_recorded_under(cx: &mut TestAppContext) {
+        replay_under_a_text_style(cx, |parent, changed| {
+            if changed { parent.font_smoothing(crate::FontSmoothing::Antialiased) } else { parent }
+        });
+    }
+
+    #[gpui::test]
     fn a_font_weight_around_a_subtree_is_part_of_what_it_was_recorded_under(cx: &mut TestAppContext) {
         replay_under_a_text_style(cx, |parent, changed| {
             if changed { parent.font_weight(crate::FontWeight::BOLD) } else { parent }
