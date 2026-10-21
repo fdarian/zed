@@ -86,9 +86,11 @@ struct MacTextSystemState {
     varied_fonts: HashMap<(FontId, FontVariations), FontId>,
     /// What each of `varied_fonts` was asked for, to set again on a copy of it at another size.
     varied_faces: HashMap<FontId, VariedFace>,
-    /// The varied faces at a size, by face and the bits of the size. Rasterising asks for
-    /// one per glyph, and making a CTFont and setting its axes costs more than a lookup.
-    sized_varied_fonts: Mutex<HashMap<(FontId, u32), CTFont>>,
+    /// Each face at a size, by face and the bits of the size. Rasterising asks for one per
+    /// glyph and shaping one per run, and making a CTFont (and setting its axes) costs more
+    /// than a lookup. A CTFont is also what CoreText keeps its per-font caches on (the ASCII
+    /// glyph and advance tables), so a copy made for every line has them filled for every line.
+    sized_fonts: Mutex<HashMap<(FontId, u32), CTFont>>,
 }
 
 struct VariedFace {
@@ -99,7 +101,7 @@ struct VariedFace {
 
 /// More sizes than a page of text uses; an animated `font-size` would otherwise grow
 /// the cache for as long as it runs.
-const SIZED_VARIED_FONTS_LIMIT: usize = 256;
+const SIZED_FONTS_LIMIT: usize = 256;
 
 impl MacTextSystem {
     /// Create a new MacTextSystem.
@@ -115,7 +117,7 @@ impl MacTextSystem {
             postscript_names_by_font_id: HashMap::default(),
             varied_fonts: HashMap::default(),
             varied_faces: HashMap::default(),
-            sized_varied_fonts: Mutex::new(HashMap::default()),
+            sized_fonts: Mutex::new(HashMap::default()),
         }))
     }
 }
@@ -576,22 +578,25 @@ impl MacTextSystemState {
     /// CoreText takes a value equal to what the font has as no change and gives the
     /// axis its automatic value.
     fn sized_font(&self, font_id: FontId, size: f32) -> CTFont {
-        let Some(face) = self.varied_faces.get(&font_id) else {
-            return self.fonts[font_id.0]
-                .native_font()
-                .clone_with_font_size(size as CGFloat);
-        };
         let key = (font_id, size.to_bits());
-        let mut sized = self.sized_varied_fonts.lock();
+        let mut sized = self.sized_fonts.lock();
         if let Some(cached) = sized.get(&key) {
             return cached.clone();
         }
-        let source = self.fonts[face.source.0].native_font();
-        let mut copy =
-            unsafe { FontKitFont::from_native_font(&source.clone_with_font_size(size as CGFloat)) };
-        apply_variations(&mut copy, &face.requested, &face.axes);
-        let copy = copy.native_font();
-        if sized.len() >= SIZED_VARIED_FONTS_LIMIT {
+        let copy = match self.varied_faces.get(&font_id) {
+            None => self.fonts[font_id.0]
+                .native_font()
+                .clone_with_font_size(size as CGFloat),
+            Some(face) => {
+                let source = self.fonts[face.source.0].native_font();
+                let mut copy = unsafe {
+                    FontKitFont::from_native_font(&source.clone_with_font_size(size as CGFloat))
+                };
+                apply_variations(&mut copy, &face.requested, &face.axes);
+                copy.native_font()
+            }
+        };
+        if sized.len() >= SIZED_FONTS_LIMIT {
             sized.clear();
         }
         sized.insert(key, copy.clone());
