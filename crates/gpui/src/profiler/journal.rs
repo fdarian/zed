@@ -16,7 +16,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
 use std::mem::MaybeUninit;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -772,33 +772,52 @@ impl Drop for JournalSlotReadGuard<'_> {
 }
 
 struct JournalRing {
-    slots: Box<[JournalSlot]>,
+    capacity: usize,
+    // Allocated by the first collector. An app that never reads the journal
+    // (anything but Zed's hang detection and benches) keeps the ring unallocated
+    // and the publisher drops what it would have written.
+    slots: OnceLock<Box<[JournalSlot]>>,
     finalized: AtomicU64,
     offered: AtomicU64,
 }
 
 impl JournalRing {
     fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
         Self {
-            slots: (0..capacity).map(|_| JournalSlot::new()).collect(),
+            capacity: capacity.max(1),
+            slots: OnceLock::new(),
             finalized: AtomicU64::new(0),
             offered: AtomicU64::new(0),
         }
     }
 
     fn capacity(&self) -> usize {
-        self.slots.len()
+        self.capacity
+    }
+
+    fn has_reader(&self) -> bool {
+        self.slots.get().is_some()
+    }
+
+    fn allocate_slots(&self) -> &[JournalSlot] {
+        self.slots
+            .get_or_init(|| (0..self.capacity).map(|_| JournalSlot::new()).collect())
+    }
+
+    fn slot(&self, sequence: u64) -> &JournalSlot {
+        let slots = self
+            .slots
+            .get()
+            .expect("entries are published and read only after a collector allocated the slots");
+        &slots[(sequence % self.capacity as u64) as usize]
     }
 
     fn try_publish(&self, sequence: u64, entry: ForegroundJournalEntry) -> bool {
-        let index = (sequence % self.slots.len() as u64) as usize;
-        self.slots[index].try_publish(sequence, entry)
+        self.slot(sequence).try_publish(sequence, entry)
     }
 
     fn read(&self, sequence: u64) -> Option<ForegroundJournalEntry> {
-        let index = (sequence % self.slots.len() as u64) as usize;
-        self.slots[index].try_read(sequence)
+        self.slot(sequence).try_read(sequence)
     }
 }
 
@@ -827,6 +846,9 @@ impl JournalPublisher {
     }
 
     fn publish(&mut self, entries: impl IntoIterator<Item = ForegroundJournalEntry>) {
+        if !self.ring.has_reader() {
+            return;
+        }
         for entry in entries {
             self.flush_pending();
             self.publish_one(entry);
@@ -903,8 +925,10 @@ impl ForegroundJournal {
     }
 
     /// Creates an independent collector that observes entries offered after
-    /// this call.
+    /// this call. The first call allocates the ring; nothing is recorded
+    /// before it.
     pub fn collector(&self) -> ForegroundJournalCollector {
+        self.ring.allocate_slots();
         ForegroundJournalCollector {
             cursor: self.ring.offered.load(Ordering::Acquire),
             ring: Arc::clone(&self.ring),
@@ -2392,7 +2416,7 @@ mod tests {
                     RingOperation::Pin(slot) => {
                         let index = usize::from(slot) % capacity;
                         if pins[index].is_none() {
-                            pins[index] = JournalSlotReadGuard::try_new(&journal.ring.slots[index]);
+                            pins[index] = JournalSlotReadGuard::try_new(journal.ring.slot(index as u64));
                             prop_assert!(pins[index].is_some());
                             model.pinned[index] = true;
                         }
@@ -2701,6 +2725,63 @@ mod tests {
             ForegroundJournalWriter::new(foreground_runnables, publisher),
             collector,
         )
+    }
+
+    #[test]
+    fn ring_has_no_slots_before_a_collector() {
+        let (journal, mut publisher) = ForegroundJournal::new(32, 4);
+        let origin = Instant::now();
+
+        publisher.publish([ring_entry(origin, 0), ring_entry(origin, 1)]);
+        assert!(journal.ring.slots.get().is_none());
+        assert_eq!(publisher.ring.offered.load(Ordering::Acquire), 0);
+        assert_eq!(publisher.next_sequence, 0);
+
+        let mut collector = journal.collector();
+        assert_eq!(journal.ring.slots.get().map(|slots| slots.len()), Some(32));
+        assert!(collector.collect_unseen().entries.is_empty());
+    }
+
+    #[test]
+    fn entries_recorded_after_a_collector_exists_are_collected() {
+        let (journal, mut publisher) = ForegroundJournal::new(32, 4);
+        let origin = Instant::now();
+        publisher.publish([ring_entry(origin, 0)]);
+
+        let mut collector = journal.collector();
+        publisher.publish([ring_entry(origin, 1), ring_entry(origin, 2)]);
+
+        let drained = collector.collect_unseen();
+        assert_eq!(drained.lost, 0);
+        assert_eq!(drained.entries.len(), 2);
+    }
+
+    #[test]
+    fn writer_without_a_collector_records_nothing_and_keeps_its_state() {
+        let (journal, publisher) = ForegroundJournal::new(32, 4);
+        let mut writer = ForegroundJournalWriter::new(ForegroundRunnableCounter::new(), publisher);
+        let origin = Instant::now();
+
+        writer.begin_turn();
+        writer.record_event(ForegroundEvent::Input(InputTiming {
+            kind: "test",
+            start: origin,
+            end: origin,
+            caused_invalidation: false,
+        }));
+        writer.end_turn(origin);
+        assert!(journal.ring.slots.get().is_none());
+
+        let mut collector = journal.collector();
+        writer.begin_turn();
+        writer.record_event(ForegroundEvent::Input(InputTiming {
+            kind: "test",
+            start: origin,
+            end: origin,
+            caused_invalidation: false,
+        }));
+        writer.end_turn(origin);
+        assert!(!collector.collect_unseen().entries.is_empty());
     }
 
     fn has_boundary_at(entries: &[ForegroundJournalEntry], at: Instant) -> bool {
