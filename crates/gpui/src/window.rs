@@ -146,6 +146,10 @@ struct WindowInvalidatorInner {
     /// The `update_count` the layout the window last built was computed at, if nothing but
     /// paint-only invalidations came since. See [`WindowInvalidator::layout_is_current`].
     pub layout_current_at: Option<usize>,
+    /// Like `layout_current_at` for what a scroll query reads (the extent and size of a scroller,
+    /// not where the boxes sit): a scroll offset write leaves it current. Never behind the record
+    /// of the layout.
+    pub scroll_metrics_current_at: Option<usize>,
     #[cfg(feature = "profiler")]
     pub frame_dirty: FrameDirtyAccumulator,
     pub platform_waker: Option<Rc<dyn Fn()>>,
@@ -179,6 +183,7 @@ impl WindowInvalidator {
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
                 layout_current_at: None,
+                scroll_metrics_current_at: None,
                 #[cfg(feature = "profiler")]
                 frame_dirty: FrameDirtyAccumulator::default(),
                 platform_waker: None,
@@ -291,6 +296,22 @@ impl WindowInvalidator {
     pub fn mark_layout_current(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.layout_current_at = Some(inner.update_count);
+        inner.scroll_metrics_current_at = Some(inner.update_count);
+    }
+
+    /// Declares the scroll metrics current at this invalidation, without the layout: the
+    /// invalidation moved nothing a scroll query reads.
+    pub fn mark_scroll_metrics_current(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.scroll_metrics_current_at = Some(inner.update_count);
+    }
+
+    /// Whether every invalidation since the last layout was paint-only or a scroll offset write
+    /// (see [`App::notify_scroll_only`]), so the size and extent of every scroller are those of
+    /// the last layout. The boxes are not: they moved with the scroll offset.
+    pub fn scroll_metrics_are_current(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.scroll_metrics_current_at == Some(inner.update_count)
     }
 
     /// Whether every invalidation since the last layout was declared paint-only (see
@@ -4164,6 +4185,20 @@ impl Window {
         if !self.invalidator.is_dirty()
             || draw_in_progress()
             || self.invalidator.layout_is_current()
+        {
+            return false;
+        }
+        self.layout_pass(cx, false)
+    }
+
+    /// [`Window::draw_if_dirty`] for a caller that reads the size and extent of a scroller
+    /// and its own offset (`scrollHeight`, `clientHeight`, `scrollTop`) and not any box: a
+    /// scroll offset write does not make it lay out, as writing `scrollTop` in a browser
+    /// changes paint properties and never layout. See [`App::notify_scroll_only`].
+    pub fn draw_if_scroll_metrics_dirty(&mut self, cx: &mut App) -> bool {
+        if !self.invalidator.is_dirty()
+            || draw_in_progress()
+            || self.invalidator.scroll_metrics_are_current()
         {
             return false;
         }
@@ -11466,6 +11501,44 @@ mod tests {
             assert_eq!(seen.get().size.height, px(70.));
             assert_eq!(paints.get(), paints_before, "the read did not paint");
             assert!(window.invalidator.is_dirty());
+        });
+    }
+
+    /// A scroll offset write leaves the scroll metrics current and the boxes stale: a read of
+    /// `scrollHeight` after any number of writes lays out nothing, a read of bounds lays out,
+    /// and any other invalidation, before or between the writes, makes the metrics stale.
+    #[gpui::test]
+    fn test_a_scroll_write_only_makes_the_boxes_stale(cx: &mut TestAppContext) {
+        struct Page;
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(div().w(px(100.)).h(px(20.)))
+            }
+        }
+        let (view, cx) = cx.add_window_view(|_, _| Page);
+        let id = view.entity_id();
+        cx.update(|window, cx| {
+            assert!(!window.draw_if_scroll_metrics_dirty(cx));
+            let passes = window.layout_pass_count();
+
+            cx.notify_scroll_only(id);
+            cx.notify_scroll_only(id);
+            assert!(!window.draw_if_scroll_metrics_dirty(cx), "scroll writes lay nothing out");
+            assert_eq!(window.layout_pass_count(), passes);
+            assert!(window.draw_if_dirty(cx), "the boxes moved with the offset");
+            assert_eq!(window.layout_pass_count(), passes + 1);
+
+            cx.notify_scroll_only(id);
+            cx.notify_paint_only(id);
+            assert!(!window.draw_if_scroll_metrics_dirty(cx), "a paint-only write moves no extent");
+            assert!(window.draw_if_dirty(cx));
+
+            cx.notify(id);
+            cx.notify_scroll_only(id);
+            assert!(window.draw_if_scroll_metrics_dirty(cx), "a write after a change is on stale metrics");
+
+            cx.notify_scroll_only(id);
+            assert!(!window.draw_if_scroll_metrics_dirty(cx), "the pass made them current");
         });
     }
 

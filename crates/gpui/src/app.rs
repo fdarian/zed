@@ -679,6 +679,14 @@ impl GpuiMode {
     }
 }
 
+/// What an invalidation says about the layout the window last built.
+#[derive(Clone, Copy)]
+enum Invalidation {
+    Layout,
+    Paint,
+    Scroll,
+}
+
 struct PlatformOwnedDrag {
     source_window: WindowId,
     state: PlatformOwnedDragState,
@@ -2745,7 +2753,7 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
-        self.notify_entity(entity_id, false);
+        self.notify_entity(entity_id, Invalidation::Layout);
     }
 
     /// [`App::notify`] for a change the caller knows moves no box: a window whose layout was
@@ -2754,10 +2762,19 @@ impl App {
     /// after, makes the layout stale again, so a wrong call here is a stale read and a doubtful
     /// one should use [`App::notify`].
     pub fn notify_paint_only(&mut self, entity_id: EntityId) {
-        self.notify_entity(entity_id, true);
+        self.notify_entity(entity_id, Invalidation::Paint);
     }
 
-    fn notify_entity(&mut self, entity_id: EntityId, paint_only: bool) {
+    /// [`App::notify`] for a write of a scroll offset. The boxes moved (the children of the
+    /// scroller sit elsewhere), so [`Window::draw_if_dirty`] lays out for a read of bounds, but
+    /// no size or extent did: [`Window::draw_if_scroll_metrics_dirty`] runs no pass if the
+    /// metrics were current before. The offset must already be clamped to the extent the last
+    /// layout made.
+    pub fn notify_scroll_only(&mut self, entity_id: EntityId) {
+        self.notify_entity(entity_id, Invalidation::Scroll);
+    }
+
+    fn notify_entity(&mut self, entity_id: EntityId, invalidation: Invalidation) {
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)
@@ -2786,9 +2803,18 @@ impl App {
         } else {
             for invalidator in &live_invalidators {
                 let layout_was_current = invalidator.layout_is_current();
+                let metrics_were_current = invalidator.scroll_metrics_are_current();
                 let invalidated = invalidator.invalidate_view(entity_id, self);
-                if paint_only && layout_was_current && invalidated {
-                    invalidator.mark_layout_current();
+                if !invalidated {
+                    continue;
+                }
+                match invalidation {
+                    Invalidation::Layout => {}
+                    Invalidation::Paint if layout_was_current => invalidator.mark_layout_current(),
+                    Invalidation::Paint | Invalidation::Scroll if metrics_were_current => {
+                        invalidator.mark_scroll_metrics_current()
+                    }
+                    Invalidation::Paint | Invalidation::Scroll => {}
                 }
             }
         }
