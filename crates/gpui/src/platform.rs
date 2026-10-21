@@ -1159,8 +1159,9 @@ pub trait PlatformTextSystem: Send + Sync {
     /// Returns the recommended text rendering mode for the given font and size.
     fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
     -> TextRenderingMode;
-    /// Returns the dilation level to use for a glyph painted in the given color.
-    fn glyph_dilation_for_color(&self, _color: Hsla) -> u8 {
+    /// Returns the bucket (0 to 7) of the text luminance a glyph painted in the given color is
+    /// rasterised for, the table that turns coverage into what the blend needs.
+    fn glyph_luminance_bucket_for_color(&self, _color: Hsla) -> u8 {
         0
     }
 }

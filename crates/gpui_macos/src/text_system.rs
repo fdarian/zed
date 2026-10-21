@@ -54,6 +54,10 @@ use crate::open_type::{
 
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
+#[allow(non_upper_case_globals)]
+const kCGImageAlphaNoneSkipFirst: u32 = 6;
+#[allow(non_upper_case_globals)]
+const kCGBitmapByteOrder32Host: u32 = 2 << 12;
 
 /// macOS text system using CoreText for font shaping.
 pub struct MacTextSystem(RwLock<MacTextSystemState>);
@@ -243,18 +247,81 @@ impl PlatformTextSystem for MacTextSystem {
         TextRenderingMode::Grayscale
     }
 
-    fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
-        // When font smoothing is enabled, CoreGraphics thickens glyph strokes by an amount that
-        // depends on the foreground color's luminance. We replicate the logic used by CoreGraphics
-        // to select between the different levels of dilation.
+    fn glyph_luminance_bucket_for_color(&self, color: Hsla) -> u8 {
         if !font_smoothing_allowed_by_user() {
             return 0;
         }
-        let rgba: Rgba = color.into();
-        let luminance = 0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b;
-        let level = ((4.0 * luminance) + 0.5).floor() as i32;
-        level.clamp(0, 4) as u8
+        luminance_bucket(color.into())
     }
+}
+
+/// The table Skia's mask gamma uses for text of this colour: its luminance, from each channel
+/// halved and cut to 3 bits (the halving is the gamma of 1.0 CoreGraphics goes to for white text
+/// from the 2.0 it has for black), in 8 steps.
+fn luminance_bucket(color: Rgba) -> u8 {
+    let channel = |value: f32| {
+        let halved = (value * 255.0).round() as u32 / 2;
+        let bits = halved >> 5;
+        (bits << 5) | (bits << 2) | (bits >> 1)
+    };
+    let luminance = (channel(color.r) * 54 + channel(color.g) * 183 + channel(color.b) * 19) >> 8;
+    (luminance >> 5) as u8
+}
+
+const LUMINANCE_BUCKETS: usize = 8;
+
+/// Skia's mask gamma for an sRGB device, contrast 0 (`SkTMaskGamma_build_correcting_lut`): for
+/// text of the bucket's luminance, the coverage a blend in the encoded space has to be given so
+/// that it comes out as a blend in linear light. The destination is guessed to be the inverse of
+/// the text.
+fn smoothing_table(bucket: usize) -> [u8; 256] {
+    fn to_linear(value: f32) -> f32 {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    fn from_linear(value: f32) -> f32 {
+        if value <= 0.0031308 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    let bits = bucket as u32;
+    let source = ((bits << 5) | (bits << 2) | (bits >> 1)) as f32 / 255.0;
+    let destination = 1.0 - source;
+    let linear_source = to_linear(source);
+    let linear_destination = to_linear(destination);
+    let mut table = [0u8; 256];
+    for (coverage, entry) in table.iter_mut().enumerate() {
+        let coverage = coverage as f32 / 255.0;
+        let value = if (source - destination).abs() < 1.0 / 256.0 {
+            255.0 * coverage
+        } else {
+            let linear = linear_source * coverage + (1.0 - coverage) * linear_destination;
+            255.0 * (from_linear(linear) - destination) / (source - destination)
+        };
+        *entry = value.round().clamp(0.0, 255.0) as u8;
+    }
+    table
+}
+
+fn smoothing_tables() -> &'static [[u8; 256]; LUMINANCE_BUCKETS] {
+    static TABLES: OnceLock<[[u8; 256]; LUMINANCE_BUCKETS]> = OnceLock::new();
+    TABLES.get_or_init(|| std::array::from_fn(smoothing_table))
+}
+
+/// The coverage of one pixel CoreGraphics drew black on white with smoothing: its output has the
+/// gamma of 2.0 that Skia's `sk_pow2_table` takes out, as Skia does for the A8 masks it makes
+/// from smoothed text.
+fn smoothed_coverage(pixel: &[u8], table: &[u8; 256]) -> u8 {
+    let linear = |value: u8| 255 - ((value as u32 * value as u32 + 128) / 255);
+    // The pixel is BGRX in memory.
+    let luminance = (linear(pixel[2]) * 54 + linear(pixel[1]) * 183 + linear(pixel[0]) * 19) >> 8;
+    table[luminance as usize]
 }
 
 fn font_smoothing_allowed_by_user() -> bool {
@@ -573,6 +640,12 @@ impl MacTextSystemState {
             }
             let bitmap_size = bitmap_size;
 
+            // Skia makes the mask of smoothed text from CoreGraphics' black on white output, whatever
+            // the colour of the text, and CoreGraphics only smooths into an opaque context.
+            let smoothed = params.font_smoothing == FontSmoothing::Auto
+                && !params.is_emoji
+                && font_smoothing_allowed_by_user();
+
             let mut bytes;
             let cx;
             if params.is_emoji {
@@ -585,6 +658,17 @@ impl MacTextSystemState {
                     bitmap_size.width.0 as usize * 4,
                     &CGColorSpace::create_device_rgb(),
                     kCGImageAlphaPremultipliedLast,
+                );
+            } else if smoothed {
+                bytes = vec![0xff; bitmap_size.width.0 as usize * 4 * bitmap_size.height.0 as usize];
+                cx = CGContext::create_bitmap_context(
+                    Some(bytes.as_mut_ptr() as *mut _),
+                    bitmap_size.width.0 as usize,
+                    bitmap_size.height.0 as usize,
+                    8,
+                    bitmap_size.width.0 as usize * 4,
+                    &CGColorSpace::create_device_rgb(),
+                    kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Host,
                 );
             } else {
                 bytes = vec![0; bitmap_size.width.0 as usize * bitmap_size.height.0 as usize];
@@ -621,17 +705,13 @@ impl MacTextSystemState {
             cx.set_allows_font_subpixel_quantization(false);
             cx.set_should_subpixel_quantize_fonts(false);
 
+            cx.set_gray_fill_color(0.0, 1.0);
             if params.font_smoothing == FontSmoothing::Antialiased {
                 // CoreGraphics smooths a glyph by default, and `-webkit-font-smoothing:
                 // antialiased` is the plain coverage without it, for dark and light text alike.
                 cx.set_should_smooth_fonts(false);
-                cx.set_gray_fill_color(0.0, 1.0);
-            } else if params.dilation > 0 {
-                let luminance = params.dilation as f64 * 0.25;
+            } else if smoothed {
                 cx.set_should_smooth_fonts(true);
-                cx.set_gray_fill_color(luminance, 1.0);
-            } else {
-                cx.set_gray_fill_color(0.0, 1.0);
             }
             self.sized_font(params.font_id, f32::from(params.font_size))
                 .draw_glyphs(
@@ -648,6 +728,16 @@ impl MacTextSystemState {
                 for pixel in bytes.chunks_exact_mut(4) {
                     swap_rgba_pa_to_bgra(pixel);
                 }
+            } else if smoothed {
+                let table = smoothing_tables()
+                    .get(params.luminance_bucket as usize)
+                    .ok_or_else(|| {
+                        anyhow!("luminance bucket {} is out of range", params.luminance_bucket)
+                    })?;
+                bytes = bytes
+                    .chunks_exact(4)
+                    .map(|pixel| smoothed_coverage(pixel, table))
+                    .collect();
             }
 
             Ok((bitmap_size, bytes))
@@ -950,6 +1040,54 @@ mod tests {
         PlatformTextSystem, RenderGlyphParams, font, px,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn test_luminance_bucket_of_text_color() {
+        let bucket = |hex: u32| {
+            super::luminance_bucket(gpui::rgb(hex))
+        };
+        assert_eq!(bucket(0x000000), 0);
+        assert_eq!(bucket(0xffffff), 3);
+        // Halved first: #a1a1a1 is 80, in the bucket of 64 to 95.
+        assert_eq!(bucket(0xa1a1a1), 2);
+        // The channels are cut to 3 bits one by one before they are weighed: pure green is
+        // 127 >> 5 = 3, scaled to 109, and 109 * 183 >> 8 is 77.
+        assert_eq!(bucket(0x00ff00), 2);
+        assert_eq!(bucket(0x0000ff), 0);
+    }
+
+    /// The tables of Skia's `SkTMaskGamma_build_correcting_lut` for an sRGB device and contrast 0,
+    /// at a few coverages, worked out from its formula.
+    #[test]
+    fn test_smoothing_tables_are_skias_mask_gamma() {
+        const COVERAGES: [usize; 7] = [0, 32, 64, 128, 192, 224, 255];
+        const TABLES: [[u8; 7]; 8] = [
+            [0, 15, 31, 68, 119, 157, 255],
+            [0, 17, 36, 79, 138, 180, 255],
+            [0, 21, 44, 96, 161, 203, 255],
+            [0, 27, 56, 116, 183, 218, 255],
+            [0, 38, 73, 140, 200, 228, 255],
+            [0, 54, 95, 160, 212, 234, 255],
+            [0, 76, 118, 176, 220, 238, 255],
+            [0, 99, 137, 188, 225, 241, 255],
+        ];
+        for (bucket, expected) in TABLES.iter().enumerate() {
+            let table = &super::smoothing_tables()[bucket];
+            let entries = COVERAGES.map(|coverage| table[coverage]);
+            assert_eq!(&entries, expected, "bucket {bucket}");
+            assert!(table.windows(2).all(|pair| pair[0] <= pair[1]), "bucket {bucket}");
+        }
+    }
+
+    #[test]
+    fn test_smoothed_coverage_takes_out_the_gamma_of_coregraphics() {
+        let table = &super::smoothing_tables()[0];
+        let coverage = |value: u8| super::smoothed_coverage(&[value, value, value, 0xff], table);
+        assert_eq!(coverage(255), 0);
+        assert_eq!(coverage(0), 255);
+        // 128 * 128 / 255 is 64 of linear value, so 191 of coverage, through the table of bucket 0.
+        assert_eq!(coverage(128), table[191]);
+    }
 
     #[test]
     fn test_layout_line_bom_char() {
@@ -1462,7 +1600,7 @@ mod tests {
                     scale_factor: 1.,
                     is_emoji: false,
                     subpixel_rendering: false,
-                    dilation: 0,
+                    luminance_bucket: 0,
                     font_smoothing: FontSmoothing::Auto,
                 })
                 .unwrap()

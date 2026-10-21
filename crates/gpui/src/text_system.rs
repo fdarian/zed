@@ -408,9 +408,10 @@ impl TextSystem {
             .rasterize_glyph(params, raster_bounds)
     }
 
-    /// Returns the dilation level to use for a glyph painted in the given color.
-    pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
-        self.platform_text_system.glyph_dilation_for_color(color)
+    /// Returns the bucket (0 to 7) of the text luminance a glyph painted in the given color is
+    /// rasterised for, the table that turns coverage into what the blend needs.
+    pub(crate) fn glyph_luminance_bucket_for_color(&self, color: Hsla) -> u8 {
+        self.platform_text_system.glyph_luminance_bucket_for_color(color)
     }
 
     /// Returns the text rendering mode recommended by the platform for the given font and size.
@@ -1501,7 +1502,7 @@ pub struct RenderGlyphParams {
     pub scale_factor: f32,
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
-    pub dilation: u8,
+    pub luminance_bucket: u8,
     pub font_smoothing: FontSmoothing,
 }
 
@@ -1516,7 +1517,7 @@ impl Hash for RenderGlyphParams {
         self.scale_factor.to_bits().hash(state);
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
-        self.dilation.hash(state);
+        self.luminance_bucket.hash(state);
         self.font_smoothing.hash(state);
     }
 }
@@ -1827,7 +1828,7 @@ mod tests {
             scale_factor: 1.,
             is_emoji: false,
             subpixel_rendering: false,
-            dilation: 0,
+            luminance_bucket: 0,
             font_smoothing,
         };
         let (auto, antialiased) = (glyph(FontSmoothing::Auto), glyph(FontSmoothing::Antialiased));

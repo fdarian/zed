@@ -2053,7 +2053,7 @@ mod tests {
                 scale_factor: 1.0,
                 is_emoji: true,
                 subpixel_rendering: false,
-                dilation: 0,
+                luminance_bucket: 0,
                 font_smoothing: gpui::FontSmoothing::Auto,
             };
             let raster_bounds = text_system.glyph_raster_bounds(&params)?;

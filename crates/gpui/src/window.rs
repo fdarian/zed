@@ -6743,8 +6743,8 @@ impl Window {
         let subpixel_variant = Point::new(subpixel_x, subpixel_y);
         let integer_origin = point(ScaledPixels(integer_x), ScaledPixels(integer_y));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = match font_smoothing {
-            FontSmoothing::Auto => self.text_system().glyph_dilation_for_color(color),
+        let luminance_bucket = match font_smoothing {
+            FontSmoothing::Auto => self.text_system().glyph_luminance_bucket_for_color(color),
             FontSmoothing::Antialiased => 0,
         };
         let params = RenderGlyphParams {
@@ -6755,7 +6755,7 @@ impl Window {
             scale_factor,
             is_emoji: false,
             subpixel_rendering,
-            dilation,
+            luminance_bucket,
             font_smoothing,
         };
 
@@ -6850,7 +6850,7 @@ impl Window {
             scale_factor,
             is_emoji: true,
             subpixel_rendering: false,
-            dilation: 0,
+            luminance_bucket: 0,
             font_smoothing: FontSmoothing::Auto,
         };
 
