@@ -47,7 +47,6 @@ use std::{
 };
 
 pub(crate) use dispatcher::*;
-pub(crate) use display::*;
 pub(crate) use display_link::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
@@ -56,6 +55,7 @@ pub(crate) use window::*;
 #[cfg(feature = "font-kit")]
 pub(crate) use text_system::*;
 
+pub use display::{MacDisplay, MacScreen};
 pub use display_link::set_frame_wake_hook;
 pub use platform::MacPlatform;
 

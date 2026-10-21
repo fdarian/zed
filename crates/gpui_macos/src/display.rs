@@ -3,17 +3,35 @@ use anyhow::Result;
 use cocoa::{
     appkit::NSScreen,
     base::{id, nil},
-    foundation::{NSArray, NSDictionary},
+    foundation::{NSArray, NSDictionary, NSRect},
 };
 use core_foundation::base::CFRelease;
 use core_foundation::uuid::{CFUUIDGetUUIDBytes, CFUUIDRef};
-use core_graphics::display::{CGDirectDisplayID, CGDisplayBounds, CGGetActiveDisplayList};
-use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, point, px, size};
+use core_graphics::{
+    base::CGFloat,
+    display::{
+        CGDirectDisplayID, CGDisplayBounds, CGDisplayIsBuiltin, CGDisplayRotation,
+        CGGetActiveDisplayList,
+    },
+};
+use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, SharedString, point, px, size};
 use objc::{msg_send, sel, sel_impl};
+use std::ffi::CStr;
 use uuid::Uuid;
 
 #[derive(Debug)]
-pub(crate) struct MacDisplay(pub(crate) CGDirectDisplayID);
+pub struct MacDisplay(pub(crate) CGDirectDisplayID);
+
+/// The `NSScreen` of a display. The frames are in global coordinates, in points, with the
+/// origin at the top left of the primary screen and y down, as `CGDisplayBounds` has them
+/// (unlike [`PlatformDisplay::bounds`], which is local to the display).
+#[derive(Clone, Debug)]
+pub struct MacScreen {
+    pub localized_name: SharedString,
+    pub frame: Bounds<Pixels>,
+    pub visible_frame: Bounds<Pixels>,
+    pub backing_scale_factor: f32,
+}
 
 unsafe impl Send for MacDisplay {}
 
@@ -149,6 +167,54 @@ impl PlatformDisplay for MacDisplay {
 }
 
 impl MacDisplay {
+    /// The display's `NSScreen`, or `None` when AppKit has none for it (a mirrored display).
+    pub fn screen(&self) -> Option<MacScreen> {
+        unsafe {
+            let screen = self.get_nsscreen();
+            if screen == nil {
+                return None;
+            }
+
+            // Cocoa's y goes up from the bottom of the primary screen, whose frame origin is (0, 0).
+            let primary = NSArray::objectAtIndex(NSScreen::screens(nil), 0);
+            let primary_height = NSScreen::frame(primary).size.height;
+            let to_global_bounds = |rect: NSRect| Bounds {
+                origin: point(
+                    px(rect.origin.x as f32),
+                    px((primary_height - rect.origin.y - rect.size.height) as f32),
+                ),
+                size: size(px(rect.size.width as f32), px(rect.size.height as f32)),
+            };
+
+            let name: id = msg_send![screen, localizedName];
+            assert!(
+                name != nil,
+                "AppKit returned a nil localizedName for display {}",
+                self.0
+            );
+            let name = CStr::from_ptr(msg_send![name, UTF8String])
+                .to_string_lossy()
+                .into_owned();
+            let backing_scale_factor: CGFloat = msg_send![screen, backingScaleFactor];
+
+            Some(MacScreen {
+                localized_name: name.into(),
+                frame: to_global_bounds(NSScreen::frame(screen)),
+                visible_frame: to_global_bounds(NSScreen::visibleFrame(screen)),
+                backing_scale_factor: backing_scale_factor as f32,
+            })
+        }
+    }
+
+    /// The rotation of the display in degrees (`CGDisplayRotation`).
+    pub fn rotation(&self) -> f64 {
+        unsafe { CGDisplayRotation(self.0) }
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        unsafe { CGDisplayIsBuiltin(self.0) != 0 }
+    }
+
     /// Find the NSScreen corresponding to this display
     unsafe fn get_nsscreen(&self) -> id {
         let screens = unsafe { NSScreen::screens(nil) };
@@ -165,5 +231,52 @@ impl MacDisplay {
             }
         }
         nil
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_frame_is_the_global_display_bounds() {
+        let primary = MacDisplay::primary()
+            .screen()
+            .expect("the primary display has a screen");
+        assert_eq!(primary.frame.origin, point(px(0.), px(0.)));
+
+        let mut with_screen = 0;
+        for display in MacDisplay::all() {
+            let Some(screen) = display.screen() else {
+                continue;
+            };
+            with_screen += 1;
+
+            let bounds = unsafe { CGDisplayBounds(display.0) };
+            assert_eq!(
+                screen.frame,
+                Bounds {
+                    origin: point(px(bounds.origin.x as f32), px(bounds.origin.y as f32)),
+                    size: size(px(bounds.size.width as f32), px(bounds.size.height as f32)),
+                },
+                "frame of display {}",
+                display.0
+            );
+            let frame = screen.frame;
+            let visible = screen.visible_frame;
+            assert!(
+                visible.left() >= frame.left()
+                    && visible.top() >= frame.top()
+                    && visible.right() <= frame.right()
+                    && visible.bottom() <= frame.bottom(),
+                "visible frame {:?} outside frame {:?}",
+                screen.visible_frame,
+                screen.frame
+            );
+            assert!(screen.backing_scale_factor >= 1.0);
+            assert!(!screen.localized_name.is_empty());
+            assert!(display.rotation() >= 0.0);
+        }
+        assert!(with_screen > 0);
     }
 }
