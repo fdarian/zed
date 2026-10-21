@@ -838,7 +838,20 @@ impl TextLayoutInner {
     /// Counted from the top of the box, which `text-box-trim` starts below the top of the lines.
     fn first_baseline(&self) -> Option<Pixels> {
         let line = self.lines.first()?;
-        Some(line.rows(self.line_height).first()?.baseline - self.trim_top)
+        Some(self.in_layout_unit(line.rows(self.line_height).first()?.baseline - self.trim_top))
+    }
+
+    /// A baseline counted from the top of a trimmed box is in the layout unit the height of the
+    /// box is (the cap height of 11px Inter is 8.0029, and the box is 8 tall), as Chrome's is: an
+    /// atomic inline takes it for its own baseline, and a fraction of a 64th more than the box has
+    /// puts the atomic a 64th above the line's baseline, which is a pixel when it is painted on a
+    /// tie.
+    fn in_layout_unit(&self, baseline: Pixels) -> Pixels {
+        if self.trim_top.0 == 0. && self.trim_bottom.0 == 0. {
+            baseline
+        } else {
+            Pixels(round_to_layout_unit(baseline.0))
+        }
     }
 
     /// Where the first line starts: above the unsnapped top of the bounds by the space the trim cut.
@@ -1438,7 +1451,7 @@ impl TextLayout {
         let row_top = rows[..rows.len() - 1]
             .iter()
             .fold(top, |top, row| top + row.height);
-        Some(row_top + last_row.baseline - element_state.trim_top)
+        Some(element_state.in_layout_unit(row_top + last_row.baseline - element_state.trim_top))
     }
 
     /// The baseline of the run that the glyph at the byte `index` is in, as a y
