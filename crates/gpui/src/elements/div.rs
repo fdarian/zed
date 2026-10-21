@@ -2385,6 +2385,32 @@ impl Div {
                 window.layout_scrollbar_size(request_layout.layout_id);
         }
         self.interactivity.content_end = Some(child_max - bounds.origin);
+        self.interactivity.scroll_extent = if self.interactivity.scroll_offset.is_some() {
+            let insets = window.layout_insets(request_layout.layout_id);
+            let unsnapped = window.layout_unsnapped_bounds(request_layout.layout_id);
+            let reach = window
+                .layout_unsnapped_scrollable_overflow(request_layout.layout_id)
+                .unwrap_or_default();
+            let scrollbar_size = self.interactivity.scrollbar_size;
+            Some(ScrollExtent {
+                content: size(
+                    reach.width - insets.border.left + insets.padding.right,
+                    reach.height - insets.border.top + insets.padding.bottom,
+                ),
+                client: size(
+                    unsnapped.size.width
+                        - insets.border.left
+                        - insets.border.right
+                        - scrollbar_size.width,
+                    unsnapped.size.height
+                        - insets.border.top
+                        - insets.border.bottom
+                        - scrollbar_size.height,
+                ),
+            })
+        } else {
+            None
+        };
 
         if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
             scroll_handle.scroll_to_active_item();
@@ -2693,6 +2719,15 @@ pub(crate) struct AriaProperties {
     pub(crate) node_hook: Option<std::rc::Rc<dyn Fn(&mut accesskit::Node)>>,
 }
 
+/// Both measured from the origin of the padding box, in logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScrollExtent {
+    /// The scrollable overflow including the padding after the children.
+    pub(crate) content: Size<Pixels>,
+    /// The padding box less the space reserved for scrollbars.
+    pub(crate) client: Size<Pixels>,
+}
+
 /// The interactivity struct. Powers all of the general-purpose
 /// interactivity in the `Div` element.
 #[derive(Default)]
@@ -2711,6 +2746,11 @@ pub struct Interactivity {
     /// sets it, so that its scroll range follows CSS scrollable overflow. Without it the range is
     /// `content_size` plus the padding.
     pub(crate) content_end: Option<Point<Pixels>>,
+    /// The scrollable extent and the client size from the boxes as layout computed them, before
+    /// they are snapped. The maximum scroll offset is measured from these, as Chrome does, so it
+    /// does not depend on where the box sits between two device pixels. A `Div` sets it; without
+    /// it the maximum is measured from `content_end` or `content_size`.
+    pub(crate) scroll_extent: Option<ScrollExtent>,
     /// The space a scroll container reserved for its scrollbars (see
     /// [`Window::layout_scrollbar_size`]). It is not part of the scrollport.
     pub(crate) scrollbar_size: Size<Pixels>,
@@ -3244,31 +3284,37 @@ impl Interactivity {
             let rem_size = window.rem_size();
             let padding = style.padding.to_pixels(bounds.size.into(), rem_size);
             let border = style.border_widths.to_pixels(rem_size);
-            // The far edge of the scrollable overflow, measured from the origin: the
-            // children's, plus the padding and border after them, which CSS adds to the
-            // overflow so the last child can scroll clear of the edge.
-            let far_edge = match self.content_end {
-                Some(content_end) => {
+            let scroll_max = match self.scroll_extent {
+                Some(extent) => {
+                    // Chrome measures both ends in device pixels, each rounded half up, so the
+                    // maximum does not depend on where the box sits. At scale 1 it is
+                    // `scrollHeight - clientHeight`.
+                    let scale_factor = window.scale_factor();
+                    let to_device = |pixels: Pixels| {
+                        Pixels(crate::util::round_half_up(pixels.0 * scale_factor) / scale_factor)
+                    };
                     point(
-                        content_end.x + padding.right + border.right,
-                        content_end.y + padding.bottom + border.bottom,
+                        to_device(extent.content.width) - to_device(extent.client.width),
+                        to_device(extent.content.height) - to_device(extent.client.height),
                     )
+                    .max(&Default::default())
                 }
+                // A scroller that is not a `Div` (a list) knows only the size of its content.
                 None => {
                     let padding_size =
                         size(padding.left + padding.right, padding.top + padding.bottom);
-                    (self.content_size + padding_size).into()
+                    let far_edge: Point<Pixels> = (self.content_size + padding_size).into();
+                    // The floating point values produced by Taffy and ours often vary
+                    // slightly after ~5 decimal places. This can lead to cases where after
+                    // subtracting these, the container becomes scrollable for less than
+                    // 0.00000x pixels. As we generally don't benefit from a precision that
+                    // high for the maximum scroll, we round the scroll max to 2 decimal
+                    // places here.
+                    (far_edge - Point::from(bounds.size - self.scrollbar_size))
+                        .map(round_to_two_decimals)
+                        .max(&Default::default())
                 }
             };
-            // The floating point values produced by Taffy and ours often vary
-            // slightly after ~5 decimal places. This can lead to cases where after
-            // subtracting these, the container becomes scrollable for less than
-            // 0.00000x pixels. As we generally don't benefit from a precision that
-            // high for the maximum scroll, we round the scroll max to 2 decimal
-            // places here.
-            let scroll_max = (far_edge - Point::from(bounds.size - self.scrollbar_size))
-                .map(round_to_two_decimals)
-                .max(&Default::default());
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
@@ -10735,6 +10781,117 @@ mod tests {
             activate(&window, cx);
             move_to(&window, cx, 50., 50.);
             assert_eq!(cx.active_cursor(), pointer_cursor(&window, cx));
+        }
+    }
+
+    /// The largest scroll offset against Chrome 155 (`scroll-extent-oracle.json` in the react
+    /// tests, which has every case of the table): the scrollable extent and the client size each
+    /// rounded half up to a device pixel, apart from where the scroller sits.
+    mod scroll_extent {
+        use super::*;
+        use crate::{Axis, ScrollHandle, TestApp};
+
+        struct Page {
+            handle: ScrollHandle,
+            axis: Axis,
+            /// The scroller's offset along the scrolled axis, from the wrapper's padding.
+            position: f32,
+            /// The scroller's size along the scrolled axis.
+            extent: f32,
+            /// The content's size along the scrolled axis.
+            content: f32,
+            padding_end: f32,
+        }
+
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let vertical = self.axis == Axis::Vertical;
+                let scroller = div()
+                    .id("scroller")
+                    .overflow_scroll()
+                    .track_scroll(&self.handle)
+                    .w(px(if vertical { 300. } else { self.extent }))
+                    .h(px(if vertical { self.extent } else { 40. }))
+                    .when(vertical, |scroller| scroller.pb(px(self.padding_end)))
+                    .when(!vertical, |scroller| scroller.pr(px(self.padding_end)))
+                    .child(
+                        div()
+                            .w(px(if vertical { 300. } else { self.content }))
+                            .h(px(if vertical { self.content } else { 20. })),
+                    );
+                div()
+                    .when(vertical, |wrapper| wrapper.pt(px(self.position)))
+                    .when(!vertical, |wrapper| wrapper.pl(px(self.position)))
+                    .child(scroller)
+            }
+        }
+
+        /// The maximum offset of a scroller at `position`, `extent` long, with `content`.
+        fn max_offset(
+            scale: f32,
+            axis: Axis,
+            position: f32,
+            extent: f32,
+            content: f32,
+            padding_end: f32,
+        ) -> f32 {
+            let mut app = TestApp::new();
+            app.set_window_scale_factor(scale);
+            let handle = ScrollHandle::new();
+            let mut window = app.open_window({
+                let handle = handle.clone();
+                move |_, _| Page { handle, axis, position, extent, content, padding_end }
+            });
+            window.draw();
+            let max = handle.max_offset();
+            // Scrolled as far as it goes, it is where the maximum says.
+            handle.set_offset(point(px(-1e6), px(-1e6)));
+            window.draw();
+            let offset = handle.offset();
+            let (max, offset) = match axis {
+                Axis::Vertical => (max.y, offset.y),
+                Axis::Horizontal => (max.x, offset.x),
+            };
+            assert_eq!(offset, -max, "scale {scale}, {axis:?}");
+            max.0
+        }
+
+        #[gpui::test]
+        fn a_scroller_between_two_pixels_scrolls_as_far_as_one_that_is_not() {
+            // 700.5 of content in 300: the snapped child is 700 tall at a top of 0.59375 (it
+            // spans pixels 1 to 701), which gave 400 where `scrollHeight - clientHeight` is 401.
+            for axis in [Axis::Vertical, Axis::Horizontal] {
+                for position in [0., 0.25, 0.6] {
+                    assert_eq!(max_offset(1., axis, position, 300., 700.5, 0.), 401.);
+                    assert_eq!(max_offset(1., axis, position, 300., 700.25, 0.), 400.);
+                }
+            }
+        }
+
+        #[gpui::test]
+        fn the_extent_and_the_client_size_each_round_half_up_at_scale_1() {
+            for axis in [Axis::Vertical, Axis::Horizontal] {
+                // 701 less a client of 301.
+                assert_eq!(max_offset(1., axis, 0.6, 300.5, 700.5, 0.), 400.);
+                // 700 less 301.
+                assert_eq!(max_offset(1., axis, 0.6, 300.5, 700.25, 0.), 399.);
+                // The padding after the content is part of the extent: 700 and a half is 701.
+                assert_eq!(max_offset(1., axis, 0.25, 300.5, 700., 0.5), 400.);
+            }
+        }
+
+        #[gpui::test]
+        fn the_maximum_is_in_device_pixels_at_scale_2() {
+            for axis in [Axis::Vertical, Axis::Horizontal] {
+                for position in [0., 0.25, 0.6] {
+                    // `scrollTo(0, scrollHeight - clientHeight)` stops short of these.
+                    assert_eq!(max_offset(2., axis, position, 300., 700.25, 0.), 400.5);
+                    assert_eq!(max_offset(2., axis, position, 300., 700.5, 0.), 400.5);
+                    assert_eq!(max_offset(2., axis, position, 300., 700.75, 0.), 401.);
+                    assert_eq!(max_offset(2., axis, position, 300.5, 700.25, 0.), 400.);
+                    assert_eq!(max_offset(2., axis, position, 300.5, 700., 0.), 399.5);
+                }
+            }
         }
     }
 
