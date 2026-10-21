@@ -318,6 +318,13 @@ pub struct Style {
     pub contain_inline_size: bool,
     /// Size containment in the block axis (`container-type: size`): the same for the height.
     pub contain_block_size: bool,
+    /// `contain-intrinsic-width`: the content-box width a contained inline axis has when its
+    /// size comes from its content, in place of the 0 of an empty box. `None` is 0. The padding
+    /// and border are added to it, and `min-` and `max-` clamp the sum. Without
+    /// `contain_inline_size` it has no effect.
+    pub contain_intrinsic_width: Option<Pixels>,
+    /// `contain-intrinsic-height`: the same for the block axis and `contain_block_size`.
+    pub contain_intrinsic_height: Option<Pixels>,
     /// Whether layout should also work out the width this element would have if its `width` were
     /// `auto`, in its real context. See [`Window::layout_natural_width`].
     pub measure_natural_width: bool,
@@ -1553,6 +1560,8 @@ impl Default for Style {
             item_is_replaced: false,
             contain_inline_size: false,
             contain_block_size: false,
+            contain_intrinsic_width: None,
+            contain_intrinsic_height: None,
             measure_natural_width: false,
             gap: Size::default(),
             // Alignment

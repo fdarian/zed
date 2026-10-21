@@ -108,7 +108,9 @@ fn cut_to_layout_unit(length: f32) -> f32 {
 
 /// `inputs` for a node with size containment: a contained axis that layout would size from the
 /// content is known to be the node's padding and border instead (clamped by `min-` and `max-`),
-/// which is what the node measures with no children. An axis the node is given, or that its
+/// which is what the node measures with no children, plus its `contain_intrinsic_size` in that
+/// axis as the size of the content box. Being the known size, it is also what the node
+/// contributes to the min-content and max-content sizes of its parent. An axis the node is given, or that its
 /// own definite size styles decide, is left to the layout algorithm.
 ///
 /// fdarian fork patch.
@@ -134,15 +136,16 @@ fn contained_inputs(style: &Style, mut inputs: LayoutInput) -> LayoutInput {
     let sized_by_content = |known: Option<f32>, styled: Option<f32>| {
         known.is_none() && (styled.is_none() || inputs.sizing_mode == SizingMode::ContentSize)
     };
-    let contained = |padding_border: f32, min: Option<f32>, max: Option<f32>| {
-        let floor = min.map_or(padding_border, |min| padding_border.max(min));
+    let contained = |padding_border: f32, intrinsic: Option<f32>, min: Option<f32>, max: Option<f32>| {
+        let content_based = padding_border + intrinsic.unwrap_or(0.0);
+        let floor = min.map_or(content_based, |min| content_based.max(min));
         Some(max.map_or(floor, |max| floor.min(max).max(padding_border)))
     };
     if style.contain_inline_size && sized_by_content(inputs.known_dimensions.width, styled_size.width) {
-        inputs.known_dimensions.width = contained(padding_border.width, min_size.width, max_size.width);
+        inputs.known_dimensions.width = contained(padding_border.width, style.contain_intrinsic_size.width, min_size.width, max_size.width);
     }
     if style.contain_block_size && sized_by_content(inputs.known_dimensions.height, styled_size.height) {
-        inputs.known_dimensions.height = contained(padding_border.height, min_size.height, max_size.height);
+        inputs.known_dimensions.height = contained(padding_border.height, style.contain_intrinsic_size.height, min_size.height, max_size.height);
     }
     inputs
 }
@@ -2518,6 +2521,168 @@ mod tests {
                     }
                     edit(&mut description, &mut persistent, &ids, &mut random);
                 }
+            }
+        }
+    }
+
+    // fdarian fork patch: `contain-intrinsic-size`.
+    mod contain_intrinsic_size {
+        use super::*;
+        use crate::geometry::Rect;
+        use crate::style::{BoxSizing, LengthPercentage};
+
+        fn edges(width: f32) -> Rect<LengthPercentage> {
+            Rect { left: length(width), right: length(width), top: length(width), bottom: length(width) }
+        }
+
+        /// A box with 5px of padding and 1px of border, contained in both axes, with a 200x100
+        /// child, so that anything but containment sizes it 212x112.
+        fn contained(intrinsic: Size<Option<f32>>) -> Style {
+            Style {
+                display: Display::Block,
+                contain_inline_size: true,
+                contain_block_size: true,
+                contain_intrinsic_size: intrinsic,
+                padding: edges(5.0),
+                border: edges(1.0),
+                ..Default::default()
+            }
+        }
+
+        fn wide_child(taffy: &mut TaffyTree<()>) -> NodeId {
+            taffy
+                .new_leaf(Style { size: Size { width: length(200.0), height: length(100.0) }, ..Default::default() })
+                .unwrap()
+        }
+
+        /// The size of `style` inside `parent`, with `Size::MAX_CONTENT` available to the parent.
+        fn size_in(parent: Style, style: Style) -> (Size<f32>, Size<f32>) {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let child = wide_child(&mut taffy);
+            let node = taffy.new_with_children(style, &[child]).unwrap();
+            let root = taffy.new_with_children(parent, &[node]).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            (taffy.layout(node).unwrap().size, taffy.layout(root).unwrap().size)
+        }
+
+        fn height(style: Style) -> f32 {
+            size_in(Style { display: Display::Block, size: Size { width: length(400.0), height: auto() }, ..Default::default() }, style)
+                .0
+                .height
+        }
+
+        fn intrinsic(width: Option<f32>, height: Option<f32>) -> Size<Option<f32>> {
+            Size { width, height }
+        }
+
+        #[test]
+        fn the_override_is_the_content_box_of_an_auto_axis() {
+            // 40 + 2 * 5 + 2 * 1, in both box sizings.
+            for box_sizing in [BoxSizing::BorderBox, BoxSizing::ContentBox] {
+                let style = Style { box_sizing, ..contained(intrinsic(None, Some(40.0))) };
+                assert_eq!(height(style), 52.0);
+            }
+        }
+
+        #[test]
+        fn without_an_override_the_axis_is_the_padding_and_border() {
+            assert_eq!(height(contained(Size::NONE)), 12.0);
+            let (size, _) = size_in(Style::default(), contained(Size::NONE));
+            assert_eq!(size, Size { width: 12.0, height: 12.0 });
+        }
+
+        #[test]
+        fn the_override_applies_only_to_a_contained_axis() {
+            let style = Style { contain_block_size: false, ..contained(intrinsic(Some(30.0), Some(40.0))) };
+            let (size, _) = size_in(Style { display: Display::Flex, ..Default::default() }, style);
+            assert_eq!(size, Size { width: 42.0, height: 112.0 });
+        }
+
+        #[test]
+        fn an_auto_width_in_a_shrink_to_fit_parent_is_the_override_plus_padding_and_border() {
+            let (size, parent) = size_in(
+                Style { display: Display::Flex, ..Default::default() },
+                contained(intrinsic(Some(30.0), None)),
+            );
+            assert_eq!(size.width, 42.0);
+            assert_eq!(parent.width, 42.0, "the parent sizes itself by what the box contributes");
+            // The block axis has no override.
+            assert_eq!(size.height, 12.0);
+        }
+
+        #[test]
+        fn min_and_max_size_clamp_the_override() {
+            for (box_sizing, extra) in [(BoxSizing::BorderBox, 0.0), (BoxSizing::ContentBox, 12.0)] {
+                let with = |min: Dimension, max: Dimension| {
+                    height(Style {
+                        box_sizing,
+                        min_size: Size { width: auto(), height: min },
+                        max_size: Size { width: auto(), height: max },
+                        ..contained(intrinsic(None, Some(40.0)))
+                    })
+                };
+                assert_eq!(with(length(70.0), auto()), 70.0 + extra);
+                assert_eq!(with(auto(), length(30.0)), 30.0 + extra);
+                assert_eq!(with(length(10.0), length(100.0)), 52.0, "a range that holds the override leaves it");
+            }
+        }
+
+        #[test]
+        fn a_definite_size_ignores_the_override() {
+            for (box_sizing, extra) in [(BoxSizing::BorderBox, 0.0), (BoxSizing::ContentBox, 12.0)] {
+                let style = Style {
+                    box_sizing,
+                    size: Size { width: auto(), height: length(100.0) },
+                    ..contained(intrinsic(None, Some(40.0)))
+                };
+                assert_eq!(height(style), 100.0 + extra);
+            }
+        }
+
+        #[test]
+        fn a_flex_item_contributes_the_override_to_its_container() {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let child = wide_child(&mut taffy);
+            let item = |taffy: &mut TaffyTree<()>, intrinsic: Size<Option<f32>>| {
+                taffy
+                    .new_with_children(Style { padding: Rect::zero(), border: Rect::zero(), ..contained(intrinsic) }, &[child])
+                    .unwrap()
+            };
+            let overridden = item(&mut taffy, intrinsic(Some(80.0), None));
+            let fixed = taffy
+                .new_leaf(Style { size: Size { width: length(50.0), height: length(10.0) }, flex_shrink: 0.0, ..Default::default() })
+                .unwrap();
+            let row = |width: Dimension| Style { display: Display::Flex, size: Size { width, height: auto() }, ..Default::default() };
+            let root = taffy.new_with_children(row(length(600.0)), &[overridden, fixed]).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            assert_eq!(taffy.layout(overridden).unwrap().size.width, 80.0);
+            assert_eq!(taffy.layout(fixed).unwrap().location.x, 80.0);
+
+            // The automatic minimum size of a flex item is its min-content size, the override.
+            taffy.set_style(root, row(length(100.0))).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            assert_eq!(taffy.layout(overridden).unwrap().size.width, 80.0);
+            assert_eq!(taffy.layout(fixed).unwrap().location.x, 80.0);
+
+            // Shrink-to-fit root.
+            taffy.set_style(root, row(auto())).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            assert_eq!(taffy.layout(root).unwrap().size.width, 130.0);
+        }
+
+        #[test]
+        fn flex_and_grid_containers_are_empty_boxes_with_the_override_as_content() {
+            for display in [Display::Flex, Display::Grid] {
+                let (size, _) = size_in(
+                    Style { display: Display::Flex, ..Default::default() },
+                    Style { display, ..contained(intrinsic(Some(40.0), Some(30.0))) },
+                );
+                assert_eq!(size, Size { width: 52.0, height: 42.0 }, "{display:?}");
+                let (size, _) = size_in(
+                    Style { display: Display::Flex, ..Default::default() },
+                    Style { display, ..contained(Size::NONE) },
+                );
+                assert_eq!(size, Size { width: 12.0, height: 12.0 }, "{display:?}");
             }
         }
     }

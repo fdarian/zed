@@ -2214,6 +2214,10 @@ impl ToTaffy<taffy::style::Style> for Style {
             item_is_replaced: self.item_is_replaced,
             contain_inline_size: self.contain_inline_size,
             contain_block_size: self.contain_block_size,
+            contain_intrinsic_size: TaffySize {
+                width: self.contain_intrinsic_width.map(|width| truncate_to_layout_unit(width.0 * scale_factor)),
+                height: self.contain_intrinsic_height.map(|height| truncate_to_layout_unit(height.0 * scale_factor)),
+            },
             margin: self.margin.to_taffy(rem_size, scale_factor, calcs),
             padding: self.padding.to_taffy(rem_size, scale_factor, calcs),
             border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor, self.collapsed_border),

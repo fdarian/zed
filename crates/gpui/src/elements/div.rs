@@ -6077,6 +6077,53 @@ mod tests {
         assert_eq!(sized.size, size(px(100.), px(24.)));
     }
 
+    struct IntrinsicItems;
+
+    impl Render for IntrinsicItems {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let item = |name: &'static str, inline: bool, block: bool| {
+                let mut item = div()
+                    .debug_selector(move || name.into())
+                    .p(px(10.))
+                    .border_2()
+                    .child(div().w(px(200.)).h(px(50.)));
+                item.style().contain_inline_size = Some(inline);
+                item.style().contain_block_size = Some(block);
+                item.style().contain_intrinsic_width = Some(px(30.));
+                item.style().contain_intrinsic_height = Some(px(40.));
+                item
+            };
+            div()
+                .w(px(600.))
+                .flex()
+                .items_start()
+                .child(item("both", true, true))
+                .child(item("inline", true, false))
+                .child(item("block", false, true))
+                .child(item("none", false, false))
+        }
+    }
+
+    #[gpui::test]
+    fn contain_intrinsic_size_replaces_the_content_box_of_a_contained_axis(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| IntrinsicItems);
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let mut bounds = |selector: &'static str| {
+            cx.update_window(window.into(), |_, window, _| {
+                window.rendered_frame.debug_bounds.get(selector).copied()
+            })
+            .unwrap()
+            .unwrap_or_else(|| panic!("{selector} was not rendered"))
+        };
+        // 24px of padding and border on each side of the override.
+        assert_eq!(bounds("both").size, size(px(54.), px(64.)));
+        assert_eq!(bounds("inline").size, size(px(54.), px(74.)), "the block axis is not contained");
+        assert_eq!(bounds("block").size, size(px(224.), px(64.)), "the inline axis is not contained");
+        assert_eq!(bounds("none").size, size(px(224.), px(74.)));
+        assert_eq!(bounds("inline").origin.x, px(54.), "a flex row sizes the item by the override");
+    }
+
     struct ContainedMargins {
         contained: bool,
     }

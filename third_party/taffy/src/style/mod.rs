@@ -470,6 +470,11 @@ pub struct Style<S: CheapCloneStr = DefaultCheapStr> {
     pub contain_inline_size: bool,
     /// `contain: block-size`: the same for the height.
     pub contain_block_size: bool,
+    // fdarian fork patch: CSS `contain-intrinsic-size`.
+    /// `contain-intrinsic-size`: the content-box size a contained axis has when it is sized by
+    /// its content, in place of the 0 of an empty box. `None` is 0. Padding, border and scrollbar
+    /// are added on top, and `min-`/`max-` clamp the sum. An axis that is not contained ignores it.
+    pub contain_intrinsic_size: Size<Option<f32>>,
     /// Should size styles apply to the content box or the border box of the node
     pub box_sizing: BoxSizing,
     /// Sets the direction of text, table and grid columns, and horizontal overflow.
@@ -634,6 +639,7 @@ impl<S: CheapCloneStr> Style<S> {
         item_is_replaced: false,
         contain_inline_size: false,
         contain_block_size: false,
+        contain_intrinsic_size: Size { width: None, height: None },
         box_sizing: BoxSizing::BorderBox,
         direction: Direction::Ltr,
         overflow: Point { x: Overflow::Visible, y: Overflow::Visible },
@@ -1342,6 +1348,7 @@ mod tests {
             item_is_replaced: false,
             contain_inline_size: false,
             contain_block_size: false,
+            contain_intrinsic_size: Size { width: None, height: None },
             box_sizing: Default::default(),
             #[cfg(feature = "float_layout")]
             float: Default::default(),
@@ -1490,12 +1497,12 @@ mod tests {
         assert_type_size::<GridTemplateComponent<String>>(56);
         assert_type_size::<GridPlacement<String>>(32);
         assert_type_size::<Line<GridPlacement<String>>>(64);
-        assert_type_size::<Style<String>>(576);
+        assert_type_size::<Style<String>>(592);
 
         // String-type dependent (Arc<str>)
         assert_type_size::<GridTemplateComponent<Arc<str>>>(56);
         assert_type_size::<GridPlacement<Arc<str>>>(24);
         assert_type_size::<Line<GridPlacement<Arc<str>>>>(48);
-        assert_type_size::<Style<Arc<str>>>(544);
+        assert_type_size::<Style<Arc<str>>>(560);
     }
 }
