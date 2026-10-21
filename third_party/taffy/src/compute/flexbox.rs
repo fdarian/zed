@@ -12,6 +12,7 @@ use crate::tree::{LayoutFlexboxContainer, LayoutPartialTreeExt, NodeId};
 use crate::util::debug::debug_log;
 use crate::util::sys::{f32_max, new_vec_with_capacity, Vec};
 use crate::util::MaybeMath;
+use crate::util::{cut_to_layout_unit, round_to_layout_unit};
 use crate::util::{MaybeResolve, ResolveOrZero};
 use crate::{BoxGenerationMode, BoxSizing, Direction, RequestedAxis};
 
@@ -1348,21 +1349,34 @@ fn resolve_flexible_lengths(line: &mut FlexLine, constants: &AlgoConstants) {
 
         let mut unfrozen: Vec<&mut FlexItem> = line.items.iter_mut().filter(|child| !child.frozen).collect();
 
+        // fdarian fork patch: Blink resets what an unfrozen item had from an earlier pass to its hypothetical size.
+        for child in &mut unfrozen {
+            child.target_size.set_main(constants.dir, child.hypothetical_inner_size.main(constants.dir));
+        }
+
         let (sum_flex_grow, sum_flex_shrink): (f32, f32) =
             unfrozen.iter().fold((0.0, 0.0), |(flex_grow, flex_shrink), item| {
                 (flex_grow + item.flex_grow, flex_shrink + item.flex_shrink)
             });
 
-        let free_space = if growing && sum_flex_grow < 1.0 {
-            (initial_free_space * sum_flex_grow - total_main_axis_gap)
-                .maybe_min(constants.node_inner_size.main(constants.dir).maybe_sub(used_space))
-        } else if shrinking && sum_flex_shrink < 1.0 {
-            (initial_free_space * sum_flex_shrink - total_main_axis_gap)
-                .maybe_max(constants.node_inner_size.main(constants.dir).maybe_sub(used_space))
+        let remaining_free_space = constants
+            .node_inner_size
+            .main(constants.dir)
+            .maybe_sub(used_space)
+            .unwrap_or(used_flex_factor - used_space);
+        // fdarian fork patch: Blink's free space is a LayoutUnit, and when the flex factors of the unfrozen items sum
+        // to less than one it is the initial free space times that sum, cut to a LayoutUnit, if that is smaller. The gaps
+        // are already in the initial free space.
+        let free_space = if growing && sum_flex_grow > 0.0 && sum_flex_grow < 1.0 {
+            let fractional = cut_to_layout_unit(initial_free_space * sum_flex_grow);
+            if fractional.abs() < remaining_free_space.abs() { fractional } else { remaining_free_space }
+        } else if shrinking && sum_flex_shrink > 0.0 && sum_flex_shrink < 1.0 {
+            let fractional = cut_to_layout_unit(initial_free_space * sum_flex_shrink);
+            if fractional.abs() < remaining_free_space.abs() { fractional } else { remaining_free_space }
         } else {
-            (constants.node_inner_size.main(constants.dir).maybe_sub(used_space))
-                .unwrap_or(used_flex_factor - used_space)
+            remaining_free_space
         };
+        let free_space = round_to_layout_unit(free_space);
 
         // c. Distribute free space proportional to the flex factors.
         //    - If the remaining free space is zero
@@ -1383,26 +1397,32 @@ fn resolve_flexible_lengths(line: &mut FlexLine, constants: &AlgoConstants) {
         //    - Otherwise
         //        Do Nothing
 
-        if free_space.is_normal() {
-            if growing && sum_flex_grow > 0.0 {
-                for child in &mut unfrozen {
-                    child
-                        .target_size
-                        .set_main(constants.dir, child.flex_basis + free_space * (child.flex_grow / sum_flex_grow));
-                }
-            } else if shrinking && sum_flex_shrink > 0.0 {
-                let sum_scaled_shrink_factor: f32 =
-                    unfrozen.iter().map(|child| child.inner_flex_basis * child.flex_shrink).sum();
+        // fdarian fork patch: the shares are those of Blink's `LineFlexer::ResolveFlexibleLengths`. Each item has the
+        // fraction its weight is of the weights up to and including it, and the items are walked from the last: it takes
+        // that fraction of what is left of the free space, rounded to a LayoutUnit (half away from zero), and the first
+        // takes all that is left. The last items get the rounding of the earlier ones, so the shares add up to the free
+        // space exactly. An item with no weight takes nothing, and a free space of the wrong sign for the used factor
+        // is not distributed.
+        if (growing && free_space > 0.0) || (shrinking && free_space < 0.0) {
+            let mut fractions: Vec<f64> = Vec::with_capacity(unfrozen.len());
+            let mut total_weight = 0.0f64;
+            for child in &unfrozen {
+                let weight =
+                    if growing { child.flex_grow as f64 } else { child.flex_shrink as f64 * child.inner_flex_basis as f64 };
+                total_weight += weight;
+                fractions.push(weight / total_weight);
+            }
 
-                if sum_scaled_shrink_factor > 0.0 {
-                    for child in &mut unfrozen {
-                        let scaled_shrink_factor = child.inner_flex_basis * child.flex_shrink;
-                        child.target_size.set_main(
-                            constants.dir,
-                            child.flex_basis + free_space * (scaled_shrink_factor / sum_scaled_shrink_factor),
-                        )
-                    }
-                }
+            let mut left = free_space;
+            for (child, fraction) in unfrozen.iter_mut().zip(fractions).rev() {
+                let share = if fraction == 1.0 {
+                    left
+                } else {
+                    let share = left as f64 * fraction;
+                    if share.is_finite() { (share * 64.0).round() as f32 / 64.0 } else { 0.0 }
+                };
+                left -= share;
+                child.target_size.set_main(constants.dir, child.flex_basis + share);
             }
         }
 

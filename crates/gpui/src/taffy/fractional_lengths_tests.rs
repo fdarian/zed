@@ -785,6 +785,141 @@ const CALC_REM: Case = [
     ],
 ];
 
+/// A flex row of `width` px whose items are `(grow, shrink, basis, min width)`, named `a`, `b`, ... with `gap`.
+fn flex_row(
+    width: f32,
+    gap: f32,
+    items: &'static [(f32, f32, f32, Option<f32>)],
+) -> impl Fn(&Found) -> AnyElement {
+    move |found| {
+        let row = marked(div().flex().w(px(width)).gap(px(gap)), found, "o");
+        items
+            .iter()
+            .zip(["a", "b", "c", "d", "e", "f", "g"])
+            .fold(row, |row, (item, name)| {
+                let mut element = marked(div().h(px(10.)), found, name)
+                    .flex_grow(item.0)
+                    .flex_shrink(item.1)
+                    .flex_basis(px(item.2));
+                if let Some(min) = item.3 {
+                    element = element.min_w(px(min));
+                }
+                row.child(element)
+            })
+            .into_any_element()
+    }
+}
+
+#[test]
+fn three_items_of_50_5_shrink_into_100_by_the_rounded_fractions_of_what_is_left() {
+    // Chrome gives the last items the rounding of the earlier ones: 1098, 1099 and 1099 64ths of a
+    // device pixel off the 3232 each at scale 1, 2197, 2198 and 2197 of 6464 at scale 2.
+    const ITEMS: &[(f32, f32, f32, Option<f32>)] = &[(0., 1., 50.5, None); 3];
+    matches_chrome(
+        &[
+            &[
+                ("a", [0.0, 0.0, 33.34375, 10.0], None),
+                ("b", [33.34375, 0.0, 33.328125, 10.0], None),
+                ("c", [66.671875, 0.0, 33.328125, 10.0], None),
+            ],
+            &[
+                ("a", [0.0, 0.0, 33.3359375, 10.0], None),
+                ("b", [33.3359375, 0.0, 33.328125, 10.0], None),
+                ("c", [66.6640625, 0.0, 33.3359375, 10.0], None),
+            ],
+        ],
+        flex_row(100., 0., ITEMS),
+    );
+}
+
+#[test]
+fn seven_items_grow_into_100_by_the_rounded_fractions_of_what_is_left() {
+    const ITEMS: &[(f32, f32, f32, Option<f32>)] = &[(1., 1., 0., None); 7];
+    matches_chrome(
+        &[
+            &[
+                ("a", [0.0, 0.0, 14.28125, 10.0], None),
+                ("b", [14.28125, 0.0, 14.296875, 10.0], None),
+                ("c", [28.578125, 0.0, 14.28125, 10.0], None),
+                ("d", [42.859375, 0.0, 14.296875, 10.0], None),
+                ("e", [57.15625, 0.0, 14.28125, 10.0], None),
+                ("f", [71.4375, 0.0, 14.28125, 10.0], None),
+                ("g", [85.71875, 0.0, 14.28125, 10.0], None),
+            ],
+            &[
+                ("a", [0.0, 0.0, 14.28125, 10.0], None),
+                ("b", [14.28125, 0.0, 14.2890625, 10.0], None),
+                ("c", [28.5703125, 0.0, 14.28125, 10.0], None),
+                ("d", [42.8515625, 0.0, 14.2890625, 10.0], None),
+                ("e", [57.140625, 0.0, 14.28125, 10.0], None),
+                ("f", [71.421875, 0.0, 14.2890625, 10.0], None),
+                ("g", [85.7109375, 0.0, 14.2890625, 10.0], None),
+            ],
+        ],
+        flex_row(100., 0., ITEMS),
+    );
+}
+
+#[test]
+fn unequal_shrink_factors_and_an_item_that_hits_its_min_width_share_as_chrome_does() {
+    const UNEQUAL: &[(f32, f32, f32, Option<f32>)] =
+        &[(0., 3., 40.3, None), (0., 1., 25.7, None), (0., 2., 33.1, None)];
+    matches_chrome(
+        &[
+            &[
+                ("a", [0.0, 0.0, 24.28125, 10.0], None),
+                ("b", [24.28125, 0.0, 22.28125, 10.0], None),
+                ("c", [46.5625, 0.0, 24.328125, 10.0], None),
+            ],
+            &[
+                ("a", [0.0, 0.0, 24.28125, 10.0], None),
+                ("b", [24.28125, 0.0, 22.2890625, 10.0], None),
+                ("c", [46.5703125, 0.0, 24.328125, 10.0], None),
+            ],
+        ],
+        flex_row(70.9, 0., UNEQUAL),
+    );
+    // `a` is frozen at its min-width after the first pass, `b` and `c` share what is left
+    const MIN: &[(f32, f32, f32, Option<f32>)] =
+        &[(0., 1., 50.5, Some(45.3)), (0., 1., 50.5, None), (0., 1., 50.5, None)];
+    matches_chrome(
+        &[
+            &[
+                ("a", [0.0, 0.0, 45.296875, 10.0], None),
+                ("b", [45.296875, 0.0, 37.703125, 10.0], None),
+                ("c", [83.0, 0.0, 37.6875, 10.0], None),
+            ],
+            &[
+                ("a", [0.0, 0.0, 45.296875, 10.0], None),
+                ("b", [45.296875, 0.0, 37.703125, 10.0], None),
+                ("c", [83.0, 0.0, 37.6953125, 10.0], None),
+            ],
+        ],
+        flex_row(120.7, 0., MIN),
+    );
+}
+
+#[test]
+fn flex_factors_that_sum_to_less_than_one_share_that_part_of_the_free_space_less_the_gaps_once() {
+    // Free space 100.3 - 40.2 - 3.3 = 56.8: 30% of it for `a` and 20% for `b`, not 56.8 less the gap again
+    const GROW: &[(f32, f32, f32, Option<f32>)] = &[(0.3, 1., 20.1, None), (0.2, 1., 20.1, None)];
+    matches_chrome(
+        &[
+            &[("a", [0.0, 0.0, 37.140625, 10.0], None), ("b", [40.4375, 0.0, 31.453125, 10.0], None)],
+            &[("a", [0.0, 0.0, 37.140625, 10.0], None), ("b", [40.4375, 0.0, 31.453125, 10.0], None)],
+        ],
+        flex_row(100.3, 3.3, GROW),
+    );
+    const SHRINK: &[(f32, f32, f32, Option<f32>)] = &[(0., 0.3, 60.3, None), (0., 0.2, 60.3, None)];
+    matches_chrome(
+        &[
+            &[("a", [0.0, 0.0, 53.21875, 10.0], None), ("b", [56.515625, 0.0, 55.578125, 10.0], None)],
+            &[("a", [0.0, 0.0, 53.21875, 10.0], None), ("b", [56.515625, 0.0, 55.578125, 10.0], None)],
+        ],
+        flex_row(100.3, 3.3, SHRINK),
+    );
+}
+
 const CALC_FRACTION: Case = [
     &[
         ("o", [0.0, 0.0, 101.0, 61.0], None),

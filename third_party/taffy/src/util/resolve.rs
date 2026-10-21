@@ -13,6 +13,12 @@ pub(crate) fn cut_to_layout_unit(length: f32) -> f32 {
     (length / UNIT).trunc() * UNIT
 }
 
+/// `length` rounded to the nearest 1/64, halves away from zero (`LayoutUnit::FromFloatRound`).
+pub(crate) fn round_to_layout_unit(length: f32) -> f32 {
+    const UNIT: f32 = 1.0 / 64.0;
+    (length / UNIT).round() * UNIT
+}
+
 /// A percentage of `basis` as Blink resolves it (`MinimumValueForLength`): `basis * fraction` in f32,
 /// cut toward zero to 1/64, so `25%` of `101.296875` is `25.3125`.
 pub(crate) fn resolve_percentage(fraction: f32, basis: f32) -> f32 {
