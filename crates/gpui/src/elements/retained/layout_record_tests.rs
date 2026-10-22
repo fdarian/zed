@@ -8,6 +8,7 @@ use super::tests::{SceneView, counters, draw, open};
 use super::*;
 use crate::{
     AnyWindowHandle, AppContext as _, InteractiveElement, ParentElement, RetainedCounters, Styled, TestAppContext, div, px,
+    util::FluentBuilder as _,
 };
 use std::cell::RefCell;
 
@@ -94,6 +95,16 @@ impl Cards {
     /// With the first `shown` cards in the page when it is drawn. A card that is `hooked` has a
     /// listener that republishes its boxes.
     fn new(cx: &mut TestAppContext, hooked: bool, shown: usize) -> Self {
+        Self::build(cx, hooked, shown, false)
+    }
+
+    /// Each card has a positioned box inside it, which the stacking context around the cards is
+    /// handed.
+    fn lifting(cx: &mut TestAppContext, shown: usize) -> Self {
+        Self::build(cx, true, shown, true)
+    }
+
+    fn build(cx: &mut TestAppContext, hooked: bool, shown: usize, lifted: bool) -> Self {
         let registry = Registry::default();
         let builds = Rc::new(Cell::new(0));
         let keys = Rc::new(RefCell::new(vec![1; Self::CARDS]));
@@ -147,6 +158,7 @@ impl Cards {
                                 .child(
                                     div()
                                         .id(("inner", index))
+                                        .when(lifted, |inner| inner.relative())
                                         .w(px(60.))
                                         .h(px(20.))
                                         .bg(crate::blue())
@@ -181,6 +193,7 @@ impl Cards {
                 };
                 div()
                     .id("root")
+                    .when(lifted, |root| root.stacking_context())
                     .size_full()
                     .flex()
                     .flex_col()
@@ -255,6 +268,13 @@ fn published_by_building(cx: &mut TestAppContext, spacer: f32) -> Vec<String> {
     passes.pop().unwrap().published
 }
 
+fn published_by_building_lifted(cx: &mut TestAppContext, spacer: f32) -> Vec<String> {
+    let cards = Cards::lifting(cx, Cards::CARDS);
+    let keys = cards.keys.clone();
+    let rekey: Change = Box::new(move |_| keys.borrow_mut().iter_mut().for_each(|key| *key += 1000));
+    cards.passes(cx, vec![rekey, cards.spacer(spacer)]).pop().unwrap().published
+}
+
 #[gpui::test]
 fn a_subtree_a_pass_that_only_lays_out_builds_is_skipped_by_the_next_pass_that_does(cx: &mut TestAppContext) {
     let cards = Cards::new(cx, true, 0);
@@ -273,6 +293,45 @@ fn a_subtree_a_pass_that_only_lays_out_builds_is_skipped_by_the_next_pass_that_d
     }
     assert_eq!(passes[5].published.len(), 2 * Cards::CARDS);
     assert_eq!(passes[0].published, published_by_building(cx, 0.));
+}
+
+#[gpui::test]
+fn a_subtree_that_hands_a_box_to_the_stacking_context_around_it_is_skipped_as_well(cx: &mut TestAppContext) {
+    let cards = Cards::lifting(cx, 0);
+    draw(cards.window, cx);
+    cards.shown.set(Cards::CARDS);
+
+    let passes = cards.passes(cx, vec![nothing(), cards.bar_up(), cards.bar_up(), cards.key(1, 2), cards.bar_up(), cards.spacer(17.), cards.bar_up()]);
+    assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [Cards::CARDS, 0, 0, 1, 0, Cards::CARDS, 0]);
+    assert_eq!(passes[0].counters.layout_records, Cards::CARDS as u64, "the lifted box does not refuse the record");
+    assert_eq!(passes[0].counters.non_reusable(NonReusable::Lift), 0);
+    assert_eq!(passes[1].counters.layout_replays, passes[0].counters.layout_replays + Cards::CARDS as u64);
+    for pass in &passes[..5] {
+        assert_eq!(pass.published, passes[0].published, "the boxes of the lifted content are published again");
+    }
+    assert_eq!(passes[0].published.len(), 2 * Cards::CARDS);
+    assert_eq!(passes[6].published, passes[5].published);
+    assert_eq!(passes[5].published, published_by_building_lifted(cx, 17.));
+}
+
+#[gpui::test]
+fn a_draw_builds_a_subtree_with_a_lifted_box_and_records_it_as_before_the_layout_record(cx: &mut TestAppContext) {
+    let cards = Cards::lifting(cx, 0);
+    draw(cards.window, cx);
+    cards.shown.set(Cards::CARDS);
+
+    let builds = cards.builds.get();
+    let passes = cards.passes(cx, vec![nothing(), cards.bar_up()]);
+    assert_eq!(passes[1].built, 0);
+    assert_eq!(
+        cards.builds.get(),
+        builds + 2 * Cards::CARDS,
+        "the cards the passes built and the cards the draw after them built: it does not use a layout record"
+    );
+    let drawn = counters(cards.window, cx);
+    assert_eq!(drawn.total_non_reusable(), 0, "{drawn:?}");
+    draw(cards.window, cx);
+    assert_eq!(counters(cards.window, cx).replays, drawn.replays + Cards::CARDS as u64, "the frame recorded them, hole and all");
 }
 
 #[gpui::test]

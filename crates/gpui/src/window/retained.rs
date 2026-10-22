@@ -1461,8 +1461,14 @@ impl Window {
     /// What the prepaint since `mark` did.
     pub(crate) fn finish_layout_recording(&self, mark: LayoutMark) -> LayoutOutcome {
         let effects = self.effects();
+        // A pass that only lays out paints nothing, so where the subtree's lifted boxes went in
+        // the stacking context around it is not something a skip has to repeat: their layout
+        // publications are part of the subtree's own tape. Only a layout pass skips with this
+        // record: what `Lift` means for a recording of a drawn frame stays with
+        // `finish_prepaint_recording`.
+        let repeatable = !(1u16 << NonReusable::Lift.index());
         LayoutOutcome {
-            reason: first_reason(mark.effects.reasons(&effects)),
+            reason: first_reason(mark.effects.reasons(&effects) & repeatable),
             published: mark.effects.published(&effects),
             holds_painted: mark.painted_skips != self.retained.layout_painted_skips,
         }
