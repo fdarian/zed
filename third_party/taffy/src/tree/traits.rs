@@ -373,6 +373,7 @@ pub(crate) trait LayoutPartialTreeExt: LayoutPartialTree {
                 axis: axis.into(),
                 run_mode: RunMode::ComputeSize,
                 vertical_margins_are_collapsible,
+                height_from_containment: false,
             },
         )
         .size
@@ -401,6 +402,7 @@ pub(crate) trait LayoutPartialTreeExt: LayoutPartialTree {
                 axis: RequestedAxis::Both,
                 run_mode: RunMode::ComputeSize,
                 vertical_margins_are_collapsible,
+                height_from_containment: false,
             },
         )
         .size
@@ -427,6 +429,7 @@ pub(crate) trait LayoutPartialTreeExt: LayoutPartialTree {
                 axis: RequestedAxis::Both,
                 run_mode: RunMode::PerformLayout,
                 vertical_margins_are_collapsible,
+                height_from_containment: false,
             },
         )
     }

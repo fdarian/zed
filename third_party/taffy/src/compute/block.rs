@@ -490,7 +490,13 @@ fn compute_inner(
         let derived = known_dimensions.maybe_apply_aspect_ratio(aspect_ratio).maybe_clamp(min_size, max_size);
         Size { width: known_dimensions.width.or(derived.width), height: known_dimensions.height.or(derived.height) }
     };
-    let container_content_box_size = known_dimensions.maybe_sub(content_box_inset.sum_axes());
+    // fdarian fork patch: the height size containment gave is the node's, not its children's
+    // percentage base. A height that is authored or given by the parent still is.
+    let percentage_known_dimensions = Size {
+        width: known_dimensions.width,
+        height: if inputs.height_from_containment { None } else { known_dimensions.height },
+    };
+    let container_content_box_size = percentage_known_dimensions.maybe_sub(content_box_inset.sum_axes());
 
     let overflow = style.overflow();
     let is_scroll_container = overflow.x.is_scroll_container() || overflow.y.is_scroll_container();
@@ -548,7 +554,7 @@ fn compute_inner(
     }
 
     let container_percentage_resolution_height =
-        known_dimensions.height.or(size.height.maybe_max(min_size.height)).or(min_size.height);
+        percentage_known_dimensions.height.or(size.height.maybe_max(min_size.height)).or(min_size.height);
 
     // 3. Perform final item layout and return content height
     let resolved_content_box_inset = padding + border + scrollbar_gutter;
@@ -1141,6 +1147,7 @@ fn perform_final_layout_on_in_flow_children(
                 parent_size,
                 available_space: available_space.map_width(|_| AvailableSpace::Definite(stretch_width)),
                 vertical_margins_are_collapsible: if item.is_in_same_bfc { Line::TRUE } else { Line::FALSE },
+                height_from_containment: false,
             };
 
             #[cfg(feature = "float_layout")]

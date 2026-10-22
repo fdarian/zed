@@ -289,6 +289,7 @@ mod tests {
             parent_size: Size { width: Some(160.0), height: None },
             available_space: Size { width: AvailableSpace::Definite(100.0), height: AvailableSpace::MaxContent },
             vertical_margins_are_collapsible: Line::FALSE,
+            height_from_containment: false,
         }
     }
 

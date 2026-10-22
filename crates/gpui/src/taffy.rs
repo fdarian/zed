@@ -213,9 +213,12 @@ struct NodeMeta {
     measured: bool,
     /// The pass that last gave the node a width to fill the window with, if any.
     stretched_in_pass: u64,
-    /// The node is [`crate::Position::Static`]. It lays out as taffy `Relative` but is not a
-    /// containing block, which taffy has no way to say.
+    /// The node is [`crate::Position::Static`] and has no layout containment. It lays out as taffy
+    /// `Relative` but is not a containing block, which taffy has no way to say.
     is_static: bool,
+    /// The node has layout containment, which makes it the containing block of the `fixed` boxes
+    /// below it, as well as of the absolute ones.
+    contains_layout: bool,
     /// The node's subtree belongs to another layer (deferred and anchored elements), so it is
     /// not part of the scrollable overflow of the scrollers it sits in.
     detached: bool,
@@ -1086,7 +1089,8 @@ impl TaffyLayoutEngine {
             // `original`, which the keywords can replace, so the request is kept on its own.
             requested: escapable.is_some().then(|| Box::new(taffy_style.clone())),
             natural: style.measure_natural_width,
-            is_static: style.position == crate::Position::Static,
+            is_static: style.position == crate::Position::Static && !style.contain_layout,
+            contains_layout: style.contain_layout,
             // A new node has no extent kept, and its parent changed to get it: only a node found
             // again says what it was.
             was_detached: true,
@@ -2215,6 +2219,7 @@ impl ToTaffy<taffy::style::Style> for Style {
             item_is_replaced: self.item_is_replaced,
             contain_inline_size: self.contain_inline_size,
             contain_block_size: self.contain_block_size,
+            contain_layout: self.contain_layout,
             contain_intrinsic_size: TaffySize {
                 width: self.contain_intrinsic_width.map(|width| truncate_to_layout_unit(width.0 * scale_factor)),
                 height: self.contain_intrinsic_height.map(|height| truncate_to_layout_unit(height.0 * scale_factor)),

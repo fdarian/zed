@@ -1230,6 +1230,9 @@ pub(crate) struct TooltipRequest {
 pub(crate) struct PositionedFrame {
     content_mask: ContentMask<Pixels>,
     element_offset: Point<Pixels>,
+    /// The content mask and element offset of the nearest box with layout containment, itself
+    /// included, which a `position: fixed` descendant is placed in. `None`: the viewport.
+    fixed: Option<(ContentMask<Pixels>, Point<Pixels>)>,
 }
 
 /// What an element that is prepainted or painted away from its place in the tree still needs
@@ -5701,10 +5704,29 @@ impl Window {
     /// element offset are what an absolutely positioned descendant escapes to. Call it inside the
     /// element's own overflow mask and scroll offset.
     pub(crate) fn with_positioned_frame<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.with_frame(false, f)
+    }
+
+    /// [`Self::with_positioned_frame`] for an element that may also have layout containment
+    /// (`contains_layout`), which makes the frame the one that `position: fixed` descendants are
+    /// placed in.
+    pub(crate) fn with_frame<R>(
+        &mut self,
+        contains_layout: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.invalidator.debug_assert_prepaint();
+        let content_mask = self.content_mask();
+        let element_offset = self.element_offset();
+        let fixed = if contains_layout {
+            Some((content_mask, element_offset))
+        } else {
+            self.positioned_frames.last().and_then(|frame| frame.fixed)
+        };
         let frame = PositionedFrame {
-            content_mask: self.content_mask(),
-            element_offset: self.element_offset(),
+            content_mask,
+            element_offset,
+            fixed,
         };
         self.positioned_frames.push(frame);
         let result = f(self);
@@ -5717,7 +5739,10 @@ impl Window {
         self.note_escape_frame(escape);
         let viewport = ContentMask::from_bounds(Bounds::new(Point::default(), self.viewport_size));
         match escape {
-            Escape::Viewport => (viewport, Point::default()),
+            Escape::Viewport => match self.positioned_frames.last().and_then(|frame| frame.fixed.as_ref()) {
+                Some((content_mask, element_offset)) => (*content_mask, *element_offset),
+                None => (viewport, Point::default()),
+            },
             Escape::ContainingBlock => match self.positioned_frames.last() {
                 Some(frame) => (frame.content_mask, frame.element_offset),
                 None => (viewport, Point::default()),

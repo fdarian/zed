@@ -116,14 +116,19 @@ impl TaffyLayoutEngine {
         kind: EscapableKind,
     ) -> Option<LayoutId> {
         let mut nearest_positioned = None;
+        let mut nearest_contained = None;
         let mut current = parent;
         loop {
-            if nearest_positioned.is_none() && !self.meta(current).is_static {
+            let meta = self.meta(current);
+            if nearest_positioned.is_none() && !meta.is_static {
                 nearest_positioned = Some(current);
+            }
+            if nearest_contained.is_none() && meta.contains_layout {
+                nearest_contained = Some(current);
             }
             if current == root {
                 return Some(match kind {
-                    EscapableKind::Fixed => root,
+                    EscapableKind::Fixed => nearest_contained.unwrap_or(root),
                     EscapableKind::Ancestor => nearest_positioned.unwrap_or(root),
                 });
             }

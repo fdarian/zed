@@ -133,6 +133,12 @@ pub struct LayoutInput {
     pub available_space: Size<AvailableSpace>,
     /// Specific to CSS Block layout. Used for correctly computing margin collapsing. You probably want to set this to `Line::FALSE`.
     pub vertical_margins_are_collapsible: Line<bool>,
+    // fdarian fork patch: size containment.
+    /// `known_dimensions.height` is the height size containment gave the node
+    /// (`contain-intrinsic-height`), not one it was given. It is the size the node ends with but
+    /// the height its children see is indefinite: a percentage height of a child is `auto`.
+    /// Set by the tree for a node with `contain_block_size`, never by a parent.
+    pub height_from_containment: bool,
 }
 
 impl LayoutInput {
@@ -147,6 +153,7 @@ impl LayoutInput {
         sizing_mode: SizingMode::InherentSize,
         axis: RequestedAxis::Both,
         vertical_margins_are_collapsible: Line::FALSE,
+        height_from_containment: false,
     };
 }
 

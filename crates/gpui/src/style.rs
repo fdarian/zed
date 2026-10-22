@@ -318,6 +318,10 @@ pub struct Style {
     pub contain_inline_size: bool,
     /// Size containment in the block axis (`container-type: size`): the same for the height.
     pub contain_block_size: bool,
+    /// `contain: layout` (and `content-visibility` other than `visible`): the box lays out as an
+    /// independent formatting context, so no margin of a child collapses through it, and it is
+    /// the containing block of its `position: fixed` descendants.
+    pub contain_layout: bool,
     /// `contain-intrinsic-width`: the content-box width a contained inline axis has when its
     /// size comes from its content, in place of the 0 of an empty box. `None` is 0. The padding
     /// and border are added to it, and `min-` and `max-` clamp the sum. Without
@@ -1589,6 +1593,7 @@ impl Default for Style {
             item_is_replaced: false,
             contain_inline_size: false,
             contain_block_size: false,
+            contain_layout: false,
             contain_intrinsic_width: None,
             contain_intrinsic_height: None,
             measure_natural_width: false,

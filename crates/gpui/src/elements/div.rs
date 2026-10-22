@@ -2432,7 +2432,7 @@ impl Div {
                 content_size,
                 window,
                 cx,
-                |display_none, position, scroll_offset, window, cx| {
+                |display_none, position, contain_layout, scroll_offset, window, cx| {
                     if display_none {
                         return;
                     }
@@ -2444,10 +2444,10 @@ impl Div {
                     // The offset of a positioned box is what an escaping descendant is
                     // placed by.
                     let mut with_frame = |window: &mut Window| {
-                        if position == Position::Static {
+                        if position == Position::Static && !contain_layout {
                             prepaint_children(window)
                         } else {
-                            window.with_positioned_frame(prepaint_children)
+                            window.with_frame(contain_layout, prepaint_children)
                         }
                     };
                     if scroll_offset.is_zero() {
@@ -2556,10 +2556,10 @@ impl Div {
                                     prepaint_children_in_context(window)
                                 }
                             };
-                            if style.position == Position::Static {
+                            if style.position == Position::Static && !style.contain_layout {
                                 prepaint_children(window);
                             } else {
-                                window.with_positioned_frame(prepaint_children);
+                                window.with_frame(style.contain_layout, prepaint_children);
                             }
                         })
                     });
@@ -3125,7 +3125,7 @@ impl Interactivity {
         content_size: Size<Pixels>,
         window: &mut Window,
         cx: &mut App,
-        f: impl FnOnce(bool, Position, Point<Pixels>, &mut Window, &mut App) -> R,
+        f: impl FnOnce(bool, Position, bool, Point<Pixels>, &mut Window, &mut App) -> R,
     ) -> R {
         self.content_size = content_size;
 
@@ -3143,12 +3143,13 @@ impl Interactivity {
         }
         self.report_a11y_focus(global_id, window);
 
-        let (display_none, position, visibility, scroll_offset) = if self.scroll_offset.is_some() {
+        let (display_none, position, contain_layout, visibility, scroll_offset) = if self.scroll_offset.is_some() {
             let style = self.compute_style_internal(None, None, window, cx);
             let scroll_offset = self.clamp_scroll_position(bounds, &style, window, cx);
             (
                 style.display == Display::None,
                 style.position,
+                style.contain_layout,
                 style.visibility.unwrap_or(window.visibility()),
                 scroll_offset,
             )
@@ -3156,6 +3157,7 @@ impl Interactivity {
             (
                 self.base_style.display == Some(Display::None),
                 self.base_style.position.unwrap_or_default(),
+                self.base_style.contain_layout.unwrap_or_default(),
                 self.base_style.visibility.unwrap_or(window.visibility()),
                 Point::default(),
             )
@@ -3164,7 +3166,7 @@ impl Interactivity {
             self.publish_layout(bounds, visibility, window);
         }
         window.with_visibility(visibility, |window| {
-            f(display_none, position, scroll_offset, window, cx)
+            f(display_none, position, contain_layout, scroll_offset, window, cx)
         })
     }
 
@@ -6168,6 +6170,85 @@ mod tests {
         let [container, child] = offsets(true);
         assert_eq!((container.origin.y, child.origin.y), (px(0.), px(7.)));
         assert_eq!(container.size.height, px(17.));
+    }
+
+    struct LayoutContainedMargins {
+        contained: bool,
+    }
+
+    impl Render for LayoutContainedMargins {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut container = div()
+                .debug_selector(|| "container".into())
+                .block()
+                .child(div().debug_selector(|| "child".into()).mt(px(7.)).h(px(10.)));
+            container.style().contain_layout = Some(self.contained);
+            div().block().child(container)
+        }
+    }
+
+    #[gpui::test]
+    fn a_box_with_layout_containment_keeps_the_margins_of_its_children_inside(
+        cx: &mut TestAppContext,
+    ) {
+        let mut bounds = |contained: bool| {
+            let window = cx.add_window(move |_, _| LayoutContainedMargins { contained });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            ["container", "child"].map(|selector| {
+                cx.update_window(window.into(), |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| panic!("{selector} was not rendered"))
+            })
+        };
+        let [container, child] = bounds(false);
+        assert_eq!((container.origin.y, child.origin.y), (px(7.), px(7.)));
+        let [container, child] = bounds(true);
+        assert_eq!((container.origin.y, child.origin.y), (px(0.), px(7.)));
+        assert_eq!(container.size.height, px(17.));
+    }
+
+    struct ContainedPercentage {
+        height: Option<f32>,
+    }
+
+    impl Render for ContainedPercentage {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut container = div()
+                .debug_selector(|| "container".into())
+                .block()
+                .child(div().debug_selector(|| "child".into()).h(relative(0.5)));
+            container.style().contain_block_size = Some(true);
+            container.style().contain_intrinsic_height = Some(px(100.));
+            if let Some(height) = self.height {
+                container = container.h(px(height));
+            }
+            div().block().child(container)
+        }
+    }
+
+    #[gpui::test]
+    fn a_percentage_height_under_the_intrinsic_height_of_a_contained_box_is_auto(
+        cx: &mut TestAppContext,
+    ) {
+        let mut heights = |height: Option<f32>| {
+            let window = cx.add_window(move |_, _| ContainedPercentage { height });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            ["container", "child"].map(|selector| {
+                cx.update_window(window.into(), |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| panic!("{selector} was not rendered"))
+                .size
+                .height
+            })
+        };
+        assert_eq!(heights(None), [px(100.), px(0.)]);
+        assert_eq!(heights(Some(200.)), [px(200.), px(100.)]);
     }
 
     struct RedrawView {
@@ -9317,6 +9398,64 @@ mod tests {
                 assert_eq!(bounds_of(&window, cx, "box").origin, point(px(10.), px(10.)));
                 assert_eq!(visible_area(&window, cx), 50. * 50.);
                 assert_eq!(chain_at(&window, cx, 30., 30.), ["box", "clip", "root"]);
+            }
+
+            fn contained<E: Styled>(mut element: E) -> E {
+                element.style().contain_layout = Some(true);
+                element
+            }
+
+            #[gpui::test]
+            fn a_fixed_box_is_placed_and_clipped_by_a_layout_contained_ancestor(cx: &mut TestAppContext) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            contained(node("clip", 200., 200., 100., 100.).overflow_hidden())
+                                .child(fixed("inside", 10., 10., 50.))
+                                .child(fixed("edge", 80., 80., 50.)),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(bounds_of(&window, cx, "inside").origin, point(px(210.), px(210.)));
+                assert_eq!(bounds_of(&window, cx, "edge").origin, point(px(280.), px(280.)));
+                assert_eq!(visible_area(&window, cx), 50. * 50. + 20. * 20.);
+                assert_eq!(chain_at(&window, cx, 230., 230.), ["inside", "clip", "root"]);
+            }
+
+            #[gpui::test]
+            fn a_positioned_box_between_a_fixed_box_and_its_layout_contained_ancestor_is_skipped(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            contained(node("outer", 200., 200., 300., 300.)).child(
+                                node("middle", 50., 50., 100., 100.).child(fixed("box", 10., 10., 50.)),
+                            ),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(bounds_of(&window, cx, "box").origin, point(px(210.), px(210.)));
+            }
+
+            #[gpui::test]
+            fn a_static_box_with_layout_containment_contains_fixed_and_absolute_boxes(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            contained(static_box("static", 200., 100.))
+                                .child(fixed("fixed", 10., 10., 50.))
+                                .child(escaping("absolute", 20., 20., 50.)),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(bounds_of(&window, cx, "fixed").origin, point(px(210.), px(210.)));
+                assert_eq!(bounds_of(&window, cx, "absolute").origin, point(px(220.), px(220.)));
             }
 
             #[gpui::test]

@@ -142,6 +142,9 @@ fn contained_inputs(style: &Style, mut inputs: LayoutInput) -> LayoutInput {
     }
     if style.contain_block_size && sized_by_content(inputs.known_dimensions.height, styled_size.height) {
         inputs.known_dimensions.height = contained(padding_border.height, style.contain_intrinsic_size.height, min_size.height, max_size.height);
+        // Blink applies `contain-intrinsic-size` after the children are laid out, so for them the
+        // height of an `auto` box stays indefinite.
+        inputs.height_from_containment = true;
     }
     inputs
 }
@@ -470,10 +473,11 @@ where
             match (display_mode, has_children) {
                 (Display::None, _) => compute_hidden_layout(tree, node_id),
                 #[cfg(feature = "block_layout")]
-                // fdarian fork patch: a box with size containment is a container, which lays its
-                // content out in a formatting context of its own, so no margin collapses through it.
+                // fdarian fork patch: a box with size or layout containment is a container, which lays
+                // its content out in a formatting context of its own, so no margin collapses through it.
                 (Display::Block, true) if tree.taffy.nodes[node_id.into()].style.contain_inline_size
-                    || tree.taffy.nodes[node_id.into()].style.contain_block_size =>
+                    || tree.taffy.nodes[node_id.into()].style.contain_block_size
+                    || tree.taffy.nodes[node_id.into()].style.contain_layout =>
                 {
                     compute_block_layout(tree, node_id, inputs, None)
                 }
@@ -2680,6 +2684,112 @@ mod tests {
                 );
                 assert_eq!(size, Size { width: 12.0, height: 12.0 }, "{display:?}");
             }
+        }
+    }
+
+    // fdarian fork patch: layout containment, and the percentage base under size containment.
+    mod containment {
+        use super::*;
+        use crate::geometry::Rect;
+        use crate::style::LengthPercentageAuto;
+
+        fn margin(top: f32, bottom: f32) -> Rect<LengthPercentageAuto> {
+            Rect { left: length(0.0), right: length(0.0), top: length(top), bottom: length(bottom) }
+        }
+
+        fn block(height: f32, margin: Rect<LengthPercentageAuto>) -> Style {
+            Style { display: Display::Block, size: Size { width: auto(), height: length(height) }, margin, ..Default::default() }
+        }
+
+        fn page() -> Style {
+            Style { display: Display::Block, size: Size { width: length(400.0), height: auto() }, ..Default::default() }
+        }
+
+        /// A parent holding a 10px block with margins 20 and 30, then a 5px sibling. Returns the
+        /// parent's top, the parent's height and the sibling's top.
+        fn margins_through(parent: Style) -> (f32, f32, f32) {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let inner = taffy.new_leaf(block(10.0, margin(20.0, 30.0))).unwrap();
+            let parent = taffy.new_with_children(parent, &[inner]).unwrap();
+            let sibling = taffy.new_leaf(block(5.0, margin(0.0, 0.0))).unwrap();
+            let root = taffy.new_with_children(page(), &[parent, sibling]).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            let parent_layout = taffy.layout(parent).unwrap();
+            (parent_layout.location.y, parent_layout.size.height, taffy.layout(sibling).unwrap().location.y)
+        }
+
+        fn plain() -> Style {
+            Style { display: Display::Block, ..Default::default() }
+        }
+
+        #[test]
+        fn a_child_margin_collapses_through_a_plain_block() {
+            assert_eq!(margins_through(plain()), (20.0, 10.0, 60.0));
+        }
+
+        #[test]
+        fn a_child_margin_stays_inside_a_block_with_layout_containment() {
+            assert_eq!(margins_through(Style { contain_layout: true, ..plain() }), (0.0, 60.0, 60.0));
+        }
+
+        #[test]
+        fn the_margins_of_a_block_with_layout_containment_collapse_with_its_siblings() {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let previous = taffy.new_leaf(block(10.0, margin(0.0, 30.0))).unwrap();
+            let inner = taffy.new_leaf(block(10.0, margin(0.0, 0.0))).unwrap();
+            let contained = taffy
+                .new_with_children(Style { contain_layout: true, margin: margin(20.0, 10.0), ..plain() }, &[inner])
+                .unwrap();
+            let next = taffy.new_leaf(block(5.0, margin(25.0, 0.0))).unwrap();
+            let root = taffy.new_with_children(page(), &[previous, contained, next]).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            assert_eq!(taffy.layout(contained).unwrap().location.y, 40.0, "30 below the previous block, not 50");
+            assert_eq!(taffy.layout(next).unwrap().location.y, 75.0, "25 below the contained block, not 35");
+        }
+
+        /// The size of the box and of its only child, a `height: 50%` leaf with nothing in it, when the box is
+        /// contained in the block axis with a `contain-intrinsic-height` of 100.
+        fn percentage_child(height: Dimension) -> (f32, f32) {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let child = taffy
+                .new_leaf(Style { size: Size { width: auto(), height: percent(0.5) }, ..Default::default() })
+                .unwrap();
+            let contained = taffy
+                .new_with_children(
+                    Style {
+                        contain_block_size: true,
+                        contain_intrinsic_size: Size { width: None, height: Some(100.0) },
+                        size: Size { width: auto(), height },
+                        ..plain()
+                    },
+                    &[child],
+                )
+                .unwrap();
+            let root = taffy.new_with_children(page(), &[contained]).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            (taffy.layout(contained).unwrap().size.height, taffy.layout(child).unwrap().size.height)
+        }
+
+        #[test]
+        fn a_percentage_height_under_a_contained_auto_height_is_auto() {
+            assert_eq!(percentage_child(auto()), (100.0, 0.0));
+        }
+
+        #[test]
+        fn a_percentage_height_under_a_contained_definite_height_resolves() {
+            assert_eq!(percentage_child(length(200.0)), (200.0, 100.0));
+        }
+
+        #[test]
+        fn a_percentage_height_under_an_uncontained_auto_height_is_auto_too() {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let child = taffy
+                .new_leaf(Style { size: Size { width: auto(), height: percent(0.5) }, ..Default::default() })
+                .unwrap();
+            let parent = taffy.new_with_children(plain(), &[child]).unwrap();
+            let root = taffy.new_with_children(page(), &[parent]).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            assert_eq!(taffy.layout(child).unwrap().size.height, 0.0);
         }
     }
 }

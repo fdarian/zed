@@ -470,6 +470,11 @@ pub struct Style<S: CheapCloneStr = DefaultCheapStr> {
     pub contain_inline_size: bool,
     /// `contain: block-size`: the same for the height.
     pub contain_block_size: bool,
+    // fdarian fork patch: CSS layout containment.
+    /// `contain: layout`: the node is an independent formatting context, so no margin of a child
+    /// collapses through its top or bottom edge. Its own margins collapse with its siblings' as
+    /// any block's do.
+    pub contain_layout: bool,
     // fdarian fork patch: CSS `contain-intrinsic-size`.
     /// `contain-intrinsic-size`: the content-box size a contained axis has when it is sized by
     /// its content, in place of the 0 of an empty box. `None` is 0. Padding, border and scrollbar
@@ -639,6 +644,7 @@ impl<S: CheapCloneStr> Style<S> {
         item_is_replaced: false,
         contain_inline_size: false,
         contain_block_size: false,
+        contain_layout: false,
         contain_intrinsic_size: Size { width: None, height: None },
         box_sizing: BoxSizing::BorderBox,
         direction: Direction::Ltr,
@@ -1348,6 +1354,7 @@ mod tests {
             item_is_replaced: false,
             contain_inline_size: false,
             contain_block_size: false,
+            contain_layout: false,
             contain_intrinsic_size: Size { width: None, height: None },
             box_sizing: Default::default(),
             #[cfg(feature = "float_layout")]
