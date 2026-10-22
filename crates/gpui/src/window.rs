@@ -140,7 +140,7 @@ impl DispatchPhase {
 /// See [`Window::layout_stamp`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayoutStamp {
-    invalidations: usize,
+    layout_invalidations: usize,
     builds: u64,
 }
 
@@ -151,6 +151,8 @@ struct WindowInvalidatorInner {
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
     pub update_count: usize,
+    /// How many of those invalidations were not declared paint-only: see [`Window::layout_stamp`].
+    pub layout_invalidations: usize,
     /// The `update_count` the layout the window last built was computed at, if nothing but
     /// paint-only invalidations came since. See [`WindowInvalidator::layout_is_current`].
     pub layout_current_at: Option<usize>,
@@ -190,6 +192,7 @@ impl WindowInvalidator {
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
+                layout_invalidations: 0,
                 layout_current_at: None,
                 scroll_metrics_current_at: None,
                 #[cfg(feature = "profiler")]
@@ -200,8 +203,17 @@ impl WindowInvalidator {
     }
 
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
+        self.invalidate_view_as(entity, cx, true)
+    }
+
+    /// [`WindowInvalidator::invalidate_view`] for an invalidation that is not declared
+    /// paint-only when `affects_layout`.
+    pub fn invalidate_view_as(&self, entity: EntityId, cx: &mut App, affects_layout: bool) -> bool {
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
+        if affects_layout {
+            inner.layout_invalidations += 1;
+        }
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
             #[cfg(feature = "profiler")]
@@ -255,6 +267,7 @@ impl WindowInvalidator {
         inner.dirty = dirty;
         if dirty {
             inner.update_count += 1;
+            inner.layout_invalidations += 1;
         }
         #[cfg(feature = "profiler")]
         let dirty_at = dirty.then(|| Self::record_frame_dirty(&mut inner));
@@ -297,6 +310,10 @@ impl WindowInvalidator {
 
     pub fn update_count(&self) -> usize {
         self.inner.borrow().update_count
+    }
+
+    pub fn layout_invalidation_count(&self) -> usize {
+        self.inner.borrow().layout_invalidations
     }
 
     /// Records that the layout being built now is the one the invalidations so far describe.
@@ -4374,8 +4391,12 @@ impl Window {
     /// passes it has built. Two equal stamps mean nothing was invalidated and nothing was built
     /// in between, so what the last build published (boxes, scroll metrics) is still what the
     /// window holds, even when it was a build that the window is dirty after.
+    ///
+    /// An invalidation declared paint-only (see [`App::notify_paint_only`]) leaves the stamp, as
+    /// it leaves the layout: it moves no box and no extent. A frame that draws it is a build, which
+    /// moves the stamp, because it replaces the bounds and scroll handles the last pass published.
     pub fn layout_stamp(&self) -> LayoutStamp {
-        LayoutStamp { invalidations: self.invalidator.update_count(), builds: self.builds }
+        LayoutStamp { layout_invalidations: self.invalidator.layout_invalidation_count(), builds: self.builds }
     }
 
     /// Whether the pass being built is a layout-only one, whose frame is thrown away without
@@ -11707,7 +11728,7 @@ mod tests {
 
     /// The stamp moves with every invalidation and every pass or draw, and with nothing else.
     #[gpui::test]
-    fn test_the_layout_stamp_moves_with_invalidations_and_builds(cx: &mut TestAppContext) {
+    fn test_the_layout_stamp_moves_with_layout_invalidations_and_builds(cx: &mut TestAppContext) {
         struct Page;
         impl Render for Page {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -11736,6 +11757,20 @@ mod tests {
             assert!(!window.draw_if_dirty(cx), "no pass runs on a window laid out");
             let settled = window.layout_stamp();
             assert_eq!(window.layout_stamp(), settled, "a read that builds nothing leaves it");
+
+            cx.notify_paint_only(id);
+            assert_eq!(window.layout_stamp(), settled, "a paint-only invalidation moves no box and leaves it");
+            cx.notify(id);
+            let stale = window.layout_stamp();
+            assert_ne!(stale, settled, "a layout one moves it");
+            cx.notify_paint_only(id);
+            assert_eq!(window.layout_stamp(), stale, "and a paint-only one after it does not");
+            assert!(window.draw_if_dirty(cx));
+            assert_ne!(window.layout_stamp(), stale, "a pass moves it");
+            let passed = window.layout_stamp();
+            cx.notify_paint_only(id);
+            let _ = window.draw(cx);
+            assert_ne!(window.layout_stamp(), passed, "and so does a frame that draws a paint-only change");
         });
     }
 

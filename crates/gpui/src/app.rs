@@ -2804,7 +2804,8 @@ impl App {
             for invalidator in &live_invalidators {
                 let layout_was_current = invalidator.layout_is_current();
                 let metrics_were_current = invalidator.scroll_metrics_are_current();
-                let invalidated = invalidator.invalidate_view(entity_id, self);
+                let affects_layout = !matches!(invalidation, Invalidation::Paint);
+                let invalidated = invalidator.invalidate_view_as(entity_id, self, affects_layout);
                 if !invalidated {
                     continue;
                 }
