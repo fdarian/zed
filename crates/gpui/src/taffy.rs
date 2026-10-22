@@ -199,6 +199,14 @@ pub struct LayoutCounters {
     /// Like `overflow_walks`, for the scrollable overflow from the unsnapped boxes
     /// ([`TaffyLayoutEngine::layout_unsnapped_scrollable_overflow_end`]).
     pub unsnapped_overflow_walks: u64,
+    /// Relayout boundaries (a box with a width and a height that clips, or with size and layout
+    /// containment) that were laid out again on their own, where the nodes above them kept the
+    /// layout they had. A change inside one is part of `nodes_laid_out` for the boundary and what
+    /// is inside it only.
+    pub boundaries_laid_out: u64,
+    /// Boundaries that gave another answer than the one the nodes above had, so that the layout
+    /// went on from the root.
+    pub boundary_fallbacks: u64,
 }
 
 /// What the engine knows about a node besides what taffy does. It lives as long as the node.
@@ -472,6 +480,8 @@ impl TaffyLayoutEngine {
         LayoutCounters {
             nodes_laid_out: self.taffy.layout_runs(),
             nodes_sized: self.taffy.size_runs(),
+            boundaries_laid_out: self.taffy.boundary_relayouts(),
+            boundary_fallbacks: self.taffy.boundary_fallbacks(),
             ..self.counters
         }
     }

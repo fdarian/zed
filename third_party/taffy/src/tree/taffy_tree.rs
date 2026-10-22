@@ -1500,6 +1500,9 @@ impl<NodeContext> TaffyTree<NodeContext> {
     /// How many times the layout results of this node were thrown away, by a change to it or under it. A
     /// generation equal to one read after a layout means that layout is still current.
     ///
+    /// A change below a relayout boundary (see [`Self::is_relayout_boundary`]) does not throw the results of the
+    /// nodes above the boundary away, but it counts here for each of them.
+    ///
     /// fdarian fork patch.
     #[inline]
     pub fn dirty_generation(&self, node: NodeId) -> TaffyResult<u64> {
@@ -1510,6 +1513,8 @@ impl<NodeContext> TaffyTree<NodeContext> {
     /// node was laid out with another size, padding, border, scrollbar or content size (a percentage of the parent
     /// moves the padding of a node whose box is the same). A generation equal to one read after a layout means that
     /// the layout of the subtree is the one it had then. Where the node is in its parent is not part of it.
+    ///
+    /// A change below a relayout boundary counts here for each node above the boundary too.
     ///
     /// fdarian fork patch.
     #[inline]

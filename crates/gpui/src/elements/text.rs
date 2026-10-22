@@ -2770,6 +2770,8 @@ mod tests {
                 extent_walks: after.extent_walks - before.extent_walks,
                 overflow_walks: after.overflow_walks - before.overflow_walks,
                 unsnapped_overflow_walks: after.unsnapped_overflow_walks - before.unsnapped_overflow_walks,
+                boundaries_laid_out: after.boundaries_laid_out - before.boundaries_laid_out,
+                boundary_fallbacks: after.boundary_fallbacks - before.boundary_fallbacks,
             }
         }
 

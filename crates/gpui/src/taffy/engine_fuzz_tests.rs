@@ -223,6 +223,30 @@ impl Generator {
             style.intrinsic_widths.flex_basis = self.basis_keyword();
         }
         style.measure_natural_width = self.random.one_in(10);
+        // A box that taffy takes for a relayout boundary where its parent is not a flex or grid
+        // container: a width and a height that are lengths and a clip, or containment of size and
+        // layout. Drawn from a generator of its own, so that the trees stay what they were before
+        // boundaries.
+        let mut aside = Random(self.random.0.rotate_left(17) ^ 0xB0B0);
+        if aside.one_in(5) {
+            if aside.one_in(4) {
+                style.contain_inline_size = true;
+                style.contain_block_size = true;
+                style.contain_layout = true;
+            } else {
+                let pixels = |aside: &mut Random| {
+                    Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(aside.pixels() + 20.))))
+                };
+                style.size = Size { width: pixels(&mut aside), height: pixels(&mut aside) };
+                style.min_size = Size::default();
+                style.max_size = Size::default();
+                style.overflow = crate::Point {
+                    x: Overflow::Hidden,
+                    y: if aside.one_in(2) { Overflow::Scroll } else { Overflow::Hidden },
+                };
+                style.intrinsic_widths = Default::default();
+            }
+        }
         style
     }
 
@@ -728,6 +752,8 @@ fn assert_reuse_matches_new_engine(
         total.children_set += counters.children_set;
         total.passes += counters.passes;
         total.measures += counters.measures;
+        total.boundaries_laid_out += counters.boundaries_laid_out;
+        total.boundary_fallbacks += counters.boundary_fallbacks;
     }
     total
 }
@@ -741,6 +767,8 @@ fn an_engine_that_lives_through_edits_lays_out_like_a_new_one(cx: &mut TestAppCo
     assert!(counters.nodes_removed > 500, "{counters:?}");
     assert!(counters.styles_set > 500, "{counters:?}");
     assert!(counters.children_set > 500, "{counters:?}");
+    // And the boxes whose layout is redone without the nodes above them.
+    assert!(counters.boundaries_laid_out > 100, "{counters:?}");
 }
 
 /// `GPUI_ENGINE_FUZZ_SEEDS=first..last cargo test --release -p gpui --lib --features test-support
@@ -1172,6 +1200,8 @@ fn delta(before: LayoutCounters, after: LayoutCounters) -> LayoutCounters {
         extent_walks: after.extent_walks - before.extent_walks,
         overflow_walks: after.overflow_walks - before.overflow_walks,
         unsnapped_overflow_walks: after.unsnapped_overflow_walks - before.unsnapped_overflow_walks,
+        boundaries_laid_out: after.boundaries_laid_out - before.boundaries_laid_out,
+        boundary_fallbacks: after.boundary_fallbacks - before.boundary_fallbacks,
     }
 }
 
@@ -1334,6 +1364,92 @@ fn a_frame_runs_the_layout_algorithm_only_for_the_nodes_whose_inputs_changed(cx:
             let idle = plain_runs(&mut engine, &tree, window, cx);
             assert_eq!((idle.nodes_laid_out, idle.nodes_sized), (0, 0), "{idle:?}");
         }
+    });
+}
+
+fn block_of(height: f32) -> Style {
+    let mut style = Style::default();
+    style.display = Display::Block;
+    style.size.height = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(height))));
+    style
+}
+
+fn plain(id: u64, style: Style, children: Vec<Plain>) -> Plain {
+    Plain { id, style, children }
+}
+
+/// A window root of blocks with a scroller of 100 by 100 that clips, and a chain of three blocks
+/// and a leaf in it.
+fn scroller_tree(leaf_height: f32) -> Plain {
+    let mut scroller = block_of(100.);
+    scroller.size.width = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(100.))));
+    scroller.overflow = crate::Point { x: Overflow::Hidden, y: Overflow::Scroll };
+    let mut auto_block = Style::default();
+    auto_block.display = Display::Block;
+    plain(
+        0,
+        auto_block.clone(),
+        vec![
+            plain(
+                1,
+                auto_block.clone(),
+                vec![
+                    plain(
+                        2,
+                        scroller,
+                        vec![
+                            plain(
+                                3,
+                                auto_block.clone(),
+                                vec![plain(
+                                    4,
+                                    auto_block.clone(),
+                                    vec![plain(5, block_of(leaf_height), Vec::new())],
+                                )],
+                            ),
+                            plain(6, block_of(30.), Vec::new()),
+                        ],
+                    ),
+                    plain(7, block_of(15.), Vec::new()),
+                ],
+            ),
+            plain(8, block_of(20.), Vec::new()),
+        ],
+    )
+}
+
+#[gpui::test]
+fn a_leaf_change_inside_a_scroller_of_fixed_size_lays_out_only_the_chain_inside_it(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut laid_out = Vec::new();
+        for boundaries in [true, false] {
+            let mut engine = TaffyLayoutEngine::new();
+            engine.taffy.set_relayout_boundaries(boundaries);
+            let first = plain_runs(&mut engine, &scroller_tree(10.), window, cx);
+            assert!(first.nodes_laid_out >= 9, "{first:?}");
+            let idle = plain_runs(&mut engine, &scroller_tree(10.), window, cx);
+            assert_eq!((idle.nodes_laid_out, idle.nodes_sized), (0, 0), "{idle:?}");
+
+            let changed = plain_runs(&mut engine, &scroller_tree(60.), window, cx);
+            laid_out.push((changed.nodes_laid_out, changed.nodes_sized, changed.boundaries_laid_out));
+            assert_eq!(changed.boundary_fallbacks, 0, "{changed:?}");
+
+            let (root, _) = plain_frame(&mut engine, &scroller_tree(60.), window, cx);
+            let leaf = (0..5).fold(root.0, |node, _| engine.taffy.child_at_index(node, 0).unwrap());
+            let bounds = engine.layout_bounds(LayoutId(leaf), 1.);
+            assert_eq!(bounds.size.height, px(60.), "boundaries {boundaries}");
+            let idle = plain_runs(&mut engine, &scroller_tree(60.), window, cx);
+            assert_eq!((idle.nodes_laid_out, idle.nodes_sized), (0, 0), "{idle:?}");
+        }
+        // The scroller, the two blocks and the leaf inside it; against the window root and the block
+        // around the scroller too, that the scroller never tells anything.
+        assert_eq!(laid_out[0].0, 4, "{laid_out:?}");
+        assert_eq!(laid_out[0].2, 1, "{laid_out:?}");
+        assert_eq!(laid_out[1].0, 6, "{laid_out:?}");
+        assert_eq!(laid_out[1].2, 0, "{laid_out:?}");
     });
 }
 
