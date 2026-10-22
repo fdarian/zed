@@ -965,8 +965,38 @@ impl<'a> StringIndexConverter<'a> {
     }
 }
 
+/// The x-height and cap height an OS/2 table (version 2 and later) gives, in font units.
+/// Skia's `SkScalerContext_Mac::generateFontMetrics` takes both from the table of the
+/// font when it has them, nonzero and below two ems, and Chrome measures `ex` and a
+/// `text-box-edge` of `ex` or `cap` from Skia's numbers. CoreText's `CTFontGetXHeight`
+/// is not the table's for every font (Inter Variable: 1056 where the table has 1118
+/// of 2048), and for a variable font it follows the variations, where the table is
+/// that of the default instance and Chrome's heights stay put.
+fn os2_heights(table: &[u8], units_per_em: u32) -> (Option<f32>, Option<f32>) {
+    const X_HEIGHT: usize = 86;
+    const CAP_HEIGHT: usize = 88;
+    let read = |offset: usize| -> Option<i16> {
+        let bytes = table.get(offset..offset + 2)?;
+        Some(i16::from_be_bytes([bytes[0], bytes[1]]))
+    };
+    let version = read(0).unwrap_or(0);
+    if version < 2 {
+        return (None, None);
+    }
+    let height = |offset: usize| {
+        read(offset)
+            .filter(|height| *height > 0 && u32::from(height.unsigned_abs()) < 2 * units_per_em)
+            .map(f32::from)
+    };
+    (height(X_HEIGHT), height(CAP_HEIGHT))
+}
+
 fn font_kit_metrics_to_metrics(font: &FontKitFont) -> FontMetrics {
     let metrics = font.metrics();
+    let (os2_x_height, os2_cap_height) = font
+        .load_font_table(u32::from_be_bytes(*b"OS/2"))
+        .map(|table| os2_heights(&table, metrics.units_per_em))
+        .unwrap_or((None, None));
     FontMetrics {
         units_per_em: metrics.units_per_em,
         ascent: metrics.ascent,
@@ -974,8 +1004,8 @@ fn font_kit_metrics_to_metrics(font: &FontKitFont) -> FontMetrics {
         line_gap: metrics.line_gap,
         underline_position: metrics.underline_position,
         underline_thickness: metrics.underline_thickness,
-        cap_height: metrics.cap_height,
-        x_height: metrics.x_height,
+        cap_height: os2_cap_height.unwrap_or(metrics.cap_height),
+        x_height: os2_x_height.unwrap_or(metrics.x_height),
         bounding_box: bounds_from_rect(metrics.bounding_box),
         // Blink's list, matched on the family name exactly: "Helvetica Neue" is not one.
         widens_ascent: matches!(
@@ -1861,6 +1891,79 @@ mod tests {
         (24., 550., 18., 258.0625),
         (24., 700., 25., 258.796875),
     ];
+
+    /// The cap height and x-height of `fixtures/inter-subset.ttf` are the OS/2 table's, as Skia
+    /// takes them: 1490 and 1118 of 2048 units, where CoreText says 1056 for the x-height (and
+    /// 1097 at `wght` 700). Chrome's label trimmed to the cap or the x-height is that tall in
+    /// every instance of the font (`x-height-oracle.json`, scale 1, 1/64 px).
+    #[test]
+    fn test_the_cap_height_and_x_height_are_the_os2_tables_in_every_instance() {
+        let fonts = MacTextSystem::new();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(INTER_SUBSET);
+        let Ok(file) = std::fs::read(&path) else {
+            eprintln!("skipped: {} is not in this checkout", path.display());
+            return;
+        };
+        fonts.add_fonts(vec![file.into()]).unwrap();
+        let instances = [
+            (400., vec![]),
+            (700., vec![]),
+            (
+                550.,
+                vec![
+                    (FontVariations::tag(*b"wght"), 550.),
+                    (FontVariations::tag(*b"opsz"), 18.),
+                ],
+            ),
+            (
+                900.,
+                vec![
+                    (FontVariations::tag(*b"wght"), 900.),
+                    (FontVariations::tag(*b"opsz"), 32.),
+                ],
+            ),
+        ];
+        // (size, x-height, cap height) in Chrome
+        let chrome = [(12., 6.546875, 8.734375), (13., 7.09375, 9.453125)];
+        for (weight, variations) in instances {
+            let font_id = fonts
+                .font_id(&Font {
+                    weight: FontWeight(weight),
+                    variations: FontVariations::new(variations),
+                    ..font("Inter Variable")
+                })
+                .unwrap();
+            let metrics = fonts.font_metrics(font_id);
+            assert_eq!(metrics.x_height, 1118., "wght {weight}: x-height in units");
+            assert_eq!(metrics.cap_height, 1490., "wght {weight}: cap height in units");
+            for (size, x_height, cap_height) in chrome {
+                let x = f32::from(metrics.x_height(px(size)));
+                let cap = f32::from(metrics.cap_height(px(size)));
+                assert!((x - x_height).abs() <= 1. / 64., "{size}px: x-height {x}, Chrome {x_height}");
+                assert!((cap - cap_height).abs() <= 1. / 64., "{size}px: cap {cap}, Chrome {cap_height}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_heights_come_from_an_os2_table_of_version_2_with_sane_values() {
+        let table = |version: u16, x_height: i16, cap_height: i16, len: usize| {
+            let mut table = vec![0; len];
+            table[..2].copy_from_slice(&version.to_be_bytes());
+            if len >= 90 {
+                table[86..88].copy_from_slice(&x_height.to_be_bytes());
+                table[88..90].copy_from_slice(&cap_height.to_be_bytes());
+            }
+            table
+        };
+        assert_eq!(super::os2_heights(&table(4, 1118, 1490, 96), 2048), (Some(1118.), Some(1490.)));
+        assert_eq!(super::os2_heights(&table(2, 1118, 1490, 90), 2048), (Some(1118.), Some(1490.)));
+        assert_eq!(super::os2_heights(&table(1, 1118, 1490, 96), 2048), (None, None));
+        assert_eq!(super::os2_heights(&table(4, 1118, 1490, 88), 2048), (None, None));
+        assert_eq!(super::os2_heights(&table(4, 0, 1490, 96), 2048), (None, Some(1490.)));
+        assert_eq!(super::os2_heights(&table(4, 1118, -5, 96), 2048), (Some(1118.), None));
+        assert_eq!(super::os2_heights(&table(4, 4096, 4095, 96), 2048), (None, Some(4095.)));
+    }
 
     #[test]
     fn test_an_explicit_opsz_is_the_one_the_text_is_drawn_with() {
