@@ -212,6 +212,10 @@ pub struct RetainedCounters {
     pub layout_replays: u64,
     /// Subtrees built by a pass that only lays out.
     pub layout_builds: u64,
+    /// Of those, the subtrees that left a layout record (see [`Window::draw_if_dirty`]) for the
+    /// pass that only lays out after them, which skips them as it skips the ones a presented frame
+    /// recorded, until a frame is drawn.
+    pub layout_records: u64,
     /// Frames that replayed something, built once more with every subtree built, and compared
     /// with that build, see [`Window::set_retention_verifier`].
     pub verified: u64,
@@ -431,6 +435,13 @@ pub(crate) struct RetainedWindow {
     /// Counts the frames that were drawn. A recording indexes the vectors of the frame it was
     /// made in, which is the rendered frame only in the draw that follows.
     pub(crate) rendered_serial: u64,
+    /// Counts the calls of [`Window::refresh`]. `refreshing` stays set until a frame is drawn, so a
+    /// layout record made after the last refresh is told from one made before it by this.
+    pub(crate) refresh_epoch: u64,
+    /// Counts the passes that built every subtree to compare a replayed one with. Such a pass writes
+    /// what the subtrees publish without the tapes of the layout records it leaves alone, so a layout
+    /// record made before one is not skipped with after it.
+    pub(crate) reference_passes: u64,
     /// Counts the passes that built a frame, abandoned ones too. An element state is stamped with
     /// the pass that accessed it.
     pub(crate) state_pass: u64,
@@ -463,6 +474,9 @@ pub(crate) struct RetainedWindow {
     pub(crate) autoscroll_requests: u32,
     pub(crate) pending_assets: u32,
     pub(crate) cached_view_hits: u32,
+    /// How many subtrees a pass that only lays out has skipped from a recording of a presented
+    /// frame: their tape is not a layout tape, and a layout record cannot hold it.
+    pub(crate) layout_painted_skips: u32,
     /// The subtree being recorded so that it can be put elsewhere, see [`Relocation`].
     pub(crate) relocation: Option<Relocation>,
     /// How many relocatable subtrees the pass being built recorded, to be put elsewhere.
@@ -773,6 +787,23 @@ pub(crate) struct PrepaintMark {
     effects: Effects,
     a11y: Option<a11y::A11yMark>,
     lifts: Option<LiftMark>,
+}
+
+/// Where the effects of a window were when a pass that only lays out began to prepaint a subtree.
+pub(crate) struct LayoutMark {
+    effects: Effects,
+    painted_skips: u32,
+}
+
+/// What the prepaint of a subtree built by a pass that only lays out did.
+pub(crate) struct LayoutOutcome {
+    /// What it did that a skip cannot repeat.
+    pub(crate) reason: Option<NonReusable>,
+    /// A listener that reports to its owner ran, and a skip does not run it again.
+    pub(crate) published: bool,
+    /// A subtree inside it was skipped from the recording of a presented frame, whose tape is not
+    /// part of one that a layout record could hold.
+    pub(crate) holds_painted: bool,
 }
 
 /// What the prepaint of a retained subtree left in the frame, in a form that outlives the frame
@@ -1419,6 +1450,29 @@ impl Window {
             nested_scrolls: self.retained.nested_scrolls.get(),
             input_handlers: self.next_frame.input_handlers.len(),
         }
+    }
+
+    /// Starts noting what the prepaint of a subtree built by a pass that only lays out does that
+    /// a skip of the subtree could not repeat. Pair with [`Self::finish_layout_recording`].
+    pub(crate) fn begin_layout_recording(&self) -> LayoutMark {
+        LayoutMark { effects: self.effects(), painted_skips: self.retained.layout_painted_skips }
+    }
+
+    /// What the prepaint since `mark` did.
+    pub(crate) fn finish_layout_recording(&self, mark: LayoutMark) -> LayoutOutcome {
+        let effects = self.effects();
+        LayoutOutcome {
+            reason: first_reason(mark.effects.reasons(&effects)),
+            published: mark.effects.published(&effects),
+            holds_painted: mark.painted_skips != self.retained.layout_painted_skips,
+        }
+    }
+
+    /// [`Window::publish_layout`] for a publication that is not the subtree's own: it is not one
+    /// of the effects that keep a recording from being replayed.
+    pub(crate) fn publish_layout_unnoted(&mut self, publish: impl FnOnce(&mut Window, &mut App) + 'static) {
+        debug_assert!(self.layout_only, "only a pass that lays out publishes");
+        self.next_frame.layout_publications.push(Box::new(publish));
     }
 
     /// Starts recording the prepaint of a retained subtree. Pair with

@@ -3043,6 +3043,7 @@ impl Window {
     pub fn refresh(&mut self) {
         if self.invalidator.not_drawing() {
             self.refreshing = true;
+            self.retained.refresh_epoch += 1;
             self.invalidator.set_dirty(true);
         }
     }
@@ -4711,6 +4712,7 @@ impl Window {
     /// One build of `next_frame`. Returns false when the pass was abandoned before paint.
     fn build_pass(&mut self, cx: &mut App) -> bool {
         self.retained.state_pass += 1;
+        self.retained.reference_passes += u64::from(self.retained.reference);
         self.captured_hitbox = None;
         let effect_groups = self.platform_window.supports_effect_groups() || self.effect_groups_forced();
         self.next_frame

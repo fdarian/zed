@@ -27,9 +27,18 @@
 //!
 //! A pass that only lays out ([`Window::draw_if_dirty`]) skips the subtrees the last presented frame
 //! recorded as the same, and puts nothing of them into its frame, which is thrown away: it takes
-//! nothing out of the frame that is rendered and records nothing, so that the draw after it can
+//! nothing out of the frame that is rendered and records no frame, so that the draw after it can
 //! replay. What the subtree published outside the frame is published again by the
 //! [`Retained::on_replay`] listener, with [`RetainedPhase::Layout`].
+//!
+//! What such a pass builds it leaves a *layout record* of, kept apart from the recording of a
+//! presented frame: where the subtree's layout nodes are and what the build read, and the
+//! publications the build made, for the listener to publish again with
+//! [`RetainedPhase::LayoutRecorded`]. The next pass that only lays out skips the subtree with it
+//! under the conditions of a recording, so that a tree that has no presented frame to be recorded
+//! in (a page that is mounted, read and written to before its first frame) is built once and not
+//! by every read. A frame that is drawn ends every layout record: it builds what it has no
+//! recording of, and records that.
 //!
 //! A subtree that is [relocatable](Retained::relocatable) is recorded to be replayed elsewhere than
 //! where it was recorded, by a whole number of device pixels, as a scroller moves its content. Its
@@ -66,7 +75,7 @@ use crate::{
     PatchUnit, PatchSource,
 };
 use collections::FxHashSet;
-use std::{any::TypeId, ops::Range, rc::Rc};
+use std::{any::TypeId, cell::Cell, ops::Range, rc::Rc};
 
 /// Wraps the subtree that `build` makes, so that a frame which asks for the same `key` as the
 /// frame before need not build it. See the [module documentation](self).
@@ -100,6 +109,12 @@ pub enum RetainedPhase {
     /// [`Window::publish_layout`] (their bounds, not what only paint writes), is published here,
     /// once the whole tree is prepainted.
     Layout,
+    /// A pass that only lays out has a subtree where a pass that only laid out built it (see the
+    /// [module documentation](self)), and puts none of it into the frame. What the listeners of
+    /// the subtree published in the pass that built it is published here, once the whole tree is
+    /// prepainted: [`RetainedPhase::Layout`] is the same for a subtree that a presented frame
+    /// recorded.
+    LayoutRecorded,
     /// A pass that only lays out has a subtree that was handed to the stacking context around
     /// the subtree it is in (see [`Retained::lift_z`]) where its recording is. What the subtree
     /// publishes in a pass that lays out is published here, once the whole tree is prepainted:
@@ -275,6 +290,68 @@ pub(crate) struct RetainedState {
     /// Every entity the subtree read, so that a frame that does not build it still observes them.
     accessed_entities: FxHashSet<crate::EntityId>,
     recorded: Option<Recorded>,
+    /// What the last pass that only laid out built of the subtree, see [`LayoutRecord`].
+    layout: Option<LayoutRecord>,
+}
+
+/// What a pass that only lays out built of a subtree, for the next one to skip it with. It is not a
+/// recording: it keeps nothing of the frame (the pass throws it away), only the layout nodes the
+/// build left in the engine and what it published outside the frame. It has its own key, engine and
+/// root, since the pass may build a subtree the recording of a presented frame is not the build of,
+/// and that recording is left as it is for the draw.
+struct LayoutRecord {
+    key: u64,
+    engine: u64,
+    root: LayoutId,
+    /// Every entity the build read.
+    accessed_entities: FxHashSet<crate::EntityId>,
+    /// The frames drawn when it was built: a frame that is drawn ends it.
+    rendered_serial: u64,
+    /// The refreshes of the window when it was built: a refresh asks for every subtree to be built.
+    refresh_epoch: u64,
+    /// The passes that built every subtree to compare with when it was built, see
+    /// `RetainedWindow::reference_passes`.
+    reference_passes: u64,
+    /// Filled when the prepaint of the build is done and nothing in it kept it from being skipped.
+    replay: Option<LayoutReplay>,
+    /// Set by the last publication of the build. A build whose publications did not all run (the
+    /// pass was abandoned, a list rolled the prepaint back) is not what a skip could publish again.
+    published: Rc<Cell<bool>>,
+}
+
+/// Where the layout left a built subtree.
+struct LayoutReplay {
+    generation: u64,
+    key: ReplayKey,
+}
+
+impl LayoutRecord {
+    fn begin(key: u64, root: LayoutId, accessed_entities: FxHashSet<crate::EntityId>, window: &Window) -> Self {
+        Self {
+            key,
+            engine: window.layout_engine_id(),
+            root,
+            accessed_entities,
+            rendered_serial: window.rendered_serial(),
+            refresh_epoch: window.retained.refresh_epoch,
+            reference_passes: window.retained.reference_passes,
+            replay: None,
+            published: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// Whether a pass that only lays out can skip the subtree built with `key` by this record.
+    fn is_current(&self, key: u64, window: &Window) -> bool {
+        self.key == key
+            && self.published.get()
+            && self.rendered_serial == window.rendered_serial()
+            && self.refresh_epoch == window.retained.refresh_epoch
+            && self.reference_passes == window.retained.reference_passes
+            && self.engine == window.layout_engine_id()
+            && window.layout_node_alive(self.root)
+            && !self.accessed_entities.iter().any(|entity| window.retained.notified.contains(entity))
+            && self.replay.as_ref().is_some_and(|replay| replay.key.shapes_layout_like(window))
+    }
 }
 
 impl RetainedState {
@@ -425,10 +502,13 @@ pub enum RetainedLayout {
     /// The frame before left the subtree recorded as the same; whether prepaint replays it is
     /// decided once layout is done.
     Skipped,
+    /// A pass that only lays out skips the subtree with the layout record of the pass before.
+    SkippedLaidOut,
     Built {
         element: AnyElement,
         /// Why what the subtree does in this frame cannot be replayed in the next one.
         unreusable: Option<NonReusable>,
+        /// The frame records the subtree, or the pass that only lays out leaves a layout record.
         record: bool,
     },
     Handed,
@@ -731,6 +811,7 @@ impl Retained {
                 })
             {
                 window.retained.counters.hits += 1;
+                state.layout = None;
                 state.owner.keep(window.retained.state_pass, window.current_state_owner());
                 cx.entities.extend_accessed(&state.accessed_entities);
                 return ((state.root, RetainedLayout::Skipped), state);
@@ -759,6 +840,7 @@ impl Retained {
                 owner,
                 accessed_entities,
                 recorded: None,
+                layout: None,
             };
             (
                 (
@@ -786,10 +868,11 @@ impl Retained {
             RetainedLayout::Skipped if window.is_layout_pass() => {
                 self.prepaint_skipped_without_recording(global_id, bounds, window, cx)
             }
+            RetainedLayout::SkippedLaidOut => self.prepaint_skipped_laid_out(global_id, bounds, window, cx),
             RetainedLayout::Skipped if window.is_recording_relocatably() => {
                 let root = self.root(global_id, window);
                 let key = window.replay_key(bounds, root);
-                self.build_skipped(global_id, bounds, key, window, cx)
+                self.build_skipped(global_id, bounds, key, SkipBasis::Recorded, window, cx)
             }
             RetainedLayout::Skipped => {
                 self.prepaint_skipped(global_id, bounds, window, cx)
@@ -799,6 +882,9 @@ impl Retained {
                 unreusable,
                 record,
             } => {
+                if record && window.is_layout_pass() {
+                    return self.prepaint_for_layout_record(global_id, bounds, element, unreusable, window, cx);
+                }
                 // A subtree inside one that is recorded in a region cannot keep a recording of its
                 // own: what it paints goes to a scene that is gone when the frame is.
                 if !record || window.is_recording_relocatably() {
@@ -832,6 +918,15 @@ impl Retained {
     }
 }
 
+/// What a subtree that was skipped for layout was skipped with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkipBasis {
+    /// The recording of a presented frame.
+    Recorded,
+    /// The layout record of a pass that only laid out.
+    LaidOut,
+}
+
 /// Requests the layout of the root of a built subtree, which the engine keeps from one frame to
 /// the next while the node requests stay the same.
 fn request_subtree_layout(
@@ -854,8 +949,9 @@ fn request_subtree_layout(
 
 impl Retained {
     /// [`Element::request_layout`] in a pass that only lays out: the subtree is skipped under the
-    /// conditions of a presented frame, and the state that decides it is read and left as it is,
-    /// for the draw after the pass.
+    /// conditions of a presented frame, or of the layout record of a pass that only laid out, and
+    /// the state that decides it is read and left as it is, for the draw after the pass. A subtree
+    /// that is built leaves a layout record.
     fn request_layout_without_recording(
         &mut self,
         global_id: &GlobalElementId,
@@ -863,10 +959,11 @@ impl Retained {
         cx: &mut App,
     ) -> (LayoutId, RetainedLayout) {
         let key = self.key;
-        let skipped = (!window.retained.reference && !window.refreshing)
+        let skipped = (!window.retained.reference)
             .then(|| {
                 window.peek_element_state(global_id, |state: &RetainedState| {
-                    let fits = state.key == key
+                    let recorded = !window.refreshing
+                        && state.key == key
                         && !state
                             .accessed_entities
                             .iter()
@@ -879,25 +976,59 @@ impl Retained {
                                 && recorded.key.shapes_layout_like(window)
                                 && recorded.lifted_paint_from_recordings(window)
                         });
-                    fits.then_some(state.root)
+                    if recorded {
+                        return Some((state.root, RetainedLayout::Skipped));
+                    }
+                    let layout = state.layout.as_ref().filter(|layout| layout.is_current(key, window))?;
+                    Some((layout.root, RetainedLayout::SkippedLaidOut))
                 })
             })
             .flatten()
             .flatten();
-        if let Some(root) = skipped {
+        if let Some((root, skip)) = skipped {
             window.retained.counters.layout_skips += 1;
-            return (root, RetainedLayout::Skipped);
+            return (root, skip);
         }
 
         window.retained.counters.layout_builds += 1;
-        let mut element = self.build()(window, cx);
-        let layout_id = request_subtree_layout(&mut element, self.lift_z, window, cx);
+        let unstable_before = window.unstable_layout_requests();
+        let escapable_before = window.escapable_layout_requests();
+        let lift_z = self.lift_z;
+        let build = self.build();
+        let ((mut element, root), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
+            let mut element = build(window, cx);
+            let root = request_subtree_layout(&mut element, lift_z, window, cx);
+            (element, root)
+        });
+        let unreusable = (window.unstable_layout_requests() != unstable_before
+            || window.layout_requests_escape(root, escapable_before))
+        .then_some(NonReusable::UnstableLayout);
+        window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+            let layout = LayoutRecord::begin(key, root, accessed_entities, window);
+            let state = match state {
+                Some(mut state) => {
+                    state.layout = Some(layout);
+                    state
+                }
+                None => RetainedState {
+                    id: global_id.clone(),
+                    key,
+                    engine: layout.engine,
+                    root,
+                    owner: StateOwner::new(),
+                    accessed_entities: Default::default(),
+                    recorded: None,
+                    layout: Some(layout),
+                },
+            };
+            ((), state)
+        });
         (
-            layout_id,
+            root,
             RetainedLayout::Built {
                 element,
-                unreusable: None,
-                record: false,
+                unreusable,
+                record: true,
             },
         )
     }
@@ -990,7 +1121,7 @@ impl Retained {
             return RetainedPrepaint::Replayed;
         }
         window.retained.counters.lazy_builds += 1;
-        self.build_skipped(global_id, bounds, key, window, cx)
+        self.build_skipped(global_id, bounds, key, SkipBasis::Recorded, window, cx)
     }
 
     /// [`Self::prepaint_skipped`] in a pass that only lays out: the recording is replayed by
@@ -1017,7 +1148,7 @@ impl Retained {
             .expect("a skipped subtree has its state");
         let Some(placed) = placed else {
             window.retained.counters.layout_builds += 1;
-            return self.build_skipped(global_id, bounds, key, window, cx);
+            return self.build_skipped(global_id, bounds, key, SkipBasis::Recorded, window, cx);
         };
         let delta = match placed {
             Ok(delta) => delta,
@@ -1026,10 +1157,11 @@ impl Retained {
                     window.retained.counters.count_relocation_miss(miss);
                 }
                 window.retained.counters.layout_builds += 1;
-                return self.build_skipped(global_id, bounds, key, window, cx);
+                return self.build_skipped(global_id, bounds, key, SkipBasis::Recorded, window, cx);
             }
         };
         window.retained.counters.layout_replays += 1;
+        window.retained.layout_painted_skips += 1;
         if window.retained.verifier.is_some() {
             window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
         }
@@ -1058,20 +1190,131 @@ impl Retained {
         RetainedPrepaint::Replayed
     }
 
+    /// [`Self::prepaint_skipped_without_recording`] for a subtree skipped with its layout record:
+    /// where layout left it is where the build that made the record saw it, or it is built again
+    /// onto the nodes it has.
+    fn prepaint_skipped_laid_out(
+        &mut self,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RetainedPrepaint {
+        let root = self.laid_out_root(global_id, window);
+        let key = window.replay_key(bounds, root);
+        let generation = window.layout_generation(root);
+        let unchanged = window
+            .peek_element_state(global_id, |state: &RetainedState| {
+                state
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.replay.as_ref())
+                    .is_some_and(|replay| replay.generation == generation && replay.key == key)
+            })
+            .expect("a skipped subtree has its state");
+        if !unchanged {
+            window.retained.counters.layout_builds += 1;
+            return self.build_skipped(global_id, bounds, key, SkipBasis::LaidOut, window, cx);
+        }
+        window.retained.counters.layout_replays += 1;
+        if window.retained.verifier.is_some() {
+            window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
+        }
+        if let Some(hook) = self.on_replay.clone() {
+            window.publish_layout(move |window, cx| hook(RetainedPhase::LayoutRecorded, Point::default(), window, cx));
+        }
+        RetainedPrepaint::Replayed
+    }
+
+    /// The layout node of the subtree whose layout record the pass is using.
+    fn laid_out_root(&self, global_id: &GlobalElementId, window: &Window) -> LayoutId {
+        window
+            .peek_element_state(global_id, |state: &RetainedState| {
+                state.layout.as_ref().expect("a subtree built or skipped by a layout record has it").root
+            })
+            .expect("a subtree being prepainted has its state")
+    }
+
+    /// Prepaints a subtree that a pass that only lays out built, and leaves its layout record.
+    fn prepaint_for_layout_record(
+        &mut self,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        element: AnyElement,
+        unreusable: Option<NonReusable>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RetainedPrepaint {
+        let root = self.laid_out_root(global_id, window);
+        let key = window.replay_key(bounds, root);
+        self.prepaint_with_layout_record(global_id, key, element, unreusable, window, cx)
+    }
+
+    /// Prepaints `element`, the build of the subtree, and completes the layout record that the
+    /// build began if nothing it did keeps a pass from skipping it, or drops the record.
+    fn prepaint_with_layout_record(
+        &mut self,
+        global_id: &GlobalElementId,
+        key: ReplayKey,
+        mut element: AnyElement,
+        unreusable: Option<NonReusable>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RetainedPrepaint {
+        let mark = window.begin_layout_recording();
+        let ((), accessed_entities) = window.detect_observed_entities(cx, |window, cx| {
+            element.prepaint(window, cx);
+        });
+        let outcome = window.finish_layout_recording(mark);
+        let publishes = self.on_replay.is_some();
+        let skippable = outcome.reason.is_none()
+            && unreusable.is_none()
+            && !outcome.holds_painted
+            && (!outcome.published || publishes);
+        window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+            let mut state = state.expect("a built subtree has its state");
+            if let Some(mut layout) = state.layout.take() {
+                layout.accessed_entities.extend(accessed_entities);
+                if skippable && !window.layout_is_dirty(layout.root) {
+                    layout.replay = Some(LayoutReplay {
+                        generation: window.layout_generation(layout.root),
+                        key,
+                    });
+                    let published = layout.published.clone();
+                    window.publish_layout_unnoted(move |_, _| published.set(true));
+                    window.retained.counters.layout_records += 1;
+                    state.layout = Some(layout);
+                }
+            }
+            ((), state)
+        });
+        RetainedPrepaint::Built {
+            element,
+            record: false,
+            relocation: None,
+        }
+    }
+
     /// Builds a subtree that was skipped for layout and cannot be replayed, onto the layout nodes
-    /// it has, and prepaints it. Records what it left only in a frame that is presented.
+    /// it has, and prepaints it. Records what it left only in a frame that is presented, and in a
+    /// pass that only lays out leaves a layout record.
     fn build_skipped(
         &mut self,
         global_id: &GlobalElementId,
         bounds: Bounds<Pixels>,
         key: ReplayKey,
+        basis: SkipBasis,
         window: &mut Window,
         cx: &mut App,
     ) -> RetainedPrepaint {
         let lift_z = self.lift_z;
         let (root, owner) = window.with_element_state(global_id, |state: Option<RetainedState>, _| {
             let state = state.expect("a skipped subtree has its state");
-            ((state.root, state.owner.clone()), state)
+            let root = match basis {
+                SkipBasis::Recorded => state.root,
+                SkipBasis::LaidOut => state.layout.as_ref().expect("a subtree skipped by its layout record has it").root,
+            };
+            ((root, state.owner.clone()), state)
         });
         // It was kept when layout skipped it, and is built after all: it owns what it accesses now.
         owner.release(window.current_state_owner());
@@ -1096,10 +1339,13 @@ impl Retained {
             || counters_after.children_set != counters_before.children_set
             || window.layout_dirty_generation(built_root) != generation_before;
 
+        let layout_accessed = window.is_layout_pass().then(|| accessed_entities.clone());
         window.with_element_state(global_id, |state: Option<RetainedState>, _| {
             let mut state = state.expect("a skipped subtree has its state");
             state.accessed_entities.extend(accessed_entities);
-            state.root = built_root;
+            if basis == SkipBasis::Recorded {
+                state.root = built_root;
+            }
             ((), state)
         });
 
@@ -1108,7 +1354,10 @@ impl Retained {
             window.retained.counters.count_non_reusable(NonReusable::LayoutMismatch);
             window.with_element_state(global_id, |state: Option<RetainedState>, _| {
                 let mut state = state.expect("a skipped subtree has its state");
-                state.recorded = None;
+                if basis == SkipBasis::Recorded {
+                    state.recorded = None;
+                }
+                state.layout = None;
                 ((), state)
             });
             // The nodes the build asked for are not the ones layout has results for. The subtree
@@ -1133,6 +1382,15 @@ impl Retained {
             };
         }
 
+        let unreusable = unstable.then_some(NonReusable::UnstableLayout);
+        if let Some(accessed_entities) = layout_accessed {
+            window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+                let mut state = state.expect("a skipped subtree has its state");
+                state.layout = Some(LayoutRecord::begin(self.key, built_root, accessed_entities, window));
+                ((), state)
+            });
+            return self.prepaint_with_layout_record(global_id, key, element, unreusable, window, cx);
+        }
         if !window.retention_records() || window.is_recording_relocatably() {
             element.prepaint(window, cx);
             return RetainedPrepaint::Built {
@@ -1141,7 +1399,6 @@ impl Retained {
                 relocation: None,
             };
         }
-        let unreusable = unstable.then_some(NonReusable::UnstableLayout);
         let (record, relocation) =
             self.record_prepaint(global_id, key, unreusable, window, cx, |window, cx| {
                 element.prepaint(window, cx);
@@ -2136,7 +2393,7 @@ mod tests {
                             move |bounds: Bounds<Pixels>, window: &mut Window, _: &mut App| {
                                 let name = format!("{name} {index}");
                                 registry.borrow_mut().insert(name.clone(), bounds);
-                                // A pass that lays out records no tape, as it records no subtree.
+                                // A pass that lays out records no painted tape.
                                 if !window.is_layout_pass() {
                                     tapes.borrow_mut()[index].push((name, bounds));
                                 }
@@ -4851,6 +5108,8 @@ mod tests {
 mod fragment_tests;
 #[cfg(test)]
 mod hole_tests;
+#[cfg(test)]
+mod layout_record_tests;
 #[cfg(test)]
 mod relocation_tests;
 #[cfg(test)]
