@@ -1814,6 +1814,11 @@ pub struct Window {
     /// How many boxes were prepainted so far that sit outside the clip they were prepainted in,
     /// see [`Window::note_escape`].
     escapes_prepainted: u32,
+    /// The root of the retained subtree being recorded or patched that is `position: absolute`
+    /// against a block outside it, and how many of the escapes counted were its own, which no
+    /// recording or patch of it is kept from (see [`Window::note_escape`]).
+    pub(crate) root_escape: Option<LayoutId>,
+    root_escapes_prepainted: u32,
     exact_clips: Option<Rc<ExactClips>>,
     /// What the children of each positioned element see, innermost last. Only prepaint reads it.
     pub(crate) positioned_frames: Vec<PositionedFrame>,
@@ -2592,6 +2597,8 @@ impl Window {
             origin_phase_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             escapes_prepainted: 0,
+            root_escape: None,
+            root_escapes_prepainted: 0,
             exact_clips: None,
             positioned_frames: Vec::new(),
             lifts_open: 0,
@@ -5672,7 +5679,11 @@ impl Window {
 
     /// Notes during prepaint that a box is placed outside the clip around it. It is what
     /// [`Window::escapes_prepainted`] counts.
-    pub(crate) fn note_escape(&mut self, escaped: &ContentMask<Pixels>, derived: bool) {
+    ///
+    /// The box that is the root of the subtree being recorded or patched is counted as well as the
+    /// others, for the clip around it to know, and apart too: the root of a patch unit is never
+    /// replayed under the clip it escapes, so it does not make its own recording unusable.
+    pub(crate) fn note_escape(&mut self, layout_id: LayoutId, escaped: &ContentMask<Pixels>, derived: bool) {
         let mut clip = self.content_mask().bounds;
         let mut escaped = escaped.bounds;
         // The region of a subtree recorded to be put elsewhere stands in for the content mask
@@ -5685,6 +5696,9 @@ impl Window {
         }
         if clip.union(&escaped) != clip {
             self.escapes_prepainted = self.escapes_prepainted.wrapping_add(1);
+            if self.root_escape == Some(layout_id) {
+                self.root_escapes_prepainted = self.root_escapes_prepainted.wrapping_add(1);
+            }
         }
     }
 

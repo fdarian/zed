@@ -915,12 +915,12 @@ impl Retained {
                 }
                 let root = self.root(global_id, window);
                 let key = window.replay_key(bounds, root);
-                let root_escapes = Self::root_escapes(&element);
+                let root_escape = Self::root_escapes(&element).then_some(root);
                 let (record, relocation) = self.record_prepaint(
                     global_id,
                     key,
                     unreusable,
-                    root_escapes,
+                    root_escape,
                     window,
                     cx,
                     |window, cx| {
@@ -1421,9 +1421,9 @@ impl Retained {
                 relocation: None,
             };
         }
-        let root_escapes = Self::root_escapes(&element);
+        let root_escape = Self::root_escapes(&element).then_some(built_root);
         let (record, relocation) =
-            self.record_prepaint(global_id, key, unreusable, root_escapes, window, cx, |window, cx| {
+            self.record_prepaint(global_id, key, unreusable, root_escape, window, cx, |window, cx| {
                 element.prepaint(window, cx);
             });
         RetainedPrepaint::Built {
@@ -1440,7 +1440,7 @@ impl Retained {
         global_id: &GlobalElementId,
         key: ReplayKey,
         unreusable: Option<NonReusable>,
-        root_escapes: bool,
+        root_escape: Option<LayoutId>,
         window: &mut Window,
         cx: &mut App,
         prepaint: impl FnOnce(&mut Window, &mut App),
@@ -1463,11 +1463,13 @@ impl Retained {
         if let Some(relocation) = relocation {
             window.begin_relocation(relocation, false);
         }
+        let outside = std::mem::replace(&mut window.root_escape, root_escape);
         let ((), accessed_entities) = window.with_state_owner(&owner, |window| {
             window.detect_observed_entities(cx, |window, cx| prepaint(window, cx))
         });
         let relocation = relocating.then(|| window.end_relocation().0);
         let recording = window.finish_prepaint_recording(mark, surroundings.as_ref());
+        window.root_escape = outside;
         let record = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a built subtree has its state");
             state.accessed_entities.extend(accessed_entities);
@@ -1504,7 +1506,7 @@ impl Retained {
                         delta: Point::default(),
                         lift_base: None,
                         patch,
-                        root_escapes,
+                        root_escapes: root_escape.is_some(),
                     });
                     window.note_retained_recording((state.id.clone(), TypeId::of::<RetainedState>()), origin);
                     true

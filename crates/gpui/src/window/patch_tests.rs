@@ -238,6 +238,8 @@ struct Page {
     scroll: Option<ScrollHandle>,
     lift: Lift,
     around: Around,
+    /// The page clips to less than the box around it, which a box placed against that one escapes.
+    narrow: bool,
 }
 
 impl Page {
@@ -262,6 +264,10 @@ impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows;
         let mut content = div().id("content").flex().flex_col().w(px(400.)).pl(px(self.knobs.shift.get()));
+        if self.narrow {
+            // A div is positioned unless it says otherwise: nothing here is a containing block.
+            content.style().position = Some(Position::Static);
+        }
         let tall = if self.scroll.is_some() { 30. } else { 1. };
         // In a scroller the unit is first, so that scrolling moves it.
         if self.scroll.is_some() {
@@ -301,6 +307,10 @@ impl Render for Page {
                 .track_scroll(handle)
                 .child(content)
                 .into_any_element(),
+            None if self.narrow => {
+                page.style().position = Some(Position::Static);
+                div().id("window").w(px(400.)).h(px(2000.)).child(page.w(px(300.)).h(px(2000.)).overflow_hidden().child(content)).into_any_element()
+            }
             None => page.w(px(400.)).h(px(2000.)).overflow_hidden().child(content).into_any_element(),
         }
     }
@@ -320,6 +330,7 @@ struct Options {
     around: Around,
     /// The box in the unit has the focus.
     focused: bool,
+    narrow: bool,
 }
 
 impl Fixture {
@@ -337,7 +348,7 @@ impl Fixture {
         let window = cx.open_window(size(px(400.), px(2000.)), {
             let knobs = knobs.clone();
             let scroll = scroll.clone();
-            move |_, _| Page { rows, knobs, plain: options.plain, scroll, lift: options.lift, around: options.around }
+            move |_, _| Page { rows, knobs, plain: options.plain, scroll, lift: options.lift, around: options.around, narrow: options.narrow }
         });
         let window = AnyWindowHandle::from(window);
         cx.update_window(window, |_, window, cx| {
@@ -1345,4 +1356,14 @@ fn a_root_fixed_to_the_viewport_is_not_repainted_in_place(cx: &mut TestAppContex
     page.tick(cx);
     let patches = page.patches(cx);
     assert_eq!((patches.patched_frames, patches.declines(PatchDecline::Surroundings)), (0, 1));
+}
+
+#[gpui::test]
+fn an_absolute_root_that_escapes_the_clip_around_it_is_repainted_in_place(cx: &mut TestAppContext) {
+    // The page that clips is narrower than the box the root is placed against: it is drawn outside
+    // the clip around it, and that is no reason for a recording of it, or for a patch of it, to be refused.
+    // The page forms no stacking context, so there is no positioned frame between.
+    let options = Options { lift: Lift::Escaping, around: Around::NoContext, narrow: true, ..Default::default() };
+    let (_, patches, _) = ticks_on_a_page_with(cx, 4, options, 6);
+    assert_eq!(patches.total_declines(), 0);
 }

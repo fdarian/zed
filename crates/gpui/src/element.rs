@@ -571,7 +571,7 @@ impl<E: Element> Drawable<E> {
                 });
                 if let Some((mask, offset, derived)) = escaped {
                     if culled == Culled::No {
-                        window.note_escape(&mask, derived);
+                        window.note_escape(layout_id, &mask, derived);
                         window.content_mask_stack.push(mask);
                         window.begin_escaped_prepaint(derived);
                     }

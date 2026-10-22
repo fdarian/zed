@@ -585,6 +585,8 @@ pub(super) struct Effects {
     /// not counted: the recording holds their paint.
     ambient_lifts: u32,
     escapes: u32,
+    /// The part of `escapes` that is the escape of the root of the subtree being recorded.
+    root_escapes: u32,
     publications: u32,
     redraw_requests: u32,
     autoscroll_requests: u32,
@@ -603,6 +605,13 @@ pub(super) struct Effects {
 }
 
 impl Effects {
+    /// `self` without the escapes of the root being recorded since `since`: the root of a patch unit
+    /// that escapes the clip around it is no reason for its recording to be unusable.
+    pub(super) fn without_root_escapes(mut self, since: &Effects) -> Effects {
+        self.escapes = self.escapes.wrapping_sub(self.root_escapes.wrapping_sub(since.root_escapes));
+        self
+    }
+
     /// The reasons the subtree cannot be put elsewhere, that happened between `self` and `later`,
     /// as a set of [`NonRelocatable`] indices.
     fn blockers(&self, later: &Effects) -> u16 {
@@ -1434,6 +1443,7 @@ impl Window {
         Effects {
             ambient_lifts: self.ambient_lift_ordinal(),
             escapes: self.escapes_prepainted,
+            root_escapes: self.root_escapes_prepainted,
             publications: self.retained.publications,
             redraw_requests: self.retained.redraw_requests,
             autoscroll_requests: self.retained.autoscroll_requests,
@@ -1529,7 +1539,10 @@ impl Window {
     ) -> Result<PrepaintRecord, NonReusable> {
         self.retained.open_recordings.pop().expect("a recording that finishes began");
         let end = self.prepaint_index();
-        let effects = self.effects();
+        let mut effects = self.effects();
+        if self.root_escape.is_some() {
+            effects = effects.without_root_escapes(&mark.effects);
+        }
         let a11y = mark.a11y.map(|mark| self.a11y.end_recording(mark));
         let hitbox_range = mark.index.hitboxes_index..end.hitboxes_index;
         let stale_parent = mark.index.hitbox_parent;

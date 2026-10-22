@@ -723,6 +723,7 @@ impl Window {
             overrun: false,
         });
         let prepaint_start = self.prepaint_index();
+        let outside = mem::replace(&mut self.root_escape, (unit.element.escapes_to() == Some(Escape::ContainingBlock)).then_some(built_root));
         unit.element.prepaint(self, cx);
         let prepaint_end = self.prepaint_index();
         let hitbox_ids = self.patch.hitbox_ids.take().expect("a patch gives the hitboxes ids");
@@ -739,7 +740,9 @@ impl Window {
         }
         let paint_end = self.paint_index();
 
-        if effects.reasons(&self.effects()) != 0 || self.redraw_before_present || self.requested_autoscroll.is_some() {
+        let patched = self.effects().without_root_escapes(&effects);
+        self.root_escape = outside;
+        if effects.reasons(&patched) != 0 || self.redraw_before_present || self.requested_autoscroll.is_some() {
             return Err(PatchDecline::Effects);
         }
         if hitbox_ids.overrun
