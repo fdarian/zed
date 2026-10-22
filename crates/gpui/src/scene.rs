@@ -925,6 +925,7 @@ impl Scene {
         group_base: u64,
     ) {
         self.clear();
+        self.paint_operations.reserve(operations.len());
         self.next_group_id = group_base;
         self.group_base = group_base;
         if let Some((log, groups)) = reuse {
@@ -1190,8 +1191,39 @@ impl PaintOperation {
     /// Whether the operations paint differently, compared field by field through their debug
     /// form: most of what they hold has no equality, and an effect that fades is not a box.
     pub(crate) fn differs_from(&self, other: &PaintOperation) -> bool {
-        !self.same_kind(other) || format!("{self:?}") != format!("{other:?}")
+        !self.same_kind(other) || !same_debug_form(self, other)
     }
+}
+
+/// Whether `left` and `right` have the same debug form, which is formatted for `right` and only
+/// compared with as `left` is formatted, so that operations that differ early are not formatted
+/// to their end.
+fn same_debug_form(left: &impl Debug, right: &impl Debug) -> bool {
+    use std::fmt::Write as _;
+
+    struct Compare<'a> {
+        rest: &'a str,
+        same: bool,
+    }
+    impl std::fmt::Write for Compare<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            match self.rest.strip_prefix(text) {
+                Some(rest) => {
+                    self.rest = rest;
+                    Ok(())
+                }
+                None => {
+                    self.same = false;
+                    Err(std::fmt::Error)
+                }
+            }
+        }
+    }
+
+    let expected = format!("{right:?}");
+    let mut compare = Compare { rest: &expected, same: true };
+    write!(compare, "{left:?}").ok();
+    compare.same && compare.rest.is_empty()
 }
 
 fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
@@ -3029,5 +3061,14 @@ mod tests {
         painted.insert_primitive(quad(5., 5., 100., 100.));
         painted.finish();
         assert_eq!(drawn(&scene), drawn(&painted));
+    }
+
+    #[test]
+    fn operations_that_paint_the_same_have_no_difference() {
+        let same = PaintOperation::Quad(quad(0., 0., 10., 10.));
+        assert!(!same.differs_from(&PaintOperation::Quad(quad(0., 0., 10., 10.))));
+        assert!(same.differs_from(&PaintOperation::Quad(quad(0., 0., 10., 11.))));
+        assert!(same.differs_from(&PaintOperation::Quad(Quad { background: crate::blue().into(), ..quad(0., 0., 10., 10.) })));
+        assert!(same.differs_from(&PaintOperation::EndLayer));
     }
 }
