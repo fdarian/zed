@@ -31,3 +31,6 @@ pub use taffy_tree::{Calc, LinearCalc, TaffyError, TaffyResult, TaffyTree};
 
 #[cfg(feature = "detailed_layout_info")]
 pub use layout::DetailedLayoutInfo;
+
+#[cfg(all(test, feature = "taffy_tree"))]
+mod relayout_boundary_tests;

@@ -260,6 +260,14 @@ impl Cache {
         ClearState::Cleared
     }
 
+    /// Whether the node was laid out (`RunMode::PerformLayout`) since the cache was cleared. Entries of size
+    /// measurements alone do not say that the layout of the node's children is current.
+    ///
+    /// fdarian fork patch.
+    pub fn has_final_layout(&self) -> bool {
+        self.final_layout_entry.is_some()
+    }
+
     /// Returns true if all cache entries are None, else false
     pub fn is_empty(&self) -> bool {
         self.final_layout_entry.is_none() && !self.measure_entries.iter().any(|entry| entry.is_some())

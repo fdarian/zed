@@ -8,7 +8,9 @@ use slotmap::{DefaultKey, SlotMap};
 #[cfg(feature = "block_layout")]
 use crate::block::BlockContext;
 use crate::geometry::Size;
-use crate::style::{AvailableSpace, Display, Style};
+use crate::style::{
+    AvailableSpace, CompactLength, Dimension, Display, LengthPercentageAuto, Overflow, Position, Style, TableRole,
+};
 use crate::sys::DefaultCheapStr;
 use crate::tree::{
     Cache, ClearState, Layout, LayoutInput, LayoutOutput, LayoutPartialTree, NodeId, PrintTree, RoundTree, RunMode,
@@ -252,6 +254,17 @@ struct NodeData {
     /// fdarian fork patch.
     pub(crate) reached: u32,
 
+    /// The input and the output of the last time a parent placed this node (`RunMode::PerformLayout`), which is
+    /// what its layout in the tree is the result of. Gone once the node was laid out hidden.
+    ///
+    /// fdarian fork patch: relayout boundaries.
+    pub(crate) saved_layout: Option<SavedLayout>,
+
+    /// Whether the node is in [`TaffyTree::pending_boundaries`].
+    ///
+    /// fdarian fork patch: relayout boundaries.
+    pub(crate) pending_relayout: bool,
+
     /// The computation result from layout algorithm
     #[cfg(feature = "detailed_layout_info")]
     pub(crate) detailed_layout_info: DetailedLayoutInfo,
@@ -267,6 +280,8 @@ impl NodeData {
             dirty_generation: 0,
             layout_generation: 0,
             reached: 0,
+            saved_layout: None,
+            pending_relayout: false,
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             has_context: false,
@@ -288,6 +303,15 @@ impl NodeData {
         }
         state
     }
+}
+
+/// What a parent asked of a node when it placed it, and what the node answered.
+///
+/// fdarian fork patch: relayout boundaries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SavedLayout {
+    pub(crate) input: LayoutInput,
+    pub(crate) output: LayoutOutput,
 }
 
 /// An entire tree of UI nodes. The entry point to Taffy's high-level API.
@@ -323,6 +347,29 @@ pub struct TaffyTree<NodeContext = ()> {
     ///
     /// fdarian fork patch.
     size_runs: u64,
+
+    /// Relayout boundaries whose cache a change below them cleared, and whose ancestors kept theirs: the layout
+    /// of the tree is waiting for [`TaffyTree::compute_layout`] to run the boundary again.
+    ///
+    /// fdarian fork patch.
+    pending_boundaries: Vec<NodeId>,
+
+    /// How many pending boundaries were laid out again on their own.
+    ///
+    /// fdarian fork patch.
+    boundary_relayouts: u64,
+
+    /// Whether a change below a relayout boundary stops there (the default). Off, every change dirties the chain to
+    /// the root as upstream does.
+    ///
+    /// fdarian fork patch.
+    relayout_boundaries: bool,
+
+    /// How many times laying a boundary out again gave another answer than the one its ancestors were laid out
+    /// with, so that the layout went on from the root.
+    ///
+    /// fdarian fork patch.
+    boundary_fallbacks: u64,
 }
 
 impl Default for TaffyTree {
@@ -463,7 +510,8 @@ where
         //   - Else call the passed closure (below) to compute the result
         //
         // If there was no cache match and a new result needs to be computed then that result will be added to the cache
-        compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+        let original_inputs = inputs;
+        let output = compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
             match inputs.run_mode {
                 RunMode::PerformLayout => tree.taffy.layout_runs += 1,
                 RunMode::ComputeSize => tree.taffy.size_runs += 1,
@@ -517,8 +565,113 @@ where
                     compute_leaf_layout(inputs, style, resolve_linear_calc, measure_function)
                 }
             }
-        })
+        });
+        if original_inputs.run_mode == RunMode::PerformLayout {
+            self.taffy.nodes[node_id.into()].saved_layout = Some(SavedLayout { input: original_inputs, output });
+        }
+        output
     }
+}
+
+impl<NodeContext, MeasureFunction> TaffyView<'_, NodeContext, MeasureFunction>
+where
+    MeasureFunction: FnMut(
+        Size<Option<f32>>,
+        Size<AvailableSpace>,
+        NodeId,
+        Option<&mut NodeContext>,
+        &Style,
+        RunMode,
+    ) -> MeasuredLeaf,
+{
+    /// Lays out again, on its own, each relayout boundary under `root` that a change cleared the cache of and
+    /// that the layout from `root` did not reach, the one nearest the root first. The layout of a boundary is
+    /// the answer to what its parent asked it last time (`SavedLayout`), so it is laid out with that input, and
+    /// keeps the place its parent gave it.
+    ///
+    /// A boundary that does not answer what it did, or answers something the layout above it reads from it,
+    /// had a change that went out of it after all: the nodes above it are laid out again then, from the root.
+    ///
+    /// fdarian fork patch.
+    fn lay_out_pending_boundaries(
+        &mut self,
+        root: NodeId,
+        available_space: Size<AvailableSpace>,
+        parent_size: Size<Option<f32>>,
+    ) {
+        // The ones that are not under `root` wait for a layout of their own root.
+        let mut waiting = Vec::new();
+        loop {
+            let mut ready: Vec<(usize, NodeId)> = Vec::new();
+            for node in std::mem::take(&mut self.taffy.pending_boundaries) {
+                let Some(data) = self.taffy.nodes.get_mut(node.into()) else {
+                    continue;
+                };
+                if data.cache.has_final_layout() || data.saved_layout.is_none() {
+                    // A layout from above placed it, or a hidden one did.
+                    data.pending_relayout = false;
+                    continue;
+                }
+                match self.taffy.depth_under(node, root) {
+                    Some(depth) => ready.push((depth, node)),
+                    None => waiting.push(node),
+                }
+            }
+            ready.sort_by_key(|(depth, _)| *depth);
+
+            let mut ready = ready.into_iter();
+            let mut fell_back = false;
+            while let Some((_, node)) = ready.next() {
+                let key = node.into();
+                let data = &mut self.taffy.nodes[key];
+                data.pending_relayout = false;
+                // A boundary above it laid it out or hid it.
+                let Some(saved) = data.saved_layout.filter(|_| !data.cache.has_final_layout()) else { continue };
+                let output = LayoutPartialTree::compute_child_layout(self, node, saved.input);
+                self.taffy.boundary_relayouts += 1;
+                if !boundary_answer_is_unchanged(&saved.output, &output, &self.taffy.nodes[key].style) {
+                    self.taffy.boundary_fallbacks += 1;
+                    self.taffy.mark_dirty_to_root(node);
+                    self.taffy.pending_boundaries.extend(ready.map(|(_, node)| node));
+                    compute_root_layout_with_parent_size(self, root, available_space, parent_size);
+                    fell_back = true;
+                    break;
+                }
+                // The parent made the rest of the layout from the output it has: the size is the same, so it is too.
+                #[cfg(feature = "content_size")]
+                if output.content_size != saved.output.content_size {
+                    let mut layout = self.taffy.nodes[key].unrounded_layout;
+                    layout.content_size = output.content_size;
+                    self.set_unrounded_layout(node, &layout);
+                }
+            }
+            if !fell_back {
+                break;
+            }
+        }
+        self.taffy.pending_boundaries.extend(waiting);
+    }
+}
+
+/// Whether a boundary, laid out again, answers what its parent has read from it: its size, its baselines and
+/// its margins, and its content size when it shows its overflow (that is part of what its parent shows).
+///
+/// fdarian fork patch.
+fn boundary_answer_is_unchanged(before: &LayoutOutput, after: &LayoutOutput, style: &Style) -> bool {
+    #[cfg(feature = "content_size")]
+    {
+        let clips = style.overflow.x != Overflow::Visible && style.overflow.y != Overflow::Visible;
+        if !clips && before.content_size != after.content_size {
+            return false;
+        }
+    }
+    #[cfg(not(feature = "content_size"))]
+    let _ = style;
+    before.size == after.size
+        && before.first_baselines == after.first_baselines
+        && before.top_margin == after.top_margin
+        && before.bottom_margin == after.bottom_margin
+        && before.margins_can_collapse_through == after.margins_can_collapse_through
 }
 
 // TraversePartialTree impl for TaffyView
@@ -613,6 +766,8 @@ where
 
     fn cache_clear(&mut self, node_id: NodeId) {
         let node = &mut self.taffy.nodes[node_id.into()];
+        // Only a hidden layout clears the cache of a node being laid out.
+        node.saved_layout = None;
         if matches!(node.cache.clear(), ClearState::Cleared) {
             node.layout_generation += 1;
         }
@@ -785,6 +940,10 @@ impl<NodeContext> TaffyTree<NodeContext> {
             config: TaffyConfig::default(),
             layout_runs: 0,
             size_runs: 0,
+            pending_boundaries: Vec::new(),
+            relayout_boundaries: true,
+            boundary_relayouts: 0,
+            boundary_fallbacks: 0,
         }
     }
 
@@ -917,7 +1076,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
             self.node_context_data.remove(key);
         }
 
-        self.mark_dirty(node)?;
+        self.mark_dirty_below(node, true);
 
         Ok(())
     }
@@ -948,7 +1107,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
         let child_key = child.into();
         self.parents[child_key] = Some(parent);
         self.children[parent_key].push(child);
-        self.mark_dirty(parent)?;
+        self.mark_dirty_below(parent, true);
 
         Ok(())
     }
@@ -964,7 +1123,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
 
         self.parents[child.into()] = Some(parent);
         self.children[parent_key].insert(child_index, child);
-        self.mark_dirty(parent)?;
+        self.mark_dirty_below(parent, true);
 
         Ok(())
     }
@@ -999,7 +1158,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
         parent_children.clear();
         children.iter().for_each(|child| parent_children.push(*child));
 
-        self.mark_dirty(parent)?;
+        self.mark_dirty_below(parent, true);
 
         Ok(())
     }
@@ -1025,7 +1184,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
         let child = self.children[parent_key].remove(child_index);
         self.parents[child.into()] = None;
 
-        self.mark_dirty(parent)?;
+        self.mark_dirty_below(parent, true);
 
         Ok(child)
     }
@@ -1044,7 +1203,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
             self.parents[child.into()] = None;
         }
 
-        self.mark_dirty(parent)?;
+        self.mark_dirty_below(parent, true);
         Ok(())
     }
 
@@ -1068,7 +1227,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
         let old_child = core::mem::replace(&mut self.children[parent_key][child_index], new_child);
         self.parents[old_child.into()] = None;
 
-        self.mark_dirty(parent)?;
+        self.mark_dirty_below(parent, true);
 
         Ok(old_child)
     }
@@ -1174,15 +1333,168 @@ impl<NodeContext> TaffyTree<NodeContext> {
     /// node under a `display: none` node is laid out hidden, which stores nothing, so its cache is empty while the
     /// caches above it are not, and stopping there leaves the ancestors with a layout that does not know about the
     /// change.
+    ///
+    /// The node may have had its own style changed, so it is never taken for the end of the dirty chain; use
+    /// [`Self::set_style`] and the child list methods, which know what changed.
     pub fn mark_dirty(&mut self, node: NodeId) -> TaffyResult<()> {
+        self.mark_dirty_below(node, false);
+        Ok(())
+    }
+
+    /// [`Self::mark_dirty`] for a change to what is inside `node`, or to the context it is measured by. The chain of
+    /// ancestors ends at the first relayout boundary (see [`Self::is_relayout_boundary`]), `node` included.
+    ///
+    /// fdarian fork patch.
+    fn mark_dirty_below(&mut self, node: NodeId, node_is_boundary_candidate: bool) {
+        let mut current = Some(node);
+        let mut candidate = node_is_boundary_candidate;
+        while let Some(node) = current {
+            let key = node.into();
+            self.nodes[key].mark_dirty();
+            if candidate && self.is_relayout_boundary(node) {
+                if !std::mem::replace(&mut self.nodes[key].pending_relayout, true) {
+                    self.pending_boundaries.push(node);
+                }
+                // The caches above stay, but a layout read from them has to know that something changed below.
+                let mut ancestor = self.parents[key];
+                while let Some(node) = ancestor {
+                    let data = &mut self.nodes[node.into()];
+                    data.dirty_generation += 1;
+                    data.layout_generation += 1;
+                    ancestor = self.parents[node.into()];
+                }
+                return;
+            }
+            candidate = true;
+            current = self.parents[key];
+        }
+    }
+
+    /// [`Self::mark_dirty`] all the way up, whatever the nodes on the way are.
+    fn mark_dirty_to_root(&mut self, node: NodeId) {
         let mut current = Some(node);
         while let Some(node) = current {
             let key = node.into();
             self.nodes[key].mark_dirty();
             current = self.parents[key];
         }
+    }
 
-        Ok(())
+    /// Whether a change below `node` can be laid out again without laying out what is above `node`: a relayout
+    /// boundary, as Blink's `ObjectIsRelayoutBoundary` has it. The parent has its answer from `node` already, and
+    /// nothing inside `node` can change that answer.
+    ///
+    /// All of these hold:
+    /// - `node` was placed by its parent, not hidden, and still is a child of one (the layout is saved);
+    /// - it is a formatting context root, which a block is by clipping its overflow, containing its layout, or being
+    ///   absolutely positioned, and a flex, grid or flow-root container is always: no margin or float of a sibling
+    ///   goes through it;
+    /// - it is not a flex, grid or table item (their parents size and align it by its content), and it is not an
+    ///   absolutely positioned box that takes its place from its static position on either axis;
+    /// - either it has size and layout containment, or it has a width and a height that are lengths, no
+    ///   `min`/`max` that goes by content, and it clips its overflow on both axes (`overflow` other than `visible`).
+    ///
+    /// Blink's condition that the box has a self-painting layer is left out: it is there for what the paint system
+    /// does with the box, and nothing in layout depends on it.
+    ///
+    /// fdarian fork patch.
+    pub fn is_relayout_boundary(&self, node: NodeId) -> bool {
+        let data = &self.nodes[node.into()];
+        let Some(parent) = self.parents[node.into()] else {
+            return false;
+        };
+        if data.saved_layout.is_none() || !self.relayout_boundaries {
+            return false;
+        }
+        let style = &data.style;
+        let is_absolute = style.position == Position::Absolute;
+        let parent_style = &self.nodes[parent.into()].style;
+        match parent_style.display {
+            Display::None => return false,
+            #[cfg(feature = "flexbox")]
+            Display::Flex if !is_absolute => return false,
+            #[cfg(feature = "grid")]
+            Display::Grid => return false,
+            #[cfg(feature = "table_layout")]
+            Display::Table => return false,
+            _ => {}
+        }
+        if style.table_role != TableRole::None || style.item_is_table {
+            return false;
+        }
+        if is_absolute {
+            let auto = |a: LengthPercentageAuto, b: LengthPercentageAuto| a.is_auto() && b.is_auto();
+            if auto(style.inset.left, style.inset.right) || auto(style.inset.top, style.inset.bottom) {
+                return false;
+            }
+        }
+
+        let is_scroll_container = style.overflow.x.is_scroll_container() || style.overflow.y.is_scroll_container();
+        let is_formatting_context_root = match style.display {
+            Display::None => return false,
+            #[cfg(feature = "table_layout")]
+            Display::Table => return false,
+            #[cfg(feature = "block_layout")]
+            Display::Block => is_absolute || is_scroll_container || style.contain_layout || self.child_count(node) == 0,
+            _ => true,
+        };
+        if !is_formatting_context_root {
+            return false;
+        }
+
+        if style.contain_inline_size && style.contain_block_size && style.contain_layout {
+            return true;
+        }
+        let is_length = |dimension: Dimension| dimension.tag() == CompactLength::LENGTH_TAG;
+        let is_not_by_content = |dimension: Dimension| {
+            matches!(dimension.tag(), CompactLength::LENGTH_TAG | CompactLength::PERCENT_TAG | CompactLength::AUTO_TAG)
+        };
+        is_length(style.size.width)
+            && is_length(style.size.height)
+            && is_not_by_content(style.min_size.width)
+            && is_not_by_content(style.min_size.height)
+            && is_not_by_content(style.max_size.width)
+            && is_not_by_content(style.max_size.height)
+            && style.overflow.x != Overflow::Visible
+            && style.overflow.y != Overflow::Visible
+    }
+
+    /// How many ancestors `node` has, if `root` is `node` or one of them.
+    fn depth_under(&self, node: NodeId, root: NodeId) -> Option<usize> {
+        let mut depth = 0;
+        let mut current = node;
+        let mut found = current == root;
+        while let Some(parent) = self.parents[current.into()] {
+            depth += 1;
+            current = parent;
+            found |= current == root;
+        }
+        found.then_some(depth)
+    }
+
+    /// Turns relayout boundaries on or off for the changes made from now on. They are on by default.
+    ///
+    /// fdarian fork patch.
+    pub fn set_relayout_boundaries(&mut self, enabled: bool) {
+        self.relayout_boundaries = enabled;
+    }
+
+    /// How many relayout boundaries were laid out again on their own, over the life of the tree, where
+    /// [`Self::compute_layout`] would otherwise have laid out the nodes above them too.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn boundary_relayouts(&self) -> u64 {
+        self.boundary_relayouts
+    }
+
+    /// How many of the boundary relayouts gave another answer than the one the ancestors had, and so were followed by
+    /// a layout from the root.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn boundary_fallbacks(&self) -> u64 {
+        self.boundary_fallbacks
     }
 
     /// How many times the layout results of this node were thrown away, by a change to it or under it. A
@@ -1269,6 +1581,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
         let use_rounding = self.config.use_rounding;
         let mut taffy_view = TaffyView { taffy: self, measure_function };
         compute_root_layout_with_parent_size(&mut taffy_view, node_id, available_space, parent_size);
+        taffy_view.lay_out_pending_boundaries(node_id, available_space, parent_size);
         if use_rounding {
             round_layout(&mut taffy_view, node_id);
         }
