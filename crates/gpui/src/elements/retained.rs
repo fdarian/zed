@@ -422,9 +422,10 @@ impl RetainedState {
         // A subtree recorded in a region prepaints and paints what lies between the content mask
         // around it and the region too, which a build under the mask leaves out: what cannot be
         // seen or hit is not compared.
-        // The same goes for a subtree that holds one, which put what it recorded into the frame
-        // when it was replayed inside it.
-        let loose = recorded.relocation.is_some() || recorded.prepaint.relocated_inside;
+        // The same goes for a subtree that was kept within an overscan with no region made for it
+        // (under a rounded clip), and for one that holds either, which put what it recorded into
+        // the frame when it was replayed inside it.
+        let loose = recorded.is_loose();
         let describe = |loose: bool| {
             let mut text = format!(
                 "{}\n{}",
@@ -492,6 +493,14 @@ impl Recorded {
                     .unwrap_or(false)
             }) && lifts.cells().all(|cell| cell.paints_from_its_recording(window))
         })
+    }
+
+    /// Whether the recording has more than a build under the content mask around it: it was
+    /// recorded with an overscan (in a region, or where a region could not be made, see
+    /// [`Self::unmovable_at_start`]: the subtree was kept, not culled, within the overscan all the
+    /// same), or holds one that was.
+    fn is_loose(&self) -> bool {
+        self.relocation.is_some() || self.unmovable_at_start.is_some() || self.prepaint.relocated_inside
     }
 
     /// Whether the recording keeps its geometry as it was in a region and not as it was in the
@@ -1115,7 +1124,7 @@ impl Retained {
                 (state.id.clone(), TypeId::of::<RetainedState>()),
                 recorded.prepaint.origin.clone(),
             );
-            if recorded.relocation.is_some() || recorded.prepaint.relocated_inside {
+            if recorded.is_loose() {
                 window.retained.relocated_inside += 1;
             }
             if delta.is_zero()
@@ -1491,7 +1500,7 @@ impl Retained {
             let record = match reason {
                 Ok(prepaint) => {
                     let patch = patch.filter(|_| prepaint.lifts.is_none());
-                    if relocating || prepaint.relocated_inside {
+                    if relocating || unmovable_at_start.is_some() || prepaint.relocated_inside {
                         window.retained.relocated_inside += 1;
                     }
                     let origin = prepaint.origin.clone();
