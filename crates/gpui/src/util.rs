@@ -171,11 +171,12 @@ pub(crate) fn round_to_device_pixel_down(logical: f32, scale_factor: f32) -> f32
 
 /// Splits a glyph origin in device pixels into the whole pixel it is painted at and the
 /// subpixel variant (in `0..variants`) it is rasterized with, so that
-/// `whole + variant / variants` is the origin rounded to the nearest `1 / variants`.
+/// `whole + variant / variants` is the origin rounded to the nearest `1 / variants`, a tie
+/// going up as Skia rounds a glyph position (`floor(position + 1 / (2 * variants))`).
 /// Shifting the origin by a whole number shifts `whole` by it and leaves the variant alone.
 #[inline]
 pub(crate) fn split_glyph_origin(origin: f32, variants: u8) -> (f32, u8) {
-    let quantized = round_half_down(origin * variants as f32) / variants as f32;
+    let quantized = round_half_up(origin * variants as f32) / variants as f32;
     let whole = quantized.floor();
     (whole, ((quantized - whole) * variants as f32) as u8)
 }
@@ -496,20 +497,55 @@ mod tests {
         }
     }
 
-    fn split_glyph_origin_toward_zero(origin: f32, variants: u8) -> (f32, u8) {
-        let quantized = round_half_toward_zero(origin * variants as f32) / variants as f32;
-        (quantized.trunc(), (quantized.fract() * variants as f32) as u8)
+    #[test]
+    fn splitting_a_glyph_origin_rounds_ties_up() {
+        // (origin, variants, whole, variant)
+        for (origin, variants, whole, variant) in [
+            // a whole pixel (one variant, as the y axis has): the tie is at .5
+            (0.5, 1, 1., 0),
+            (20.5, 1, 21., 0),
+            (20.4999, 1, 20., 0),
+            (-0.5, 1, 0., 0),
+            (-1.5, 1, -1., 0),
+            (-2.5, 1, -2., 0),
+            (-2.5001, 1, -3., 0),
+            // quarters (the x axis): the ties are at eighths
+            (0.125, 4, 0., 1),
+            (0.375, 4, 0., 2),
+            (0.625, 4, 0., 3),
+            (0.875, 4, 1., 0),
+            (20.125, 4, 20., 1),
+            (20.875, 4, 21., 0),
+            (20.1249, 4, 20., 0),
+            (-0.125, 4, 0., 0),
+            (-0.375, 4, -1., 3),
+            (-0.625, 4, -1., 2),
+            (-0.875, 4, -1., 1),
+            (-1.125, 4, -1., 0),
+        ] {
+            assert_eq!(
+                split_glyph_origin(origin, variants),
+                (whole, variant),
+                "{origin} in {variants}"
+            );
+        }
     }
 
     #[test]
-    fn splitting_a_glyph_origin_is_what_it_was_for_non_negative_values() {
-        for value in non_negative_values() {
-            for variants in [1, 4] {
+    fn splitting_a_glyph_origin_is_the_origin_rounded_to_the_nearest_variant() {
+        for variants in [1, 4] {
+            for step in -64 * 16..64 * 16 {
+                let value = step as f32 / 64.;
                 let (whole, variant) = split_glyph_origin(value, variants);
-                let (expected_whole, expected_variant) =
-                    split_glyph_origin_toward_zero(value, variants);
-                assert_eq!(whole.to_bits(), expected_whole.to_bits(), "{value}");
-                assert_eq!(variant, expected_variant, "{value}");
+                let painted = whole + variant as f32 / variants as f32;
+                // Exactly representable, so the distance is exact: at most half a variant,
+                // and a tie is the upper one.
+                let distance = value - painted;
+                let half_variant = 0.5 / variants as f32;
+                assert!(
+                    (-half_variant..half_variant).contains(&distance),
+                    "{value} in {variants} painted at {painted}"
+                );
             }
         }
     }

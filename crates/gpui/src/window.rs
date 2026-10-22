@@ -6991,7 +6991,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
-        let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_down(c.0)));
+        let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_up(c.0)));
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
