@@ -989,7 +989,7 @@ impl TextLayout {
                 };
                 let unmeasurable = |wrap_width, truncate_width| {
                     if run == MeasureRun::Place {
-                        element_state.0.borrow_mut().replace(TextLayoutInner {
+                        element_state.place(TextLayoutInner {
                             lines: Default::default(),
                             len: 0,
                             line_height,
@@ -1231,7 +1231,7 @@ impl TextLayout {
                 // The handle holds the layout that was placed and prepainted, which a retained
                 // root replays without measuring or prepainting again.
                 if run == MeasureRun::Place {
-                    element_state.0.borrow_mut().replace(inner);
+                    element_state.place(inner);
                 }
 
                 MeasuredLeaf {
@@ -1258,6 +1258,20 @@ impl TextLayout {
         };
         self.1.set(Some(layout_id));
         layout_id
+    }
+
+    /// Holds what a layout pass measured and placed. Where the text was prepainted stays: a
+    /// text of a retained subtree that is skipped is placed again with the answer it had, from the
+    /// probes the layout of its surroundings asked about, and is not prepainted again, while the
+    /// registries of the frame and the recordings that hold this layout read its bounds.
+    fn place(&self, mut placed: TextLayoutInner) {
+        let mut state = self.0.borrow_mut();
+        if let Some(previous) = state.as_ref() {
+            placed.bounds = previous.bounds;
+            placed.phase = previous.phase;
+            placed.phase_y = previous.phase_y;
+        }
+        *state = Some(placed);
     }
 
     /// Holds what `previous` measured: the layout node did not measure the text again because
@@ -2265,6 +2279,18 @@ mod tests {
                 }));
                 layout
             })
+        }
+
+        #[crate::test]
+        fn placing_the_text_again_keeps_where_it_was_prepainted(cx: &mut TestAppContext) {
+            let layout = two_lines(cx);
+            let bounds = layout.bounds();
+            let mut placed = layout.0.borrow().clone().unwrap();
+            placed.bounds = None;
+            placed.phase_y = px(0.25);
+            layout.place(placed);
+            assert_eq!(layout.bounds(), bounds);
+            assert_eq!(layout.0.borrow().as_ref().unwrap().phase_y, Pixels::ZERO);
         }
 
         #[crate::test]
