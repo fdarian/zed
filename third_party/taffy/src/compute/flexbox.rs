@@ -158,11 +158,24 @@ struct AlgoConstants {
     node_outer_size: Size<Option<f32>>,
     /// The content-box size of the node being laid out (if known)
     node_inner_size: Size<Option<f32>>,
+    /// fdarian fork patch: `node_inner_size.height` is the height size containment gave the node, which
+    /// its free space, stretch and line sizes use but its children's percentages do not: see
+    /// [`AlgoConstants::percentage_base`].
+    height_from_containment: bool,
 
     /// The size of the virtual container containing the flex items.
     container_size: Size<f32>,
     /// The size of the internal container
     inner_container_size: Size<f32>,
+}
+
+impl AlgoConstants {
+    /// What the percentages of the items resolve against. Blink applies `contain-intrinsic-size` after
+    /// the children are laid out, so the height it gives an `auto` box is not one they can resolve
+    /// against, though the box ends up that tall and its free space and stretch read it.
+    fn percentage_base(&self) -> Size<Option<f32>> {
+        Size { width: self.node_inner_size.width, height: self.node_inner_size.height.filter(|_| !self.height_from_containment) }
+    }
 }
 
 /// Computes the layout of a box according to the flexbox algorithm
@@ -246,10 +259,16 @@ pub fn compute_flexbox_layout(
 
 /// Compute a preliminary size for an item
 fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
-    let LayoutInput { known_dimensions, parent_size, available_space, run_mode, .. } = inputs;
+    let LayoutInput { known_dimensions, parent_size, available_space, run_mode, height_from_containment, .. } = inputs;
 
     // Define some general constants we will need for the remainder of the algorithm.
-    let mut constants = compute_constants(tree, tree.get_flexbox_container_style(node), known_dimensions, parent_size);
+    let mut constants = compute_constants(
+        tree,
+        tree.get_flexbox_container_style(node),
+        known_dimensions,
+        parent_size,
+        height_from_containment,
+    );
 
     // 9. Flex Layout Algorithm
 
@@ -438,6 +457,7 @@ fn compute_constants(
     style: impl FlexboxContainerStyle,
     known_dimensions: Size<Option<f32>>,
     parent_size: Size<Option<f32>>,
+    height_from_containment: bool,
 ) -> AlgoConstants {
     let dir = style.flex_direction();
     let is_row = dir.is_row();
@@ -507,6 +527,7 @@ fn compute_constants(
         justify_content,
         node_outer_size,
         node_inner_size,
+        height_from_containment,
         container_size,
         inner_container_size,
     }
@@ -532,10 +553,10 @@ fn generate_anonymous_flex_items(
             let aspect_ratio = child_style.aspect_ratio();
             let padding = child_style
                 .padding()
-                .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis));
+                .resolve_or_zero(constants.percentage_base().width, |val, basis| tree.calc(val, basis));
             let border = child_style
                 .border()
-                .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis));
+                .resolve_or_zero(constants.percentage_base().width, |val, basis| tree.calc(val, basis));
             let pb_sum = (padding + border).sum_axes();
             let box_sizing_adjustment =
                 if child_style.box_sizing() == BoxSizing::ContentBox { pb_sum } else { Size::ZERO };
@@ -544,32 +565,32 @@ fn generate_anonymous_flex_items(
                 order: index as u32,
                 size: child_style
                     .size()
-                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
+                    .maybe_resolve(constants.percentage_base(), |val, basis| tree.calc(val, basis))
                     .maybe_apply_aspect_ratio(aspect_ratio)
                     .maybe_add(box_sizing_adjustment),
                 min_size: child_style
                     .min_size()
-                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
+                    .maybe_resolve(constants.percentage_base(), |val, basis| tree.calc(val, basis))
                     .maybe_add(box_sizing_adjustment),
                 max_size: child_style
                     .max_size()
-                    .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
+                    .maybe_resolve(constants.percentage_base(), |val, basis| tree.calc(val, basis))
                     .maybe_add(box_sizing_adjustment),
                 aspect_ratio,
 
                 inset: child_style
                     .inset()
-                    .zip_size(constants.node_inner_size, |p, s| p.maybe_resolve(s, |val, basis| tree.calc(val, basis))),
+                    .zip_size(constants.percentage_base(), |p, s| p.maybe_resolve(s, |val, basis| tree.calc(val, basis))),
                 margin: child_style
                     .margin()
-                    .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
+                    .resolve_or_zero(constants.percentage_base().width, |val, basis| tree.calc(val, basis)),
                 margin_is_auto: child_style.margin().map(LengthPercentageAuto::is_auto),
                 padding: child_style
                     .padding()
-                    .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
+                    .resolve_or_zero(constants.percentage_base().width, |val, basis| tree.calc(val, basis)),
                 border: child_style
                     .border()
-                    .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
+                    .resolve_or_zero(constants.percentage_base().width, |val, basis| tree.calc(val, basis)),
                 align_self: child_style.align_self().unwrap_or(constants.align_items).resolve_self_relative(
                     child_style.direction(),
                     constants.layout_direction,
@@ -712,7 +733,7 @@ fn determine_flex_base_size(
 
         // Parent size for child sizing
         let cross_axis_parent_size = constants.node_inner_size.cross(dir);
-        let child_parent_size = Size::from_cross(dir, cross_axis_parent_size);
+        let child_parent_size = Size::from_cross(dir, constants.percentage_base().cross(dir));
 
         // Available space for child sizing
         // Min/max sizes transferred through the aspect ratio are taken into account here
@@ -774,7 +795,7 @@ fn determine_flex_base_size(
             None
         } else {
             basis_style
-                .maybe_resolve(container_width, |val, basis| tree.calc(val, basis))
+                .maybe_resolve(constants.percentage_base().main(dir), |val, basis| tree.calc(val, basis))
                 .maybe_add(box_sizing_adjustment)
         };
 
@@ -1154,7 +1175,7 @@ fn determine_container_main_size(
                                 let content_main_size = tree.measure_child_size(
                                     item.node,
                                     child_known_dimensions,
-                                    constants.node_inner_size,
+                                    constants.percentage_base(),
                                     child_available_space,
                                     SizingMode::InherentSize,
                                     dir.main_axis(),
@@ -1514,7 +1535,7 @@ fn determine_hypothetical_cross_size(
                     width: if constants.is_row { child.target_size.width.into() } else { child_cross },
                     height: if constants.is_row { child_cross } else { child.target_size.height.into() },
                 },
-                constants.node_inner_size,
+                constants.percentage_base(),
                 Size {
                     width: if constants.is_row { child_known_main } else { child_available_cross },
                     height: if constants.is_row { child_available_cross } else { child_known_main },
@@ -1577,7 +1598,7 @@ fn calculate_children_base_lines(
                         child.target_size.height.into()
                     },
                 },
-                constants.node_inner_size,
+                constants.percentage_base(),
                 Size {
                     width: if constants.is_row {
                         constants.container_size.width.into()
@@ -1742,17 +1763,17 @@ fn determine_used_cross_size(
                     // a reasonable interpretation. Although it seems to me that the spec *should* apply aspect_ratio here.
                     let padding = child_style
                         .padding()
-                        .resolve_or_zero(constants.node_inner_size, |val, basis| tree.calc(val, basis));
+                        .resolve_or_zero(constants.percentage_base(), |val, basis| tree.calc(val, basis));
                     let border = child_style
                         .border()
-                        .resolve_or_zero(constants.node_inner_size, |val, basis| tree.calc(val, basis));
+                        .resolve_or_zero(constants.percentage_base(), |val, basis| tree.calc(val, basis));
                     let pb_sum = (padding + border).sum_axes();
                     let box_sizing_adjustment =
                         if child_style.box_sizing() == BoxSizing::ContentBox { pb_sum } else { Size::ZERO };
 
                     let max_size_ignoring_aspect_ratio = child_style
                         .max_size()
-                        .maybe_resolve(constants.node_inner_size, |val, basis| tree.calc(val, basis))
+                        .maybe_resolve(constants.percentage_base(), |val, basis| tree.calc(val, basis))
                         .maybe_add(box_sizing_adjustment);
 
                     (line_cross_size - child.margin.cross_axis_sum(constants.dir)).maybe_clamp(
@@ -2064,14 +2085,14 @@ fn calculate_flex_item(
     #[cfg(feature = "content_size")] total_content_size: &mut Size<f32>,
     #[cfg(feature = "content_size")] border: Rect<f32>,
     container_size: Size<f32>,
-    node_inner_size: Size<Option<f32>>,
+    percentage_base: Size<Option<f32>>,
     direction: FlexDirection,
     layout_direction: Direction,
 ) {
     let layout_output = tree.perform_child_layout(
         item.node,
         item.target_size.map(|s| s.into()),
-        node_inner_size,
+        percentage_base,
         container_size.map(|s| s.into()),
         SizingMode::ContentSize,
         Line::FALSE,
@@ -2186,7 +2207,7 @@ fn calculate_layout_line(
     #[cfg(feature = "content_size")] content_size: &mut Size<f32>,
     #[cfg(feature = "content_size")] border: Rect<f32>,
     container_size: Size<f32>,
-    node_inner_size: Size<Option<f32>>,
+    percentage_base: Size<Option<f32>>,
     padding_border: Rect<f32>,
     direction: FlexDirection,
     layout_direction: Direction,
@@ -2216,7 +2237,7 @@ fn calculate_layout_line(
                 #[cfg(feature = "content_size")]
                 border,
                 container_size,
-                node_inner_size,
+                percentage_base,
                 direction,
                 layout_direction,
             );
@@ -2234,7 +2255,7 @@ fn calculate_layout_line(
                 #[cfg(feature = "content_size")]
                 border,
                 container_size,
-                node_inner_size,
+                percentage_base,
                 direction,
                 layout_direction,
             );
@@ -2273,7 +2294,7 @@ fn final_layout_pass(
                 #[cfg(feature = "content_size")]
                 constants.border,
                 constants.container_size,
-                constants.node_inner_size,
+                constants.percentage_base(),
                 constants.content_box_inset,
                 constants.dir,
                 constants.layout_direction,
@@ -2290,7 +2311,7 @@ fn final_layout_pass(
                 #[cfg(feature = "content_size")]
                 constants.border,
                 constants.container_size,
-                constants.node_inner_size,
+                constants.percentage_base(),
                 constants.content_box_inset,
                 constants.dir,
                 constants.layout_direction,

@@ -3103,7 +3103,7 @@ mod tests {
 
         /// The size of the box and of its only child, a `height: 50%` leaf with nothing in it, when the box is
         /// contained in the block axis with a `contain-intrinsic-height` of 100.
-        fn percentage_child(height: Dimension) -> (f32, f32) {
+        fn percentage_child_of(container: Style, height: Dimension) -> (f32, f32) {
             let mut taffy: TaffyTree<()> = TaffyTree::new();
             let child = taffy
                 .new_leaf(Style { size: Size { width: auto(), height: percent(0.5) }, ..Default::default() })
@@ -3114,7 +3114,7 @@ mod tests {
                         contain_block_size: true,
                         contain_intrinsic_size: Size { width: None, height: Some(100.0) },
                         size: Size { width: auto(), height },
-                        ..plain()
+                        ..container
                     },
                     &[child],
                 )
@@ -3122,6 +3122,14 @@ mod tests {
             let root = taffy.new_with_children(page(), &[contained]).unwrap();
             taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
             (taffy.layout(contained).unwrap().size.height, taffy.layout(child).unwrap().size.height)
+        }
+
+        fn percentage_child(height: Dimension) -> (f32, f32) {
+            percentage_child_of(plain(), height)
+        }
+
+        fn flex(flex_direction: FlexDirection) -> Style {
+            Style { display: Display::Flex, flex_direction, ..Default::default() }
         }
 
         #[test]
@@ -3132,6 +3140,45 @@ mod tests {
         #[test]
         fn a_percentage_height_under_a_contained_definite_height_resolves() {
             assert_eq!(percentage_child(length(200.0)), (200.0, 100.0));
+        }
+
+        #[test]
+        fn a_percentage_height_under_a_contained_auto_height_is_auto_in_a_flex_column() {
+            assert_eq!(percentage_child_of(flex(FlexDirection::Column), auto()), (100.0, 0.0));
+        }
+
+        #[test]
+        fn a_percentage_height_under_a_contained_auto_height_is_auto_in_a_flex_row() {
+            assert_eq!(percentage_child_of(flex(FlexDirection::Row), auto()), (100.0, 0.0));
+        }
+
+        #[test]
+        fn a_percentage_height_under_a_contained_definite_height_resolves_in_a_flex_container() {
+            assert_eq!(percentage_child_of(flex(FlexDirection::Column), length(200.0)), (200.0, 100.0));
+            assert_eq!(percentage_child_of(flex(FlexDirection::Row), length(200.0)), (200.0, 100.0));
+        }
+
+        /// The contained height is still the container's own: an auto-height item of a row stretches to it, and a
+        /// growing item of a column fills it.
+        #[test]
+        fn a_contained_flex_container_keeps_its_height_for_stretch_and_free_space() {
+            for (direction, grow) in [(FlexDirection::Row, 0.0), (FlexDirection::Column, 1.0)] {
+                let mut taffy: TaffyTree<()> = TaffyTree::new();
+                let child = taffy.new_leaf(Style { flex_grow: grow, ..Default::default() }).unwrap();
+                let contained = taffy
+                    .new_with_children(
+                        Style {
+                            contain_block_size: true,
+                            contain_intrinsic_size: Size { width: None, height: Some(100.0) },
+                            ..flex(direction)
+                        },
+                        &[child],
+                    )
+                    .unwrap();
+                let root = taffy.new_with_children(page(), &[contained]).unwrap();
+                taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+                assert_eq!(taffy.layout(child).unwrap().size.height, 100.0, "{direction:?}");
+            }
         }
 
         #[test]
