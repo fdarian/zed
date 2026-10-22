@@ -964,8 +964,9 @@ impl Retained {
                     return self.prepaint_for_layout_record(global_id, bounds, element, unreusable, window, cx);
                 }
                 // A subtree inside one that is recorded in a region cannot keep a recording of its
-                // own: what it paints goes to a scene that is gone when the frame is.
-                if !record || window.is_recording_relocatably() {
+                // own: what it paints goes to a scene that is gone when the frame is. Nor can one
+                // inside the build that a verifier compares a replay with (a relocation does not nest).
+                if !record || window.is_recording_any_relocation() {
                     element.prepaint(window, cx);
                     return RetainedPrepaint::Built {
                         element,
@@ -1473,7 +1474,7 @@ impl Retained {
             });
             return self.prepaint_with_layout_record(global_id, key, element, unreusable, window, cx);
         }
-        if !window.retention_records() || window.is_recording_relocatably() {
+        if !window.retention_records() || window.is_recording_any_relocation() {
             element.prepaint(window, cx);
             return RetainedPrepaint::Built {
                 element,

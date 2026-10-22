@@ -2204,6 +2204,13 @@ impl Window {
             .is_some_and(|relocation| !relocation.direct)
     }
 
+    /// Whether a relocatable subtree is being prepainted or painted, in a region or as the
+    /// build a verifier compares a replay with (`direct`): a subtree in it records nothing of
+    /// its own, since a relocation does not nest and the one around holds what it holds.
+    pub(crate) fn is_recording_any_relocation(&self) -> bool {
+        self.retained.relocation.is_some()
+    }
+
     /// Whether a subtree is being recorded in a region that stands in for the content mask
     /// around it, which a culled one is not.
     fn is_recording_regionally(&self) -> bool {
