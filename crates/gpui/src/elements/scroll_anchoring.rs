@@ -5,10 +5,12 @@
 //! resized above it), the scroller is scrolled by the same distance, so what the user looks at
 //! stays where it is.
 //!
-//! Blink picks the anchor before a layout and compares after it. A pass of gpui is already
-//! laid out when the scroller prepaints, so the anchor is picked at the end of the prepaint
-//! of the pass before, from the geometry that pass ended with, which is the geometry Blink's
-//! pick would read, and compared with the layout of the next one.
+//! Blink picks the anchor before a layout (`NotifyBeforeLayout`), from the boxes of the layout
+//! before it and the style and tree the page has now, and compares after it. [`ScrollAnchoring::before_layout`]
+//! does the same: the layout engine calls it for each tracked scroller of a pass just before it
+//! computes the layout of the pass, when the nodes still have the boxes of the pass before and
+//! already have the styles and the children the new one asks for. [`ScrollAnchoring::step`]
+//! compares in the prepaint of the scroller, which is after the layout.
 //!
 //! The scroller keeps the state in its `ScrollHandleState`, so only scrollers that track a
 //! handle anchor. Blink: `third_party/blink/renderer/core/layout/scroll_anchor.cc`.
@@ -25,6 +27,8 @@ pub(crate) struct ScrollAnchoring {
     /// The offset the last step left in the scroller. Another offset at the next prepaint means
     /// that something scrolled it: the wheel, a scrollbar, a call of the handle.
     left_offset: Point<Pixels>,
+    /// The scrollport of the last step, which the pick before the layout looks into.
+    client: Size<Pixels>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,17 +60,61 @@ impl ScrollAnchoring {
         }
     }
 
-    /// Moves the offset by what the layout moved the anchor, and picks an anchor if the scroller
-    /// has none. To be called when the offset is clamped to the new layout, since Blink clamps
-    /// first and compensates after.
+    /// Blink's `NotifyBeforeLayout`: keeps the anchor, or picks one if the scroller has none, from
+    /// the boxes of the last layout and the tree and styles of the one that is about to run. An
+    /// anchor that left the scroller, is hidden or is `overflow-anchor: none` now is replaced, as
+    /// one that the scroller was scrolled away from since the last step is. Pass `jumped` when the
+    /// offset is about to be set to the end.
+    pub(crate) fn before_layout(
+        &mut self,
+        engine: &mut TaffyLayoutEngine,
+        layout_id: LayoutId,
+        enabled: bool,
+        offset: Point<Pixels>,
+        jumped: bool,
+        scale_factor: f32,
+    ) {
+        self.note_offset(offset, jumped);
+        if let Some(anchor) = self.anchor {
+            let kept = anchor.engine == engine.id()
+                && engine.contains(anchor.node)
+                && Path::to_scroller(engine, anchor.node, layout_id).is_some_and(|path| !path.excluded);
+            if !kept {
+                self.anchor = None;
+            }
+        }
+        self.left_offset = offset;
+        // Blink does not anchor a scroller that is at its start.
+        if !enabled || offset.y == Pixels::ZERO {
+            self.anchor = None;
+        } else if self.anchor.is_none() && !jumped {
+            let scroller = Scroller {
+                layout_id,
+                client: self.client,
+                max_offset_y: Pixels::ZERO,
+                enabled,
+            };
+            let view = Scrollport::of(engine, &scroller, scale_factor);
+            self.anchor = Walk::select(engine, &view, &scroller, offset).map(|(node, block_start)| Anchor {
+                engine: engine.id(),
+                node,
+                block_start,
+            });
+        }
+    }
+
+    /// Moves the offset by what the layout moved the anchor. To be called when the offset is
+    /// clamped to the new layout, since Blink clamps first and compensates after.
     pub(crate) fn step(
         &mut self,
         scroller: &Scroller,
         offset: &mut Point<Pixels>,
         window: &mut Window,
     ) {
+        self.client = scroller.client;
         if !scroller.enabled {
             self.anchor = None;
+            self.left_offset = *offset;
             return;
         }
         let scale_factor = window.scale_factor();
@@ -82,17 +130,8 @@ impl ScrollAnchoring {
                 }
             }
         }
-        // Blink does not anchor a scroller that is at its start.
         if offset.y == Pixels::ZERO {
             self.anchor = None;
-        } else if self.anchor.is_none() {
-            self.anchor = Walk::select(engine, &view, scroller, *offset).map(|(node, block_start)| {
-                Anchor {
-                    engine: engine.id(),
-                    node,
-                    block_start,
-                }
-            });
         }
         self.left_offset = *offset;
     }
@@ -161,7 +200,7 @@ impl Path {
             if current == scroller {
                 return Some(path);
             }
-            path.excluded |= facts.excluded;
+            path.excluded |= facts.excluded || facts.hidden;
             current = engine.layout_parent(current)?;
         }
     }
@@ -302,7 +341,9 @@ impl<'a> Walk<'a> {
         facts: &AnchorFacts,
         containing_block_inside: bool,
     ) -> Examined {
-        if facts.excluded {
+        // A box with `display: none` has no layout object in Blink, so it is not walked. The
+        // boxes it has are those of the layout before, when this walk runs before a layout.
+        if facts.excluded || facts.hidden {
             return Examined::Skip;
         }
         // Blink's `CandidateMayMoveWithScroller`.
@@ -351,6 +392,7 @@ mod tests {
         height: f32,
         margin_top: f32,
         anchor_none: bool,
+        hidden: bool,
     }
 
     struct Model {
@@ -375,12 +417,12 @@ mod tests {
                         .w(px(100.))
                         .h(px(row.height))
                         .mt(px(row.margin_top));
-                    if row.anchor_none {
+                    let element = if row.anchor_none {
                         element.overflow_anchor(OverflowAnchor::None)
                     } else {
                         element
-                    }
-                    .into_any_element()
+                    };
+                    if row.hidden { element.hidden() } else { element }.into_any_element()
                 })
                 .collect::<Vec<AnyElement>>();
             div().size_full().child(
@@ -416,6 +458,7 @@ mod tests {
                     height: 30.,
                     margin_top: 0.,
                     anchor_none: false,
+                    hidden: false,
                 })
                 .collect(),
             scroller_anchor_none: false,
@@ -480,6 +523,7 @@ mod tests {
                     height,
                     margin_top: 0.,
                     anchor_none: false,
+                    hidden: false,
                 },
             );
         }
@@ -564,6 +608,38 @@ mod tests {
     }
 
     #[gpui::test]
+    fn an_anchor_turned_none_in_the_frame_of_the_change_is_replaced_by_the_next_box(
+        cx: &mut TestAppContext,
+    ) {
+        let scene = harness(cx);
+        scene.scroll_to(300., cx);
+        scene.row(10).anchor_none = true;
+        scene.insert_above(100, 50.);
+        scene.draw(cx);
+        assert_eq!(scene.top(), 350., "row 11 anchors, from where it was before the layout");
+    }
+
+    #[gpui::test]
+    fn a_scroller_turned_on_in_the_frame_of_the_change_anchors(cx: &mut TestAppContext) {
+        let scene = harness(cx);
+        scene.model.borrow_mut().scroller_anchor_none = true;
+        scene.scroll_to(300., cx);
+        scene.model.borrow_mut().scroller_anchor_none = false;
+        scene.insert_above(100, 50.);
+        scene.draw(cx);
+        assert_eq!(scene.top(), 350.);
+    }
+
+    #[gpui::test]
+    fn an_anchor_that_is_hidden_is_replaced_by_the_box_after_it(cx: &mut TestAppContext) {
+        let scene = harness(cx);
+        scene.scroll_to(300., cx);
+        scene.row(10).hidden = true;
+        scene.draw(cx);
+        assert_eq!(scene.top(), 270., "row 11 moved up by the 30 of row 10");
+    }
+
+    #[gpui::test]
     fn a_box_partly_in_view_is_the_anchor(cx: &mut TestAppContext) {
         let scene = harness(cx);
         scene.scroll_to(310., cx);
@@ -596,17 +672,19 @@ mod tests {
     }
 
     #[gpui::test]
-    fn an_explicit_scroll_between_frames_drops_the_anchor(cx: &mut TestAppContext) {
+    fn an_explicit_scroll_between_frames_picks_a_new_anchor_from_the_boxes_before_the_layout(
+        cx: &mut TestAppContext,
+    ) {
         let scene = harness(cx);
         scene.scroll_to(300., cx);
         scene.handle.set_offset(point(px(0.), px(-200.)));
         scene.insert_above(100, 50.);
         scene.draw(cx);
-        assert_eq!(scene.top(), 200.);
+        assert_eq!(scene.top(), 250., "the box in view at 200 is the anchor, as Blink picks it");
 
         scene.insert_above(101, 50.);
         scene.draw(cx);
-        assert_eq!(scene.top(), 250., "the scroll picked a new anchor");
+        assert_eq!(scene.top(), 300.);
     }
 
     #[gpui::test]
@@ -622,13 +700,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_removed_anchor_compensates_nothing(cx: &mut TestAppContext) {
+    fn a_removed_anchor_is_replaced_by_the_box_after_it(cx: &mut TestAppContext) {
         let scene = harness(cx);
         scene.scroll_to(300., cx);
         scene.model.borrow_mut().rows.retain(|row| row.key != 10);
         scene.insert_above(100, 50.);
         scene.draw(cx);
-        assert_eq!(scene.top(), 300.);
+        // The next row moved by 50 less the 30 of the row that went.
+        assert_eq!(scene.top(), 320.);
     }
 
     #[gpui::test]

@@ -361,6 +361,15 @@ pub struct TaffyLayoutEngine {
     unstable_requests: u64,
     /// The nodes with `NodeMeta::anchor_restyled` set in the pass under way.
     anchor_restyled_nodes: Vec<LayoutId>,
+    /// The scrollers that asked for layout in the pass and have not picked their anchor yet.
+    anchor_scrollers: Vec<AnchorScroller>,
+}
+
+/// A scroll container that anchors, as the pass under way found it.
+struct AnchorScroller {
+    layout_id: LayoutId,
+    enabled: bool,
+    handle: crate::ScrollHandle,
 }
 
 /// Where the boxes of a subtree reach.
@@ -455,6 +464,7 @@ impl TaffyLayoutEngine {
             probed: Vec::new(),
             unstable_requests: 0,
             anchor_restyled_nodes: Vec::new(),
+            anchor_scrollers: Vec::new(),
         }
     }
 
@@ -632,6 +642,7 @@ impl TaffyLayoutEngine {
                 meta.anchor_restyled = false;
             }
         }
+        self.anchor_scrollers.clear();
         self.pass += 1;
         self.counters.passes += 1;
     }
@@ -1334,6 +1345,7 @@ impl TaffyLayoutEngine {
         //
 
         self.detach_from_stale_parent(id);
+        self.pick_scroll_anchors(window.scale_factor());
         self.give_back_stretched_widths(true);
         if !self.computed_layouts.insert(id) {
             let stack = &mut self.layout_bounds_scratch_space;
@@ -1370,6 +1382,37 @@ impl TaffyLayoutEngine {
         let containing_width = containing_width.map(|width| width.map(|width| width.0 * scale_factor));
         self.run_taffy_in(id, available_space, containing_width, scale_factor, window, cx);
         self.settle_containing_blocks(id, available_space, scale_factor, window, cx);
+    }
+
+    /// Notes a scroll container that asked for layout in this pass, to pick its anchor before the
+    /// layout is computed.
+    pub(crate) fn note_anchor_scroller(
+        &mut self,
+        layout_id: LayoutId,
+        enabled: bool,
+        handle: crate::ScrollHandle,
+    ) {
+        self.anchor_scrollers.push(AnchorScroller {
+            layout_id,
+            enabled,
+            handle,
+        });
+    }
+
+    /// Lets the scrollers of the pass pick their anchors while the nodes have the boxes of the pass
+    /// before and the styles and children of this one, which is when Blink picks.
+    fn pick_scroll_anchors(&mut self, scale_factor: f32) {
+        if self.anchor_scrollers.is_empty() {
+            return;
+        }
+        for scroller in std::mem::take(&mut self.anchor_scrollers) {
+            scroller
+                .handle
+                .pick_anchor(self, scroller.layout_id, scroller.enabled, scale_factor);
+        }
+        // What was asked of the boxes above is of the boxes before the layout.
+        self.absolute_layout_bounds.clear();
+        self.absolute_outer_origins.clear();
     }
 
     /// A root that a frame before had under a parent which this pass did not ask for is not under
@@ -1983,6 +2026,8 @@ fn scroll_anchor_fields_differ(old: &taffy::style::Style, new: &taffy::style::St
 pub(crate) struct AnchorFacts {
     /// `overflow-anchor: none`.
     pub excluded: bool,
+    /// `display: none`.
+    pub hidden: bool,
     pub position: crate::Position,
     /// The node is not a containing block of absolute boxes.
     pub is_static: bool,
@@ -2003,6 +2048,7 @@ impl TaffyLayoutEngine {
         let overflow = [style.overflow.x, style.overflow.y];
         AnchorFacts {
             excluded: meta.anchor_excluded,
+            hidden: style.display == taffy::style::Display::None,
             position: meta.position,
             is_static: meta.is_static,
             has_inset: meta.has_inset,

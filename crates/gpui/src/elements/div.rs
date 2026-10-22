@@ -2948,7 +2948,15 @@ impl Interactivity {
                 }
 
                 let style = self.compute_style_internal(None, element_state.as_mut(), window, cx);
+                let anchoring = self.scroll_offset.as_ref().and(self.tracked_scroll_handle.clone()).map(
+                    |handle| (handle, style.overflow_anchor != OverflowAnchor::None),
+                );
                 let layout_id = f(style, window, cx);
+                if let Some((handle, enabled)) = anchoring {
+                    window
+                        .layout_engine_mut()
+                        .note_anchor_scroller(layout_id, enabled, handle);
+                }
                 self.layout_id = Some(layout_id);
                 (layout_id, element_state)
             },
@@ -5326,6 +5334,22 @@ impl Default for ScrollHandle {
 }
 
 impl ScrollHandle {
+    /// See [`ScrollAnchoring::before_layout`].
+    pub(crate) fn pick_anchor(
+        &self,
+        engine: &mut crate::taffy::TaffyLayoutEngine,
+        layout_id: LayoutId,
+        enabled: bool,
+        scale_factor: f32,
+    ) {
+        let mut state = self.0.borrow_mut();
+        let offset = *state.offset.borrow();
+        let jumped = state.scroll_to_bottom;
+        state
+            .anchoring
+            .before_layout(engine, layout_id, enabled, offset, jumped, scale_factor);
+    }
+
     /// Construct a new scroll handle.
     pub fn new() -> Self {
         Self(Rc::default())
