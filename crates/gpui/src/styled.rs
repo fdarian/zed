@@ -4,7 +4,7 @@ use crate::{
     DefiniteLength, Direction, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontSmoothing, FontStyle,
     FontVariations,
     FlexBasisKeyword, FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
-    JustifyContent, Length, LineHeight, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
+    JustifyContent, Length, LineHeight, OverflowAnchor, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
     StyleRefinement, TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow,
     TextStyleRefinement, UnderlineStyle, WhiteSpace,
     px, relative, rems,
@@ -41,6 +41,13 @@ pub trait Styled: Sized {
     /// space. A zero width hides it, for example in a refinement.
     fn outline(mut self, outline: crate::Outline) -> Self {
         self.style().outline = Some(outline);
+        self
+    }
+
+    /// Sets CSS `overflow-anchor`: [`OverflowAnchor::None`] on a scroller turns its scroll
+    /// anchoring off, and on a descendant keeps it and its subtree from being the anchor.
+    fn overflow_anchor(mut self, overflow_anchor: OverflowAnchor) -> Self {
+        self.style().overflow_anchor = Some(overflow_anchor);
         self
     }
 

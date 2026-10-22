@@ -22,7 +22,7 @@ use crate::{
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, OverscrollBehavior,
+    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, OverflowAnchor, OverscrollBehavior,
     ParentElement, Position, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     scroll_routing, size,
@@ -46,7 +46,10 @@ use std::{
     time::Duration,
 };
 
-use super::ImageCacheProvider;
+use super::{
+    ImageCacheProvider,
+    scroll_anchoring::{ScrollAnchoring, Scroller},
+};
 
 #[cfg(feature = "stacker")]
 type StackSafe<T> = stacksafe::StackSafe<T>;
@@ -3296,6 +3299,9 @@ impl Interactivity {
             if let Some(mut scroll_handle_state) = tracked_scroll_handle.as_deref_mut() {
                 scroll_handle_state.overflow = style.overflow;
                 scroll_to_bottom = mem::take(&mut scroll_handle_state.scroll_to_bottom);
+                scroll_handle_state
+                    .anchoring
+                    .note_offset(*scroll_offset.borrow(), scroll_to_bottom);
             }
 
             let rem_size = window.rem_size();
@@ -3336,6 +3342,20 @@ impl Interactivity {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
             }
 
+            if let Some(scroll_handle_state) = tracked_scroll_handle.as_deref_mut()
+                && let (Some(layout_id), Some(extent)) = (self.layout_id, self.scroll_extent)
+            {
+                scroll_handle_state.anchoring.step(
+                    &Scroller {
+                        layout_id,
+                        client: extent.client,
+                        max_offset_y: scroll_max.y,
+                        enabled: style.overflow_anchor != OverflowAnchor::None,
+                    },
+                    &mut *scroll_offset,
+                    window,
+                );
+            }
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
@@ -5277,6 +5297,7 @@ struct ScrollHandleState {
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
     active_item: Option<ScrollActiveItem>,
+    anchoring: ScrollAnchoring,
 }
 
 #[derive(Default, Debug, Clone, Copy)]

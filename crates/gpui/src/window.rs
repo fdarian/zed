@@ -7510,6 +7510,12 @@ impl Window {
         (engine.id(), engine.pass())
     }
 
+    /// The engine that lays out the element being prepainted, for the readers of layout that walk
+    /// the nodes themselves (scroll anchoring).
+    pub(crate) fn layout_engine_mut(&mut self) -> &mut TaffyLayoutEngine {
+        self.layout_engine.as_mut().unwrap()
+    }
+
     /// See [`TaffyLayoutEngine::has_percent_width_limits`].
     pub(crate) fn layout_has_percent_width_limits(&self, layout_id: LayoutId) -> bool {
         self.layout_engine

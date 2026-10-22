@@ -242,6 +242,16 @@ struct NodeMeta {
     intrinsic_resolved: Option<Box<intrinsic::Resolved>>,
     /// The `width` that the node had before [`TaffyLayoutEngine::set_forced_width`] replaced it.
     unforced_width: Option<taffy::style::Dimension>,
+    /// The node's `position`, which taffy's own cannot tell sticky, fixed and static by.
+    position: crate::Position,
+    /// The node has `overflow-anchor: none`.
+    anchor_excluded: bool,
+    /// Any of the node's insets is not `auto`. Taffy is given auto insets for a sticky node.
+    has_inset: bool,
+    /// A request of the pass that is under way changed something of the node that scroll
+    /// anchoring does not follow (its insets, margin, padding, size, position), so the layout
+    /// that moves the anchor must not be compensated for. Dropped by [`TaffyLayoutEngine::end_pass`].
+    anchor_restyled: bool,
 }
 
 impl NodeMeta {
@@ -349,6 +359,8 @@ pub struct TaffyLayoutEngine {
     /// for: nodes no frame keeps, and nodes whose style or size layout rewrites. See
     /// [`Self::unstable_requests`].
     unstable_requests: u64,
+    /// The nodes with `NodeMeta::anchor_restyled` set in the pass under way.
+    anchor_restyled_nodes: Vec<LayoutId>,
 }
 
 /// Where the boxes of a subtree reach.
@@ -442,6 +454,7 @@ impl TaffyLayoutEngine {
             run: 0,
             probed: Vec::new(),
             unstable_requests: 0,
+            anchor_restyled_nodes: Vec::new(),
         }
     }
 
@@ -614,6 +627,11 @@ impl TaffyLayoutEngine {
         self.natural_widths.clear();
         self.escapable_nodes.clear();
         self.ordinals.clear();
+        for id in std::mem::take(&mut self.anchor_restyled_nodes) {
+            if let Some(meta) = self.meta.get_mut(&id) {
+                meta.anchor_restyled = false;
+            }
+        }
         self.pass += 1;
         self.counters.passes += 1;
     }
@@ -892,7 +910,21 @@ impl TaffyLayoutEngine {
             meta.intrinsic_resolved = old.intrinsic_resolved.take();
         }
         let escapable_requested = meta.requested.take();
+        let anchor_restyled = old.anchor_restyled
+            || old.position != meta.position
+            || old.has_inset != meta.has_inset
+            || {
+                let previous = requested
+                    .as_deref()
+                    .unwrap_or_else(|| self.taffy.style(id.0).expect(EXPECT_MESSAGE));
+                scroll_anchor_fields_differ(previous, &taffy_style)
+            };
+        meta.anchor_restyled = anchor_restyled;
+        let newly_restyled = anchor_restyled && !old.anchor_restyled;
         *old = meta;
+        if newly_restyled {
+            self.anchor_restyled_nodes.push(id);
+        }
 
         old.requested = if differs { None } else { requested };
         if differs {
@@ -1100,6 +1132,11 @@ impl TaffyLayoutEngine {
             // `original`, which the keywords can replace, so the request is kept on its own.
             requested: escapable.is_some().then(|| Box::new(taffy_style.clone())),
             natural: style.measure_natural_width,
+            position: style.position,
+            anchor_excluded: style.overflow_anchor == crate::OverflowAnchor::None,
+            has_inset: [style.inset.top, style.inset.right, style.inset.bottom, style.inset.left]
+                .iter()
+                .any(|edge| *edge != crate::Length::Auto),
             is_static: style.position == crate::Position::Static && !style.contain_layout,
             contains_layout: style.contain_layout,
             // A new node has no extent kept, and its parent changed to get it: only a node found
@@ -1924,6 +1961,66 @@ impl TaffyLayoutEngine {
             width: Pixels(layout.content_box_width() / scale_factor),
             height: Pixels(layout.content_box_height() / scale_factor),
         })
+    }
+}
+
+/// Whether a style change is one that scroll anchoring does not compensate for: Blink's
+/// `kScrollAnchor` group of properties (`top` and the other insets, margin, padding, `width`,
+/// `height`, their `min-` and `max-`, `position` and `contain-intrinsic-size`).
+fn scroll_anchor_fields_differ(old: &taffy::style::Style, new: &taffy::style::Style) -> bool {
+    old.inset != new.inset
+        || old.margin != new.margin
+        || old.padding != new.padding
+        || old.size != new.size
+        || old.min_size != new.min_size
+        || old.max_size != new.max_size
+        || old.position != new.position
+        || old.contain_intrinsic_size != new.contain_intrinsic_size
+}
+
+/// What scroll anchoring reads of a node besides its box.
+#[derive(Clone, Copy)]
+pub(crate) struct AnchorFacts {
+    /// `overflow-anchor: none`.
+    pub excluded: bool,
+    pub position: crate::Position,
+    /// The node is not a containing block of absolute boxes.
+    pub is_static: bool,
+    /// The node has an inset, which makes a sticky node move with the scroll.
+    pub has_inset: bool,
+    /// `overflow` is not `visible` on one of the axes.
+    pub clips: bool,
+    /// `overflow` is `scroll` on one of the axes: a scroll container of its own.
+    pub scrolls: bool,
+    /// See [`NodeMeta::anchor_restyled`].
+    pub restyled: bool,
+}
+
+impl TaffyLayoutEngine {
+    pub(crate) fn anchor_facts(&self, id: LayoutId) -> AnchorFacts {
+        let meta = self.meta(id);
+        let style = self.taffy.style(id.0).expect(EXPECT_MESSAGE);
+        let overflow = [style.overflow.x, style.overflow.y];
+        AnchorFacts {
+            excluded: meta.anchor_excluded,
+            position: meta.position,
+            is_static: meta.is_static,
+            has_inset: meta.has_inset,
+            clips: overflow.iter().any(|axis| *axis != taffy::style::Overflow::Visible),
+            scrolls: overflow.iter().any(|axis| *axis == taffy::style::Overflow::Scroll),
+            restyled: meta.anchor_restyled,
+        }
+    }
+
+    pub(crate) fn layout_child_count(&self, id: LayoutId) -> usize {
+        self.taffy.child_count(id.0)
+    }
+
+    pub(crate) fn layout_child_at(&self, id: LayoutId, index: usize) -> LayoutId {
+        self.taffy
+            .child_at_index(id.0, index)
+            .expect(EXPECT_MESSAGE)
+            .into()
     }
 }
 

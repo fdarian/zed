@@ -9,6 +9,7 @@ mod image_cache;
 mod img;
 mod list;
 mod retained;
+mod scroll_anchoring;
 mod surface;
 mod svg;
 mod text;

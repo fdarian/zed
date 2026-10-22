@@ -249,6 +249,9 @@ pub struct Style {
     pub overflow: Point<Overflow>,
     /// How much space (in points) should be reserved for the scrollbars of `Overflow::Scroll` and `Overflow::Auto` nodes.
     pub scrollbar_width: AbsoluteLength,
+    /// CSS `overflow-anchor`. On a scroller, `None` turns scroll anchoring off for it; on any other
+    /// element it keeps the element and its subtree from being chosen as the anchor.
+    pub overflow_anchor: OverflowAnchor,
     /// Whether both x and y axis should be scrollable at the same time.
     pub allow_concurrent_scroll: bool,
     /// Whether scrolling should be restricted to the input gesture's axis.
@@ -1594,6 +1597,7 @@ impl Default for Style {
             contain_inline_size: false,
             contain_block_size: false,
             contain_layout: false,
+            overflow_anchor: OverflowAnchor::default(),
             contain_intrinsic_width: None,
             contain_intrinsic_height: None,
             measure_natural_width: false,
@@ -2242,6 +2246,19 @@ pub enum Overflow {
     /// for a scrollbar. The amount of space reserved is controlled by the `scrollbar_width` property.
     /// Content that overflows this node should *not* contribute to the scroll region of its parent.
     Scroll,
+}
+
+/// CSS `overflow-anchor`: whether an element may be the anchor that keeps a scroller's view in
+/// place when the content above it changes size.
+///
+/// <https://developer.mozilla.org/en-US/docs/Web/CSS/overflow-anchor>
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub enum OverflowAnchor {
+    /// The element can be chosen as the anchor of its scroller.
+    #[default]
+    Auto,
+    /// The element and its subtree are never the anchor, and a scroller with it does not anchor.
+    None,
 }
 
 /// The positioning strategy for this item.
