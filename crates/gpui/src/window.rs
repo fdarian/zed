@@ -137,6 +137,13 @@ impl DispatchPhase {
     }
 }
 
+/// See [`Window::layout_stamp`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutStamp {
+    invalidations: usize,
+    builds: u64,
+}
+
 struct WindowInvalidatorInner {
     #[cfg(feature = "profiler")]
     pub window_id: WindowId,
@@ -1881,6 +1888,8 @@ pub struct Window {
     /// The pass running is one that does not paint: see [`Window::draw_if_dirty`].
     layout_only: bool,
     layout_passes: u64,
+    /// How many times the window drew or ran a layout pass: see [`Window::layout_stamp`].
+    builds: u64,
     /// A culled subtree is being prepainted: see [`Element::cull_outset`].
     culling: bool,
     /// The next element prepainted is the top of that subtree.
@@ -2622,6 +2631,7 @@ impl Window {
             measuring: false,
             layout_only: false,
             layout_passes: 0,
+            builds: 0,
             culling: false,
             cull_root_next: false,
             culled_subtrees: 0,
@@ -4343,6 +4353,14 @@ impl Window {
         self.layout_passes
     }
 
+    /// Where the window's layout stands: the invalidations it has had and the frames and layout
+    /// passes it has built. Two equal stamps mean nothing was invalidated and nothing was built
+    /// in between, so what the last build published (boxes, scroll metrics) is still what the
+    /// window holds, even when it was a build that the window is dirty after.
+    pub fn layout_stamp(&self) -> LayoutStamp {
+        LayoutStamp { invalidations: self.invalidator.update_count(), builds: self.builds }
+    }
+
     /// Whether the pass being built is a layout-only one, whose frame is thrown away without
     /// painting. An element that publishes something from paint publishes it from
     /// prepaint in such a pass: see [`Window::publish_layout`].
@@ -4437,6 +4455,7 @@ impl Window {
         self.next_frame.clear();
         self.invalidator.set_phase(DrawPhase::None);
         self.measured_at = Some((self.invalidator.update_count(), paint));
+        self.builds += 1;
         if !paint {
             self.layout_passes += 1;
         }
@@ -4449,6 +4468,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.builds += 1;
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -11664,6 +11684,40 @@ mod tests {
 
             cx.notify_scroll_only(id);
             assert!(!window.draw_if_scroll_metrics_dirty(cx), "the pass made them current");
+        });
+    }
+
+    /// The stamp moves with every invalidation and every pass or draw, and with nothing else.
+    #[gpui::test]
+    fn test_the_layout_stamp_moves_with_invalidations_and_builds(cx: &mut TestAppContext) {
+        struct Page;
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(div().w(px(100.)).h(px(20.)))
+            }
+        }
+        let (view, cx) = cx.add_window_view(|_, _| Page);
+        let id = view.entity_id();
+        cx.update(|window, cx| {
+            let clean = window.layout_stamp();
+            assert_eq!(window.layout_stamp(), clean);
+
+            cx.notify(id);
+            let invalidated = window.layout_stamp();
+            assert_ne!(invalidated, clean, "an invalidation moves it");
+            assert_eq!(window.layout_stamp(), invalidated, "and reading it does not");
+
+            assert!(window.draw_if_dirty(cx));
+            let laid_out = window.layout_stamp();
+            assert_ne!(laid_out, invalidated, "a layout pass moves it");
+
+            cx.notify(id);
+            let again = window.layout_stamp();
+            assert!(window.draw_if_dirty(cx));
+            assert_ne!(window.layout_stamp(), again);
+            assert!(!window.draw_if_dirty(cx), "no pass runs on a window laid out");
+            let settled = window.layout_stamp();
+            assert_eq!(window.layout_stamp(), settled, "a read that builds nothing leaves it");
         });
     }
 
