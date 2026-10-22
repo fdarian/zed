@@ -789,6 +789,60 @@ fn a_root_that_says_it_is_lifted_under_a_parent_that_lifts_nothing_is_repainted_
 }
 
 #[gpui::test]
+fn a_root_that_stops_being_a_stacking_context_declines_for_the_children_it_lifts(cx: &mut TestAppContext) {
+    // The track of a scrollbar: a lifted root with an opacity animation, which is a stacking context
+    // while it runs and holds a positioned thumb. When the animation ends the root is no context,
+    // and the thumb is handed to the page's.
+    fn element(tick: u32, context: bool) -> AnyElement {
+        let mut root = div().id(UNIT).absolute().z_index(1).w(px(100.)).h(px(30.)).bg(color(tick));
+        if context {
+            root = root.stacking_context();
+        }
+        root.child(div().id("thumb").absolute().z_index(1).w(px(10.)).h(px(10.)).bg(blue())).into_any_element()
+    }
+    struct Track(Rc<Knobs>);
+    impl Render for Track {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let tick = self.0.tick.get();
+            div().id("page").relative().stacking_context().w(px(400.)).h(px(2000.)).child(
+                retained(UNIT, 1_000 + tick as u64, move |_, _| element(tick, true)).patchable().lift_z(1),
+            )
+        }
+    }
+    let knobs = Rc::new(Knobs::default());
+    let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(2000.)), {
+        let knobs = knobs.clone();
+        move |_, _| Track(knobs)
+    }));
+    cx.update_window(window, |_, window, cx| {
+        window.draw(cx).clear(cx);
+        window.draw(cx).clear(cx);
+        let ticked = knobs.clone();
+        window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+            let context = !ticked.fixed.get();
+            window.repaint_in_place(vec![(ElementId::from(UNIT), element(ticked.tick.get(), context))], cx, |_, _| true).is_ok()
+        })));
+        for _ in 0..3 {
+            knobs.tick.set(knobs.tick.get() + 1);
+            window.request_tick();
+            window.draw(cx).clear(cx);
+        }
+        let counters = window.patch_counters();
+        assert_eq!((counters.patched_frames, counters.total_declines()), (3, 0));
+
+        knobs.fixed.set(true);
+        knobs.tick.set(knobs.tick.get() + 1);
+        window.request_tick();
+        window.draw(cx).clear(cx);
+        let counters = window.patch_counters();
+        assert_eq!(counters.patched_frames, 3);
+        assert_eq!(counters.declines(PatchDecline::Lifts), 1);
+        assert_eq!(counters.total_declines(), 1);
+    })
+    .unwrap();
+}
+
+#[gpui::test]
 fn a_patch_the_embedder_refuses_changes_nothing(cx: &mut TestAppContext) {
     let page = Fixture::new(cx, 3);
     page.tick(cx);

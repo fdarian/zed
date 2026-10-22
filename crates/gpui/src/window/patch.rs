@@ -55,6 +55,10 @@ pub enum PatchDecline {
     /// Painting did something a recording cannot repeat: asked for another frame, scrolled
     /// something into view, deferred a draw or loaded an asset.
     Effects,
+    /// The new element hands an element to a stacking context outside the root, which a recording
+    /// that is patched never did: the root stopped being a stacking context (an opacity animation
+    /// that ended), and its positioned children are the page's to paint now.
+    Lifts,
     /// The hitboxes are not the ones recorded.
     Hitboxes,
     /// The listeners, tooltips, cursors, tab stops, input handlers, dispatch nodes or focus are
@@ -68,7 +72,7 @@ pub enum PatchDecline {
 
 impl PatchDecline {
     /// Every reason.
-    pub const ALL: [PatchDecline; 12] = [
+    pub const ALL: [PatchDecline; 13] = [
         PatchDecline::PendingView,
         PatchDecline::Refreshing,
         PatchDecline::UnknownUnit,
@@ -77,6 +81,7 @@ impl PatchDecline {
         PatchDecline::LayoutMismatch,
         PatchDecline::UnstableLayout,
         PatchDecline::Effects,
+        PatchDecline::Lifts,
         PatchDecline::Hitboxes,
         PatchDecline::Registrations,
         PatchDecline::Operations,
@@ -727,6 +732,13 @@ impl Window {
         unit.element.prepaint(self, cx);
         let prepaint_end = self.prepaint_index();
         let hitbox_ids = self.patch.hitbox_ids.take().expect("a patch gives the hitboxes ids");
+        // The lists of the surroundings are scratch ones, painted by no one: the recording of a
+        // patched root handed nothing to a context outside it, and what was handed here would have
+        // `mark_lifted` skip a child that nothing paints.
+        if self.lift_lists.iter().flatten().any(|list| list.next_ordinal != 0) {
+            self.root_escape = outside;
+            return Err(PatchDecline::Lifts);
+        }
 
         self.invalidator.set_phase(DrawPhase::Paint);
         let paint_start = self.paint_index();
