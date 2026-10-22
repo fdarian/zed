@@ -250,6 +250,10 @@ impl PlatformWindow for TestWindow {
         self.0.lock().scale_factor
     }
 
+    fn force_scale_factor(&self, scale_factor: f32) {
+        self.0.lock().scale_factor = scale_factor;
+    }
+
     fn appearance(&self) -> WindowAppearance {
         self.0.lock().appearance
     }

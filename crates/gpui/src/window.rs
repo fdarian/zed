@@ -3893,9 +3893,11 @@ impl Window {
         self.scale_factor
     }
 
-    /// Overrides the display scale factor for tests.
+    /// Overrides the display scale factor for tests. The platform window keeps it across
+    /// resizes and screen changes, and sizes its drawable by it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        self.platform_window.force_scale_factor(scale_factor);
         self.apply_scale_factor(scale_factor);
         self.refresh();
     }

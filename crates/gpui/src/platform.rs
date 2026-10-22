@@ -1035,6 +1035,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// Makes the window report `scale_factor` from now on, whatever display it is on or
+    /// moves to: the analogue of Chrome's `--force-device-scale-factor`. The drawable follows
+    /// it, so a capture is the window's size times the factor. It does not run the resize
+    /// callback; the caller (`Window::set_scale_factor`) applies the factor to the window.
+    #[cfg(any(test, feature = "test-support"))]
+    fn force_scale_factor(&self, _scale_factor: f32) {
+        unimplemented!("force_scale_factor is not implemented for this platform")
+    }
+
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.

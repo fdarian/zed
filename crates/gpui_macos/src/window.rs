@@ -662,6 +662,9 @@ struct MacWindowState {
     sheet_parent: Option<id>,
     pointer_locked: bool,
     last_mouse_movement: Point<Pixels>,
+    /// A scale factor a test chose over the display's, like `--force-device-scale-factor`.
+    #[cfg(any(test, feature = "test-support"))]
+    forced_scale_factor: Option<f32>,
 }
 
 impl MacWindowState {
@@ -953,6 +956,10 @@ impl MacWindowState {
     }
 
     fn scale_factor(&self) -> f32 {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(forced) = self.forced_scale_factor {
+            return forced;
+        }
         get_scale_factor(self.native_window)
     }
 
@@ -1159,6 +1166,8 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 pointer_locked: false,
                 last_mouse_movement: Point::default(),
+                #[cfg(any(test, feature = "test-support"))]
+                forced_scale_factor: None,
                 accesskit_adapter: None,
                 sheet_parent: None,
             })));
@@ -1540,6 +1549,19 @@ impl PlatformWindow for MacWindow {
 
     fn scale_factor(&self) -> f32 {
         self.0.as_ref().lock().scale_factor()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn force_scale_factor(&self, scale_factor: f32) {
+        let mut lock = self.0.lock();
+        lock.forced_scale_factor = Some(scale_factor);
+        let drawable_size = lock.content_size().to_device_pixels(scale_factor);
+        if let Some(layer) = lock.renderer.layer() {
+            unsafe {
+                let _: () = msg_send![layer, setContentsScale: scale_factor as f64];
+            }
+        }
+        lock.renderer.update_drawable_size(drawable_size);
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -2385,11 +2407,24 @@ impl rwh::HasDisplayHandle for MacWindow {
     }
 }
 
+/// The scale of the display a window on no screen counts as being on, the way Chrome puts
+/// a window nobody placed on the primary display. 1.0 on a machine with no screens at all.
+fn primary_display_scale_factor() -> f32 {
+    unsafe {
+        let screens = NSScreen::screens(nil);
+        if cocoa::foundation::NSArray::count(screens) == 0 {
+            return 1.0;
+        }
+        let primary = cocoa::foundation::NSArray::objectAtIndex(screens, 0);
+        NSScreen::backingScaleFactor(primary) as f32
+    }
+}
+
 fn get_scale_factor(native_window: id) -> f32 {
     let factor = unsafe {
         let screen: id = msg_send![native_window, screen];
         if screen.is_null() {
-            return 2.0;
+            return primary_display_scale_factor();
         }
         NSScreen::backingScaleFactor(screen) as f32
     };
@@ -2400,7 +2435,11 @@ fn get_scale_factor(native_window: id) -> f32 {
     // (if it is off-screen), though we'd expect to see viewDidChangeBackingProperties before
     // it was rendered for real.
     // Regardless, attempt to avoid the issue here.
-    if factor == 0.0 { 2. } else { factor }
+    if factor == 0.0 {
+        primary_display_scale_factor()
+    } else {
+        factor
+    }
 }
 
 /// Returns whether `window` is one of GPUI's managed windows.
