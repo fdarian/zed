@@ -175,6 +175,9 @@ pub struct FrameWorkCounters {
     pub painted_primitives: u64,
     /// Primitives a replay put into the scene again, counted the same way.
     pub replayed_primitives: u64,
+    /// Draw orders that were worked out with a scene's bounds tree: the cost of the number of
+    /// primitives a scene holds, which a scene made again from the orders it had does not pay.
+    pub bounds_inserts: u64,
 }
 
 impl FrameWorkCounters {
@@ -185,6 +188,7 @@ impl FrameWorkCounters {
         self.culled_painted += other.culled_painted;
         self.painted_primitives += other.painted_primitives;
         self.replayed_primitives += other.replayed_primitives;
+        self.bounds_inserts += other.bounds_inserts;
     }
 }
 

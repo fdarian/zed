@@ -180,6 +180,7 @@ fn a_frame_that_replays_every_card_works_on_the_elements_around_them_only(cx: &m
             culled_painted: after.work.culled_painted - before.work.culled_painted,
             painted_primitives: after.work.painted_primitives - before.work.painted_primitives,
             replayed_primitives: after.work.replayed_primitives - before.work.replayed_primitives,
+            ..Default::default()
         });
     }
     // The view, the page, the box that changed and the scroller are built; the cards, retained roots and
@@ -191,6 +192,7 @@ fn a_frame_that_replays_every_card_works_on_the_elements_around_them_only(cx: &m
         culled_painted: 0,
         painted_primitives: 1,
         replayed_primitives: 3,
+        bounds_inserts: 0,
     };
     assert_eq!(works[0], expected, "4 cards");
     assert_eq!(works[1], expected, "40 cards: what is culled costs no prepaint, paint or primitive");

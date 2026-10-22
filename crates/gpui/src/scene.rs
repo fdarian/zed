@@ -67,6 +67,34 @@ pub struct Scene {
     inserting: PrimitiveCount,
     /// Primitives routed into this scene since it was made, which `clear` keeps.
     pub(crate) counts: crate::FrameWorkCounters,
+    /// What this scene put in its bounds tree since `clear`, in order, and the order each got.
+    order_log: Vec<OrderEntry>,
+    /// The log of an earlier build of this scene that the inserts are being compared with: while
+    /// they are the same bounds in the same sequence, the orders are the same, and the tree is not
+    /// asked. See [`Scene::rebuild_from_operations`].
+    order_reuse: Option<OrderReuse>,
+    /// Set when the inserts of a scene that reuses a log are not the log's.
+    order_reuse_failed: bool,
+    /// The tree does not hold what `order_log` says was inserted: a rebuild that reused the orders
+    /// left it as it was.
+    tree_stale: bool,
+    /// The log of each group that ended since `clear`, by id, and the first id given since.
+    group_logs: std::collections::HashMap<u64, Vec<OrderEntry>>,
+    group_base: u64,
+    /// The logs of the groups of the build being reused, taken by the groups of this one.
+    group_reuse: Option<std::collections::HashMap<u64, Vec<OrderEntry>>>,
+}
+
+/// A bounds a scene put in its tree, and the order the tree gave it.
+#[derive(Clone, Copy)]
+struct OrderEntry {
+    bounds: Bounds<ScaledPixels>,
+    order: DrawOrder,
+}
+
+struct OrderReuse {
+    log: Vec<OrderEntry>,
+    cursor: usize,
 }
 
 /// How a primitive a scene takes is counted, see [`crate::FrameWorkCounters`].
@@ -128,6 +156,54 @@ impl Scene {
         self.group_stack.clear();
         self.flat_opacities.clear();
         self.text_clips.clear();
+        self.order_log.clear();
+        self.order_reuse = None;
+        self.order_reuse_failed = false;
+        self.tree_stale = false;
+        self.group_logs.clear();
+        self.group_reuse = None;
+        self.group_base = self.next_group_id;
+    }
+
+    /// The order the bounds tree gives `bounds`, or the order the build this one reuses gave the
+    /// same bounds at this point of the same sequence, which is the same by what an order is: one
+    /// more than the greatest of the bounds inserted before that intersect. Once the sequence is
+    /// not the one reused the orders are not worked out at all: the build is made again without
+    /// reuse.
+    fn insert_bounds(&mut self, bounds: Bounds<ScaledPixels>) -> DrawOrder {
+        if self.order_reuse_failed {
+            return 0;
+        }
+        let order = match &mut self.order_reuse {
+            Some(reuse) => match reuse.log.get(reuse.cursor).filter(|entry| entry.bounds == bounds) {
+                Some(entry) => {
+                    reuse.cursor += 1;
+                    entry.order
+                }
+                None => {
+                    self.order_reuse_failed = true;
+                    return 0;
+                }
+            },
+            None => {
+                self.materialize_tree();
+                self.counts.bounds_inserts += 1;
+                self.primitive_bounds.insert(bounds)
+            }
+        };
+        self.order_log.push(OrderEntry { bounds, order });
+        order
+    }
+
+    /// Puts into the tree what the log says was, for the inserts a rebuild did not make.
+    fn materialize_tree(&mut self) {
+        if !mem::replace(&mut self.tree_stale, false) {
+            return;
+        }
+        self.primitive_bounds.clear();
+        for entry in &self.order_log {
+            self.primitive_bounds.insert(entry.bounds);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -170,7 +246,7 @@ impl Scene {
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         self.record(PaintOperation::StartLayer(bounds));
         let current = self.current_mut();
-        let order = current.primitive_bounds.insert(bounds);
+        let order = current.insert_bounds(bounds);
         current.layer_stack.push(order);
     }
 
@@ -349,7 +425,7 @@ impl Scene {
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .unwrap_or_else(|| self.insert_bounds(clipped_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -527,16 +603,24 @@ impl Scene {
                 .layer_stack
                 .last()
                 .copied()
-                .unwrap_or_else(|| current.primitive_bounds.insert(bounds))
+                .unwrap_or_else(|| current.insert_bounds(bounds))
         });
         let id = self.next_group_id;
         self.next_group_id += 1;
+        let mut scene = Scene::sub_scene();
+        if let Some(logs) = &mut self.group_reuse {
+            scene.order_reuse = Some(OrderReuse {
+                log: logs.remove(&id).unwrap_or_default(),
+                cursor: 0,
+            });
+            scene.tree_stale = true;
+        }
         self.group_stack.push(GroupBuilder {
             id,
             effect,
             content_mask,
             reserved_order,
-            scene: Scene::sub_scene(),
+            scene,
         });
     }
 
@@ -574,6 +658,13 @@ impl Scene {
             reserved_order,
             mut scene,
         } = builder;
+
+        self.counts.bounds_inserts += scene.counts.bounds_inserts;
+        let reused_all = scene.order_reuse.as_ref().is_none_or(|reuse| reuse.cursor == reuse.log.len());
+        if scene.order_reuse_failed || !reused_all {
+            self.order_reuse_failed = true;
+        }
+        self.group_logs.insert(id, mem::take(&mut scene.order_log));
 
         // Nothing of a fully faded group shows, whatever it filters or sits over.
         if effect.opacity <= 0. {
@@ -659,7 +750,7 @@ impl Scene {
             self.layer_stack
                 .last()
                 .copied()
-                .unwrap_or_else(|| self.primitive_bounds.insert(clipped))
+                .unwrap_or_else(|| self.insert_bounds(clipped))
         });
         self.groups.push(group);
     }
@@ -809,11 +900,47 @@ impl Scene {
     /// typed vectors and the draw orders, the way a frame that had painted them would have. For a
     /// log in which some operations were overwritten in place (see
     /// [`Window::repaint_in_place`]). Not counted as work.
+    ///
+    /// What a patch changes is how operations paint, which is seldom where: the bounds the scene
+    /// puts in its tree are then the ones it put there when it was built, in the same sequence,
+    /// and so are the orders, which are all the tree is for. The scene is made again from the log
+    /// of those (its own and that of each group) and the tree is not asked, which is the cost of
+    /// the page and not of the operations a patch changed. A patch that moves something is made
+    /// again with the tree.
     pub(crate) fn rebuild_from_operations(&mut self) {
         let operations = mem::take(&mut self.paint_operations);
+        let log = mem::take(&mut self.order_log);
+        let groups = mem::take(&mut self.group_logs);
+        let group_base = self.group_base;
+        self.rebuild(&operations, Some((log, groups)), group_base);
+        if self.order_reuse_failed {
+            self.rebuild(&operations, None, group_base);
+        }
+    }
+
+    fn rebuild(
+        &mut self,
+        operations: &[PaintOperation],
+        reuse: Option<(Vec<OrderEntry>, std::collections::HashMap<u64, Vec<OrderEntry>>)>,
+        group_base: u64,
+    ) {
         self.clear();
-        self.replay_operations(&operations, PrimitiveCount::Uncounted);
-        self.finish();
+        self.next_group_id = group_base;
+        self.group_base = group_base;
+        if let Some((log, groups)) = reuse {
+            self.order_reuse = Some(OrderReuse { log, cursor: 0 });
+            self.group_reuse = Some(groups);
+            self.tree_stale = true;
+        }
+        self.replay_operations(operations, PrimitiveCount::Uncounted);
+        if self.order_reuse.as_ref().is_some_and(|reuse| reuse.cursor != reuse.log.len()) {
+            self.order_reuse_failed = true;
+        }
+        self.order_reuse = None;
+        self.group_reuse = None;
+        if !self.order_reuse_failed {
+            self.finish();
+        }
     }
 
     fn replay_operations(&mut self, operations: &[PaintOperation], count: PrimitiveCount) {
@@ -2819,5 +2946,88 @@ mod tests {
         assert_eq!(scene.groups.len(), 1);
         assert!(scene.surfaces.is_empty());
         assert_eq!(scene.groups[0].scene.surfaces.len(), 1);
+    }
+
+    /// Everything a renderer reads of a scene, with the draw orders, groups included.
+    fn drawn(scene: &Scene) -> String {
+        let mut text = format!("{:?}\n{:?}\n{:?}\n", scene.quads, scene.monochrome_sprites, scene.shadows);
+        for group in &scene.groups {
+            text.push_str(&format!(
+                "group {} {} {:?} {:?}\n{}",
+                group.id,
+                group.order,
+                group.bounds,
+                group.effect,
+                drawn(&group.scene)
+            ));
+        }
+        text
+    }
+
+    /// A page: a card, a faded group of two overlapping quads over it, a layer and text on top.
+    /// `accent` and `moved` are what a patch changes.
+    fn page(accent: Hsla, moved: f32) -> Scene {
+        let mut scene = scene();
+        scene.insert_primitive(quad(0., 0., 300., 200.));
+        scene.start_group(fade(0.5), mask(), None);
+        scene.insert_primitive(Quad { background: accent.into(), ..quad(20., 20., 60., 60.) });
+        scene.insert_primitive(quad(40. + moved, 40., 60., 60.));
+        scene.end_group();
+        scene.push_layer(bounds(120., 20., 100., 100.));
+        scene.insert_primitive(quad(130., 30., 20., 20.));
+        scene.insert_primitive(quad(140., 40., 20., 20.));
+        scene.pop_layer();
+        for column in 0..6 {
+            scene.insert_primitive(glyph(10. + column as f32 * 9., 150.));
+        }
+        scene.start_group(fade(0.25), mask(), None);
+        scene.insert_primitive(quad(200., 150., 40., 40.));
+        scene.end_group();
+        scene.finish();
+        scene
+    }
+
+    /// The operations of `page(accent, moved)` where a patch wrote the ones of `patched`.
+    fn patched_page(accent: Hsla, patched_accent: Hsla, moved: f32) -> Scene {
+        let mut scene = page(accent, 0.);
+        let operations = page(patched_accent, moved).into_operations();
+        assert_eq!(operations.len(), scene.paint_operations.len());
+        for (slot, painted) in scene.paint_operations.iter_mut().zip(operations) {
+            slot.clone_from(&painted);
+        }
+        scene
+    }
+
+    #[test]
+    fn a_scene_made_again_with_other_colors_is_the_scene_painted_so_without_the_tree() {
+        let green = Hsla { h: 0.33, s: 1., l: 0.5, a: 1. };
+        let mut scene = patched_page(red(), green, 0.);
+        let inserts = scene.counts.bounds_inserts;
+        scene.rebuild_from_operations();
+        assert_eq!(drawn(&scene), drawn(&page(green, 0.)));
+        assert_eq!(scene.counts.bounds_inserts, inserts, "no order was worked out");
+    }
+
+    #[test]
+    fn a_scene_made_again_after_something_moved_is_the_scene_painted_so() {
+        let mut scene = patched_page(red(), red(), 30.);
+        let inserts = scene.counts.bounds_inserts;
+        scene.rebuild_from_operations();
+        assert_eq!(drawn(&scene), drawn(&page(red(), 30.)));
+        assert!(scene.counts.bounds_inserts > inserts, "the orders were worked out again");
+    }
+
+    #[test]
+    fn a_scene_made_again_from_orders_takes_what_is_painted_in_it_after_as_one_painted_so() {
+        let green = Hsla { h: 0.33, s: 1., l: 0.5, a: 1. };
+        let mut scene = patched_page(red(), green, 0.);
+        scene.rebuild_from_operations();
+        scene.rebuild_from_operations();
+        scene.insert_primitive(quad(5., 5., 100., 100.));
+        scene.finish();
+        let mut painted = page(green, 0.);
+        painted.insert_primitive(quad(5., 5., 100., 100.));
+        painted.finish();
+        assert_eq!(drawn(&scene), drawn(&painted));
     }
 }

@@ -512,6 +512,7 @@ fn spent(after: FrameWorkCounters, before: FrameWorkCounters) -> FrameWorkCounte
         culled_painted: after.culled_painted - before.culled_painted,
         painted_primitives: after.painted_primitives - before.painted_primitives,
         replayed_primitives: after.replayed_primitives - before.replayed_primitives,
+        bounds_inserts: after.bounds_inserts - before.bounds_inserts,
     }
 }
 
@@ -564,6 +565,9 @@ fn a_tick_that_changes_one_root_costs_the_same_whatever_the_page_holds(cx: &mut 
     assert_eq!(small.0.painted, 10);
     assert_eq!(small.0.painted_primitives, 10);
     assert_eq!(small.0.replayed_primitives, 0);
+    // The primitives the unit paints are put in the tree of the scene it is painted into, and the
+    // scene it is patched into is made again from the orders it had.
+    assert_eq!(small.0.bounds_inserts, 10);
 
     let page = Fixture::new(cx, 1000);
     page.tick(cx);
