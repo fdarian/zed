@@ -3164,6 +3164,22 @@ impl Window {
         }
     }
 
+    /// The tab stop [`Self::focus_next`] would move to, without moving.
+    pub fn next_tab_stop(&self) -> Option<FocusHandle> {
+        if !self.focus_enabled {
+            return None;
+        }
+        self.rendered_frame.tab_stops.next(self.focus.as_ref())
+    }
+
+    /// The tab stop [`Self::focus_prev`] would move to, without moving.
+    pub fn prev_tab_stop(&self) -> Option<FocusHandle> {
+        if !self.focus_enabled {
+            return None;
+        }
+        self.rendered_frame.tab_stops.prev(self.focus.as_ref())
+    }
+
     /// Move focus to previous tab stop.
     pub fn focus_prev(&mut self, cx: &mut App) {
         if !self.focus_enabled {
