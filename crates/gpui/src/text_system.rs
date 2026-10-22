@@ -686,6 +686,7 @@ impl WindowTextSystem {
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        let mut item_starts: SmallVec<[usize; 4]> = SmallVec::new();
 
         let mut lines = SmallVec::new();
         let mut max_wrap_lines = line_clamp;
@@ -693,6 +694,7 @@ impl WindowTextSystem {
 
         let mut process_line = |line_text: SharedString, line_start, line_end| {
             font_runs.clear();
+            item_starts.clear();
 
             let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(32);
             let mut run_start = line_start;
@@ -703,6 +705,11 @@ impl WindowTextSystem {
                 };
 
                 let run_len_within_line = cmp::min(line_end - run_start, run.len);
+                // Blink measures each text node as an item of its own, though text of one font is
+                // shaped together whatever nodes it is in.
+                if run_start > line_start {
+                    item_starts.push(run_start - line_start);
+                }
 
                 let decoration_changed =
                     push_decoration(&mut decoration_runs, run, run_len_within_line);
@@ -747,6 +754,7 @@ impl WindowTextSystem {
                 &line_text,
                 font_size,
                 &font_runs,
+                &item_starts,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
                 options,

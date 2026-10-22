@@ -2062,4 +2062,59 @@ mod tests {
             assert_eq!(lines[0].size(px(20.)).width, px(width / 64.), "{family} {size} {text:?}");
         }
     }
+
+    /// Blink measures every text node as an item of its own and shapes the nodes of one font
+    /// together, so the edge between two is ceiled twice and a kern pair across it is split
+    /// between them. The widths are headless Chrome's, in 64ths of a pixel (`nodes` of
+    /// `text-measure-oracle.json` of gpuix at scale 1), the nodes of a text separated by `|`.
+    #[test]
+    fn test_each_text_node_is_an_item_and_a_kern_across_two_is_split() {
+        let platform: Arc<dyn PlatformTextSystem> = Arc::new(MacTextSystem::new());
+        let text_system = gpui::WindowTextSystem::new(Arc::new(gpui::TextSystem::new(platform)));
+        let hanging = gpui::TextLayoutOptions {
+            hang_trailing_spaces: true,
+            ..Default::default()
+        };
+        // The same text in one node and in two is two layouts, though the runs are alike.
+        let quick: gpui::SharedString = "Quick brown fox jumps".into();
+        let run = |len| gpui::TextRun {
+            len,
+            font: font("Helvetica Neue"),
+            ..Default::default()
+        };
+        let width_of = |runs: &[gpui::TextRun]| {
+            let lines = text_system.shape_text(quick.clone(), px(13.), runs, None, None).unwrap();
+            lines[0].size(px(20.)).width
+        };
+        assert_eq!(width_of(&[run(21)]), px(8600. / 64.));
+        assert_eq!(width_of(&[run(12), run(9)]), px(8601. / 64.));
+        for (family, size, nodes, min_content, width) in [
+            ("Helvetica Neue", 13., "Quick brown |fox jumps", 2326., 8601.),
+            ("Helvetica Neue", 13., "Fract|ional wid|ths", 3668., 6349.),
+            ("Helvetica", 13., "a |To", 872., 1559.),
+            ("Helvetica", 13., "a| To", 872., 1559.),
+            ("Helvetica", 13., "T|o To", 880., 1975.),
+            ("Helvetica", 13., "To |To", 879., 1975.),
+            ("Helvetica", 16., "a |Wa", 1499., 2353.),
+            ("Times", 13., "a |Ta", 813., 1383.),
+            ("Times", 16., "bA| b", 1224., 1964.),
+            ("Times", 16., "b|A b", 1224., 1964.),
+        ] {
+            let text: gpui::SharedString = nodes.replace('|', "").into();
+            let runs: Vec<_> = nodes
+                .split('|')
+                .map(|node| gpui::TextRun {
+                    len: node.len(),
+                    font: font(family),
+                    ..Default::default()
+                })
+                .collect();
+            let measured = text_system
+                .min_content_width(text.clone(), px(size), &runs, hanging, &[])
+                .unwrap();
+            assert_eq!(measured, px(min_content / 64.), "{family} {size} {nodes:?} at min-content");
+            let lines = text_system.shape_text(text, px(size), &runs, None, None).unwrap();
+            assert_eq!(lines[0].size(px(20.)).width, px(width / 64.), "{family} {size} {nodes:?}");
+        }
+    }
 }

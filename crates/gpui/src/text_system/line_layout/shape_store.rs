@@ -214,6 +214,7 @@ fn estimated_bytes(key: &CacheKey) -> usize {
         + size_of::<CacheKey>()
         + key.text.len()
         + key.runs.len() * size_of::<FontRun>()
+        + key.item_starts.len() * size_of::<usize>()
         + key.insets.len() * size_of::<TextInset>()
         + key.inline.len() * size_of::<InlineSpec>()
 }
@@ -250,6 +251,7 @@ mod tests {
             text: SharedString::from(text.to_string()),
             font_size: px(16.),
             runs: Default::default(),
+            item_starts: Box::default(),
             wrap_width: None,
             max_lines: None,
             force_width: None,

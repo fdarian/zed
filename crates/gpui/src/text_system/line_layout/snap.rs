@@ -1,17 +1,20 @@
 //! How Chrome measures the width of a line of text, which every inline size of a text comes from.
 //!
-//! Blink lays a text out in items, one per style run, and measures each from the cumulative
-//! advances of its glyphs, counted from the start of the item and ceiled to a layout unit (1/64 of
-//! a device pixel): an item is `ceil(P_end)` wide, and a piece of one (a word, or the part of an
-//! item on one wrapped line) is `ceil(P_end) - ceil(P_start)`. A line is as wide as its pieces
-//! added up, so the width of a word depends on where its item starts and the width of a line of
-//! several runs is a unit or two over the width of the glyphs it holds.
+//! Blink lays a text out in items, one per text node (a style run), and
+//! measures each from the cumulative advances of its glyphs, counted from the start of the item and
+//! ceiled to a layout unit (1/64 of a device pixel): an item is `ceil(P_end)` wide, and a piece of
+//! one (a word, or the part of an item on one wrapped line) is `ceil(P_end) - ceil(P_start)`. A line
+//! is as wide as its pieces added up, so the width of a word depends on where its item starts and
+//! the width of a line of several runs is a unit or two over the width of the glyphs it holds.
+//! Shaping does not follow the items: text of one font is shaped as one run whatever nodes it is in.
 //!
 //! A font with no GPOS table kerns through its `kern` or `kerx` table, which HarfBuzz applies by
 //! splitting each pair: the first glyph's advance takes `k >> 1` of the kern `k` and the second
 //! glyph's takes the rest, and the second also moves its offset by that rest so that it is drawn
 //! where CoreText draws it, after all of `k`. Blink measures with the advances, so a glyph after
-//! a kern stands `k - (k >> 1)` earlier than where CoreText puts it. Only the measure moves.
+//! a kern stands `k - (k >> 1)` earlier than where CoreText puts it. Only the measure moves. A pair
+//! across the edge of two items is kerned all the same, so the item before it ends that earlier and
+//! the item after it is that much wider.
 
 use super::{LineLayout, LineLayoutCache};
 use crate::{FontRun, Pixels, util::{LAYOUT_UNIT, ceil_layout_units}};
@@ -55,15 +58,13 @@ impl SnapMarks {
         Pixels(units as f32 * LAYOUT_UNIT / scale_factor)
     }
 
-    /// How far glyph `glyph` is from the start of `item`, in layout units rounded up.
+    /// How far glyph `glyph` is from the start of `item`, in layout units rounded up. Both are
+    /// measured from the advances of the glyphs before them, which is where the share of a kern
+    /// at an edge between two items goes: the glyph after it is measured without it, so the item
+    /// before ends that much earlier and the item it starts is that much wider.
     fn position_units(&self, x: &[Pixels], scale_factor: f32, item: Range<usize>, glyph: usize) -> i64 {
-        // The edges of an item are measured whole: nothing kerns across them.
-        let share = if glyph == item.start || glyph == item.end {
-            Pixels::ZERO
-        } else {
-            self.kern_share(glyph)
-        };
-        ceil_layout_units((x[glyph] - x[item.start] - share).0, scale_factor)
+        let measured = |glyph: usize| x[glyph] - self.kern_share(glyph);
+        ceil_layout_units((measured(glyph) - measured(item.start)).0, scale_factor)
     }
 
     fn kern_share(&self, glyph: usize) -> Pixels {
@@ -85,23 +86,33 @@ pub(super) fn glyph_positions(layout: &LineLayout) -> Vec<Pixels> {
 }
 
 impl LineLayoutCache {
-    /// The marks of `shaped`, a line shaped as `runs`, whose items are the font runs.
-    pub(super) fn snap_marks(&self, shaped: &LineLayout, runs: &[FontRun]) -> SnapMarks {
+    /// The marks of `shaped`, a line shaped as `runs`, whose items start where a font run does and
+    /// at the bytes `item_starts`: the text nodes that were shaped together with the one before,
+    /// which kern across the edge between them as one run does.
+    pub(super) fn snap_marks(
+        &self,
+        shaped: &LineLayout,
+        runs: &[FontRun],
+        item_starts: &[usize],
+    ) -> SnapMarks {
         let indices: Vec<usize> = shaped
             .runs
             .iter()
             .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
             .collect();
-        let mut item_starts: SmallVec<[usize; 4]> = SmallVec::new();
+        let mut starts: SmallVec<[usize; 8]> = SmallVec::from_slice(item_starts);
         let mut byte = 0;
-        for run in runs.iter().filter(|run| run.len > 0) {
-            if byte > 0 {
-                let glyph = indices.partition_point(|index| *index < byte);
-                if glyph < indices.len() && item_starts.last().is_none_or(|last| *last < glyph) {
-                    item_starts.push(glyph);
-                }
-            }
+        for run in runs {
             byte += run.len;
+            starts.push(byte);
+        }
+        starts.sort_unstable();
+        let mut item_starts: SmallVec<[usize; 4]> = SmallVec::new();
+        for byte in starts.into_iter().filter(|byte| *byte > 0) {
+            let glyph = indices.partition_point(|index| *index < byte);
+            if glyph < indices.len() && item_starts.last().is_none_or(|last| *last < glyph) {
+                item_starts.push(glyph);
+            }
         }
         SnapMarks {
             item_starts,
@@ -209,11 +220,23 @@ mod tests {
     }
 
     #[test]
-    fn test_the_edges_of_an_item_do_not_move_by_a_kern() {
+    fn test_a_kern_across_the_edge_of_two_items_ends_the_first_earlier_and_widens_the_second() {
+        // Glyph 1 follows a kern whose share is -2 units, and starts the second item: the first
+        // ends at 4 + 2 units and the second is what is left of 8, as the whole is 8 either way.
         let positions = x(&[0., 4. * UNIT, 8. * UNIT]);
         let kerned = marks(&[1], &[(1, -2. * UNIT)]);
-        assert_eq!(kerned.width(&positions, 1., 1, 2), px(4. * UNIT));
+        assert_eq!(kerned.width(&positions, 1., 0, 1), px(6. * UNIT));
+        assert_eq!(kerned.width(&positions, 1., 1, 2), px(2. * UNIT));
         assert_eq!(kerned.width(&positions, 1., 0, 2), px(8. * UNIT));
+    }
+
+    #[test]
+    fn test_an_item_that_starts_after_a_kern_is_ceiled_from_its_own_start() {
+        // The second item holds glyphs 1 and 2 of 4.4 units each; glyph 1 follows a kern whose
+        // share of -3 units its advance takes: 4.4 - 3 + 4.4 = 5.8 units, which Chrome ceils to 6.
+        let positions = x(&[0., 10. * UNIT, 14.4 * UNIT, 18.8 * UNIT]);
+        let kerned = marks(&[1], &[(1, -3. * UNIT)]);
+        assert_eq!(kerned.width(&positions, 1., 1, 3), px(6. * UNIT));
     }
 
     #[test]

@@ -1964,6 +1964,7 @@ impl LineLayoutCache {
         text: Text,
         font_size: Pixels,
         runs: &[FontRun],
+        item_starts: &[usize],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
         options: TextLayoutOptions,
@@ -2016,6 +2017,7 @@ impl LineLayoutCache {
             text: text.as_ref(),
             font_size,
             runs,
+            item_starts,
             wrap_width,
             max_lines,
             force_width: None,
@@ -2080,7 +2082,7 @@ impl LineLayoutCache {
                 || wrap_width.is_some()
                 || options.hang_trailing_spaces
                 || !insets.is_empty();
-            let marks = self.snap_marks(&shaped_layout, runs);
+            let marks = self.snap_marks(&shaped_layout, runs, item_starts);
             let (unwrapped_layout, computation) = if needs_pass {
                 let computation = shaped_layout.compute_styled_wrap_boundaries(
                     text.as_ref(),
@@ -2109,6 +2111,7 @@ impl LineLayoutCache {
                 text,
                 font_size,
                 runs: SmallVec::from(runs),
+                item_starts: item_starts.into(),
                 wrap_width,
                 max_lines,
                 force_width: None,
@@ -2373,6 +2376,7 @@ impl LineLayoutCache {
             text: text.as_ref(),
             font_size,
             runs,
+            item_starts: &[],
             wrap_width: None,
             max_lines: None,
             force_width,
@@ -2432,6 +2436,7 @@ impl LineLayoutCache {
                 text,
                 font_size,
                 runs: SmallVec::from(runs),
+                item_starts: Box::default(),
                 wrap_width: None,
                 max_lines: None,
                 force_width,
@@ -2681,6 +2686,8 @@ struct CacheKey {
     text: SharedString,
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
+    /// Where the items of the line start, see [`SnapMarks`], besides where its font runs do.
+    item_starts: Box<[usize]>,
     wrap_width: Option<Pixels>,
     /// How many wrapped lines the layout stops at, which changes where it ends.
     max_lines: Option<usize>,
@@ -2698,6 +2705,7 @@ struct CacheKeyRef<'a> {
     text: &'a str,
     font_size: Pixels,
     runs: &'a [FontRun],
+    item_starts: &'a [usize],
     wrap_width: Option<Pixels>,
     /// How many wrapped lines the layout stops at, which changes where it ends.
     max_lines: Option<usize>,
@@ -2803,6 +2811,7 @@ impl AsCacheKeyRef for CacheKey {
             text: &self.text,
             font_size: self.font_size,
             runs: self.runs.as_slice(),
+            item_starts: &self.item_starts,
             wrap_width: self.wrap_width,
             max_lines: self.max_lines,
             force_width: self.force_width,
