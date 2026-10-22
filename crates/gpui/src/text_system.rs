@@ -1632,6 +1632,12 @@ pub struct FontMetrics {
     /// as Chrome does on macOS for Times, Helvetica and Courier, whose own metrics are
     /// tighter than the fonts they stand in for. See [`Self::line_box`].
     pub widens_ascent: bool,
+
+    /// Whether the font has no GPOS table, so that its kerning is a `kern` or `kerx` table,
+    /// which HarfBuzz (Chrome's shaper) applies by splitting each pair between the two
+    /// glyphs, where CoreText puts all of it on the first. It is what [`WrappedLineLayout::line_widths`]
+    /// measures a word after a kerned space by.
+    pub legacy_kerning: bool,
 }
 
 /// The content area of the inline box of a font at a size, and the leading its line gap
@@ -1913,6 +1919,16 @@ mod insets_tests {
         }
     }
 
+    /// `actual` is `base` or up to `units` layout units over it: the widths of the runs of a
+    /// line are each rounded up, where `base` was rounded once.
+    fn assert_in_units_over(actual: Pixels, base: Pixels, units: u32) {
+        let over = f32::from(actual - base) * 64.;
+        assert!(
+            (-1e-3..=units as f32 + 1e-3).contains(&over),
+            "{actual:?} is {over} layout units over {base:?}, of at most {units}"
+        );
+    }
+
     fn inset(range: Range<usize>, leading: f32, trailing: f32) -> TextInset {
         TextInset {
             range,
@@ -2074,7 +2090,8 @@ mod insets_tests {
             let text_system = WindowTextSystem::new(cx.text_system().clone());
             let plain = shape(&text_system, "abcd", None, &[]);
             let inset = shape(&text_system, "abcd", None, &[inset(1..3, 5., 7.)]);
-            assert_eq!(inset[0].layout.width(), plain[0].layout.width() + px(12.));
+            // The inset splits the run in three, and each is measured in layout units on its own.
+            assert_in_units_over(inset[0].layout.width(), plain[0].layout.width() + px(12.), 2);
             let plain_layout = &plain[0].layout.unwrapped_layout;
             let inset_layout = &inset[0].layout.unwrapped_layout;
             assert_eq!(inset_layout.x_for_index(1), plain_layout.x_for_index(1));
@@ -2207,9 +2224,9 @@ mod insets_tests {
             assert!(ends(&lines[1]).is_empty());
             assert_eq!(ends(&lines[2]), vec![(0, px(0.), px(7.))]);
             let plain = shape(&text_system, "ab\ncd\nef", None, &[]);
-            assert_eq!(lines[0].layout.width(), plain[0].layout.width() + px(5.));
+            assert_in_units_over(lines[0].layout.width(), plain[0].layout.width() + px(5.), 1);
             assert_eq!(lines[1].layout.width(), plain[1].layout.width());
-            assert_eq!(lines[2].layout.width(), plain[2].layout.width() + px(7.));
+            assert_in_units_over(lines[2].layout.width(), plain[2].layout.width() + px(7.), 1);
         });
     }
 
@@ -2269,6 +2286,7 @@ mod line_box_tests {
             x_height: 0.,
             bounding_box: Bounds::default(),
             widens_ascent: false,
+            legacy_kerning: false,
         }
     }
 

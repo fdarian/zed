@@ -17,8 +17,10 @@ use std::{
 };
 
 mod shape_store;
+mod snap;
 
 use self::shape_store::{SHAPE_STORE_BUDGET_BYTES, ShapeStore};
+use self::snap::{SnapMarks, glyph_positions};
 use super::line_break::LineBreaks;
 use super::{
     InlineRun, InlineSpec, PlacedBox, RunWrap, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
@@ -840,6 +842,7 @@ impl LineLayout {
             SmallVec::new()
         };
         let line_widths = positions.line_widths(&line_starts, hang);
+        let line_ends = positions.content_ends(&line_starts, hang);
         let last_line_words = positions.words_on_line(line_starts[line_starts.len() - 1]);
         let (tabbed_x, glyph_insets) = positions.into_placed();
         WrapComputation {
@@ -851,6 +854,7 @@ impl LineLayout {
             last_line_words,
             broke_word,
             line_starts,
+            line_ends,
         }
     }
 
@@ -911,6 +915,7 @@ impl LineLayout {
             SmallVec::new()
         };
         let line_widths = positions.line_widths(&line_starts, hang);
+        let line_ends = positions.content_ends(&line_starts, hang);
         let last_line_words = positions.words_on_line(line_starts[line_starts.len() - 1]);
         let (tabbed_x, glyph_insets) = positions.into_placed();
         WrapComputation {
@@ -922,6 +927,7 @@ impl LineLayout {
             last_line_words,
             broke_word: false,
             line_starts,
+            line_ends,
         }
     }
 
@@ -962,6 +968,7 @@ impl LineLayout {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct WrapComputation {
     pub(super) boundaries: SmallVec<[WrapBoundary; 1]>,
     /// With tab stops or insets, the x of every glyph, and then of the end of the
@@ -978,6 +985,25 @@ pub(super) struct WrapComputation {
     pub(super) broke_word: bool,
     /// The glyph each line starts at, counting through all the runs.
     pub(super) line_starts: SmallVec<[usize; 2]>,
+    /// The glyph each line ends at, before the spaces that hang at its end.
+    pub(super) line_ends: SmallVec<[usize; 1]>,
+}
+
+impl WrapComputation {
+    /// A line of `glyph_count` glyphs that does not break.
+    fn unbroken(glyph_count: usize) -> Self {
+        Self {
+            boundaries: SmallVec::new(),
+            tabbed_x: None,
+            hanging_widths: SmallVec::new(),
+            glyph_insets: Vec::new(),
+            line_widths: SmallVec::new(),
+            last_line_words: 0,
+            broke_word: false,
+            line_starts: smallvec![0],
+            line_ends: smallvec![glyph_count],
+        }
+    }
 }
 
 /// The places a text may break and where each of its glyphs is, for choosing among
@@ -1214,6 +1240,22 @@ impl<'a> GlyphPositions<'a> {
     /// How wide the spaces at the end of each line are, for lines that start at
     /// the glyphs `line_starts`. A line of nothing else hangs whole.
     fn hanging_widths(&self, line_starts: &[usize]) -> SmallVec<[Pixels; 1]> {
+        let line_end = |line_ix: usize| {
+            line_starts
+                .get(line_ix + 1)
+                .copied()
+                .unwrap_or(self.glyphs.len())
+        };
+        self.content_ends(line_starts, true)
+            .into_iter()
+            .enumerate()
+            .map(|(line_ix, content_end)| self.x(line_end(line_ix)) - self.x(content_end))
+            .collect()
+    }
+
+    /// The glyph each line of those that start at `line_starts` ends at, as alignment
+    /// sees it: before the spaces that hang at its end, when `hang`.
+    fn content_ends(&self, line_starts: &[usize], hang: bool) -> SmallVec<[usize; 1]> {
         line_starts
             .iter()
             .enumerate()
@@ -1222,11 +1264,11 @@ impl<'a> GlyphPositions<'a> {
                     .get(line_ix + 1)
                     .copied()
                     .unwrap_or(self.glyphs.len());
-                let mut first_hanging = line_end;
-                while first_hanging > *line_start && self.glyphs[first_hanging - 1].hangs {
-                    first_hanging -= 1;
+                let mut end = line_end;
+                while hang && end > *line_start && self.glyphs[end - 1].hangs {
+                    end -= 1;
                 }
-                self.x(line_end) - self.x(first_hanging)
+                end
             })
             .collect()
     }
@@ -1293,6 +1335,14 @@ pub struct WrappedLineLayout {
     /// The insets of the glyphs that have any, in glyph order. Empty when the
     /// line was laid out without insets.
     pub insets: Vec<GlyphInset>,
+
+    /// How wide each wrapped line is as Chrome measures it, see [`SnapMarks`]:
+    /// without the spaces that hang at its end.
+    line_widths: SmallVec<[Pixels; 1]>,
+
+    /// How wide the line is whole, measured the same way and counting the spaces
+    /// that hang.
+    snapped_width: Pixels,
 }
 
 /// Where the placeholder of an atomic inline sits in a wrapped line: the top left corner
@@ -1320,6 +1370,34 @@ pub struct WrapBoundary {
 }
 
 impl WrappedLineLayout {
+    /// The layout of `unwrapped_layout`, which is `computation` placed, wrapped at
+    /// `wrap_width`. `marks` are those of the line the unwrapped layout was made from.
+    pub(super) fn new(
+        unwrapped_layout: Arc<LineLayout>,
+        wrap_width: Option<Pixels>,
+        computation: WrapComputation,
+        marks: &SnapMarks,
+    ) -> Self {
+        let x = glyph_positions(&unwrapped_layout);
+        let scale_factor = unwrapped_layout.scale_factor;
+        let line_widths = computation
+            .line_starts
+            .iter()
+            .zip(&computation.line_ends)
+            .map(|(start, end)| marks.width(&x, scale_factor, *start, *end))
+            .collect();
+        let snapped_width = marks.width(&x, scale_factor, 0, x.len() - 1);
+        Self {
+            unwrapped_layout,
+            wrap_boundaries: computation.boundaries,
+            wrap_width,
+            hanging_widths: computation.hanging_widths,
+            insets: computation.glyph_insets,
+            line_widths,
+            snapped_width,
+        }
+    }
+
     /// The length of the underlying text, in utf8 bytes.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
@@ -1330,31 +1408,15 @@ impl WrappedLineLayout {
     pub fn width(&self) -> Pixels {
         self.wrap_width
             .unwrap_or(Pixels::MAX)
-            .min(self.unwrapped_layout.width)
+            .min(self.snapped_width)
     }
 
-    /// How wide each wrapped line is, as alignment sees it: without the spaces
-    /// that hang at its end, and counting the tab stops and insets on it.
+    /// How wide each wrapped line is as Chrome measures it, a multiple of a layout
+    /// unit (1/64 of a device pixel): without the spaces that hang at its end, and
+    /// counting the tab stops and insets on it. A line of several style runs is the
+    /// sum of the widths of its parts in each, where each is ceiled on its own.
     pub fn line_widths(&self) -> impl Iterator<Item = Pixels> + '_ {
-        let boundary_x = |boundary: &WrapBoundary| {
-            self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
-                .position
-                .x
-        };
-        let starts = iter::once(Pixels::ZERO).chain(self.wrap_boundaries.iter().map(boundary_x));
-        let ends = self
-            .wrap_boundaries
-            .iter()
-            .map(boundary_x)
-            .chain(iter::once(self.unwrapped_layout.width));
-        starts.zip(ends).enumerate().map(|(line_ix, (start, end))| {
-            let hanging = self
-                .hanging_widths
-                .get(line_ix)
-                .copied()
-                .unwrap_or(Pixels::ZERO);
-            end - start - hanging
-        })
+        self.line_widths.iter().copied()
     }
 
     /// The metrics of each wrapped row of this line, for the given line height.
@@ -2018,7 +2080,8 @@ impl LineLayoutCache {
                 || wrap_width.is_some()
                 || options.hang_trailing_spaces
                 || !insets.is_empty();
-            let (wrap_boundaries, unwrapped_layout, hanging_widths, glyph_insets) = if needs_pass {
+            let marks = self.snap_marks(&shaped_layout, runs);
+            let (unwrapped_layout, computation) = if needs_pass {
                 let computation = shaped_layout.compute_styled_wrap_boundaries(
                     text.as_ref(),
                     wrap_width,
@@ -2027,26 +2090,21 @@ impl LineLayoutCache {
                     tab_stop.as_ref().map(|tab_stop| tab_stop as TabStopFor<'_>),
                     insets,
                 );
-                let unwrapped_layout = match computation.tabbed_x {
-                    Some(x) => Arc::new(shaped_layout.with_x_positions(&x)),
+                let unwrapped_layout = match &computation.tabbed_x {
+                    Some(x) => Arc::new(shaped_layout.with_x_positions(x)),
                     None => shaped_layout,
                 };
-                (
-                    computation.boundaries,
-                    unwrapped_layout,
-                    computation.hanging_widths,
-                    computation.glyph_insets,
-                )
+                (unwrapped_layout, computation)
             } else {
-                (SmallVec::new(), shaped_layout, SmallVec::new(), Vec::new())
+                let glyph_count = shaped_layout.runs.iter().map(|run| run.glyphs.len()).sum();
+                (shaped_layout, WrapComputation::unbroken(glyph_count))
             };
-            let layout = Arc::new(WrappedLineLayout {
+            let layout = Arc::new(WrappedLineLayout::new(
                 unwrapped_layout,
-                wrap_boundaries,
                 wrap_width,
-                hanging_widths,
-                insets: glyph_insets,
-            });
+                computation,
+                &marks,
+            ));
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
@@ -2934,13 +2992,12 @@ mod tests {
             Some(&tab_stop),
             &[],
         );
-        WrappedLineLayout {
-            unwrapped_layout: Arc::new(shaped.with_x_positions(&computation.tabbed_x.unwrap())),
-            wrap_boundaries: computation.boundaries,
-            wrap_width: wrap_width.map(px),
-            hanging_widths: computation.hanging_widths,
-            insets: computation.glyph_insets,
-        }
+        WrappedLineLayout::new(
+            Arc::new(shaped.with_x_positions(&computation.tabbed_x.clone().unwrap())),
+            wrap_width.map(px),
+            computation,
+            &SnapMarks::default(),
+        )
     }
 
     /// Where each character starts, within its wrapped line, and which line.
@@ -3156,13 +3213,12 @@ mod tests {
         let shaped = monospace_layout(text, 10.);
         let computation =
             shaped.compute_wrap_boundaries(text, wrap_width.map(px), None, options, None, &[]);
-        WrappedLineLayout {
-            unwrapped_layout: Arc::new(shaped),
-            wrap_boundaries: computation.boundaries,
-            wrap_width: wrap_width.map(px),
-            hanging_widths: computation.hanging_widths,
-            insets: computation.glyph_insets,
-        }
+        WrappedLineLayout::new(
+            Arc::new(shaped),
+            wrap_width.map(px),
+            computation,
+            &SnapMarks::default(),
+        )
     }
 
     fn pixels(values: &[f32]) -> Vec<Pixels> {
@@ -3731,16 +3787,15 @@ mod tests {
             resolver.as_ref().map(|resolver| resolver as TabStopFor<'_>),
             insets,
         );
-        WrappedLineLayout {
-            unwrapped_layout: Arc::new(match computation.tabbed_x {
-                Some(x) => shaped.with_x_positions(&x),
+        WrappedLineLayout::new(
+            Arc::new(match &computation.tabbed_x {
+                Some(x) => shaped.with_x_positions(x),
                 None => shaped,
             }),
-            wrap_boundaries: computation.boundaries,
-            wrap_width: wrap_width.map(px),
-            hanging_widths: computation.hanging_widths,
-            insets: computation.glyph_insets,
-        }
+            wrap_width.map(px),
+            computation,
+            &SnapMarks::default(),
+        )
     }
 
     fn inset_line(text: &str, wrap_width: Option<f32>, insets: &[TextInset]) -> WrappedLineLayout {
@@ -4121,13 +4176,12 @@ mod tests {
                 None,
                 &[],
             );
-            let layout = WrappedLineLayout {
-                unwrapped_layout: Arc::new(shaped),
-                wrap_boundaries: computation.boundaries.clone(),
-                wrap_width: Some(px(wrap_width)),
-                hanging_widths: computation.hanging_widths.clone(),
-                insets: Vec::new(),
-            };
+            let layout = WrappedLineLayout::new(
+                Arc::new(shaped),
+                Some(px(wrap_width)),
+                computation.clone(),
+                &SnapMarks::default(),
+            );
             (layout, computation)
         }
 
@@ -4191,13 +4245,12 @@ mod tests {
                 None,
                 &insets,
             );
-            let layout = WrappedLineLayout {
-                unwrapped_layout: Arc::new(shaped.with_x_positions(&computation.tabbed_x.unwrap())),
-                wrap_boundaries: computation.boundaries,
-                wrap_width: Some(px(200.)),
-                hanging_widths: computation.hanging_widths,
-                insets: computation.glyph_insets,
-            };
+            let layout = WrappedLineLayout::new(
+                Arc::new(shaped.with_x_positions(&computation.tabbed_x.clone().unwrap())),
+                Some(px(200.)),
+                computation,
+                &SnapMarks::default(),
+            );
             let widths: Vec<_> = layout.line_widths().map(f32::from).collect();
             assert_eq!(widths.len(), 2);
             assert!(widths.iter().all(|width| *width <= 200.), "{widths:?}");
@@ -4791,13 +4844,12 @@ mod tests {
             None,
             &[],
         );
-        WrappedLineLayout {
-            unwrapped_layout: Arc::new(shaped),
-            wrap_boundaries: computation.boundaries,
-            wrap_width: wrap_width.map(px),
-            hanging_widths: computation.hanging_widths,
-            insets: computation.glyph_insets,
-        }
+        WrappedLineLayout::new(
+            Arc::new(shaped),
+            wrap_width.map(px),
+            computation,
+            &SnapMarks::default(),
+        )
     }
 
     #[test]

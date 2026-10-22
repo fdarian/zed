@@ -236,6 +236,7 @@ fn wrapped_line_layout_bytes(layout: &WrappedLineLayout) -> usize {
         + line_layout_bytes(&layout.unwrapped_layout)
         + layout.wrap_boundaries.len() * size_of::<WrapBoundary>()
         + layout.hanging_widths.len() * size_of::<Pixels>()
+        + layout.line_widths().count() * size_of::<Pixels>()
         + layout.insets.len() * size_of::<GlyphInset>()
 }
 

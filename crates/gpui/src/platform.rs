@@ -1229,6 +1229,7 @@ impl PlatformTextSystem for NoopTextSystem {
                 },
             },
             widens_ascent: false,
+            legacy_kerning: false,
         }
     }
 

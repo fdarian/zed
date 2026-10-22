@@ -679,6 +679,7 @@ impl DirectWriteState {
                     },
                 },
                 widens_ascent: false,
+                legacy_kerning: false,
             }
         }
     }

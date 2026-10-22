@@ -2192,7 +2192,8 @@ mod tests {
         let width = min_content(cx, text, options, insets);
         let expected = spaces_wide(cx, spaces);
         assert!(
-            (width - expected).abs() < px(0.01),
+            // The width of a word is measured in layout units, rounded up from where it starts.
+            (width - expected).abs() <= px(1. / 64. + 1e-4),
             "{text:?} under {options:?} is {width:?} wide at min-content, expected {spaces} spaces ({expected:?})"
         );
     }
@@ -2269,7 +2270,7 @@ mod tests {
         let normal = min_content(cx, cjk, breaking(WordBreak::Normal), &[]);
         let kept = min_content(cx, cjk, breaking(WordBreak::KeepAll), &[]);
         assert!(
-            (kept - normal * 3.).abs() < px(0.01) && kept > px(0.),
+            (kept - normal * 3.).abs() <= px(3. / 64. + 1e-4) && kept > px(0.),
             "keep-all {kept:?} is three characters of {normal:?}"
         );
         assert_min_content(cx, "abcdef ghi", breaking(WordBreak::KeepAll), &[], 7.);

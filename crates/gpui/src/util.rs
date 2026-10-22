@@ -251,7 +251,13 @@ const SUM_NOISE: f32 = 1. / 8192.;
 /// of its width in device pixels). The result is in logical pixels: a multiple of 1/128 at scale 2.
 #[inline]
 pub(crate) fn ceil_to_layout_unit(logical: f32, scale_factor: f32) -> f32 {
-    ((logical * scale_factor - SUM_NOISE) / LAYOUT_UNIT).ceil() * LAYOUT_UNIT / scale_factor
+    ceil_layout_units(logical, scale_factor) as f32 * LAYOUT_UNIT / scale_factor
+}
+
+/// How many layout units [`ceil_to_layout_unit`] takes `logical` to.
+#[inline]
+pub(crate) fn ceil_layout_units(logical: f32, scale_factor: f32) -> i64 {
+    ((logical * scale_factor - SUM_NOISE) / LAYOUT_UNIT).ceil() as i64
 }
 
 /// A size a node measured, which is a multiple of the layout unit of the window, in device pixels:

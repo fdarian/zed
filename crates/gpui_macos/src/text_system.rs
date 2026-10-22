@@ -1012,6 +1012,9 @@ fn font_kit_metrics_to_metrics(font: &FontKitFont) -> FontMetrics {
             font.family_name().as_str(),
             "Times" | "Helvetica" | "Courier"
         ),
+        legacy_kerning: font
+            .load_font_table(u32::from_be_bytes(*b"GPOS"))
+            .is_none(),
     }
 }
 
@@ -1492,7 +1495,8 @@ mod tests {
         assert!(two_characters > 20. && two_characters < 30., "{two_characters}");
         assert!((x(5) - x(2) - 30.).abs() < 0.01);
         assert!((x(8) - x(5) - two_characters).abs() < 0.01);
-        assert!((f32::from(layout.width()) - x(8)).abs() < 0.01);
+        // Each of the three runs is measured on its own, in layout units rounded up.
+        assert!((f32::from(layout.width()) - x(8)).abs() < 3. / 64.);
 
         // Nothing was shaped for the placeholder: its glyph is the one of the box.
         let object_runs: Vec<_> = layout
@@ -2017,5 +2021,45 @@ mod tests {
             super::owned_font_handle(collection).unwrap(),
             font_kit::handle::Handle::Memory { .. }
         ));
+    }
+
+    /// Helvetica and Times kern through a legacy `kern` table, which Chrome's HarfBuzz splits
+    /// between the two glyphs of a pair: a word after a kerned space starts half a kern later
+    /// than CoreText puts it, and a word before one ends half a kern earlier. The widths are
+    /// headless Chrome's, in 64ths of a pixel (`text-measure-oracle.json` of gpuix at scale 1).
+    #[test]
+    fn test_a_legacy_kern_is_split_between_its_glyphs_as_chrome_measures_it() {
+        let platform: Arc<dyn PlatformTextSystem> = Arc::new(MacTextSystem::new());
+        for family in ["Helvetica", "Times"] {
+            let font_id = platform.font_id(&font(family)).unwrap();
+            assert!(platform.font_metrics(font_id).legacy_kerning, "{family}");
+        }
+        let text_system = gpui::WindowTextSystem::new(Arc::new(gpui::TextSystem::new(platform)));
+        let hanging = gpui::TextLayoutOptions {
+            hang_trailing_spaces: true,
+            ..Default::default()
+        };
+        for (family, size, text, min_content, width) in [
+            ("Helvetica", 13., "a To", 871., 1558.),
+            ("Helvetica", 13., "a AV", 1025., 1697.),
+            ("Helvetica", 16., "a Wa", 1499., 2353.),
+            ("Times", 13., "a Ta", 813., 1383.),
+            ("Times", 16., "bA b", 1224., 1964.),
+        ] {
+            let text: gpui::SharedString = text.to_string().into();
+            let run = gpui::TextRun {
+                len: text.len(),
+                font: font(family),
+                ..Default::default()
+            };
+            let measured = text_system
+                .min_content_width(text.clone(), px(size), &[run.clone()], hanging, &[])
+                .unwrap();
+            assert_eq!(measured, px(min_content / 64.), "{family} {size} {text:?} at min-content");
+            let lines = text_system
+                .shape_text(text.clone(), px(size), &[run], None, None)
+                .unwrap();
+            assert_eq!(lines[0].size(px(20.)).width, px(width / 64.), "{family} {size} {text:?}");
+        }
     }
 }

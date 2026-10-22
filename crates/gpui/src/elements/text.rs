@@ -1202,8 +1202,9 @@ impl TextLayout {
                     _ => (Pixels::ZERO, Pixels::ZERO),
                 };
                 size.height -= trim_top + trim_bottom;
-                // As Chrome lays a text out: the width above its advance, the height at the
-                // layout unit nearest to it.
+                // As Chrome lays a text out: the height at the layout unit nearest to it, and the
+                // width at the unit above it. The widths of the lines are that already, run by run;
+                // what is left to round is a tab stop or an inset that is not a whole unit.
                 size.width = Pixels(ceil_to_layout_unit(size.width.0, scale_factor));
                 size.height = Pixels(round_to_layout_unit(size.height.0, scale_factor));
 
@@ -3665,6 +3666,13 @@ mod tests {
             Pixels(ceil_to_layout_unit((space * characters).0, scale))
         }
 
+        /// What the box is as wide as when its widest word is the characters `from..to` of the
+        /// space: the layout unit above where it ends less the one above where it starts, as Chrome
+        /// measures a piece of a run.
+        fn piece(space: Pixels, from: f32, to: f32, scale: f32) -> Pixels {
+            wide(space, to, scale) - wide(space, from, scale)
+        }
+
         struct MinContentText {
             text: &'static str,
             style: fn(&mut crate::StyleRefinement),
@@ -3733,7 +3741,7 @@ mod tests {
         fn a_box_is_as_wide_as_the_longest_word_and_the_text_wraps_in_it(cx: &mut TestAppContext) {
             for scale in [1., 2.] {
                 let (width, lines) = laid_out(cx, scale, "aa bbbbbb cccc", |_| {});
-                assert_eq!(width, wide(space(cx), 7., scale), "scale {scale}");
+                assert_eq!(width, piece(space(cx), 3., 10., scale), "scale {scale}");
                 assert_eq!(lines, 3);
             }
         }
@@ -3751,9 +3759,12 @@ mod tests {
                     style.text_style().overflow_wrap = Some(OverflowWrap::Anywhere);
                 });
                 let space = space(cx);
-                assert_eq!(normal, wide(space, 7., scale), "scale {scale}");
+                let widest_character = (0..14)
+                    .map(|ix| piece(space, ix as f32, ix as f32 + 1., scale))
+                    .fold(Pixels::ZERO, Pixels::max);
+                assert_eq!(normal, piece(space, 3., 10., scale), "scale {scale}");
                 assert_eq!(break_word, normal);
-                assert_eq!(anywhere, wide(space, 1., scale), "scale {scale}");
+                assert_eq!(anywhere, widest_character, "scale {scale}");
                 assert_eq!(normal_lines, 3);
                 assert!(anywhere_lines > normal_lines);
             }
