@@ -706,6 +706,49 @@ impl<'a> A11ySubtreeBuilder<'a> {
         pushed
     }
 
+    /// Append a synthetic node that has synthetic children of its own: `children` runs with the
+    /// node on top of the stack, so what it pushes hangs off it. The id of a nested node still
+    /// derives from this builder's parent (see [`Self::synthetic_node_id`]), so the keys of a
+    /// whole nested tree have to be unique together.
+    ///
+    /// Returns `false` if a node with this id is already present in the tree, in which case the
+    /// node is discarded and `children` does not run.
+    pub fn push_nested(
+        &mut self,
+        id: NodeId,
+        node: accesskit::Node,
+        children: impl FnOnce(&mut Self),
+    ) -> bool {
+        if !self.nodes.push(id, node) {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        self.nodes.record_node_info(
+            id,
+            debug::NodeDebugInfo {
+                synthetic: true,
+                view: self.creator.view,
+                element_id: self.creator.element_id.clone(),
+                source_location: self.creator.source_location,
+            },
+        );
+        children(self);
+        self.nodes.pop();
+        true
+    }
+
+    /// Relate the synthetic node `id`, which must have been pushed this frame, to the nodes
+    /// whose author ids are `author_ids`, resolved when the frame is finalized (see
+    /// [`A11yRelation`]).
+    pub fn push_relation(
+        &mut self,
+        id: NodeId,
+        relation: A11yRelation,
+        author_ids: &[SharedString],
+    ) {
+        self.nodes.defer_relation(id, relation, author_ids);
+    }
+
     /// A mutable reference to the parent node.
     pub fn parent_node(&mut self) -> &mut accesskit::Node {
         self.nodes
@@ -1195,6 +1238,35 @@ mod tests {
 
         let update = builder.finalize();
         assert_eq!(update.focus, ROOT_NODE_ID);
+    }
+
+    #[test]
+    fn synthetic_nodes_nest_and_take_relations() {
+        use super::A11ySubtreeBuilder;
+
+        let mut builder = new_builder();
+        let host = NodeId(1);
+        assert!(builder.push(host, test_node()));
+        let mut synthetic = A11ySubtreeBuilder::new(host, &mut builder);
+        let (list, item, button) = (
+            synthetic.synthetic_node_id(0),
+            synthetic.synthetic_node_id(1),
+            synthetic.synthetic_node_id(2),
+        );
+        let mut list_node = accesskit::Node::new(Role::List);
+        list_node.set_author_id("list");
+        assert!(synthetic.push_nested(list, list_node, |synthetic| {
+            assert!(synthetic.push_child(item, accesskit::Node::new(Role::ListItem)));
+        }));
+        assert!(synthetic.push_child(button, accesskit::Node::new(Role::Button)));
+        synthetic.push_relation(button, A11yRelation::LabelledBy, &["list".into()]);
+        builder.pop();
+
+        let update = builder.finalize();
+        let node = |id: NodeId| &update.nodes.iter().find(|(node_id, _)| *node_id == id).unwrap().1;
+        assert_eq!(node(host).children(), [list, button]);
+        assert_eq!(node(list).children(), [item]);
+        assert_eq!(node(button).labelled_by(), [list]);
     }
 
     #[test]
