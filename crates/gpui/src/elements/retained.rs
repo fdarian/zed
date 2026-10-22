@@ -68,7 +68,7 @@
 //! that before the subtree is built.
 
 use crate::{
-    Origin, StateOwner, AnyElement, App, Bounds, Edges, Element, ElementId, Escape, GlobalElementId, InspectorElementId,
+    Hsla, TextStyleRefinement, Origin, StateOwner, AnyElement, App, Bounds, Edges, Element, ElementId, Escape, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, NonReusable, PaintRecord, Pixels, Point, PrepaintRecord,
     Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
     blocker_bit, first_blocker, IsZero, SubtreeText, scene::PrimitiveCount,
@@ -94,6 +94,7 @@ pub fn retained(
         cull_outset: None,
         overscan: None,
         patchable: false,
+        ignores_text_color: false,
     }
 }
 
@@ -155,9 +156,39 @@ pub struct Retained {
     cull_outset: Option<Edges<Pixels>>,
     overscan: Option<Pixels>,
     patchable: bool,
+    ignores_text_color: bool,
+}
+
+/// The colour a subtree that [ignores the text colour](Retained::ignoring_text_color) is built,
+/// recorded and replayed under. Magenta, so that a text that does read it shows.
+const FIXED_TEXT_COLOR: Hsla = Hsla { h: 5. / 6., s: 1., l: 0.5, a: 1. };
+
+fn with_fixed_text_color<R>(ignores: bool, window: &mut Window, f: impl FnOnce(&mut Window) -> R) -> R {
+    if !ignores {
+        return f(window);
+    }
+    window.with_text_style(
+        Some(TextStyleRefinement { color: Some(FIXED_TEXT_COLOR), ..Default::default() }),
+        f,
+    )
 }
 
 impl Retained {
+    /// Says that nothing in the subtree reads the colour of the text style around it: a text with
+    /// no colour of its own, an underline of its default colour, anything that paints with the
+    /// colour its parent has. The subtree is laid out, built, recorded and replayed under a
+    /// colour of its own, so that a change of the colour around it is no change to its key, and
+    /// a recording of it is replayed under another. A subtree that does read it shows in
+    /// [`FIXED_TEXT_COLOR`].
+    ///
+    /// Not for a subtree that is [handed to a stacking context](Self::lift_z) or holds one: the
+    /// context paints it under the colour it has.
+    pub fn ignoring_text_color(mut self) -> Self {
+        self.ignores_text_color = true;
+        self
+    }
+
+
     /// Says that a tick which changes only how the subtree paints may repaint it in place, with
     /// [`Window::repaint_in_place`], leaving the rest of the frame as it is. A frame that records
     /// the subtree leaves what that needs of its surroundings, if the recording is a plain one: not
@@ -580,7 +611,10 @@ impl Element for Retained {
         // under the one around it: a frame that skips the subtree makes none of them, and the
         // elements without an id that follow it must keep the numbers they had.
         let outer_scope = std::mem::replace(&mut window.layout_scope, global_id.scope_hash());
-        let result = self.request_layout_in_scope(global_id, window, cx);
+        let ignores_text_color = self.ignores_text_color;
+        let result = with_fixed_text_color(ignores_text_color, window, |window| {
+            self.request_layout_in_scope(global_id, window, cx)
+        });
         window.layout_scope = outer_scope;
         result
     }
@@ -596,7 +630,10 @@ impl Element for Retained {
     ) -> RetainedPrepaint {
         let global_id = &self.global_id(window);
         let outer_scope = std::mem::replace(&mut window.layout_scope, global_id.scope_hash());
-        let result = self.prepaint_in_scope(global_id, bounds, request_layout, window, cx);
+        let ignores_text_color = self.ignores_text_color;
+        let result = with_fixed_text_color(ignores_text_color, window, |window| {
+            self.prepaint_in_scope(global_id, bounds, request_layout, window, cx)
+        });
         window.layout_scope = outer_scope;
         // The parent hands this subtree to the stacking context around it once this returns, unless
         // it is in a culled subtree, where nothing is handed over: the next element that is would
@@ -630,6 +667,64 @@ impl Element for Retained {
         cx: &mut App,
     ) {
         let global_id = &self.global_id(window);
+        let ignores_text_color = self.ignores_text_color;
+        with_fixed_text_color(ignores_text_color, window, |window| self.paint_subtree(global_id, prepaint, window, cx));
+    }
+}
+
+/// Puts what the paint of the subtree `global_id` recorded into the frame being built.
+fn replay_recorded_paint(
+    global_id: &GlobalElementId,
+    hook: Option<&ReplayHook>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.with_element_state(global_id, |state: Option<RetainedState>, window| {
+        let mut state = state.expect("a replayed subtree has its state");
+        // What the subtree read while it painted is read again by its replay: the layout of a
+        // wrapper that holds it as a hole is skipped, and its entities are not observed otherwise.
+        cx.entities.extend_accessed(&state.accessed_entities);
+        let recorded = state
+            .recorded
+            .as_mut()
+            .expect("a replayed subtree has its recording");
+        let delta = recorded.delta;
+        let lift_base = recorded.lift_base;
+        debug_assert!(
+            recorded.relocation.as_ref().is_none_or(|relocation| !relocation.regional()
+                || relocation.info.covers_mask(delta, &window.content_mask())),
+            "the region a relocatable subtree was recorded in covers the clip it is painted under"
+        );
+        let paint = recorded
+            .paint
+            .as_mut()
+            .expect("a subtree is skipped only with its paint recorded");
+        let range = window.replay_paint(paint, delta, lift_base, false);
+        paint.set_range(range);
+        if let Some(hook) = hook {
+            window.retained.replayed_root = Some(state.root);
+            hook(RetainedPhase::Paint, delta, window, cx);
+            window.retained.replayed_root = None;
+        }
+        ((), state)
+    });
+}
+
+/// Puts what the paint of a subtree that was handed to a stacking context recorded into the
+/// frame, when the context paints it, as the subtree itself would have.
+pub(crate) fn replay_hole_paint(hole: &crate::window::Hole, window: &mut Window, cx: &mut App) {
+    replay_recorded_paint(&hole.id, hole.hook.as_ref(), window, cx);
+}
+
+impl Retained {
+    /// The paint of the subtree: replays it, or paints what was built and records it.
+    fn paint_subtree(
+        &mut self,
+        global_id: &GlobalElementId,
+        prepaint: &mut RetainedPrepaint,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         match prepaint {
             RetainedPrepaint::Replayed => {
                 replay_recorded_paint(global_id, self.on_replay.as_ref(), window, cx);
@@ -729,50 +824,6 @@ impl Element for Retained {
             }
         }
     }
-}
-
-/// Puts what the paint of the subtree `global_id` recorded into the frame being built.
-fn replay_recorded_paint(
-    global_id: &GlobalElementId,
-    hook: Option<&ReplayHook>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    window.with_element_state(global_id, |state: Option<RetainedState>, window| {
-        let mut state = state.expect("a replayed subtree has its state");
-        // What the subtree read while it painted is read again by its replay: the layout of a
-        // wrapper that holds it as a hole is skipped, and its entities are not observed otherwise.
-        cx.entities.extend_accessed(&state.accessed_entities);
-        let recorded = state
-            .recorded
-            .as_mut()
-            .expect("a replayed subtree has its recording");
-        let delta = recorded.delta;
-        let lift_base = recorded.lift_base;
-        debug_assert!(
-            recorded.relocation.as_ref().is_none_or(|relocation| !relocation.regional()
-                || relocation.info.covers_mask(delta, &window.content_mask())),
-            "the region a relocatable subtree was recorded in covers the clip it is painted under"
-        );
-        let paint = recorded
-            .paint
-            .as_mut()
-            .expect("a subtree is skipped only with its paint recorded");
-        let range = window.replay_paint(paint, delta, lift_base, false);
-        paint.set_range(range);
-        if let Some(hook) = hook {
-            window.retained.replayed_root = Some(state.root);
-            hook(RetainedPhase::Paint, delta, window, cx);
-            window.retained.replayed_root = None;
-        }
-        ((), state)
-    });
-}
-
-/// Puts what the paint of a subtree that was handed to a stacking context recorded into the
-/// frame, when the context paints it, as the subtree itself would have.
-pub(crate) fn replay_hole_paint(hole: &crate::window::Hole, window: &mut Window, cx: &mut App) {
-    replay_recorded_paint(&hole.id, hole.hook.as_ref(), window, cx);
 }
 
 impl Retained {
@@ -3657,6 +3708,67 @@ mod tests {
         draw(window, cx);
         draw(window, cx);
         assert!(counters(window, cx).replays > before.replays);
+    }
+
+    /// A subtree of text under a parent that sets `color`, and the colour it is given in the second state.
+    fn replay_under_a_text_color(cx: &mut TestAppContext, ignoring: bool) -> (bool, bool) {
+        let changed = Rc::new(Cell::new(false));
+        let key = Rc::new(Cell::new(1));
+        let window = open(cx, {
+            let changed = changed.clone();
+            let key = key.clone();
+            Rc::new(move |_, _| {
+                let color = if changed.get() { crate::blue() } else { crate::red() };
+                let subtree = retained("retained", key.get(), move |_, _| {
+                    div().id("text").bg(crate::red()).child("aaaa bbbb cccc dddd").into_any_element()
+                });
+                let subtree = if ignoring { subtree.ignoring_text_color() } else { subtree };
+                div()
+                    .id("root")
+                    .size_full()
+                    .child(
+                        div()
+                            .id("parent")
+                            .w(px(60.))
+                            .flex()
+                            .flex_col()
+                            .text_color(color)
+                            .child(subtree)
+                            .child(div().id("bar").flex_none().h(px(10.)).w(px(50.)).bg(crate::green())),
+                    )
+                    .into_any_element()
+            })
+        });
+        draw(window, cx);
+        draw(window, cx);
+        let before = counters(window, cx);
+        assert!(before.replays > 0);
+
+        changed.set(true);
+        draw(window, cx);
+        let drawn = snapshot(window, cx, &POINTS);
+        let after = counters(window, cx);
+        key.set(2);
+        draw(window, cx);
+        let built = snapshot(window, cx, &POINTS);
+        assert_eq!(drawn.scene, built.scene, "what is replayed is what is built");
+        assert_eq!(drawn.chains, built.chains);
+        (
+            after.replays > before.replays,
+            after.builds + after.lazy_builds > before.builds + before.lazy_builds,
+        )
+    }
+
+    #[gpui::test]
+    fn a_text_color_around_a_subtree_is_part_of_what_it_was_recorded_under(cx: &mut TestAppContext) {
+        let (replayed, built) = replay_under_a_text_color(cx, false);
+        assert!(!replayed && built, "built under another colour");
+    }
+
+    #[gpui::test]
+    fn a_subtree_that_ignores_the_text_color_around_it_is_replayed_under_another(cx: &mut TestAppContext) {
+        let (replayed, built) = replay_under_a_text_color(cx, true);
+        assert!(replayed && !built, "replayed under another colour");
     }
 
     #[gpui::test]
