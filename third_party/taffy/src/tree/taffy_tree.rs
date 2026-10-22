@@ -313,6 +313,16 @@ pub struct TaffyTree<NodeContext = ()> {
 
     /// Layout mode configuration
     config: TaffyConfig,
+
+    /// How many times a layout algorithm ran for a node with `RunMode::PerformLayout`, a cache miss.
+    ///
+    /// fdarian fork patch.
+    layout_runs: u64,
+
+    /// Like `layout_runs`, for `RunMode::ComputeSize`: the runs that only size a node.
+    ///
+    /// fdarian fork patch.
+    size_runs: u64,
 }
 
 impl Default for TaffyTree {
@@ -454,6 +464,11 @@ where
         //
         // If there was no cache match and a new result needs to be computed then that result will be added to the cache
         compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+            match inputs.run_mode {
+                RunMode::PerformLayout => tree.taffy.layout_runs += 1,
+                RunMode::ComputeSize => tree.taffy.size_runs += 1,
+                RunMode::PerformHiddenLayout => {}
+            }
             // fdarian fork patch: size containment.
             let inputs = {
                 let style = &tree.taffy.nodes[node_id.into()].style;
@@ -768,7 +783,28 @@ impl<NodeContext> TaffyTree<NodeContext> {
             parents: SlotMap::with_capacity(capacity),
             node_context_data: SecondaryMap::with_capacity(capacity),
             config: TaffyConfig::default(),
+            layout_runs: 0,
+            size_runs: 0,
         }
+    }
+
+    /// How many nodes had their layout algorithm run to place them, over the life of the tree: the
+    /// cache misses of `RunMode::PerformLayout`. A node answered from its cache, and a hidden one, is not
+    /// counted.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn layout_runs(&self) -> u64 {
+        self.layout_runs
+    }
+
+    /// Like [`Self::layout_runs`], for the runs that only size a node (`RunMode::ComputeSize`), which a
+    /// parent makes to learn what a child contributes before it places it.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn size_runs(&self) -> u64 {
+        self.size_runs
     }
 
     /// Enable rounding of layout values. Rounding is enabled by default.

@@ -2765,6 +2765,8 @@ mod tests {
                 children_set: after.children_set - before.children_set,
                 passes: after.passes - before.passes,
                 measures: after.measures - before.measures,
+                nodes_laid_out: after.nodes_laid_out - before.nodes_laid_out,
+                nodes_sized: after.nodes_sized - before.nodes_sized,
                 extent_walks: after.extent_walks - before.extent_walks,
                 overflow_walks: after.overflow_walks - before.overflow_walks,
                 unsnapped_overflow_walks: after.unsnapped_overflow_walks - before.unsnapped_overflow_walks,

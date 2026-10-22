@@ -1167,6 +1167,8 @@ fn delta(before: LayoutCounters, after: LayoutCounters) -> LayoutCounters {
         children_set: after.children_set - before.children_set,
         passes: after.passes - before.passes,
         measures: after.measures - before.measures,
+        nodes_laid_out: after.nodes_laid_out - before.nodes_laid_out,
+        nodes_sized: after.nodes_sized - before.nodes_sized,
         extent_walks: after.extent_walks - before.extent_walks,
         overflow_walks: after.overflow_walks - before.overflow_walks,
         unsnapped_overflow_walks: after.unsnapped_overflow_walks - before.unsnapped_overflow_walks,
@@ -1278,6 +1280,60 @@ fn a_changed_style_or_child_list_is_the_only_thing_set(cx: &mut TestAppContext) 
         assert_eq!(counters.nodes_created, 0);
         assert_eq!(delta(before, engine.counters()).nodes_removed, gone_nodes);
         assert_eq!(engine.taffy.total_node_count() as u64, nodes - gone_nodes);
+    });
+}
+
+/// `plain_tree` with a size on every box that its content does not change, so a change to a leaf
+/// reaches no sibling and no size above it.
+fn fixed_tree(tree: &mut Plain) {
+    tree.style.size.width = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(100.))));
+    tree.style.size.height = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(40.))));
+    tree.children.iter_mut().for_each(fixed_tree);
+}
+
+/// What taffy ran for a frame, from the first request to the end of the compute.
+fn plain_runs(
+    engine: &mut TaffyLayoutEngine,
+    tree: &Plain,
+    window: &mut Window,
+    cx: &mut App,
+) -> LayoutCounters {
+    let before = engine.counters();
+    plain_frame(engine, tree, window, cx);
+    delta(before, engine.counters())
+}
+
+#[gpui::test]
+fn a_frame_runs_the_layout_algorithm_only_for_the_nodes_whose_inputs_changed(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        for (depth, fan) in [(1, 3), (3, 3), (4, 3), (3, 6), (3, 1)] {
+            let mut engine = TaffyLayoutEngine::new();
+            let mut tree = plain_tree(&mut 0, depth, fan);
+            fixed_tree(&mut tree);
+            let nodes = plain_count(&tree) as u64;
+
+            let first = plain_runs(&mut engine, &tree, window, cx);
+            assert!(first.nodes_laid_out >= nodes, "every node is placed once: {first:?}");
+
+            let idle = plain_runs(&mut engine, &tree, window, cx);
+            assert_eq!((idle.nodes_laid_out, idle.nodes_sized), (0, 0), "{idle:?}");
+
+            // The height of one leaf: it and its ancestors run again over their children, which
+            // answer from their caches, and each ancestor is sized once on the way.
+            let mut leaf = &mut tree;
+            while !leaf.children.is_empty() {
+                leaf = &mut leaf.children[0];
+            }
+            leaf.style.size.height = Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(41.))));
+            let changed = plain_runs(&mut engine, &tree, window, cx);
+            let chain = depth as u64 + 1;
+            assert_eq!(changed.nodes_laid_out, chain, "depth {depth}, fan {fan}: {changed:?}");
+            assert_eq!(changed.nodes_sized, depth as u64, "depth {depth}, fan {fan}: {changed:?}");
+
+            let idle = plain_runs(&mut engine, &tree, window, cx);
+            assert_eq!((idle.nodes_laid_out, idle.nodes_sized), (0, 0), "{idle:?}");
+        }
     });
 }
 

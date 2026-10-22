@@ -183,6 +183,13 @@ pub struct LayoutCounters {
     pub passes: u64,
     /// Calls to the measure functions of leaves.
     pub measures: u64,
+    /// Nodes whose layout algorithm ran to place them: the cache misses of taffy, which a node
+    /// whose inputs are those of its last layout is not. A change to one leaf makes this its
+    /// chain of ancestors and whatever their new sizes reach, not the size of the tree.
+    pub nodes_laid_out: u64,
+    /// Nodes whose layout algorithm ran only to size them, which a parent does to learn what a
+    /// child contributes before it places it. Not part of `nodes_laid_out`.
+    pub nodes_sized: u64,
     /// Subtrees whose painted extent ([`TaffyLayoutEngine::painted_extent`]) was worked out from
     /// their children, and not found as an earlier pass or frame left it.
     pub extent_walks: u64,
@@ -439,7 +446,11 @@ impl TaffyLayoutEngine {
     }
 
     pub fn counters(&self) -> LayoutCounters {
-        self.counters
+        LayoutCounters {
+            nodes_laid_out: self.taffy.layout_runs(),
+            nodes_sized: self.taffy.size_runs(),
+            ..self.counters
+        }
     }
 
     pub(crate) fn id(&self) -> u64 {
