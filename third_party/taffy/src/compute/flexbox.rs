@@ -1,5 +1,8 @@
 //! Computes the [flexbox](https://css-tricks.com/snippets/css/a-guide-to-flexbox/) layout algorithm on [`TaffyTree`](crate::TaffyTree) according to the [spec](https://www.w3.org/TR/css-flexbox-1/)
-use crate::compute::common::alignment::{compute_alignment_offset, resolve_self_alignment_safety};
+use crate::compute::common::alignment::{
+    alignment_spacing, centred_on_static_position, initial_alignment_offset, resolve_self_alignment_safety,
+    LayoutUnitDiffuser,
+};
 use crate::geometry::{Line, Point, Rect, Size};
 use crate::style::{
     AlignContent, AlignContentKeyword, AlignItems, AlignItemsKeyword, AlignSelf, AvailableSpace, FlexWrap,
@@ -12,7 +15,7 @@ use crate::tree::{LayoutFlexboxContainer, LayoutPartialTreeExt, NodeId};
 use crate::util::debug::debug_log;
 use crate::util::sys::{f32_max, new_vec_with_capacity, Vec};
 use crate::util::MaybeMath;
-use crate::util::{cut_to_layout_unit, round_to_layout_unit};
+use crate::util::{cut_to_layout_unit, half_layout_unit, round_to_layout_unit};
 use crate::util::{MaybeResolve, ResolveOrZero};
 use crate::{BoxGenerationMode, BoxSizing, Direction, RequestedAxis};
 
@@ -1722,9 +1725,14 @@ fn handle_align_content_stretch(flex_lines: &mut [FlexLine], node_size: Size<Opt
         let lines_total_cross: f32 = flex_lines.iter().map(|line| line.cross_size).sum::<f32>() + total_cross_axis_gap;
 
         if lines_total_cross < container_min_inner_cross {
-            let remaining = container_min_inner_cross - lines_total_cross;
-            let addition = remaining / flex_lines.len() as f32;
-            flex_lines.iter_mut().for_each(|line| line.cross_size += addition);
+            // fdarian fork patch: the free space is diffused over the lines in 1/64 as Blink does it, in the order the
+            // lines are laid out (the last one first in `wrap-reverse`).
+            let mut additions = LayoutUnitDiffuser::new(container_min_inner_cross - lines_total_cross, flex_lines.len());
+            if constants.is_wrap_reverse {
+                flex_lines.iter_mut().rev().for_each(|line| line.cross_size += additions.next());
+            } else {
+                flex_lines.iter_mut().for_each(|line| line.cross_size += additions.next());
+            }
         }
     }
 }
@@ -1821,36 +1829,51 @@ fn distribute_remaining_free_space(flex_lines: &mut [FlexLine], constants: &Algo
             }
         }
 
-        if free_space > 0.0 && num_auto_margins > 0 {
-            let margin = free_space / num_auto_margins as f32;
-
-            for child in line.items.iter_mut() {
+        // fdarian fork patch: as in Blink, the free space is diffused over the auto margins in 1/64 (the items in
+        // order, the start margin before the end one), and `justify-content` has none left to align with.
+        let free_space = if free_space > 0.0 && num_auto_margins > 0 {
+            let mut shares = LayoutUnitDiffuser::new(free_space, num_auto_margins);
+            let mut give_margins = |child: &mut FlexItem| {
                 if child.margin_is_auto.main_start(constants.dir) {
+                    let share = shares.next();
                     if constants.is_row {
-                        child.margin.left = margin;
+                        child.margin.left = share;
                     } else {
-                        child.margin.top = margin;
+                        child.margin.top = share;
                     }
                 }
                 if child.margin_is_auto.main_end(constants.dir) {
+                    let share = shares.next();
                     if constants.is_row {
-                        child.margin.right = margin;
+                        child.margin.right = share;
                     } else {
-                        child.margin.bottom = margin;
+                        child.margin.bottom = share;
                     }
                 }
+            };
+            if constants.dir.is_reverse() {
+                line.items.iter_mut().rev().for_each(&mut give_margins);
+            } else {
+                line.items.iter_mut().for_each(&mut give_margins);
             }
-        }
+            0.0
+        } else {
+            free_space
+        };
 
         let num_items = line.items.len();
         let layout_reverse = constants.dir.is_reverse();
         let gap = constants.gap.main(constants.dir);
         let raw_justify_content_mode = constants.justify_content.unwrap_or(JustifyContent::FLEX_START);
         let justify_content_mode = apply_alignment_fallback(free_space, num_items, raw_justify_content_mode);
+        let mut spacing = alignment_spacing(free_space, num_items, justify_content_mode, true);
 
         let justify_item = |(i, child): (usize, &mut FlexItem)| {
-            child.offset_main =
-                compute_alignment_offset(free_space, num_items, gap, justify_content_mode, layout_reverse, i == 0);
+            child.offset_main = if i == 0 {
+                initial_alignment_offset(free_space, num_items, justify_content_mode, layout_reverse)
+            } else {
+                gap + spacing.next()
+            };
         };
 
         if layout_reverse {
@@ -1888,25 +1911,28 @@ fn resolve_cross_axis_auto_margins(flex_lines: &mut [FlexLine], constants: &Algo
         for child in line.items.iter_mut() {
             let free_space = line_cross_size - child.outer_target_size.cross(constants.dir);
 
+            // fdarian fork patch: as in Blink, an auto margin is not negative, and two of them are each half of the
+            // free space in 1/64 cut toward zero.
+            let margin_space = f32_max(free_space, 0.0);
             if child.margin_is_auto.cross_start(constants.dir) && child.margin_is_auto.cross_end(constants.dir) {
                 if constants.is_row {
-                    child.margin.top = free_space / 2.0;
-                    child.margin.bottom = free_space / 2.0;
+                    child.margin.top = half_layout_unit(margin_space);
+                    child.margin.bottom = half_layout_unit(margin_space);
                 } else {
-                    child.margin.left = free_space / 2.0;
-                    child.margin.right = free_space / 2.0;
+                    child.margin.left = half_layout_unit(margin_space);
+                    child.margin.right = half_layout_unit(margin_space);
                 }
             } else if child.margin_is_auto.cross_start(constants.dir) {
                 if constants.is_row {
-                    child.margin.top = free_space;
+                    child.margin.top = margin_space;
                 } else {
-                    child.margin.left = free_space;
+                    child.margin.left = margin_space;
                 }
             } else if child.margin_is_auto.cross_end(constants.dir) {
                 if constants.is_row {
-                    child.margin.bottom = free_space;
+                    child.margin.bottom = margin_space;
                 } else {
-                    child.margin.right = free_space;
+                    child.margin.right = margin_space;
                 }
             } else {
                 // 14. Align all flex items along the cross-axis.
@@ -1977,7 +2003,7 @@ fn align_flex_items_along_cross_axis(
                 free_space
             }
         }
-        AlignItemsKeyword::Center => free_space / 2.0,
+        AlignItemsKeyword::Center => half_layout_unit(free_space),
         AlignItemsKeyword::Baseline => {
             if constants.is_row {
                 if constants.is_wrap_reverse {
@@ -2062,9 +2088,13 @@ fn align_flex_lines_per_align_content(flex_lines: &mut [FlexLine], constants: &A
 
     let align_content_mode = apply_alignment_fallback(free_space, num_lines, constants.align_content);
 
+    let mut spacing = alignment_spacing(free_space, num_lines, align_content_mode, true);
     let align_line = |(i, line): (usize, &mut FlexLine)| {
-        line.offset_cross =
-            compute_alignment_offset(free_space, num_lines, gap, align_content_mode, constants.is_wrap_reverse, i == 0);
+        line.offset_cross = if i == 0 {
+            initial_alignment_offset(free_space, num_lines, align_content_mode, constants.is_wrap_reverse)
+        } else {
+            gap + spacing.next()
+        };
     };
 
     if constants.is_wrap_reverse {
@@ -2576,15 +2606,22 @@ fn perform_absolute_layout_on_absolute_children(
                 }
                 (AlignContentKeyword::SpaceEvenly, _)
                 | (AlignContentKeyword::SpaceAround, _)
-                | (AlignContentKeyword::Center, _) => {
-                    (constants.container_size.main(constants.dir)
-                        + constants.content_box_inset.main_start(constants.dir)
-                        - constants.content_box_inset.main_end(constants.dir)
-                        - final_size.main(constants.dir)
-                        + resolved_margin.main_start(constants.dir)
-                        - resolved_margin.main_end(constants.dir))
-                        / 2.0
-                }
+                | (AlignContentKeyword::Center, _) => centred_on_static_position(
+                    constants.container_size.main(constants.dir),
+                    Line {
+                        start: constants.border.main_start(constants.dir),
+                        end: constants.border.main_end(constants.dir),
+                    },
+                    Line {
+                        start: constants.content_box_inset.main_start(constants.dir),
+                        end: constants.content_box_inset.main_end(constants.dir),
+                    },
+                    final_size.main(constants.dir),
+                    Line {
+                        start: resolved_margin.main_start(constants.dir),
+                        end: resolved_margin.main_end(constants.dir),
+                    },
+                ),
             }
         };
 
@@ -2650,15 +2687,22 @@ fn perform_absolute_layout_on_absolute_children(
                         - final_size.cross(constants.dir)
                         - resolved_margin.cross_end(constants.dir)
                 }
-                (AlignItemsKeyword::Center, _) => {
-                    (constants.container_size.cross(constants.dir)
-                        + constants.content_box_inset.cross_start(constants.dir)
-                        - constants.content_box_inset.cross_end(constants.dir)
-                        - final_size.cross(constants.dir)
-                        + resolved_margin.cross_start(constants.dir)
-                        - resolved_margin.cross_end(constants.dir))
-                        / 2.0
-                }
+                (AlignItemsKeyword::Center, _) => centred_on_static_position(
+                    constants.container_size.cross(constants.dir),
+                    Line {
+                        start: constants.border.cross_start(constants.dir),
+                        end: constants.border.cross_end(constants.dir),
+                    },
+                    Line {
+                        start: constants.content_box_inset.cross_start(constants.dir),
+                        end: constants.content_box_inset.cross_end(constants.dir),
+                    },
+                    final_size.cross(constants.dir),
+                    Line {
+                        start: resolved_margin.cross_start(constants.dir),
+                        end: resolved_margin.cross_end(constants.dir),
+                    },
+                ),
                 // SelfStart/SelfEnd are resolved to Start/End against the item's own direction
                 // where `align_self` is read above.
                 (AlignItemsKeyword::SelfStart | AlignItemsKeyword::SelfEnd, _) => unreachable!(),

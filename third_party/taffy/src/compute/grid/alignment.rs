@@ -1,7 +1,7 @@
 //! Alignment of tracks and final positioning of items
 use super::types::GridTrack;
 use crate::compute::common::alignment::{
-    apply_alignment_fallback, compute_alignment_offset, resolve_self_alignment_safety,
+    alignment_spacing, apply_alignment_fallback, centred_on_static_position, initial_alignment_offset, resolve_self_alignment_safety,
 };
 use crate::geometry::{InBothAbsAxis, Line, Point, Rect, Size};
 use crate::style::{
@@ -10,7 +10,7 @@ use crate::style::{
 };
 use crate::tree::{Layout, LayoutPartialTreeExt, NodeId, SizingMode};
 use crate::util::sys::f32_max;
-use crate::util::{MaybeMath, MaybeResolve, ResolveOrZero};
+use crate::util::{half_layout_unit, MaybeMath, MaybeResolve, ResolveOrZero};
 
 #[cfg(feature = "content_size")]
 use crate::compute::common::content_size::compute_content_size_contribution;
@@ -34,9 +34,7 @@ pub(super) fn align_tracks(
     // Count the number of non-collapsed tracks (not counting gutters)
     let num_tracks = tracks.iter().skip(1).step_by(2).filter(|track| !track.is_collapsed).count();
 
-    // Grid layout treats gaps as full tracks rather than applying them at alignment so we
-    // simply pass zero here. Grid layout is never reversed.
-    let gap = 0.0;
+    // Grid layout treats gaps as full tracks rather than applying them at alignment, and is never reversed.
     let layout_is_reversed = false;
     let track_alignment = apply_alignment_fallback(free_space, num_tracks, track_alignment_style);
     let track_alignment = if axis_is_reversed { track_alignment.reversed() } else { track_alignment };
@@ -45,10 +43,14 @@ pub(super) fn align_tracks(
     // grid's lines should still be aligned within the container (e.g. at the inline-start edge
     // for RTL), so apply the offset to the origin instead.
     let empty_grid_offset = if num_tracks == 0 {
-        compute_alignment_offset(free_space, num_tracks, gap, track_alignment, layout_is_reversed, true)
+        initial_alignment_offset(free_space, num_tracks, track_alignment, layout_is_reversed)
     } else {
         0.0
     };
+
+    // fdarian fork patch: as in Blink, the free space of `space-between`, `space-around` and `space-evenly` is divided
+    // in 1/64 and the remainder dropped (grid_track_sizing_algorithm.cc), where flexbox diffuses it.
+    let mut spacing = alignment_spacing(free_space, num_tracks, track_alignment, false);
 
     // Compute offsets
     let mut total_offset = origin + empty_grid_offset;
@@ -61,10 +63,12 @@ pub(super) fn align_tracks(
         // Alignment offsets should be applied only to non-collapsed tracks.
         let is_first = is_non_collapsed_track && !seen_non_collapsed_track;
 
-        let offset = if is_non_collapsed_track {
-            compute_alignment_offset(free_space, num_tracks, gap, track_alignment, layout_is_reversed, is_first)
-        } else {
+        let offset = if !is_non_collapsed_track {
             0.0
+        } else if is_first {
+            initial_alignment_offset(free_space, num_tracks, track_alignment, layout_is_reversed)
+        } else {
+            spacing.next()
         };
 
         track.offset = total_offset + offset;
@@ -345,8 +349,9 @@ pub(super) fn align_item_within_area(
     let free_space = f32_max(grid_area_size - resolved_size - non_auto_margin.sum(), 0.0);
 
     // Expand auto margins to fill available space
-    let auto_margin_count = margin.start.is_none() as u8 + margin.end.is_none() as u8;
-    let auto_margin_size = if auto_margin_count > 0 { free_space / auto_margin_count as f32 } else { 0.0 };
+    // fdarian fork patch: two auto margins centre the item, which is half the free space in 1/64 cut toward zero in
+    // Blink (`AlignmentOffset`).
+    let auto_margin_size = if margin.start.is_none() && margin.end.is_none() { half_layout_unit(free_space) } else { free_space };
     let resolved_margin = Line {
         start: margin.start.unwrap_or(auto_margin_size) + baseline_shim,
         end: margin.end.unwrap_or(auto_margin_size),
@@ -376,7 +381,9 @@ pub(super) fn align_item_within_area(
             }
         }
         AlignItemsKeyword::Center => {
-            (grid_area_size - resolved_size + resolved_margin.start - resolved_margin.end) / 2.0
+            // fdarian fork patch: the margin and then half the free space, cut toward zero in 1/64 (`AlignmentOffset`).
+            resolved_margin.start
+                + half_layout_unit(grid_area_size - resolved_size - resolved_margin.start - resolved_margin.end)
         }
         // SelfStart/SelfEnd are resolved to Start/End against the item's own direction in
         // `align_and_position_item`.
@@ -394,6 +401,14 @@ pub(super) fn align_item_within_area(
             }
             (Some(start), None) => start + non_auto_margin.start,
             (None, Some(end)) => grid_area_size - end - resolved_size - non_auto_margin.end,
+            (None, None) if alignment_keyword == AlignItemsKeyword::Center => centred_on_static_position(
+                grid_area_size,
+                Line { start: 0.0, end: 0.0 },
+                Line { start: 0.0, end: 0.0 },
+                resolved_size,
+                // An auto margin is zero beside an auto inset.
+                non_auto_margin,
+            ),
             (None, None) => alignment_based_offset,
         }
     } else {

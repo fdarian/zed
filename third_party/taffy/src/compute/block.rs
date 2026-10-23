@@ -7,7 +7,7 @@ use crate::tree::{LayoutPartialTree, LayoutPartialTreeExt, NodeId};
 use crate::util::debug::debug_log;
 use crate::util::sys::f32_max;
 use crate::util::sys::Vec;
-use crate::util::MaybeMath;
+use crate::util::{half_layout_unit, MaybeMath};
 use crate::util::{MaybeResolve, ResolveOrZero};
 use crate::{
     BlockContainerStyle, BlockItemStyle, BoxGenerationMode, BoxSizing, Direction, LayoutBlockContainer, RequestedAxis,
@@ -262,7 +262,7 @@ impl BlockContext<'_> {
     }
 }
 
-use super::common::alignment::{apply_alignment_fallback, compute_alignment_offset};
+use super::common::alignment::{apply_alignment_fallback, initial_alignment_offset};
 #[cfg(feature = "content_size")]
 use super::common::content_size::compute_content_size_contribution;
 
@@ -607,7 +607,7 @@ fn compute_inner(
         let any_in_flow = items.iter().any(|item| item.final_layout.is_some());
         if any_in_flow {
             let keyword = apply_alignment_fallback(free_space, 1, align_content);
-            let group_offset = compute_alignment_offset(free_space, 1, 0.0, keyword, false, true);
+            let group_offset = initial_alignment_offset(free_space, 1, keyword, false);
             first_baseline = first_baseline.map(|baseline| baseline + group_offset);
             for item in items.iter_mut() {
                 if let Some(layout) = item.final_layout.as_mut() {
@@ -1203,17 +1203,18 @@ fn perform_final_layout_on_in_flow_children(
             // Note: Vertical auto-margins for relatively positioned block items simply resolve to 0.
             // See: https://www.w3.org/TR/CSS21/visudet.html#abs-non-replaced-width
             let free_x_space = f32_max(0.0, stretch_width - final_size.width);
-            let x_axis_auto_margin_size = {
-                let auto_margin_count = item_margin.left.is_none() as u8 + item_margin.right.is_none() as u8;
-                if auto_margin_count > 0 {
-                    free_x_space / auto_margin_count as f32
-                } else {
-                    0.0
+            // fdarian fork patch: two auto margins are half the free space in 1/64 cut toward zero and the rest, as in
+            // Blink's `ResolveAutoMargins`; the right margin takes the odd 64th.
+            let (auto_margin_left, auto_margin_right) = match (item_margin.left, item_margin.right) {
+                (None, None) => {
+                    let left = half_layout_unit(free_x_space);
+                    (left, free_x_space - left)
                 }
+                _ => (free_x_space, free_x_space),
             };
             let resolved_margin = Rect {
-                left: item_margin.left.unwrap_or(x_axis_auto_margin_size),
-                right: item_margin.right.unwrap_or(x_axis_auto_margin_size),
+                left: item_margin.left.unwrap_or(auto_margin_left),
+                right: item_margin.right.unwrap_or(auto_margin_right),
                 top: top_margin_set.resolve(),
                 bottom: bottom_margin_set.resolve(),
             };
@@ -1356,8 +1357,8 @@ fn perform_final_layout_on_in_flow_children(
                     (TextAlign::LegacyRight, Direction::Rtl) => {
                         // Do nothing. Right aligned by default.
                     }
-                    (TextAlign::LegacyCenter, Direction::Ltr) => location.x += free_x_space / 2.0,
-                    (TextAlign::LegacyCenter, Direction::Rtl) => location.x -= free_x_space / 2.0,
+                    (TextAlign::LegacyCenter, Direction::Ltr) => location.x += half_layout_unit(free_x_space),
+                    (TextAlign::LegacyCenter, Direction::Rtl) => location.x -= half_layout_unit(free_x_space),
                 }
             }
 

@@ -25,6 +25,27 @@ pub(crate) fn resolve_percentage(fraction: f32, basis: f32) -> f32 {
     cut_to_layout_unit(basis * fraction)
 }
 
+/// `length` as a count of 1/64 units. A length that is already a `LayoutUnit` is exact, one that is not is rounded.
+pub(crate) fn layout_unit_count(length: f32) -> i64 {
+    (length * 64.0).round() as i64
+}
+
+/// A count of 1/64 units as a length.
+pub(crate) fn layout_unit_length(count: i64) -> f32 {
+    count as f32 / 64.0
+}
+
+/// `length / 2` as Blink divides a `LayoutUnit`: the raw count is divided as an integer, toward zero for a negative
+/// one too, so `5.984375` is half of `11.96875` and of `11.984375`.
+pub(crate) fn half_layout_unit(length: f32) -> f32 {
+    layout_unit_length(layout_unit_count(length) / 2)
+}
+
+/// `length / divisor` as Blink divides a `LayoutUnit` by an integer: the raw count is divided toward zero.
+pub(crate) fn divide_layout_unit(length: f32, divisor: usize) -> f32 {
+    layout_unit_length(layout_unit_count(length) / divisor as i64)
+}
+
 /// Trait to encapsulate behaviour where we need to resolve from a
 /// potentially context-dependent size or dimension into
 /// a context-independent size or dimension.
