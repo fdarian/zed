@@ -75,7 +75,7 @@ use crate::{
     Hsla, TextStyleRefinement, Origin, StateOwner, AnyElement, App, Bounds, Edges, Element, ElementId, Escape, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, NonReusable, PaintRecord, Pixels, Point, PrepaintRecord,
     Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
-    blocker_bit, first_blocker, IsZero, SubtreeText, scene::PrimitiveCount,
+    blocker_bit, first_blocker, HandleList, IsZero, SubtreeText, scene::PrimitiveCount,
     PatchUnit, PatchSource,
 };
 use collections::FxHashSet;
@@ -361,7 +361,17 @@ struct LayoutRecord {
 /// Where the layout left a built subtree.
 struct LayoutReplay {
     generation: u64,
+    /// Where the build saw the subtree. A skip works out how far the subtree is from this, and not
+    /// from where the skip before put it.
     key: ReplayKey,
+    /// Nothing the build did ties the subtree to where it was: it can be skipped where a layout
+    /// moved it by a whole number of device pixels, see [`ReplayKey::translation`].
+    translatable: bool,
+    /// The reasons it cannot, and those of the subtrees skipped inside it: a subtree around it
+    /// that skips it has them too.
+    blockers: u16,
+    /// What the build left outside the frame, which a skip moves with the subtree.
+    handles: Rc<HandleList>,
 }
 
 impl LayoutRecord {
@@ -1294,25 +1304,37 @@ impl Retained {
         let root = self.laid_out_root(global_id, window);
         let key = window.replay_key(bounds, root);
         let generation = window.layout_generation(root);
-        let unchanged = window
+        let placed = window
             .peek_element_state(global_id, |state: &RetainedState| {
-                state
-                    .layout
-                    .as_ref()
-                    .and_then(|layout| layout.replay.as_ref())
-                    .is_some_and(|replay| replay.generation == generation && replay.key == key)
+                let replay = state.layout.as_ref()?.replay.as_ref()?;
+                if replay.generation != generation {
+                    return None;
+                }
+                let delta = if replay.key == key {
+                    Point::default()
+                } else if replay.translatable {
+                    replay.key.translation(&key)?
+                } else {
+                    return None;
+                };
+                Some((delta, replay.blockers, replay.handles.clone()))
             })
             .expect("a skipped subtree has its state");
-        if !unchanged {
+        let Some((delta, blockers, handles)) = placed else {
             window.retained.counters.layout_builds += 1;
             return self.build_skipped(global_id, bounds, key, SkipBasis::LaidOut, window, cx);
-        }
+        };
         window.retained.counters.layout_replays += 1;
+        if delta != Point::default() {
+            window.retained.counters.layout_translations += 1;
+        }
         if window.retained.verifier.is_some() {
             window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
         }
+        handles.place(delta);
+        window.note_layout_replay(&handles, blockers, delta);
         if let Some(hook) = self.on_replay.clone() {
-            window.publish_layout(move |window, cx| hook(RetainedPhase::LayoutRecorded, Point::default(), window, cx));
+            window.publish_layout(move |window, cx| hook(RetainedPhase::LayoutRecorded, delta, window, cx));
         }
         RetainedPrepaint::Replayed
     }
@@ -1358,6 +1380,7 @@ impl Retained {
         });
         let outcome = window.finish_layout_recording(mark);
         let publishes = self.on_replay.is_some();
+        let translates = self.translates;
         let skippable = outcome.reason.is_none()
             && unreusable.is_none()
             && !outcome.holds_painted
@@ -1370,6 +1393,9 @@ impl Retained {
                     layout.replay = Some(LayoutReplay {
                         generation: window.layout_generation(layout.root),
                         key,
+                        translatable: outcome.blockers == 0 && (!outcome.published || translates),
+                        blockers: outcome.blockers,
+                        handles: outcome.handles,
                     });
                     let published = layout.published.clone();
                     window.publish_layout_unnoted(move |_, _| published.set(true));

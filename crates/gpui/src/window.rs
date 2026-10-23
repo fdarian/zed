@@ -76,7 +76,7 @@ pub use patch::{PatchCounters, PatchDecline, PatchOutcome};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
 pub(crate) use retained::{
-    LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
+    HandleList, LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
     Origin, RetainedWindow, StateOwner, SubtreeText, blocker_bit, first_blocker,
 };
 

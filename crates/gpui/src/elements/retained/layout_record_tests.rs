@@ -7,7 +7,7 @@
 use super::tests::{SceneView, counters, draw, open};
 use super::*;
 use crate::{
-    AnyWindowHandle, AppContext as _, InteractiveElement, ParentElement, RetainedCounters, Styled, TestAppContext, div, px,
+    AnyWindowHandle, AppContext as _, InteractiveElement, ParentElement, RetainedCounters, StatefulInteractiveElement, Styled, TestAppContext, div, px,
     util::FluentBuilder as _,
 };
 use std::cell::RefCell;
@@ -253,6 +253,28 @@ fn republish(
         };
         for name in &names {
             registry.borrow_mut().extend(tapes.borrow().get(name).cloned().unwrap_or_default());
+        }
+    }
+}
+
+/// [`republish`] for an owner that takes how far the subtree is from where it was built.
+fn republish_translated(
+    registry: &Registry,
+    laid_out: &Tapes,
+    painted: &Tapes,
+    names: Vec<String>,
+) -> impl Fn(RetainedPhase, Point<Pixels>, &mut Window, &mut App) + 'static {
+    let (registry, laid_out, painted) = (registry.clone(), laid_out.clone(), painted.clone());
+    move |phase, delta, _, _| {
+        let tapes = match phase {
+            RetainedPhase::LayoutRecorded => &laid_out,
+            RetainedPhase::Layout => &painted,
+            _ => return,
+        };
+        for name in &names {
+            for (published, bounds) in tapes.borrow().get(name).cloned().unwrap_or_default() {
+                registry.borrow_mut().insert(published, Bounds::new(bounds.origin + delta, bounds.size));
+            }
         }
     }
 }
@@ -670,6 +692,8 @@ struct Locked {
     around_key: Rc<Cell<u64>>,
     /// The second card reads an entity when it is built.
     reads: Rc<Cell<bool>>,
+    /// The height of the box before the host: a layout that moves it.
+    spacer: Rc<Cell<f32>>,
 }
 
 impl Locked {
@@ -680,9 +704,11 @@ impl Locked {
         let host = Rc::new(Cell::new(Host::Skipped));
         let around_key = Rc::new(Cell::new(1));
         let reads = Rc::new(Cell::new(false));
+        let spacer = Rc::new(Cell::new(0.));
         let entity = cx.new(|_| 0u32);
         let window = open(cx, {
-            let (builds, host, around_key, reads) = (builds.clone(), host.clone(), around_key.clone(), reads.clone());
+            let (builds, host, around_key, reads, spacer) =
+                (builds.clone(), host.clone(), around_key.clone(), reads.clone(), spacer.clone());
             Rc::new(move |_, _| {
                 let cards = (0..Self::CARDS).map(|index| {
                     let (builds, reads, entity) = (builds.clone(), reads.clone(), entity.clone());
@@ -711,11 +737,18 @@ impl Locked {
                 } else {
                     element.into_any_element()
                 };
-                div().id("root").size_full().flex().flex_col().child(content).into_any_element()
+                div()
+                    .id("root")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().id("locked-spacer").flex_none().h(px(spacer.get())).w(px(10.)))
+                    .child(content)
+                    .into_any_element()
             })
         });
         cx.update_window(window, |_, window, _| window.set_max_draw_passes(2)).unwrap();
-        Self { window, builds, host, around_key, reads }
+        Self { window, builds, host, around_key, reads, spacer }
     }
 
     fn view(window: &mut Window, cx: &mut App) {
@@ -864,4 +897,442 @@ fn the_states_of_locked_content_go_when_a_draw_shows_it_and_hides_it_again(cx: &
     locked.draw_as(Host::Shown, cx);
     locked.draw_as(Host::Skipped, cx);
     assert_eq!(locked.states(cx), skipped, "nothing owns them any more");
+}
+
+#[gpui::test]
+fn a_locked_subtrees_layout_record_is_put_where_a_box_before_the_host_moved_it(cx: &mut TestAppContext) {
+    let locked = Locked::new(cx, false);
+    let first = locked.force(cx, |_| {});
+    assert_eq!(first.built, Locked::CARDS);
+
+    let mut previous = first;
+    for (round, spacer) in [17., 30., 0., 5., 5.].into_iter().enumerate() {
+        let again = locked.force(cx, |_| locked.spacer.set(spacer));
+        assert_eq!(again.built, 0, "round {round}: the draw between kept them, and the move is only a move");
+        assert_eq!(again.counters.layout_builds, previous.counters.layout_builds, "round {round}");
+        let moved = u64::from(round != 2);
+        assert_eq!(
+            again.counters.layout_translations,
+            previous.counters.layout_translations + moved * Locked::CARDS as u64,
+            "round {round}"
+        );
+        previous = again;
+    }
+}
+
+/// What a card of the page that moves is.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Piece {
+    /// A text and a scroller that is not scrolled.
+    Plain,
+    /// Has a box that is sticky.
+    Sticky,
+    /// Has a canvas, whose closures may keep where it is.
+    Captures,
+    /// A scroller that is scrolled.
+    Scrolled,
+    /// Has a box absolutely positioned in the frame around the cards, which layout places by
+    /// that frame and so is no layout a record keeps.
+    Escapes,
+    /// Has a box placed by the viewport.
+    Fixed,
+    /// Its owner does not take the offset of a replay.
+    Blind,
+}
+
+/// What the texts and the scrollers of the cards hold of their bounds, which a read sees.
+fn describe_handles(
+    texts: &RefCell<std::collections::BTreeMap<usize, crate::TextLayout>>,
+    scrolls: &RefCell<std::collections::BTreeMap<usize, crate::ScrollHandle>>,
+) -> String {
+    let texts = texts.borrow().iter().map(|(index, layout)| format!("text {index} {:?}", layout.bounds())).collect::<Vec<_>>();
+    let scrolls = scrolls
+        .borrow()
+        .iter()
+        .map(|(index, scroll)| {
+            format!(
+                "scroll {index} {:?} {:?} {:?} {:?}",
+                scroll.bounds(),
+                scroll.padding_box(),
+                scroll.bounds_for_item(0),
+                scroll.max_offset()
+            )
+        })
+        .collect::<Vec<_>>();
+    texts.into_iter().chain(scrolls).collect::<Vec<_>>().join("\n")
+}
+
+/// Cards in a frame that clips and is positioned, below a box that a test grows: the cards are
+/// moved by it, the frame with them. Each has a text and a scroller whose handles are read, and
+/// publishes its boxes the way gpuix does.
+struct Moving {
+    window: AnyWindowHandle,
+    registry: Registry,
+    builds: Rc<Cell<usize>>,
+    keys: Rc<RefCell<Vec<u64>>>,
+    shown: Rc<Cell<bool>>,
+    spacer: Rc<Cell<f32>>,
+    /// The frame around the cards clips them, so the content mask they are built under moves
+    /// with them.
+    clipped: Rc<Cell<bool>>,
+    texts: Rc<RefCell<std::collections::BTreeMap<usize, crate::TextLayout>>>,
+    scrolls: Rc<RefCell<std::collections::BTreeMap<usize, crate::ScrollHandle>>>,
+}
+
+impl Page for Moving {
+    fn window(&self) -> AnyWindowHandle {
+        self.window
+    }
+
+    fn published(&self) -> Vec<String> {
+        let mut lines = self.registry.borrow().iter().map(|(name, bounds)| format!("{name} {bounds:?}")).collect::<Vec<_>>();
+        lines.push(self.handles());
+        lines
+    }
+
+    fn builds(&self) -> usize {
+        self.builds.get()
+    }
+}
+
+impl Moving {
+    fn new(cx: &mut TestAppContext, pieces: Vec<Piece>, nested: bool) -> Self {
+        let registry = Registry::default();
+        let builds = Rc::new(Cell::new(0));
+        let keys = Rc::new(RefCell::new(vec![1; pieces.len()]));
+        let shown = Rc::new(Cell::new(false));
+        let spacer = Rc::new(Cell::new(0.));
+        let clipped = Rc::new(Cell::new(true));
+        let texts: Rc<RefCell<std::collections::BTreeMap<usize, crate::TextLayout>>> = Rc::default();
+        let scrolls: Rc<RefCell<std::collections::BTreeMap<usize, crate::ScrollHandle>>> = Rc::default();
+        let laid_out: Tapes = Tapes::default();
+        let painted: Tapes = Tapes::default();
+        let window = open(cx, {
+            let (registry, builds, keys, shown, spacer, clipped) =
+                (registry.clone(), builds.clone(), keys.clone(), shown.clone(), spacer.clone(), clipped.clone());
+            let (texts, scrolls) = (texts.clone(), scrolls.clone());
+            Rc::new(move |_, _| {
+                let cards = pieces.iter().copied().enumerate().filter(|_| shown.get()).map(|(index, piece)| {
+                    let name = format!("card {index}");
+                    let publisher = |name: String| {
+                        let (registry, laid_out, painted, tape) = (registry.clone(), laid_out.clone(), painted.clone(), format!("card {index}"));
+                        move |bounds: Bounds<Pixels>, window: &mut Window, _: &mut App| {
+                            registry.borrow_mut().insert(name.clone(), bounds);
+                            let tapes = if window.is_layout_pass() { &laid_out } else { &painted };
+                            tapes.borrow_mut().entry(tape.clone()).or_default().push((name.clone(), bounds));
+                        }
+                    };
+                    let forget = {
+                        let (laid_out, painted, tape) = (laid_out.clone(), painted.clone(), name.clone());
+                        move |window: &mut Window| {
+                            if window.is_layout_pass() {
+                                laid_out.borrow_mut().remove(&tape);
+                            } else if window.retention_records() {
+                                painted.borrow_mut().remove(&tape);
+                            }
+                        }
+                    };
+                    let contents = {
+                        let (texts, scrolls) = (texts.clone(), scrolls.clone());
+                        move || {
+                            let text = crate::StyledText::new(format!("Card {index} with enough words to wrap"));
+                            texts.borrow_mut().insert(index, text.layout().clone());
+                            let scroll = crate::ScrollHandle::new();
+                            if piece == Piece::Scrolled {
+                                scroll.set_offset(crate::point(px(0.), px(-5.)));
+                            }
+                            scrolls.borrow_mut().insert(index, scroll.clone());
+                            div()
+                                .child(text)
+                                .child(
+                                    div()
+                                        .id(("scroller", index))
+                                        .overflow_y_scroll()
+                                        .track_scroll(&scroll)
+                                        .w(px(60.))
+                                        .h(px(16.))
+                                        .child(div().w(px(10.)).h(px(60.)).bg(crate::green())),
+                                )
+                        }
+                    };
+                    let outer = retained(("moving-card", index), keys.borrow()[index], {
+                        let (builds, publish, forget, contents) =
+                            (builds.clone(), publisher(name.clone()), forget.clone(), contents.clone());
+                        move |window, _| {
+                            builds.set(builds.get() + 1);
+                            forget(window);
+                            let mut card = div()
+                                .id(("moving", index))
+                                .always_hitbox()
+                                .w(px(100.))
+                                .h(px(40.))
+                                .flex_none()
+                                .bg(crate::red())
+                                .on_painted(publish);
+                            match piece {
+                                Piece::Sticky => {
+                                    let mut sticky = div().id(("sticky", index)).w(px(40.)).h(px(10.));
+                                    sticky.style().position = Some(crate::Position::Sticky);
+                                    sticky.style().inset.top = Some(px(0.).into());
+                                    card = card.child(sticky);
+                                }
+                                Piece::Captures => card = card.child(crate::canvas(|_, _, _| (), |_, _, _, _| {}).w(px(10.)).h(px(10.))),
+                                Piece::Escapes => {
+                                    card.style().position = Some(crate::Position::Static);
+                                    let mut placed = div().id(("placed", index)).top(px(6.)).left(px(120.)).w(px(50.)).h(px(10.));
+                                    placed.style().position = Some(crate::Position::AbsoluteInAncestor);
+                                    card = card.child(placed);
+                                }
+                                Piece::Fixed => {
+                                    let mut placed = div().id(("placed", index)).top(px(6.)).left(px(120.)).w(px(50.)).h(px(10.));
+                                    placed.style().position = Some(crate::Position::Fixed);
+                                    card = card.child(placed);
+                                }
+                                Piece::Plain | Piece::Scrolled | Piece::Blind => {}
+                            }
+                            if !nested {
+                                return card.child(contents()).into_any_element();
+                            }
+                            let inner = retained(("moving-inner", index), 1, {
+                                let (builds, contents) = (builds.clone(), contents.clone());
+                                move |_, _| {
+                                    builds.set(builds.get() + 1000);
+                                    contents().into_any_element()
+                                }
+                            });
+                            card.child(inner).into_any_element()
+                        }
+                    });
+                    let names = vec![name];
+                    match piece {
+                        Piece::Blind => outer.on_replay(republish(&registry, &laid_out, &painted, names)),
+                        _ => outer.on_replay_translated(republish_translated(&registry, &laid_out, &painted, names)),
+                    }
+                });
+                let reset = {
+                    let registry = registry.clone();
+                    crate::canvas(
+                        move |_, window, _| {
+                            if window.is_layout_pass() {
+                                registry.borrow_mut().clear();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .w(px(0.))
+                    .h(px(0.))
+                };
+                div()
+                    .id("root")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(reset)
+                    .child(div().id("spacer").flex_none().h(px(spacer.get())).w(px(10.)))
+                    .child(div().id("frame").relative().when(clipped.get(), |frame| frame.overflow_hidden()).flex().flex_col().flex_none().w(px(200.)).h(px(200.)).children(cards))
+                    .into_any_element()
+            })
+        });
+        cx.update_window(window, |_, window, _| window.set_max_draw_passes(2)).unwrap();
+        let page = Self { window, registry, builds, keys, shown, spacer, clipped, texts, scrolls };
+        draw(window, cx);
+        page.shown.set(true);
+        page
+    }
+
+    fn handles(&self) -> String {
+        describe_handles(&self.texts, &self.scrolls)
+    }
+
+    /// What the verifier compares: what the cards published and hold.
+    fn describe(&self) -> Rc<dyn Fn(&Window) -> String> {
+        let (registry, texts, scrolls) = (self.registry.clone(), self.texts.clone(), self.scrolls.clone());
+        Rc::new(move |_| {
+            let published = registry.borrow().iter().map(|(name, bounds)| format!("{name} {bounds:?}\n")).collect::<String>();
+            published + &describe_handles(&texts, &scrolls)
+        })
+    }
+
+    fn spacer(&self, height: f32) -> Change {
+        let spacer = self.spacer.clone();
+        Box::new(move |_| spacer.set(height))
+    }
+
+    fn key(&self, index: usize, key: u64) -> Change {
+        let keys = self.keys.clone();
+        Box::new(move |_| keys.borrow_mut()[index] = key)
+    }
+
+    fn rekey(&self) -> Change {
+        let keys = self.keys.clone();
+        Box::new(move |_| keys.borrow_mut().iter_mut().for_each(|key| *key += 1000))
+    }
+}
+
+/// What a page that is built whole at `spacer` publishes and holds.
+fn built_at(cx: &mut TestAppContext, pieces: &[Piece], nested: bool, spacer: f32) -> Vec<String> {
+    let page = Moving::new(cx, pieces.to_vec(), nested);
+    let change = page.spacer(spacer);
+    page.passes(cx, vec![change]).pop().unwrap().published
+}
+
+fn translations(pass: &Pass) -> u64 {
+    pass.counters.layout_translations
+}
+
+#[gpui::test]
+fn a_subtree_that_a_box_before_it_moved_is_skipped_where_it_is_and_what_it_holds_moves_with_it(cx: &mut TestAppContext) {
+    let pieces = vec![Piece::Plain; 3];
+    let page = Moving::new(cx, pieces.clone(), false);
+    let spacers = [0., 17., 30., 0., 5., 5.];
+    let passes = page.passes(cx, spacers.iter().map(|spacer| page.spacer(*spacer)).collect());
+    assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [3, 0, 0, 0, 0, 0]);
+    assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 3, 6, 6, 9, 12]);
+    for (pass, spacer) in passes.iter().zip(spacers) {
+        assert_eq!(pass.published, built_at(cx, &pieces, false, spacer), "at {spacer}");
+    }
+    assert!(passes[1].published.iter().any(|line| line.contains("y: 17px")), "{:?}", passes[1].published);
+}
+
+#[gpui::test]
+fn a_subtree_moved_by_a_fraction_of_a_pixel_is_built_where_it_is(cx: &mut TestAppContext) {
+    let pieces = vec![Piece::Plain; 3];
+    let page = Moving::new(cx, pieces.clone(), false);
+    let spacers = [0., 17.25, 18.25, 18., 0.];
+    let passes = page.passes(cx, spacers.iter().map(|spacer| page.spacer(*spacer)).collect());
+    // The scale factor of the window is 2. 17.25 is a different place in the device pixel; 18.25 is
+    // a whole one from it; 18 is not from the record at 17.25, and 0 is from the one at 18.
+    assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [3, 3, 0, 3, 0]);
+    assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 0, 3, 3, 6]);
+    for (pass, spacer) in passes.iter().zip(spacers) {
+        assert_eq!(pass.published, built_at(cx, &pieces, false, spacer), "at {spacer}");
+    }
+}
+
+#[gpui::test]
+fn a_subtree_whose_content_mask_did_not_move_with_it_is_built_where_it_is(cx: &mut TestAppContext) {
+    // What is culled inside it depends on where it is in the mask, and a culled box is told so.
+    let pieces = vec![Piece::Plain; 3];
+    let page = Moving::new(cx, pieces.clone(), false);
+    page.clipped.set(false);
+    let passes = page.passes(cx, vec![nothing(), page.spacer(17.), page.spacer(30.)]);
+    assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [3, 3, 3]);
+    assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 0, 0]);
+    assert_eq!(passes[2].published, {
+        let fresh = Moving::new(cx, pieces.clone(), false);
+        fresh.clipped.set(false);
+        let change = fresh.spacer(30.);
+        fresh.passes(cx, vec![change]).pop().unwrap().published
+    });
+}
+
+#[gpui::test]
+fn a_subtree_that_holds_something_tied_to_its_place_is_built_where_it_is_moved(cx: &mut TestAppContext) {
+    for piece in [Piece::Sticky, Piece::Captures, Piece::Scrolled, Piece::Escapes, Piece::Fixed, Piece::Blind] {
+        let pieces = vec![Piece::Plain, piece, Piece::Plain];
+        let page = Moving::new(cx, pieces.clone(), false);
+        let passes = page.passes(cx, vec![nothing(), page.spacer(17.), page.spacer(17.), page.spacer(40.)]);
+        // A box placed by a frame outside the subtree is laid out by the engine from that frame: the
+        // subtree is no layout to keep at all, moved or not.
+        let builds = if matches!(piece, Piece::Escapes | Piece::Fixed) { [3, 1, 1, 1] } else { [3, 1, 0, 1] };
+        assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), builds, "{piece:?}");
+        assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 2, 4, 6], "{piece:?}");
+        assert_eq!(passes[1].published, built_at(cx, &pieces, false, 17.), "{piece:?}");
+        assert_eq!(passes[3].published, built_at(cx, &pieces, false, 40.), "{piece:?}");
+    }
+}
+
+#[gpui::test]
+fn a_subtree_inside_one_that_is_moved_moves_with_it_or_alone(cx: &mut TestAppContext) {
+    let pieces = vec![Piece::Plain; 2];
+    let page = Moving::new(cx, pieces.clone(), true);
+    let spacers = [0., 17., 17., 40., 0., 40.];
+    let passes = page.passes(
+        cx,
+        vec![nothing(), page.spacer(17.), page.key(0, 2), page.spacer(40.), page.spacer(0.), page.spacer(40.)],
+    );
+    // An outer build counts one and an inner one a thousand.
+    assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [2002, 0, 1, 0, 0, 0]);
+    // The inner one of the card that was built again is put 17 away inside it, and then both move.
+    assert_eq!(passes[2].counters.layout_replays, passes[1].counters.layout_replays + 2);
+    for (pass, spacer) in passes.iter().zip(spacers) {
+        assert_eq!(pass.published, built_at(cx, &pieces, true, spacer), "at {spacer}");
+    }
+}
+
+#[gpui::test]
+fn a_verified_pass_that_moved_subtrees_leaves_what_a_build_leaves(cx: &mut TestAppContext) {
+    for nested in [false, true] {
+        let pieces = vec![Piece::Plain; 3];
+        let page = Moving::new(cx, pieces.clone(), nested);
+        let describe = page.describe();
+        cx.update_window(page.window, |_, window, _| window.set_retention_verifier(Some(describe))).unwrap();
+        let passes = page.passes(
+            cx,
+            vec![nothing(), page.spacer(17.), nothing(), page.spacer(30.), nothing(), page.spacer(0.), nothing(), page.spacer(9.)],
+        );
+        assert!(passes[7].counters.verified >= 3, "{:?}", passes[7].counters);
+        assert!(translations(&passes[7]) >= 6, "{:?}", passes[7].counters);
+        cx.update_window(page.window, |_, window, _| {
+            assert_eq!(window.retention_mismatches(), Vec::<String>::new(), "nested {nested}");
+            assert_eq!(window.retained_counters().mismatches, 0);
+        })
+        .unwrap();
+    }
+}
+
+#[gpui::test]
+fn pages_changed_at_random_between_passes_that_lay_out_hold_what_a_build_holds(cx: &mut TestAppContext) {
+    use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
+
+    let kinds = [Piece::Plain, Piece::Plain, Piece::Plain, Piece::Sticky, Piece::Captures, Piece::Scrolled, Piece::Escapes, Piece::Fixed, Piece::Blind];
+    let seeds = std::env::var("TRANSLATION_FUZZ_SEEDS").ok().and_then(|seeds| seeds.parse().ok()).unwrap_or(12u64);
+    let mut translated = 0;
+    for seed in 0..seeds {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let count = rng.random_range(2..6usize);
+        let pieces = (0..count).map(|_| kinds[rng.random_range(0..kinds.len())]).collect::<Vec<_>>();
+        let nested = seed % 3 == 0;
+        let page = Moving::new(cx, pieces.clone(), nested);
+        let reference = Moving::new(cx, pieces.clone(), nested);
+        let mut spacer = 0.;
+        let (mut changes, mut mirrors) = (Vec::<Change>::new(), Vec::<Change>::new());
+        for _ in 0..14 {
+            let (change, mirror): (Change, Change) = match rng.random_range(0..6) {
+                0 | 1 => {
+                    spacer = rng.random_range(0..12u32) as f32 * 7.;
+                    (page.spacer(spacer), reference.spacer(spacer))
+                }
+                2 => {
+                    spacer += rng.random_range(1..4u32) as f32 * 0.25;
+                    (page.spacer(spacer), reference.spacer(spacer))
+                }
+                3 => {
+                    let at = rng.random_range(0..count);
+                    let key = rng.random_range(2..9u64);
+                    (page.key(at, key), reference.key(at, key))
+                }
+                4 => (nothing(), nothing()),
+                _ => {
+                    spacer += rng.random_range(1..5u32) as f32;
+                    (page.spacer(spacer), reference.spacer(spacer))
+                }
+            };
+            let rekey = reference.rekey();
+            changes.push(change);
+            mirrors.push(Box::new(move |window| {
+                mirror(window);
+                rekey(window);
+            }));
+        }
+        // The passes of a page are run in one update, with no frame drawn between them.
+        let ours = page.passes(cx, changes);
+        let theirs = reference.passes(cx, mirrors);
+        for (step, (one, two)) in ours.into_iter().zip(theirs).enumerate() {
+            translated = translated.max(translations(&one));
+            assert_eq!(one.published, two.published, "seed {seed} step {step} pieces {pieces:?} nested {nested}");
+        }
+    }
+    assert!(translated > 0, "some subtree was put elsewhere");
 }

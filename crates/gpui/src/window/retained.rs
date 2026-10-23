@@ -214,6 +214,9 @@ pub struct RetainedCounters {
     /// Of those, the subtrees that pass published from the recording, instead of building them
     /// for prepaint as it does the ones that moved.
     pub layout_replays: u64,
+    /// Of those, the subtrees a layout record put elsewhere than it was made, by a whole number
+    /// of device pixels (see [`ReplayKey::translation`]).
+    pub layout_translations: u64,
     /// Subtrees built by a pass that only lays out.
     pub layout_builds: u64,
     /// Of those, the subtrees that left a layout record (see [`Window::draw_if_dirty`]) for the
@@ -489,6 +492,9 @@ pub(crate) struct RetainedWindow {
     pub(crate) layout_painted_skips: u32,
     /// The subtree being recorded so that it can be put elsewhere, see [`Relocation`].
     pub(crate) relocation: Option<Relocation>,
+    /// The subtrees a pass that only lays out is building and will leave a layout record of,
+    /// outermost first.
+    layout_recordings: Vec<OpenLayoutRecording>,
     /// How many relocatable subtrees the pass being built recorded, to be put elsewhere.
     pub(crate) recorded_relocatably: u32,
     /// How many recordings made in a region were put into the pass being built.
@@ -509,6 +515,57 @@ pub(crate) struct RetainedWindow {
     open_paints: Vec<Rc<Origin>>,
     /// How many recordings that were made in a region or hold one were recorded or replayed.
     pub(crate) relocated_inside: u32,
+}
+
+/// What a build of a subtree by a pass that only lays out has noted so far, for the layout record
+/// to be put elsewhere than it was made.
+struct OpenLayoutRecording {
+    /// How many positioned frames the surroundings had.
+    frames_below: usize,
+    /// Boxes that escaped to a frame outside the subtree.
+    unframed_escapes: Cell<u32>,
+    /// The [`NonRelocatable`] reasons of the subtrees inside that were skipped.
+    blockers: u16,
+    handles: Vec<HandleEntry>,
+}
+
+/// What a subtree holds outside the frame that moves with it: the handles it noted itself and the
+/// lists of the subtrees inside it, `by` away from where each was recorded.
+enum HandleEntry {
+    Own(Relocated),
+    Nested(Rc<HandleList>, Point<Pixels>),
+}
+
+/// What a layout record holds outside the frame (see [`Window::note_relocated`]), kept as the
+/// tapes are: a list is never changed once the build is done, and the list of a subtree inside is
+/// held by the list around it.
+pub(crate) struct HandleList {
+    entries: Vec<HandleEntry>,
+    /// How far from where it was recorded everything in the list was put last.
+    applied: Cell<Point<Pixels>>,
+}
+
+impl HandleList {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Puts everything in the list where `delta` from the recording puts it, if it is not there.
+    pub(crate) fn place(&self, delta: Point<Pixels>) {
+        if self.applied.get() != delta {
+            self.apply(delta);
+        }
+    }
+
+    fn apply(&self, delta: Point<Pixels>) {
+        self.applied.set(delta);
+        for entry in &self.entries {
+            match entry {
+                HandleEntry::Own(handle) => (handle.apply)(delta),
+                HandleEntry::Nested(list, by) => list.apply(delta + *by),
+            }
+        }
+    }
 }
 
 /// A recording of prepaint that has begun and not finished.
@@ -816,6 +873,11 @@ pub(crate) struct LayoutMark {
 
 /// What the prepaint of a subtree built by a pass that only lays out did.
 pub(crate) struct LayoutOutcome {
+    /// The reasons the subtree cannot be put elsewhere than it was built, as
+    /// [`Effects::blockers`] gives them, and the ones of the subtrees skipped inside it.
+    pub(crate) blockers: u16,
+    /// What the build noted that is held outside the frame.
+    pub(crate) handles: Rc<HandleList>,
     /// What it did that a skip cannot repeat.
     pub(crate) reason: Option<NonReusable>,
     /// A listener that reports to its owner ran, and a skip does not run it again.
@@ -1043,6 +1105,80 @@ impl ReplayKey {
         // is not asked: a box that is placed by a frame outside the subtree is no part of a
         // recording that can be moved, see [`NonRelocatable::Escape`], and the other boxes are
         // placed by the subtree.
+        Some(delta)
+    }
+}
+
+impl ReplayKey {
+    /// How far a layout moved the subtree from where this key recorded it, if that is all that
+    /// differs: the box, the place the layout engine gave it and the content mask around it moved
+    /// by one whole number of device pixels, and everything else the subtree reads is the same.
+    /// For a subtree built by a pass that only lays out (a sibling grew), where
+    /// [`Self::relocation`] is for a scroll.
+    ///
+    /// The phase of the origin is the same and so is the size, so every edge inside snaps to the
+    /// side it snapped to. The positioned frame around is not asked: a box placed by a frame
+    /// outside the subtree is a reason the layout record cannot be put elsewhere
+    /// ([`NonRelocatable::Escape`]), and the others are placed by the subtree. Needs a scale
+    /// factor that is a power of two, where a position shifted by whole device pixels is exactly
+    /// the shifted position, and no exact clip.
+    pub(crate) fn translation(&self, later: &ReplayKey) -> Option<Point<Pixels>> {
+        let power_of_two = self.scale_factor > 0. && self.scale_factor.to_bits() & 0x007f_ffff == 0;
+        if !power_of_two
+            || !self.exact_clips.is_empty()
+            || !later.exact_clips.is_empty()
+            || self.bounds.size != later.bounds.size
+            || self.unsnapped_size != later.unsnapped_size
+            || self.phase != later.phase
+            || self.element_offset != later.element_offset
+            || self.snapped_offset != later.snapped_offset
+            || self.text_style != later.text_style
+            || self.visibility != later.visibility
+            || self.element_opacity != later.element_opacity
+            || self.rem_size != later.rem_size
+            || self.scale_factor != later.scale_factor
+            || self.viewport_size != later.viewport_size
+            || self.current_view != later.current_view
+            || self.image_cache != later.image_cache
+            || self.a11y_active != later.a11y_active
+            || self.culling != later.culling
+            || self.lifting != later.lifting
+            || self.lift_shape != later.lift_shape
+            || self.lifts_open != later.lifts_open
+            || self.dom_hit_testing != later.dom_hit_testing
+        {
+            return None;
+        }
+        let delta = later.bounds.origin - self.bounds.origin;
+        let device = delta.scale(self.scale_factor);
+        if device.x.0 != device.x.0.round() || device.y.0 != device.y.0.round() {
+            return None;
+        }
+        // The layout engine's origin is a sum of the offsets above it in `f32`: the phase is as
+        // close as that, and so is how far it moved.
+        let close = |moved: Pixels, by: Pixels| {
+            (moved.0 - by.0).abs() * self.scale_factor <= SubpixelPhase::TOLERANCE
+        };
+        let moved = later.layout_origin - self.layout_origin;
+        if !close(moved.x, delta.x) || !close(moved.y, delta.y) {
+            return None;
+        }
+        // A mask that moved with the subtree is the same around it. One that did not is cut
+        // differently from the subtree where it ended up, and what is culled inside is not the
+        // same. (A culled subtree is under the empty mask, wherever it is.)
+        if !self.culling {
+            let mask = |mask: &ContentMask<Pixels>| (mask.bounds, mask.corner_radii, mask.corner_radii_y);
+            let (before, after) = (mask(&self.content_mask), mask(&later.content_mask));
+            let origin = after.0.origin - before.0.origin;
+            if before.0.size != after.0.size
+                || before.1 != after.1
+                || before.2 != after.2
+                || !close(origin.x, delta.x)
+                || !close(origin.y, delta.y)
+            {
+                return None;
+            }
+        }
         Some(delta)
     }
 }
@@ -1489,13 +1625,36 @@ impl Window {
 
     /// Starts noting what the prepaint of a subtree built by a pass that only lays out does that
     /// a skip of the subtree could not repeat. Pair with [`Self::finish_layout_recording`].
-    pub(crate) fn begin_layout_recording(&self) -> LayoutMark {
+    pub(crate) fn begin_layout_recording(&mut self) -> LayoutMark {
+        self.retained.layout_recordings.push(OpenLayoutRecording {
+            frames_below: self.positioned_frames.len(),
+            unframed_escapes: Cell::new(0),
+            blockers: 0,
+            handles: Vec::new(),
+        });
         LayoutMark { effects: self.effects(), painted_skips: self.retained.layout_painted_skips }
     }
 
     /// What the prepaint since `mark` did.
-    pub(crate) fn finish_layout_recording(&self, mark: LayoutMark) -> LayoutOutcome {
+    pub(crate) fn finish_layout_recording(&mut self, mark: LayoutMark) -> LayoutOutcome {
+        let open = self.retained.layout_recordings.pop().expect("a layout recording that finishes began");
         let effects = self.effects();
+        let mut blockers = mark.effects.blockers(&effects) | open.blockers;
+        if open.unframed_escapes.get() != 0 {
+            blockers |= blocker_bit(NonRelocatable::Escape);
+        }
+        if let Some(reason) = self.scale_blocker() {
+            blockers |= blocker_bit(reason);
+        }
+        let handles = Rc::new(HandleList { entries: open.handles, applied: Cell::new(Point::default()) });
+        // The subtree around holds all of it too. The escape is its own to tell: a frame outside
+        // this subtree can be inside that one.
+        if let Some(outer) = self.retained.layout_recordings.last_mut() {
+            outer.blockers |= blockers & !blocker_bit(NonRelocatable::Escape);
+            if !handles.is_empty() {
+                outer.handles.push(HandleEntry::Nested(handles.clone(), Point::default()));
+            }
+        }
         // A pass that only lays out paints nothing, so where the subtree's lifted boxes went in
         // the stacking context around it is not something a skip has to repeat: their layout
         // publications are part of the subtree's own tape. Only a layout pass skips with this
@@ -1503,9 +1662,22 @@ impl Window {
         // `finish_prepaint_recording`.
         let repeatable = !(1u16 << NonReusable::Lift.index());
         LayoutOutcome {
+            blockers,
+            handles,
             reason: first_reason(mark.effects.reasons(&effects) & repeatable),
             published: mark.effects.published(&effects),
             holds_painted: mark.painted_skips != self.retained.layout_painted_skips,
+        }
+    }
+
+    /// Notes that a subtree was skipped with its layout record, `delta` away from where it was
+    /// recorded, for the layout record of the subtree being built around it, if any.
+    pub(crate) fn note_layout_replay(&mut self, handles: &Rc<HandleList>, blockers: u16, delta: Point<Pixels>) {
+        if let Some(outer) = self.retained.layout_recordings.last_mut() {
+            outer.blockers |= blockers;
+            if !handles.is_empty() {
+                outer.handles.push(HandleEntry::Nested(handles.clone(), delta));
+            }
         }
     }
 
@@ -2193,7 +2365,7 @@ impl Window {
 
     /// Whether a subtree is being recorded, and what it holds outside the frame is worth noting.
     pub(crate) fn tracks_relocation(&self) -> bool {
-        self.retained.relocation.is_some()
+        self.retained.relocation.is_some() || !self.retained.layout_recordings.is_empty()
     }
 
     pub(crate) fn note_nested_scroll(&self) {
@@ -2212,11 +2384,14 @@ impl Window {
         apply: impl Fn(Point<Pixels>) + 'static,
         describe: impl Fn() -> String + 'static,
     ) {
+        let handle = Relocated {
+            apply: Rc::new(apply),
+            describe: Rc::new(describe),
+        };
         if let Some(relocation) = self.retained.relocation.as_mut() {
-            relocation.handles.push(Relocated {
-                apply: Rc::new(apply),
-                describe: Rc::new(describe),
-            });
+            relocation.handles.push(handle);
+        } else if let Some(open) = self.retained.layout_recordings.last_mut() {
+            open.handles.push(HandleEntry::Own(handle));
         }
     }
 
@@ -2397,6 +2572,11 @@ impl Window {
     /// Notes that a box escapes to a containing block (or the viewport) for a subtree being
     /// recorded, if that one is outside of it.
     pub(crate) fn note_escape_frame(&self, escape: Escape) {
+        for open in &self.retained.layout_recordings {
+            if escape == Escape::Viewport || self.positioned_frames.len() <= open.frames_below {
+                open.unframed_escapes.set(open.unframed_escapes.get() + 1);
+            }
+        }
         let Some(relocation) = self.retained.relocation.as_ref() else {
             return;
         };
