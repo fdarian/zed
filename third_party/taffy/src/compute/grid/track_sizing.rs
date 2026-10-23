@@ -1278,9 +1278,20 @@ fn expand_flexible_tracks(
 
     // For each flexible track, if the product of the used flex fraction and the track’s flex factor is greater
     // than the track’s base size, set its base size to that product.
+    //
+    // fdarian fork patch: Blink (`ExpandFlexibleTracks`) takes the share of a flexible track in 1/64 as a float, cuts
+    // it to a whole number of them (an epsilon added for a share just below one), and the fraction it cut goes to the
+    // next flexible track, so that `minmax(10%, 1fr)` beside `1fr`, or three `1fr` of a width that does not divide, add up
+    // to the width of the grid. A track whose share is below its base size keeps it and the fraction carried goes on.
+    let mut carried_fraction = 0.0f32;
     for track in axis_tracks.iter_mut().filter(|track| track.max_track_sizing_function.is_fr()) {
         let track_flex_factor = track.max_track_sizing_function.0.value();
-        track.base_size = f32_max(track.base_size, track_flex_factor * flex_fraction);
+        let share = flex_fraction * 64.0 * track_flex_factor + carried_fraction;
+        let expanded = (share + f32::EPSILON).trunc();
+        if expanded / 64.0 >= track.base_size {
+            track.base_size = expanded / 64.0;
+            carried_fraction = f32_max(share - expanded, 0.0);
+        }
     }
 }
 
