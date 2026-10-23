@@ -67,6 +67,7 @@ mod subscription;
 mod svg_renderer;
 mod tab_stop;
 mod taffy;
+mod transform;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_decoration;
@@ -130,6 +131,7 @@ pub use gpui_macros::{
     AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,
 };
 pub use spring::*;
+pub use transform::*;
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].
 ///

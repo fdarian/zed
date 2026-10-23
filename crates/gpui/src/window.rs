@@ -68,6 +68,8 @@ pub(crate) mod a11y;
 mod patch;
 #[cfg(test)]
 mod patch_tests;
+#[cfg(test)]
+mod transform_tests;
 mod prompts;
 mod retained;
 
@@ -1815,6 +1817,8 @@ pub struct Window {
     root_seed: Option<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    /// The transforms [`Window::with_transform`] is inside, innermost last. Empty for none.
+    transform_stack: Vec<AmbientTransform>,
     /// How many boxes were prepainted so far that sit outside the clip they were prepainted in,
     /// see [`Window::note_escape`].
     escapes_prepainted: u32,
@@ -2599,6 +2603,7 @@ impl Window {
             origin_phase_stack: Vec::new(),
             root_seed: None,
             content_mask_stack: Vec::new(),
+            transform_stack: Vec::new(),
             escapes_prepainted: 0,
             root_escape: None,
             root_escapes_prepainted: 0,
@@ -2716,6 +2721,55 @@ const EXACT_TOLERANCE: f32 = 0.01;
 /// The points between the two ends of a corner's arc that [`ContentMask::intersection_is_exact`]
 /// tests.
 const EXACT_ARC_SAMPLES: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransformKind {
+    /// Only moves, by whatever amount: painted content is placed, not transformed.
+    Translation,
+    General,
+}
+
+/// One [`Window::with_transform`], with everything the painters need of it.
+#[derive(Clone, Debug)]
+struct AmbientTransform {
+    /// From the local space to the window, in logical pixels, the transforms inside each other
+    /// multiplied out.
+    matrix: TransformationMatrix,
+    kind: TransformKind,
+    /// The translation of a `Translation` rounded to whole device pixels, in logical pixels.
+    offset: Point<Pixels>,
+    /// `offset` in device pixels.
+    device_offset: Point<ScaledPixels>,
+    /// The clip in the local space of a `General` transform, in logical pixels.
+    local_clip: Option<ContentMask<Pixels>>,
+}
+
+/// What a primitive takes from the ambient transform.
+struct Placement {
+    /// Added to the snapped bounds, in device pixels.
+    offset: Point<ScaledPixels>,
+    transformation: TransformationMatrix,
+    local_clip: ContentMask<ScaledPixels>,
+}
+
+impl Placement {
+    fn shift(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: bounds.origin + self.offset,
+            size: bounds.size,
+        }
+    }
+}
+
+impl Default for Placement {
+    fn default() -> Self {
+        Self {
+            offset: Point::default(),
+            transformation: TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
+        }
+    }
+}
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
 /// rendered. The mask is a rectangle whose corners may be rounded, which is how `overflow: hidden`
@@ -5583,16 +5637,205 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
-            if mask.is_rounded() && self.retained.relocation.is_some() {
-                self.note_rounded_mask(mask);
+            if let Some(ambient) = self.transform_stack.last() {
+                let (kind, offset) = (ambient.kind, ambient.offset);
+                return self.with_transformed_content_mask(kind, offset, mask, f);
             }
-            self.content_mask_stack.push(mask);
-            let result = f(self);
-            self.content_mask_stack.pop();
-            result
+            self.with_window_content_mask(mask, f)
         } else {
             f(self)
+        }
+    }
+
+    #[inline]
+    fn with_window_content_mask<R>(
+        &mut self,
+        mask: ContentMask<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let mask = mask.intersect(&self.content_mask());
+        if mask.is_rounded() && self.retained.relocation.is_some() {
+            self.note_rounded_mask(mask);
+        }
+        self.content_mask_stack.push(mask);
+        let result = f(self);
+        self.content_mask_stack.pop();
+        result
+    }
+
+    /// [`Window::with_content_mask`] inside a transform, where `mask` is in the local space of
+    /// the element. Under a translation the window mask takes it, moved by the rounded
+    /// translation; under a general transform the window mask stays what it is, since its
+    /// rectangle is not one in the local space, and the mask joins the local clip.
+    fn with_transformed_content_mask<R>(
+        &mut self,
+        kind: TransformKind,
+        offset: Point<Pixels>,
+        mask: ContentMask<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        match kind {
+            TransformKind::Translation => self.with_window_content_mask(mask.translated(offset), f),
+            TransformKind::General => {
+                let previous = self.set_local_clip(|clip| {
+                    Some(match clip {
+                        Some(clip) => mask.intersect(&clip),
+                        None => mask,
+                    })
+                });
+                let result = f(self);
+                self.set_local_clip(|_| previous);
+                result
+            }
+        }
+    }
+
+    /// `mask`, from the local space of what is being painted, in window space, or `None` when
+    /// a general transform leaves it no window-space rectangle.
+    fn window_space_mask(&self, mask: ContentMask<Pixels>) -> Option<ContentMask<Pixels>> {
+        match self.transform_stack.last() {
+            None => Some(mask),
+            Some(ambient) => match ambient.kind {
+                TransformKind::Translation => Some(mask.translated(ambient.offset)),
+                TransformKind::General => None,
+            },
+        }
+    }
+
+    /// Replaces the local clip of the innermost transform with what `change` makes of it and
+    /// returns the old one.
+    fn set_local_clip(
+        &mut self,
+        change: impl FnOnce(Option<ContentMask<Pixels>>) -> Option<ContentMask<Pixels>>,
+    ) -> Option<ContentMask<Pixels>> {
+        let Some(ambient) = self.transform_stack.last_mut() else {
+            panic!("a local clip needs a transform");
+        };
+        let previous = ambient.local_clip;
+        ambient.local_clip = change(previous);
+        previous
+    }
+
+    /// Runs `f` with `matrix` applied to everything painted and prepainted in it: `matrix` takes
+    /// the local space of the elements inside to the space they are in now, in logical pixels,
+    /// and composes onto the transform already in effect.
+    ///
+    /// Inside a transform that only translates, nothing is drawn transformed: the translation
+    /// rounded to whole device pixels moves the logical bounds before they are snapped, so the
+    /// output is the same pixels as the content placed there, and masks pushed inside are moved
+    /// into window space. Inside any other transform, primitives carry the matrix and the
+    /// shaders draw them through it.
+    ///
+    /// The clips follow one model. [`Window::content_mask`] is always in window space and is not
+    /// changed by a general transform, so what is painted is still cut by the hardware clip and
+    /// the rounded coverage at the window position. A mask pushed with
+    /// [`Window::with_content_mask`] inside a general transform goes into a separate local clip,
+    /// in the local space, which the shader evaluates with the local position. When a general
+    /// transform is entered inside another one with a local clip, the clip is mapped into the
+    /// new local space exactly if `matrix` only scales and moves; otherwise it is replaced by its
+    /// bounding box in window space, intersected into the window mask, with its corner radii
+    /// dropped. That makes deeply nested rotations under a clipping rotated ancestor clip to the
+    /// bounding box of the ancestor's clip.
+    ///
+    /// A matrix that flattens the plane paints nothing.
+    pub fn with_transform<R>(
+        &mut self,
+        matrix: TransformationMatrix,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        if matrix.is_identity() {
+            return f(self);
+        }
+        let outer = self.transform();
+        let composed = outer.compose(matrix);
+        let carried_clip = self.transform_stack.last().and_then(|ambient| ambient.local_clip);
+
+        let scale_factor = self.scale_factor();
+        let (kind, offset, device_offset) = if composed.is_translation() {
+            let device = point(
+                ScaledPixels((composed.translation[0] * scale_factor).round()),
+                ScaledPixels((composed.translation[1] * scale_factor).round()),
+            );
+            let offset = point(Pixels(device.x.0 / scale_factor), Pixels(device.y.0 / scale_factor));
+            (TransformKind::Translation, offset, device)
+        } else {
+            (TransformKind::General, Point::default(), Point::default())
+        };
+
+        let flat = kind == TransformKind::General && composed.inverse().is_none();
+        let mut local_clip = None;
+        let mut window_clip = flat.then(ContentMask::default);
+        if let Some(clip) = carried_clip {
+            let in_new_space = match (kind, matrix.inverse()) {
+                (TransformKind::General, Some(inverse)) => clip.mapped_exactly(&inverse),
+                _ => None,
+            };
+            match in_new_space {
+                Some(mapped) => local_clip = Some(mapped),
+                None => {
+                    let in_window = clip.mapped_loosely(&outer);
+                    window_clip = Some(match window_clip {
+                        Some(flat) => flat.intersect(&in_window),
+                        None => in_window,
+                    });
+                }
+            }
+        }
+
+        self.transform_stack.push(AmbientTransform {
+            matrix: composed,
+            kind,
+            offset,
+            device_offset,
+            local_clip,
+        });
+        let result = match window_clip {
+            Some(clip) => self.with_window_content_mask(clip, f),
+            None => f(self),
+        };
+        self.transform_stack.pop();
+        result
+    }
+
+    /// The transform in effect, from the local space of what is being painted to the window, in
+    /// logical pixels. The unit matrix outside [`Window::with_transform`].
+    pub fn transform(&self) -> TransformationMatrix {
+        self.transform_stack
+            .last()
+            .map_or_else(TransformationMatrix::unit, |ambient| ambient.matrix)
+    }
+
+    /// `bounds`, in the local space of what is being painted, as the window has them: moved by
+    /// the rounded translation, or the bounding box of the transformed corners.
+    pub(crate) fn bounds_in_window(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        match self.transform_stack.last() {
+            None => bounds,
+            Some(ambient) => match ambient.kind {
+                TransformKind::Translation => Bounds::new(bounds.origin + ambient.offset, bounds.size),
+                TransformKind::General => ambient.matrix.bounding_box(bounds),
+            },
+        }
+    }
+
+    /// What a primitive painted now carries of the ambient transform.
+    #[inline]
+    fn placement(&self) -> Placement {
+        let Some(ambient) = self.transform_stack.last() else {
+            return Placement::default();
+        };
+        match ambient.kind {
+            TransformKind::Translation => Placement {
+                offset: ambient.device_offset,
+                ..Placement::default()
+            },
+            TransformKind::General => Placement {
+                offset: Point::default(),
+                transformation: ambient.matrix.scaled(self.scale_factor()),
+                local_clip: ambient
+                    .local_clip
+                    .map_or_else(ContentMask::unbounded, |clip| clip.scale(self.scale_factor())),
+            },
         }
     }
 
@@ -5621,15 +5864,20 @@ impl Window {
         let Some(mask) = mask else {
             return f(self);
         };
+        // The exact intersection needs both masks in one space, which a general transform has
+        // none of; there the local clip is the approximate intersection.
+        let Some(window_mask) = self.window_space_mask(mask) else {
+            return self.with_content_mask(Some(mask), f);
+        };
         let current = self.content_mask();
-        if !self.next_frame.scene.effect_groups_enabled() || self.clip_is_exact(&mask, &current) {
+        if !self.next_frame.scene.effect_groups_enabled() || self.clip_is_exact(&window_mask, &current) {
             return self.with_content_mask(Some(mask), f);
         }
         let effect = GroupEffect {
             exact_clip: true,
             ..GroupEffect::default()
         };
-        self.with_effect_group(effect, None, |window| window.with_replaced_content_mask(mask, f))
+        self.with_effect_group(effect, None, |window| window.with_replaced_content_mask(window_mask, f))
     }
 
     /// Like [`Window::with_content_mask`] for the prepaint of a clip, but a hitbox inserted
@@ -5648,10 +5896,13 @@ impl Window {
         let Some(mask) = mask else {
             return f(self);
         };
+        let Some(window_mask) = self.window_space_mask(mask) else {
+            return self.with_content_mask(Some(mask), f);
+        };
         let current = self.content_mask();
         // Inside an inexact clip the approximate mask of a hitbox is not consulted for its
         // corners, so every clip that rounds one has to be in the list from there on.
-        let exact = self.exact_clips.is_none() && self.clip_is_exact(&mask, &current);
+        let exact = self.exact_clips.is_none() && self.clip_is_exact(&window_mask, &current);
         if exact {
             return self.with_content_mask(Some(mask), f);
         }
@@ -5665,7 +5916,7 @@ impl Window {
             })),
         };
         self.exact_clips = Some(Rc::new(ExactClips {
-            mask,
+            mask: window_mask,
             outer,
             from_surroundings: false,
         }));
@@ -6626,7 +6877,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        let clipped_bounds = self.bounds_in_window(bounds).intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
@@ -6665,7 +6916,8 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
-        let element_bounds = self.cover_bounds(bounds);
+        let placement = self.placement();
+        let element_bounds = placement.shift(self.cover_bounds(bounds));
         let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
             if shadow.inset {
@@ -6675,7 +6927,7 @@ impl Window {
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(shadow_bounds),
+                bounds: placement.shift(self.cover_bounds(shadow_bounds)),
                 content_mask,
                 corner_radii: element_corner_radii.x,
                 corner_radii_y: element_corner_radii.y,
@@ -6685,6 +6937,8 @@ impl Window {
                 element_corner_radii_y: element_corner_radii.y,
                 inset: 0,
                 pad: 0,
+                transformation: placement.transformation,
+                local_clip: placement.local_clip,
             });
         }
     }
@@ -6709,7 +6963,8 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
-        let element_bounds = self.cover_bounds(bounds);
+        let placement = self.placement();
+        let element_bounds = placement.shift(self.cover_bounds(bounds));
         let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
             if !shadow.inset {
@@ -6722,7 +6977,7 @@ impl Window {
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: self.cover_bounds(hole),
+                bounds: placement.shift(self.cover_bounds(hole)),
                 content_mask,
                 corner_radii: hole_corner_radii.x,
                 corner_radii_y: hole_corner_radii.y,
@@ -6732,15 +6987,23 @@ impl Window {
                 element_corner_radii_y: element_corner_radii.y,
                 inset: 1,
                 pad: 0,
+                transformation: placement.transformation,
+                local_clip: placement.local_clip,
             });
         }
     }
 
     /// The quad in device pixels, snapped and masked the way painting it would.
     pub(crate) fn device_quad(&self, quad: PaintQuad, opacity: f32) -> Quad {
-        let snapped_bounds = self.snap_bounds(quad.bounds);
+        let placement = self.placement();
+        let snapped_bounds = placement.shift(self.snap_bounds(quad.bounds));
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let borders = resolve_borders(&quad.border_styles, &quad.border_colors, &snapped_border_widths);
+        let mut background_tile = quad.background_tile.scale(self.scale_factor());
+        if background_tile.width > 0. {
+            background_tile.origin_x += placement.offset.x.0;
+            background_tile.origin_y += placement.offset.y.0;
+        }
         Quad {
             order: 0,
             bounds: snapped_bounds,
@@ -6749,13 +7012,15 @@ impl Window {
                 .background
                 .opacity(opacity)
                 .scale_gradient(self.scale_factor()),
-            background_tile: quad.background_tile.scale(self.scale_factor()),
+            background_tile,
             border_colors: borders.colors.map(|color| color.opacity(opacity)),
             border_inner_colors: borders.inner_colors.map(|color| color.opacity(opacity)),
             corner_radii: quad.corner_radii.x.scale(self.scale_factor()),
             corner_radii_y: quad.corner_radii.y.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_styles: borders.styles,
+            transformation: placement.transformation,
+            local_clip: placement.local_clip,
         }
     }
 

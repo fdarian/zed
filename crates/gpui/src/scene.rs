@@ -305,7 +305,7 @@ impl Scene {
             return;
         }
         if primitive
-            .bounds()
+            .window_bounds()
             .intersect(&primitive.content_mask().bounds)
             .is_empty()
         {
@@ -354,7 +354,7 @@ impl Scene {
     /// here and not by the painter because the pieces are cut out of the quad's content mask,
     /// which a recording that is put elsewhere only knows once it is.
     pub(crate) fn insert_quad(&mut self, quad: Quad) {
-        if self.hidden || quad.bounds.intersect(&quad.content_mask.bounds).is_empty() {
+        if self.hidden || quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty() {
             return;
         }
         self.record(PaintOperation::Quad(quad));
@@ -367,7 +367,12 @@ impl Scene {
 
         // A strip narrows the mask to a different rectangle, which would drop the mask's rounded
         // corners, so a rounded mask paints the whole quad.
-        if inner_bounds.is_empty() || quad.content_mask.corner_radii != Corners::default() {
+        // The strips are cut out of the window-space mask, which is the quad's own space only
+        // when nothing transforms it.
+        if inner_bounds.is_empty()
+            || quad.content_mask.corner_radii != Corners::default()
+            || quad.transformation != TransformationMatrix::unit()
+        {
             self.route(quad.into(), true);
             return;
         }
@@ -414,7 +419,7 @@ impl Scene {
     /// Stores the primitive in this scene with an order, without recording or routing it.
     fn insert_primitive_local(&mut self, mut primitive: Primitive) {
         let clipped_bounds = primitive
-            .bounds()
+            .window_bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
@@ -486,10 +491,10 @@ impl Scene {
             }
         };
         for shadow in &self.shadows {
-            add(shadow.bounds, &shadow.content_mask);
+            add(shadow.window_bounds(), &shadow.content_mask);
         }
         for quad in &self.quads {
-            add(quad.bounds, &quad.content_mask);
+            add(quad.window_bounds(), &quad.content_mask);
         }
         for path in &self.paths {
             add(path.bounds, &path.content_mask);
@@ -1323,6 +1328,16 @@ impl Primitive {
         }
     }
 
+    /// The area the primitive covers in the window: its bounds, or for a primitive with a
+    /// transformation the bounding box of the bounds after it.
+    pub fn window_bounds(&self) -> Bounds<ScaledPixels> {
+        match self {
+            Primitive::Shadow(shadow) => shadow.window_bounds(),
+            Primitive::Quad(quad) => quad.window_bounds(),
+            _ => *self.bounds(),
+        }
+    }
+
     /// Scales the primitive's alpha, as a group's opacity does when it is drawn flat.
     pub fn apply_opacity(&mut self, opacity: f32) {
         match self {
@@ -1484,9 +1499,16 @@ fn translate_mask(mask: &mut ContentMask<ScaledPixels>, delta: Point<ScaledPixel
 
 #[expect(missing_docs)]
 impl Quad {
+    /// A quad with a transformation is moved through it, as a sprite is: its bounds and the
+    /// tile origin are in its own space, which `delta` does not concern.
     pub fn translate(&mut self, delta: Point<ScaledPixels>) {
-        translate_bounds(&mut self.bounds, delta);
         translate_mask(&mut self.content_mask, delta);
+        if self.transformation != TransformationMatrix::unit() {
+            self.transformation.translation[0] += delta.x.0;
+            self.transformation.translation[1] += delta.y.0;
+            return;
+        }
+        translate_bounds(&mut self.bounds, delta);
         if self.background_tile.width > 0. {
             self.background_tile.origin_x += delta.x.0;
             self.background_tile.origin_y += delta.y.0;
@@ -1496,9 +1518,19 @@ impl Quad {
 
 impl Shadow {
     fn translate(&mut self, delta: Point<ScaledPixels>) {
+        translate_mask(&mut self.content_mask, delta);
+        if self.transformation != TransformationMatrix::unit() {
+            self.transformation.translation[0] += delta.x.0;
+            self.transformation.translation[1] += delta.y.0;
+            return;
+        }
         translate_bounds(&mut self.bounds, delta);
         translate_bounds(&mut self.element_bounds, delta);
-        translate_mask(&mut self.content_mask, delta);
+    }
+
+    /// The area of the shadow's rectangle in the window; the blur beyond it is not counted.
+    pub fn window_bounds(&self) -> Bounds<ScaledPixels> {
+        transformed_bounds(&self.transformation, self.bounds)
     }
 }
 
@@ -1844,7 +1876,7 @@ impl PrimitiveBatch {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Quad {
@@ -1864,6 +1896,71 @@ pub struct Quad {
     pub corner_radii_y: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
     pub background_tile: BackgroundTile,
+    /// Where the quad's own space (`bounds`, radii, borders, `local_clip`) is in the window, in
+    /// device pixels. The unit matrix for content that no transform applies to.
+    pub transformation: TransformationMatrix,
+    /// A clip in the quad's own space, which a window-space `content_mask` can't be under a
+    /// rotation. Unbounded unless a transform has one.
+    pub local_clip: ContentMask<ScaledPixels>,
+}
+
+impl Default for Quad {
+    fn default() -> Self {
+        Self {
+            order: 0,
+            border_styles: Edges::default(),
+            bounds: Bounds::default(),
+            content_mask: ContentMask::default(),
+            background: Background::default(),
+            border_colors: Edges::default(),
+            border_inner_colors: Edges::default(),
+            corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
+            border_widths: Edges::default(),
+            background_tile: BackgroundTile::default(),
+            transformation: TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
+        }
+    }
+}
+
+impl Quad {
+    /// The area the quad covers in the window, see [`Primitive::window_bounds`].
+    pub fn window_bounds(&self) -> Bounds<ScaledPixels> {
+        transformed_bounds(&self.transformation, self.bounds)
+    }
+}
+
+impl ContentMask<ScaledPixels> {
+    /// A clip that cuts nothing within any area the renderer draws.
+    pub fn unbounded() -> Self {
+        const EXTENT: f32 = 2e6;
+        ContentMask {
+            bounds: Bounds {
+                origin: point(ScaledPixels(-EXTENT / 2.), ScaledPixels(-EXTENT / 2.)),
+                size: Size {
+                    width: ScaledPixels(EXTENT),
+                    height: ScaledPixels(EXTENT),
+                },
+            },
+            corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
+        }
+    }
+}
+
+/// `bounds` after `transformation`, with the pixel the shaders add around a transformed
+/// primitive for antialiasing. Untouched under the unit matrix, which the shaders draw as is.
+fn transformed_bounds(
+    transformation: &TransformationMatrix,
+    bounds: Bounds<ScaledPixels>,
+) -> Bounds<ScaledPixels> {
+    if *transformation == TransformationMatrix::unit() {
+        return bounds;
+    }
+    transformation
+        .bounding_box_scaled(bounds)
+        .dilate(ScaledPixels(1.))
 }
 
 impl From<Quad> for Primitive {
@@ -1915,6 +2012,10 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+    /// See [`Quad::transformation`].
+    pub transformation: TransformationMatrix,
+    /// See [`Quad::local_clip`].
+    pub local_clip: ContentMask<ScaledPixels>,
 }
 
 impl From<Shadow> for Primitive {

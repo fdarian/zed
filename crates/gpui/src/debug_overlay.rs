@@ -257,6 +257,7 @@ fn solid_quad(
         corner_radii_y: Corners::default(),
         border_widths: Edges::default(),
         background_tile: Default::default(),
+        ..Quad::default()
     }
 }
 
