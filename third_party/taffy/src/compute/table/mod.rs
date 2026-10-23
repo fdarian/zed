@@ -18,14 +18,16 @@
 //!   - A child of a table, row group or row that is not a table part is a cell of its own, where CSS wraps it and its
 //!     neighbours in one anonymous cell. It is as big as its row, and its content stays at the top: only nodes with the
 //!     role of a cell are aligned in their row.
-//!   - Cells and rows with `rowspan`s that leave rows without a cell of their own (and no height) share the height of
-//!     the spanning cell differently in some cases.
+//!   - A cell aligned to the baseline whose content has none (a box with no text in it) is aligned by the bottom of its
+//!     content, where Chrome gives it no baseline: a cell that spans rows with such content makes its first row as tall
+//!     as the cell, and not as tall as the row needs.
 //!   - A table that is a flex item and is given less width than its min-content still reports its min-content width,
 //!     but the flex container positions it for the width it asked for.
 //!   - The max-content width of a table whose percentage columns add up to 100% next to columns without one is
 //!     unbounded in Chrome. Here it is what the columns ask for, and a definite available width is filled.
 //!   - Absolutely positioned children of the table are placed by their insets, auto margins do not centre them.
-//!   - The sums are f32 where Chrome has 1/64 of a pixel, so widths shared out can differ in the second decimal.
+//!   - The widths shared out between the columns are f32 where Chrome has 1/64 of a pixel, so they can differ in the
+//!     second decimal. The heights shared out between the rows and row groups are in 1/64 of a pixel as Chrome has them.
 use crate::geometry::{Point, Rect, Size};
 use crate::style::{AvailableSpace, BoxSizing, CaptionSide, CoreStyle, Dimension, VerticalAlign};
 use crate::style::{TableContainerStyle, TableItemStyle, TableLayout};
@@ -115,8 +117,10 @@ struct RowHeight {
     /// Whether `height` was given to the row, as a length or a percentage
     fixed: bool,
     /// The percentage of the height of its row group the row asks for, as a fraction: its own, or the largest of its
-    /// cells
+    /// cells, and no more than the rows before it in the group leave of 100%
     percent: Option<f32>,
+    /// Whether a cell that spans rows starts in the row
+    has_rowspan_start: bool,
 }
 
 /// What a row group asks of its height
@@ -126,8 +130,6 @@ struct SectionHeight {
     requested: bool,
     /// The percentage of the height of the groups the group asks for, as a fraction
     percent: Option<f32>,
-    /// How much taller than its rows the group has to be for its height as a length
-    min_extra: f32,
 }
 
 /// What is known of a cell once the widths of the columns are
@@ -282,8 +284,7 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
 
     // 5. Row heights
     let (fits, mut rows, section_heights) = table.measure_rows(&column_widths);
-    let content_height_without_spacing: f32 = rows.iter().map(|row| row.height).sum::<f32>()
-        + section_heights.iter().map(|section| section.min_extra).sum::<f32>();
+    let content_height_without_spacing: f32 = rows.iter().map(|row| row.height).sum();
 
     // 6. Caption heights
     let caption_sizes = table.caption_heights(&captions, table_width);
@@ -304,11 +305,10 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
             .maybe_clamp(min_size.height, max_size.height),
         natural_grid_height,
     );
-    let extra_height = grid_height - natural_grid_height;
     // The groups are 100% of what the spacing around them leaves, in the table
     let group_count = structure.sections.iter().filter(|section| section.row_count > 0).count();
     let percent_base = grid_height - padding_border_size.height - spacing.height * (group_count + 1) as f32;
-    table.distribute_table_height(&mut rows, &section_heights, extra_height, percent_base);
+    table.distribute_table_height(&mut rows, &section_heights, f32_max(percent_base, 0.0));
     let table_size = Size { width: table_width, height: captions_top + grid_height + captions_bottom };
 
     // Where the first row's baseline is, for a table that is itself aligned by baseline

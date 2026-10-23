@@ -3593,6 +3593,96 @@ mod percent_heights {
     }
 }
 
+/// The height of a table shared out in `LayoutUnit`s, 1/64 of a pixel, each share cut and what the cuts leave given to the
+/// last row (`DistributeExcessBlockSizeToRows`, `DistributeTableBlockSizeToSections`), against the numbers of Chrome
+/// (`packages/react/src/__tests__/fixtures/fractional-lengths-oracle.html`, the cases `table rest ...`). The boxes are
+/// 30px wide, so the heights are those of the rows; every height is compared exactly.
+mod layout_units {
+    use super::*;
+
+    fn row(percent_height: Option<f32>, box_height: f32) -> Spec {
+        tr(
+            |s| {
+                if let Some(percent_height) = percent_height {
+                    s.size.height = percent(percent_height);
+                }
+            },
+            vec![td(|_| {}, vec![boxed(30.0, box_height)])],
+        )
+    }
+
+    fn body(children: Vec<Spec>) -> Spec {
+        part("tbody", TableRole::RowGroup(RowGroupKind::Body), |_| {}, children)
+    }
+
+    fn high(height: f32) -> impl FnOnce(&mut Style) {
+        move |s| s.size.height = length(height)
+    }
+
+    fn top(s: &mut Style) {
+        s.vertical_align = VerticalAlign::Top;
+    }
+
+    /// The `[y, height]` of the nodes at the indices of `rects`
+    #[track_caller]
+    fn assert_spans(got: &[[f32; 4]], at: &[usize], want: &[[f32; 2]]) {
+        let got: Vec<[f32; 2]> = at.iter().map(|index| [got[*index][1], got[*index][3]]).collect();
+        assert_eq!(got, want);
+    }
+
+    /// ```html
+    /// <table style="height:100.296875px"><tr><td><div style="height:10px"></div></td></tr>
+    ///   <tr><td><div style="height:11px"></div></td></tr><tr><td><div style="height:13px"></div></td></tr></table>
+    /// ```
+    #[test]
+    fn rows_that_are_auto_grow_in_proportion_and_the_last_takes_what_the_cuts_leave() {
+        let tree = vec![table(high(100.296875), vec![row(None, 10.0), row(None, 11.0), row(None, 13.0)])];
+        assert_spans(&rects(tree, 300.0), &[1, 4, 7], &[[0.0, 29.484375], [29.484375, 32.4375], [61.921875, 38.375]]);
+    }
+
+    /// The first row is `height:23.3%`, so it grows to what that is of 100.296875px (cut to 23.359375) first
+    #[test]
+    fn a_row_with_a_percentage_grows_to_it_before_the_others() {
+        let tree = vec![table(high(100.296875), vec![row(Some(0.233), 10.0), row(None, 11.0), row(None, 13.0)])];
+        assert_spans(&rects(tree, 300.0), &[1, 4, 7], &[[0.0, 23.359375], [23.359375, 35.25], [58.609375, 41.6875]]);
+    }
+
+    /// Three empty rows share it equally, the last takes the 64ths
+    #[test]
+    fn empty_rows_share_it_equally() {
+        let tree = vec![table(high(100.296875), vec![row(None, 0.0), row(None, 0.0), row(None, 0.0)])];
+        assert_spans(&rects(tree, 300.0), &[1, 4, 7], &[[0.0, 33.421875], [33.421875, 33.421875], [66.84375, 33.453125]]);
+    }
+
+    /// Two row groups share the height of the table in proportion to their heights, and then each its rows
+    #[test]
+    fn row_groups_grow_in_proportion_and_then_their_rows() {
+        let tree = vec![table(
+            high(100.296875),
+            vec![body(vec![row(None, 10.0), row(None, 11.0)]), body(vec![row(None, 13.0), row(None, 7.0)])],
+        )];
+        assert_spans(
+            &rects(tree, 300.0),
+            &[1, 2, 5, 8, 9, 12],
+            &[[0.0, 51.359375], [0.0, 24.453125], [24.453125, 26.90625], [51.359375, 48.9375], [51.359375, 31.796875], [83.15625, 17.140625]],
+        );
+    }
+
+    /// A cell that spans two rows of 10px and 11px asks for 40px: the rows grow in proportion to their heights. The cells
+    /// are aligned to the top: a box has no baseline in Chrome, and here the bottom of the content is one
+    #[test]
+    fn rows_a_cell_spans_grow_in_proportion() {
+        let tree = vec![table(
+            |_| {},
+            vec![
+                tr(|_| {}, vec![td(top, vec![boxed(30.0, 10.0)]), td_span(1, 2, top, vec![boxed(30.0, 40.296875)])]),
+                tr(|_| {}, vec![td(top, vec![boxed(30.0, 11.0)])]),
+            ],
+        )];
+        assert_spans(&rects(tree, 300.0), &[1, 6], &[[0.0, 19.1875], [19.1875, 21.109375]]);
+    }
+}
+
 /// `direction: rtl`, against the boxes Chrome gives (the pages are in `packages/react/src/__tests__/fixtures/direction-oracle.html`):
 /// a table in a `direction: rtl` block of 300px, with the cells rtl as they inherit it. Boxes of 30px or less in a cell
 /// that is wider sit at the right of it.
