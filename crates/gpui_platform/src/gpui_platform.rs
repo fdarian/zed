@@ -80,6 +80,22 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
+/// [`current_platform`] whose windows stay where and as big as they are asked, so one opened at
+/// (-10000, -10000) is on no screen and can be taller than any display, as a headless browser's.
+pub fn current_offscreen_platform() -> Rc<dyn Platform> {
+    #[cfg(target_os = "macos")]
+    {
+        let platform = gpui_macos::MacPlatform::new(false);
+        platform.keep_window_frames();
+        Rc::new(platform)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        current_platform(false)
+    }
+}
+
 /// Returns a new [`HeadlessRenderer`] for the current platform, if available.
 #[cfg(feature = "test-support")]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {

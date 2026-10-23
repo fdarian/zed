@@ -76,6 +76,9 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+/// A plain flag rather than a field of the state behind `WINDOW_STATE_IVAR`: AppKit asks for the
+/// constrained frame from inside calls that already hold that state's lock.
+const KEEPS_FRAME_IVAR: &str = "keepsFrame";
 
 /// How many display-link steps in a row may find nothing to do before the link stops. Every step
 /// is a wake of the embedder, so a window that asked for one frame (a caret toggle) costs this
@@ -385,7 +388,12 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
     unsafe {
         let mut decl = ClassDecl::new(name, superclass).unwrap();
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+        decl.add_ivar::<BOOL>(KEEPS_FRAME_IVAR);
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
+        decl.add_method(
+            sel!(constrainFrameRect:toScreen:),
+            constrain_frame_rect as extern "C" fn(&Object, Sel, NSRect, id) -> NSRect,
+        );
 
         decl.add_method(
             sel!(canBecomeMainWindow),
@@ -1000,6 +1008,7 @@ impl MacWindow {
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
+        keep_frame: bool,
     ) -> Self {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
@@ -1094,6 +1103,7 @@ impl MacWindow {
                 target_screen,
             );
             assert!(!native_window.is_null());
+            (*native_window).set_ivar(KEEPS_FRAME_IVAR, if keep_frame { YES } else { NO });
             let () = msg_send![
                 native_window,
                 registerForDraggedTypes:
@@ -2469,6 +2479,20 @@ unsafe fn drop_window_state(object: &Object) {
 
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
     YES
+}
+
+/// AppKit pulls a window that is shown onto a screen, which also caps it to the screen's visible
+/// frame. A window opened with `keep_frame` is where and as big as it was asked, on no screen if
+/// it was asked off all of them.
+extern "C" fn constrain_frame_rect(this: &Object, _: Sel, frame: NSRect, screen: id) -> NSRect {
+    unsafe {
+        let keeps_frame: BOOL = *this.get_ivar(KEEPS_FRAME_IVAR);
+        if keeps_frame == YES {
+            frame
+        } else {
+            msg_send![super(this, class!(NSWindow)), constrainFrameRect: frame toScreen: screen]
+        }
+    }
 }
 
 extern "C" fn dealloc_window(this: &Object, _: Sel) {

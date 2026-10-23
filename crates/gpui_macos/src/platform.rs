@@ -189,6 +189,7 @@ pub(crate) struct MacPlatformState {
     text_system: Arc<dyn PlatformTextSystem>,
     renderer_context: renderer::Context,
     headless: bool,
+    keep_window_frames: bool,
     mode: MacPlatformMode,
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
@@ -234,6 +235,7 @@ impl MacPlatform {
 
         Self(Mutex::new(MacPlatformState {
             headless,
+            keep_window_frames: false,
             mode: MacPlatformMode::Blocking,
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
@@ -259,6 +261,12 @@ impl MacPlatform {
             cursor_visible: Arc::new(AtomicBool::new(true)),
             system_notifications: crate::system_notifications::SystemNotificationState::new(),
         }))
+    }
+
+    /// Windows opened after this are where and as big as they are asked to be, not pulled onto a
+    /// screen and capped to its visible frame, so a window asked off every screen has none.
+    pub fn keep_window_frames(&self) {
+        self.0.lock().keep_window_frames = true;
     }
 
     /// Creates a platform whose AppKit event loop is driven by a foreign main loop.
@@ -882,13 +890,20 @@ impl Platform for MacPlatform {
             return Err(PopupNotSupportedError.into());
         }
 
-        let (cursor_visible, foreground_executor, background_executor, renderer_context) = {
+        let (
+            cursor_visible,
+            foreground_executor,
+            background_executor,
+            renderer_context,
+            keep_window_frames,
+        ) = {
             let guard = self.0.lock();
             (
                 guard.cursor_visible.clone(),
                 guard.foreground_executor.clone(),
                 guard.background_executor.clone(),
                 guard.renderer_context.clone(),
+                guard.keep_window_frames,
             )
         };
 
@@ -899,6 +914,7 @@ impl Platform for MacPlatform {
             foreground_executor,
             background_executor,
             renderer_context,
+            keep_window_frames,
         )))
     }
 
