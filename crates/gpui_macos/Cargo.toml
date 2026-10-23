@@ -16,6 +16,11 @@ name = "run_loop_wake"
 path = "tests/run_loop_wake.rs"
 harness = false
 
+[[test]]
+name = "window_resize"
+path = "tests/window_resize.rs"
+harness = false
+
 [features]
 default = ["gpui/default"]
 test-support = ["gpui/test-support", "gpui_apple/test-support"]

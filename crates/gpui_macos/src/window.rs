@@ -1485,10 +1485,15 @@ impl PlatformWindow for MacWindow {
         this.foreground_executor
             .spawn(async move {
                 if_window_not_closed(closed, || unsafe {
+                    // `setContentSize:` asks `constrainFrameRect:toScreen:` too, which caps the
+                    // window to the screen's visible frame; this one is a size that was asked for.
+                    let keeps_frame: BOOL = *(*window).get_ivar(KEEPS_FRAME_IVAR);
+                    (*window).set_ivar(KEEPS_FRAME_IVAR, YES);
                     window.setContentSize_(NSSize {
                         width: size.width.as_f32() as f64,
                         height: size.height.as_f32() as f64,
                     });
+                    (*window).set_ivar(KEEPS_FRAME_IVAR, keeps_frame);
                 })
             })
             .detach();
