@@ -2044,8 +2044,13 @@ impl TaffyLayoutEngine {
         if open_absolute && !self.meta(id).is_static {
             open_absolute = false;
         }
-        if let Some(transform) = &self.meta(id).transform {
-            rect = transform.resolve(border_box).bounding_box(rect);
+        // The matrix resolves from the box as layout computed it, as it does when it is painted,
+        // whichever boxes `rect` is made of.
+        if self.meta(id).transform.is_some() {
+            let transform_box = self.layout_unsnapped_bounds(id, scale_factor);
+            if let Some(matrix) = self.element_transform(id, transform_box) {
+                rect = matrix.bounding_box(rect);
+            }
         }
         (rect, open_absolute)
     }
@@ -2130,8 +2135,8 @@ impl TaffyLayoutEngine {
             extent.open_absolute = false;
         }
         if self.meta(id).transform.is_some() {
-            let border_box = self.layout_bounds(id, scale_factor);
-            if let Some(matrix) = self.element_transform(id, border_box) {
+            let transform_box = self.layout_unsnapped_bounds(id, scale_factor);
+            if let Some(matrix) = self.element_transform(id, transform_box) {
                 extent.bounds = matrix.bounding_box(extent.bounds);
             }
         }

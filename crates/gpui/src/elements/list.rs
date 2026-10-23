@@ -292,6 +292,8 @@ struct ItemLayout {
 pub struct ListPrepaintState {
     hitbox: Hitbox,
     style: Style,
+    /// The border box as layout computed it, which the list's `transform` resolves from.
+    transform_box: Bounds<Pixels>,
     layout: LayoutItemsResponse,
     /// The padding box, where the rows are clipped and hit.
     viewport: Bounds<Pixels>,
@@ -1802,7 +1804,11 @@ impl Element for List {
         style.refine(&self.style);
 
         let rem_size = window.rem_size();
-        let transform = style.transform_matrix(bounds);
+        let transform_box = self
+            .interactivity
+            .layout_id
+            .map_or(bounds, |layout_id| window.layout_unsnapped_bounds(layout_id));
+        let transform = style.transform_matrix(transform_box);
         let hitbox = window.with_transform(transform, |window| {
             window.insert_hitbox_shaped(
                 bounds,
@@ -1890,6 +1896,7 @@ impl Element for List {
         ListPrepaintState {
             hitbox,
             style,
+            transform_box,
             layout,
             viewport,
             escape_inside: window.escapes_prepainted() != escapes_before,
@@ -1906,7 +1913,7 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let transform = prepaint.style.transform_matrix(bounds);
+        let transform = prepaint.style.transform_matrix(prepaint.transform_box);
         window.with_transform(transform, |window| {
             let current_view = window.current_view();
 

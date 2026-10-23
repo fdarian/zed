@@ -2849,6 +2849,11 @@ pub struct Interactivity {
     pub hovered: Option<bool>,
     pub(crate) tooltip_id: Option<TooltipId>,
     pub(crate) content_size: Size<Pixels>,
+    /// The border box as layout computed it, before it is snapped, which `transform` resolves its
+    /// origin and percentages from as a browser does: from the snapped box, a descendant at a
+    /// fractional offset lands off by the difference of the box and its snap, scaled by the
+    /// transform. Set by prepaint, for paint.
+    pub(crate) transform_box: Option<Bounds<Pixels>>,
     /// Where the scrollable overflow ends, measured from the border box origin: the far corner of
     /// the border boxes of the descendants, through every descendant that does not clip. A `Div`
     /// sets it, so that its scroll range follows CSS scrollable overflow. Without it the range is
@@ -3101,6 +3106,13 @@ impl Interactivity {
         }
     }
 
+    /// The border box that `transform` resolves from: the box as layout computed it, which is
+    /// `bounds` for an element with no layout node.
+    fn unsnapped_transform_box(&self, bounds: Bounds<Pixels>, window: &mut Window) -> Bounds<Pixels> {
+        self.layout_id
+            .map_or(bounds, |layout_id| window.layout_unsnapped_bounds(layout_id))
+    }
+
     /// Commit the bounds of this element according to this interactivity state's configured styles.
     pub fn prepaint<R>(
         &mut self,
@@ -3177,9 +3189,11 @@ impl Interactivity {
                 };
                 // Prepaint sees the fade too, so that a retained subtree inside is recorded and
                 // replayed only where it was recorded faded out: see `ReplayKey`.
+                let transform_box = self.unsnapped_transform_box(bounds, window);
+                self.transform_box = Some(transform_box);
                 window.with_visibility(visibility, |window| {
                     window.with_faded_out_if(style.is_faded_out(), |window| {
-                    window.with_transform(style.transform_matrix(bounds), |window| {
+                    window.with_transform(style.transform_matrix(transform_box), |window| {
                     window.with_text_style(style.text_style().cloned(), |window| {
                         window.with_exact_hit_mask(
                             style.overflow_mask(bounds, window.rem_size()),
@@ -3273,9 +3287,10 @@ impl Interactivity {
         }
         // Nothing is drawn or hit here, but the boxes of the descendants are reported through the
         // transform around them (`getBoundingClientRect`), and the layout holds the element's own.
+        let transform_box = self.unsnapped_transform_box(bounds, window);
         let own_transform = self
             .layout_id
-            .and_then(|layout_id| window.layout_own_transform(layout_id, bounds))
+            .and_then(|layout_id| window.layout_own_transform(layout_id, transform_box))
             .unwrap_or_else(TransformationMatrix::unit);
         window.with_transform(own_transform, |window| {
             window.with_visibility(visibility, |window| {
@@ -3581,7 +3596,10 @@ impl Interactivity {
                             .map(|lines| (borders.clone(), lines)),
                         _ => None,
                     };
-                    window.with_transform(style.transform_matrix(bounds), |window| {
+                    let transform_box = self
+                        .transform_box
+                        .expect("an element is prepainted before it is painted");
+                    window.with_transform(style.transform_matrix(transform_box), |window| {
                     style.paint_box_with_effects(bounds, box_bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_overflow_clip(
