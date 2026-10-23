@@ -420,6 +420,13 @@ trait ElementObject {
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels>;
+
+    fn layout_as_root_unsnapped(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels>;
 }
 
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
@@ -578,6 +585,7 @@ impl<E: Element> Drawable<E> {
                     window.element_offset_stack.push(offset);
                 }
 
+                window.seed_layout_root(layout_id);
                 let mut bounds = window.layout_bounds(layout_id);
                 let sticky_offset = self.element.prepaint_offset(bounds, window);
                 if !sticky_offset.is_zero() {
@@ -807,6 +815,26 @@ impl<E: Element> Drawable<E> {
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels> {
+        let layout_id = self.layout_root(available_space, window, cx);
+        window.layout_bounds(layout_id).size
+    }
+
+    pub(crate) fn layout_as_root_unsnapped(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        let layout_id = self.layout_root(available_space, window, cx);
+        window.layout_unsnapped_size(layout_id)
+    }
+
+    fn layout_root(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> LayoutId {
         if matches!(&self.phase, ElementDrawPhase::Start) {
             self.request_layout(window, cx);
         }
@@ -849,8 +877,7 @@ impl<E: Element> Drawable<E> {
             }
             _ => panic!("cannot measure after painting"),
         };
-
-        window.layout_bounds(layout_id).size
+        layout_id
     }
 }
 
@@ -898,6 +925,16 @@ where
         cx: &mut App,
     ) -> Size<Pixels> {
         Drawable::layout_as_root(self, available_space, window, cx)
+    }
+
+    #[inline]
+    fn layout_as_root_unsnapped(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        Drawable::layout_as_root_unsnapped(self, available_space, window, cx)
     }
 }
 
@@ -983,6 +1020,18 @@ impl AnyElement {
         self.0.layout_as_root(available_space, window, cx)
     }
 
+    /// [`Self::layout_as_root`] with the size layout computed, in 1/64 of a device pixel, and not
+    /// snapped to whole device pixels: the size of a box in a browser's layout, which a list adds
+    /// up to place its rows as a block of divs is placed.
+    pub fn layout_as_root_unsnapped(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        self.0.layout_as_root_unsnapped(available_space, window, cx)
+    }
+
     /// Prepaints this element at the given absolute origin. The element is a layout root, so it is
     /// the containing block of the absolutely positioned boxes that have no positioned ancestor
     /// inside it, and a stacking context of its own: nothing inside it is lifted into a context
@@ -1012,6 +1061,23 @@ impl AnyElement {
         cx: &mut App,
     ) -> Option<FocusHandle> {
         window.with_unsnapped_element_origin(origin, |window| {
+            window.with_lift_barrier(|window| {
+                window.with_positioned_frame(|window| self.prepaint(window, cx))
+            })
+        })
+    }
+
+    /// [`Self::prepaint_at`] for a layout root placed at an origin that layout has not snapped to a
+    /// device pixel, such as a row of a list in the flow of its list: the root is painted at the
+    /// device pixel the origin rounds half up to, and the edges of everything in it snap from the
+    /// origin itself, see [`Window::with_fractional_element_origin`].
+    pub fn prepaint_at_fractional(
+        &mut self,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<FocusHandle> {
+        window.with_fractional_element_origin(origin, |window| {
             window.with_lift_barrier(|window| {
                 window.with_positioned_frame(|window| self.prepaint(window, cx))
             })

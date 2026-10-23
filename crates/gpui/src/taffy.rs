@@ -310,6 +310,9 @@ pub struct TaffyLayoutEngine {
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
+    /// How far from the device pixel it is painted on the origin of a layout root is, in device
+    /// pixels, see [`Self::set_origin_seed`]. Not dropped by a pass: it belongs to the root.
+    origin_seeds: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
     /// Nodes with a width keyword that `compute_layout` has not measured yet, in the order they
@@ -456,6 +459,7 @@ impl TaffyLayoutEngine {
             meta: FxHashMap::default(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
+            origin_seeds: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
             intrinsic_pending: Vec::new(),
@@ -608,6 +612,7 @@ impl TaffyLayoutEngine {
         while let Some(id) = stack.pop() {
             self.absolute_layout_bounds.remove(&id);
             self.absolute_outer_origins.remove(&id);
+            self.origin_seeds.remove(&id);
             stack.extend(
                 self.taffy
                     .children(id.into())
@@ -655,6 +660,7 @@ impl TaffyLayoutEngine {
         self.give_back_stretched_widths(false);
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
+        self.origin_seeds.clear();
         self.computed_layouts.clear();
         self.intrinsic_pending.clear();
         self.natural_pending.clear();
@@ -1650,6 +1656,42 @@ impl TaffyLayoutEngine {
         self.taffy.parent(id.0).map(LayoutId)
     }
 
+    /// Says that the layout root `id` is painted at a device pixel and that its position is
+    /// `seed` (device pixels, from -0.5 to 0.5) further: the edges of the root and of every node
+    /// below it snap from there, as a box in a block at a fractional position snaps, and not from the
+    /// root's own origin. Used for the rows of a list, which are roots stacked at fractional
+    /// positions. Must be called before the first bounds of the root are asked for.
+    pub fn set_origin_seed(&mut self, id: LayoutId, seed: Point<f32>) {
+        if seed == Point::default() && !self.origin_seeds.contains_key(&id) {
+            return;
+        }
+        self.origin_seeds.insert(id, seed);
+        let stack = &mut self.layout_bounds_scratch_space;
+        stack.push(id);
+        while let Some(id) = stack.pop() {
+            self.absolute_layout_bounds.remove(&id);
+            self.absolute_outer_origins.remove(&id);
+            stack.extend(
+                self.taffy
+                    .children(id.into())
+                    .expect(EXPECT_MESSAGE)
+                    .into_iter()
+                    .map(LayoutId::from),
+            );
+        }
+    }
+
+    /// The size of the node as layout computed it, in logical pixels and before it is snapped to
+    /// device pixels. Unlike [`Self::layout_unsnapped_bounds`] it keeps no bounds, so it can be
+    /// asked before the origin of a root is known.
+    pub fn layout_unsnapped_size(&self, id: LayoutId, scale_factor: f32) -> Size<Pixels> {
+        let size = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE).size;
+        Size {
+            width: Pixels(size.width / scale_factor),
+            height: Pixels(size.height / scale_factor),
+        }
+    }
+
     pub fn layout_bounds(&mut self, id: LayoutId, scale_factor: f32) -> Bounds<Pixels> {
         if let Some(layout) = self.absolute_layout_bounds.get(&id).cloned() {
             return layout;
@@ -1670,7 +1712,7 @@ impl TaffyLayoutEngine {
                     .expect("parent absolute outer origin should be cached");
                 parent_origin + Point::from(layout_location)
             }
-            None => Point::from(layout_location),
+            None => Point::from(layout_location) + self.origin_seeds.get(&id).copied().unwrap_or_default(),
         };
         self.absolute_outer_origins
             .insert(id, absolute_outer_origin);

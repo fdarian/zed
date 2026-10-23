@@ -1809,6 +1809,10 @@ pub struct Window {
     /// How far each atomic inline being prepainted is from the device pixel it is painted on (see
     /// [`Window::with_unsnapped_element_origin`]), innermost last.
     pub(crate) origin_phase_stack: Vec<Point<Pixels>>,
+    /// How far the element about to be prepainted is from the device pixel it is painted on, for
+    /// the layout root it is: taken by the first element prepainted, see
+    /// [`Window::with_fractional_element_origin`].
+    root_seed: Option<Point<Pixels>>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     /// How many boxes were prepainted so far that sit outside the clip they were prepainted in,
@@ -2595,6 +2599,7 @@ impl Window {
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             origin_phase_stack: Vec::new(),
+            root_seed: None,
             content_mask_stack: Vec::new(),
             escapes_prepainted: 0,
             root_escape: None,
@@ -6141,6 +6146,43 @@ impl Window {
         result
     }
 
+    /// Runs `f`, the prepaint of a layout root placed at `origin`, the window position a block
+    /// flow puts it at before it is snapped to a device pixel, such as a row of a list. The root
+    /// is painted at the device pixel `origin` rounds half up to, and the edges of it and of
+    /// everything below it snap from `origin` itself, as the edges of a box in a block at a
+    /// fractional position do: two roots that touch at `origin` and `origin + height` touch
+    /// when painted. [`Self::layout_unsnapped_bounds`] reports from `origin`. This method should
+    /// only be called during the prepaint phase of element drawing.
+    pub fn with_fractional_element_origin<R>(
+        &mut self,
+        origin: Point<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_prepaint();
+
+        let scale_factor = self.scale_factor();
+        let snapped = origin.map(|c| px(round_half_up(c.0 * scale_factor) / scale_factor));
+        self.root_seed = Some((origin - snapped).map(|c| px(c.0 * scale_factor)));
+        // The seed puts the fraction in the layout engine, which `layout_unsnapped_bounds`
+        // reads: an enclosing atomic inline's own fraction must not be added to it again.
+        self.origin_phase_stack.push(Point::default());
+        let result = self.with_absolute_element_offset(snapped, f);
+        self.origin_phase_stack.pop();
+        self.root_seed = None;
+        result
+    }
+
+    /// Hands the layout root being prepainted the fraction of its origin that
+    /// [`Self::with_fractional_element_origin`] holds, if it holds one.
+    pub(crate) fn seed_layout_root(&mut self, layout_id: LayoutId) {
+        if let Some(seed) = self.root_seed.take() {
+            self.layout_engine
+                .as_mut()
+                .unwrap()
+                .set_origin_seed(layout_id, seed.map(|c| c.0).into());
+        }
+    }
+
     /// How far the atomic inline being prepainted is from the device pixel it is painted on, see
     /// [`Self::with_unsnapped_element_origin`]. Zero outside one.
     pub(crate) fn element_origin_phase(&self) -> Point<Pixels> {
@@ -7795,6 +7837,21 @@ impl Window {
             .layout_unsnapped_bounds(layout_id, scale_factor);
         bounds.origin += self.pixel_snap_point(self.element_offset()) + self.element_origin_phase();
         bounds
+    }
+
+    /// The size of the given layout node as layout computed it, in logical pixels and before it is
+    /// snapped to device pixels. It leaves no bounds behind, so it is safe to ask for a root that
+    /// is not placed yet (see [`Self::with_fractional_element_origin`]).
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_unsnapped_size(&mut self, layout_id: LayoutId) -> Size<Pixels> {
+        self.invalidator.debug_assert_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .layout_unsnapped_size(layout_id, scale_factor)
     }
 
     /// The padding and border widths the given layout node was laid out with, in

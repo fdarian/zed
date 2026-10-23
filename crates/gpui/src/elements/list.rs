@@ -86,6 +86,8 @@ struct ScrollClient {
 
 struct StateInner {
     last_layout_bounds: Option<Bounds<Pixels>>,
+    /// The width the rows were laid out at.
+    last_content_width: Option<Pixels>,
     last_padding: Option<Edges<Pixels>>,
     last_client: Option<ScrollClient>,
     items: SumTree<ListItem>,
@@ -350,6 +352,7 @@ impl ListState {
     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
         let this = Self(Rc::new(RefCell::new(StateInner {
             last_layout_bounds: None,
+            last_content_width: None,
             last_padding: None,
             last_client: None,
             items: SumTree::default(),
@@ -1135,7 +1138,7 @@ impl StateInner {
         for (ix, item) in cursor.enumerate() {
             let size = item.size().unwrap_or_else(|| {
                 let mut element = render_item(ix, window, cx);
-                element.layout_as_root(available_item_space, window, cx)
+                element.layout_as_root_unsnapped(available_item_space, window, cx)
             });
 
             measured_items.push(ListItem::Measured {
@@ -1194,7 +1197,7 @@ impl StateInner {
                 };
                 let size = item.size().unwrap_or_else(|| {
                     let mut element = render_item(cursor.start().0, window, cx);
-                    element.layout_as_root(available_item_space, window, cx)
+                    element.layout_as_root_unsnapped(available_item_space, window, cx)
                 });
                 scroll_top.item_ix = cursor.start().0;
                 scroll_top.offset_in_item += size.height;
@@ -1220,7 +1223,7 @@ impl StateInner {
             if visible_height < available_height || size.is_none() {
                 let item_index = scroll_top.item_ix + ix;
                 let mut element = render_item(item_index, window, cx);
-                let element_size = element.layout_as_root(available_item_space, window, cx);
+                let element_size = element.layout_as_root_unsnapped(available_item_space, window, cx);
                 size = Some(element_size);
 
                 // If there's a pending scroll adjustment for the scroll-top
@@ -1281,7 +1284,7 @@ impl StateInner {
                 if let Some(item) = cursor.item() {
                     let item_index = cursor.start().0;
                     let mut element = render_item(item_index, window, cx);
-                    let element_size = element.layout_as_root(available_item_space, window, cx);
+                    let element_size = element.layout_as_root_unsnapped(available_item_space, window, cx);
                     let focus_handle = item.focus_handle();
                     rendered_height += element_size.height;
                     measured_items.push_front(ListItem::Measured {
@@ -1330,7 +1333,7 @@ impl StateInner {
                     *size
                 } else {
                     let mut element = render_item(cursor.start().0, window, cx);
-                    element.layout_as_root(available_item_space, window, cx)
+                    element.layout_as_root_unsnapped(available_item_space, window, cx)
                 };
 
                 leading_overdraw += size.height;
@@ -1375,7 +1378,7 @@ impl StateInner {
                 if item.contains_focused(window, cx) {
                     let item_index = cursor.start().0;
                     let mut element = render_item(cursor.start().0, window, cx);
-                    let size = element.layout_as_root(available_item_space, window, cx);
+                    let size = element.layout_as_root_unsnapped(available_item_space, window, cx);
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
                         element,
@@ -1397,14 +1400,15 @@ impl StateInner {
     fn prepaint_items(
         &mut self,
         bounds: Bounds<Pixels>,
+        unsnapped: Bounds<Pixels>,
         padding: Edges<Pixels>,
         autoscroll: bool,
         render_item: &mut RenderItemFn,
         window: &mut Window,
         cx: &mut App,
     ) -> Result<LayoutItemsResponse, ListOffset> {
-        // Rows are as wide as the list is inside its left and right padding.
-        let content_width = padded_width(bounds.size.width, &padding);
+        // Rows are as wide as the list is inside its left and right padding, as layout sized it.
+        let content_width = padded_width(unsnapped.size.width, &padding);
         window.transact(|window| {
             match self.measuring_behavior {
                 ListMeasuringBehavior::Measure(has_measured) if !has_measured => {
@@ -1427,11 +1431,16 @@ impl StateInner {
 
             // Only paint the visible items, if there is actually any space for them (taking padding into account)
             if bounds.size.height > padding.top + padding.bottom {
-                let mut item_origin = bounds.origin + Point::new(padding.left, padding.top);
-                item_origin.y -= layout_response.scroll_top.offset_in_item;
+                // The rows are stacked from where layout put the list, as the blocks of a scroller
+                // are, and each is snapped to the device pixel on its own when it is painted. The
+                // scroll offset is the one a browser scrolls to: a whole device pixel.
+                let scrolled = self.scroll_top(&layout_response.scroll_top);
+                let scroll_snap = scrolled - round_to_device_half_up(scrolled, window.scale_factor());
+                let mut item_origin = unsnapped.origin + Point::new(padding.left, padding.top);
+                item_origin.y += scroll_snap - layout_response.scroll_top.offset_in_item;
                 for item in &mut layout_response.item_layouts {
                     window.with_exact_hit_mask(Some(ContentMask::from_bounds(bounds)), |window| {
-                        item.element.prepaint_at(item_origin, window, cx);
+                        item.element.prepaint_at_fractional(item_origin, window, cx);
                     });
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
@@ -1458,7 +1467,7 @@ impl StateInner {
                                         let mut element = render_item(cursor.start().0, window, cx);
                                         let item_available_size =
                                             size(content_width.into(), AvailableSpace::MinContent);
-                                        element.layout_as_root(item_available_size, window, cx)
+                                        element.layout_as_root_unsnapped(item_available_size, window, cx)
                                     });
                                     item_ix = cursor.start().0;
                                     offset_in_item += size.height;
@@ -1486,7 +1495,7 @@ impl StateInner {
                                     let mut item = render_item(cursor.start().0, window, cx);
                                     let item_available_size =
                                         size(content_width.into(), AvailableSpace::MinContent);
-                                    item.layout_as_root(item_available_size, window, cx)
+                                    item.layout_as_root_unsnapped(item_available_size, window, cx)
                                 });
                                 height -= size.height;
                             }
@@ -1727,20 +1736,22 @@ impl Element for List {
             style.hit_clip_path(bounds, rem_size),
         );
 
-        let padding = style
-            .padding
-            .to_pixels(bounds.size.into(), window.rem_size());
+        let layout_id = self
+            .interactivity
+            .layout_id
+            .expect("a list requests layout before it prepaints");
+        let unsnapped = window.layout_unsnapped_bounds(layout_id);
+        let padding = window.layout_insets(layout_id).padding;
+        let content_width = padded_width(unsnapped.size.width, &padding);
 
         // A change in the width rows get, from the list's own width or its
         // horizontal padding, can alter wrapped heights. Keep the last size as a
         // hint so off-screen rows do not collapse to 0. First layout must not wipe
         // with_uniform_item_height hints.
-        if state.last_layout_bounds.is_some_and(|last_bounds| {
-            padded_width(
-                last_bounds.size.width,
-                &state.last_padding.unwrap_or_default(),
-            ) != padded_width(bounds.size.width, &padding)
-        }) {
+        if state
+            .last_content_width
+            .is_some_and(|last_width| last_width != content_width)
+        {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
                     size_hint: item.size().or(item.size_hint()),
@@ -1753,32 +1764,26 @@ impl Element for List {
             state.measuring_behavior.reset();
         }
 
-        let client_size = window
-            .layout_unsnapped_bounds(
-                self.interactivity
-                    .layout_id
-                    .expect("a list requests layout before it prepaints"),
-            )
-            .size;
         state.last_client = Some(ScrollClient {
-            size: client_size,
+            size: unsnapped.size,
             scale_factor: window.scale_factor(),
         });
 
         let escapes_before = window.escapes_prepainted();
         let layout = window.with_hitbox_parent(&hitbox, |window| {
-            match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
+            match state.prepaint_items(bounds, unsnapped, padding, true, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
                 Err(autoscroll_request) => {
                     state.logical_scroll_top = Some(autoscroll_request);
                     state
-                        .prepaint_items(bounds, padding, false, &mut self.render_item, window, cx)
+                        .prepaint_items(bounds, unsnapped, padding, false, &mut self.render_item, window, cx)
                         .unwrap()
                 }
             }
         });
 
         state.last_layout_bounds = Some(bounds);
+        state.last_content_width = Some(content_width);
         state.last_padding = Some(padding);
         // The overlay reads the list state, which must not be borrowed meanwhile.
         drop(state_guard);
@@ -1787,8 +1792,13 @@ impl Element for List {
         let prepaint_layout_listeners = std::mem::take(&mut self.interactivity.prepaint_layout_listeners);
         if let Some(layout_id) = self.interactivity.layout_id {
             for listener in prepaint_layout_listeners {
+                window.note_publication();
                 listener(bounds, layout_id, window, cx);
             }
+        }
+        if window.is_layout_pass() {
+            self.interactivity
+                .publish_layout(bounds, style.visibility.unwrap_or(window.visibility()), window);
         }
         if let Some(prepainter) = self.interactivity.overlay_prepainter.take() {
             window.with_hitbox_parent(&hitbox, |window| prepainter(bounds, window, cx));
@@ -1868,6 +1878,12 @@ impl Element for List {
                 cx,
             );
         });
+
+        // A hidden list paints nothing and keeps its box, as a hidden div does.
+        window.with_visibility(
+            prepaint.style.visibility.unwrap_or(window.visibility()),
+            |window| self.interactivity.run_paint_listeners(bounds, window, cx),
+        );
 
         let overlay_painter = self.interactivity.overlay_painter.take();
         let escape_inside = prepaint.escape_inside;
@@ -2004,10 +2020,11 @@ mod test {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
+    use super::round_to_device_half_up;
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
-        px, size,
+        IntoElement, ListState, ParentElement, Pixels, Render, Styled, TestAppContext, Window, canvas, div, list,
+        point, px, size,
     };
 
     #[gpui::test]
@@ -3427,5 +3444,109 @@ mod test {
             max,
             "a write past the end is held to the range"
         );
+    }
+    struct FractionalRows(ListState, Rc<RefCell<Vec<Bounds<Pixels>>>>);
+    impl Render for FractionalRows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.1.clone();
+            let rows = list(self.0.clone(), move |ix, _, _| {
+                let seen = seen.clone();
+                div()
+                    .h(px(20.3))
+                    .w_full()
+                    .on_prepainted_layout(move |_, layout_id, window, _| {
+                        let bounds = window.layout_unsnapped_bounds(layout_id);
+                        let mut seen = seen.borrow_mut();
+                        if seen.len() <= ix {
+                            seen.resize(ix + 1, Bounds::default());
+                        }
+                        seen[ix] = bounds;
+                    })
+                    .into_any()
+            })
+            .absolute()
+            .left(px(5.7))
+            .top(px(3.3))
+            .w(px(100.))
+            .h(px(60.))
+            .pt(px(7.4));
+            div().relative().w_full().h_full().child(rows)
+        }
+    }
+
+    /// A row of 20.3 is 20.296875 tall (1299/64 at scale 1, 2598/128 at scale 2) and not 20, and
+    /// the rows stack from the unsnapped origin of the list and the padding: Chrome's boxes of a
+    /// scroller of divs.
+    #[gpui::test]
+    fn test_rows_are_measured_and_stacked_unsnapped(cx: &mut TestAppContext) {
+        for scale in [1.0, 2.0] {
+            let cx = cx.add_empty_window();
+            cx.update(|window, _| window.set_scale_factor(scale));
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let state = ListState::new(10, crate::ListAlignment::Top, px(300.));
+            cx.draw(point(px(0.), px(0.)), size(px(200.), px(100.)), |_, cx| {
+                cx.new(|_| FractionalRows(state.clone(), seen.clone())).into_any_element()
+            });
+
+            // Lengths are cut toward zero to 1/64 of a device pixel.
+            let cut = |length: f32| px((length * 64. * scale).floor() / (64. * scale));
+            let height = cut(20.3);
+            let top = cut(3.3) + cut(7.4);
+            let seen = seen.borrow();
+            assert!(seen.len() >= 3, "rows in view are built at scale {scale}");
+            for (ix, bounds) in seen.iter().enumerate().take(3) {
+                assert_eq!(bounds.size.height, height, "height of row {ix} at scale {scale}");
+                assert_eq!(
+                    bounds.origin.y,
+                    top + height * ix as f32,
+                    "top of row {ix} at scale {scale}"
+                );
+                assert_eq!(bounds.origin.x, cut(5.7), "left of row {ix} at scale {scale}");
+            }
+            // Ten rows and the padding above them, less the 60 of the list, each end on a device pixel.
+            let content = round_to_device_half_up(height * 10. + cut(7.4), scale);
+            assert_eq!(
+                state.max_offset_for_scrollbar().y,
+                content - px(60.),
+                "the range at scale {scale}"
+            );
+        }
+    }
+
+    struct ListWithListeners(ListState, Rc<RefCell<Vec<Bounds<Pixels>>>>, Rc<RefCell<Vec<Bounds<Pixels>>>>);
+    impl Render for ListWithListeners {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let painted = self.1.clone();
+            let painted_layout = self.2.clone();
+            let rows = list(self.0.clone(), |_, _, _| div().h(px(20.)).w_full().into_any())
+                .absolute()
+                .left(px(5.7))
+                .top(px(3.3))
+                .w(px(100.5))
+                .h(px(60.3))
+                .on_painted(move |bounds, _, _| painted.borrow_mut().push(bounds))
+                .on_painted_layout(move |bounds, _, _, _| painted_layout.borrow_mut().push(bounds));
+            div().relative().w_full().h_full().child(rows)
+        }
+    }
+
+    /// A list reports the box it is painted at to `on_painted` and `on_painted_layout` every
+    /// time it is painted, as a div does.
+    #[gpui::test]
+    fn test_a_list_reports_its_painted_box(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| window.set_scale_factor(1.));
+        let painted = Rc::new(RefCell::new(Vec::new()));
+        let painted_layout = Rc::new(RefCell::new(Vec::new()));
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(100.)), |_, cx| {
+            cx.new(|_| ListWithListeners(state.clone(), painted.clone(), painted_layout.clone()))
+                .into_any_element()
+        });
+
+        // 5.7 rounds to 6 and 106.2 to 106; 3.3 to 3 and 63.6 to 64.
+        let expected = Bounds::new(point(px(6.), px(3.)), size(px(100.), px(61.)));
+        assert_eq!(painted.borrow().as_slice(), &[expected]);
+        assert_eq!(painted_layout.borrow().as_slice(), &[expected]);
     }
 }

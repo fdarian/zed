@@ -3289,16 +3289,7 @@ impl Interactivity {
             if visibility == Visibility::Visible {
                 self.register_a11y_actions(global_id, window);
             }
-            if let Some(listener) = self.paint_bounds_listener.take() {
-                window.note_publication();
-                listener(bounds, window, cx);
-            }
-            if let Some(listener) = self.paint_layout_listener.take()
-                && let Some(layout_id) = self.layout_id
-            {
-                window.note_publication();
-                listener(bounds, layout_id, window, cx);
-            }
+            self.run_paint_listeners(bounds, window, cx);
             window.with_tab_group(tab_group, |window| {
                 if visibility == Visibility::Visible
                     && let Some(focus_handle) = &self.tracked_focus_handle
@@ -3312,8 +3303,23 @@ impl Interactivity {
         });
     }
 
+    /// What paint reports to the `on_painted` and `on_painted_layout` listeners of an element,
+    /// under the visibility it is painted with.
+    pub(crate) fn run_paint_listeners(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        if let Some(listener) = self.paint_bounds_listener.take() {
+            window.note_publication();
+            listener(bounds, window, cx);
+        }
+        if let Some(listener) = self.paint_layout_listener.take()
+            && let Some(layout_id) = self.layout_id
+        {
+            window.note_publication();
+            listener(bounds, layout_id, window, cx);
+        }
+    }
+
     /// What paint reports to the listeners, for a pass that does not paint.
-    fn publish_layout(&self, bounds: Bounds<Pixels>, visibility: Visibility, window: &mut Window) {
+    pub(crate) fn publish_layout(&self, bounds: Bounds<Pixels>, visibility: Visibility, window: &mut Window) {
         let bounds_listener = self.paint_bounds_listener.clone();
         let layout_listener = self
             .paint_layout_listener
@@ -3532,16 +3538,7 @@ impl Interactivity {
                 window.with_visibility(visibility, |window| {
                     // The listeners see the element's own visibility, and run for a hidden
                     // element: it has no paint, but it has its box.
-                    if let Some(listener) = self.paint_bounds_listener.take() {
-                        window.note_publication();
-                        listener(bounds, window, cx);
-                    }
-                    if let Some(listener) = self.paint_layout_listener.take()
-                        && let Some(layout_id) = self.layout_id
-                    {
-                        window.note_publication();
-                        listener(bounds, layout_id, window, cx);
-                    }
+                    self.run_paint_listeners(bounds, window, cx);
 
                     let box_bounds = match (style.display, self.layout_id) {
                         (Display::Table, Some(layout_id)) => {
