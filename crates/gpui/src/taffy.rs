@@ -7,6 +7,7 @@ use crate::{
     },
 };
 use collections::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::{any::Any, cell::RefCell, fmt::Debug, ops::Range, rc::Rc};
 
 mod calc;
@@ -179,6 +180,9 @@ pub struct LayoutCounters {
     pub styles_set: u64,
     /// Times the children of a node were set to a list that differed from its own.
     pub children_set: u64,
+    /// Times a locked host was left without children and kept the ones it had, see
+    /// [`TaffyLayoutEngine::request_parking_layout`].
+    pub children_parked: u64,
     /// Passes over the tree that ended, with a frame or without.
     pub passes: u64,
     /// Calls to the measure functions of leaves.
@@ -342,6 +346,11 @@ pub struct TaffyLayoutEngine {
 
     /// The nodes that keyed requests can get, by key.
     keys: FxHashMap<NodeKey, LayoutId>,
+    /// The children a locked host (see [`Self::request_parking_layout`]) had when it was last
+    /// forced and has none since. They are in no
+    /// tree, and a collection reaches them through the host, so the node of a subtree that was
+    /// laid out keeps its results until the next forced request gives it back.
+    parked: FxHashMap<LayoutId, SmallVec<[LayoutId; 4]>>,
     /// How many keyed requests each scope made in the pass.
     ordinals: FxHashMap<u64, u32>,
     /// The number of the pass under way. Starts at 1: no node is from pass 0.
@@ -430,6 +439,10 @@ struct ScrollReach {
 /// the last collection left, over twice as many, and then collects.
 const GARBAGE_SLACK: usize = 4096;
 
+/// Xored into the scope of a request of a locked host, so that its place among the keyed requests
+/// is its own whatever its children requested before it.
+const PARKING_SCOPE: u64 = 0x5041_524b_4544_4c4b;
+
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
 
 impl TaffyLayoutEngine {
@@ -459,6 +472,7 @@ impl TaffyLayoutEngine {
             detach_rechecks: Vec::new(),
             calcs_after_sweep: 0,
             keys: FxHashMap::default(),
+            parked: FxHashMap::default(),
             ordinals: FxHashMap::default(),
             pass: 1,
             stretched: Vec::new(),
@@ -710,7 +724,8 @@ impl TaffyLayoutEngine {
 
     /// Frees every node that is not in the tree of a root that the pass laid out. Nodes that were
     /// requested and then left out of every tree are garbage, so are the ones of an abandoned
-    /// pass that the last pass did not ask for again.
+    /// pass that the last pass did not ask for again. The children a locked host has parked are in
+    /// its tree for this: they are reached through it.
     fn collect_garbage(&mut self) {
         if !self.garbage_possible && self.roots_at_collection == self.computed_layouts {
             return;
@@ -733,6 +748,9 @@ impl TaffyLayoutEngine {
                     self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE),
                 ));
             }
+            if let Some(parked) = self.parked.get(&id) {
+                stack.extend(parked.iter().copied());
+            }
         }
         self.scratch_stack = stack;
         self.alive_after_collection = alive;
@@ -746,6 +764,7 @@ impl TaffyLayoutEngine {
             self.painted_extents.remove(&id);
             self.scroll_reaches.remove(&id);
             self.unsnapped_scroll_reaches.remove(&id);
+            self.parked.remove(&id);
             if let Some(key) = meta.key {
                 self.keys.remove(&key);
             }
@@ -840,6 +859,43 @@ impl TaffyLayoutEngine {
         scale_factor: f32,
         children: &[LayoutId],
     ) -> LayoutId {
+        self.keyed_layout(scope, style, rem_size, scale_factor, children, false)
+    }
+
+    /// [`Self::request_keyed_layout`] for the host of content that is locked, as a
+    /// `content-visibility` element locks it: its content is laid out while a read forces it and is
+    /// not requested at all while it is skipped.
+    ///
+    /// A request that gives the host no children, after one that did, parks what it had: the
+    /// children are in no tree and are not garbage, so the nodes of the content keep their layout
+    /// results and the request that gives them back (a request of the same keys) finds them as it
+    /// left them. A request with children drops what was parked. Content that was shown is not
+    /// parked: it was requested under an ordinary node, which is garbage once the host is requested
+    /// by this.
+    ///
+    /// The host has a place of its own among the keyed requests, which does not depend on how many
+    /// requests its children made before it: the host of a request without children is the node of
+    /// the one with.
+    pub fn request_parking_layout(
+        &mut self,
+        scope: u64,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        children: &[LayoutId],
+    ) -> LayoutId {
+        self.keyed_layout(scope ^ PARKING_SCOPE, style, rem_size, scale_factor, children, true)
+    }
+
+    fn keyed_layout(
+        &mut self,
+        scope: u64,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        children: &[LayoutId],
+        park: bool,
+    ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor, &mut self.calcs);
         let key = self.next_key(scope);
 
@@ -854,7 +910,7 @@ impl TaffyLayoutEngine {
             // The measure function of a leaf that this node used to be would answer for it.
             self.taffy.set_node_context(id.0, None).expect(EXPECT_MESSAGE);
         }
-        self.set_children_if_changed(id, children);
+        self.set_children_if_changed(id, children, park);
         id
     }
 
@@ -966,7 +1022,10 @@ impl TaffyLayoutEngine {
         was_measured
     }
 
-    fn set_children_if_changed(&mut self, id: LayoutId, children: &[LayoutId]) {
+    fn set_children_if_changed(&mut self, id: LayoutId, children: &[LayoutId], park: bool) {
+        if !children.is_empty() {
+            self.parked.remove(&id);
+        }
         let unchanged = self.taffy.child_count(id.0) == children.len()
             && children.iter().enumerate().all(|(index, child)| {
                 self.taffy.child_at_index(id.0, index) == Ok(child.0)
@@ -977,6 +1036,13 @@ impl TaffyLayoutEngine {
         }
         self.counters.children_set += 1;
         self.garbage_possible = true;
+        if park && children.is_empty() {
+            let old = (0..self.taffy.child_count(id.0))
+                .map(|index| LayoutId(self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE)))
+                .collect();
+            self.parked.insert(id, old);
+            self.counters.children_parked += 1;
+        }
         #[cfg(debug_assertions)]
         {
             let mut ancestor = Some(id.0);
@@ -1069,7 +1135,7 @@ impl TaffyLayoutEngine {
         meta.measured = true;
         self.register(id, &meta);
         self.reuse_node(id, meta, taffy_style);
-        self.set_children_if_changed(id, &[]);
+        self.set_children_if_changed(id, &[], false);
 
         let kept = self
             .taffy
@@ -4619,6 +4685,144 @@ mod tests {
                 engine.computed_layouts.insert(root);
                 engine.end_frame();
                 assert_eq!(engine.calcs.len(), 1);
+            });
+        }
+        /// The content of a locked host as a frame requests it when a read forces it: a leaf and a
+        /// node over it, asked for in the scope of the host, which is asked for after them.
+        fn locked_host(engine: &mut TaffyLayoutEngine, forced: bool) -> (LayoutId, Option<[LayoutId; 2]>) {
+            if !forced {
+                return (engine.request_parking_layout(1, flex(), REM, 1., &[]), None);
+            }
+            let leaf = engine.request_keyed_layout(1, flex(), REM, 1., &[]);
+            let over = engine.request_keyed_layout(2, flex(), REM, 1., &[leaf]);
+            (engine.request_parking_layout(1, flex(), REM, 1., &[over]), Some([over, leaf]))
+        }
+
+        #[gpui::test]
+        fn the_children_a_locked_host_parks_survive_collection_with_what_layout_cached_for_them(
+            cx: &mut TestAppContext,
+        ) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let (host, content) = locked_host(&mut engine, true);
+                let [over, leaf] = content.unwrap();
+                engine.compute_layout(host, space(), window, cx);
+                engine.end_frame();
+                let generation = engine.layout_generation(over);
+
+                // The frames that skip the content: the host is the node of the frames that forced it
+                // whatever its children asked for before it, and nothing is freed.
+                for _ in 0..3 {
+                    let (skipped, none) = locked_host(&mut engine, false);
+                    assert_eq!((skipped, none), (host, None));
+                    engine.compute_layout(skipped, space(), window, cx);
+                    engine.end_frame();
+                    assert!(engine.contains(over) && engine.contains(leaf));
+                    assert_eq!(engine.taffy.child_count(host.0), 0);
+                }
+                assert_eq!(engine.counters().nodes_removed, 0);
+
+                let laid_out = engine.counters().nodes_laid_out;
+                let (forced, content) = locked_host(&mut engine, true);
+                assert_eq!((forced, content), (host, Some([over, leaf])));
+                assert_eq!(engine.layout_generation(over), generation, "giving the nodes back moves nothing");
+                engine.compute_layout(forced, space(), window, cx);
+                engine.end_frame();
+                assert_eq!(
+                    engine.counters().nodes_laid_out - laid_out,
+                    1,
+                    "the host lays out again, the content has the results it cached"
+                );
+                assert_eq!(engine.layout_generation(over), generation);
+                assert!(engine.parked.is_empty(), "the nodes are in the tree again");
+                assert_eq!(engine.counters().nodes_removed, 0);
+            });
+        }
+
+        #[gpui::test]
+        fn content_that_is_not_parked_is_laid_out_again_when_it_comes_back(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let ask = |engine: &mut TaffyLayoutEngine, forced: bool| {
+                    let content = forced.then(|| {
+                        let leaf = engine.request_keyed_layout(1, flex(), REM, 1., &[]);
+                        engine.request_keyed_layout(2, flex(), REM, 1., &[leaf])
+                    });
+                    engine.request_keyed_layout(1, flex(), REM, 1., content.as_slice())
+                };
+                let host = ask(&mut engine, true);
+                engine.compute_layout(host, space(), window, cx);
+                engine.end_frame();
+                let host = ask(&mut engine, false);
+                engine.compute_layout(host, space(), window, cx);
+                engine.end_frame();
+                assert_eq!(engine.counters().nodes_removed, 2, "an ordinary host drops its children");
+                let laid_out = engine.counters().nodes_laid_out;
+                let host = ask(&mut engine, true);
+                engine.compute_layout(host, space(), window, cx);
+                assert_eq!(engine.counters().nodes_laid_out - laid_out, 3);
+            });
+        }
+
+        #[gpui::test]
+        fn a_locked_host_that_is_gone_takes_what_it_parked_with_it(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let (host, _) = locked_host(&mut engine, true);
+                engine.compute_layout(host, space(), window, cx);
+                engine.end_frame();
+                let (host, _) = locked_host(&mut engine, false);
+                engine.compute_layout(host, space(), window, cx);
+                engine.end_frame();
+                assert_eq!(engine.parked.len(), 1);
+                assert_eq!(engine.taffy.total_node_count(), 3);
+
+                // A frame of something else.
+                let other = engine.request_keyed_layout(7, flex(), REM, 1., &[]);
+                engine.compute_layout(other, space(), window, cx);
+                engine.end_frame();
+                assert_eq!(engine.taffy.total_node_count(), 1);
+                assert_eq!(engine.meta.len(), 1);
+                assert!(engine.parked.is_empty());
+                assert_eq!(engine.counters().nodes_removed, 3);
+            });
+        }
+
+        #[gpui::test]
+        fn locked_hosts_inside_parked_content_keep_theirs(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                // The outer host holds an inner one, which holds a leaf; the inner is parked first.
+                let forced = |engine: &mut TaffyLayoutEngine, outer_forced: bool, inner_forced: bool| {
+                    let inner_content = inner_forced.then(|| engine.request_keyed_layout(30, flex(), REM, 1., &[]));
+                    let inner = engine.request_parking_layout(20, flex(), REM, 1., inner_content.as_slice());
+                    let outer_content = outer_forced.then_some(inner);
+                    let outer = engine.request_parking_layout(10, flex(), REM, 1., outer_content.as_slice());
+                    (outer, inner, inner_content)
+                };
+                let (outer, inner, leaf) = forced(&mut engine, true, true);
+                engine.compute_layout(outer, space(), window, cx);
+                engine.end_frame();
+                let (_, inner_skipped, _) = forced(&mut engine, true, false);
+                assert_eq!(inner_skipped, inner);
+                engine.compute_layout(outer, space(), window, cx);
+                engine.end_frame();
+                // Now the outer is skipped too: the inner is parked under it, and the leaf under that.
+                let (outer_skipped, _, _) = forced(&mut engine, false, false);
+                engine.compute_layout(outer_skipped, space(), window, cx);
+                engine.end_frame();
+                assert!(engine.contains(inner) && engine.contains(leaf.unwrap()));
+                assert_eq!(engine.counters().nodes_removed, 0);
+
+                let (back, inner_back, leaf_back) = forced(&mut engine, true, true);
+                assert_eq!((back, inner_back, leaf_back), (outer, inner, leaf));
+                engine.compute_layout(back, space(), window, cx);
+                engine.end_frame();
+                assert!(engine.parked.is_empty());
             });
         }
     }

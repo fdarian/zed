@@ -4757,6 +4757,7 @@ impl Window {
     fn build_pass(&mut self, cx: &mut App) -> bool {
         self.retained.state_pass += 1;
         self.retained.reference_passes += u64::from(self.retained.reference);
+        self.retained.layout_reference_passes += u64::from(self.retained.reference && self.layout_only);
         self.captured_hitbox = None;
         let effect_groups = self.platform_window.supports_effect_groups() || self.effect_groups_forced();
         self.next_frame
@@ -7418,6 +7419,34 @@ impl Window {
         let scale_factor = self.scale_factor();
 
         self.layout_engine.as_mut().unwrap().request_keyed_layout(
+            self.layout_scope,
+            style,
+            rem_size,
+            scale_factor,
+            &cx.layout_id_buffer,
+        )
+    }
+
+    /// [`Self::request_layout`] for the host of locked content (see
+    /// [`crate::InteractiveElement::locked_content`]): children given while the content is forced are set
+    /// aside when a request gives none, so the layout nodes of the content, with the results they
+    /// cached, are the ones a later forced request finds. See
+    /// [`TaffyLayoutEngine::request_parking_layout`].
+    #[must_use]
+    pub fn request_layout_parking(
+        &mut self,
+        style: Style,
+        children: impl IntoIterator<Item = LayoutId>,
+        cx: &mut App,
+    ) -> LayoutId {
+        self.invalidator.debug_assert_prepaint();
+
+        cx.layout_id_buffer.clear();
+        cx.layout_id_buffer.extend(children);
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+
+        self.layout_engine.as_mut().unwrap().request_parking_layout(
             self.layout_scope,
             style,
             rem_size,

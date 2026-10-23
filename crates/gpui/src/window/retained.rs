@@ -446,6 +446,12 @@ pub(crate) struct RetainedWindow {
     /// what the subtrees publish without the tapes of the layout records it leaves alone, so a layout
     /// record made before one is not skipped with after it.
     pub(crate) reference_passes: u64,
+    /// [`Self::reference_passes`] of the passes that only lay out. A layout record that a draw does
+    /// not end (see [`LayoutRecord`]) is told from a stale one by this: a draw's reference pass
+    /// writes nothing a locked record's tapes hold.
+    pub(crate) layout_reference_passes: u64,
+    /// How many locks of content are being built or prepainted, see [`Window::with_content_lock`].
+    pub(crate) content_locks: u32,
     /// Counts the passes that built a frame, abandoned ones too. An element state is stamped with
     /// the pass that accessed it.
     pub(crate) state_pass: u64,
@@ -1317,6 +1323,21 @@ impl Window {
         let result = build(self);
         self.retained.state_owners.pop();
         result
+    }
+
+    /// [`Self::with_state_owner`] for the content of a locked host (see
+    /// [`crate::InteractiveElement::locked_content`]): the layout records the content leaves are carried
+    /// across the draws that skip it, and so are the states it accesses, as its owner is kept.
+    pub(crate) fn with_content_lock<R>(&mut self, owner: &Rc<StateOwner>, build: impl FnOnce(&mut Self) -> R) -> R {
+        self.retained.content_locks += 1;
+        let result = self.with_state_owner(owner, build);
+        self.retained.content_locks -= 1;
+        result
+    }
+
+    /// Whether the subtree being built is inside the content of a locked host.
+    pub(crate) fn is_content_locked(&self) -> bool {
+        self.retained.content_locks > 0
     }
 
     /// The subtree whose content is being built, if one is.

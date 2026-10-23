@@ -639,3 +639,229 @@ fn a_verified_pass_that_skipped_with_a_layout_record_publishes_what_a_build_publ
         assert_eq!(pass.published, passes[0].published);
     }
 }
+
+/// What the host of a page of locked content shows.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Host {
+    /// The cards are its children and nothing locks them.
+    Shown,
+    /// A read forces the content: the cards are its children, under a lock.
+    Forced,
+    /// The content is skipped: the host has no children.
+    Skipped,
+}
+
+/// What a pass that forced the content built, and the state it left.
+struct Forced {
+    built: usize,
+    counters: RetainedCounters,
+    layout: crate::LayoutCounters,
+    states: usize,
+}
+
+/// Three cards in the host of locked content, which a pass that only lays out forces and a draw
+/// skips, as a read of geometry inside a `content-visibility` element does. The host is inside a
+/// retained subtree of its own when `around`, whose key is the forced one for the pass.
+struct Locked {
+    window: AnyWindowHandle,
+    builds: Rc<Cell<usize>>,
+    host: Rc<Cell<Host>>,
+    /// The key of the subtree around the host: 1 for a draw, 2 for a pass that forces.
+    around_key: Rc<Cell<u64>>,
+    /// The second card reads an entity when it is built.
+    reads: Rc<Cell<bool>>,
+}
+
+impl Locked {
+    const CARDS: usize = 3;
+
+    fn new(cx: &mut TestAppContext, around: bool) -> Self {
+        let builds = Rc::new(Cell::new(0));
+        let host = Rc::new(Cell::new(Host::Skipped));
+        let around_key = Rc::new(Cell::new(1));
+        let reads = Rc::new(Cell::new(false));
+        let entity = cx.new(|_| 0u32);
+        let window = open(cx, {
+            let (builds, host, around_key, reads) = (builds.clone(), host.clone(), around_key.clone(), reads.clone());
+            Rc::new(move |_, _| {
+                let cards = (0..Self::CARDS).map(|index| {
+                    let (builds, reads, entity) = (builds.clone(), reads.clone(), entity.clone());
+                    retained(("locked-card", index), 1, move |_, cx| {
+                        builds.set(builds.get() + 1);
+                        if index == 1 && reads.get() {
+                            entity.read(cx);
+                        }
+                        div()
+                            .id(("locked-card-box", index))
+                            .w(px(100.))
+                            .h(px(10.))
+                            .flex_none()
+                            .bg(crate::red())
+                            .into_any_element()
+                    })
+                });
+                let element = div().id("host").w(px(100.)).h(px(30.)).flex_none().overflow_hidden();
+                let element = match host.get() {
+                    Host::Shown => element.children(cards),
+                    Host::Forced => element.locked_content(false).children(cards),
+                    Host::Skipped => element.locked_content(true),
+                };
+                let content = if around {
+                    retained("around", around_key.get(), move |_, _| element.into_any_element()).into_any_element()
+                } else {
+                    element.into_any_element()
+                };
+                div().id("root").size_full().flex().flex_col().child(content).into_any_element()
+            })
+        });
+        cx.update_window(window, |_, window, _| window.set_max_draw_passes(2)).unwrap();
+        Self { window, builds, host, around_key, reads }
+    }
+
+    fn view(window: &mut Window, cx: &mut App) {
+        window.root::<SceneView>().flatten().unwrap().update(cx, |_, cx| cx.notify());
+    }
+
+    /// A pass that only lays out with the content forced, after `before`, and then the draw that
+    /// follows it with the content skipped, which ends the update.
+    fn force(&self, cx: &mut TestAppContext, before: impl FnOnce(&mut Window)) -> Forced {
+        let built = self.builds.get();
+        let forced = cx
+            .update_window(self.window, |_, window, cx| {
+                before(window);
+                self.host.set(Host::Forced);
+                self.around_key.set(2);
+                Self::view(window, cx);
+                assert!(window.draw_if_dirty(cx), "a pass ran");
+                let forced = Forced {
+                    built: self.builds.get() - built,
+                    counters: window.retained_counters(),
+                    layout: window.layout_counters(),
+                    states: window.element_states.len(),
+                };
+                self.host.set(Host::Skipped);
+                self.around_key.set(1);
+                Self::view(window, cx);
+                forced
+            })
+            .unwrap();
+        forced
+    }
+
+    /// A draw with the host as `host` says.
+    fn draw_as(&self, host: Host, cx: &mut TestAppContext) {
+        cx.update_window(self.window, |_, window, cx| {
+            self.host.set(host);
+            self.around_key.set(1);
+            Self::view(window, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn serial(&self, cx: &mut TestAppContext) -> u64 {
+        cx.update_window(self.window, |_, window, _| window.rendered_serial()).unwrap()
+    }
+
+    fn states(&self, cx: &mut TestAppContext) -> usize {
+        cx.update_window(self.window, |_, window, _| window.element_states.len()).unwrap()
+    }
+}
+
+#[gpui::test]
+fn a_locked_subtrees_layout_record_survives_the_draw_that_skips_its_host(cx: &mut TestAppContext) {
+    let locked = Locked::new(cx, false);
+    let serial = locked.serial(cx);
+
+    let first = locked.force(cx, |_| {});
+    assert_eq!(first.built, Locked::CARDS);
+    assert_eq!(first.counters.layout_records, Locked::CARDS as u64);
+    assert!(locked.serial(cx) > serial, "the draw that skips the host ran");
+    assert_eq!(locked.states(cx), first.states, "and kept what the pass left");
+
+    let mut previous = first;
+    for round in 0..3 {
+        let serial = locked.serial(cx);
+        let again = locked.force(cx, |_| {});
+        assert_eq!(again.built, 0, "round {round}");
+        assert_eq!(again.counters.layout_skips, previous.counters.layout_skips + Locked::CARDS as u64);
+        assert_eq!(again.counters.layout_builds, previous.counters.layout_builds, "round {round}");
+        assert_eq!(again.layout.nodes_created, previous.layout.nodes_created, "round {round}");
+        assert_eq!(again.layout.nodes_removed, previous.layout.nodes_removed, "round {round}: the nodes were parked");
+        assert!(locked.serial(cx) > serial);
+        previous = again;
+    }
+}
+
+#[gpui::test]
+fn a_locked_subtrees_layout_record_survives_draws_that_replay_the_subtree_around_its_host(cx: &mut TestAppContext) {
+    let locked = Locked::new(cx, true);
+    let first = locked.force(cx, |_| {});
+    assert_eq!(first.built, Locked::CARDS);
+    let hits = counters(locked.window, cx).hits;
+    assert!(hits >= 1, "the draw after the pass replayed the subtree around the host without visiting it: {hits}");
+
+    let mut previous = first;
+    for round in 0..3 {
+        let again = locked.force(cx, |_| {});
+        assert_eq!(again.built, 0, "round {round}");
+        assert_eq!(again.counters.layout_skips, previous.counters.layout_skips + Locked::CARDS as u64, "round {round}");
+        assert_eq!(again.layout.nodes_created, previous.layout.nodes_created, "round {round}");
+        previous = again;
+    }
+}
+
+#[gpui::test]
+fn a_locked_subtrees_layout_record_that_read_an_entity_is_not_carried(cx: &mut TestAppContext) {
+    let locked = Locked::new(cx, false);
+    locked.reads.set(true);
+    let first = locked.force(cx, |_| {});
+    assert_eq!(first.built, Locked::CARDS);
+
+    let again = locked.force(cx, |_| {});
+    assert_eq!(again.built, 1, "the card that read an entity is built again");
+    assert_eq!(again.counters.layout_skips, first.counters.layout_skips + (Locked::CARDS - 1) as u64);
+    assert_eq!(again.counters.layout_builds, first.counters.layout_builds + 1);
+}
+
+#[gpui::test]
+fn a_refresh_ends_the_layout_records_a_lock_carried(cx: &mut TestAppContext) {
+    let locked = Locked::new(cx, false);
+    locked.force(cx, |_| {});
+    let kept = locked.force(cx, |_| {});
+    assert_eq!(kept.built, 0);
+
+    let refreshed = locked.force(cx, |window| window.refresh());
+    assert_eq!(refreshed.built, Locked::CARDS);
+    let after = locked.force(cx, |_| {});
+    assert_eq!(after.built, 0, "what the refreshed pass built is carried again");
+}
+
+#[gpui::test]
+fn a_draw_that_shows_the_content_replaces_what_the_lock_kept(cx: &mut TestAppContext) {
+    let locked = Locked::new(cx, false);
+    let first = locked.force(cx, |_| {});
+    assert_eq!(first.built, Locked::CARDS);
+
+    let built = locked.builds.get();
+    locked.draw_as(Host::Shown, cx);
+    assert_eq!(locked.builds.get() - built, Locked::CARDS, "a draw ignores layout records");
+    locked.draw_as(Host::Skipped, cx);
+
+    let after = locked.force(cx, |_| {});
+    assert_eq!(after.built, Locked::CARDS, "the content that was shown is not what was locked");
+    assert_eq!(after.counters.layout_skips, first.counters.layout_skips);
+}
+
+#[gpui::test]
+fn the_states_of_locked_content_go_when_a_draw_shows_it_and_hides_it_again(cx: &mut TestAppContext) {
+    let locked = Locked::new(cx, false);
+    let skipped = locked.states(cx);
+    let forced = locked.force(cx, |_| {});
+    assert!(forced.states > skipped, "the pass made the states of the cards");
+    assert_eq!(locked.states(cx), forced.states);
+
+    locked.draw_as(Host::Shown, cx);
+    locked.draw_as(Host::Skipped, cx);
+    assert_eq!(locked.states(cx), skipped, "nothing owns them any more");
+}

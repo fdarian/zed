@@ -2789,6 +2789,7 @@ mod tests {
                 collections_walked: after.collections_walked - before.collections_walked,
                 styles_set: after.styles_set - before.styles_set,
                 children_set: after.children_set - before.children_set,
+                children_parked: after.children_parked - before.children_parked,
                 passes: after.passes - before.passes,
                 measures: after.measures - before.measures,
                 nodes_laid_out: after.nodes_laid_out - before.nodes_laid_out,

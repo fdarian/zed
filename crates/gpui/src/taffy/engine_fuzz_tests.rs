@@ -100,12 +100,24 @@ enum Content {
     Text(Text),
 }
 
+/// How a container is locked, as the host of a `content-visibility` element is.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Lock {
+    /// An ordinary container.
+    None,
+    /// The content is requested, under a host that parks it when it is not.
+    Forced,
+    /// The content is not requested: the engine parks what a frame that forced it asked for.
+    Skipped,
+}
+
 #[derive(Clone)]
 struct Node {
     key: Key,
     scope: Key,
     style: Style,
     content: Content,
+    lock: Lock,
 }
 
 struct Generator {
@@ -275,11 +287,19 @@ impl Generator {
             let count = self.random.below(5);
             Content::Container((0..count).map(|_| self.node(depth - 1, scope)).collect())
         };
+        // A host is one from the start, so the node of a container does not change with its lock
+        // (an ordinary request and a parking one do not share a node).
+        let lock = if matches!(content, Content::Container(_)) && Random::new(u64::from(key) ^ 0x10C4).one_in(4) {
+            Lock::Forced
+        } else {
+            Lock::None
+        };
         Node {
             key,
             scope,
             style,
             content,
+            lock,
         }
     }
 
@@ -348,6 +368,19 @@ struct Scene {
 }
 
 fn edit_scene(scene: &mut Scene, generator: &mut Generator) {
+    // A host asks for its content or does not: drawn from a generator of its own, so that the
+    // trees stay what they were before locks.
+    let mut aside = Random(generator.random.0.rotate_left(29) ^ 0x10C4);
+    if aside.one_in(2) {
+        let hosts: Vec<_> = container_paths(&mut scene.root)
+            .into_iter()
+            .filter(|path| node_at(&mut scene.root, path).lock != Lock::None)
+            .collect();
+        if !hosts.is_empty() {
+            let host = node_at(&mut scene.root, &hosts[aside.below(hosts.len())]);
+            host.lock = if aside.one_in(3) { Lock::Forced } else { Lock::Skipped };
+        }
+    }
     match generator.random.below(14) {
         0 => {
             // A node and its subtree become a root of their own, or a root becomes a child again.
@@ -461,6 +494,16 @@ fn request_node(
     scale_factor: f32,
 ) -> (LayoutId, Option<Lines>) {
     match &node.content {
+        Content::Container(_) if node.lock != Lock::None => (
+            engine.request_parking_layout(
+                node.scope.into(),
+                node.style.clone(),
+                REM_SIZE,
+                scale_factor,
+                children,
+            ),
+            None,
+        ),
         Content::Container(_) => (
             engine.request_keyed_layout(
                 node.scope.into(),
@@ -510,6 +553,7 @@ fn request_tree(
     requested: &mut Vec<Requested>,
 ) -> LayoutId {
     let children: Vec<LayoutId> = match &node.content {
+        Content::Container(_) if node.lock == Lock::Skipped => Vec::new(),
         Content::Container(children) => children
             .iter()
             .map(|child| request_tree(engine, child, scale_factor, requested))
@@ -586,6 +630,25 @@ fn observe(
             (*key, observed)
         })
         .collect()
+}
+
+/// The nodes the engine reached from the roots it last laid out, and through the children it parked
+/// if `parked`.
+fn tree_of(engine: &TaffyLayoutEngine, parked: bool) -> FxHashSet<LayoutId> {
+    let mut found = FxHashSet::default();
+    let mut stack: Vec<LayoutId> = engine.roots_at_collection.iter().copied().collect();
+    while let Some(id) = stack.pop() {
+        if !found.insert(id) {
+            continue;
+        }
+        for index in 0..engine.taffy.child_count(id.0) {
+            stack.push(LayoutId(engine.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE)));
+        }
+        if parked && let Some(children) = engine.parked.get(&id) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    found
 }
 
 /// Requests both trees of the scene in full.
@@ -729,14 +792,26 @@ fn assert_reuse_matches_new_engine(
                 }
             }
 
-            // What the frame did not ask for is gone, and with it what only it held.
+            // What the frame did not ask for is gone, and with it what only it held: but the content
+            // of a skipped host, which the host parked.
             let nodes = kept[0].len();
-            assert_eq!(reused.meta.len(), nodes, "seed {seed}, step {step}");
-            assert_eq!(reused.taffy.total_node_count(), nodes, "seed {seed}, step {step}");
-            assert_eq!(reused.keys.len(), fresh.keys.len(), "seed {seed}, step {step}");
+            let asked_for = tree_of(&reused, false);
+            assert_eq!(asked_for.len(), nodes, "seed {seed}, step {step}");
+            let alive = tree_of(&reused, true);
+            let parked: Vec<_> = alive.difference(&asked_for).copied().collect();
+            assert_eq!(reused.meta.len(), alive.len(), "seed {seed}, step {step}");
+            assert_eq!(reused.taffy.total_node_count(), alive.len(), "seed {seed}, step {step}");
+            assert!(
+                reused.parked.keys().all(|host| alive.contains(host)),
+                "seed {seed}, step {step}: a host that is gone holds nothing"
+            );
+            let parked_keys = parked.iter().filter(|id| reused.meta[id].key.is_some()).count();
+            assert_eq!(reused.keys.len(), fresh.keys.len() + parked_keys, "seed {seed}, step {step}");
             reused.sweep_calcs();
             fresh.sweep_calcs();
-            assert_eq!(reused.calcs.len(), fresh.calcs.len(), "seed {seed}, step {step}");
+            if parked.is_empty() {
+                assert_eq!(reused.calcs.len(), fresh.calcs.len(), "seed {seed}, step {step}");
+            }
 
             previous = Some(Scene {
                 root: scene.root.clone(),
@@ -750,6 +825,7 @@ fn assert_reuse_matches_new_engine(
         total.nodes_removed += counters.nodes_removed;
         total.styles_set += counters.styles_set;
         total.children_set += counters.children_set;
+        total.children_parked += counters.children_parked;
         total.passes += counters.passes;
         total.measures += counters.measures;
         total.boundaries_laid_out += counters.boundaries_laid_out;
@@ -767,6 +843,8 @@ fn an_engine_that_lives_through_edits_lays_out_like_a_new_one(cx: &mut TestAppCo
     assert!(counters.nodes_removed > 500, "{counters:?}");
     assert!(counters.styles_set > 500, "{counters:?}");
     assert!(counters.children_set > 500, "{counters:?}");
+    // And the content of skipped hosts is parked and given back.
+    assert!(counters.children_parked > 100, "{counters:?}");
     // And the boxes whose layout is redone without the nodes above them.
     assert!(counters.boundaries_laid_out > 100, "{counters:?}");
 }
@@ -784,7 +862,7 @@ fn a_long_run_of_edits_lays_out_like_a_new_engine(cx: &mut TestAppContext) {
 }
 
 fn node(key: Key, style: Style, content: Content) -> Node {
-    Node { key, scope: key, style, content }
+    Node { key, scope: key, style, content, lock: Lock::None }
 }
 
 fn text_node(key: Key, style: Style, width: f32, line_height: f32, keyed: bool) -> Node {
@@ -1193,6 +1271,7 @@ fn delta(before: LayoutCounters, after: LayoutCounters) -> LayoutCounters {
         collections_walked: after.collections_walked - before.collections_walked,
         styles_set: after.styles_set - before.styles_set,
         children_set: after.children_set - before.children_set,
+        children_parked: after.children_parked - before.children_parked,
         passes: after.passes - before.passes,
         measures: after.measures - before.measures,
         nodes_laid_out: after.nodes_laid_out - before.nodes_laid_out,

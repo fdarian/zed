@@ -37,8 +37,12 @@
 //! [`RetainedPhase::LayoutRecorded`]. The next pass that only lays out skips the subtree with it
 //! under the conditions of a recording, so that a tree that has no presented frame to be recorded
 //! in (a page that is mounted, read and written to before its first frame) is built once and not
-//! by every read. A frame that is drawn ends every layout record: it builds what it has no
-//! recording of, and records that.
+//! by every read. A frame that is drawn ends the layout records it visits: it builds what it has no
+//! recording of, and records that. A record made inside the content of a locked host (see
+//! [`crate::InteractiveElement::locked_content`]) is not ended by the draws that skip the host, which
+//! do not visit it, and the next pass that lays the content out skips with it (unless the build
+//! read an entity, a refresh came, or a pass that built every subtree to compare with did), as a
+//! browser keeps the layout of a locked subtree.
 //!
 //! A subtree that is [relocatable](Retained::relocatable) is recorded to be replayed elsewhere than
 //! where it was recorded, by a whole number of device pixels, as a scroller moves its content. Its
@@ -336,12 +340,16 @@ struct LayoutRecord {
     root: LayoutId,
     /// Every entity the build read.
     accessed_entities: FxHashSet<crate::EntityId>,
-    /// The frames drawn when it was built: a frame that is drawn ends it.
+    /// The frames drawn when it was built: a frame that is drawn ends it, unless it is `locked`.
     rendered_serial: u64,
+    /// Built in the content of a locked host, which a draw skips without visiting. The draw ends
+    /// it only by visiting it (a hit drops it, a build makes the state anew), and until then it
+    /// is as current as it was, unless it read an entity: a notification a draw consumed is gone.
+    locked: bool,
     /// The refreshes of the window when it was built: a refresh asks for every subtree to be built.
     refresh_epoch: u64,
-    /// The passes that built every subtree to compare with when it was built, see
-    /// `RetainedWindow::reference_passes`.
+    /// The passes that only lay out and built every subtree to compare with when it was built, see
+    /// `RetainedWindow::layout_reference_passes`.
     reference_passes: u64,
     /// Filled when the prepaint of the build is done and nothing in it kept it from being skipped.
     replay: Option<LayoutReplay>,
@@ -364,8 +372,9 @@ impl LayoutRecord {
             root,
             accessed_entities,
             rendered_serial: window.rendered_serial(),
+            locked: window.is_content_locked(),
             refresh_epoch: window.retained.refresh_epoch,
-            reference_passes: window.retained.reference_passes,
+            reference_passes: window.retained.layout_reference_passes,
             replay: None,
             published: Rc::new(Cell::new(false)),
         }
@@ -375,9 +384,9 @@ impl LayoutRecord {
     fn is_current(&self, key: u64, window: &Window) -> bool {
         self.key == key
             && self.published.get()
-            && self.rendered_serial == window.rendered_serial()
+            && (self.rendered_serial == window.rendered_serial() || (self.locked && self.accessed_entities.is_empty()))
             && self.refresh_epoch == window.retained.refresh_epoch
-            && self.reference_passes == window.retained.reference_passes
+            && self.reference_passes == window.retained.layout_reference_passes
             && self.engine == window.layout_engine_id()
             && window.layout_node_alive(self.root)
             && !self.accessed_entities.iter().any(|entity| window.retained.notified.contains(entity))

@@ -28,7 +28,7 @@ use crate::{
     scroll_routing, size,
     sticky::{self, StickyInsets},
     tab_stop::PaintedChild,
-    window::{LiftedElement, WindowRegion},
+    window::{LiftedElement, StateOwner, WindowRegion},
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -853,6 +853,26 @@ pub trait InteractiveElement: Sized {
     /// is never culled. Without a call to this the element is never culled.
     fn cullable(mut self, outset: Edges<Pixels>) -> Self {
         self.interactivity().cull_outset = Some(outset);
+        self
+    }
+
+    /// Makes this element the host of locked content, as a browser locks the subtree of an element
+    /// with `content-visibility: hidden` (or `auto` while it is not near): the content is laid out
+    /// when something forces it (a read of geometry), and kept as it was laid out while the host
+    /// is skipped.
+    ///
+    /// `skipped` says which this frame is: `true` gives the element no children, and keeps what
+    /// the content left of the earlier passes that built it (the element states it accessed, the
+    /// layout nodes it asked for and the layout records of its retained subtrees) for the next
+    /// pass that forces it, however many draws come first. `false` gives the element the children
+    /// to lay out, and builds them as the pass that forces them. A frame that builds the children
+    /// as shown does not call this, and what was kept is dropped.
+    ///
+    /// The element needs an id, which holds what is kept. A layout record the content leaves is
+    /// carried across the draws that skip it unless it read an entity: an entity notified
+    /// meanwhile has been consumed by a draw that did not look.
+    fn locked_content(mut self, skipped: bool) -> Self {
+        self.interactivity().locked_content = Some(skipped);
         self
     }
 
@@ -2094,6 +2114,36 @@ fn prepaint_unlifted_child(
 pub struct DivFrameState {
     layout_id: LayoutId,
     child_layout_ids: SmallVec<[LayoutId; 2]>,
+    /// The owner of what the children access, for the host of locked content that is forced.
+    content_lock: Option<Rc<StateOwner>>,
+}
+
+/// What the host of locked content keeps from one frame to the next, see
+/// [`InteractiveElement::locked_content`].
+struct ContentLock {
+    /// Owns the element states of the content, and keeps them while the host is skipped, as the
+    /// owner of a retained subtree does for its own.
+    owner: Rc<StateOwner>,
+}
+
+impl ContentLock {
+    /// The owner of the content of the host `global_id`, with the host skipped in the draw being
+    /// built, or built as the content of a draw that is not skipped: a pass that only lays out is
+    /// thrown away, and leaves the state of the owner as the draw before it had it.
+    fn owner(global_id: &GlobalElementId, skipped: bool, window: &mut Window) -> Rc<StateOwner> {
+        let owner = window.with_element_state(global_id, |lock: Option<ContentLock>, _| {
+            let lock = lock.unwrap_or_else(|| ContentLock { owner: StateOwner::new() });
+            (lock.owner.clone(), lock)
+        });
+        if !window.is_layout_pass() {
+            if skipped {
+                owner.keep(window.retained.state_pass, window.current_state_owner());
+            } else {
+                owner.release(window.current_state_owner());
+            }
+        }
+        owner
+    }
 }
 
 /// Interactivity state displayed an manipulated in the inspector.
@@ -2192,6 +2242,14 @@ impl Element for Div {
             self.interactivity.no_scrollbar.x || self.interactivity.programmatic_scroll_only.x,
             self.interactivity.no_scrollbar.y || self.interactivity.programmatic_scroll_only.y,
         );
+        let content_lock = self.interactivity.locked_content.map(|skipped| {
+            debug_assert!(
+                !skipped || self.children.is_empty(),
+                "the content of a skipped host is not built"
+            );
+            let global_id = global_id.expect("the host of locked content has an id");
+            ContentLock::owner(global_id, skipped, window)
+        });
         let layout_id = window.with_image_cache(image_cache, |window| {
             self.interactivity.request_layout(
                 global_id,
@@ -2208,12 +2266,22 @@ impl Element for Div {
                         style.overflow.y = Overflow::Hidden;
                     }
                     window.with_text_style(style.text_style().cloned(), |window| {
-                        child_layout_ids = self
-                            .children
-                            .iter_mut()
-                            .map(|child| child.request_layout(window, cx))
-                            .collect::<SmallVec<_>>();
-                        window.request_layout(style, child_layout_ids.iter().copied(), cx)
+                        let mut request_children = |window: &mut Window| {
+                            self.children
+                                .iter_mut()
+                                .map(|child| child.request_layout(window, cx))
+                                .collect::<SmallVec<_>>()
+                        };
+                        match content_lock.as_ref() {
+                            Some(owner) => {
+                                child_layout_ids = window.with_content_lock(owner, request_children);
+                                window.request_layout_parking(style, child_layout_ids.iter().copied(), cx)
+                            }
+                            None => {
+                                child_layout_ids = request_children(window);
+                                window.request_layout(style, child_layout_ids.iter().copied(), cx)
+                            }
+                        }
                     })
                 },
             )
@@ -2224,6 +2292,7 @@ impl Element for Div {
             DivFrameState {
                 layout_id,
                 child_layout_ids,
+                content_lock,
             },
         )
     }
@@ -2337,6 +2406,7 @@ impl Div {
             .as_mut()
             .map(|provider| provider.provide(window, cx));
 
+        let content_lock = request_layout.content_lock.clone();
         let has_prepaint_listener = self.prepaint_listener.is_some();
         let mut children_bounds = Vec::with_capacity(if has_prepaint_listener {
             request_layout.child_layout_ids.len()
@@ -2440,8 +2510,14 @@ impl Div {
                         return;
                     }
                     let mut prepaint_children = |window: &mut Window| {
-                        for child in children.iter_mut() {
-                            child.prepaint(window, cx);
+                        let mut prepaint_each = |window: &mut Window| {
+                            for child in children.iter_mut() {
+                                child.prepaint(window, cx);
+                            }
+                        };
+                        match content_lock.as_ref() {
+                            Some(owner) => window.with_content_lock(owner, prepaint_each),
+                            None => prepaint_each(window),
                         }
                     };
                     // The offset of a positioned box is what an escaping descendant is
@@ -2553,10 +2629,16 @@ impl Div {
                             // place.
                             let hidden = window.visibility() == Visibility::Hidden;
                             let prepaint_children = move |window: &mut Window| {
-                                if hidden {
-                                    window.with_lift_barrier(prepaint_children_in_context)
-                                } else {
-                                    prepaint_children_in_context(window)
+                                let prepaint_children_lifted = move |window: &mut Window| {
+                                    if hidden {
+                                        window.with_lift_barrier(prepaint_children_in_context)
+                                    } else {
+                                        prepaint_children_in_context(window)
+                                    }
+                                };
+                                match content_lock.as_ref() {
+                                    Some(owner) => window.with_content_lock(owner, prepaint_children_lifted),
+                                    None => prepaint_children_lifted(window),
                                 }
                             };
                             if style.position == Position::Static && !style.contain_layout {
@@ -2845,6 +2927,8 @@ pub struct Interactivity {
     pub(crate) tab_stop: bool,
     /// See [`InteractiveElement::cullable`].
     pub(crate) cull_outset: Option<Edges<Pixels>>,
+    /// See [`InteractiveElement::locked_content`]: whether the content is skipped.
+    pub(crate) locked_content: Option<bool>,
 
     pub(crate) a11y_action_listeners:
         Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
