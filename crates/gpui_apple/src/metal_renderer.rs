@@ -4468,6 +4468,8 @@ mod tests {
             element_corner_radii_y: Corners::default(),
             inset: 0,
             pad: 0,
+            transformation: gpui::TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
         }
     }
 
@@ -5121,5 +5123,167 @@ mod tests {
             renderer.texture_pool.bytes() as f64 / 1e6,
             peak as f64 / 1e6
         );
+    }
+    fn matrix(values: [f32; 6]) -> gpui::TransformationMatrix {
+        gpui::TransformationMatrix::from_css(values)
+    }
+
+    /// A rotation of `degrees` around `center`, as a quad's matrix in device pixels.
+    fn rotation_around(degrees: f32, center: (f32, f32)) -> gpui::TransformationMatrix {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        matrix([
+            cos,
+            sin,
+            -sin,
+            cos,
+            center.0 - (cos * center.0 - sin * center.1),
+            center.1 - (sin * center.0 + cos * center.1),
+        ])
+    }
+
+    fn rounded_box(x: f32, y: f32, side: f32, radius: f32, color: u32) -> Quad {
+        Quad {
+            corner_radii: Corners::all(ScaledPixels(radius)),
+            ..solid(x, y, side, side, color)
+        }
+    }
+
+    fn assert_images_match(actual: &image::RgbaImage, expected: &image::RgbaImage) {
+        for (x, y, pixel) in actual.enumerate_pixels() {
+            let other = expected.get_pixel(x, y);
+            for channel in 0..4 {
+                assert!(
+                    pixel.0[channel].abs_diff(other.0[channel]) <= 2,
+                    "pixel ({x}, {y}) is {:?} and not {:?}",
+                    pixel.0,
+                    other.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_rotated_rounded_quad_fills_its_center_and_not_the_corners_of_its_bounds() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            transformation: rotation_around(45., (20., 20.)),
+            ..rounded_box(10., 10., 20., 6., 0xff0000)
+        });
+        let image = render(&mut scene);
+        assert_eq!(dominant_channel(&image, 20, 20), "red");
+        assert_eq!(dominant_channel(&image, 20, 11), "red");
+        assert_eq!(dominant_channel(&image, 12, 20), "red");
+        for (x, y) in [(11, 11), (28, 11), (11, 28), (28, 28), (20, 6), (7, 20)] {
+            assert!(is_cleared(&image, x, y), "pixel ({x}, {y}) should be empty");
+        }
+    }
+
+    #[test]
+    fn a_translated_quad_matches_the_quad_drawn_at_the_offset() {
+        let framed = |x: f32, y: f32, transformation| Quad {
+            content_mask: window_mask(),
+            border_widths: Edges::all(ScaledPixels(2.)),
+            border_colors: Edges::all(hex(0x0000ff)),
+            transformation,
+            ..rounded_box(x, y, 14., 5., 0xff0000)
+        };
+        let mut moved = Scene::default();
+        moved.insert_primitive(framed(5., 5., matrix([1., 0., 0., 1., 9., 6.])));
+        let mut placed = Scene::default();
+        placed.insert_primitive(framed(14., 11., gpui::TransformationMatrix::unit()));
+        assert_images_match(&render(&mut moved), &render(&mut placed));
+    }
+
+    #[test]
+    fn a_local_clip_cuts_a_rotated_quad_along_its_own_axes() {
+        let mut scene = Scene::default();
+        let mut clip = window_mask();
+        clip.bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(20.), ScaledPixels(40.)),
+        );
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            transformation: rotation_around(45., (20., 20.)),
+            local_clip: clip,
+            ..rounded_box(10., 10., 20., 0., 0xff0000)
+        });
+        let image = render(&mut scene);
+        // The local left half of the quad is the half above the anti-diagonal.
+        assert_eq!(dominant_channel(&image, 17, 17), "red");
+        assert!(is_cleared(&image, 23, 23));
+    }
+
+    #[test]
+    fn a_window_mask_cuts_a_rotated_quad_in_the_window() {
+        let mut scene = Scene::default();
+        let mut mask = window_mask();
+        mask.bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(20.), ScaledPixels(40.)),
+        );
+        scene.insert_primitive(Quad {
+            content_mask: mask,
+            transformation: rotation_around(45., (20., 20.)),
+            ..rounded_box(10., 10., 20., 0., 0xff0000)
+        });
+        let image = render(&mut scene);
+        assert_eq!(dominant_channel(&image, 18, 20), "red");
+        assert!(is_cleared(&image, 22, 20));
+    }
+
+    #[test]
+    fn a_scaled_quad_has_antialiased_edges_at_its_own_resolution() {
+        let mut scene = Scene::default();
+        // 10 by 10 scaled by 1.5 covers 15 pixels, 1 to 16 from the corner at 1.
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            transformation: matrix([1.5, 0., 0., 1.5, 1., 1.]),
+            ..rounded_box(0., 0., 10., 0., 0xffffff)
+        });
+        let image = render(&mut scene);
+        assert_eq!(image.get_pixel(8, 8).0[0], 255);
+        let edge = image.get_pixel(16, 8).0[0];
+        assert!(edge == 0, "the box ends at 16: {edge}");
+        let half = {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                content_mask: window_mask(),
+                transformation: matrix([1.5, 0., 0., 1.5, 1.5, 1.]),
+                ..rounded_box(0., 0., 10., 0., 0xffffff)
+            });
+            render(&mut scene).get_pixel(1, 8).0[0]
+        };
+        assert!((100..160).contains(&half), "half covered: {half}");
+    }
+
+    #[test]
+    fn a_translated_shadow_matches_the_shadow_drawn_at_the_offset() {
+        let element = |x: f32| Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(x)),
+            size(ScaledPixels(12.), ScaledPixels(12.)),
+        );
+        let radii = CornerRadii {
+            x: Corners::all(ScaledPixels(3.)),
+            y: Corners::default(),
+        };
+        for blur in [0., 4.] {
+            let drawn = |x: f32, transformation| gpui::Shadow {
+                bounds: element(x),
+                element_bounds: Bounds::new(
+                    point(ScaledPixels(x + 3.), ScaledPixels(x + 3.)),
+                    size(ScaledPixels(6.), ScaledPixels(6.)),
+                ),
+                element_corner_radii: radii.x,
+                transformation,
+                ..shadow(blur, radii)
+            };
+            let mut moved = Scene::default();
+            moved.insert_primitive(drawn(6., matrix([1., 0., 0., 1., 8., 8.])));
+            let mut placed = Scene::default();
+            placed.insert_primitive(drawn(14., gpui::TransformationMatrix::unit()));
+            assert_images_match(&render(&mut moved), &render(&mut placed));
+        }
     }
 }
