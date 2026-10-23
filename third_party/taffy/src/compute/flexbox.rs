@@ -165,6 +165,10 @@ struct AlgoConstants {
     /// its free space, stretch and line sizes use but its children's percentages do not: see
     /// [`AlgoConstants::percentage_base`].
     height_from_containment: bool,
+    /// fdarian fork patch: the container is a column whose height was not given to it. The height its items are flexed
+    /// to is not one their percentages resolve against, as in Blink, where the main size of a flex item is definite
+    /// only when the container's is.
+    column_height_indefinite: bool,
 
     /// The size of the virtual container containing the flex items.
     container_size: Size<f32>,
@@ -531,6 +535,7 @@ fn compute_constants(
         node_outer_size,
         node_inner_size,
         height_from_containment,
+        column_height_indefinite: is_column && (known_dimensions.height.is_none() || height_from_containment),
         container_size,
         inner_container_size,
     }
@@ -1045,6 +1050,32 @@ fn collect_flex_lines<'a>(
     }
 }
 
+/// The main size of the longest flex line, the items at their hypothetical main sizes in a column and at their flex base
+/// sizes (at least their style minimum) in a row, with the gaps between them.
+fn longest_line_main_size(lines: &[FlexLine<'_>], constants: &AlgoConstants) -> f32 {
+    lines
+        .iter()
+        .map(|line| {
+            let line_main_axis_gap = sum_axis_gaps(constants.gap.main(constants.dir), line.items.len());
+            let total_target_size = line
+                .items
+                .iter()
+                .map(|child| {
+                    if constants.is_column {
+                        return child.hypothetical_outer_size.main(constants.dir);
+                    }
+                    let padding_border_sum = (child.padding + child.border).main_axis_sum(constants.dir);
+                    (child.flex_basis.maybe_max(child.min_size.main(constants.dir))
+                        + child.margin.main_axis_sum(constants.dir))
+                    .max(padding_border_sum)
+                })
+                .sum::<f32>();
+            total_target_size + line_main_axis_gap
+        })
+        .max_by(|a, b| a.total_cmp(b))
+        .unwrap_or(0.0)
+}
+
 /// Determine the container's main size (if not already known)
 fn determine_container_main_size(
     tree: &mut impl LayoutFlexboxContainer,
@@ -1058,25 +1089,7 @@ fn determine_container_main_size(
     let outer_main_size: f32 = constants.node_outer_size.main(constants.dir).unwrap_or_else(|| {
         match available_space.main(dir) {
             AvailableSpace::Definite(main_axis_available_space) => {
-                let longest_line_length: f32 = lines
-                    .iter()
-                    .map(|line| {
-                        let line_main_axis_gap = sum_axis_gaps(constants.gap.main(constants.dir), line.items.len());
-                        let total_target_size = line
-                            .items
-                            .iter()
-                            .map(|child| {
-                                let padding_border_sum = (child.padding + child.border).main_axis_sum(constants.dir);
-                                (child.flex_basis.maybe_max(child.min_size.main(constants.dir))
-                                    + child.margin.main_axis_sum(constants.dir))
-                                .max(padding_border_sum)
-                            })
-                            .sum::<f32>();
-                        total_target_size + line_main_axis_gap
-                    })
-                    .max_by(|a, b| a.total_cmp(b))
-                    .unwrap_or(0.0);
-                let size = longest_line_length + main_content_box_inset;
+                let size = longest_line_main_size(lines, constants) + main_content_box_inset;
                 if lines.len() > 1 {
                     f32_max(size, main_axis_available_space)
                 } else {
@@ -1084,25 +1097,13 @@ fn determine_container_main_size(
                 }
             }
             AvailableSpace::MinContent if constants.is_wrap => {
-                let longest_line_length: f32 = lines
-                    .iter()
-                    .map(|line| {
-                        let line_main_axis_gap = sum_axis_gaps(constants.gap.main(constants.dir), line.items.len());
-                        let total_target_size = line
-                            .items
-                            .iter()
-                            .map(|child| {
-                                let padding_border_sum = (child.padding + child.border).main_axis_sum(constants.dir);
-                                (child.flex_basis.maybe_max(child.min_size.main(constants.dir))
-                                    + child.margin.main_axis_sum(constants.dir))
-                                .max(padding_border_sum)
-                            })
-                            .sum::<f32>();
-                        total_target_size + line_main_axis_gap
-                    })
-                    .max_by(|a, b| a.total_cmp(b))
-                    .unwrap_or(0.0);
-                longest_line_length + main_content_box_inset
+                longest_line_main_size(lines, constants) + main_content_box_inset
+            }
+            // The automatic block size of a flex container is the sum of the hypothetical main sizes of its items, as in
+            // Blink (`max_sum_hypothetical_main_size`, flex_layout_algorithm.cc): an item's content enters only through
+            // its automatic minimum size, so a `flex-basis: 0` item is not as tall as its content.
+            AvailableSpace::MinContent | AvailableSpace::MaxContent if constants.is_column => {
+                longest_line_main_size(lines, constants) + main_content_box_inset
             }
             AvailableSpace::MinContent | AvailableSpace::MaxContent => {
                 // Define a base main_size variable. This is mutated once for iteration over the outer
@@ -1185,23 +1186,7 @@ fn determine_container_main_size(
                                     Line::FALSE,
                                 ) + item.margin.main_axis_sum(constants.dir);
 
-                                // This is somewhat bizarre in that it's asymmetrical depending whether the flex container is a column or a row.
-                                //
-                                // I *think* this might relate to https://drafts.csswg.org/css-flexbox-1/#algo-main-container:
-                                //
-                                //    "The automatic block size of a block-level flex container is its max-content size."
-                                //
-                                // Which could suggest that flex-basis defining a vertical size does not shrink because it is in the block axis, and the automatic size
-                                // in the block axis is a MAX content size. Whereas a flex-basis defining a horizontal size does shrink because the automatic size in
-                                // inline axis is MIN content size (although I don't have a reference for that).
-                                //
-                                // Ultimately, this was not found by reading the spec, but by trial and error fixing tests to align with Webkit/Firefox output.
-                                // (see the `flex_basis_unconstraint_row` and `flex_basis_uncontraint_column` generated tests which demonstrate this)
-                                if constants.is_row {
-                                    content_main_size.maybe_clamp(style_min, style_max)
-                                } else {
-                                    content_main_size.max(item.flex_basis).maybe_clamp(style_min, style_max)
-                                }
+                                content_main_size.maybe_clamp(style_min, style_max)
                             }
                         };
                         item.content_flex_fraction = {
@@ -2116,16 +2101,23 @@ fn calculate_flex_item(
     #[cfg(feature = "content_size")] border: Rect<f32>,
     container_size: Size<f32>,
     percentage_base: Size<Option<f32>>,
+    column_height_indefinite: bool,
     direction: FlexDirection,
     layout_direction: Direction,
 ) {
-    let layout_output = tree.perform_child_layout(
+    let layout_output = tree.compute_child_layout(
         item.node,
-        item.target_size.map(|s| s.into()),
-        percentage_base,
-        container_size.map(|s| s.into()),
-        SizingMode::ContentSize,
-        Line::FALSE,
+        LayoutInput {
+            known_dimensions: item.target_size.map(|s| s.into()),
+            parent_size: percentage_base,
+            available_space: container_size.map(|s| s.into()),
+            sizing_mode: SizingMode::ContentSize,
+            axis: RequestedAxis::Both,
+            run_mode: RunMode::PerformLayout,
+            vertical_margins_are_collapsible: Line::FALSE,
+            // The item is as high as the column made it, which its percentages do not resolve against
+            height_from_containment: column_height_indefinite,
+        },
     );
     let LayoutOutput {
         size,
@@ -2238,6 +2230,7 @@ fn calculate_layout_line(
     #[cfg(feature = "content_size")] border: Rect<f32>,
     container_size: Size<f32>,
     percentage_base: Size<Option<f32>>,
+    column_height_indefinite: bool,
     padding_border: Rect<f32>,
     direction: FlexDirection,
     layout_direction: Direction,
@@ -2268,6 +2261,7 @@ fn calculate_layout_line(
                 border,
                 container_size,
                 percentage_base,
+                column_height_indefinite,
                 direction,
                 layout_direction,
             );
@@ -2286,6 +2280,7 @@ fn calculate_layout_line(
                 border,
                 container_size,
                 percentage_base,
+                column_height_indefinite,
                 direction,
                 layout_direction,
             );
@@ -2325,6 +2320,7 @@ fn final_layout_pass(
                 constants.border,
                 constants.container_size,
                 constants.percentage_base(),
+                constants.column_height_indefinite,
                 constants.content_box_inset,
                 constants.dir,
                 constants.layout_direction,
@@ -2342,6 +2338,7 @@ fn final_layout_pass(
                 constants.border,
                 constants.container_size,
                 constants.percentage_base(),
+                constants.column_height_indefinite,
                 constants.content_box_inset,
                 constants.dir,
                 constants.layout_direction,
@@ -3056,6 +3053,144 @@ mod margin_tests {
                 assert_eq!(item(height, 0.0, 130.0, align), Size { width: 70.0, height: 20.0 }, "{align:?}, 130px of margin");
                 assert_eq!(item(height, 12.0, 130.0, align), Size { width: 70.0, height: 20.0 }, "{align:?}, a margin on both");
             }
+        }
+    }
+}
+
+/// The automatic height of a flex column against the numbers headless Chrome has for the same pages (see
+/// `packages/react/src/__tests__/flex-column-size.test.tsx` in gpuix, which has many more): the sum of the hypothetical
+/// main sizes of its items, so the content of an item enters only through its automatic minimum size. The card is a
+/// column with a border of 1px, holding `prev` (padding of 64px above and below, a box of 132px inside) and a foot of 43px.
+#[cfg(test)]
+mod column_size_tests {
+    use crate::geometry::Point;
+    use crate::prelude::*;
+    use crate::style::Overflow;
+    use crate::{FlexDirection, TaffyTree};
+
+    /// The border box heights `(card, prev)` of the card once `prev` is given `change`, with `height` of space to lay
+    /// the card out into.
+    fn heights(height: AvailableSpace, change: impl FnOnce(&mut Style)) -> (f32, f32) {
+        heights_in(height, None, change)
+    }
+
+    /// The same, the card an item of a column of `outer_height` if there is one.
+    fn heights_in(height: AvailableSpace, outer_height: Option<Dimension>, change: impl FnOnce(&mut Style)) -> (f32, f32) {
+        let mut tree: TaffyTree<()> = TaffyTree::new();
+        tree.disable_rounding();
+        let content = tree
+            .new_leaf(Style { size: Size { width: length(300.0), height: length(132.0) }, flex_shrink: 0.0, ..Style::default() })
+            .unwrap();
+        let mut style = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            padding: Rect { left: length(0.0), right: length(0.0), top: length(64.0), bottom: length(64.0) },
+            flex_grow: 1.0,
+            flex_basis: length(0.0),
+            min_size: Size { width: auto(), height: length(0.0) },
+            ..Style::default()
+        };
+        change(&mut style);
+        let prev = tree.new_with_children(style, &[content]).unwrap();
+        let foot = tree.new_leaf(Style { size: Size { width: auto(), height: length(43.0) }, flex_shrink: 0.0, ..Style::default() }).unwrap();
+        let card = tree
+            .new_with_children(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
+                    border: Rect { left: length(1.0), right: length(1.0), top: length(1.0), bottom: length(1.0) },
+                    overflow: Point { x: Overflow::Hidden, y: Overflow::Hidden },
+                    min_size: Size { width: auto(), height: length(0.0) },
+                    ..Style::default()
+                },
+                &[prev, foot],
+            )
+            .unwrap();
+        let root = match outer_height {
+            Some(height) => tree
+                .new_with_children(
+                    Style {
+                        display: Display::Flex,
+                        flex_direction: FlexDirection::Column,
+                        size: Size { width: length(700.0), height },
+                        ..Style::default()
+                    },
+                    &[card],
+                )
+                .unwrap(),
+            None => card,
+        };
+        tree.compute_layout(root, Size { width: AvailableSpace::Definite(700.0), height }).unwrap();
+        (tree.layout(card).unwrap().size.height, tree.layout(prev).unwrap().size.height)
+    }
+
+    const SPACES: [AvailableSpace; 3] = [AvailableSpace::MaxContent, AvailableSpace::MinContent, AvailableSpace::Definite(1000.0)];
+
+    #[test]
+    fn a_basis_of_zero_does_not_make_the_column_as_high_as_the_content_of_the_item() {
+        for space in SPACES {
+            // 1 + 128 + 43 + 1: not 305, which is the 132px of content on top of the padding
+            assert_eq!(heights(space, |_| {}), (173.0, 128.0), "{space:?}");
+            assert_eq!(heights(space, |style| style.flex_grow = 0.0), (173.0, 128.0), "{space:?}, not growing");
+            assert_eq!(
+                heights(space, |style| style.overflow = Point { x: Overflow::Hidden, y: Overflow::Hidden }),
+                (173.0, 128.0),
+                "{space:?}, clipped"
+            );
+        }
+    }
+
+    #[test]
+    fn the_automatic_minimum_size_of_an_item_is_where_the_content_counts() {
+        for space in SPACES {
+            // `min-height: auto` is the content: 64 + 132 + 64
+            let auto_min = |style: &mut Style| style.min_size.height = auto();
+            assert_eq!(heights(space, auto_min), (305.0, 260.0), "{space:?}");
+            assert_eq!(heights(space, |style| {
+                auto_min(style);
+                style.flex_grow = 0.0
+            }), (305.0, 260.0), "{space:?}, not growing");
+            // a scroll container has none
+            assert_eq!(heights(space, |style| {
+                auto_min(style);
+                style.overflow = Point { x: Overflow::Hidden, y: Overflow::Hidden }
+            }), (173.0, 128.0), "{space:?}, clipped");
+        }
+    }
+
+    #[test]
+    fn a_basis_other_than_zero_is_clamped_by_the_minimum_and_maximum() {
+        for space in SPACES {
+            assert_eq!(heights(space, |style| style.flex_basis = length(500.0)), (545.0, 500.0), "{space:?}, 500px");
+            assert_eq!(heights(space, |style| style.flex_basis = length(1.0)), (173.0, 128.0), "{space:?}, 1px");
+            assert_eq!(heights(space, |style| style.flex_basis = auto()), (305.0, 260.0), "{space:?}, auto");
+            assert_eq!(
+                heights(space, |style| {
+                    style.flex_basis = length(500.0);
+                    style.max_size.height = length(200.0)
+                }),
+                (245.0, 200.0),
+                "{space:?}, 500px with a maximum of 200px"
+            );
+            assert_eq!(heights(space, |style| style.min_size.height = length(300.0)), (345.0, 300.0), "{space:?}, a minimum of 300px");
+        }
+    }
+
+    #[test]
+    fn a_percentage_basis_is_of_a_height_the_column_was_given() {
+        let zero_percent = |style: &mut Style| {
+            style.flex_grow = 0.0;
+            style.flex_basis = percent(0.0)
+        };
+        for space in SPACES {
+            // The card is as high as its content in a column of automatic height, which its item does not resolve the
+            // percentage against: the basis is the content, as `auto` is (Chrome: 260)
+            assert_eq!(heights_in(space, Some(auto()), zero_percent), (305.0, 260.0), "{space:?}, an outer column of automatic height");
+            // In a column that is 400px high, the card is flexed to 400px less nothing: it does not grow, and the 0%
+            // is of its 305px
+            assert_eq!(heights_in(space, Some(length(400.0)), zero_percent), (305.0, 128.0), "{space:?}, an outer column of 400px");
+            // As the card alone, the 0% is of nothing it was given either, as it is in a block
+            assert_eq!(heights(space, zero_percent), (305.0, 260.0), "{space:?}, the card alone");
         }
     }
 }

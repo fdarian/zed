@@ -94,6 +94,8 @@ const AXIS_VERTICAL: u8 = 1 << 4;
 /// value in the same bits.
 const KNOWN_WIDTH: u8 = 1 << 5;
 const KNOWN_HEIGHT: u8 = 1 << 6;
+/// Whether the known height is not one the children of the node resolve a percentage against (`height_from_containment`).
+const HEIGHT_INDEFINITE: u8 = 1 << 7;
 
 impl From<&LayoutInput> for CacheKey {
     fn from(input: &LayoutInput) -> Self {
@@ -112,7 +114,8 @@ impl From<&LayoutInput> for CacheKey {
                 | flag(input.vertical_margins_are_collapsible.start, MODE_COLLAPSIBLE_START)
                 | flag(input.vertical_margins_are_collapsible.end, MODE_COLLAPSIBLE_END)
                 | flag(input.known_dimensions.width.is_some(), KNOWN_WIDTH)
-                | flag(input.known_dimensions.height.is_some(), KNOWN_HEIGHT),
+                | flag(input.known_dimensions.height.is_some(), KNOWN_HEIGHT)
+                | flag(input.height_from_containment, HEIGHT_INDEFINITE),
         }
     }
 }
@@ -310,6 +313,8 @@ mod tests {
             LayoutInput { vertical_margins_are_collapsible: Line { start: true, end: false }, ..asked },
             LayoutInput { vertical_margins_are_collapsible: Line { start: false, end: true }, ..asked },
             LayoutInput { axis: RequestedAxis::Vertical, ..asked },
+            // A height its children do not resolve a percentage against is another ask.
+            LayoutInput { height_from_containment: true, ..asked },
             // A negative parent size is not the positive one: an inner size below its padding is.
             LayoutInput { parent_size: Size { width: Some(-160.0), height: None }, ..asked },
             // A width that is known is not one that is available.

@@ -137,7 +137,8 @@ pub struct LayoutInput {
     /// `known_dimensions.height` is the height size containment gave the node
     /// (`contain-intrinsic-height`), not one it was given. It is the size the node ends with but
     /// the height its children see is indefinite: a percentage height of a child is `auto`.
-    /// Set by the tree for a node with `contain_block_size`, never by a parent.
+    /// Set by the tree for a node with `contain_block_size`, and by a flex column whose own height was not given to it
+    /// for its items, whose height is the one it flexed them to.
     pub height_from_containment: bool,
 }
 
