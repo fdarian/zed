@@ -71,20 +71,22 @@ pub struct ListDomScroll {
     pub top: Pixels,
     /// The rows and the padding around them: what `scrollHeight` rounds.
     pub content_height: Pixels,
-    /// The list as layout sized it: what `clientWidth` and `clientHeight` round.
+    /// The list's padding box as layout sized it (its size less its border): what `clientWidth` and
+    /// `clientHeight` round.
     pub client: Size<Pixels>,
 }
 
 /// What the list measures its scroll range against, from the last layout.
 #[derive(Clone, Copy)]
 struct ScrollClient {
-    /// The size of the list as layout computed it, before it is snapped to a device pixel: what
-    /// a scroller's client size is.
+    /// The size of the list's padding box as layout computed it, before it is snapped to a device
+    /// pixel: what a scroller's client size is.
     size: Size<Pixels>,
     scale_factor: f32,
 }
 
 struct StateInner {
+    /// The padding box the rows are clipped to: the list less its border.
     last_layout_bounds: Option<Bounds<Pixels>>,
     /// The width the rows were laid out at.
     last_content_width: Option<Pixels>,
@@ -256,9 +258,23 @@ fn padded_width(width: Pixels, padding: &Edges<Pixels>) -> Pixels {
     (width - padding.left - padding.right).max(px(0.))
 }
 
+/// The padding box of `bounds`: what is left inside the border.
+fn padding_box(bounds: Bounds<Pixels>, border: &Edges<Pixels>) -> Bounds<Pixels> {
+    Bounds::new(
+        bounds.origin + point(border.left, border.top),
+        size(
+            (bounds.size.width - border.left - border.right).max(px(0.)),
+            (bounds.size.height - border.top - border.bottom).max(px(0.)),
+        ),
+    )
+}
+
 struct LayoutItemsResponse {
     max_item_width: Pixels,
     scroll_top: ListOffset,
+    /// How far the scroll top is below the top of the first row in `item_layouts`: rows above the
+    /// scroll top are built when they show in the top padding.
+    first_row_offset: Pixels,
     item_layouts: VecDeque<ItemLayout>,
 }
 
@@ -273,6 +289,8 @@ pub struct ListPrepaintState {
     hitbox: Hitbox,
     style: Style,
     layout: LayoutItemsResponse,
+    /// The padding box, where the rows are clipped and hit.
+    viewport: Bounds<Pixels>,
     /// Whether a row escapes the list's clip, which keeps the clip from being painted exactly.
     escape_inside: bool,
 }
@@ -1004,16 +1022,52 @@ impl StateInner {
         )
     }
 
+    /// The rows that show in a padding box `height` tall at `scroll_top`, the ones in the top
+    /// padding included.
     fn visible_range(
         items: &SumTree<ListItem>,
         height: Pixels,
+        padding_top: Pixels,
         scroll_top: &ListOffset,
     ) -> Range<usize> {
+        let first = Self::first_visible_row(items, padding_top, scroll_top);
         let mut cursor = items.cursor::<ListItemSummary>(());
-        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
-        let start_y = cursor.start().height + scroll_top.offset_in_item;
-        cursor.seek_forward(&Height(start_y + height), Bias::Left);
-        scroll_top.item_ix..cursor.start().count + 1
+        cursor.seek(&Count(first.item_ix), Bias::Right);
+        let scrolled = cursor.start().height + first.offset_in_item;
+        cursor.seek_forward(&Height(scrolled - padding_top + height), Bias::Left);
+        first.item_ix..cursor.start().count + 1
+    }
+
+    /// The first row that shows in the padding box, and how far the scroll top is below its top.
+    /// The padding box starts `padding_top` above the rows' scroll offset, so the row holding that
+    /// edge is above the scroll top's row when the scroll top is less than `padding_top` into its
+    /// row.
+    fn first_visible_row(
+        items: &SumTree<ListItem>,
+        padding_top: Pixels,
+        scroll_top: &ListOffset,
+    ) -> ListOffset {
+        if padding_top <= px(0.) || scroll_top.offset_in_item >= padding_top {
+            return *scroll_top;
+        }
+        let (anchor, ..) = items.find::<ListItemSummary, _>(
+            (),
+            &Count(scroll_top.item_ix),
+            Bias::Right,
+        );
+        let scrolled = anchor.height + scroll_top.offset_in_item;
+        let (first, ..) = items.find::<ListItemSummary, _>(
+            (),
+            &Height((scrolled - padding_top).max(px(0.))),
+            Bias::Right,
+        );
+        if first.count >= scroll_top.item_ix {
+            return *scroll_top;
+        }
+        ListOffset {
+            item_ix: first.count,
+            offset_in_item: scrolled - first.height,
+        }
     }
 
     /// The scroll position of the list's first visible edge, and the furthest it can go.
@@ -1066,7 +1120,8 @@ impl StateInner {
         }
 
         if let Some(handler) = self.scroll_handler.as_mut() {
-            let visible_range = Self::visible_range(&self.items, height, &new_offset);
+            let padding_top = self.last_padding.unwrap_or_default().top;
+            let visible_range = Self::visible_range(&self.items, height, padding_top, &new_offset);
             handler(
                 &ListScrollEvent {
                     visible_range,
@@ -1206,12 +1261,21 @@ impl StateInner {
             self.logical_scroll_top = Some(scroll_top);
         }
 
+        // Rows that end below the top of the padding box show, so the walk starts above the scroll
+        // top when its row starts less than the top padding above it.
+        let first_row = Self::first_visible_row(&old_items, padding.top, &scroll_top);
+        let mut first_row_offset = first_row.offset_in_item;
         let mut cursor = old_items.cursor::<Count>(());
 
         // Render items after the scroll top, including those in the trailing overdraw
-        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
+        cursor.seek(&Count(first_row.item_ix), Bias::Right);
         for (ix, item) in cursor.by_ref().enumerate() {
-            let visible_height = rendered_height - scroll_top.offset_in_item;
+            let item_index = first_row.item_ix + ix;
+            if item_index == scroll_top.item_ix {
+                // The rows above were measured on the way: where the scroll top is follows them.
+                first_row_offset = rendered_height - padding.top + scroll_top.offset_in_item;
+            }
+            let visible_height = rendered_height - first_row_offset;
             if visible_height >= available_height + self.overdraw {
                 break;
             }
@@ -1221,14 +1285,13 @@ impl StateInner {
 
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
             if visible_height < available_height || size.is_none() {
-                let item_index = scroll_top.item_ix + ix;
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root_unsnapped(available_item_space, window, cx);
                 size = Some(element_size);
 
                 // If there's a pending scroll adjustment for the scroll-top
                 // item, apply it.
-                if ix == 0 {
+                if item_index == scroll_top.item_ix {
                     if let Some(pending_scroll) = self.pending_scroll.take() {
                         match pending_scroll {
                             PendingScroll::Absolute { item_ix, offset }
@@ -1249,6 +1312,7 @@ impl StateInner {
                             _ => {}
                         }
                     }
+                    first_row_offset = rendered_height - padding.top + scroll_top.offset_in_item;
                 }
 
                 if visible_height < available_height {
@@ -1273,13 +1337,14 @@ impl StateInner {
         }
         rendered_height += padding.bottom;
 
-        // Prepare to start walking upward from the item at the scroll top.
-        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
+        // Prepare to start walking upward from the first row built.
+        cursor.seek(&Count(first_row.item_ix), Bias::Right);
 
         // If the rendered items do not fill the visible region, then adjust
-        // the scroll top upward.
-        if !self.fills_viewport(rendered_height - scroll_top.offset_in_item, available_height) {
-            while rendered_height < available_height {
+        // the scroll top upward. A row above the first shows in the top padding while the scroll
+        // top is less than that padding into the first.
+        if !self.fills_viewport(rendered_height - first_row_offset, available_height) {
+            while rendered_height < available_height + padding.top {
                 cursor.prev();
                 if let Some(item) = cursor.item() {
                     let item_index = cursor.start().0;
@@ -1322,10 +1387,11 @@ impl StateInner {
                     self.logical_scroll_top = None;
                 }
             };
+            first_row_offset = scroll_top.offset_in_item;
         }
 
         // Measure items in the leading overdraw
-        let mut leading_overdraw = scroll_top.offset_in_item;
+        let mut leading_overdraw = first_row_offset;
         while leading_overdraw < self.overdraw {
             cursor.prev();
             if let Some(item) = cursor.item() {
@@ -1393,10 +1459,12 @@ impl StateInner {
         LayoutItemsResponse {
             max_item_width,
             scroll_top,
+            first_row_offset,
             item_layouts,
         }
     }
 
+    /// `bounds` is the padding box, `unsnapped` the same box as layout sized it.
     fn prepaint_items(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1437,7 +1505,7 @@ impl StateInner {
                 let scrolled = self.scroll_top(&layout_response.scroll_top);
                 let scroll_snap = scrolled - round_to_device_half_up(scrolled, window.scale_factor());
                 let mut item_origin = unsnapped.origin + Point::new(padding.left, padding.top);
-                item_origin.y += scroll_snap - layout_response.scroll_top.offset_in_item;
+                item_origin.y += scroll_snap - layout_response.first_row_offset;
                 for item in &mut layout_response.item_layouts {
                     window.with_exact_hit_mask(Some(ContentMask::from_bounds(bounds)), |window| {
                         item.element.prepaint_at_fractional(item_origin, window, cx);
@@ -1740,8 +1808,11 @@ impl Element for List {
             .interactivity
             .layout_id
             .expect("a list requests layout before it prepaints");
-        let unsnapped = window.layout_unsnapped_bounds(layout_id);
-        let padding = window.layout_insets(layout_id).padding;
+        let insets = window.layout_insets(layout_id);
+        let padding = insets.padding;
+        // A scroller's client box is its padding box, as the rows' clip and range are.
+        let unsnapped = padding_box(window.layout_unsnapped_bounds(layout_id), &insets.border);
+        let viewport = padding_box(bounds, &insets.border);
         let content_width = padded_width(unsnapped.size.width, &padding);
 
         // A change in the width rows get, from the list's own width or its
@@ -1771,18 +1842,18 @@ impl Element for List {
 
         let escapes_before = window.escapes_prepainted();
         let layout = window.with_hitbox_parent(&hitbox, |window| {
-            match state.prepaint_items(bounds, unsnapped, padding, true, &mut self.render_item, window, cx) {
+            match state.prepaint_items(viewport, unsnapped, padding, true, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
                 Err(autoscroll_request) => {
                     state.logical_scroll_top = Some(autoscroll_request);
                     state
-                        .prepaint_items(bounds, unsnapped, padding, false, &mut self.render_item, window, cx)
+                        .prepaint_items(viewport, unsnapped, padding, false, &mut self.render_item, window, cx)
                         .unwrap()
                 }
             }
         });
 
-        state.last_layout_bounds = Some(bounds);
+        state.last_layout_bounds = Some(viewport);
         state.last_content_width = Some(content_width);
         state.last_padding = Some(padding);
         // The overlay reads the list state, which must not be borrowed meanwhile.
@@ -1807,6 +1878,7 @@ impl Element for List {
             hitbox,
             style,
             layout,
+            viewport,
             escape_inside: window.escapes_prepainted() != escapes_before,
         }
     }
@@ -1829,7 +1901,8 @@ impl Element for List {
         // to prevent the list from scrolling. This matches the ordering of
         // div-based scroll containers.
         let list_state = self.state.clone();
-        let height = bounds.size.height;
+        let viewport = prepaint.viewport;
+        let height = viewport.size.height;
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox = prepaint.hitbox.clone();
         // Set with `InteractiveElement::overscroll_behavior`; a list scrolls along y only.
@@ -1892,7 +1965,7 @@ impl Element for List {
             .style
             .paint_with_effects(bounds, window, cx, |window, cx| {
                 window.with_overflow_clip(
-                    Some(ContentMask::from_bounds(bounds)),
+                    Some(ContentMask::from_bounds(viewport)),
                     escape_inside,
                     |window| {
                         for item in &mut layout.item_layouts {
@@ -3548,5 +3621,196 @@ mod test {
         let expected = Bounds::new(point(px(6.), px(3.)), size(px(100.), px(61.)));
         assert_eq!(painted.borrow().as_slice(), &[expected]);
         assert_eq!(painted_layout.borrow().as_slice(), &[expected]);
+    }
+
+    /// A list of rows of 20 at (6, 4) with a 100 by 80 border box, a border of 2 above, 3 below, 5 on
+    /// the left and 1 on the right, and 30 of padding above and 7 on the left. `seen` holds the
+    /// unsnapped box of every row prepainted.
+    struct BorderedList(ListState, Rc<RefCell<Vec<Option<Bounds<Pixels>>>>>);
+    impl Render for BorderedList {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.1.clone();
+            let rows = list(self.0.clone(), move |ix, _, _| {
+                let seen = seen.clone();
+                div()
+                    .h(px(20.))
+                    .w_full()
+                    .on_prepainted_layout(move |_, layout_id, window, _| {
+                        let bounds = window.layout_unsnapped_bounds(layout_id);
+                        let mut seen = seen.borrow_mut();
+                        if seen.len() <= ix {
+                            seen.resize(ix + 1, None);
+                        }
+                        seen[ix] = Some(bounds);
+                    })
+                    .into_any()
+            })
+            .absolute()
+            .left(px(6.))
+            .top(px(4.))
+            .w(px(100.))
+            .h(px(80.))
+            .border_t(px(2.))
+            .border_b(px(3.))
+            .border_l(px(5.))
+            .border_r(px(1.))
+            .pt(px(30.))
+            .pl(px(7.));
+            div().relative().w_full().h_full().child(rows)
+        }
+    }
+
+    fn draw_bordered_list(
+        state: &ListState,
+        seen: &Rc<RefCell<Vec<Option<Bounds<Pixels>>>>>,
+        cx: &mut crate::VisualTestContext,
+    ) {
+        seen.borrow_mut().clear();
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(150.)), |_, cx| {
+            cx.new(|_| BorderedList(state.clone(), seen.clone())).into_any_element()
+        });
+    }
+
+    /// A list scrolls in its padding box, as a div does: the client size, the range and the rows'
+    /// position leave out the border.
+    #[gpui::test]
+    fn test_a_list_scrolls_in_its_padding_box(cx: &mut TestAppContext) {
+        for scale in [1.0, 2.0] {
+            let cx = cx.add_empty_window();
+            cx.update(|window, _| window.set_scale_factor(scale));
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let state = ListState::new(10, crate::ListAlignment::Top, px(300.))
+                .with_uniform_item_height(px(20.));
+            draw_bordered_list(&state, &seen, cx);
+
+            // 100 less 5 and 1 wide, 80 less 2 and 3 tall.
+            let dom = state.dom_scroll().expect("the list was laid out");
+            assert_eq!(dom.client, size(px(94.), px(75.)), "client box at scale {scale}");
+            assert_eq!(dom.content_height, px(230.), "scrollHeight at scale {scale}");
+            assert_eq!(state.max_offset_for_scrollbar().y, px(155.), "range at scale {scale}");
+            assert_eq!(
+                state.viewport_bounds(),
+                Bounds::new(point(px(11.), px(6.)), size(px(94.), px(75.))),
+                "the padding box at scale {scale}"
+            );
+
+            let first = seen.borrow()[0].expect("the first row is built");
+            assert_eq!(
+                first.origin,
+                point(px(6. + 5. + 7.), px(4. + 2. + 30.)),
+                "the rows start inside the border and the padding at scale {scale}"
+            );
+            assert_eq!(first.size.width, px(94. - 7.), "a row is as wide as the padding box less the padding");
+
+            state.set_offset_from_scrollbar(point(px(0.), px(-1e6)));
+            draw_bordered_list(&state, &seen, cx);
+            assert_eq!(
+                state.dom_scroll().expect("the list was laid out").top,
+                px(155.),
+                "a write past the end stops at the range at scale {scale}"
+            );
+        }
+    }
+
+    /// A row that ends 5 below the top of the padding box shows in the 30 of padding above the
+    /// rows, though the scroll top is in the row below it.
+    #[gpui::test]
+    fn test_a_row_in_the_top_padding_is_built(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| window.set_scale_factor(1.));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let state = ListState::new(10, crate::ListAlignment::Top, px(300.))
+            .with_uniform_item_height(px(20.));
+        // The scroll offset is 45: rows 0 and 1 end at -15 + 20 and 5 + 20 below the padding box's top.
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 2,
+            offset_in_item: px(5.),
+        });
+        draw_bordered_list(&state, &seen, cx);
+
+        let seen = seen.borrow();
+        let padding_box_top = px(4. + 2.);
+        let row = |ix: usize| seen.get(ix).copied().flatten();
+        let row_zero = row(0).expect("a row that ends in the top padding is built");
+        assert_eq!(row_zero.origin.y, padding_box_top + px(30. - 45.));
+        assert_eq!(row_zero.bottom(), padding_box_top + px(5.));
+        assert_eq!(row(1).expect("the row below it").origin.y, padding_box_top + px(30. - 25.));
+        assert_eq!(
+            state.logical_scroll_top().item_ix,
+            2,
+            "the scroll top is still the row it was"
+        );
+        assert_eq!(state.dom_scroll().expect("laid out").top, px(45.));
+    }
+
+    /// A row that ends exactly at the top of the padding box shows nothing of it and is not built.
+    #[gpui::test]
+    fn test_a_row_above_the_padding_box_is_not_built(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| window.set_scale_factor(1.));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let state = ListState::new(10, crate::ListAlignment::Top, px(300.))
+            .with_uniform_item_height(px(20.));
+        // Row 0 ends at 30 - 50 + 20: the top of the padding box.
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 2,
+            offset_in_item: px(10.),
+        });
+        draw_bordered_list(&state, &seen, cx);
+
+        let seen = seen.borrow();
+        assert!(seen.first().copied().flatten().is_none(), "row 0 shows nothing");
+        assert!(seen.get(1).copied().flatten().is_some());
+    }
+
+    /// The end of a bottom-aligned list is the scroll top of the row where the rows and the padding
+    /// reach the bottom, and the row above shows in the top padding when that scroll top is less than
+    /// the padding into its row.
+    #[gpui::test]
+    fn test_a_bottom_aligned_list_builds_the_row_in_its_top_padding(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| window.set_scale_factor(1.));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let state = ListState::new(10, crate::ListAlignment::Bottom, px(300.))
+            .with_uniform_item_height(px(20.));
+        draw_bordered_list(&state, &seen, cx);
+        draw_bordered_list(&state, &seen, cx);
+
+        // 230 of content in 75: the scroll offset is 155, 15 into row 7. Row 6 spans -5 to 15 in the
+        // padding box and row 5 ends at -5.
+        assert_eq!(state.dom_scroll().expect("laid out").top, px(155.));
+        let seen = seen.borrow();
+        assert!(
+            seen.get(6).copied().flatten().is_some(),
+            "row 6 is in the top padding"
+        );
+        assert!(seen.get(5).copied().flatten().is_none(), "row 5 is above the padding box");
+    }
+
+    /// The range a scroll reports is the rows in the padding box, those in the top padding included.
+    #[gpui::test]
+    fn test_the_visible_range_starts_in_the_top_padding(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| window.set_scale_factor(1.));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let state = ListState::new(10, crate::ListAlignment::Top, px(300.))
+            .with_uniform_item_height(px(20.));
+        let ranges = Rc::new(RefCell::new(Vec::new()));
+        let recorded = ranges.clone();
+        state.set_scroll_handler(move |event, _, _| recorded.borrow_mut().push(event.visible_range.clone()));
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 2,
+            offset_in_item: px(5.),
+        });
+        draw_bordered_list(&state, &seen, cx);
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(30.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-1.))),
+            ..Default::default()
+        });
+
+        // The padding box shows the rows from 16 to 91 (75 tall): rows 0 to 4.
+        assert_eq!(ranges.borrow().as_slice(), &[0..5]);
     }
 }
