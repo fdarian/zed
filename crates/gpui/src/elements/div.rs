@@ -276,7 +276,7 @@ impl Interactivity {
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Capture
                     && !window.has_active_prompt()
-                    && !hitbox.contains(&window.mouse_position())
+                    && !hitbox.contains_window_point(window.mouse_position())
                 {
                     (listener)(event, window, cx)
                 }
@@ -3714,14 +3714,19 @@ impl Interactivity {
                         size: text.size(FONT_SIZE),
                     };
                     if let Some(source_location) = self.source_location
-                        && text_bounds.contains(&window.mouse_position())
+                        && hitbox
+                            .to_local(window.mouse_position())
+                            .is_some_and(|local| text_bounds.contains(&local))
                         && window.modifiers().secondary()
                     {
                         let secondary_held = window.modifiers().secondary();
                         window.on_key_event({
+                            let hitbox = hitbox.clone();
                             move |e: &crate::ModifiersChangedEvent, _phase, window, _cx| {
                                 if e.modifiers.secondary() != secondary_held
-                                    && text_bounds.contains(&window.mouse_position())
+                                    && hitbox
+                                        .to_local(window.mouse_position())
+                                        .is_some_and(|local| text_bounds.contains(&local))
                                 {
                                     window.refresh();
                                 }
@@ -4034,7 +4039,8 @@ impl Interactivity {
                             && mouse_down.button == MouseButton::Left
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
-                            let cursor_offset = event.position - hitbox.origin;
+                            // The preview is drawn in the window, so the offset is measured there.
+                            let cursor_offset = window.mouse_position() - hitbox.window_bounds().origin;
                             let drag = (listener.render)(
                                 listener.value.as_ref(),
                                 cursor_offset,
@@ -4249,11 +4255,11 @@ impl Interactivity {
                 // Use bounds instead of testing hitbox since this is called during prepaint.
                 let check_is_hovered_during_prepaint = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
-                    let source_bounds = hitbox.bounds;
+                    let source = hitbox.clone();
                     move |window: &Window| {
                         !window.last_input_was_keyboard()
                             && pending_mouse_down.borrow().is_none()
-                            && source_bounds.contains(&window.mouse_position())
+                            && source.contains_window_point(window.mouse_position())
                     }
                 });
                 let check_is_hovered = Rc::new({

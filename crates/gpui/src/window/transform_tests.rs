@@ -585,11 +585,12 @@ mod elements {
     //! scrollable overflow and culling around it end up.
 
     use crate::{
-        AnyElement, Context, Edges, ElementTransform, IntoElement, ParentElement, Quad, Render,
+        AnyElement, Context, Edges, ElementId, ElementTransform, Hitbox, IntoElement, ParentElement, Quad, Render,
         ScrollHandle, Styled, TestApp, TestAppWindow, TransformFunction, TransformLength,
-        TransformationMatrix, Window, blue, div, point, px, red, InteractiveElement,
+        TransformationMatrix, Window, blue, canvas, div, point, px, red, InteractiveElement,
         StatefulInteractiveElement,
     };
+    use super::{css, rotation};
     use std::{cell::RefCell, rc::Rc};
 
     struct Scene {
@@ -606,6 +607,8 @@ mod elements {
         let mut app = TestApp::new();
         let build: Rc<dyn Fn() -> AnyElement> = Rc::new(build);
         let mut window = app.open_window(move |_, _| Scene { build });
+        // `always_hitbox` is for this mode.
+        window.update(|_, window, _| window.set_dom_hit_testing(true));
         window.draw();
         (app, window)
     }
@@ -921,5 +924,349 @@ mod elements {
         let before = window.update(|_, window, _| window.culled_subtree_count());
         window.draw();
         assert_eq!(window.update(|_, window, _| window.culled_subtree_count()) - before, 1);
+    }
+
+    fn hits(window: &mut TestAppWindow<Scene>, x: f32, y: f32) -> Vec<String> {
+        window.update(|_, window, _| {
+            let hit = window.rendered_frame.hit_test(point(px(x), px(y)), true);
+            hit.ids
+                .iter()
+                .filter_map(|id| window.rendered_frame.hitboxes.iter().find(|hitbox| hitbox.id == *id))
+                .filter_map(|hitbox| match hitbox.identity.as_ref()?.last()? {
+                    ElementId::Name(name) => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    fn hitbox_named(window: &mut TestAppWindow<Scene>, name: &'static str) -> Hitbox {
+        window.update(|_, window, _| {
+            window
+                .rendered_frame
+                .hitboxes
+                .iter()
+                .find(|hitbox| {
+                    hitbox.identity.as_ref().and_then(|id| id.last()) == Some(&ElementId::Name(name.into()))
+                })
+                .unwrap_or_else(|| panic!("no hitbox {name}"))
+                .clone()
+        })
+    }
+
+    fn at(matrix: TransformationMatrix, x: f32, y: f32) -> (f32, f32) {
+        let mapped = matrix.apply_xy(x, y);
+        (mapped[0], mapped[1])
+    }
+
+    fn bar(transform: ElementTransform) -> AnyElement {
+        div()
+            .size_full()
+            .child(
+                div()
+                    .id("bar")
+                    .always_hitbox()
+                    .absolute()
+                    .left(px(50.))
+                    .top(px(60.))
+                    .w(px(100.))
+                    .h(px(40.))
+                    .transform(transform),
+            )
+            .into_any_element()
+    }
+
+    #[test]
+    fn a_point_in_the_rotated_box_but_outside_the_plain_one_hits_it_and_the_other_way_round() {
+        let (_app, mut window) = open(|| bar(about_center(vec![TransformFunction::Rotate(90f32.to_radians())])));
+        // The box turned upright covers x in [80, 120] and y in [30, 130] about (100, 80).
+        assert_eq!(hits(&mut window, 100., 40.), ["bar"]);
+        assert_eq!(hits(&mut window, 100., 125.), ["bar"]);
+        assert!(hits(&mut window, 60., 80.).is_empty(), "inside the box before it turned");
+        assert!(hits(&mut window, 140., 80.).is_empty());
+
+        let bar = hitbox_named(&mut window, "bar");
+        assert_eq!(bar.bounds, crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(100.), px(40.))));
+        let local = bar.to_local(point(px(100.), px(40.))).unwrap();
+        assert!((local.x.0 - 60.).abs() < 1e-3 && (local.y.0 - 80.).abs() < 1e-3, "{local:?}");
+        let window_bounds = bar.window_bounds();
+        assert!((window_bounds.origin.x.0 - 80.).abs() < 1e-3 && (window_bounds.size.height.0 - 100.).abs() < 1e-3);
+        assert!(bar.contains_window_point(point(px(100.), px(40.))));
+        assert!(!bar.contains_window_point(point(px(60.), px(80.))));
+    }
+
+    #[test]
+    fn a_translated_box_is_hit_where_it_is_painted() {
+        let (_app, mut window) = open(|| {
+            bar(about_top_left(vec![TransformFunction::Translate(
+                TransformLength::pixels(100.),
+                TransformLength::pixels(0.),
+            )]))
+        });
+        assert_eq!(hits(&mut window, 200., 80.), ["bar"]);
+        assert!(hits(&mut window, 100., 80.).is_empty());
+        let bar = hitbox_named(&mut window, "bar");
+        let local = bar.to_local(point(px(200.), px(80.))).unwrap();
+        assert_eq!((local.x.0, local.y.0), (100., 80.));
+    }
+
+    #[test]
+    fn a_box_scaled_to_nothing_is_hit_nowhere() {
+        let (_app, mut window) = open(|| {
+            bar(about_center(vec![TransformFunction::Scale(0., 0.)]))
+        });
+        for (x, y) in [(100., 80.), (60., 70.), (140., 90.)] {
+            assert!(hits(&mut window, x, y).is_empty());
+        }
+        assert!(hitbox_named(&mut window, "bar").to_local(point(px(100.), px(80.))).is_none());
+    }
+
+    /// A 100 by 100 clipping box at (50, 50) turned 30 degrees about its center, with a box in
+    /// it from x = 110 to 210: it overflows to the right.
+    fn clipping_parent(child_transform: Option<ElementTransform>) -> AnyElement {
+        let mut child = div().id("child").always_hitbox().absolute().left(px(60.)).top(px(10.)).w(px(100.)).h(px(80.));
+        if let Some(transform) = child_transform {
+            child = child.transform(transform);
+        }
+        div()
+            .size_full()
+            .child(
+                div()
+                    .id("parent")
+                    .always_hitbox()
+                    .absolute()
+                    .left(px(50.))
+                    .top(px(50.))
+                    .w(px(100.))
+                    .h(px(100.))
+                    .overflow_hidden()
+                    .transform(about_center(vec![TransformFunction::Rotate(30f32.to_radians())]))
+                    .child(child),
+            )
+            .into_any_element()
+    }
+
+    fn parent_matrix() -> TransformationMatrix {
+        about_center(vec![TransformFunction::Rotate(30f32.to_radians())])
+            .resolve(crate::Bounds::new(point(px(50.), px(50.)), crate::size(px(100.), px(100.))))
+    }
+
+    #[test]
+    fn an_overflowing_box_is_hit_only_inside_the_clip_of_its_turned_parent() {
+        let (_app, mut window) = open(|| clipping_parent(None));
+        let matrix = parent_matrix();
+        // Parent-local points: the child covers x in [110, 210], y in [60, 140]; the clip is x in
+        // [50, 150], y in [50, 150].
+        let (x, y) = at(matrix, 140., 100.);
+        assert_eq!(hits(&mut window, x, y), ["child", "parent"]);
+        let (x, y) = at(matrix, 180., 100.);
+        assert!(hits(&mut window, x, y).is_empty(), "inside the child and outside the clip");
+        let (x, y) = at(matrix, 80., 100.);
+        assert_eq!(hits(&mut window, x, y), ["parent"]);
+        // The plain place of that overflow is nowhere near the turned one.
+        assert!(hits(&mut window, 180., 100.).is_empty());
+    }
+
+    #[test]
+    fn a_turned_box_in_a_clipping_turned_parent_is_hit_inside_the_loose_clip() {
+        let own = about_center(vec![TransformFunction::Rotate(60f32.to_radians())]);
+        let (_app, mut window) = open({
+            let own = own.clone();
+            move || clipping_parent(Some(own.clone()))
+        });
+        // The child's box in parent-local space, turned about its center by its own transform,
+        // then by the parent's.
+        let child = own.resolve(crate::Bounds::new(point(px(110.), px(60.)), crate::size(px(100.), px(80.))));
+        let both = parent_matrix().compose(child);
+        // The child's center, (160, 100) in layout, is outside the clip of the parent (x < 150),
+        // but its corner nearest the parent's center is inside.
+        let (x, y) = at(both, 115., 100.);
+        assert_eq!(hits(&mut window, x, y), ["child", "parent"]);
+        // Far from the clip, wherever the child reaches.
+        let (x, y) = at(both, 205., 100.);
+        assert!(hits(&mut window, x, y).is_empty());
+    }
+
+    #[test]
+    fn a_listener_under_a_scale_is_given_the_position_in_the_element() {
+        use crate::{MouseButton, MouseDownEvent, Point};
+        use std::{cell::RefCell, rc::Rc};
+        let seen: Rc<RefCell<Vec<(&'static str, Point<crate::Pixels>)>>> = Rc::default();
+        let (_app, mut window) = open({
+            let seen = seen.clone();
+            move || {
+                let outside = canvas(|_, _, _| (), {
+                    let seen = seen.clone();
+                    move |_, (): (), window, _| {
+                        let seen = seen.clone();
+                        window.on_mouse_event(move |event: &MouseDownEvent, _, _, _| {
+                            seen.borrow_mut().push(("window", event.position))
+                        });
+                    }
+                });
+                let inside = canvas(|_, _, _| (), {
+                    let seen = seen.clone();
+                    move |_, (): (), window, _| {
+                        let seen = seen.clone();
+                        window.on_mouse_event(move |event: &MouseDownEvent, _, _, _| {
+                            seen.borrow_mut().push(("canvas", event.position))
+                        });
+                    }
+                });
+                div()
+                    .size_full()
+                    .child(outside.absolute().size_full())
+                    .child(
+                        div()
+                            .id("scaled")
+                            .absolute()
+                            .left(px(10.))
+                            .top(px(10.))
+                            .w(px(50.))
+                            .h(px(50.))
+                            .transform(about_top_left(vec![TransformFunction::Scale(2., 2.)]))
+                            .on_mouse_down(MouseButton::Left, {
+                                let seen = seen.clone();
+                                move |event, _, _| seen.borrow_mut().push(("div", event.position))
+                            })
+                            .child(inside.size_full()),
+                    )
+                    .into_any_element()
+            }
+        });
+        window.simulate_mouse_down(point(px(50.), px(70.)), MouseButton::Left);
+        let seen = seen.borrow();
+        let position_of = |who: &str| seen.iter().find(|(name, _)| *name == who).unwrap().1;
+        // The box covers [10, 110] after the scale, so (50, 70) is 40 and 60 into it: 20 and 30
+        // in its own units, from its corner at (10, 10).
+        assert_eq!(position_of("window"), point(px(50.), px(70.)));
+        assert_eq!(position_of("div"), point(px(30.), px(40.)));
+        assert_eq!(position_of("canvas"), point(px(30.), px(40.)));
+        assert_eq!(window.update(|_, window, _| window.mouse_position()), point(px(50.), px(70.)));
+    }
+
+    #[test]
+    fn a_listener_in_a_flat_space_is_not_called() {
+        use crate::{MouseButton, MouseDownEvent};
+        use std::{cell::Cell, rc::Rc};
+        let called = Rc::new(Cell::new(0));
+        let (_app, mut window) = open({
+            let called = called.clone();
+            move || {
+                div()
+                    .size_full()
+                    .child(
+                        div()
+                            .id("flat")
+                            .w(px(50.))
+                            .h(px(50.))
+                            .transform(about_top_left(vec![TransformFunction::Scale(0., 1.)]))
+                            .on_mouse_down(MouseButton::Left, {
+                                let called = called.clone();
+                                move |_: &MouseDownEvent, _, _| called.set(called.get() + 1)
+                            }),
+                    )
+                    .into_any_element()
+            }
+        });
+        window.simulate_mouse_down(point(px(10.), px(10.)), MouseButton::Left);
+        assert_eq!(called.get(), 0);
+    }
+
+    #[test]
+    fn deferred_and_anchored_content_under_a_transform_draws() {
+        let (_app, mut window) = open(|| {
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .id("turned")
+                        .absolute()
+                        .left(px(50.))
+                        .top(px(60.))
+                        .w(px(100.))
+                        .h(px(40.))
+                        .transform(about_center(vec![TransformFunction::Rotate(30f32.to_radians())]))
+                        .child(crate::deferred(div().id("deferred").always_hitbox().w(px(10.)).h(px(10.))))
+                        .child(
+                            crate::anchored()
+                                .child(div().id("anchored").always_hitbox().w(px(10.)).h(px(10.))),
+                        ),
+                )
+                .into_any_element()
+        });
+        window.draw();
+        for name in ["deferred", "anchored"] {
+            let hitbox = hitbox_named(&mut window, name);
+            assert!(hitbox.bounds.size.width == px(10.), "{name} is laid out");
+        }
+    }
+
+    /// The hitboxes a prepaint inserts inside the transforms, named by the order they are in.
+    fn inserted_in(
+        transforms: Vec<TransformationMatrix>,
+        bounds: crate::Bounds<crate::Pixels>,
+    ) -> Hitbox {
+        use crate::HitboxBehavior;
+        use std::{cell::RefCell, rc::Rc};
+        let inserted: Rc<RefCell<Option<Hitbox>>> = Rc::default();
+        let (_app, _window) = open({
+            let inserted = inserted.clone();
+            move || {
+                let (transforms, inserted) = (transforms.clone(), inserted.clone());
+                canvas(
+                    move |_, window, _| {
+                        fn nest(
+                            window: &mut Window,
+                            transforms: &[TransformationMatrix],
+                            bounds: crate::Bounds<crate::Pixels>,
+                        ) -> Hitbox {
+                            match transforms.split_first() {
+                                None => window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                                Some((first, rest)) => {
+                                    window.with_transform(*first, |window| nest(window, rest, bounds))
+                                }
+                            }
+                        }
+                        *inserted.borrow_mut() = Some(nest(window, &transforms, bounds));
+                    },
+                    |_, (): (), _, _| {},
+                )
+                .size_full()
+                .into_any_element()
+            }
+        });
+        inserted.borrow_mut().take().unwrap()
+    }
+
+    #[test]
+    fn a_hitbox_moved_by_a_relocation_is_hit_where_the_primitives_are_put() {
+        use crate::ContentMask;
+        let bounds = crate::Bounds::new(point(px(10.), px(10.)), crate::size(px(40.), px(20.)));
+        let everywhere = ContentMask::from_bounds(crate::Bounds::new(point(px(-1e4), px(-1e4)), crate::size(px(2e4), px(2e4))));
+        let delta = point(px(0.), px(64.));
+
+        // Under a translation the box and the space stay together: the bounds move.
+        let hitbox = inserted_in(vec![css([1., 0., 0., 1., 100., 0.])], bounds);
+        let moved = hitbox.relocated(delta, &everywhere);
+        assert_eq!(moved.bounds.origin, bounds.origin + delta);
+        assert!(moved.contains_window_point(point(px(130.), px(84.))));
+        assert!(!moved.contains_window_point(point(px(130.), px(20.))));
+
+        // Under a rotation the box stays in its own space and the space moves.
+        let hitbox = inserted_in(vec![rotation(90.)], bounds);
+        let moved = hitbox.relocated(delta, &everywhere);
+        assert_eq!(moved.bounds, bounds);
+        // (30, 20) turns to (-20, 30) and moves down to (-20, 94).
+        assert!(moved.contains_window_point(point(px(-20.), px(94.))));
+        assert!(!moved.contains_window_point(point(px(-20.), px(30.))));
+        let local = moved.to_local(point(px(-20.), px(94.))).unwrap();
+        assert!((local.x.0 - 30.).abs() < 1e-3 && (local.y.0 - 20.).abs() < 1e-3, "{local:?}");
+
+        // A turn inside a translation, which the translation's own relocation carries.
+        let hitbox = inserted_in(vec![css([1., 0., 0., 1., 100., 0.]), rotation(90.)], bounds);
+        let moved = hitbox.relocated(delta, &everywhere);
+        assert_eq!(moved.bounds, bounds);
+        assert!(moved.contains_window_point(point(px(80.), px(94.))));
     }
 }

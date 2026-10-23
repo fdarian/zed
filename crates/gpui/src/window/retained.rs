@@ -969,6 +969,7 @@ struct PaintAmbient {
     text_style: TextStyle,
     visibility: Visibility,
     element_opacity: f32,
+    transform: Option<AmbientKey>,
     rem_size: Pixels,
 }
 
@@ -981,6 +982,7 @@ impl PaintAmbient {
             && self.text_style == later.text_style
             && self.visibility == later.visibility
             && self.element_opacity == later.element_opacity
+            && self.transform == later.transform
             && self.rem_size == later.rem_size
     }
 }
@@ -1004,6 +1006,11 @@ pub(crate) struct ReplayKey {
     text_style: TextStyle,
     visibility: Visibility,
     element_opacity: f32,
+    /// The transform around the subtree. A subtree is drawn and hit through it, so it is not
+    /// replayed under another, and not put elsewhere when it is more than a translation: its
+    /// primitives move in the window by the offset of the elements around it, which is not the
+    /// window distance there.
+    transform: Option<AmbientKey>,
     rem_size: Pixels,
     scale_factor: f32,
     viewport_size: Size<Pixels>,
@@ -1097,6 +1104,7 @@ impl ReplayKey {
             || self.text_style != later.text_style
             || self.visibility != later.visibility
             || self.element_opacity != later.element_opacity
+            || self.transform != later.transform
             || self.rem_size != later.rem_size
             || self.scale_factor != later.scale_factor
             || self.viewport_size != later.viewport_size
@@ -1112,7 +1120,9 @@ impl ReplayKey {
             return None;
         }
         let delta = later.snapped_offset - self.snapped_offset;
-        if self.bounds.origin + delta != later.bounds.origin {
+        if self.bounds.origin + delta != later.bounds.origin
+            || (self.transform.as_ref().is_some_and(AmbientKey::is_general) && !delta.is_zero())
+        {
             return None;
         }
         // Where the positioned frame around the subtree is, and whether it moves with the subtree,
@@ -1157,6 +1167,7 @@ impl ReplayKey {
             || self.text_style != later.text_style
             || self.visibility != later.visibility
             || self.element_opacity != later.element_opacity
+            || self.transform != later.transform
             || self.rem_size != later.rem_size
             || self.scale_factor != later.scale_factor
             || self.viewport_size != later.viewport_size
@@ -1172,6 +1183,9 @@ impl ReplayKey {
             return None;
         }
         let delta = later.bounds.origin - self.bounds.origin;
+        if self.transform.as_ref().is_some_and(AmbientKey::is_general) && !delta.is_zero() {
+            return None;
+        }
         let device = delta.scale(self.scale_factor);
         if device.x.0 != device.x.0.round() || device.y.0 != device.y.0.round() {
             return None;
@@ -2344,6 +2358,7 @@ impl Window {
             text_style: self.text_style(),
             visibility: self.visibility,
             element_opacity: self.element_opacity,
+            transform: self.ambient_key(),
             rem_size: self.rem_size(),
         }
     }
@@ -2373,6 +2388,7 @@ impl Window {
             text_style: self.text_style(),
             visibility: self.visibility,
             element_opacity: self.element_opacity,
+            transform: self.ambient_key(),
             rem_size: self.rem_size(),
             scale_factor: self.scale_factor,
             viewport_size: self.viewport_size,

@@ -830,8 +830,37 @@ pub struct DismissEvent;
 
 type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 
-pub(crate) type AnyMouseListener =
-    Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
+/// A mouse listener, with the space it was registered in.
+pub(crate) struct MouseListener {
+    /// Takes the window to local matrix of the listener's space, if it has one, to map the position
+    /// of the event by.
+    handler: Box<
+        dyn FnMut(&dyn Any, Option<&TransformationMatrix>, DispatchPhase, &mut Window, &mut App)
+            + 'static,
+    >,
+    /// `None` outside any transform.
+    space: Option<Rc<HitSpace>>,
+}
+
+impl MouseListener {
+    fn call(
+        &mut self,
+        event: &dyn Any,
+        phase: DispatchPhase,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        match &self.space {
+            None => (self.handler)(event, None, phase, window, cx),
+            // Nothing in a space that is flat can be pointed at.
+            Some(space) => {
+                if let Some(to_local) = &space.to_local {
+                    (self.handler)(event, Some(to_local), phase, window, cx)
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct CursorStyleRequest {
@@ -859,6 +888,29 @@ impl Eq for HitTest {}
 struct HitChainLink {
     identity: Option<GlobalElementId>,
     bounds: Bounds<Pixels>,
+    window_bounds: Bounds<Pixels>,
+    space: Option<Rc<HitSpace>>,
+}
+
+/// One hitbox of [`Window::hit_chain_entries`].
+pub struct HitChainEntry<'a> {
+    /// The element id the hitbox was inserted under.
+    pub id: &'a GlobalElementId,
+    /// The bounds of the hitbox in the space of the element, see [`Hitbox::bounds`].
+    pub bounds: Bounds<Pixels>,
+    /// The bounding box of `bounds` in the window.
+    pub window_bounds: Bounds<Pixels>,
+    space: Option<&'a Rc<HitSpace>>,
+}
+
+impl HitChainEntry<'_> {
+    /// Where the window point `position` is in the space of the hitbox, see [`Hitbox::to_local`].
+    pub fn to_local(&self, position: Point<Pixels>) -> Option<Point<Pixels>> {
+        match self.space {
+            None => Some(position),
+            Some(space) => space.to_local.as_ref().map(|to_local| map_point(to_local, position)),
+        }
+    }
 }
 
 /// A type of window control area that corresponds to the platform window.
@@ -954,10 +1006,12 @@ impl HitboxId {
 pub struct Hitbox {
     /// A unique identifier for the hitbox.
     pub id: HitboxId,
-    /// The bounds of the hitbox.
+    /// The bounds of the hitbox, in its own space: the one of the element, which is the window
+    /// unless the hitbox was inserted inside a transform, see [`Hitbox::to_local`].
     #[deref]
     pub bounds: Bounds<Pixels>,
-    /// The content mask when the hitbox was inserted.
+    /// The content mask when the hitbox was inserted, in window space. A clip pushed inside a
+    /// general transform is not in it but in the local clip, see [`Window::with_transform`].
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
@@ -972,12 +1026,16 @@ pub struct Hitbox {
     /// Inserted in a box that escaped to an absolute content mask, which a subtree recorded in a
     /// region of its own does not cut by the content mask around the region.
     unclipped: bool,
+    /// `None` outside any transform.
+    space: Option<Rc<HitSpace>>,
+    /// The clip pushed inside a general transform, in the hitbox's own space.
+    local_clip: Option<ContentMask<Pixels>>,
 }
 
 /// The `overflow` clips around a hitbox that `content_mask` is only an approximation of, as a
 /// list of masks the pointer has to be inside every one of. A hitbox gets them when a nested clip
 /// is not exactly the intersection of its two masks, see [`Window::with_exact_hit_mask`].
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct ExactClips {
     mask: ContentMask<Pixels>,
     outer: Option<Rc<ExactClips>>,
@@ -987,6 +1045,10 @@ struct ExactClips {
 }
 
 impl ExactClips {
+    fn depth(&self) -> usize {
+        1 + self.outer.as_ref().map_or(0, |outer| outer.depth())
+    }
+
     fn contains(&self, position: Point<Pixels>) -> bool {
         self.mask.contains(&position)
             && self.outer.as_ref().is_none_or(|outer| outer.contains(position))
@@ -1025,13 +1087,22 @@ impl Hitbox {
             debug_assert!(delta.is_zero(), "a subtree with a box that escapes is not moved");
             return self.clone();
         }
+        // Under a transform that is more than a translation the hitbox keeps its own space and the
+        // transform carries it to the new place, as it does a primitive.
+        let moves_in_place = self.space.as_ref().is_none_or(|space| space.is_translation());
         let mut bounds = self.bounds;
-        bounds.origin += delta;
-        let clip = self.clip.as_ref().map(|clip| {
-            let mut clip = (**clip).clone();
-            clip.translate(point(delta.x.0, delta.y.0));
-            Rc::new(clip)
-        });
+        let mut clip = self.clip.clone();
+        let mut space = self.space.clone();
+        if moves_in_place {
+            bounds.origin += delta;
+            clip = self.clip.as_ref().map(|clip| {
+                let mut clip = (**clip).clone();
+                clip.translate(point(delta.x.0, delta.y.0));
+                Rc::new(clip)
+            });
+        } else if let Some(current) = &self.space {
+            space = Some(Rc::new(current.moved(delta)));
+        }
         Hitbox {
             id: self.id,
             bounds,
@@ -1046,13 +1117,15 @@ impl Hitbox {
                 .as_ref()
                 .map(|clips| Rc::new(clips.relocated(delta, surroundings))),
             unclipped: false,
+            space,
+            local_clip: self.local_clip,
         }
     }
 
     /// The hitbox as text, for comparing the frames of two builds of the same subtree.
     pub(crate) fn describe(&self) -> String {
         format!(
-            "{:?} {:?} {:?} {:?} {:?} clip {:?} exact {}",
+            "{:?} {:?} {:?} {:?} {:?} clip {:?} exact {} space {:?} local clip {:?}",
             self.identity,
             self.bounds,
             self.content_mask,
@@ -1060,13 +1133,42 @@ impl Hitbox {
             self.corner_radii,
             self.clip,
             self.exact_clips.as_ref().map_or_else(String::new, |clips| clips.describe()),
+            self.space,
+            self.local_clip,
         )
     }
 
     /// Whether the pointer can be on the hitbox anywhere, which a hitbox cut away by its mask
     /// cannot.
     pub(crate) fn is_reachable(&self) -> bool {
-        !self.bounds.intersect(&self.content_mask.bounds).is_empty()
+        !self.window_bounds().intersect(&self.content_mask.bounds).is_empty()
+    }
+
+    /// Where the window point `position` is in the space of the hitbox, the one `bounds` is in:
+    /// `position` itself outside any transform. `None` when a transform that flattens the plane
+    /// is around the hitbox, where nothing can be hit. This is the offset of the pointer in the
+    /// element, as `offsetX` and `offsetY` are in the DOM, once `bounds.origin` is taken off.
+    pub fn to_local(&self, position: Point<Pixels>) -> Option<Point<Pixels>> {
+        match &self.space {
+            None => Some(position),
+            Some(space) => space.to_local.as_ref().map(|to_local| map_point(to_local, position)),
+        }
+    }
+
+    /// The bounds of the hitbox in the window: the bounding box of its corners after the
+    /// transform it was inserted in.
+    pub fn window_bounds(&self) -> Bounds<Pixels> {
+        match &self.space {
+            None => self.bounds,
+            Some(space) => space.to_window.bounding_box(self.bounds),
+        }
+    }
+
+    /// Whether the window point `position` is inside `bounds`, ignoring the content mask, the
+    /// rounded corners and what is in front: the plain geometry that `bounds.contains(&position)`
+    /// is for a hitbox that is not inside a transform.
+    pub fn contains_window_point(&self, position: Point<Pixels>) -> bool {
+        self.to_local(position).is_some_and(|local| self.bounds.contains(&local))
     }
 }
 
@@ -1110,14 +1212,21 @@ impl Hitbox {
     /// content mask it was inserted under. A `clip-path` is not part of this, as it also cuts the
     /// hitboxes inside, see `Frame::clipped_out`.
     fn contains_point(&self, position: Point<Pixels>) -> bool {
-        self.bounds
-            .intersect(&self.content_mask.bounds)
-            .contains(&position)
-            && match &self.exact_clips {
+        // The content mask is in window space and everything else in the space of the hitbox.
+        if !self.content_mask.bounds.contains(&position)
+            || !match &self.exact_clips {
                 Some(clips) => clips.contains(position),
                 None => self.content_mask.contains(&position),
             }
-            && point_in_rounded_rect(position, self.bounds, self.corner_radii)
+        {
+            return false;
+        }
+        let Some(local) = self.to_local(position) else {
+            return false;
+        };
+        self.bounds.contains(&local)
+            && self.local_clip.as_ref().is_none_or(|clip| clip.contains(&local))
+            && point_in_rounded_rect(local, self.bounds, self.corner_radii)
     }
 
     /// The innermost hitbox that enclosed this one when it was inserted, see
@@ -1368,7 +1477,7 @@ pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) accessed_element_states: Vec<(GlobalElementId, TypeId)>,
-    pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
+    pub(crate) mouse_listeners: Vec<Option<MouseListener>>,
     root_key_listeners: Vec<Option<KeyListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -1683,12 +1792,12 @@ impl Frame {
     /// CSS.
     fn clipped_out(&self, clips: &ClipIndex, ix: usize, position: Point<Pixels>) -> bool {
         debug_assert_eq!(clips.enclosing_clip.len(), self.hitboxes.len());
-        let position = Point::new(position.x.0, position.y.0);
         let clipped = |ix: usize| {
-            self.hitboxes[ix]
-                .clip
-                .as_ref()
-                .is_some_and(|clip| !clip.contains(position))
+            let hitbox = &self.hitboxes[ix];
+            hitbox.clip.as_ref().is_some_and(|clip| match hitbox.to_local(position) {
+                Some(local) => !clip.contains(Point::new(local.x.0, local.y.0)),
+                None => true,
+            })
         };
         if clipped(ix) {
             return true;
@@ -1720,6 +1829,8 @@ impl Frame {
             hit_test.chain.push(HitChainLink {
                 identity: hitbox.identity.clone(),
                 bounds: hitbox.bounds,
+                window_bounds: hitbox.window_bounds(),
+                space: hitbox.space.clone(),
             });
             // A parent is inserted before its children unless a z-indexed element moved the
             // child, so look behind first and then ahead.
@@ -2745,6 +2856,62 @@ struct AmbientTransform {
     device_offset: Point<ScaledPixels>,
     /// The clip in the local space of a `General` transform, in logical pixels.
     local_clip: Option<ContentMask<Pixels>>,
+    /// What a hitbox or mouse listener registered inside the transform keeps of it.
+    space: Rc<HitSpace>,
+}
+
+/// How a point maps between the window and the local space of a hitbox or mouse listener that
+/// was registered inside a transform. A translation maps by the rounded offset that painted
+/// content is placed by, so that the pointer hits what is on screen.
+#[derive(Clone, Debug)]
+pub(crate) struct HitSpace {
+    to_window: TransformationMatrix,
+    /// `None` when the transform flattens the plane: nothing inside it can be hit.
+    to_local: Option<TransformationMatrix>,
+}
+
+impl HitSpace {
+    fn new(to_window: TransformationMatrix) -> Self {
+        Self {
+            to_window,
+            to_local: to_window.inverse(),
+        }
+    }
+
+    /// Whether it only moves, so that a subtree moved by `delta` in the window is moved by
+    /// `delta` in the local space as well.
+    fn is_translation(&self) -> bool {
+        self.to_window.is_translation()
+    }
+
+    /// The space after everything in it was moved by `delta` in the window.
+    fn moved(&self, delta: Point<Pixels>) -> HitSpace {
+        let mut to_window = self.to_window;
+        to_window.translation[0] += delta.x.0;
+        to_window.translation[1] += delta.y.0;
+        HitSpace::new(to_window)
+    }
+}
+
+fn map_point(matrix: &TransformationMatrix, position: Point<Pixels>) -> Point<Pixels> {
+    let mapped = matrix.apply_xy(position.x.0, position.y.0);
+    point(px(mapped[0]), px(mapped[1]))
+}
+
+/// What a recording reads of the transform around it: what the primitives and hitboxes of the
+/// subtree are drawn and hit through.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AmbientKey {
+    matrix: TransformationMatrix,
+    kind: TransformKind,
+    local_clip: Option<ContentMask<Pixels>>,
+}
+
+impl AmbientKey {
+    /// Whether painting through it needs more than moving by whole device pixels.
+    pub(crate) fn is_general(&self) -> bool {
+        self.kind == TransformKind::General
+    }
 }
 
 /// What a primitive takes from the ambient transform.
@@ -4294,11 +4461,24 @@ impl Window {
     ///
     /// Hitboxes inserted outside any element id are left out, and an element without an id of its
     /// own reports the id of its nearest ancestor that has one.
+    ///
+    /// The bounds are those in the window: the bounding box of a transformed hitbox. See
+    /// [`Window::hit_chain_entries`] for the bounds of the element and the position in them.
     pub fn hit_chain(&self) -> impl Iterator<Item = (&GlobalElementId, Bounds<Pixels>)> {
-        self.mouse_hit_test
-            .chain
-            .iter()
-            .filter_map(|link| Some((link.identity.as_ref()?, link.bounds)))
+        self.hit_chain_entries().map(|entry| (entry.id, entry.window_bounds))
+    }
+
+    /// [`Window::hit_chain`] with the space of each hitbox, which maps the pointer into the
+    /// hitbox for `offsetX` and `offsetY`.
+    pub fn hit_chain_entries(&self) -> impl Iterator<Item = HitChainEntry<'_>> {
+        self.mouse_hit_test.chain.iter().filter_map(|link| {
+            Some(HitChainEntry {
+                id: link.identity.as_ref()?,
+                bounds: link.bounds,
+                window_bounds: link.window_bounds,
+                space: link.space.as_ref(),
+            })
+        })
     }
 
     /// Releases any active pointer capture.
@@ -5838,12 +6018,21 @@ impl Window {
             }
         }
 
+        let space = match kind {
+            TransformKind::Translation => {
+                let mut to_window = TransformationMatrix::unit();
+                to_window.translation = [offset.x.0, offset.y.0];
+                HitSpace::new(to_window)
+            }
+            TransformKind::General => HitSpace::new(composed),
+        };
         self.transform_stack.push(AmbientTransform {
             matrix: composed,
             kind,
             offset,
             device_offset,
             local_clip,
+            space: Rc::new(space),
         });
         let result = match window_clip {
             Some(clip) => self.with_window_content_mask(clip, f),
@@ -5851,6 +6040,14 @@ impl Window {
         };
         self.transform_stack.pop();
         result
+    }
+
+    pub(crate) fn ambient_key(&self) -> Option<AmbientKey> {
+        self.transform_stack.last().map(|ambient| AmbientKey {
+            matrix: ambient.matrix,
+            kind: ambient.kind,
+            local_clip: ambient.local_clip,
+        })
     }
 
     /// The transform in effect, from the local space of what is being painted to the window, in
@@ -8404,6 +8601,8 @@ impl Window {
             clip: clip.map(Rc::new),
             exact_clips: self.exact_clips.clone(),
             unclipped: self.is_prepainting_unclipped(),
+            space: self.transform_stack.last().map(|ambient| ambient.space.clone()),
+            local_clip: self.transform_stack.last().and_then(|ambient| ambient.local_clip),
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         self.next_frame.hitboxes_changed();
@@ -8467,7 +8666,7 @@ impl Window {
             return entries
                 .iter()
                 .rev()
-                .find(|(_, hitbox)| hitbox.bounds.contains(&position))
+                .find(|(_, hitbox)| hitbox.contains_window_point(position))
                 .and_then(|(region, _)| match region {
                     WindowRegion::Control(area) => Some(*area),
                     WindowRegion::Client => None,
@@ -8573,6 +8772,10 @@ impl Window {
     /// is determined by the first parameter of the given listener. When the next frame is rendered
     /// the listener will be cleared.
     ///
+    /// A listener registered inside [`Window::with_transform`] is given the position of the event
+    /// in the local space it was registered in, and is not called at all when that space is flat.
+    /// [`Window::mouse_position`] stays in the window.
+    ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn on_mouse_event<Event: MouseEvent>(
         &mut self,
@@ -8580,13 +8783,27 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        self.next_frame.mouse_listeners.push(Some(Box::new(
-            move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
-                if let Some(event) = event.downcast_ref() {
-                    listener(event, phase, window, cx)
-                }
-            },
-        )));
+        self.next_frame.mouse_listeners.push(Some(MouseListener {
+            handler: Box::new(
+                move |event: &dyn Any,
+                      to_local: Option<&TransformationMatrix>,
+                      phase: DispatchPhase,
+                      window: &mut Window,
+                      cx: &mut App| {
+                    let Some(event) = event.downcast_ref::<Event>() else {
+                        return;
+                    };
+                    match to_local {
+                        None => listener(event, phase, window, cx),
+                        Some(to_local) => {
+                            let local = event.with_position_mapped(&|position| map_point(to_local, position));
+                            listener(&local, phase, window, cx)
+                        }
+                    }
+                },
+            ),
+            space: self.transform_stack.last().map(|ambient| ambient.space.clone()),
+        }));
     }
 
     /// Register a key event listener on this node for the next frame. The type of event
@@ -9122,7 +9339,7 @@ impl Window {
         // special purposes, such as detecting events outside of a given Bounds.
         for listener in &mut mouse_listeners {
             let listener = listener.as_mut().unwrap();
-            listener(event, DispatchPhase::Capture, self, cx);
+            listener.call(event, DispatchPhase::Capture, self, cx);
             if !cx.propagate_event {
                 break;
             }
@@ -9132,7 +9349,7 @@ impl Window {
         if cx.propagate_event {
             for listener in mouse_listeners.iter_mut().rev() {
                 let listener = listener.as_mut().unwrap();
-                listener(event, DispatchPhase::Bubble, self, cx);
+                listener.call(event, DispatchPhase::Bubble, self, cx);
                 if !cx.propagate_event {
                     break;
                 }
@@ -10283,7 +10500,7 @@ impl Window {
                     .iter()
                     .find(|hitbox| hitbox.id == hitbox_id)
             {
-                self.paint_quad(crate::fill(hitbox.bounds, crate::rgba(0x61afef4d)));
+                self.paint_quad(crate::fill(hitbox.window_bounds(), crate::rgba(0x61afef4d)));
             }
         }
     }
@@ -12372,6 +12589,8 @@ mod tests {
                 }),
                 exact_clips: None,
                 unclipped: false,
+                space: None,
+                local_clip: None,
             });
         }
         frame

@@ -1440,3 +1440,311 @@ fn an_absolute_root_that_escapes_the_clip_around_it_is_repainted_in_place(cx: &m
     let (_, patches, _) = ticks_on_a_page_with(cx, 4, options, 6);
     assert_eq!(patches.total_declines(), 0);
 }
+
+mod transforms {
+    //! A tick of a transform inside a patchable root is patched: the hitboxes and the mouse
+    //! listeners of the frame that is rendered take the new space from the patch, and a subtree
+    //! replayed inside another transform is built again.
+
+    use super::*;
+    use crate::{
+        ElementTransform, InteractiveElement, MouseButton, MouseDownEvent, PlatformInput, Point, TransformFunction,
+        TransformLength,
+    };
+
+    #[derive(Default)]
+    struct Spin {
+        /// Degrees the card in the unit is turned by.
+        degrees: Cell<f32>,
+        /// Whether the root of the unit is turned as well, by twice the degrees.
+        root: Cell<bool>,
+        /// Whether the card is moved by the degrees instead of turned.
+        slide: Cell<bool>,
+        seen: RefCell<Vec<Point<Pixels>>>,
+        /// The degrees the element that holds the page's retained box is turned by.
+        around: Cell<f32>,
+    }
+
+    fn about_center(function: TransformFunction) -> ElementTransform {
+        ElementTransform {
+            functions: vec![function],
+            origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+        }
+    }
+
+    fn turn(degrees: f32) -> ElementTransform {
+        about_center(TransformFunction::Rotate(degrees.to_radians()))
+    }
+
+    /// The root is 100 wide and 100 tall; the card in it is at (20, 30), 60 by 20, with a 10 by 10
+    /// box at its left end that listens to the mouse.
+    fn unit_for(spin: &Rc<Spin>) -> AnyElement {
+        let transform = if spin.slide.get() {
+            ElementTransform {
+                functions: vec![TransformFunction::Translate(
+                    TransformLength::pixels(spin.degrees.get()),
+                    TransformLength::pixels(0.),
+                )],
+                origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+            }
+        } else {
+            turn(spin.degrees.get())
+        };
+        let seen = spin.clone();
+        let mut root = div().id(UNIT).w(px(100.)).h(px(100.)).flex_none().bg(blue());
+        if spin.root.get() {
+            root = root.transform(turn(spin.degrees.get() * 2.));
+        }
+        root.child(
+            div()
+                .id("card")
+                .always_hitbox()
+                .absolute()
+                .left(px(20.))
+                .top(px(30.))
+                .w(px(60.))
+                .h(px(20.))
+                .bg(red())
+                .transform(transform)
+                .child(div().id("tip").w(px(10.)).h(px(10.)).bg(green()).on_mouse_down(MouseButton::Left, move |event, _, _| {
+                    seen.seen.borrow_mut().push(event.position)
+                })),
+        )
+        .into_any_element()
+    }
+
+    struct SpinPage(Rc<Spin>);
+
+    impl Render for SpinPage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let spin = self.0.clone();
+            let key = 1_000 + (spin.degrees.get() * 4.) as u64 + spin.root.get() as u64;
+            let unit = retained(UNIT, key, {
+                let spin = spin.clone();
+                move |_, _| unit_for(&spin)
+            })
+            .patchable();
+            let mut around = div().id("around").w(px(200.)).h(px(200.)).flex_none().child(unit);
+            if spin.around.get() != 0. {
+                around = around.transform(turn(spin.around.get()));
+            }
+            div().id("page").w(px(400.)).h(px(400.)).child(around).into_any_element()
+        }
+    }
+
+    struct Rig {
+        window: AnyWindowHandle,
+        spin: Rc<Spin>,
+    }
+
+    impl Rig {
+        fn new(cx: &mut TestAppContext, setup: impl FnOnce(&Spin)) -> Self {
+            let spin = Rc::new(Spin::default());
+            setup(&spin);
+            let window = cx.open_window(size(px(400.), px(400.)), {
+                let spin = spin.clone();
+                move |_, _| SpinPage(spin)
+            });
+            let window = AnyWindowHandle::from(window);
+            cx.update_window(window, |_, window, cx| {
+                window.set_dom_hit_testing(true);
+                let patched = spin.clone();
+                window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                    let element = unit_for(&patched);
+                    window.repaint_in_place(vec![(ElementId::from(UNIT), element)], cx, |_, _| true).is_ok()
+                })));
+                // The second frame replays the unit, which registers it again.
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+                window.present_cached_frame();
+            })
+            .unwrap();
+            Self { window, spin }
+        }
+
+        fn tick(&self, cx: &mut TestAppContext, degrees: f32) {
+            self.spin.degrees.set(degrees);
+            cx.update_window(self.window, |_, window, cx| {
+                window.request_tick();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn draw_whole(&self, cx: &mut TestAppContext) {
+            cx.update_window(self.window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        /// A frame of a page that is notified, which replays what it can.
+        fn redraw(&self, cx: &mut TestAppContext) {
+            cx.update_window(self.window, |view, window, cx| {
+                view.downcast::<SpinPage>().unwrap().update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn patches(&self, cx: &mut TestAppContext) -> PatchCounters {
+            cx.update_window(self.window, |_, window, _| window.patch_counters()).unwrap()
+        }
+
+        fn retained(&self, cx: &mut TestAppContext) -> RetainedCounters {
+            cx.update_window(self.window, |_, window, _| window.retained_counters()).unwrap()
+        }
+
+        fn quads(&self, cx: &mut TestAppContext) -> String {
+            cx.update_window(self.window, |_, window, _| format!("{:#?}", window.rendered_frame.scene.quads)).unwrap()
+        }
+
+        /// What the rendered frame paints and what hits it, without the ids.
+        fn snapshot(&self, cx: &mut TestAppContext) -> String {
+            cx.update_window(self.window, |_, window, _| {
+                let frame = &window.rendered_frame;
+                format!(
+                    "{:#?}\n{:#?}",
+                    frame.scene.quads,
+                    frame.hitboxes.iter().map(|hitbox| hitbox.describe()).collect::<Vec<_>>()
+                )
+            })
+            .unwrap()
+        }
+
+        fn hits(&self, cx: &mut TestAppContext, x: f32, y: f32) -> Vec<String> {
+            cx.update_window(self.window, |_, window, _| {
+                let hit = window.rendered_frame.hit_test(point(px(x), px(y)), true);
+                hit.ids
+                    .iter()
+                    .filter_map(|id| window.rendered_frame.hitboxes.iter().find(|hitbox| hitbox.id == *id))
+                    .filter_map(|hitbox| match hitbox.identity.as_ref()?.last()? {
+                        ElementId::Name(name) => Some(name.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap()
+        }
+
+        fn mouse_down(&self, cx: &mut TestAppContext, x: f32, y: f32) {
+            cx.update_window(self.window, |_, window, cx| {
+                let event = MouseDownEvent {
+                    position: point(px(x), px(y)),
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                };
+                window.dispatch_event(PlatformInput::MouseDown(event), cx);
+            })
+            .unwrap();
+        }
+    }
+
+    /// The window point of the point `(x, y)` of the page after the card turned by `degrees` about
+    /// its center (50, 40) in the page: the page is at the window's origin.
+    fn turned(degrees: f32, x: f32, y: f32) -> (f32, f32) {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        let (dx, dy) = (x - 50., y - 40.);
+        (50. + dx * cos - dy * sin, 40. + dx * sin + dy * cos)
+    }
+
+    #[gpui::test]
+    fn a_tick_that_only_turns_a_card_is_patched_and_hit_where_the_card_is_now(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx, |_| {});
+        let before = rig.patches(cx);
+        // The card is 60 wide and 20 tall about (50, 40): its far end is (80, 40) in the page.
+        let (x, y) = turned(90., 75., 40.);
+        assert!((x - 50.).abs() < 1e-3 && (y - 65.).abs() < 1e-3, "{x} {y}");
+        assert!(rig.hits(cx, x, y).is_empty());
+        rig.tick(cx, 90.);
+        let patches = rig.patches(cx);
+        assert_eq!(patches.patched_frames - before.patched_frames, 1);
+        assert_eq!(patches.total_declines(), 0);
+        assert_eq!(rig.hits(cx, x, y), ["card"]);
+        assert!(rig.hits(cx, 75., 40.).is_empty(), "the card is no longer at its plain place");
+
+        let patched = rig.snapshot(cx);
+        rig.draw_whole(cx);
+        assert_same(&patched, &rig.snapshot(cx), "a patched frame is the frame built whole");
+        assert_eq!(rig.hits(cx, x, y), ["card"]);
+    }
+
+    #[gpui::test]
+    fn a_tick_that_turns_the_root_and_the_card_is_patched(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx, |spin| spin.root.set(true));
+        for degrees in [10., 25., 40.] {
+            rig.tick(cx, degrees);
+        }
+        let patches = rig.patches(cx);
+        assert_eq!((patches.patched_frames, patches.total_declines()), (3, 0));
+        let patched = rig.snapshot(cx);
+        rig.draw_whole(cx);
+        assert_same(&patched, &rig.snapshot(cx), "a patched frame is the frame built whole");
+    }
+
+    #[gpui::test]
+    fn a_tick_that_slides_a_card_is_patched_and_hit_at_the_new_place(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx, |spin| spin.slide.set(true));
+        // The card is at x in [20, 80]; the tip at [20, 30].
+        assert_eq!(rig.hits(cx, 60., 45.), ["card"]);
+        rig.tick(cx, 100.);
+        let patches = rig.patches(cx);
+        assert_eq!((patches.patched_frames, patches.total_declines()), (1, 0));
+        assert!(rig.hits(cx, 60., 45.).is_empty());
+        assert_eq!(rig.hits(cx, 160., 45.), ["card"]);
+        let patched = rig.snapshot(cx);
+        rig.draw_whole(cx);
+        assert_same(&patched, &rig.snapshot(cx), "a patched frame is the frame built whole");
+    }
+
+    #[gpui::test]
+    fn the_listener_of_a_patched_card_is_given_the_position_in_the_card_as_it_is_now(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx, |_| {});
+        rig.tick(cx, 90.);
+        // The tip is the top left 10 by 10 of the card, whose left end is at the top after the
+        // turn: the card is 60 by 20 about (50, 40), the tip's center (25, 35) in the page.
+        let (x, y) = turned(90., 25., 35.);
+        rig.mouse_down(cx, x, y);
+        let seen = rig.spin.seen.borrow();
+        let [position] = seen[..] else { panic!("{seen:?}") };
+        assert!((position.x.0 - 25.).abs() < 1e-2 && (position.y.0 - 35.).abs() < 1e-2, "{position:?}");
+    }
+
+    #[gpui::test]
+    fn a_subtree_replayed_inside_another_transform_is_built_again_and_where_it_is_now(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx, |_| {});
+        let before = rig.retained(cx);
+        rig.redraw(cx);
+        let same = rig.retained(cx);
+        assert_eq!((same.builds - before.builds, same.replays - before.replays), (0, 1), "nothing around moved: replayed");
+
+        rig.spin.around.set(30.);
+        rig.redraw(cx);
+        let moved = rig.retained(cx);
+        assert_eq!(
+            (moved.lazy_builds - same.lazy_builds, moved.replays - same.replays),
+            (1, 0),
+            "the transform around it changed"
+        );
+        let replayed = rig.quads(cx);
+
+        let fresh = Rig::new(cx, |spin| spin.around.set(30.));
+        assert_same(&replayed, &fresh.quads(cx), "the subtree is where a fresh build puts it");
+        // The center of the card (50, 40) turned by 30 degrees about the center of the box around.
+        let (sin, cos) = 30f32.to_radians().sin_cos();
+        let (x, y) = (100. + (50. - 100.) * cos - (40. - 100.) * sin, 100. + (50. - 100.) * sin + (40. - 100.) * cos);
+        assert_eq!(rig.hits(cx, x, y), ["card"]);
+        assert_eq!(fresh.hits(cx, x, y), ["card"]);
+        assert!(rig.hits(cx, 50., 40.).is_empty());
+
+        // The same transform again is replayed.
+        rig.redraw(cx);
+        let again = rig.retained(cx);
+        assert_eq!((again.lazy_builds - moved.lazy_builds, again.replays - moved.replays), (0, 1));
+        assert_same(&replayed, &rig.quads(cx), "and still there");
+        assert_eq!(rig.hits(cx, x, y), ["card"]);
+    }
+}

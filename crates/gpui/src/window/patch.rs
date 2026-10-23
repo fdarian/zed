@@ -220,6 +220,7 @@ struct Surroundings {
     element_offset: Point<Pixels>,
     origin_phase: Point<Pixels>,
     element_opacity: f32,
+    transforms: Vec<AmbientTransform>,
     positioned_frame: Option<PositionedFrame>,
     image_cache: Option<AnyImageCache>,
     hitbox_parent: Option<HitboxId>,
@@ -253,6 +254,21 @@ struct UnitRun {
     /// Where the recording's are in the rendered scene.
     rendered: Range<usize>,
     changed: bool,
+    /// Where the unit's places are in the rendered frame, and what the patch made of them.
+    places: Places,
+}
+
+/// What the rendered frame takes from a patch besides its operations: the transforms, which a
+/// tick of one changes, and with them the places the pointer hits and the position the listeners
+/// are given.
+struct Places {
+    /// The hitboxes the patch inserted, and the position in the rendered frame of the one with
+    /// the same id.
+    hitboxes: Vec<(Hitbox, usize)>,
+    /// The space of each mouse listener the patch registered, and the range of the rendered
+    /// frame's listeners they stand for.
+    listener_spaces: Vec<Option<Rc<HitSpace>>>,
+    listeners: Range<usize>,
 }
 
 /// What the window was before a patch ran in it.
@@ -269,6 +285,7 @@ struct SavedSurroundings {
     text_style_stack: Vec<TextStyleRefinement>,
     visibility: Visibility,
     element_opacity: f32,
+    transforms: Vec<AmbientTransform>,
     exact_clips: Option<Rc<ExactClips>>,
     lift_lists: Vec<Option<LiftList>>,
     lifts_open: usize,
@@ -500,6 +517,7 @@ impl Window {
             element_offset: self.element_offset_stack.last().copied().unwrap_or_default(),
             origin_phase: self.element_origin_phase(),
             element_opacity: self.element_opacity,
+            transforms: self.transform_stack.clone(),
             positioned_frame: self.positioned_frames.last().copied(),
             image_cache: self.image_cache_stack.last().cloned(),
             hitbox_parent: self.hitbox_parent_stack.last().copied(),
@@ -553,6 +571,7 @@ impl Window {
         let operations = mem::take(&mut self.next_frame.scene.paint_operations);
         self.finish_scratch(scratch, cx);
         let runs = runs?;
+        let runs_len = runs.len();
 
         if !accept(self, cx) {
             return Err(PatchDecline::Rejected);
@@ -578,7 +597,18 @@ impl Window {
             }
             self.rendered_frame.scene.rebuild_from_operations();
         }
-        Ok(PatchOutcome { units: runs.len(), changed })
+        let mut moved_hitboxes = false;
+        for run in runs {
+            moved_hitboxes |= self.put_places(run.places);
+        }
+        if moved_hitboxes {
+            // A transform that ticked moved what is under the pointer.
+            self.rendered_frame.hitboxes_changed();
+            if !self.pointer_outside {
+                self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position, self.dom_hit_testing);
+            }
+        }
+        Ok(PatchOutcome { units: runs_len, changed })
     }
 
     /// Makes the scratch frame a clean one to draw the roots into.
@@ -640,6 +670,7 @@ impl Window {
             text_style_stack: mem::replace(&mut self.text_style_stack, unit.context.text_style_stack.clone()),
             visibility: mem::replace(&mut self.visibility, unit.context.visibility),
             element_opacity: mem::replace(&mut self.element_opacity, unit.element_opacity),
+            transforms: mem::replace(&mut self.transform_stack, unit.transforms.clone()),
             exact_clips: mem::replace(&mut self.exact_clips, unit.exact_clips.clone()),
             lift_lists: mem::replace(&mut self.lift_lists, lift_lists),
             lifts_open: mem::replace(&mut self.lifts_open, unit.lifts_open),
@@ -673,6 +704,7 @@ impl Window {
         self.text_style_stack = saved.text_style_stack;
         self.visibility = saved.visibility;
         self.element_opacity = saved.element_opacity;
+        self.transform_stack = saved.transforms;
         self.exact_clips = saved.exact_clips;
         self.lift_lists = saved.lift_lists;
         self.lifts_open = saved.lifts_open;
@@ -774,6 +806,7 @@ impl Window {
             return Err(PatchDecline::Registrations);
         }
 
+        let places = self.places_of(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end)?;
         let rendered = source.paint.start.scene_index..source.paint.end.scene_index;
         let scratch = scene_start..self.next_frame.scene.len();
         let painted = &self.next_frame.scene.paint_operations[scratch.clone()];
@@ -782,7 +815,72 @@ impl Window {
             return Err(PatchDecline::Operations);
         }
         let changed = painted.iter().zip(recorded).any(|(painted, recorded)| painted.differs_from(recorded));
-        Ok(UnitRun { scratch, rendered, changed })
+        Ok(UnitRun { scratch, rendered, changed, places })
+    }
+
+    /// Where in the rendered frame the hitboxes and mouse listeners that the scratch frame got
+    /// for the unit are. They are the recording's one for one: the ids are the recording's, and
+    /// the counts were checked.
+    fn places_of(
+        &self,
+        source: &PatchSource,
+        prepaint: Range<&PrepaintStateIndex>,
+        paint: Range<&PaintIndex>,
+    ) -> Result<Places, PatchDecline> {
+        let inserted = &self.next_frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index];
+        let rendered = &self.rendered_frame.hitboxes;
+        let hint = source.prepaint.start.hitboxes_index..source.prepaint.end.hitboxes_index;
+        let mut by_id: FxHashMap<HitboxId, usize> = FxHashMap::default();
+        let mut index_range = |range: Range<usize>, by_id: &mut FxHashMap<HitboxId, usize>| {
+            for (offset, hitbox) in rendered.get(range.clone()).unwrap_or_default().iter().enumerate() {
+                by_id.insert(hitbox.id, range.start + offset);
+            }
+        };
+        index_range(hint, &mut by_id);
+        if inserted.iter().any(|hitbox| !by_id.contains_key(&hitbox.id)) {
+            // A hitbox that a stacking context moved out of the range the unit was recorded in.
+            index_range(0..rendered.len(), &mut by_id);
+        }
+        let mut hitboxes = Vec::with_capacity(inserted.len());
+        for hitbox in inserted {
+            let slot = *by_id.get(&hitbox.id).ok_or(PatchDecline::Hitboxes)?;
+            hitboxes.push((hitbox.clone(), slot));
+        }
+        let listeners = &self.next_frame.mouse_listeners[paint.start.mouse_listeners_index..paint.end.mouse_listeners_index];
+        let rendered_listeners = source.paint.start.mouse_listeners_index..source.paint.end.mouse_listeners_index;
+        if self.rendered_frame.mouse_listeners.get(rendered_listeners.clone()).is_none_or(|rendered| rendered.len() != listeners.len()) {
+            return Err(PatchDecline::Registrations);
+        }
+        Ok(Places {
+            hitboxes,
+            listener_spaces: listeners
+                .iter()
+                .map(|listener| listener.as_ref().and_then(|listener| listener.space.clone()))
+                .collect(),
+            listeners: rendered_listeners,
+        })
+    }
+
+    /// Gives the rendered frame the places of a unit that a patch made.
+    fn put_places(&mut self, places: Places) -> bool {
+        let mut changed = false;
+        for (hitbox, slot) in places.hitboxes {
+            let rendered = &mut self.rendered_frame.hitboxes[slot];
+            changed |= !rendered.is_placed_like(&hitbox);
+            rendered.content_mask = hitbox.content_mask;
+            rendered.space = hitbox.space;
+            rendered.local_clip = hitbox.local_clip;
+            rendered.exact_clips = hitbox.exact_clips;
+        }
+        for (listener, space) in self.rendered_frame.mouse_listeners[places.listeners]
+            .iter_mut()
+            .zip(places.listener_spaces)
+        {
+            if let Some(listener) = listener {
+                listener.space = space;
+            }
+        }
+        changed
     }
 
     /// Whether the hitboxes the scratch frame got in `range` are `recorded`, field by field.
@@ -843,19 +941,27 @@ impl Window {
 }
 
 impl Hitbox {
-    /// Whether `other` is the hitbox, field by field.
+    /// Whether `other` is the hitbox, but for where it is in the window: the transform around it,
+    /// the content mask and the clips that follow from it are what a patch is for.
     fn same_as(&self, other: &Hitbox) -> bool {
         self.id == other.id
             && self.bounds == other.bounds
-            && self.content_mask == other.content_mask
             && self.behavior == other.behavior
             && self.corner_radii == other.corner_radii
             && self.identity == other.identity
             && self.parent == other.parent
             && self.unclipped == other.unclipped
             && self.clip.is_some() == other.clip.is_some()
-            && self.exact_clips.is_some() == other.exact_clips.is_some()
-            && (self.clip.is_none() && self.exact_clips.is_none() || self.describe() == other.describe())
+            && self.clip.as_ref().map(|clip| format!("{clip:?}")) == other.clip.as_ref().map(|clip| format!("{clip:?}"))
+            && self.exact_clips.as_ref().map(|clips| clips.depth()) == other.exact_clips.as_ref().map(|clips| clips.depth())
+    }
+
+    /// Whether `other` is in the same place in the window.
+    fn is_placed_like(&self, other: &Hitbox) -> bool {
+        self.content_mask == other.content_mask
+            && self.local_clip == other.local_clip
+            && self.space.as_deref().map(|space| space.to_window) == other.space.as_deref().map(|space| space.to_window)
+            && self.exact_clips == other.exact_clips
     }
 }
 
