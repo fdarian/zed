@@ -67,7 +67,8 @@ impl std::fmt::Debug for ListState {
 /// A list's scroll position and the extent of what it scrolls in, see [`ListState::dom_scroll`].
 #[derive(Clone, Copy, Debug)]
 pub struct ListDomScroll {
-    /// How far the rows have moved up: `scrollTop`.
+    /// How far the rows have moved up: `scrollTop`, which is a whole device pixel, as a scroller's
+    /// is in Chrome, though the list may sit between two (a wheel, a trackpad).
     pub top: Pixels,
     /// The rows and the padding around them: what `scrollHeight` rounds.
     pub content_height: Pixels,
@@ -91,6 +92,9 @@ struct StateInner {
     /// The width the rows were laid out at.
     last_content_width: Option<Pixels>,
     last_padding: Option<Edges<Pixels>>,
+    /// Where the first row's top edge is at scroll top 0, as layout put it: inside the list's border
+    /// and padding, unsnapped.
+    last_rows_origin: Option<Point<Pixels>>,
     last_client: Option<ScrollClient>,
     items: SumTree<ListItem>,
     logical_scroll_top: Option<ListOffset>,
@@ -372,6 +376,7 @@ impl ListState {
             last_layout_bounds: None,
             last_content_width: None,
             last_padding: None,
+            last_rows_origin: None,
             last_client: None,
             items: SumTree::default(),
             logical_scroll_top: None,
@@ -771,29 +776,31 @@ impl ListState {
     }
 
     /// Get the bounds for the given item in window coordinates, if it's
-    /// been rendered.
+    /// been measured. They are where the row is placed: inside the list's border and padding, as
+    /// wide as the list is between its padding, and scrolled to a device pixel. A row above the
+    /// scroll top has bounds, and is in view when it ends in the top padding.
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
         let state = &*self.0.borrow();
 
-        let bounds = state.last_layout_bounds.unwrap_or_default();
-        let scroll_top = state.logical_scroll_top();
-        if ix < scroll_top.item_ix {
-            return None;
-        }
+        let origin = state.last_rows_origin?;
+        let client = state.last_client?;
+        let width = state.last_content_width?;
+        let scroll_top = round_to_device_half_up(
+            state.scroll_top(&state.logical_scroll_top()),
+            client.scale_factor,
+        );
 
         let mut cursor = state.items.cursor::<Dimensions<Count, Height>>(());
-        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
-
-        let scroll_top = cursor.start().1.0 + scroll_top.offset_in_item;
-
-        cursor.seek_forward(&Count(ix), Bias::Right);
+        cursor.seek(&Count(ix), Bias::Right);
         if let Some(&ListItem::Measured { size, .. }) = cursor.item() {
             let &Dimensions(Count(count), Height(top), _) = cursor.start();
             if count == ix {
-                let top = bounds.top() + top - scroll_top;
-                return Some(Bounds::from_corners(
-                    point(bounds.left(), top),
-                    point(bounds.right(), top + size.height),
+                return Some(Bounds::new(
+                    point(origin.x, origin.y + top - scroll_top),
+                    Size {
+                        width,
+                        height: size.height,
+                    },
                 ));
             }
         }
@@ -874,7 +881,7 @@ impl ListState {
             state.scroll_top(&state.logical_scroll_top()).min(max_top)
         };
         Some(ListDomScroll {
-            top,
+            top: round_to_device_half_up(top, client.scale_factor),
             content_height: state.items.summary().height + padding.top + padding.bottom,
             client: client.size,
         })
@@ -908,6 +915,12 @@ impl ListState {
         Some((max, offset.min(max)))
     }
 
+    /// The scale factor of the window the list was last laid out in, or `None` before its first
+    /// layout.
+    pub fn scale_factor(&self) -> Option<f32> {
+        self.0.borrow().last_client.map(|client| client.scale_factor)
+    }
+
     /// Return the bounds of the viewport in pixels.
     pub fn viewport_bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().last_layout_bounds.unwrap_or_default()
@@ -923,14 +936,11 @@ impl ListState {
     pub fn item_is_above_viewport(&self, ix: usize) -> Option<bool> {
         let viewport_bounds = self.0.borrow().last_layout_bounds?;
 
-        let scroll_top = self.logical_scroll_top();
-        if ix < scroll_top.item_ix {
-            // Rows before the logical scroll top have no item bounds, but
-            // their position relative to the viewport is known from scroll state.
-            return Some(true);
-        }
-
-        let item_bounds = self.bounds_for_item(ix)?;
+        let Some(item_bounds) = self.bounds_for_item(ix) else {
+            // Rows before the logical scroll top that were never measured have no item bounds,
+            // but their position relative to the viewport is known from scroll state.
+            return (ix < self.logical_scroll_top().item_ix).then_some(true);
+        };
         Some(item_bounds.bottom() <= viewport_bounds.top())
     }
 
@@ -942,14 +952,9 @@ impl ListState {
     pub fn item_is_below_viewport(&self, ix: usize) -> Option<bool> {
         let viewport_bounds = self.0.borrow().last_layout_bounds?;
 
-        let scroll_top = self.logical_scroll_top();
-        if ix < scroll_top.item_ix {
-            // Rows before the logical scroll top have no item bounds, but
-            // their position relative to the viewport is known from scroll state.
-            return Some(false);
-        }
-
-        let item_bounds = self.bounds_for_item(ix)?;
+        let Some(item_bounds) = self.bounds_for_item(ix) else {
+            return (ix < self.logical_scroll_top().item_ix).then_some(false);
+        };
         Some(item_bounds.top() >= viewport_bounds.bottom())
     }
 }
@@ -1854,6 +1859,7 @@ impl Element for List {
         });
 
         state.last_layout_bounds = Some(viewport);
+        state.last_rows_origin = Some(unsnapped.origin + Point::new(padding.left, padding.top));
         state.last_content_width = Some(content_width);
         state.last_padding = Some(padding);
         // The overlay reads the list state, which must not be borrowed meanwhile.
@@ -3785,6 +3791,47 @@ mod test {
             "row 6 is in the top padding"
         );
         assert!(seen.get(5).copied().flatten().is_none(), "row 5 is above the padding box");
+    }
+
+    /// `bounds_for_item` is where the row was placed (inside the border and the padding, as wide as
+    /// the list is between its padding, scrolled to a device pixel), so a row in the top padding is
+    /// neither above nor below the viewport, and the scroll top reads back a whole device pixel.
+    #[gpui::test]
+    fn test_bounds_for_item_are_where_the_rows_are_placed(cx: &mut TestAppContext) {
+        for (scale, offset_in_item, scroll_top) in [(1.0, 5.5, 46.), (1.0, 5.4, 45.), (2.0, 5.3, 45.5)] {
+            let cx = cx.add_empty_window();
+            cx.update(|window, _| window.set_scale_factor(scale));
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let state = ListState::new(10, crate::ListAlignment::Top, px(300.))
+                .with_uniform_item_height(px(20.));
+            state.scroll_to(gpui::ListOffset {
+                item_ix: 2,
+                offset_in_item: px(offset_in_item),
+            });
+            draw_bordered_list(&state, &seen, cx);
+            draw_bordered_list(&state, &seen, cx);
+
+            assert_eq!(
+                state.dom_scroll().expect("laid out").top,
+                px(scroll_top),
+                "scrollTop is a device pixel at scale {scale}"
+            );
+            // The rows in the top padding and the one below them.
+            for ix in [0, 1, 2] {
+                let placed = seen.borrow()[ix].expect("the row is built");
+                let bounds = state.bounds_for_item(ix).expect("the row has bounds");
+                assert_eq!(bounds, placed, "row {ix} at scale {scale}");
+            }
+            let top_of_padding_box = state.viewport_bounds().top();
+            let row_zero = state.bounds_for_item(0).expect("row 0 has bounds");
+            assert_eq!(
+                row_zero.origin.y,
+                top_of_padding_box + px(30. - scroll_top),
+                "row 0 is placed {scroll_top} up from the top padding at scale {scale}"
+            );
+            assert_eq!(state.item_is_above_viewport(0), Some(false), "row 0 shows in the top padding");
+            assert_eq!(state.item_is_below_viewport(0), Some(false));
+        }
     }
 
     /// The range a scroll reports is the rows in the padding box, those in the top padding included.

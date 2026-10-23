@@ -2810,6 +2810,14 @@ pub(crate) fn round_to_device_half_up(length: Pixels, scale_factor: f32) -> Pixe
     Pixels(crate::util::round_half_up(length.0 * scale_factor) / scale_factor)
 }
 
+/// A scroll offset (how far the content moved: zero, then negative) as the scroller sits and is read
+/// back: the position it is scrolled to is rounded half up to a device pixel, as Chrome snaps it.
+/// `Pixels::ZERO -` rather than negation, so an offset of 0 stays `+0`.
+pub(crate) fn snap_scroll_offset(offset: Point<Pixels>, scale_factor: f32) -> Point<Pixels> {
+    let snap = |along: Pixels| Pixels::ZERO - round_to_device_half_up(Pixels::ZERO - along, scale_factor);
+    point(snap(offset.x), snap(offset.y))
+}
+
 /// How far a scroller scrolls along an axis, for `content` (the scrollable overflow including the
 /// padding after the children) and `client` (the padding box less the scrollbars), as Chrome has
 /// it: both ends rounded to a device pixel, so the maximum does not depend on where the box sits.
@@ -3456,6 +3464,7 @@ impl Interactivity {
             }
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
+                scroll_handle_state.scale_factor = Some(window.scale_factor());
                 scroll_handle_state.bounds = bounds;
                 scroll_handle_state.user_scroll = point(
                     style.overflow.x == Overflow::Scroll && !self.programmatic_scroll_only.x,
@@ -3482,7 +3491,9 @@ impl Interactivity {
             if !scroll_offset.is_zero() {
                 window.note_nested_scroll();
             }
-            *scroll_offset
+            // The children sit where the position that reads back puts them. A wheel or a trackpad
+            // leaves the offset between device pixels, which `pixel_snap` would round toward zero.
+            snap_scroll_offset(*scroll_offset, window.scale_factor())
         } else {
             Point::default()
         }
@@ -5382,6 +5393,8 @@ struct ScrollHandleState {
     scrollbar_size: Size<Pixels>,
     user_scroll: Point<bool>,
     max_offset: Point<Pixels>,
+    /// The scale of the window as of the last layout, `None` before it.
+    scale_factor: Option<f32>,
     child_bounds: Vec<Bounds<Pixels>>,
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
@@ -5444,6 +5457,12 @@ impl ScrollHandle {
     /// Get the maximum scroll offset.
     pub fn max_offset(&self) -> Point<Pixels> {
         self.0.borrow().max_offset
+    }
+
+    /// The scale factor of the window the scroller was last laid out in, or `None` before its
+    /// first layout.
+    pub fn scale_factor(&self) -> Option<f32> {
+        self.0.borrow().scale_factor
     }
 
     /// Get the top child that's scrolled into view.
@@ -8118,6 +8137,58 @@ mod tests {
             assert_eq!(handle.scrollbar_size(), size(px(0.), px(0.)));
             assert_eq!(handle.padding_box().size, size(px(100.), px(100.)));
             assert_eq!(handle.max_offset(), point(px(200.), px(200.)));
+        }
+
+        /// A scroller between two device pixels (a wheel or a trackpad leaves it there) puts its children
+        /// where Chrome does: the position rounded half up, not `pixel_snap`'s half toward zero.
+        #[gpui::test]
+        fn a_scroller_between_device_pixels_paints_at_the_position_that_reads_back(
+            cx: &mut TestAppContext,
+        ) {
+            for (scale, offset, painted) in [
+                (1., -10.5, -11.),
+                (1., -10.4, -10.),
+                (1., -10.6, -11.),
+                (2., -10.25, -10.5),
+                (2., -10.1, -10.),
+                (2., -10.75, -11.),
+            ] {
+                let handle = ScrollHandle::new();
+                let window = open_scene(cx, true, {
+                    let handle = handle.clone();
+                    move || {
+                        root()
+                            .child(
+                                div()
+                                    .id("scroller")
+                                    .w(px(100.))
+                                    .h(px(100.))
+                                    .overflow_scroll()
+                                    .track_scroll(&handle)
+                                    .child(div().w(px(300.)).h(px(300.)).bg(crate::red())),
+                            )
+                            .into_any_element()
+                    }
+                });
+                cx.update_window(window, |_, window, cx| {
+                    window.set_scale_factor(scale);
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+                assert_eq!(handle.scale_factor(), Some(scale));
+                handle.set_offset(point(px(0.), px(offset)));
+                let top = cx
+                    .update_window(window, |_, window, cx| {
+                        window.draw(cx).clear(cx);
+                        window
+                            .painted_quads()
+                            .iter()
+                            .map(|quad| quad.bounds.origin.y.0 / scale)
+                            .fold(f32::MAX, f32::min)
+                    })
+                    .unwrap();
+                assert_eq!(top, painted, "child at offset {offset} at scale {scale}");
+            }
         }
 
         #[gpui::test]
