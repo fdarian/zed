@@ -73,3 +73,5 @@ uuid.workspace = true
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 gpui_apple = { workspace = true, features = ["test-support"] }
+# The integration tests use `post_event_on_event_thread`, which `test-support` enables.
+gpui_macos = { path = ".", default-features = false, features = ["test-support"] }

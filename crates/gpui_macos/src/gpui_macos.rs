@@ -58,6 +58,8 @@ pub(crate) use text_system::*;
 
 pub use display::{MacDisplay, MacScreen};
 pub use platform::MacPlatform;
+#[cfg(any(test, feature = "test-support"))]
+pub use run_loop_wake::post_event_on_event_thread;
 pub use run_loop_wake::{run_loop_pumped, set_run_loop_wake_hook};
 
 trait BoolExt {

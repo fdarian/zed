@@ -13,6 +13,13 @@
 //! Each is a kqueue `EVFILT_MACHPORT` knote with `EV_DISPATCH`, so after it fires it stays
 //! disabled until [`run_loop_pumped`] enables it again. A message that is still pending then
 //! fires at once, so nothing is lost between the pump and the re-arm.
+//!
+//! Input needs a third source. AppKit receives every WindowServer event on the thread
+//! `com.apple.NSEventThread` and hands it to the main thread with `CFRunLoopPerformBlock` on the
+//! main run loop plus `CFRunLoopWakeUp`. Nothing runs that run loop here, so CoreFoundation
+//! ignores the wake-up and sends no message to a port that is watched. An observer on
+//! NSEventThread's run loop turns every iteration of it into a message on the main queue, which
+//! is watched.
 
 use std::{
     ffi::c_void,
@@ -22,20 +29,28 @@ use std::{
 };
 
 use core_foundation_sys::{
-    base::{CFIndex, CFRelease},
+    base::{CFIndex, CFRelease, CFRetain},
     mach_port::{
         CFMachPortCreate, CFMachPortCreateRunLoopSource, CFMachPortGetPort, CFMachPortInvalidate,
         CFMachPortRef,
     },
-    runloop::{CFRunLoopAddSource, CFRunLoopGetMain, CFRunLoopRemoveSource, kCFRunLoopDefaultMode},
+    runloop::{
+        CFRunLoopActivity, CFRunLoopAddObserver, CFRunLoopAddSource, CFRunLoopGetMain,
+        CFRunLoopObserverCreate, CFRunLoopObserverInvalidate, CFRunLoopObserverRef, CFRunLoopRef,
+        CFRunLoopRemoveObserver, CFRunLoopRemoveSource, CFRunLoopWakeUp, kCFRunLoopBeforeWaiting,
+        kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+    },
 };
+use dispatch2::DispatchQueue;
 use libc::{
     EV_ADD, EV_CLEAR, EV_DISPATCH, EV_ENABLE, EV_ERROR, EV_RECEIPT, EVFILT_MACHPORT, EVFILT_USER,
     NOTE_TRIGGER,
 };
 use mach2::{
     kern_return::{KERN_SUCCESS, kern_return_t},
+    mach_port::mach_port_deallocate,
     port::mach_port_t,
+    task::task_threads,
     traps::mach_task_self,
     vm::mach_vm_deallocate,
     vm_types::{mach_vm_address_t, mach_vm_size_t},
@@ -43,10 +58,13 @@ use mach2::{
 
 const MACH_PORT_TYPE_PORT_SET: u32 = 1 << 19;
 const SHUTDOWN_IDENT: usize = 1;
+const EVENT_THREAD_NAME: &str = "com.apple.NSEventThread";
 
 unsafe extern "C" {
     // Exported by libdispatch (libSystem); CoreFoundation uses it for the same purpose.
     fn _dispatch_get_main_queue_port_4CF() -> mach_port_t;
+    // Exported by CoreFoundation, which has no public way to get another thread's run loop.
+    fn _CFRunLoopGet0(thread: libc::pthread_t) -> CFRunLoopRef;
     fn mach_port_names(
         task: mach_port_t,
         names: *mut *mut mach_port_t,
@@ -68,7 +86,16 @@ struct Watch {
     kqueue: i32,
     ports: [mach_port_t; 2],
     thread: JoinHandle<()>,
+    event_thread_observer: EventThreadObserver,
 }
+
+struct EventThreadObserver {
+    run_loop: CFRunLoopRef,
+    observer: CFRunLoopObserverRef,
+}
+
+// CoreFoundation run loops and observers can be used from any thread.
+unsafe impl Send for EventThreadObserver {}
 
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
 
@@ -133,11 +160,13 @@ fn start(hook: WakeHook) -> Watch {
         kqueue,
         ports,
         thread,
+        event_thread_observer: unsafe { observe_event_thread() },
     }
 }
 
 fn stop(watch: Watch) {
     unsafe {
+        unobserve_event_thread(watch.event_thread_observer);
         kevent_change(watch.kqueue, SHUTDOWN_IDENT, EVFILT_USER, 0, NOTE_TRIGGER);
     }
     watch
@@ -145,6 +174,43 @@ fn stop(watch: Watch) {
         .join()
         .expect("the run loop wake thread panicked");
     unsafe { libc::close(watch.kqueue) };
+}
+
+/// Posts `event` to the application from NSEventThread, the way AppKit hands WindowServer input to
+/// the main thread, so that it goes by the observer. An event posted from any other thread never
+/// touches NSEventThread, and no real input is posted from one.
+///
+/// # Safety
+///
+/// `event` must be a valid `NSEvent`.
+#[cfg(any(test, feature = "test-support"))]
+pub unsafe fn post_event_on_event_thread(event: cocoa::base::id) {
+    use block::ConcreteBlock;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    unsafe extern "C" {
+        fn CFRunLoopPerformBlock(run_loop: CFRunLoopRef, mode: *const c_void, block: *const c_void);
+    }
+
+    unsafe {
+        let run_loop = event_thread_run_loop();
+        let _: cocoa::base::id = msg_send![event, retain];
+        // A pointer is not `Send`, and the block is only ever run on NSEventThread.
+        let event = event as usize;
+        let block = ConcreteBlock::new(move || {
+            let event = event as cocoa::base::id;
+            let app: cocoa::base::id = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![app, postEvent: event atStart: objc::runtime::NO];
+            let _: () = msg_send![event, release];
+        })
+        .copy();
+        CFRunLoopPerformBlock(
+            run_loop,
+            kCFRunLoopDefaultMode as *const c_void,
+            &*block as *const _ as *const c_void,
+        );
+        CFRunLoopWakeUp(run_loop);
+    }
 }
 
 fn watch_ports(kqueue: i32, hook: WakeHook) {
@@ -192,6 +258,98 @@ unsafe fn kevent_change(kqueue: i32, ident: usize, filter: i16, flags: u16, ffla
         received != 1 || receipt_flags & EV_ERROR == 0 || receipt_data == 0,
         "kevent change (ident {ident}, filter {filter}) rejected, errno {receipt_data}"
     );
+}
+
+/// Observes `kCFRunLoopBeforeWaiting` on NSEventThread, which comes after the source callout that
+/// queued an event's block for the main thread, so the event is pending when the main queue's
+/// message is seen. The message is sent to the main queue, and not the hook called from the
+/// observer, so that a wake which lands while the knotes are disabled still fires when they are
+/// enabled again. All common modes: NSEventThread runs in more than the default one (event
+/// tracking, modal panels).
+///
+/// NSEventThread exists as soon as `NSApplication` does.
+unsafe fn observe_event_thread() -> EventThreadObserver {
+    unsafe {
+        let run_loop = event_thread_run_loop();
+        CFRetain(run_loop as *const c_void);
+        let observer = CFRunLoopObserverCreate(
+            ptr::null(),
+            kCFRunLoopBeforeWaiting,
+            1,
+            0,
+            event_thread_before_waiting,
+            ptr::null_mut(),
+        );
+        assert!(
+            !observer.is_null(),
+            "could not create the run loop observer"
+        );
+        CFRunLoopAddObserver(run_loop, observer, kCFRunLoopCommonModes);
+        EventThreadObserver { run_loop, observer }
+    }
+}
+
+unsafe fn unobserve_event_thread(event_thread_observer: EventThreadObserver) {
+    unsafe {
+        CFRunLoopRemoveObserver(
+            event_thread_observer.run_loop,
+            event_thread_observer.observer,
+            kCFRunLoopCommonModes,
+        );
+        CFRunLoopObserverInvalidate(event_thread_observer.observer);
+        CFRelease(event_thread_observer.observer as *const c_void);
+        CFRelease(event_thread_observer.run_loop as *const c_void);
+    }
+}
+
+extern "C" fn event_thread_before_waiting(
+    _observer: CFRunLoopObserverRef,
+    _activity: CFRunLoopActivity,
+    _info: *mut c_void,
+) {
+    extern "C" fn nothing(_: *mut c_void) {}
+    unsafe { DispatchQueue::main().exec_async_f(ptr::null_mut(), nothing) };
+}
+
+/// The run loop of `com.apple.NSEventThread`, the thread AppKit receives WindowServer events on.
+///
+/// # Panics
+///
+/// If `NSApplication` has not been created yet, so the thread does not exist.
+pub(crate) unsafe fn event_thread_run_loop() -> CFRunLoopRef {
+    unsafe {
+        let task = mach_task_self();
+        let mut threads = ptr::null_mut();
+        let mut count = 0;
+        let result = task_threads(task, &mut threads, &mut count);
+        assert_eq!(result, KERN_SUCCESS, "task_threads failed: {result}");
+
+        let mut event_thread = None;
+        for thread in std::slice::from_raw_parts(threads, count as usize) {
+            let pthread = libc::pthread_from_mach_thread_np(*thread);
+            if pthread == 0 {
+                continue;
+            }
+            let mut name = [0 as libc::c_char; 64];
+            if libc::pthread_getname_np(pthread, name.as_mut_ptr(), name.len()) == 0
+                && std::ffi::CStr::from_ptr(name.as_ptr()).to_bytes()
+                    == EVENT_THREAD_NAME.as_bytes()
+            {
+                event_thread = Some(pthread);
+            }
+        }
+        for thread in std::slice::from_raw_parts(threads, count as usize) {
+            mach_port_deallocate(task, *thread);
+        }
+        deallocate(threads, count);
+
+        let event_thread = event_thread.unwrap_or_else(|| {
+            panic!("the thread {EVENT_THREAD_NAME} does not exist: create the NSApplication first")
+        });
+        let run_loop = _CFRunLoopGet0(event_thread);
+        assert!(!run_loop.is_null(), "{EVENT_THREAD_NAME} has no run loop");
+        run_loop
+    }
 }
 
 extern "C" fn ignore_message(
