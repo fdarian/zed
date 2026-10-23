@@ -141,7 +141,7 @@ impl DispatchPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayoutStamp {
     layout_invalidations: usize,
-    builds: u64,
+    boxes: u64,
 }
 
 struct WindowInvalidatorInner {
@@ -1914,8 +1914,6 @@ pub struct Window {
     /// The pass running is one that does not paint: see [`Window::draw_if_dirty`].
     layout_only: bool,
     layout_passes: u64,
-    /// How many times the window drew or ran a layout pass: see [`Window::layout_stamp`].
-    builds: u64,
     /// A culled subtree is being prepainted: see [`Element::cull_outset`].
     culling: bool,
     /// The next element prepainted is the top of that subtree.
@@ -2660,7 +2658,6 @@ impl Window {
             measuring: false,
             layout_only: false,
             layout_passes: 0,
-            builds: 0,
             culling: false,
             cull_root_next: false,
             culled_subtrees: 0,
@@ -4401,16 +4398,20 @@ impl Window {
         self.layout_passes
     }
 
-    /// Where the window's layout stands: the invalidations it has had and the frames and layout
-    /// passes it has built. Two equal stamps mean nothing was invalidated and nothing was built
-    /// in between, so what the last build published (boxes, scroll metrics) is still what the
-    /// window holds, even when it was a build that the window is dirty after.
+    /// Where the window's layout stands: the invalidations it has had and the boxes its layout
+    /// engine has put its nodes in. Two equal stamps mean nothing was invalidated and no box moved
+    /// or changed size in between, so what the last pass published (boxes, scroll metrics) is still
+    /// what a pass would publish, even when frames were drawn in between and the window is dirty.
     ///
     /// An invalidation declared paint-only (see [`App::notify_paint_only`]) leaves the stamp, as
-    /// it leaves the layout: it moves no box and no extent. A frame that draws it is a build, which
-    /// moves the stamp, because it replaces the bounds and scroll handles the last pass published.
+    /// it leaves the layout: it moves no box and no extent. So does a frame that draws it, and any
+    /// other build that gives every node the box it had. A frame that moves a box without an
+    /// invalidation, as one that ticks an animation of a width does, moves it.
     pub fn layout_stamp(&self) -> LayoutStamp {
-        LayoutStamp { layout_invalidations: self.invalidator.layout_invalidation_count(), builds: self.builds }
+        LayoutStamp {
+            layout_invalidations: self.invalidator.layout_invalidation_count(),
+            boxes: self.layout_engine.as_ref().expect("the layout engine is out only while a pass runs").box_generation(),
+        }
     }
 
     /// Whether the pass being built is a layout-only one, whose frame is thrown away without
@@ -4507,7 +4508,6 @@ impl Window {
         self.next_frame.clear();
         self.invalidator.set_phase(DrawPhase::None);
         self.measured_at = Some((self.invalidator.update_count(), paint));
-        self.builds += 1;
         if !paint {
             self.layout_passes += 1;
         }
@@ -4520,7 +4520,6 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
-        self.builds += 1;
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -11828,18 +11827,33 @@ mod tests {
         });
     }
 
-    /// The stamp moves with every invalidation and every pass or draw, and with nothing else.
+    /// The stamp moves with every layout invalidation and with every box laid out to another place
+    /// or size, and with nothing else: a pass or a frame that gives every node the box it had leaves it.
     #[gpui::test]
-    fn test_the_layout_stamp_moves_with_layout_invalidations_and_builds(cx: &mut TestAppContext) {
-        struct Page;
+    fn test_the_layout_stamp_moves_with_layout_invalidations_and_boxes(cx: &mut TestAppContext) {
+        struct Page {
+            width: Rc<Cell<f32>>,
+            height: Rc<Cell<f32>>,
+        }
         impl Render for Page {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().size_full().child(div().w(px(100.)).h(px(20.)))
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().w(px(self.width.get())).h(px(self.height.get())))
+                    .child(div().w(px(100.)).h(px(20.)))
             }
         }
-        let (view, cx) = cx.add_window_view(|_, _| Page);
+        let width = Rc::new(Cell::new(100.));
+        let height = Rc::new(Cell::new(20.));
+        let (view, cx) = cx.add_window_view({
+            let (width, height) = (width.clone(), height.clone());
+            |_, _| Page { width, height }
+        });
         let id = view.entity_id();
         cx.update(|window, cx| {
+            let _ = window.draw(cx);
             let clean = window.layout_stamp();
             assert_eq!(window.layout_stamp(), clean);
 
@@ -11849,30 +11863,39 @@ mod tests {
             assert_eq!(window.layout_stamp(), invalidated, "and reading it does not");
 
             assert!(window.draw_if_dirty(cx));
-            let laid_out = window.layout_stamp();
-            assert_ne!(laid_out, invalidated, "a layout pass moves it");
-
-            cx.notify(id);
-            let again = window.layout_stamp();
-            assert!(window.draw_if_dirty(cx));
-            assert_ne!(window.layout_stamp(), again);
+            assert_eq!(window.layout_stamp(), invalidated, "a layout pass that moves no box leaves it");
             assert!(!window.draw_if_dirty(cx), "no pass runs on a window laid out");
-            let settled = window.layout_stamp();
-            assert_eq!(window.layout_stamp(), settled, "a read that builds nothing leaves it");
+
+            let _ = window.draw(cx);
+            assert_eq!(window.layout_stamp(), invalidated, "and so does a frame");
 
             cx.notify_paint_only(id);
-            assert_eq!(window.layout_stamp(), settled, "a paint-only invalidation moves no box and leaves it");
-            cx.notify(id);
-            let stale = window.layout_stamp();
-            assert_ne!(stale, settled, "a layout one moves it");
-            cx.notify_paint_only(id);
-            assert_eq!(window.layout_stamp(), stale, "and a paint-only one after it does not");
-            assert!(window.draw_if_dirty(cx));
-            assert_ne!(window.layout_stamp(), stale, "a pass moves it");
-            let passed = window.layout_stamp();
-            cx.notify_paint_only(id);
+            assert_eq!(window.layout_stamp(), invalidated, "a paint-only invalidation moves no box and leaves it");
             let _ = window.draw(cx);
-            assert_ne!(window.layout_stamp(), passed, "and so does a frame that draws a paint-only change");
+            assert_eq!(window.layout_stamp(), invalidated, "and the frame that draws it");
+
+            window.request_tick();
+            assert_eq!(window.layout_stamp(), invalidated, "a tick is no invalidation");
+            let _ = window.draw(cx);
+            assert_eq!(window.layout_stamp(), invalidated, "and a frame that ticks nothing a box depends on leaves it");
+
+            width.set(150.);
+            window.request_tick();
+            let _ = window.draw(cx);
+            let widened = window.layout_stamp();
+            assert_ne!(widened, invalidated, "a tick that changes a width moves it, with no invalidation");
+
+            // The box below it only moves.
+            height.set(40.);
+            window.request_tick();
+            let _ = window.draw(cx);
+            let grown = window.layout_stamp();
+            assert_ne!(grown, widened, "a box moved by the growth of its sibling moves it");
+            let _ = window.draw(cx);
+            assert_eq!(window.layout_stamp(), grown);
+
+            cx.notify(id);
+            assert_ne!(window.layout_stamp(), grown, "and a layout invalidation moves it again");
         });
     }
 

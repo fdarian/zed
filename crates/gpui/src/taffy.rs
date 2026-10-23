@@ -587,6 +587,12 @@ impl TaffyLayoutEngine {
         self.taffy.layout_generation(id.0).expect(EXPECT_MESSAGE)
     }
 
+    /// Changes whenever a node of the engine is laid out to another box, in size or place. See
+    /// [`taffy::TaffyTree::box_generation`].
+    pub(crate) fn box_generation(&self) -> u64 {
+        self.taffy.box_generation()
+    }
+
     /// Whether the node holds no layout result, which is the case for a node nothing laid out
     /// and for one under `display: none`.
     pub(crate) fn is_dirty(&self, id: LayoutId) -> bool {

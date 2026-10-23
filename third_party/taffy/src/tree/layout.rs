@@ -277,6 +277,18 @@ impl Layout {
             || self.padding != other.padding
     }
 
+    /// Whether the node's box is another one under `other`: where it is, its size, border, padding and scrollbars.
+    /// How far its content reaches, its order and its margin are not part of it.
+    ///
+    /// fdarian fork patch.
+    pub(crate) fn differs_box(&self, other: &Layout) -> bool {
+        self.location != other.location
+            || self.size != other.size
+            || self.scrollbar_size != other.scrollbar_size
+            || self.border != other.border
+            || self.padding != other.padding
+    }
+
     /// Creates a new zero-[`Layout`].
     ///
     /// The Zero-layout has size and location set to ZERO.

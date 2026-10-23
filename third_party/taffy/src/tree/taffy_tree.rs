@@ -370,6 +370,12 @@ pub struct TaffyTree<NodeContext = ()> {
     ///
     /// fdarian fork patch.
     boundary_fallbacks: u64,
+
+    /// Bumped whenever a node's stored layout changes in size, location, border, padding or scrollbar size: see
+    /// [`TaffyTree::box_generation`]. Never reset, not even by [`TaffyTree::clear`].
+    ///
+    /// fdarian fork patch.
+    box_generation: u64,
 }
 
 impl Default for TaffyTree {
@@ -728,9 +734,13 @@ where
 
     #[inline(always)]
     fn set_unrounded_layout(&mut self, node_id: NodeId, layout: &Layout) {
-        let node = &mut self.taffy.nodes[node_id.into()];
+        let taffy = &mut *self.taffy;
+        let node = &mut taffy.nodes[node_id.into()];
         if node.unrounded_layout.differs_inside(layout) {
             node.layout_generation += 1;
+        }
+        if node.unrounded_layout.differs_box(layout) {
+            taffy.box_generation += 1;
         }
         node.unrounded_layout = *layout;
     }
@@ -944,6 +954,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
             relayout_boundaries: true,
             boundary_relayouts: 0,
             boundary_fallbacks: 0,
+            box_generation: 0,
         }
     }
 
@@ -1520,6 +1531,17 @@ impl<NodeContext> TaffyTree<NodeContext> {
     #[inline]
     pub fn layout_generation(&self, node: NodeId) -> TaffyResult<u64> {
         Ok(self.nodes[node.into()].layout_generation)
+    }
+
+    /// How many times a node of the tree was laid out to another box: its size, its place in its parent, its
+    /// border, padding or scrollbar size. Two equal readings mean that no node of the tree has moved or changed
+    /// size in between, whatever was laid out again: a layout that gives every node the box it had leaves it.
+    /// A node's content size and order are not part of it, and neither are the nodes added or removed.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn box_generation(&self) -> u64 {
+        self.box_generation
     }
 
     /// Indicates whether the layout of this node needs to be recomputed
@@ -2199,6 +2221,35 @@ mod tests {
         assert_eq!(taffy.layout(child).unwrap().padding.left, 20.0);
         assert!(taffy.layout_generation(child).unwrap() > first);
         assert_eq!(taffy.dirty_generation(child), Ok(0));
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn the_box_generation_follows_the_boxes_the_nodes_are_laid_out_to() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let child = taffy
+            .new_leaf(Style { size: Size { width: length(100.0), height: length(40.0) }, flex_shrink: 0.0, ..Default::default() })
+            .unwrap();
+        let sibling = taffy.new_leaf(Style { size: Size { width: length(10.0), height: length(10.0) }, ..Default::default() }).unwrap();
+        let root_style = |width: f32| Style {
+            display: Display::Flex,
+            size: Size { width: length(width), height: length(100.0) },
+            ..Default::default()
+        };
+        let root = taffy.new_with_children(root_style(400.0), &[sibling, child]).unwrap();
+        assert_eq!(taffy.box_generation(), 0);
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let first = taffy.box_generation();
+        assert_ne!(first, 0, "the nodes were given their boxes");
+
+        taffy.mark_dirty(root).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert_eq!(taffy.box_generation(), first, "a layout that gives every node the box it had leaves it");
+
+        taffy.set_style(sibling, Style { size: Size { width: length(30.0), height: length(10.0) }, ..Default::default() }).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert_eq!(taffy.layout(child).unwrap().location.x, 30.0, "the sibling grew and the child moved with no change of its own");
+        assert!(taffy.box_generation() > first, "a box that only moved counts");
     }
 
     // fdarian fork patch.
