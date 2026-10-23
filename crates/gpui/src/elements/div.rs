@@ -24,7 +24,7 @@ use crate::{
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, OverflowAnchor, OverscrollBehavior,
     ParentElement, Position, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
+    StyleRefinement, Styled, Task, TooltipId, TransformationMatrix, Visibility, Window, WindowControlArea, point, px,
     scroll_routing, size,
     sticky::{self, StickyInsets},
     tab_stop::PaintedChild,
@@ -3271,8 +3271,16 @@ impl Interactivity {
         if window.is_layout_pass() {
             self.publish_layout(bounds, visibility, window);
         }
-        window.with_visibility(visibility, |window| {
-            f(display_none, position, contains_fixed, scroll_offset, window, cx)
+        // Nothing is drawn or hit here, but the boxes of the descendants are reported through the
+        // transform around them (`getBoundingClientRect`), and the layout holds the element's own.
+        let own_transform = self
+            .layout_id
+            .and_then(|layout_id| window.layout_own_transform(layout_id, bounds))
+            .unwrap_or_else(TransformationMatrix::unit);
+        window.with_transform(own_transform, |window| {
+            window.with_visibility(visibility, |window| {
+                f(display_none, position, contains_fixed, scroll_offset, window, cx)
+            })
         })
     }
 

@@ -8463,6 +8463,22 @@ impl Window {
             .layout_margin_bottom(layout_id, scale_factor)
     }
 
+    /// The matrix of the `transform` of the element of the given layout node for its border box
+    /// `border_box`, from the element's own space to the one the box is in (the space of
+    /// [`Window::layout_unsnapped_bounds`] and, composed onto [`Window::transform`] as asked from
+    /// the element's prepaint or paint listeners, to the window). `None` for an element with no
+    /// transform. Pass the unsnapped box to get the matrix a browser reports geometry through.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_own_transform(
+        &self,
+        layout_id: LayoutId,
+        border_box: Bounds<Pixels>,
+    ) -> Option<TransformationMatrix> {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        self.layout_engine.as_ref().unwrap().element_transform(layout_id, border_box)
+    }
+
     /// The size of the given layout node as layout computed it, in logical pixels and before it is
     /// snapped to device pixels. It leaves no bounds behind, so it is safe to ask for a root that
     /// is not placed yet (see [`Self::with_fractional_element_origin`]).
