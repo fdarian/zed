@@ -2505,7 +2505,7 @@ impl Div {
                 content_size,
                 window,
                 cx,
-                |display_none, position, contain_layout, scroll_offset, window, cx| {
+                |display_none, position, contains_fixed, scroll_offset, window, cx| {
                     if display_none {
                         return;
                     }
@@ -2523,10 +2523,10 @@ impl Div {
                     // The offset of a positioned box is what an escaping descendant is
                     // placed by.
                     let mut with_frame = |window: &mut Window| {
-                        if position == Position::Static && !contain_layout {
+                        if position == Position::Static && !contains_fixed {
                             prepaint_children(window)
                         } else {
-                            window.with_frame(contain_layout, prepaint_children)
+                            window.with_frame(contains_fixed, prepaint_children)
                         }
                     };
                     if scroll_offset.is_zero() {
@@ -2641,10 +2641,10 @@ impl Div {
                                     None => prepaint_children_lifted(window),
                                 }
                             };
-                            if style.position == Position::Static && !style.contain_layout {
+                            if style.position == Position::Static && !style.contains_fixed() {
                                 prepaint_children(window);
                             } else {
-                                window.with_frame(style.contain_layout, prepaint_children);
+                                window.with_frame(style.contains_fixed(), prepaint_children);
                             }
                         })
                     });
@@ -3248,13 +3248,13 @@ impl Interactivity {
         }
         self.report_a11y_focus(global_id, window);
 
-        let (display_none, position, contain_layout, visibility, scroll_offset) = if self.scroll_offset.is_some() {
+        let (display_none, position, contains_fixed, visibility, scroll_offset) = if self.scroll_offset.is_some() {
             let style = self.compute_style_internal(None, None, window, cx);
             let scroll_offset = self.clamp_scroll_position(bounds, &style, window, cx);
             (
                 style.display == Display::None,
                 style.position,
-                style.contain_layout,
+                style.contains_fixed(),
                 style.visibility.unwrap_or(window.visibility()),
                 scroll_offset,
             )
@@ -3262,7 +3262,8 @@ impl Interactivity {
             (
                 self.base_style.display == Some(Display::None),
                 self.base_style.position.unwrap_or_default(),
-                self.base_style.contain_layout.unwrap_or_default(),
+                self.base_style.contain_layout.unwrap_or_default()
+                    || self.base_style.contain_positioned.unwrap_or_default(),
                 self.base_style.visibility.unwrap_or(window.visibility()),
                 Point::default(),
             )
@@ -3271,7 +3272,7 @@ impl Interactivity {
             self.publish_layout(bounds, visibility, window);
         }
         window.with_visibility(visibility, |window| {
-            f(display_none, position, contain_layout, scroll_offset, window, cx)
+            f(display_none, position, contains_fixed, scroll_offset, window, cx)
         })
     }
 
@@ -6325,6 +6326,42 @@ mod tests {
         let [container, child] = offsets(true);
         assert_eq!((container.origin.y, child.origin.y), (px(0.), px(7.)));
         assert_eq!(container.size.height, px(17.));
+    }
+
+    struct PositionedContainedMargins {
+        contains_positioned: bool,
+    }
+
+    impl Render for PositionedContainedMargins {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut container = div()
+                .debug_selector(|| "container".into())
+                .block()
+                .child(div().debug_selector(|| "child".into()).mt(px(7.)).h(px(10.)));
+            container.style().contain_positioned = Some(self.contains_positioned);
+            div().block().child(container)
+        }
+    }
+
+    #[gpui::test]
+    fn a_box_that_contains_positioned_boxes_still_collapses_the_margins_of_its_children(
+        cx: &mut TestAppContext,
+    ) {
+        let mut bounds = |contains_positioned: bool| {
+            let window = cx.add_window(move |_, _| PositionedContainedMargins { contains_positioned });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            ["container", "child"].map(|selector| {
+                cx.update_window(window.into(), |_, window, _| {
+                    window.rendered_frame.debug_bounds.get(selector).copied()
+                })
+                .unwrap()
+                .unwrap_or_else(|| panic!("{selector} was not rendered"))
+            })
+        };
+        let without = bounds(false);
+        assert_eq!((without[0].origin.y, without[1].origin.y), (px(7.), px(7.)));
+        assert_eq!(bounds(true), without);
     }
 
     struct LayoutContainedMargins {
@@ -9612,6 +9649,11 @@ mod tests {
                 element
             }
 
+            fn contains_positioned<E: Styled>(mut element: E) -> E {
+                element.style().contain_positioned = Some(true);
+                element
+            }
+
             #[gpui::test]
             fn a_fixed_box_is_placed_and_clipped_by_a_layout_contained_ancestor(cx: &mut TestAppContext) {
                 let window = open_scene(cx, true, || {
@@ -9663,6 +9705,27 @@ mod tests {
 
                 assert_eq!(bounds_of(&window, cx, "fixed").origin, point(px(210.), px(210.)));
                 assert_eq!(bounds_of(&window, cx, "absolute").origin, point(px(220.), px(220.)));
+            }
+
+            #[gpui::test]
+            fn a_static_box_that_contains_positioned_boxes_is_the_containing_block_of_fixed_and_absolute_ones(
+                cx: &mut TestAppContext,
+            ) {
+                let window = open_scene(cx, true, || {
+                    root()
+                        .child(
+                            contains_positioned(static_box("static", 200., 100.).overflow_hidden())
+                                .child(fixed("fixed", 10., 10., 50.))
+                                .child(escaping("absolute", 20., 20., 50.))
+                                .child(fixed("edge", 80., 80., 50.)),
+                        )
+                        .into_any_element()
+                });
+
+                assert_eq!(bounds_of(&window, cx, "fixed").origin, point(px(210.), px(210.)));
+                assert_eq!(bounds_of(&window, cx, "absolute").origin, point(px(220.), px(220.)));
+                assert_eq!(bounds_of(&window, cx, "edge").origin, point(px(280.), px(280.)));
+                assert_eq!(chain_at(&window, cx, 310., 310.), ["root"], "the fixed box is clipped by it");
             }
 
             #[gpui::test]

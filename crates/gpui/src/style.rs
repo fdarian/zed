@@ -331,6 +331,10 @@ pub struct Style {
     /// independent formatting context, so no margin of a child collapses through it, and it is
     /// the containing block of its `position: fixed` descendants.
     pub contain_layout: bool,
+    /// The box is the containing block of its `position: fixed` and absolute descendants, as a
+    /// CSS `transform` makes it, and nothing else of `contain_layout`: the margins of its children
+    /// still collapse through it.
+    pub contain_positioned: bool,
     /// `contain-intrinsic-width`: the content-box width a contained inline axis has when its
     /// size comes from its content, in place of the 0 of an empty box. `None` is 0. The padding
     /// and border are added to it, and `min-` and `max-` clamp the sum. Without
@@ -1015,6 +1019,12 @@ impl Hash for HighlightStyle {
 const UNBOUNDED_CLIP: Pixels = Pixels(1.0e6);
 
 impl Style {
+    /// Whether the box is the containing block of its `fixed` descendants (and, whatever its
+    /// `position`, of its absolute ones).
+    pub(crate) fn contains_fixed(&self) -> bool {
+        self.contain_layout || self.contain_positioned
+    }
+
     /// Returns true if the style is visible and the background is opaque.
     pub fn has_opaque_background(&self) -> bool {
         self.background
@@ -1621,6 +1631,7 @@ impl Default for Style {
             contain_inline_size: false,
             contain_block_size: false,
             contain_layout: false,
+            contain_positioned: false,
             overflow_anchor: OverflowAnchor::default(),
             contain_intrinsic_width: None,
             contain_intrinsic_height: None,

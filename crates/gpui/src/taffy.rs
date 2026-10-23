@@ -235,9 +235,9 @@ struct NodeMeta {
     /// The node is [`crate::Position::Static`] and has no layout containment. It lays out as taffy
     /// `Relative` but is not a containing block, which taffy has no way to say.
     is_static: bool,
-    /// The node has layout containment, which makes it the containing block of the `fixed` boxes
-    /// below it, as well as of the absolute ones.
-    contains_layout: bool,
+    /// The node is the containing block of the `fixed` boxes below it, as well as of the absolute
+    /// ones: it has layout containment or [`Style::contain_positioned`].
+    contains_fixed: bool,
     /// The node's subtree belongs to another layer (deferred and anchored elements), so it is
     /// not part of the scrollable overflow of the scrollers it sits in.
     detached: bool,
@@ -1251,8 +1251,8 @@ impl TaffyLayoutEngine {
             has_inset: [style.inset.top, style.inset.right, style.inset.bottom, style.inset.left]
                 .iter()
                 .any(|edge| *edge != crate::Length::Auto),
-            is_static: style.position == crate::Position::Static && !style.contain_layout,
-            contains_layout: style.contain_layout,
+            is_static: style.position == crate::Position::Static && !style.contains_fixed(),
+            contains_fixed: style.contains_fixed(),
             transform: style
                 .transform
                 .clone()

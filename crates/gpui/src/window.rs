@@ -6298,17 +6298,17 @@ impl Window {
     }
 
     /// [`Self::with_positioned_frame`] for an element that may also have layout containment
-    /// (`contains_layout`), which makes the frame the one that `position: fixed` descendants are
+    /// (`contains_fixed`), which makes the frame the one that `position: fixed` descendants are
     /// placed in.
     pub(crate) fn with_frame<R>(
         &mut self,
-        contains_layout: bool,
+        contains_fixed: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_prepaint();
         let content_mask = self.content_mask();
         let element_offset = self.element_offset();
-        let fixed = if contains_layout {
+        let fixed = if contains_fixed {
             Some((content_mask, element_offset))
         } else {
             self.positioned_frames.last().and_then(|frame| frame.fixed)

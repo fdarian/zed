@@ -123,7 +123,7 @@ impl TaffyLayoutEngine {
             if nearest_positioned.is_none() && !meta.is_static {
                 nearest_positioned = Some(current);
             }
-            if nearest_contained.is_none() && meta.contains_layout {
+            if nearest_contained.is_none() && meta.contains_fixed {
                 nearest_contained = Some(current);
             }
             if current == root {
