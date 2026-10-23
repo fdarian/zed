@@ -6,8 +6,8 @@
 
 use crate::{
     Anchor, BackgroundBox, BackgroundPosition, BoxRegion, Bounds, CornerRadii, Corners, Edges, Hsla, LengthPercentage,
-    MaskComposite, MaskMode, Pixels, Point, PolychromeSprite, Quad, ScaledPixels, Size, ellipse_corner_sdf, point,
-    size,
+    MaskComposite, MaskMode, Pixels, Point, PolychromeSprite, Quad, ScaledPixels, Size, TransformationMatrix,
+    ellipse_corner_sdf, point, size,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -600,6 +600,84 @@ impl ResolvedClipPath {
         }
     }
 
+    /// The path after `matrix`. A matrix that rotates or skews has no rounded rectangle or ellipse
+    /// for an image, so those become polygons that follow their outline.
+    pub fn transformed(&self, matrix: &TransformationMatrix) -> ResolvedClipPath {
+        let map = |point: &Point<f32>| {
+            let mapped = matrix.apply_xy(point.x, point.y);
+            Point::new(mapped[0], mapped[1])
+        };
+        if matrix.is_axis_aligned() {
+            match self {
+                ResolvedClipPath::RoundedRect {
+                    bounds,
+                    corner_radii,
+                } => {
+                    let mask = crate::ContentMask {
+                        bounds: *bounds,
+                        corner_radii: corner_radii.x,
+                        corner_radii_y: corner_radii.y,
+                    };
+                    let mapped = mask
+                        .mapped_exactly(matrix)
+                        .expect("an axis-aligned matrix maps a rounded rectangle");
+                    return ResolvedClipPath::RoundedRect {
+                        bounds: mapped.bounds,
+                        corner_radii: CornerRadii {
+                            x: mapped.corner_radii,
+                            y: mapped.corner_radii_y,
+                        },
+                    };
+                }
+                ResolvedClipPath::Ellipse { center, radii } => {
+                    return ResolvedClipPath::Ellipse {
+                        center: map(center),
+                        radii: Size::new(
+                            radii.width * matrix.rotation_scale[0][0].abs(),
+                            radii.height * matrix.rotation_scale[1][1].abs(),
+                        ),
+                    };
+                }
+                ResolvedClipPath::Polygon { .. } => {}
+            }
+        }
+        match self {
+            ResolvedClipPath::RoundedRect {
+                bounds,
+                corner_radii,
+            } => ResolvedClipPath::Polygon {
+                contours: vec![
+                    rounded_rect_outline(bounds, corner_radii)
+                        .iter()
+                        .map(map)
+                        .collect(),
+                ],
+                even_odd: false,
+            },
+            ResolvedClipPath::Ellipse { center, radii } => ResolvedClipPath::Polygon {
+                contours: vec![
+                    (0..OUTLINE_SAMPLES * 4)
+                        .map(|step| {
+                            let angle = step as f32 / (OUTLINE_SAMPLES * 4) as f32 * std::f32::consts::TAU;
+                            map(&Point::new(
+                                center.x + radii.width * angle.cos(),
+                                center.y + radii.height * angle.sin(),
+                            ))
+                        })
+                        .collect(),
+                ],
+                even_odd: false,
+            },
+            ResolvedClipPath::Polygon { contours, even_odd } => ResolvedClipPath::Polygon {
+                contours: contours
+                    .iter()
+                    .map(|contour| contour.iter().map(map).collect())
+                    .collect(),
+                even_odd: *even_odd,
+            },
+        }
+    }
+
     /// Whether the point is inside, ignoring antialiasing. The GPU evaluates the same shape.
     pub fn contains(&self, position: Point<f32>) -> bool {
         match self {
@@ -652,6 +730,34 @@ impl ResolvedClipPath {
             }
         }
     }
+}
+
+/// The points an arc of a quarter turn is cut into when a rounded outline becomes a polygon.
+const OUTLINE_SAMPLES: usize = 16;
+
+/// The outline of a rounded rectangle, clockwise from the top edge's left end.
+fn rounded_rect_outline(
+    bounds: &Bounds<ScaledPixels>,
+    corner_radii: &CornerRadii<ScaledPixels>,
+) -> Vec<Point<f32>> {
+    let radii_y = corner_radii.explicit_y();
+    let (left, top) = (bounds.left().0, bounds.top().0);
+    let (right, bottom) = (bounds.right().0, bounds.bottom().0);
+    // Each corner: where its arc is centred, the radii, and the angle (in quarter turns) it starts at.
+    let corners = [
+        (left + corner_radii.x.top_left.0, top + radii_y.top_left.0, corner_radii.x.top_left.0, radii_y.top_left.0, 2),
+        (right - corner_radii.x.top_right.0, top + radii_y.top_right.0, corner_radii.x.top_right.0, radii_y.top_right.0, 3),
+        (right - corner_radii.x.bottom_right.0, bottom - radii_y.bottom_right.0, corner_radii.x.bottom_right.0, radii_y.bottom_right.0, 0),
+        (left + corner_radii.x.bottom_left.0, bottom - radii_y.bottom_left.0, corner_radii.x.bottom_left.0, radii_y.bottom_left.0, 1),
+    ];
+    let mut outline = Vec::with_capacity(corners.len() * (OUTLINE_SAMPLES + 1));
+    for (center_x, center_y, radius_x, radius_y, quarter) in corners {
+        for step in 0..=OUTLINE_SAMPLES {
+            let angle = (quarter as f32 + step as f32 / OUTLINE_SAMPLES as f32) * std::f32::consts::FRAC_PI_2;
+            outline.push(Point::new(center_x + radius_x * angle.cos(), center_y + radius_y * angle.sin()));
+        }
+    }
+    outline
 }
 
 /// Whether the contours fill a position: by their summed winding number for `nonzero`, or by the

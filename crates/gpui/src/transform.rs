@@ -210,6 +210,31 @@ impl ContentMask<Pixels> {
     }
 }
 
+impl ContentMask<ScaledPixels> {
+    /// [`ContentMask::mapped_exactly`] for device pixels.
+    pub(crate) fn mapped_exactly(&self, matrix: &TransformationMatrix) -> Option<ContentMask<ScaledPixels>> {
+        let corners = |corners: &Corners<ScaledPixels>| corners.map(|radius| px(radius.0));
+        let as_pixels = ContentMask {
+            bounds: Bounds {
+                origin: point(px(self.bounds.origin.x.0), px(self.bounds.origin.y.0)),
+                size: size(px(self.bounds.size.width.0), px(self.bounds.size.height.0)),
+            },
+            corner_radii: corners(&self.corner_radii),
+            corner_radii_y: corners(&self.corner_radii_y),
+        };
+        as_pixels.mapped_exactly(matrix).map(|mapped| mapped.scale(1.))
+    }
+
+    /// [`ContentMask::mapped_loosely`] for device pixels.
+    pub(crate) fn mapped_loosely(&self, matrix: &TransformationMatrix) -> ContentMask<ScaledPixels> {
+        self.mapped_exactly(matrix).unwrap_or_else(|| ContentMask {
+            bounds: matrix.bounding_box_scaled(self.bounds),
+            corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
+        })
+    }
+}
+
 /// A length that is a number of pixels plus a fraction of the element's own border box, which
 /// is what `translate()` and `transform-origin` percentages are. Units that are not pixels
 /// (`em`, `vw`, ...) are resolved to pixels by the caller.

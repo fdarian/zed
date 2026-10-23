@@ -2750,6 +2750,16 @@ struct Placement {
     offset: Point<ScaledPixels>,
     transformation: TransformationMatrix,
     local_clip: ContentMask<ScaledPixels>,
+    /// Whether the transform is a general one, which the primitives carry as a matrix.
+    general: bool,
+}
+
+/// A clip a sprite is given, in the space it is clipped in.
+pub(crate) enum SpriteClip {
+    /// The content mask of the window, as it is under any transform.
+    Window(ContentMask<ScaledPixels>),
+    /// A rectangle in the local space of what is being painted, as the clip of a mask layer is.
+    Local(ContentMask<ScaledPixels>),
 }
 
 impl Placement {
@@ -2757,6 +2767,29 @@ impl Placement {
         Bounds {
             origin: bounds.origin + self.offset,
             size: bounds.size,
+        }
+    }
+
+    /// The matrix from the local space to the window with the rounded translation in it, for a
+    /// primitive that can't just have its bounds moved.
+    fn matrix(&self) -> TransformationMatrix {
+        TransformationMatrix {
+            rotation_scale: self.transformation.rotation_scale,
+            translation: [
+                self.transformation.translation[0] + self.offset.x.0,
+                self.transformation.translation[1] + self.offset.y.0,
+            ],
+        }
+    }
+
+    /// The local clip of a primitive whose own space is `own` inside the space the clip is in.
+    fn local_clip_through(&self, own: &TransformationMatrix) -> ContentMask<ScaledPixels> {
+        if *own == TransformationMatrix::unit() || self.local_clip == ContentMask::unbounded() {
+            return self.local_clip;
+        }
+        match own.inverse() {
+            Some(inverse) => self.local_clip.mapped_loosely(&inverse),
+            None => ContentMask::unbounded(),
         }
     }
 }
@@ -2767,6 +2800,7 @@ impl Default for Placement {
             offset: Point::default(),
             transformation: TransformationMatrix::unit(),
             local_clip: ContentMask::unbounded(),
+            general: false,
         }
     }
 }
@@ -5835,6 +5869,7 @@ impl Window {
                 local_clip: ambient
                     .local_clip
                     .map_or_else(ContentMask::unbounded, |clip| clip.scale(self.scale_factor())),
+                general: true,
             },
         }
     }
@@ -6451,21 +6486,51 @@ impl Window {
     /// once finished. Without renderer support only the opacity applies, per primitive.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
+    ///
+    /// Inside a transform, `effect` is in the local space and the group is composited in the
+    /// window: the content is drawn through the matrix, so the group covers the bounding box of
+    /// what it paints. A `clip-path` is mapped through the matrix. The `backdrop-filter` is
+    /// clipped to the bounding box of the element's box, not to its rotated outline.
     pub fn with_effect_group<R>(
         &mut self,
-        effect: GroupEffect,
+        mut effect: GroupEffect,
         reserved: Option<Bounds<Pixels>>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.invalidator.debug_assert_paint();
         let content_mask = self.snapped_content_mask();
-        let reserved = reserved.map(|bounds| self.cover_bounds(bounds));
+        let placement = self.placement();
+        let reserved = reserved.map(|bounds| {
+            if placement.general {
+                self.cover_bounds(self.bounds_in_window(bounds))
+            } else {
+                placement.shift(self.cover_bounds(bounds))
+            }
+        });
+        self.place_group_effect(&placement, &mut effect);
         self.next_frame
             .scene
             .start_group(effect, content_mask, reserved);
         let result = f(self);
         self.next_frame.scene.end_group();
         result
+    }
+
+    /// Moves what an effect holds in the local space into the window. The layers of a mask are
+    /// not touched: they were made by painters that put them where they go.
+    fn place_group_effect(&self, placement: &Placement, effect: &mut GroupEffect) {
+        if placement.general {
+            effect.reference = placement.transformation.bounding_box_scaled(effect.reference);
+            effect.reference_radii = CornerRadii::default();
+            if let Some(clip_path) = &mut effect.clip_path {
+                *clip_path = clip_path.transformed(&placement.transformation);
+            }
+        } else if placement.offset != Point::default() {
+            effect.reference.origin = effect.reference.origin + placement.offset;
+            if let Some(clip_path) = &mut effect.clip_path {
+                clip_path.translate(Point::new(placement.offset.x.0, placement.offset.y.0));
+            }
+        }
     }
 
     /// Runs `f` while keeping a copy of every glyph it paints. The first group opened inside with
@@ -7056,14 +7121,23 @@ impl Window {
 
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
+        let mut content_mask = self.content_mask();
         let opacity = self.element_opacity();
+        if let Some(ambient) = self.transform_stack.last()
+            && let Some(local_clip) = ambient.local_clip
+        {
+            // A path is cut by one window-space rectangle, so the local clip is loose here.
+            content_mask = content_mask.intersect(&local_clip.mapped_loosely(&ambient.matrix));
+        }
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
-        self.next_frame
-            .scene
-            .insert_primitive(path.scale(scale_factor));
+        let placement = self.placement();
+        let mut path = path.scale(scale_factor);
+        if placement.general || placement.offset != Point::default() {
+            path.place(placement.offset, &placement.transformation);
+        }
+        self.next_frame.scene.insert_primitive(path);
     }
 
     /// Paint an underline into the scene for the next frame at the current z-index.
@@ -7154,21 +7228,24 @@ impl Window {
         }
         let color = color.unwrap_or_default().opacity(self.element_opacity());
         let content_mask = self.snapped_content_mask();
+        let placement = self.placement();
 
         for band in geometry.bands() {
             self.next_frame.scene.insert_primitive(Underline {
                 order: 0,
                 pad: 0,
-                bounds: Bounds {
+                bounds: placement.shift(Bounds {
                     origin: point(origin.x, origin.y + ScaledPixels(band.offset)),
                     size: size(width, ScaledPixels(band.height)),
-                },
+                }),
                 content_mask: content_mask.clone(),
                 color,
                 thickness,
                 style: geometry.shape,
                 mark_length: ScaledPixels(geometry.mark_length),
                 mark_period: ScaledPixels(geometry.mark_period),
+                transformation: placement.transformation,
+                local_clip: placement.local_clip,
             });
         }
     }
@@ -7198,13 +7275,16 @@ impl Window {
 
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let placement = self.placement();
+        let glyph_origin = origin.scale(scale_factor) + placement.offset;
 
         let (integer_x, subpixel_x) = split_glyph_origin(glyph_origin.x.0, SUBPIXEL_VARIANTS_X);
         let (integer_y, subpixel_y) = split_glyph_origin(glyph_origin.y.0, SUBPIXEL_VARIANTS_Y);
         let subpixel_variant = Point::new(subpixel_x, subpixel_y);
         let integer_origin = point(ScaledPixels(integer_x), ScaledPixels(integer_y));
-        let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
+        // Subpixel rendering is tied to the pixel grid, which a matrix does not keep.
+        let subpixel_rendering =
+            !placement.general && self.should_use_subpixel_rendering(font_id, font_size);
         let luminance_bucket = match font_smoothing {
             FontSmoothing::Auto => self.text_system().glyph_luminance_bucket_for_color(color),
             FontSmoothing::Antialiased => 0,
@@ -7254,7 +7334,8 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: TransformationMatrix::unit(),
+                    transformation: placement.transformation,
+                    local_clip: placement.local_clip,
                 });
             }
         }
@@ -7302,7 +7383,8 @@ impl Window {
 
 
         let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let placement = self.placement();
+        let glyph_origin = origin.scale(scale_factor) + placement.offset;
         let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_up(c.0)));
         let params = RenderGlyphParams {
             font_id,
@@ -7343,6 +7425,8 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                transformation: placement.transformation,
+                local_clip: placement.local_clip,
             });
         }
         Ok(())
@@ -7400,9 +7484,17 @@ impl Window {
                 .size
                 .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
         };
+        let placement = self.placement();
         let final_bounds = svg_bounds
             .map_origin(|value| ScaledPixels(round_half_down(value.0)))
             .map_size(|size| size.ceil());
+        // The sprite's own matrix turns around a centre in the local space, so a translation
+        // can't just move the bounds under it.
+        let (final_bounds, sprite_transformation) = if transformation == TransformationMatrix::unit() {
+            (placement.shift(final_bounds), placement.transformation)
+        } else {
+            (final_bounds, placement.matrix().compose(transformation))
+        };
 
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
@@ -7411,7 +7503,8 @@ impl Window {
             content_mask,
             color: color.opacity(element_opacity),
             tile,
-            transformation,
+            transformation: sprite_transformation,
+            local_clip: placement.local_clip_through(&transformation),
         });
 
         Ok(())
@@ -7490,7 +7583,7 @@ impl Window {
             grayscale,
             nearest_neighbor,
             self.element_opacity(),
-            self.snapped_content_mask(),
+            SpriteClip::Window(self.snapped_content_mask()),
         )?;
         if let Some(sprite) = sprite {
             self.next_frame.scene.insert_image(sprite);
@@ -7512,7 +7605,7 @@ impl Window {
         grayscale: bool,
         nearest_neighbor: bool,
         opacity: f32,
-        content_mask: ContentMask<ScaledPixels>,
+        clip: SpriteClip,
     ) -> Result<Option<PolychromeSprite>> {
         let visible_bounds = bounds.intersect(&image_bounds);
         if visible_bounds.size.width <= Pixels::ZERO || visible_bounds.size.height <= Pixels::ZERO {
@@ -7540,7 +7633,19 @@ impl Window {
             })?
             .expect("Callback above only returns Some");
 
-        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
+        let placement = self.placement();
+        let visible_bounds_snapped = placement.shift(self.snap_bounds(visible_bounds));
+        let (content_mask, local_clip) = match clip {
+            SpriteClip::Window(mask) => (mask, placement.local_clip),
+            SpriteClip::Local(clip) if placement.general => (ContentMask::unbounded(), clip),
+            SpriteClip::Local(clip) => (
+                ContentMask {
+                    bounds: placement.shift(clip.bounds),
+                    ..clip
+                },
+                ContentMask::unbounded(),
+            ),
+        };
 
         let sub_tile = if visible_bounds == image_bounds {
             tile
@@ -7596,7 +7701,21 @@ impl Window {
             corner_radii_y: corner_radii.y,
             tile: sub_tile,
             opacity,
+            transformation: placement.transformation,
+            local_clip,
         }))
+    }
+
+    /// Where a surface is drawn in device pixels. The platform draws a surface as an upright
+    /// rectangle, so under a transform that is not a translation it is drawn in the bounding box
+    /// of the transformed bounds: scaled and moved right, but not rotated or skewed.
+    pub(crate) fn surface_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+        let placement = self.placement();
+        if placement.general {
+            self.snap_bounds(self.bounds_in_window(bounds))
+        } else {
+            placement.shift(self.snap_bounds(bounds))
+        }
     }
 
     /// Paint a surface into the scene for the next frame at the current z-index.
@@ -7612,7 +7731,7 @@ impl Window {
         }
 
 
-        let bounds = self.snap_bounds(bounds);
+        let bounds = self.surface_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
@@ -7646,7 +7765,7 @@ impl Window {
         }
 
         let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
+        let bounds = self.bounds_in_window(bounds).scale(scale_factor);
         let content_mask = self.content_mask().scale(scale_factor);
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,

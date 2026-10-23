@@ -42,6 +42,7 @@ float2 apply_transform(TransformationMatrix transformation, float2 position);
 float4 device_position_of(float2 position, constant Size_DevicePixels *viewport_size);
 float4 distance_from_clip(float2 position, Bounds_ScaledPixels clip_bounds);
 float local_clip_coverage(float2 local_position, ContentMask_ScaledPixels local_clip, float pixel);
+float rect_coverage(float2 local_position, Bounds_ScaledPixels bounds, float pixel);
 float4 select_border_color(bool is_left, bool is_top, float vertical_weight,
                            float4 top, float4 right, float4 bottom,
                            float4 left);
@@ -55,6 +56,24 @@ float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bo
   float4 solid_color, float4 color0, float4 color1);
 float4 css_gradient_color(Background background, float2 position, Bounds_ScaledPixels bounds);
 float4 dither(float4 color, float2 position);
+
+// A vertex of a primitive that may be drawn through a matrix, see `transformed_vertex`.
+struct TransformedVertex {
+  float4 device_position;
+  float4 clip_distance;
+  // Across the primitive's bounds, 0 to 1 (a little beyond for the padding).
+  float2 unit_position;
+  // Where the vertex is in the primitive's own space; unused when `local_scale` is 0.
+  float2 local_position;
+  // The device pixels one unit of the primitive's own space covers, or 0 when no
+  // matrix applies and the fragment works in window pixels.
+  float local_scale;
+};
+
+TransformedVertex transformed_vertex(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                                     TransformationMatrix transformation,
+                                     Bounds_ScaledPixels clip_bounds,
+                                     constant Size_DevicePixels *viewport_size);
 
 struct GradientColor {
   float4 solid;
@@ -816,6 +835,8 @@ struct UnderlineVertexOutput {
   float4 position [[position]];
   float4 color [[flat]];
   uint underline_id [[flat]];
+  float2 local_position;
+  float local_scale [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
@@ -823,6 +844,8 @@ struct UnderlineFragmentInput {
   float4 position [[position]];
   float4 color [[flat]];
   uint underline_id [[flat]];
+  float2 local_position;
+  float local_scale [[flat]];
 };
 
 vertex UnderlineVertexOutput underline_vertex(
@@ -833,15 +856,17 @@ vertex UnderlineVertexOutput underline_vertex(
     [[buffer(ShadowInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Underline underline = underlines[underline_id];
-  float4 device_position =
-      to_device_position(unit_vertex, underline.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
-                                                 underline.content_mask.bounds);
+  TransformedVertex vertex_data =
+      transformed_vertex(unit_vertex, underline.bounds, underline.transformation,
+                         underline.content_mask.bounds, viewport_size);
+  float4 clip_distance = vertex_data.clip_distance;
   float4 color = hsla_to_rgba(underline.color);
   return UnderlineVertexOutput{
-      device_position,
+      vertex_data.device_position,
       color,
       underline_id,
+      vertex_data.local_position,
+      vertex_data.local_scale,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -857,26 +882,36 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   const uint SHAPE_WAVY = 3u;
 
   Underline underline = underlines[input.underline_id];
+  // Everything below is in the underline's own space, which is the window's when nothing
+  // transforms it. `pixel` is the device pixels one unit of it covers.
+  bool transformed = input.local_scale > 0.0;
+  float pixel = transformed ? input.local_scale : 1.0;
+  float2 local_position = transformed ? input.local_position : input.position.xy;
   float mask_alpha = content_mask_coverage(input.position.xy, underline.content_mask);
+  if (transformed) {
+    mask_alpha *= local_clip_coverage(local_position, underline.local_clip, pixel) *
+                  rect_coverage(local_position, underline.bounds, pixel);
+  }
   if (underline.style == SHAPE_DOTTED) {
     // Round dots, laid out from the left edge; the nearest dot decides the coverage.
     float radius = underline.mark_length * 0.5;
-    float2 local = input.position.xy - float2(underline.bounds.origin.x, underline.bounds.origin.y);
+    float2 local = local_position - float2(underline.bounds.origin.x, underline.bounds.origin.y);
     float nearest = floor((local.x - radius) / underline.mark_period + 0.5);
     float2 center = float2(nearest * underline.mark_period + radius, radius);
-    float alpha = saturate(0.5 - (length(local - center) - radius));
+    float alpha = saturate(0.5 - (length(local - center) - radius) * pixel);
     return input.color * float4(1., 1., 1., alpha * mask_alpha);
   } else if (underline.style == SHAPE_DASHED) {
-    float x = input.position.x - underline.bounds.origin.x;
+    float x = local_position.x - underline.bounds.origin.x;
     float along = x - floor(x / underline.mark_period) * underline.mark_period;
-    float alpha = saturate(along + 0.5) * saturate(underline.mark_length - along + 0.5);
+    float alpha = saturate(along * pixel + 0.5) *
+                  saturate((underline.mark_length - along) * pixel + 0.5);
     return input.color * float4(1., 1., 1., alpha * mask_alpha);
   } else if (underline.style == SHAPE_WAVY) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
         float2(underline.bounds.origin.x, underline.bounds.origin.y);
 
-    float2 st = ((input.position.xy - origin) / underline.bounds.size.height) -
+    float2 st = ((local_position - origin) / underline.bounds.size.height) -
                 float2(0., 0.5);
     float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.height;
     float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.height;
@@ -888,7 +923,7 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_top_border = distance_in_pixels - half_thickness;
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
-        0.5 - max(-distance_from_bottom_border, distance_from_top_border));
+        0.5 - max(-distance_from_bottom_border, distance_from_top_border) * pixel);
     return input.color * float4(1., 1., 1., alpha * mask_alpha);
   } else {
     return input.color * float4(1., 1., 1., mask_alpha);
@@ -901,6 +936,8 @@ struct MonochromeSpriteVertexOutput {
   uint sprite_id [[flat]];
   float4 color [[flat]];
   float4 clip_distance;
+  float2 local_position;
+  float local_scale [[flat]];
 };
 
 struct MonochromeSpriteFragmentInput {
@@ -909,6 +946,8 @@ struct MonochromeSpriteFragmentInput {
   uint sprite_id [[flat]];
   float4 color [[flat]];
   float4 clip_distance;
+  float2 local_position;
+  float local_scale [[flat]];
 };
 
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
@@ -921,18 +960,20 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
     [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   MonochromeSprite sprite = sprites[sprite_id];
-  float4 device_position =
-      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
-  float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
-                                                 sprite.content_mask.bounds, sprite.transformation);
-  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  TransformedVertex vertex_data =
+      transformed_vertex(unit_vertex, sprite.bounds, sprite.transformation,
+                         sprite.content_mask.bounds, viewport_size);
+  float4 clip_distance = vertex_data.clip_distance;
+  float2 tile_position = to_tile_position(vertex_data.unit_position, sprite.tile, atlas_size);
   float4 color = hsla_to_rgba(sprite.color);
   return MonochromeSpriteVertexOutput{
-      device_position,
+      vertex_data.device_position,
       tile_position,
       sprite_id,
       color,
-      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      vertex_data.local_position,
+      vertex_data.local_scale};
 }
 
 fragment float4 monochrome_sprite_fragment(
@@ -943,13 +984,28 @@ fragment float4 monochrome_sprite_fragment(
     return float4(0.0);
   }
 
+  MonochromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
+  float2 tile_position = input.tile_position;
+  float coverage = 1.0;
+  if (input.local_scale > 0.0) {
+    // The padding around a transformed sprite reads the tile's edge texels, not its
+    // neighbours in the atlas, and is cut to the sprite's antialiased bounds.
+    float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
+    float2 tile_origin = float2(sprite.tile.bounds.origin.x, sprite.tile.bounds.origin.y);
+    float2 tile_size = float2(sprite.tile.bounds.size.width, sprite.tile.bounds.size.height);
+    float2 tile_low = (tile_origin + 0.5) / atlas_size;
+    float2 tile_high = max((tile_origin + tile_size - 0.5) / atlas_size, tile_low);
+    tile_position = clamp(tile_position, tile_low, tile_high);
+    coverage = rect_coverage(input.local_position, sprite.bounds, input.local_scale) *
+               local_clip_coverage(input.local_position, sprite.local_clip, input.local_scale);
+  }
   float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+      atlas_texture.sample(atlas_texture_sampler, tile_position);
   float4 color = input.color;
-  color.a *= sample.a;
-  color.a *= content_mask_coverage(input.position.xy, sprites[input.sprite_id].content_mask);
+  color.a *= sample.a * coverage;
+  color.a *= content_mask_coverage(input.position.xy, sprite.content_mask);
   return color;
 }
 
@@ -957,6 +1013,8 @@ struct PolychromeSpriteVertexOutput {
   float4 position [[position]];
   float2 tile_position;
   uint sprite_id [[flat]];
+  float2 local_position;
+  float local_scale [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
@@ -964,6 +1022,8 @@ struct PolychromeSpriteFragmentInput {
   float4 position [[position]];
   float2 tile_position;
   uint sprite_id [[flat]];
+  float2 local_position;
+  float local_scale [[flat]];
 };
 
 vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
@@ -977,15 +1037,17 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PolychromeSprite sprite = sprites[sprite_id];
-  float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
-                                                 sprite.content_mask.bounds);
-  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  TransformedVertex vertex_data =
+      transformed_vertex(unit_vertex, sprite.bounds, sprite.transformation,
+                         sprite.content_mask.bounds, viewport_size);
+  float4 clip_distance = vertex_data.clip_distance;
+  float2 tile_position = to_tile_position(vertex_data.unit_position, sprite.tile, atlas_size);
   return PolychromeSpriteVertexOutput{
-      device_position,
+      vertex_data.device_position,
       tile_position,
       sprite_id,
+      vertex_data.local_position,
+      vertex_data.local_scale,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -994,6 +1056,11 @@ fragment float4 polychrome_sprite_fragment(
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
   PolychromeSprite sprite = sprites[input.sprite_id];
+  // Everything below is in the sprite's own space, which is the window's when nothing
+  // transforms it. `pixel` is the device pixels one unit of it covers.
+  bool transformed = input.local_scale > 0.0;
+  float pixel = transformed ? input.local_scale : 1.0;
+  float2 local_position = transformed ? input.local_position : input.position.xy;
   constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear);
   constexpr sampler nearest_neighbor_sampler(mag_filter::nearest,
                                              min_filter::nearest);
@@ -1006,12 +1073,13 @@ fragment float4 polychrome_sprite_fragment(
   float2 tile_low = (tile_origin + 0.5) / atlas_size;
   float2 tile_high = max((tile_origin + tile_size - 0.5) / atlas_size, tile_low);
   float2 tile_position = clamp(input.tile_position, tile_low, tile_high);
+  // The padding of a transformed sprite is past the tile for the nearest sampler too.
   float4 sample = sprite.nearest_neighbor
                       ? atlas_texture.sample(nearest_neighbor_sampler,
-                                             input.tile_position)
+                                             transformed ? tile_position : input.tile_position)
                       : atlas_texture.sample(linear_sampler, tile_position);
   float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii, sprite.corner_radii_y);
+      quad_sdf(local_position, sprite.bounds, sprite.corner_radii, sprite.corner_radii_y);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -1020,7 +1088,11 @@ fragment float4 polychrome_sprite_fragment(
     color.g = grayscale;
     color.b = grayscale;
   }
-  color.a *= sprite.opacity * saturate(0.5 - distance) *
+  float clip_alpha = 1.0;
+  if (transformed) {
+    clip_alpha = local_clip_coverage(local_position, sprite.local_clip, pixel);
+  }
+  color.a *= sprite.opacity * saturate(0.5 - distance * pixel) * clip_alpha *
              content_mask_coverage(input.position.xy, sprite.content_mask);
   return color;
 }
@@ -1519,6 +1591,55 @@ float local_clip_coverage(float2 local_position, ContentMask_ScaledPixels local_
   return saturate(0.5 - quad_sdf(local_position, local_clip.bounds,
                                  local_clip.corner_radii,
                                  local_clip.corner_radii_y) * pixel);
+}
+
+float rect_coverage(float2 local_position, Bounds_ScaledPixels bounds, float pixel) {
+  float2 half_size = float2(bounds.size.width, bounds.size.height) / 2.0;
+  float2 center = float2(bounds.origin.x, bounds.origin.y) + half_size;
+  float2 outside = fabs(local_position - center) - half_size;
+  float distance = length(max(outside, float2(0.0))) + min(max(outside.x, outside.y), 0.0);
+  return saturate(0.5 - distance * pixel);
+}
+
+// The vertex of a primitive whose own space is `transformation` away from the window. Without
+// a matrix it is the plain quad of `bounds`. With one, the quad grows by a device pixel on
+// every side, where the antialiased edges are drawn, and goes through the matrix; the clip
+// distances are those of the window position.
+TransformedVertex transformed_vertex(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                                     TransformationMatrix transformation,
+                                     Bounds_ScaledPixels clip_bounds,
+                                     constant Size_DevicePixels *viewport_size) {
+  TransformedVertex result;
+  if (is_identity_transform(transformation)) {
+    result.device_position = to_device_position(unit_vertex, bounds, viewport_size);
+    result.clip_distance = distance_from_clip_rect(unit_vertex, bounds, clip_bounds);
+    result.unit_position = unit_vertex;
+    result.local_position = float2(0.0);
+    result.local_scale = 0.0;
+    return result;
+  }
+  float local_scale = transform_pixel_scale(transformation);
+  if (local_scale < 1e-6) {
+    // A matrix that flattens the plane draws nothing: put the quad off the screen.
+    result.device_position = float4(2.0, 2.0, 0.0, 1.0);
+    result.clip_distance = float4(-1.0);
+    result.unit_position = float2(0.0);
+    result.local_position = float2(0.0);
+    result.local_scale = 1.0;
+    return result;
+  }
+  float pad = 1.0 / local_scale;
+  float2 size = float2(bounds.size.width, bounds.size.height);
+  float2 origin = float2(bounds.origin.x, bounds.origin.y) - pad;
+  float2 extent = size + 2.0 * pad;
+  float2 local_position = origin + unit_vertex * extent;
+  float2 window_position = apply_transform(transformation, local_position);
+  result.device_position = device_position_of(window_position, viewport_size);
+  result.clip_distance = distance_from_clip(window_position, clip_bounds);
+  result.unit_position = (local_position - float2(bounds.origin.x, bounds.origin.y)) / max(size, float2(1e-6));
+  result.local_position = local_position;
+  result.local_scale = local_scale;
+  return result;
 }
 
 float4 over(float4 below, float4 above) {

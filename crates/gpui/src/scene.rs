@@ -500,16 +500,16 @@ impl Scene {
             add(path.bounds, &path.content_mask);
         }
         for underline in &self.underlines {
-            add(underline.bounds, &underline.content_mask);
+            add(underline.window_bounds(), &underline.content_mask);
         }
         for sprite in &self.monochrome_sprites {
-            add(sprite.bounds, &sprite.content_mask);
+            add(sprite.window_bounds(), &sprite.content_mask);
         }
         for sprite in &self.subpixel_sprites {
-            add(sprite.bounds, &sprite.content_mask);
+            add(transformed_bounds(&sprite.transformation, sprite.bounds), &sprite.content_mask);
         }
         for sprite in &self.polychrome_sprites {
-            add(sprite.bounds, &sprite.content_mask);
+            add(sprite.window_bounds(), &sprite.content_mask);
         }
         for surface in &self.surfaces {
             add(surface.bounds, &surface.content_mask);
@@ -1334,7 +1334,13 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => shadow.window_bounds(),
             Primitive::Quad(quad) => quad.window_bounds(),
-            _ => *self.bounds(),
+            Primitive::Underline(underline) => underline.window_bounds(),
+            Primitive::MonochromeSprite(sprite) => sprite.window_bounds(),
+            Primitive::SubpixelSprite(sprite) => {
+                transformed_bounds(&sprite.transformation, sprite.bounds)
+            }
+            Primitive::PolychromeSprite(sprite) => sprite.window_bounds(),
+            Primitive::Path(_) | Primitive::Surface(_) => *self.bounds(),
         }
     }
 
@@ -1388,24 +1394,15 @@ impl Primitive {
     }
 
     /// Moves the primitive by `delta`, the way a painter that painted it there would have put it
-    /// where it ends up on screen: a sprite's bounds move, and its transformation changes so that
-    /// what the transformation does to the moved bounds is the old place moved by `delta`.
+    /// where it ends up on screen.
     fn translate_replayed(&mut self, delta: Point<ScaledPixels>) {
         match self {
             Primitive::Shadow(shadow) => shadow.translate(delta),
             Primitive::Quad(quad) => quad.translate(delta),
             Primitive::Path(path) => path.translate(delta),
             Primitive::Underline(underline) => underline.translate(delta),
-            Primitive::MonochromeSprite(sprite) => {
-                translate_bounds(&mut sprite.bounds, delta);
-                translate_transformation(&mut sprite.transformation, delta);
-                translate_mask(&mut sprite.content_mask, delta);
-            }
-            Primitive::SubpixelSprite(sprite) => {
-                translate_bounds(&mut sprite.bounds, delta);
-                translate_transformation(&mut sprite.transformation, delta);
-                translate_mask(&mut sprite.content_mask, delta);
-            }
+            Primitive::MonochromeSprite(sprite) => sprite.translate(delta),
+            Primitive::SubpixelSprite(sprite) => sprite.translate(delta),
             Primitive::PolychromeSprite(sprite) => sprite.translate(delta),
             Primitive::Surface(surface) => surface.translate(delta),
         }
@@ -1481,12 +1478,15 @@ fn clip_mask(mask: &mut ContentMask<ScaledPixels>, clip: &Bounds<ScaledPixels>) 
     };
 }
 
-/// Moves what `transformation` draws by `delta` when its bounds were moved by `delta` too: the
-/// shader draws `rotation_scale * bounds + translation`.
-fn translate_transformation(transformation: &mut TransformationMatrix, delta: Point<ScaledPixels>) {
-    let [[a, b], [c, d]] = transformation.rotation_scale;
-    transformation.translation[0] += (1. - a) * delta.x.0 - b * delta.y.0;
-    transformation.translation[1] += -c * delta.x.0 + (1. - d) * delta.y.0;
+/// Moves what `transformation` draws by `delta`, when it is not the unit matrix. A primitive with
+/// one has its bounds and its local clip in its own space, which `delta` does not concern.
+fn move_through(transformation: &mut TransformationMatrix, delta: Point<ScaledPixels>) -> bool {
+    if *transformation == TransformationMatrix::unit() {
+        return false;
+    }
+    transformation.translation[0] += delta.x.0;
+    transformation.translation[1] += delta.y.0;
+    true
 }
 
 fn translate_bounds(bounds: &mut Bounds<ScaledPixels>, delta: Point<ScaledPixels>) {
@@ -1499,13 +1499,11 @@ fn translate_mask(mask: &mut ContentMask<ScaledPixels>, delta: Point<ScaledPixel
 
 #[expect(missing_docs)]
 impl Quad {
-    /// A quad with a transformation is moved through it, as a sprite is: its bounds and the
-    /// tile origin are in its own space, which `delta` does not concern.
+    /// A quad with a transformation is moved through it: its bounds and the tile origin are in
+    /// its own space, which `delta` does not concern.
     pub fn translate(&mut self, delta: Point<ScaledPixels>) {
         translate_mask(&mut self.content_mask, delta);
-        if self.transformation != TransformationMatrix::unit() {
-            self.transformation.translation[0] += delta.x.0;
-            self.transformation.translation[1] += delta.y.0;
+        if move_through(&mut self.transformation, delta) {
             return;
         }
         translate_bounds(&mut self.bounds, delta);
@@ -1519,9 +1517,7 @@ impl Quad {
 impl Shadow {
     fn translate(&mut self, delta: Point<ScaledPixels>) {
         translate_mask(&mut self.content_mask, delta);
-        if self.transformation != TransformationMatrix::unit() {
-            self.transformation.translation[0] += delta.x.0;
-            self.transformation.translation[1] += delta.y.0;
+        if move_through(&mut self.transformation, delta) {
             return;
         }
         translate_bounds(&mut self.bounds, delta);
@@ -1536,33 +1532,52 @@ impl Shadow {
 
 impl Underline {
     fn translate(&mut self, delta: Point<ScaledPixels>) {
-        translate_bounds(&mut self.bounds, delta);
         translate_mask(&mut self.content_mask, delta);
+        if !move_through(&mut self.transformation, delta) {
+            translate_bounds(&mut self.bounds, delta);
+        }
+    }
+
+    /// The area the underline covers in the window, see [`Primitive::window_bounds`].
+    pub fn window_bounds(&self) -> Bounds<ScaledPixels> {
+        transformed_bounds(&self.transformation, self.bounds)
     }
 }
 
 impl MonochromeSprite {
-    /// Moves through the transformation rather than the bounds, which is where a sprite's
-    /// position ends up whatever the rest of the matrix does.
     fn translate(&mut self, delta: Point<ScaledPixels>) {
-        self.transformation.translation[0] += delta.x.0;
-        self.transformation.translation[1] += delta.y.0;
         translate_mask(&mut self.content_mask, delta);
+        if !move_through(&mut self.transformation, delta) {
+            translate_bounds(&mut self.bounds, delta);
+        }
+    }
+
+    /// The area the sprite covers in the window, see [`Primitive::window_bounds`].
+    pub fn window_bounds(&self) -> Bounds<ScaledPixels> {
+        transformed_bounds(&self.transformation, self.bounds)
     }
 }
 
 impl SubpixelSprite {
     fn translate(&mut self, delta: Point<ScaledPixels>) {
-        self.transformation.translation[0] += delta.x.0;
-        self.transformation.translation[1] += delta.y.0;
         translate_mask(&mut self.content_mask, delta);
+        if !move_through(&mut self.transformation, delta) {
+            translate_bounds(&mut self.bounds, delta);
+        }
     }
 }
 
 impl PolychromeSprite {
     pub(crate) fn translate(&mut self, delta: Point<ScaledPixels>) {
-        translate_bounds(&mut self.bounds, delta);
         translate_mask(&mut self.content_mask, delta);
+        if !move_through(&mut self.transformation, delta) {
+            translate_bounds(&mut self.bounds, delta);
+        }
+    }
+
+    /// The area the sprite covers in the window, see [`Primitive::window_bounds`].
+    pub fn window_bounds(&self) -> Bounds<ScaledPixels> {
+        transformed_bounds(&self.transformation, self.bounds)
     }
 }
 
@@ -1574,6 +1589,29 @@ impl PaintSurface {
 }
 
 impl Path<ScaledPixels> {
+    /// Places the path where a transform puts it, in the vertices: the rasterizer draws triangles,
+    /// which take any affine matrix, and the antialiasing of the curves follows the screen-space
+    /// gradient of their coordinates. The bounds become those of the placed vertices.
+    pub(crate) fn place(&mut self, offset: Point<ScaledPixels>, matrix: &TransformationMatrix) {
+        if self.vertices.is_empty() {
+            self.bounds = matrix.bounding_box_scaled(self.bounds);
+            translate_bounds(&mut self.bounds, offset);
+            return;
+        }
+        let mut low = [f32::INFINITY; 2];
+        let mut high = [f32::NEG_INFINITY; 2];
+        for vertex in &mut self.vertices {
+            let placed = matrix.apply_xy(vertex.xy_position.x.0, vertex.xy_position.y.0);
+            vertex.xy_position = point(ScaledPixels(placed[0]), ScaledPixels(placed[1])) + offset;
+            low = [low[0].min(vertex.xy_position.x.0), low[1].min(vertex.xy_position.y.0)];
+            high = [high[0].max(vertex.xy_position.x.0), high[1].max(vertex.xy_position.y.0)];
+        }
+        self.bounds = Bounds::from_corners(
+            point(ScaledPixels(low[0]), ScaledPixels(low[1])),
+            point(ScaledPixels(high[0]), ScaledPixels(high[1])),
+        );
+    }
+
     fn translate(&mut self, delta: Point<ScaledPixels>) {
         translate_bounds(&mut self.bounds, delta);
         translate_mask(&mut self.content_mask, delta);
@@ -1985,6 +2023,10 @@ pub struct Underline {
     /// the starts of two marks.
     pub mark_length: ScaledPixels,
     pub mark_period: ScaledPixels,
+    /// See [`Quad::transformation`].
+    pub transformation: TransformationMatrix,
+    /// See [`Quad::local_clip`].
+    pub local_clip: ContentMask<ScaledPixels>,
 }
 
 impl From<Underline> for Primitive {
@@ -2164,7 +2206,12 @@ pub struct MonochromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub tile: AtlasTile,
+    /// Where the sprite's own space (`bounds`, `local_clip`) is in the window: an SVG's own
+    /// transformation, with the one of the element it is in after it. The unit matrix for a glyph
+    /// that nothing transforms.
     pub transformation: TransformationMatrix,
+    /// A clip in the sprite's own space, see [`Quad::local_clip`].
+    pub local_clip: ContentMask<ScaledPixels>,
 }
 
 impl From<MonochromeSprite> for Primitive {
@@ -2206,6 +2253,10 @@ pub struct PolychromeSprite {
     /// The vertical radii of the corners; zero for the same as `corner_radii`.
     pub corner_radii_y: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    /// See [`Quad::transformation`].
+    pub transformation: TransformationMatrix,
+    /// See [`Quad::local_clip`].
+    pub local_clip: ContentMask<ScaledPixels>,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -2475,6 +2526,7 @@ mod tests {
                 bounds: Bounds::default(),
             },
             transformation: TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
         }
     }
 
@@ -2807,6 +2859,8 @@ mod tests {
             corner_radii: Corners::default(),
             corner_radii_y: Corners::default(),
             tile: glyph(0., 0.).tile,
+            transformation: TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
         };
         scene.insert_primitive(sprite);
         scene.insert_image(sprite);

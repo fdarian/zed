@@ -8,7 +8,7 @@
 use crate::{
     App, BackgroundImage, BackgroundImages, BackgroundTile, BorderStyle, Bounds, ContentMask,
     CornerRadii, Edges, Hsla, LengthPercentage, MaskComposite, MaskLayer, MaskMode, Pixels, Size,
-    Window, MAX_IMAGE_TILES, point, px, quad, size,
+    SpriteClip, Window, MAX_IMAGE_TILES, point, px, quad, size,
 };
 use gpui_util::ResultExt;
 use schemars::JsonSchema;
@@ -268,7 +268,7 @@ impl MaskBorder {
                                 false,
                                 false,
                                 1.,
-                                clip,
+                                SpriteClip::Local(clip),
                             )
                             .log_err()
                             .flatten();

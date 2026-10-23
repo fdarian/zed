@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     AbsoluteLength, App, Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundImages,
-    BackgroundLayer, BackgroundTag, MaskBorder, MaskLayer, MaskMode,
+    BackgroundLayer, BackgroundTag, MaskBorder, MaskLayer, MaskMode, SpriteClip,
     BorderStyle, ClipPathValue, FilterFunction, ResolvedClipPath, GroupEffect, Bounds, ContentMask, CornerRadii,
     CornerRadius, Corners, CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Escape, Font,
     FontFallbacks, FontFeatures, FontSmoothing, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
@@ -1253,7 +1253,7 @@ impl Style {
                         false,
                         false,
                         1.,
-                        clip,
+                        SpriteClip::Local(clip),
                     )
                     .log_err()
                     .flatten()

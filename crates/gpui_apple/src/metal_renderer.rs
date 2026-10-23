@@ -4045,6 +4045,8 @@ mod tests {
             corner_radii: Corners::default(),
             corner_radii_y: Corners::default(),
             tile,
+            transformation: gpui::TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
         }
     }
 
@@ -4775,6 +4777,7 @@ mod tests {
             color: gpui::transparent_black(),
             tile,
             transformation: gpui::TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
         });
         scene.end_text_clip();
         scene.finish();
@@ -5285,5 +5288,317 @@ mod tests {
             placed.insert_primitive(drawn(14., gpui::TransformationMatrix::unit()));
             assert_images_match(&render(&mut moved), &render(&mut placed));
         }
+    }
+
+    fn render_in(renderer: &mut MetalHeadlessRenderer, scene: &mut Scene) -> image::RgbaImage {
+        scene.finish();
+        renderer
+            .render_scene_to_image(scene, size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .expect("scene should render")
+    }
+
+    fn white_image(renderer: &MetalHeadlessRenderer, id: usize) -> gpui::AtlasTile {
+        atlas_image(renderer, id, 1, 1, pixels(&[OPAQUE_WHITE]))
+    }
+
+    /// A monochrome tile whose alpha differs from texel to texel.
+    fn ramp_tile(renderer: &MetalHeadlessRenderer, name: &str) -> gpui::AtlasTile {
+        let bytes: Vec<u8> = (0..64u32).map(|texel| (texel * 4 + 3) as u8).collect();
+        gpui::PlatformHeadlessRenderer::sprite_atlas(renderer)
+            .get_or_insert_with(
+                &gpui::AtlasKey::Svg(gpui::RenderSvgParams {
+                    path: name.to_string().into(),
+                    size: size(DevicePixels(8), DevicePixels(8)),
+                }),
+                &mut || Ok(Some((size(DevicePixels(8), DevicePixels(8)), bytes.clone().into()))),
+            )
+            .expect("the atlas takes the tile")
+            .expect("the tile exists")
+    }
+
+    fn glyph_sprite(
+        tile: gpui::AtlasTile,
+        at: (f32, f32),
+        transformation: gpui::TransformationMatrix,
+    ) -> gpui::MonochromeSprite {
+        gpui::MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(at.0), ScaledPixels(at.1)),
+                size(ScaledPixels(8.), ScaledPixels(8.)),
+            ),
+            content_mask: window_mask(),
+            color: hex(0xff0000),
+            tile,
+            transformation,
+            local_clip: ContentMask::unbounded(),
+        }
+    }
+
+    fn lit(image: &image::RgbaImage, x: u32, y: u32) -> bool {
+        image.get_pixel(x, y).0[..3].iter().any(|&channel| channel > 200)
+    }
+
+    fn lit_pixels(image: &image::RgbaImage) -> usize {
+        image.pixels().filter(|pixel| pixel.0[..3].iter().any(|&channel| channel > 127)).count()
+    }
+
+    #[test]
+    fn a_translated_glyph_sprite_matches_the_one_drawn_at_the_offset() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = ramp_tile(&renderer, "ramp");
+        let mut moved = Scene::default();
+        moved.insert_primitive(glyph_sprite(tile, (5., 4.), matrix([1., 0., 0., 1., 9., 7.])));
+        let mut placed = Scene::default();
+        placed.insert_primitive(glyph_sprite(tile, (14., 11.), gpui::TransformationMatrix::unit()));
+        let moved = render_in(&mut renderer, &mut moved);
+        assert_images_match(&moved, &render_in(&mut renderer, &mut placed));
+        assert!(moved.pixels().any(|pixel| pixel.0[0] > 40), "the sprite is drawn");
+    }
+
+    #[test]
+    fn a_translated_image_matches_the_one_drawn_at_the_offset() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = atlas_image(&renderer, 1, 2, 2, pixels(&[OPAQUE_WHITE, OPAQUE_BLACK, OPAQUE_BLACK, OPAQUE_WHITE]));
+        let rounded = |at: (f32, f32), transformation| gpui::PolychromeSprite {
+            corner_radii: Corners::all(ScaledPixels(5.)),
+            transformation,
+            ..image_sprite(tile, (at.0, at.1, 12., 12.), window_mask())
+        };
+        let mut moved = Scene::default();
+        moved.insert_primitive(rounded((4., 6.), matrix([1., 0., 0., 1., 8., 5.])));
+        let mut placed = Scene::default();
+        placed.insert_primitive(rounded((12., 11.), gpui::TransformationMatrix::unit()));
+        assert_images_match(
+            &render_in(&mut renderer, &mut moved),
+            &render_in(&mut renderer, &mut placed),
+        );
+    }
+
+    #[test]
+    fn a_rotated_image_with_rounded_corners_fills_its_center_and_not_the_corner_of_its_bounds() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = white_image(&renderer, 1);
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::PolychromeSprite {
+            corner_radii: Corners::all(ScaledPixels(6.)),
+            transformation: rotation_around(45., (20., 20.)),
+            ..image_sprite(tile, (10., 10., 20., 20.), window_mask())
+        });
+        let image = render_in(&mut renderer, &mut scene);
+        assert!(lit(&image, 20, 20));
+        assert!(lit(&image, 20, 10), "inside the rounded tip");
+        assert!(lit(&image, 12, 20));
+        // The corners of the unrotated bounds and the tips the radius rounds off.
+        for (x, y) in [(11, 11), (28, 11), (11, 28), (28, 28), (20, 6), (7, 20)] {
+            assert!(is_cleared(&image, x, y), "pixel ({x}, {y}) should be empty");
+        }
+    }
+
+    #[test]
+    fn a_scaled_image_covers_twice_the_area_at_twice_the_size() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = white_image(&renderer, 1);
+        let mut plain = Scene::default();
+        plain.insert_primitive(image_sprite(tile, (4., 4., 8., 8.), window_mask()));
+        let mut scaled = Scene::default();
+        scaled.insert_primitive(gpui::PolychromeSprite {
+            transformation: matrix([2., 0., 0., 2., 0., 0.]),
+            ..image_sprite(tile, (4., 4., 8., 8.), window_mask())
+        });
+        let plain = render_in(&mut renderer, &mut plain);
+        let scaled = render_in(&mut renderer, &mut scaled);
+        assert_eq!(lit_pixels(&plain), 64);
+        assert_eq!(lit_pixels(&scaled), 256);
+        assert!(lit(&scaled, 8, 8) && lit(&scaled, 23, 23));
+        assert!(is_cleared(&scaled, 7, 7) && is_cleared(&scaled, 24, 24));
+    }
+
+    #[test]
+    fn a_local_clip_cuts_a_rotated_image_along_its_own_axes() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = white_image(&renderer, 1);
+        let mut clip = window_mask();
+        clip.bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(20.), ScaledPixels(40.)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::PolychromeSprite {
+            transformation: rotation_around(45., (20., 20.)),
+            local_clip: clip,
+            ..image_sprite(tile, (10., 10., 20., 20.), window_mask())
+        });
+        let image = render_in(&mut renderer, &mut scene);
+        assert!(lit(&image, 17, 17));
+        assert!(is_cleared(&image, 23, 23));
+    }
+
+    #[test]
+    fn a_rotated_glyph_sprite_is_drawn_through_the_matrix_and_antialiased() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = gpui::PlatformHeadlessRenderer::sprite_atlas(&renderer)
+            .get_or_insert_with(
+                &gpui::AtlasKey::Svg(gpui::RenderSvgParams {
+                    path: "solid".into(),
+                    size: size(DevicePixels(16), DevicePixels(16)),
+                }),
+                &mut || Ok(Some((size(DevicePixels(16), DevicePixels(16)), vec![255u8; 256].into()))),
+            )
+            .expect("the atlas takes the tile")
+            .expect("the tile exists");
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::MonochromeSprite {
+            bounds: Bounds::new(
+                point(ScaledPixels(12.), ScaledPixels(12.)),
+                size(ScaledPixels(16.), ScaledPixels(16.)),
+            ),
+            ..glyph_sprite(tile, (0., 0.), rotation_around(45., (20., 20.)))
+        });
+        let image = render_in(&mut renderer, &mut scene);
+        assert!(lit(&image, 20, 20) && lit(&image, 20, 11) && lit(&image, 11, 20));
+        for (x, y) in [(12, 12), (27, 12), (12, 27), (27, 27)] {
+            assert!(is_cleared(&image, x, y), "pixel ({x}, {y}) should be empty");
+        }
+        // The slanted edge has partly covered pixels, which a hard-edged quad would not.
+        let partial = image.pixels().filter(|pixel| (40..215).contains(&pixel.0[0])).count();
+        assert!(partial > 10, "{partial} antialiased pixels");
+    }
+
+    fn underline(style: u32, bounds: (f32, f32, f32, f32), transformation: gpui::TransformationMatrix) -> gpui::Underline {
+        gpui::Underline {
+            order: 0,
+            pad: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(bounds.0), ScaledPixels(bounds.1)),
+                size(ScaledPixels(bounds.2), ScaledPixels(bounds.3)),
+            ),
+            content_mask: window_mask(),
+            color: hex(0xff0000),
+            thickness: ScaledPixels(2.),
+            style,
+            mark_length: ScaledPixels(3.),
+            mark_period: ScaledPixels(6.),
+            transformation,
+            local_clip: ContentMask::unbounded(),
+        }
+    }
+
+    #[test]
+    fn a_translated_underline_matches_the_one_drawn_at_the_offset_in_every_shape() {
+        // Solid, dotted, dashed and wavy.
+        for style in 0..4 {
+            let mut moved = Scene::default();
+            moved.insert_primitive(underline(style, (3., 5., 24., 6.), matrix([1., 0., 0., 1., 7., 9.])));
+            let mut placed = Scene::default();
+            placed.insert_primitive(underline(style, (10., 14., 24., 6.), gpui::TransformationMatrix::unit()));
+            assert_images_match(&render(&mut moved), &render(&mut placed));
+        }
+    }
+
+    #[test]
+    fn a_rotated_underline_runs_along_the_turned_axis() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(underline(0, (8., 18., 24., 4.), rotation_around(90., (20., 20.))));
+        let image = render(&mut scene);
+        assert_eq!(dominant_channel(&image, 20, 10), "red");
+        assert_eq!(dominant_channel(&image, 20, 29), "red");
+        assert!(is_cleared(&image, 10, 20), "the horizontal run is gone");
+        assert!(is_cleared(&image, 29, 20));
+        assert!(is_cleared(&image, 24, 20), "the line is 4 wide");
+    }
+
+    #[test]
+    fn a_rotated_dashed_underline_keeps_its_dashes_along_its_own_length() {
+        let mut scene = Scene::default();
+        let mut dashed = underline(2, (4., 18., 32., 4.), rotation_around(90., (20., 20.)));
+        dashed.mark_length = ScaledPixels(4.);
+        dashed.mark_period = ScaledPixels(8.);
+        scene.insert_primitive(dashed);
+        let image = render(&mut scene);
+        // Along the line: marks at local x 0..4, 8..12, ... from its top end (y = 4).
+        assert_eq!(dominant_channel(&image, 20, 6), "red");
+        assert!(is_cleared(&image, 20, 10), "between two dashes");
+        assert_eq!(dominant_channel(&image, 20, 14), "red");
+    }
+
+    #[test]
+    fn a_rotated_element_with_opacity_composites_at_the_rotated_place() {
+        let mut scene = groups_scene();
+        scene.start_group(
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        // Two overlapping rotated boxes, so the group is needed to fade them as one.
+        for color in [0xff0000, 0xff0000] {
+            scene.insert_primitive(Quad {
+                content_mask: window_mask(),
+                transformation: rotation_around(45., (20., 20.)),
+                ..rounded_box(10., 10., 20., 0., color)
+            });
+        }
+        scene.end_group();
+        let image = render(&mut scene);
+        let center = image.get_pixel(20, 20).0[0] as i32;
+        assert!((center - 128).abs() <= 4, "half faded once, not twice: {center}");
+        for (x, y) in [(11, 11), (28, 11), (11, 28), (28, 28)] {
+            assert!(is_cleared(&image, x, y), "pixel ({x}, {y}) should be empty");
+        }
+        assert!(image.get_pixel(20, 8).0[0] > 20, "the tip of the diamond is at the top");
+    }
+
+    #[test]
+    fn a_rotated_image_in_a_mask_masks_where_the_turned_image_is() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = white_image(&renderer, 1);
+        let turned = gpui::PolychromeSprite {
+            transformation: rotation_around(45., (20., 20.)),
+            ..image_sprite(tile, (10., 10., 20., 20.), window_mask())
+        };
+        let image = through_image_mask(
+            &mut renderer,
+            vec![sprites_of(vec![turned], MaskMode::Alpha, MaskComposite::Add)],
+        );
+        assert_mask(&image, 20, 20, 1.);
+        assert_mask(&image, 20, 12, 1.);
+        assert_mask(&image, 11, 11, 0.);
+        assert_mask(&image, 28, 28, 0.);
+    }
+
+    #[test]
+    fn a_clip_path_polygon_in_window_space_cuts_a_rotated_group() {
+        let mut scene = groups_scene();
+        let diamond = gpui::ResolvedClipPath::Polygon {
+            contours: vec![vec![
+                gpui::Point::new(20., 6.),
+                gpui::Point::new(34., 20.),
+                gpui::Point::new(20., 34.),
+                gpui::Point::new(6., 20.),
+            ]],
+            even_odd: false,
+        };
+        scene.start_group(
+            GroupEffect {
+                clip_path: Some(diamond),
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            transformation: rotation_around(10., (20., 20.)),
+            ..rounded_box(2., 2., 36., 0., 0xff0000)
+        });
+        scene.end_group();
+        let image = render(&mut scene);
+        assert_eq!(dominant_channel(&image, 20, 20), "red");
+        assert!(is_cleared(&image, 8, 8));
+        assert!(is_cleared(&image, 32, 32));
     }
 }
