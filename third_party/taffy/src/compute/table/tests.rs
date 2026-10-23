@@ -3817,7 +3817,7 @@ mod collapsed {
     use super::*;
     use crate::compute::table::DetailedTableInfo;
 
-    fn lines_of(spec: Spec, width: f32) -> DetailedTableInfo {
+    pub(super) fn lines_of(spec: Spec, width: f32) -> DetailedTableInfo {
         let mut tree: TaffyTree<(Vec<f32>, f32)> = TaffyTree::new();
         tree.disable_rounding();
         let mut order = Vec::new();
@@ -3929,5 +3929,159 @@ mod collapsed {
         // none is: the bottom of the row
         let top = |s: &mut Style| s.vertical_align = VerticalAlign::Top;
         assert_eq!(with(vec![td(top, vec![boxed(20.0, 10.0)]), td(top, vec![boxed(5.0, 20.0)])]), Some(18.0 + 20.0));
+    }
+}
+
+/// The baseline of a row of cells without a baseline, against the boxes Chrome gives (the pages are the "no baseline"
+/// cases of `packages/react/src/__tests__/fixtures/table-baseline-cell-oracle.html`, the table in an `inline-table` next to
+/// text 20px high: the baseline is where the table sits on the baseline of the text). A row that no cell is aligned in
+/// has its baseline as far above its bottom as the least padding and border below the content of its cells; an empty
+/// row's is its top. A cell with children has a baseline even without text: the bottom of its content.
+mod cell_baselines {
+    use super::collapsed::lines_of;
+    use super::*;
+
+    fn baseline_of(rows: Vec<Spec>) -> Option<f32> {
+        lines_of(table(|_| {}, rows), 300.0).first_baseline
+    }
+
+    fn top(s: &mut Style) {
+        s.vertical_align = VerticalAlign::Top;
+    }
+
+    /// `<td style="height:50px;padding-bottom:5px">` with nothing in it, and a row with a height.
+    #[test]
+    fn a_row_without_baseline_cells_is_above_the_padding_below_its_cells() {
+        let padded = |s: &mut Style| {
+            s.size.height = length(50.0);
+            s.padding.bottom = length(5.0);
+        };
+        assert_eq!(baseline_of(vec![tr(|_| {}, vec![td(padded, vec![])])]), Some(45.0));
+        // The row is as tall as its height, the cell is not
+        assert_eq!(
+            baseline_of(vec![tr(|s| s.size.height = length(50.0), vec![td(|s| s.padding.bottom = length(5.0), vec![])])]),
+            Some(45.0)
+        );
+        // Nothing to cut: the row is as tall as the padding
+        assert_eq!(baseline_of(vec![tr(|_| {}, vec![td(|s| s.padding.bottom = length(5.0), vec![])])]), Some(0.0));
+    }
+
+    /// The least of the cells' padding and border below the content counts, whichever cell it is.
+    #[test]
+    fn it_is_above_the_least_padding_and_border_of_the_cells() {
+        let cell = |height: f32, padding: f32, border: f32| {
+            td(
+                move |s| {
+                    s.size.height = length(height);
+                    s.padding.bottom = length(padding);
+                    s.border.bottom = length(border);
+                },
+                vec![],
+            )
+        };
+        assert_eq!(baseline_of(vec![tr(|_| {}, vec![cell(50.0, 8.0, 0.0), cell(20.0, 2.0, 0.0)])]), Some(48.0));
+        assert_eq!(baseline_of(vec![tr(|_| {}, vec![cell(40.0, 0.0, 6.0)])]), Some(34.0));
+    }
+
+    /// Cells aligned to the top, the middle or the bottom are not on the baseline, with content or not.
+    #[test]
+    fn cells_that_are_not_on_the_baseline_do_not_make_one() {
+        let top_6 = |s: &mut Style| {
+            top(s);
+            s.padding.bottom = length(6.0);
+        };
+        let tall = |s: &mut Style| {
+            top(s);
+            s.size.height = length(50.0);
+            s.padding.bottom = length(2.0);
+        };
+        // a top-aligned box in each cell: 50 - 2
+        assert_eq!(
+            baseline_of(vec![tr(|_| {}, vec![td(top_6, vec![boxed(20.0, 20.0)]), td(tall, vec![boxed(20.0, 20.0)])])]),
+            Some(48.0)
+        );
+        // an empty cell in the row counts as well: 50 - 4
+        let empty = |s: &mut Style| {
+            s.size.height = length(30.0);
+            s.padding.bottom = length(4.0);
+        };
+        let tall_9 = |s: &mut Style| {
+            top(s);
+            s.size.height = length(50.0);
+            s.padding.bottom = length(9.0);
+        };
+        assert_eq!(
+            baseline_of(vec![tr(|_| {}, vec![td(empty, vec![]), td(tall_9, vec![boxed(20.0, 20.0)])])]),
+            Some(46.0)
+        );
+        // aligned to the middle: 50 - 6
+        let middle_6 = |s: &mut Style| {
+            s.vertical_align = VerticalAlign::Middle;
+            s.padding.bottom = length(6.0);
+        };
+        let middle_9 = |s: &mut Style| {
+            s.vertical_align = VerticalAlign::Middle;
+            s.size.height = length(50.0);
+            s.padding.bottom = length(9.0);
+        };
+        assert_eq!(
+            baseline_of(vec![tr(|_| {}, vec![td(middle_6, vec![boxed(20.0, 20.0)]), td(middle_9, vec![])])]),
+            Some(44.0)
+        );
+    }
+
+    /// A cell with children has a baseline, the bottom of its content, so the row has one: 0 for a box without a size, 12
+    /// for a box of 12px, below the padding above it.
+    #[test]
+    fn a_cell_with_a_box_and_no_text_has_the_bottom_of_its_content_for_a_baseline() {
+        let cell = |s: &mut Style| {
+            s.size.height = length(30.0);
+            s.padding.bottom = length(5.0);
+        };
+        let tall = |s: &mut Style| {
+            top(s);
+            s.size.height = length(50.0);
+            s.padding.bottom = length(9.0);
+        };
+        assert_eq!(
+            baseline_of(vec![tr(|_| {}, vec![td(cell, vec![boxed(0.0, 0.0)]), td(tall, vec![boxed(20.0, 20.0)])])]),
+            Some(0.0)
+        );
+        assert_eq!(
+            baseline_of(vec![tr(|_| {}, vec![td(cell, vec![boxed(0.0, 12.0)]), td(tall, vec![boxed(20.0, 20.0)])])]),
+            Some(12.0)
+        );
+        let padded = |s: &mut Style| {
+            s.padding.top = length(6.0);
+            s.padding.bottom = length(5.0);
+        };
+        let bottom = |s: &mut Style| {
+            s.vertical_align = VerticalAlign::Bottom;
+            s.size.height = length(50.0);
+        };
+        assert_eq!(
+            baseline_of(vec![tr(|_| {}, vec![td(padded, vec![boxed(0.0, 12.0)]), td(bottom, vec![])])]),
+            Some(18.0)
+        );
+    }
+
+    /// The first row decides, below the caption; a row without cells has its top for the baseline.
+    #[test]
+    fn it_is_the_baseline_of_the_first_row() {
+        let empty = |s: &mut Style| {
+            s.size.height = length(30.0);
+            s.padding.bottom = length(4.0);
+        };
+        let one = || tr(|_| {}, vec![td(|_| {}, vec![boxed(20.0, 20.0)])]);
+        assert_eq!(baseline_of(vec![tr(|_| {}, vec![td(empty, vec![])]), one()]), Some(26.0));
+        assert_eq!(baseline_of(vec![tr(|_| {}, vec![]), one()]), Some(0.0));
+        assert_eq!(baseline_of(vec![tr(|_| {}, vec![])]), Some(0.0));
+        assert_eq!(
+            baseline_of(vec![
+                part("caption", TableRole::Caption(CaptionSide::Top), |s| s.size.height = length(12.0), vec![]),
+                tr(|_| {}, vec![td(empty, vec![])])
+            ]),
+            Some(12.0 + 26.0)
+        );
     }
 }

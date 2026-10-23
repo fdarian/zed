@@ -291,8 +291,9 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
             };
             let block_size = f32_max(content_height, requested);
 
-            // The baseline of the cell: its first baseline or, without one, the bottom of its content. A cell
-            // without children has no baseline and takes no part in aligning the others.
+            // The baseline of the cell, as Blink's `FinalizeTableCellLayout` and `RowBaselineTabulator::ProcessCell`
+            // have it: its first baseline or, without one, the bottom of its content. A cell without children has
+            // none and takes no part in aligning the others.
             let baseline_aligned =
                 style.vertical_align == VerticalAlign::Baseline && self.tree.child_count(cell.node) > 0;
             let baseline = if baseline_aligned {
@@ -316,6 +317,7 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
             let mut height = 0.0;
             let mut baseline: Option<f32> = None;
             let mut below_baseline = 0.0;
+            let mut fallback_descent: Option<f32> = None;
             for &cell in &row.cells {
                 let placed = &structure.cells[cell];
                 // A height given to a cell makes the row at least that tall, but does not move its baseline. The
@@ -323,6 +325,9 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 if placed.row_span == 1 {
                     height = f32_max(height, fits[cell].block_size);
                 }
+                let style = &self.cell_styles[cell];
+                let descent = style.padding.bottom + style.border.bottom;
+                fallback_descent = Some(fallback_descent.map_or(descent, |least| f32_min(least, descent)));
                 if fits[cell].baseline_aligned {
                     let ascent = fits[cell].baseline;
                     baseline = Some(baseline.map_or(ascent, |current| f32_max(current, ascent)));
@@ -360,7 +365,14 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                 }
             }
             let has_rowspan_start = row.cells.iter().any(|cell| structure.cells[*cell].row_span > 1);
-            rows.push(RowHeight { height, baseline, fixed: fixed || percent.is_some(), percent, has_rowspan_start });
+            rows.push(RowHeight {
+                height,
+                baseline,
+                fallback_descent,
+                fixed: fixed || percent.is_some(),
+                percent,
+                has_rowspan_start,
+            });
         }
         // The percentages of the rows of a group add up to 100% at most, the later rows lose
         for section in &structure.sections {

@@ -18,9 +18,6 @@
 //!   - A child of a table, row group or row that is not a table part is a cell of its own, where CSS wraps it and its
 //!     neighbours in one anonymous cell. It is as big as its row, and its content stays at the top: only nodes with the
 //!     role of a cell are aligned in their row.
-//!   - A cell aligned to the baseline whose content has none (a box with no text in it) is aligned by the bottom of its
-//!     content, where Chrome gives it no baseline: a cell that spans rows with such content makes its first row as tall
-//!     as the cell, and not as tall as the row needs.
 //!   - A table that is a flex item and is given less width than its min-content still reports its min-content width,
 //!     but the flex container positions it for the width it asked for.
 //!   - The max-content width of a table whose percentage columns add up to 100% next to columns without one is
@@ -60,7 +57,8 @@ pub struct DetailedTableInfo {
     /// border box of the table, captions above the rows included. One more than there are rows
     pub row_lines: Vec<f32>,
     /// The y of the first baseline of the table, relative to the top of its border box: the baseline of its first row, or
-    /// that row's bottom when none of its cells is aligned to the baseline. `None` for a table with no rows
+    /// when none of its cells is aligned to the baseline, as far above the bottom of that row as the least padding and
+    /// border below the content of its cells. `None` for a table with no rows
     pub first_baseline: Option<f32>,
 }
 
@@ -114,6 +112,8 @@ struct RowHeight {
     height: f32,
     /// The distance from the top of the row to the baseline of its baseline-aligned cells, if it has any
     baseline: Option<f32>,
+    /// The least padding and border below the content of its cells, for the baseline of a row without `baseline`
+    fallback_descent: Option<f32>,
     /// Whether `height` was given to the row, as a length or a percentage
     fixed: bool,
     /// The percentage of the height of its row group the row asks for, as a fraction: its own, or the largest of its
@@ -121,6 +121,15 @@ struct RowHeight {
     percent: Option<f32>,
     /// Whether a cell that spans rows starts in the row
     has_rowspan_start: bool,
+}
+
+impl RowHeight {
+    /// Where the baseline of the row is, once it is `height` tall. With no cell on the baseline it is above the least
+    /// padding and border below the cells, as in Blink's `RowBaselineTabulator::ComputeBaseline`, and the top of a row
+    /// without cells.
+    fn baseline(&self) -> f32 {
+        self.baseline.unwrap_or_else(|| self.fallback_descent.map_or(0.0, |descent| f32_max(self.height - descent, 0.0)))
+    }
 }
 
 /// What a row group asks of its height
@@ -313,8 +322,7 @@ pub fn compute_table_layout<Tree: LayoutTableContainer>(
 
     // Where the first row's baseline is, for a table that is itself aligned by baseline
     let grid_top = captions_top + padding_border.top;
-    // The first row has its baseline, or its bottom when none of its cells is aligned to it
-    let first_baseline = rows.first().map(|row| grid_top + spacing.height + row.baseline.unwrap_or(row.height));
+    let first_baseline = rows.first().map(|row| grid_top + spacing.height + row.baseline());
 
     if inputs.run_mode == RunMode::ComputeSize {
         return LayoutOutput::from_sizes_and_baselines(table_size, Size::ZERO, Point { x: None, y: first_baseline });
