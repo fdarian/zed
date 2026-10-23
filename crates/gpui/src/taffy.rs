@@ -3,7 +3,7 @@ use crate::{
     Style, Window, point, size,
     util::{
         LAYOUT_UNIT, ceil_measured_size_to_layout_unit, round_half_up, round_to_device_pixel,
-        snap_border_width_to_device_pixel, truncate_to_layout_unit,
+        snap_border_spacing_to_device_pixel, snap_border_width_to_device_pixel, truncate_to_layout_unit,
     },
 };
 use collections::{FxHashMap, FxHashSet};
@@ -2536,8 +2536,8 @@ impl ToTaffy<taffy::style::Style> for Style {
             table_role: self.table_role.into(),
             table_layout: self.table_layout.into(),
             border_spacing: taffy::geometry::Size {
-                width: self.border_spacing.width.to_taffy(rem_size, scale_factor, calcs),
-                height: self.border_spacing.height.to_taffy(rem_size, scale_factor, calcs),
+                width: snap_border_spacing_to_device_pixel(self.border_spacing.width.to_pixels(rem_size).0, scale_factor),
+                height: snap_border_spacing_to_device_pixel(self.border_spacing.height.to_pixels(rem_size).0, scale_factor),
             },
             border_collapse: self.border_collapse,
             vertical_align: self.cell_vertical_align.into(),

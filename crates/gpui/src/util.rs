@@ -207,6 +207,14 @@ pub(crate) fn snap_border_width_to_device_pixel(logical: f32, scale_factor: f32)
     }
 }
 
+/// A `border-spacing` in whole device pixels, as Chrome keeps it (a `short` of the zoomed length): cut
+/// off, so `2.5px` is `2` on a display of scale 1 and `5` device pixels on one of scale 2. A length
+/// from `0.99` of a device pixel up counts as the pixel (Chrome's cut-off is there, not at 1).
+#[inline]
+pub(crate) fn snap_border_spacing_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
+    (logical.max(0.0) * scale_factor + 0.01).floor()
+}
+
 /// A thickness rounded to the nearest device pixel, a half up, and at least one: only
 /// none at all stays none. This is how Chrome fills a line whose thickness is a length,
 /// so `1.5px` is two pixels on a display of scale 1 and `0.3px` is one.
@@ -378,6 +386,30 @@ mod tests {
             (3.0 - 1e-5, 1.0, 3.0),
         ] {
             assert_eq!(snap_border_width_to_device_pixel(width, scale), expected, "{width} at {scale}");
+        }
+
+        // Chrome, `table-border-spacing-oracle.json`: a spacing is cut to whole device pixels, a hair under a
+        // pixel (0.99) counts as one.
+        for (spacing, scale, expected) in [
+            (0.0, 1.0, 0.0),
+            (-3.0, 1.0, 0.0),
+            (0.4, 1.0, 0.0),
+            (0.5, 1.0, 0.0),
+            (0.989, 1.0, 0.0),
+            (0.99, 1.0, 1.0),
+            (1.6, 1.0, 1.0),
+            (2.5, 1.0, 2.0),
+            (2.75, 1.0, 2.0),
+            (0.4, 2.0, 0.0),
+            (0.5, 2.0, 1.0),
+            (0.99, 2.0, 1.0),
+            (0.995, 2.0, 2.0),
+            (1.6, 2.0, 3.0),
+            (2.5, 2.0, 5.0),
+            (2.75, 2.0, 5.0),
+            (3.0, 1.5, 4.0),
+        ] {
+            assert_eq!(snap_border_spacing_to_device_pixel(spacing, scale), expected, "{spacing} at {scale}");
         }
 
         // Cover's near edge floors, far edge ceils. Together they form a strict superset.
