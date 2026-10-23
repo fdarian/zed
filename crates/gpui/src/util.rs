@@ -290,6 +290,14 @@ pub(crate) fn overflows(width: crate::Pixels, available: crate::Pixels) -> bool 
     width.0 > available.0 + FIT_SLACK
 }
 
+/// How many layout units of text a line of `available` may hold and still fit, as Blink's line
+/// breaker takes it: `available` cut to a unit, and one unit more (`LayoutUnit::AddEpsilon` in
+/// `LineBreaker::SetCurrentStyle`), so a line a unit wider than its box still does not wrap.
+#[inline]
+pub(crate) fn fit_layout_units(available: crate::Pixels, scale_factor: f32) -> i64 {
+    (((available.0 * scale_factor + SUM_NOISE) / LAYOUT_UNIT).floor() as i64).saturating_add(1)
+}
+
 #[inline]
 pub(crate) fn ceil_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor).ceil()

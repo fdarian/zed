@@ -17,7 +17,8 @@
 //! the item after it is that much wider.
 
 use super::{LineLayout, LineLayoutCache};
-use crate::{FontRun, Pixels, util::{LAYOUT_UNIT, ceil_layout_units}};
+use super::ShapedRun;
+use crate::{FontId, FontRun, Pixels, px, util::{LAYOUT_UNIT, ceil_layout_units}};
 use gpui_util::ResultExt as _;
 use smallvec::SmallVec;
 use std::ops::Range;
@@ -32,6 +33,9 @@ pub struct SnapMarks {
     /// The glyphs that follow a kern of a font with no GPOS table, with the part of the kern that
     /// HarfBuzz leaves out of the advance before them. Ascending by glyph.
     kern_shares: Vec<(usize, Pixels)>,
+    /// The glyphs that follow a soft hyphen, with the advance of the hyphen Blink adds to a line
+    /// that breaks before one. Ascending by glyph.
+    hyphens: Vec<(usize, Pixels)>,
 }
 
 impl SnapMarks {
@@ -39,8 +43,48 @@ impl SnapMarks {
     /// whose end is at the last of `x`, at `scale_factor` device pixels to a pixel: a multiple of a
     /// layout unit, which is 1/64 of a device pixel.
     pub(super) fn width(&self, x: &[Pixels], scale_factor: f32, from: usize, to: usize) -> Pixels {
-        let glyph_count = x.len() - 1;
         let mut units = 0;
+        self.for_each_piece(x.len() - 1, from, to, |item, glyph, stop| {
+            units += self.position_units(x, scale_factor, item.clone(), stop)
+                - self.position_units(x, scale_factor, item, glyph);
+        });
+        Pixels(units as f32 * LAYOUT_UNIT / scale_factor)
+    }
+
+    /// How wide the glyphs `from..to` are to the line breaker, in layout units: the sum over the
+    /// items they are in of the width of the part in each from its own first glyph, ceiled
+    /// (`ShapeResultView::SnappedWidth` of the piece of an item that is on the line). It is not
+    /// [`Self::width`], which is the width the line is reported to have: the break is decided on
+    /// the piece from where it starts on the line, the width of the line is the difference of two
+    /// ceils from the start of the item. `x(i)` is the x of glyph `i`, and of the end of the line
+    /// at `glyph_count`, and `from` is where the line starts.
+    pub(in crate::text_system) fn fit_units(
+        &self,
+        x: impl Fn(usize) -> Pixels,
+        glyph_count: usize,
+        scale_factor: f32,
+        from: usize,
+        to: usize,
+    ) -> i64 {
+        let mut units = 0;
+        self.for_each_piece(glyph_count, from, to, |_, glyph, stop| {
+            let measured = |glyph: usize| x(glyph) - self.kern_share(glyph);
+            // Blink shapes the line again from its first glyph, which then follows no kern.
+            let start = if glyph == from { x(glyph) } else { measured(glyph) };
+            units += ceil_layout_units((measured(stop) - start).0, scale_factor);
+        });
+        units
+    }
+
+    /// Calls `piece` with each item the glyphs `from..to` are in, the first glyph of the part of it
+    /// that is in them and the glyph where that ends.
+    fn for_each_piece(
+        &self,
+        glyph_count: usize,
+        from: usize,
+        to: usize,
+        mut piece: impl FnMut(Range<usize>, usize, usize),
+    ) {
         let mut glyph = from;
         let mut item = self.item_starts.partition_point(|start| *start <= from);
         while glyph < to {
@@ -50,12 +94,10 @@ impl SnapMarks {
             };
             let end = self.item_starts.get(item).copied().unwrap_or(glyph_count);
             let stop = to.min(end);
-            units += self.position_units(x, scale_factor, first..end, stop)
-                - self.position_units(x, scale_factor, first..end, glyph);
+            piece(first..end, glyph, stop);
             glyph = stop;
             item += 1;
         }
-        Pixels(units as f32 * LAYOUT_UNIT / scale_factor)
     }
 
     /// How far glyph `glyph` is from the start of `item`, in layout units rounded up. Both are
@@ -65,6 +107,14 @@ impl SnapMarks {
     fn position_units(&self, x: &[Pixels], scale_factor: f32, item: Range<usize>, glyph: usize) -> i64 {
         let measured = |glyph: usize| x[glyph] - self.kern_share(glyph);
         ceil_layout_units((measured(glyph) - measured(item.start)).0, scale_factor)
+    }
+
+    /// How wide the hyphen is that a line gets when it breaks before `glyph`, in layout units
+    /// (`ShapeResult::SnappedWidth` of the hyphen), or `None` if `glyph` does not follow a soft
+    /// hyphen. The hyphen is not painted, only measured.
+    pub(super) fn hyphen_units(&self, glyph: usize, scale_factor: f32) -> Option<i64> {
+        let ix = self.hyphens.binary_search_by_key(&glyph, |(ix, _)| *ix).ok()?;
+        Some(ceil_layout_units(self.hyphens[ix].1.0, scale_factor))
     }
 
     fn kern_share(&self, glyph: usize) -> Pixels {
@@ -92,6 +142,7 @@ impl LineLayoutCache {
     pub(super) fn snap_marks(
         &self,
         shaped: &LineLayout,
+        text: &str,
         runs: &[FontRun],
         item_starts: &[usize],
     ) -> SnapMarks {
@@ -117,7 +168,47 @@ impl LineLayoutCache {
         SnapMarks {
             item_starts,
             kern_shares: self.kern_shares(shaped),
+            hyphens: self.hyphens(shaped, text),
         }
+    }
+
+    /// The glyphs of `shaped` that follow a soft hyphen, with the advance of the hyphen Blink draws
+    /// where a line breaks before them: U+2010 if the font of the glyph before has it, and a
+    /// hyphen-minus if not. The soft hyphen itself has no glyph to count on.
+    fn hyphens(&self, shaped: &LineLayout, text: &str) -> Vec<(usize, Pixels)> {
+        if !text.contains('\u{AD}') {
+            return Vec::new();
+        }
+        let glyphs: Vec<(usize, &ShapedRun)> = shaped
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(move |glyph| (glyph.index, run)))
+            .collect();
+        let mut hyphens: Vec<(usize, Pixels)> = Vec::new();
+        for (byte, _) in text.match_indices('\u{AD}') {
+            let after = glyphs.partition_point(|(index, _)| *index < byte + '\u{AD}'.len_utf8());
+            let before = after.checked_sub(1).and_then(|glyph| glyphs.get(glyph));
+            if let Some((_, run)) = before
+                && after < glyphs.len()
+                && hyphens.last().is_none_or(|(last, _)| *last < after)
+                && let Some(advance) = self.hyphen_advance(run.font_id, run.font_size)
+            {
+                hyphens.push((after, advance));
+            }
+        }
+        hyphens
+    }
+
+    fn hyphen_advance(&self, font_id: FontId, font_size: Pixels) -> Option<Pixels> {
+        let glyph_id = ['\u{2010}', '-']
+            .into_iter()
+            .find_map(|hyphen| self.platform_text_system.glyph_for_char(font_id, hyphen))?;
+        let advance = self
+            .platform_text_system
+            .advance(font_id, glyph_id)
+            .log_err()?;
+        let units_per_em = self.platform_text_system.font_metrics(font_id).units_per_em;
+        Some(px(advance.width / units_per_em as f32 * f32::from(font_size)))
     }
 
     /// The part of every legacy kern in `shaped` that HarfBuzz leaves out of the advance of the
@@ -171,6 +262,7 @@ mod tests {
         SnapMarks {
             item_starts: item_starts.iter().copied().collect(),
             kern_shares: kern_shares.iter().map(|(ix, share)| (*ix, px(*share))).collect(),
+            hyphens: Vec::new(),
         }
     }
 
@@ -237,6 +329,67 @@ mod tests {
         let positions = x(&[0., 10. * UNIT, 14.4 * UNIT, 18.8 * UNIT]);
         let kerned = marks(&[1], &[(1, -3. * UNIT)]);
         assert_eq!(kerned.width(&positions, 1., 1, 3), px(6. * UNIT));
+    }
+
+    #[test]
+    fn test_the_fit_of_a_piece_is_its_width_ceiled_from_where_it_starts_on_the_line() {
+        // Glyphs 10.4 units wide. From glyph 1 to 3 the piece is 20.8 units, which is 21 and not
+        // the 22 of two ceiled halves, nor the difference of the ceils of its edges (31 - 11).
+        let positions = x(&[0., 10.4 * UNIT, 20.8 * UNIT, 31.2 * UNIT]);
+        let at = |from, to| marks(&[], &[]).fit_units(|glyph| positions[glyph], 3, 1., from, to);
+        assert_eq!(at(1, 3), 21);
+        assert_eq!(at(0, 3), 32);
+        assert_eq!(at(0, 1), 11);
+    }
+
+    #[test]
+    fn test_the_fit_of_a_line_of_two_items_is_the_sum_of_its_pieces() {
+        // Items [0, 2) and [2, 4) of glyphs 0.4 units wide: 0.8 + 0.8 is 1 + 1 units, where one item
+        // of 1.6 is 2 as well, and a piece from glyph 1 is 0.4 + 0.8, which is 1 + 1.
+        let positions = x(&[0., 0.4 * UNIT, 0.8 * UNIT, 1.2 * UNIT, 1.6 * UNIT]);
+        let two = marks(&[2], &[]);
+        assert_eq!(two.fit_units(|glyph| positions[glyph], 4, 1., 0, 4), 2);
+        assert_eq!(two.fit_units(|glyph| positions[glyph], 4, 1., 1, 4), 2);
+        let one = marks(&[], &[]);
+        assert_eq!(one.fit_units(|glyph| positions[glyph], 4, 1., 0, 4), 2);
+    }
+
+    #[test]
+    fn test_a_line_starts_after_no_kern_but_a_piece_inside_it_does() {
+        // Glyph 2 follows a kern whose share is -4 units. As the first glyph of a line it has been
+        // shaped again with nothing before it, so its piece is the 4 units of its glyph; glyph 3
+        // is measured with the share, so a line from glyph 0 or 1 is 12 and 8 units wide.
+        let positions = x(&[0., 4. * UNIT, 8. * UNIT, 12. * UNIT]);
+        let kerned = marks(&[], &[(2, -4. * UNIT)]);
+        assert_eq!(kerned.fit_units(|glyph| positions[glyph], 3, 1., 2, 3), 4);
+        assert_eq!(kerned.fit_units(|glyph| positions[glyph], 3, 1., 1, 3), 8);
+        assert_eq!(kerned.fit_units(|glyph| positions[glyph], 3, 1., 0, 3), 12);
+    }
+
+    #[test]
+    fn test_a_line_that_breaks_after_a_soft_hyphen_has_the_hyphen_to_fit() {
+        let soft_hyphen = |hyphens: &[(usize, f32)]| SnapMarks {
+            hyphens: hyphens.iter().map(|(ix, width)| (*ix, px(*width))).collect(),
+            ..SnapMarks::default()
+        };
+        let marks = soft_hyphen(&[(4, 5. * UNIT)]);
+        assert_eq!(marks.hyphen_units(4, 1.), Some(5));
+        assert_eq!(marks.hyphen_units(3, 1.), None);
+
+        // Breaks before glyphs 2 and 4, 20 and 40 units wide, the second after a soft hyphen
+        // whose hyphen is 5 units. The line is 40 units wide: 40 + 5 does not fit in 40
+        // (and one more), so the line breaks at the earlier place, which fits what is left, 35.
+        let units = |to: usize| to as i64 * 10;
+        let break_at = |fit: i64| LineLayout::break_candidate(&[2, 4], 0, fit, &marks, 1., units);
+        assert_eq!(break_at(41), Some(2));
+        // With room for the hyphen it stays.
+        assert_eq!(break_at(45), Some(4));
+        // A line that is already too wide for its place gets no retry: it overflows to the break.
+        assert_eq!(break_at(30), Some(4));
+        // No earlier place fits the narrower line: the first place there is.
+        let marks = soft_hyphen(&[(4, 25. * UNIT)]);
+        let break_at = |fit: i64| LineLayout::break_candidate(&[2, 4], 0, fit, &marks, 1., units);
+        assert_eq!(break_at(41), Some(2));
     }
 
     #[test]

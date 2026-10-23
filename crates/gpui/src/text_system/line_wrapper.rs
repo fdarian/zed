@@ -2263,8 +2263,13 @@ mod tests {
             ..Default::default()
         };
         assert_min_content(cx, "abcdef ghi", breaking(WordBreak::Normal), &[], 7.);
-        // Between any two letters.
-        assert_min_content(cx, "abcdef ghi", breaking(WordBreak::BreakAll), &[], 1.);
+        // Between any two letters, and never before a space: it stays with the letter before it unless it hangs.
+        assert_min_content(cx, "abcdef ghi", breaking(WordBreak::BreakAll), &[], 2.);
+        let hanging = TextLayoutOptions {
+            hang_trailing_spaces: true,
+            ..breaking(WordBreak::BreakAll)
+        };
+        assert_min_content(cx, "abcdef ghi", hanging, &[], 1.);
         // CJK breaks between its characters, unless it is kept together.
         let cjk = "\u{4E2D}\u{4E2D}\u{4E2D}";
         let normal = min_content(cx, cjk, breaking(WordBreak::Normal), &[]);

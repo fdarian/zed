@@ -20,7 +20,8 @@ mod shape_store;
 mod snap;
 
 use self::shape_store::{SHAPE_STORE_BUDGET_BYTES, ShapeStore};
-use self::snap::{SnapMarks, glyph_positions};
+pub(super) use self::snap::SnapMarks;
+use self::snap::glyph_positions;
 use super::line_break::LineBreaks;
 use super::{
     InlineRun, InlineSpec, PlacedBox, RunWrap, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
@@ -146,19 +147,6 @@ impl TextLayoutOptions {
             ..self
         }
     }
-}
-
-/// Whether a line may break between `before` and `after`, two characters that
-/// are not both part of the same word, under `word-break: break-all`. Spaces
-/// are left to the other rules, and a break stays out of the places where UAX
-/// #14 never has one: before closing punctuation or a combining mark, after
-/// opening punctuation, and on either side of a non-breaking glue character.
-fn may_break_between(before: char, after: char) -> bool {
-    let glue = |c| matches!(c, '\u{00A0}' | '\u{202F}' | '\u{2011}');
-    let closing =
-        |c: char| "!?)]},.:;\"'”’»…".contains(c) || ('\u{0300}'..='\u{036F}').contains(&c);
-    let opening = |c| matches!(c, '(' | '[' | '{' | '“' | '‘' | '«');
-    before != ' ' && !glue(before) && !glue(after) && !closing(after) && !opening(before)
 }
 
 /// Extra inline advance around a byte range of a line of text, as the padding,
@@ -702,17 +690,25 @@ impl LineLayout {
         options: TextLayoutOptions,
         tab_stop: Option<TabStopFor<'_>>,
         insets: &[TextInset],
+        marks: &SnapMarks,
     ) -> WrapComputation {
         let hang = options.spaces_hang();
-        let line_breaks = LineBreaks::new(text, options.word_break == WordBreak::KeepAll);
-        let break_all = options.word_break == WordBreak::BreakAll;
+        let line_breaks = LineBreaks::new(text, options.word_break);
+        let fit = wrap_width
+            .map(|wrap_width| crate::util::fit_layout_units(wrap_width, self.scale_factor));
         let breaks_words = options.overflow_wrap != OverflowWrap::Normal;
         let mut boundaries = SmallVec::new();
         // The glyph each line starts at.
         let mut line_starts: SmallVec<[usize; 2]> = SmallVec::new();
         line_starts.push(0);
         let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = None;
+        // The glyphs a line may start at, between the start of the line and the glyph tested, ascending.
+        let mut candidates: SmallVec<[usize; 4]> = SmallVec::new();
+        let push_candidate = |candidates: &mut SmallVec<[usize; 4]>, ix: usize| {
+            if candidates.last() != Some(&ix) {
+                candidates.push(ix);
+            }
+        };
         let mut last_boundary = WrapBoundary {
             run_ix: 0,
             glyph_ix: 0,
@@ -723,9 +719,10 @@ impl LineLayout {
         let mut word_wraps = !options.nowrap;
         let mut spaces: Option<SpaceRun> = None;
         let mut positions = GlyphPositions::new(self, text, tab_stop, options, insets);
+        let glyph_count = positions.glyphs.len();
         let mut placed = 0;
 
-        for ix in 0..positions.glyphs.len() {
+        for ix in 0..glyph_count {
             positions.place(ix + 1, last_boundary_x);
             placed = ix + 1;
             let boundary = positions.glyphs[ix].boundary;
@@ -757,18 +754,18 @@ impl LineLayout {
             if positions.glyphs[ix].is_object {
                 // A line may break on either side of an atomic inline, like an image.
                 if first_non_whitespace_ix.is_some() && may_break_here {
-                    last_candidate_ix = Some(ix);
+                    push_candidate(&mut candidates, ix);
                 }
             } else if prev_was_object && ch != ' ' && first_non_whitespace_ix.is_some() {
                 if may_break_here {
-                    last_candidate_ix = Some(ix);
+                    push_candidate(&mut candidates, ix);
                 }
             } else if ch != ' '
                 && first_non_whitespace_ix.is_some()
                 && may_break_here
                 && line_breaks.contains(positions.glyphs[ix].index)
             {
-                last_candidate_ix = Some(ix);
+                push_candidate(&mut candidates, ix);
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
@@ -778,15 +775,36 @@ impl LineLayout {
             // A hanging space is not measured, so it never causes a wrap: the word
             // after it overflows instead, and the line wraps before that word.
             let hanging = hang && positions.glyphs[ix].hangs;
-            let width = positions.x(ix + 1) - last_boundary_x;
-
             // Without a place to break, a word that does not fit is left to overflow
             // when `overflow_wrap` is normal, and goes on until one turns up. A word
             // is not broken where the text does not wrap.
-            if !hanging
-                && wrap_width.is_some_and(|wrap_width| crate::util::overflows(width, wrap_width))
-                && boundary > last_boundary
-                && (last_candidate_ix.is_some()
+            let line_start = line_starts[line_starts.len() - 1];
+            let chosen = match fit {
+                Some(fit) if !hanging && boundary > last_boundary => {
+                    let units = |to: usize| {
+                        marks.fit_units(
+                            |glyph| positions.x(glyph),
+                            glyph_count,
+                            self.scale_factor,
+                            line_start,
+                            to,
+                        )
+                    };
+                    (units(ix + 1) > fit).then(|| {
+                        Self::break_candidate(
+                            &candidates,
+                            line_start,
+                            fit,
+                            marks,
+                            self.scale_factor,
+                            units,
+                        )
+                    })
+                }
+                _ => None,
+            };
+            if let Some(candidate_ix) = chosen
+                && (candidate_ix.is_some()
                     || (breaks_words
                         && ix > 0
                         && may_break_apart(&positions.glyphs[ix - 1], &positions.glyphs[ix])))
@@ -798,9 +816,9 @@ impl LineLayout {
                     break;
                 }
 
-                let candidate_ix = last_candidate_ix.take();
                 broke_word |= candidate_ix.is_none();
                 let line_start_ix = candidate_ix.unwrap_or(ix);
+                candidates.retain(|candidate| *candidate > line_start_ix);
                 last_boundary = positions.glyphs[line_start_ix].boundary;
                 last_boundary_x = positions.x(line_start_ix);
                 boundaries.push(last_boundary);
@@ -814,16 +832,7 @@ impl LineLayout {
             // starts the next line. Taken after the check above, so that the space
             // itself is measured against the breaks before it.
             if options.break_spaces && ch == ' ' && positions.glyphs[ix].wrap.wraps {
-                last_candidate_ix = Some(ix + 1);
-            }
-            // Between letters the line may break, so the candidate is always the
-            // glyph that overflows, and the line is filled to the edge.
-            if break_all
-                && let Some(next) = positions.glyphs.get(ix + 1)
-                && may_break_between(ch, next.wrap_char)
-                && may_break_apart(&positions.glyphs[ix], next)
-            {
-                last_candidate_ix = Some(ix + 1);
+                push_candidate(&mut candidates, ix + 1);
             }
             if ch != ' ' {
                 spaces = None;
@@ -858,6 +867,34 @@ impl LineLayout {
         }
     }
 
+    /// The glyph a line that does not fit breaks at, among the `candidates` it has: the last, and
+    /// `None` when there is none. `units(to)` is the width the glyphs from the start of the line to
+    /// `to` have to the line breaker. A line that breaks at a soft hyphen is given a hyphen, and the
+    /// hyphen is part of what has to fit; Blink then shapes the line again a hyphen narrower
+    /// (`LineBreaker::BreakText`), so the break may be at any earlier candidate that fits that.
+    fn break_candidate(
+        candidates: &[usize],
+        line_start: usize,
+        fit: i64,
+        marks: &SnapMarks,
+        scale_factor: f32,
+        units: impl Fn(usize) -> i64,
+    ) -> Option<usize> {
+        let last = *candidates.last()?;
+        let hyphen = marks.hyphen_units(last, scale_factor);
+        let width = units(last);
+        match hyphen {
+            Some(hyphen) if width <= fit && width + hyphen > fit => candidates
+                .iter()
+                .rev()
+                .copied()
+                .filter(|candidate| *candidate > line_start)
+                .find(|candidate| units(*candidate) <= fit - hyphen)
+                .or_else(|| candidates.iter().copied().find(|candidate| *candidate > line_start)),
+            _ => Some(last),
+        }
+    }
+
     /// Where the text may break, and the x of its glyphs. A text wrapped at no width
     /// at all breaks at every place a line may break, without cutting a word.
     pub(super) fn break_opportunities(
@@ -865,6 +902,7 @@ impl LineLayout {
         text: &str,
         options: TextLayoutOptions,
         insets: &[TextInset],
+        marks: &SnapMarks,
     ) -> BreakOpportunities {
         let everywhere = TextLayoutOptions {
             overflow_wrap: OverflowWrap::Normal,
@@ -872,7 +910,7 @@ impl LineLayout {
             ..options
         };
         let computation =
-            self.compute_wrap_boundaries(text, Some(px(0.)), None, everywhere, None, insets);
+            self.compute_wrap_boundaries(text, Some(px(0.)), None, everywhere, None, insets, marks);
         let breaks = computation.line_starts[1..].to_vec();
         let glyphs = || self.runs.iter().flat_map(|run| run.glyphs.iter());
         let x = computation.tabbed_x.unwrap_or_else(|| {
@@ -2082,7 +2120,7 @@ impl LineLayoutCache {
                 || wrap_width.is_some()
                 || options.hang_trailing_spaces
                 || !insets.is_empty();
-            let marks = self.snap_marks(&shaped_layout, runs, item_starts);
+            let marks = self.snap_marks(&shaped_layout, text.as_ref(), runs, item_starts);
             let (unwrapped_layout, computation) = if needs_pass {
                 let computation = shaped_layout.compute_styled_wrap_boundaries(
                     text.as_ref(),
@@ -2091,6 +2129,7 @@ impl LineLayoutCache {
                     options,
                     tab_stop.as_ref().map(|tab_stop| tab_stop as TabStopFor<'_>),
                     insets,
+                    &marks,
                 );
                 let unwrapped_layout = match &computation.tabbed_x {
                     Some(x) => Arc::new(shaped_layout.with_x_positions(x)),
@@ -3000,6 +3039,7 @@ mod tests {
             TextLayoutOptions::default(),
             Some(&tab_stop),
             &[],
+            &SnapMarks::default(),
         );
         WrappedLineLayout::new(
             Arc::new(shaped.with_x_positions(&computation.tabbed_x.clone().unwrap())),
@@ -3179,9 +3219,10 @@ mod tests {
             options,
             Some(&tab_stop),
             &[],
+            &SnapMarks::default(),
         );
         let without_stops =
-            shaped.compute_wrap_boundaries(text, Some(px(65.)), None, options, None, &[]);
+            shaped.compute_wrap_boundaries(text, Some(px(65.)), None, options, None, &[], &SnapMarks::default());
         assert_eq!(with_stops.boundaries, without_stops.boundaries);
         assert_eq!(without_stops.tabbed_x, None);
         let shaped_x: Vec<Pixels> = shaped.runs[0]
@@ -3221,7 +3262,7 @@ mod tests {
     ) -> WrappedLineLayout {
         let shaped = monospace_layout(text, 10.);
         let computation =
-            shaped.compute_wrap_boundaries(text, wrap_width.map(px), None, options, None, &[]);
+            shaped.compute_wrap_boundaries(text, wrap_width.map(px), None, options, None, &[], &SnapMarks::default());
         WrappedLineLayout::new(
             Arc::new(shaped),
             wrap_width.map(px),
@@ -3340,6 +3381,7 @@ mod tests {
             hanging,
             Some(&tab_stop),
             &[],
+            &SnapMarks::default(),
         );
         // The tab ends at 80, past the 50 wide line, but it hangs.
         assert_eq!(hung.boundaries.len(), 1);
@@ -3352,6 +3394,7 @@ mod tests {
             TextLayoutOptions::default(),
             Some(&tab_stop),
             &[],
+            &SnapMarks::default(),
         );
         // The tab wraps by itself and starts a line.
         assert_eq!(unhung.boundaries.len(), 2);
@@ -3465,7 +3508,7 @@ mod tests {
     fn test_min_content_is_the_longest_segment_between_hyphens() {
         let text = "self-evident truths";
         let shaped = monospace_layout(text, 10.);
-        let opportunities = shaped.break_opportunities(text, TextLayoutOptions::default(), &[]);
+        let opportunities = shaped.break_opportunities(text, TextLayoutOptions::default(), &[], &SnapMarks::default());
         assert_eq!(opportunities.breaks, vec![5, 13]);
     }
 
@@ -3549,6 +3592,7 @@ mod tests {
             options,
             Some(&tab_stop),
             &[],
+            &SnapMarks::default(),
         );
         // The tab ends at 80, past the line, so it begins the next one, and
         // neither line hangs it.
@@ -3692,7 +3736,7 @@ mod tests {
             ..Default::default()
         };
         let computation =
-            shaped.compute_wrap_boundaries(text, Some(px(35.)), Some(2), options, None, &[]);
+            shaped.compute_wrap_boundaries(text, Some(px(35.)), Some(2), options, None, &[], &SnapMarks::default());
         assert_eq!(computation.boundaries.len(), 1);
     }
 
@@ -3729,6 +3773,58 @@ mod tests {
         // It breaks whatever overflow-wrap says.
         let all = word_break_line("aaaaaaaa", 35., WordBreak::BreakAll, OverflowWrap::Normal);
         assert_eq!(boundary_indices(&all), vec![3, 6]);
+    }
+
+    #[test]
+    fn test_a_line_fits_by_blinks_ceiled_pieces_not_by_floats() {
+        // Four glyphs of 10.0025 are 40.01 wide, 2561 layout units ceiled, and a box of 40 holds
+        // 2560 + 1 of them: the word fits, where its float width is more than a 1/1024 over.
+        let options = TextLayoutOptions {
+            hang_trailing_spaces: true,
+            overflow_wrap: OverflowWrap::Normal,
+            ..Default::default()
+        };
+        let text = "aaaa bbbb";
+        let shaped = monospace_layout(text, 10.0025);
+        let breaks = |wrap_width: f32| {
+            let computation = shaped.compute_wrap_boundaries(
+                text,
+                Some(px(wrap_width)),
+                None,
+                options,
+                None,
+                &[],
+                &SnapMarks::default(),
+            );
+            computation.line_starts.to_vec()
+        };
+        assert_eq!(breaks(40.), vec![0, 5]);
+        // A unit less is too narrow for the four letters: they overflow and the line breaks after them.
+        assert_eq!(breaks(39.98), vec![0, 5]);
+        let overflowing = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::BreakWord,
+            ..options
+        };
+        let breaks_word = shaped.compute_wrap_boundaries(
+            text,
+            Some(px(39.98)),
+            None,
+            overflowing,
+            None,
+            &[],
+            &SnapMarks::default(),
+        );
+        assert_eq!(breaks_word.line_starts.to_vec(), vec![0, 3, 5, 8]);
+        let fits_word = shaped.compute_wrap_boundaries(
+            text,
+            Some(px(40.)),
+            None,
+            overflowing,
+            None,
+            &[],
+            &SnapMarks::default(),
+        );
+        assert_eq!(fits_word.line_starts.to_vec(), vec![0, 5]);
     }
 
     #[test]
@@ -3795,6 +3891,7 @@ mod tests {
             options,
             resolver.as_ref().map(|resolver| resolver as TabStopFor<'_>),
             insets,
+            &SnapMarks::default(),
         );
         WrappedLineLayout::new(
             Arc::new(match &computation.tabbed_x {
@@ -3847,6 +3944,7 @@ mod tests {
                             options,
                             stop,
                             &[],
+                            &SnapMarks::default(),
                         );
                         assert!(plain.glyph_insets.is_empty());
                         assert_eq!(plain.tabbed_x.is_some(), stop.is_some());
@@ -3854,7 +3952,7 @@ mod tests {
                         // Insets that add nothing change nothing.
                         let zero = [inset(0..text.len(), 0., 0.)];
                         let inset = shaped
-                            .compute_wrap_boundaries(text, wrap_width, None, options, stop, &zero);
+                            .compute_wrap_boundaries(text, wrap_width, None, options, stop, &zero, &SnapMarks::default());
                         assert_eq!(inset.boundaries, plain.boundaries, "{text:?} {options:?}");
                         assert_eq!(inset.hanging_widths, plain.hanging_widths);
                         let shaped_x: Vec<Pixels> = shaped.runs[0]
@@ -4184,6 +4282,7 @@ mod tests {
                 options,
                 None,
                 &[],
+                &SnapMarks::default(),
             );
             let layout = WrappedLineLayout::new(
                 Arc::new(shaped),
@@ -4253,6 +4352,7 @@ mod tests {
                 options,
                 None,
                 &insets,
+                &SnapMarks::default(),
             );
             let layout = WrappedLineLayout::new(
                 Arc::new(shaped.with_x_positions(&computation.tabbed_x.clone().unwrap())),
@@ -4305,6 +4405,7 @@ mod tests {
                     overflowing(style),
                     None,
                     &[],
+                    &SnapMarks::default(),
                 )
             };
             let balanced = wrap(TextWrapStyle::Balance);
@@ -4365,6 +4466,7 @@ mod tests {
                 },
                 None,
                 &[],
+                &SnapMarks::default(),
             );
             let greedy = shaped.compute_wrap_boundaries(
                 text,
@@ -4376,6 +4478,7 @@ mod tests {
                 },
                 None,
                 &[],
+                &SnapMarks::default(),
             );
             assert_eq!(spaces.boundaries, greedy.boundaries);
         }
@@ -4852,6 +4955,7 @@ mod tests {
             options,
             None,
             &[],
+            &SnapMarks::default(),
         );
         WrappedLineLayout::new(
             Arc::new(shaped),
@@ -5018,6 +5122,7 @@ mod tests {
             options,
             None,
             &[],
+            &SnapMarks::default(),
         );
         let chars: Vec<char> = text.chars().collect();
         let mut rows = Vec::new();

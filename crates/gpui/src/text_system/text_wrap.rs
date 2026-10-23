@@ -7,8 +7,10 @@
 //! touched, the box is sized from the available width and only the breaks move, as
 //! in CSS.
 
-use super::line_layout::{LineLayout, TabStopFor, TextInset, TextLayoutOptions, WrapComputation};
-use crate::{Pixels, px};
+use super::line_layout::{
+    LineLayout, SnapMarks, TabStopFor, TextInset, TextLayoutOptions, WrapComputation,
+};
+use crate::Pixels;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -46,10 +48,6 @@ const ORPHAN_PENALTY: f32 = 10_000.;
 /// Two ways to break that differ by less than this, in square pixels, cost the same.
 const TIE_TOLERANCE: f32 = 0.5;
 
-/// A line wider than its wrap width by no more than this still fits: glyph
-/// positions are floats.
-const FIT_TOLERANCE: f32 = 1. / 256.;
-
 /// What the last line of the lines being broken costs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LastLine {
@@ -70,23 +68,19 @@ impl LineLayout {
         options: TextLayoutOptions,
         tab_stop: Option<TabStopFor<'_>>,
         insets: &[TextInset],
+        marks: &SnapMarks,
     ) -> WrapComputation {
-        let greedy =
-            self.compute_wrap_boundaries(text, wrap_width, max_lines, options, tab_stop, insets);
+        let greedy = self.compute_wrap_boundaries(
+            text, wrap_width, max_lines, options, tab_stop, insets, marks,
+        );
         let (Some(wrap_width), None) = (wrap_width, max_lines) else {
             return greedy;
         };
         let line_count = greedy.line_starts.len();
-        let widest = greedy.line_widths.iter().copied().fold(px(0.), Pixels::max);
         // Chromium lays out a text with a tab, or that breaks after every space, as
-        // `auto` does, and so one with a line that overflows. A word wider than the
-        // line leaves nothing to even out.
-        if line_count < 2
-            || text.contains('\t')
-            || options.break_spaces
-            || greedy.broke_word
-            || widest > wrap_width + px(FIT_TOLERANCE)
-        {
+        // `auto` does, and so one with a line that overflows (checked below). A word
+        // wider than the line leaves nothing to even out.
+        if line_count < 2 || text.contains('\t') || options.break_spaces || greedy.broke_word {
             return greedy;
         }
         let (last_line, first_line) = match options.text_wrap_style {
@@ -106,7 +100,26 @@ impl LineLayout {
             }
         };
 
-        let opportunities = self.break_opportunities(text, options, insets);
+        let opportunities = self.break_opportunities(text, options, insets, marks);
+        let glyph_count = opportunities.x.len() - 1;
+        let fit = crate::util::fit_layout_units(wrap_width, self.scale_factor);
+        let fits = |from: usize, to: usize| {
+            marks.fit_units(
+                |glyph| opportunities.x[glyph],
+                glyph_count,
+                self.scale_factor,
+                from,
+                to,
+            ) <= fit
+        };
+        let overflows = greedy
+            .line_starts
+            .iter()
+            .zip(&greedy.line_ends)
+            .any(|(start, end)| !fits(*start, *end));
+        if overflows {
+            return greedy;
+        }
         // The lines before the first one that is re-broken stay where greedy put them.
         let start = greedy.line_starts[first_line];
         let mut candidates = vec![start];
@@ -117,18 +130,15 @@ impl LineLayout {
         let line_cost = |from: usize, to: usize| -> Option<f32> {
             let first = candidates[from];
             let mut end = candidates[to];
-            let after_hanging = if hangs {
+            if hangs {
                 while end > first && opportunities.hangs[end - 1] {
                     end -= 1;
                 }
-                opportunities.x[end]
-            } else {
-                opportunities.x[end]
-            };
-            let width = after_hanging - opportunities.x[first];
-            if width > wrap_width + px(FIT_TOLERANCE) {
+            }
+            if !fits(first, end) {
                 return None;
             }
+            let width = opportunities.x[end] - opportunities.x[first];
             let slack = f32::from(wrap_width - width);
             let last = to == candidates.len() - 1;
             Some(match last_line {

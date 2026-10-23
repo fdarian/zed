@@ -1,4 +1,4 @@
-//! Where a line of text may break, for `word-break: normal` and `keep-all`, the way
+//! Where a line of text may break, for `word-break: normal`, `keep-all` and `break-all`, the way
 //! Blink decides it (`text_break_iterator.cc`, `LazyLineBreakIterator::NextBreakablePosition`).
 //!
 //! A break is allowed before a character, never before a space, and always before the
@@ -12,7 +12,9 @@
 //!    `-` followed by a digit breaks only after a letter or a digit, so `ABCD-1234`
 //!    breaks and a minus sign in `x -5` does not, and `-` followed by a character beyond
 //!    ASCII is left to ICU.
-//! 2. `word-break: keep-all` keeps two letters or numbers together.
+//! 2. `word-break: keep-all` keeps two letters or numbers together. `break-all` adds a break
+//!    between two characters whose line breaking classes are in [`breaks_after_break_all`]
+//!    (letters and numbers, mostly), before the table says no.
 //! 3. The Unicode line breaking algorithm (UAX #14) over the whole text, from ICU4X, at
 //!    the strictness Chrome uses for `line-break: auto`.
 //!
@@ -30,22 +32,42 @@ use icu_segmenter::{
     options::{LineBreakOptions, LineBreakStrictness, LineBreakWordOption},
 };
 
+use super::line_layout::WordBreak;
+
 /// The places a text may break, as the byte offsets of the characters a line may start at.
 pub(super) struct LineBreaks {
     offsets: Vec<usize>,
 }
 
 impl LineBreaks {
-    pub(super) fn new(text: &str, keep_all: bool) -> Self {
+    pub(super) fn new(text: &str, word_break: WordBreak) -> Self {
         let mut offsets = Vec::new();
         let mut icu = Icu::new(text);
         let mut before_last = None;
         let mut last = None;
+        // The class of the last character that was not a combining mark, which is what
+        // `break-all` looks at to see whether a letter may be cut from the one before.
+        let mut last_class = LineBreak::Unknown;
         for (offset, current) in text.char_indices() {
+            let class = break_all_class(current);
             if let Some(last) = last
-                && breaks_between(before_last, last, current, keep_all, offset, &mut icu)
+                && breaks_between(
+                    before_last,
+                    last,
+                    current,
+                    Between {
+                        word_break,
+                        last_class,
+                        class,
+                    },
+                    offset,
+                    &mut icu,
+                )
             {
                 offsets.push(offset);
+            }
+            if class != LineBreak::CombiningMark || last.is_none() {
+                last_class = class;
             }
             before_last = last;
             last = Some(current);
@@ -64,11 +86,21 @@ fn is_space(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\n')
 }
 
+/// What `word-break` needs to know about the two characters a break is asked for.
+#[derive(Clone, Copy)]
+struct Between {
+    word_break: WordBreak,
+    /// The class of the last character before the current one that is not a combining mark.
+    last_class: LineBreak,
+    /// The class of the current character, as `break-all` sees it.
+    class: LineBreak,
+}
+
 fn breaks_between(
     before_last: Option<char>,
     last: char,
     current: char,
-    keep_all: bool,
+    between: Between,
     offset: usize,
     icu: &mut Icu,
 ) -> bool {
@@ -78,12 +110,61 @@ fn breaks_between(
     if is_space(last) {
         return true;
     }
-    match fast_break(before_last, last, current) {
-        Fast::Break => true,
-        Fast::NoBreak => false,
-        Fast::Unknown => {
-            !(keep_all && keeps_together(before_last, last, current)) && icu.is_boundary(offset)
+    let fast = fast_break(before_last, last, current);
+    if matches!(fast, Fast::Break) {
+        return true;
+    }
+    match between.word_break {
+        // The table is asked before the fast table's refusal, so `break-all` cuts between
+        // two characters of ASCII too.
+        WordBreak::BreakAll
+            if breaks_after_break_all(between.last_class, between.class)
+                // LB21: no break before a character that breaks after itself, but `|`.
+                && !(between.class == LineBreak::BreakAfter && current != '|') =>
+        {
+            return true;
         }
+        WordBreak::KeepAll if keeps_together(before_last, last, current) => return false,
+        _ => {}
+    }
+    match fast {
+        Fast::Break | Fast::NoBreak => false,
+        Fast::Unknown => icu.is_boundary(offset),
+    }
+}
+
+/// Blink's `LineBreakPropertyValue`: the class of a character, with `+` an alphabetic one, as
+/// Internet Explorer has it under `break-all`.
+fn break_all_class(character: char) -> LineBreak {
+    if character == '+' {
+        return LineBreak::Alphabetic;
+    }
+    CodePointMapData::<LineBreak>::new().get(character)
+}
+
+/// Blink's `kBreakAllLineBreakClassTable`: whether `break-all` adds a break between a character of
+/// class `last` and one of class `current`, which UAX #14 does not break. A class that is not
+/// listed adds none.
+fn breaks_after_break_all(last: LineBreak, current: LineBreak) -> bool {
+    use LineBreak as L;
+    let letters_and_numbers = [L::Ambiguous, L::Alphabetic, L::BreakAfter, L::Hyphen, L::Numeric];
+    let ends_word = |extra: &[LineBreak]| {
+        letters_and_numbers.contains(&current) || current == L::HebrewLetter || extra.contains(&current)
+    };
+    match last {
+        L::Ambiguous | L::Alphabetic | L::BreakAfter | L::Numeric | L::ComplexContext
+        | L::BreakSymbols | L::HebrewLetter => {
+            ends_word(&[L::OpenPunctuation, L::PrefixNumeric, L::ComplexContext])
+        }
+        L::ClosePunctuation => ends_word(&[L::PrefixNumeric]),
+        L::CloseParenthesis => ends_word(&[L::PrefixNumeric, L::ComplexContext]),
+        L::Exclamation | L::PostfixNumeric => {
+            ends_word(&[L::PostfixNumeric, L::PrefixNumeric])
+        }
+        L::InfixNumeric => ends_word(&[]),
+        L::Hyphen => current == L::Numeric,
+        L::PrefixNumeric => current == L::PostfixNumeric,
+        _ => false,
     }
 }
 
@@ -275,7 +356,18 @@ mod tests {
     /// The rows a text is cut into at every place a line may break, which is what
     /// Chrome lays a text out in at a width of zero. The expected rows are Chrome's.
     fn rows(text: &str, keep_all: bool) -> Vec<&str> {
-        let breaks = LineBreaks::new(text, keep_all);
+        rows_of(
+            text,
+            if keep_all {
+                WordBreak::KeepAll
+            } else {
+                WordBreak::Normal
+            },
+        )
+    }
+
+    fn rows_of(text: &str, word_break: WordBreak) -> Vec<&str> {
+        let breaks = LineBreaks::new(text, word_break);
         let mut rows = Vec::new();
         let mut start = 0;
         for (offset, _) in text.char_indices().skip(1) {
@@ -517,6 +609,29 @@ mod tests {
             rows("ภาษาไทยเป็นภาษาที่มีวรรณยุกต์", false),
             ["ภาษา", "ไทย", "เป็น", "ภาษา", "ที่", "มี", "วรรณยุกต์"]
         );
+    }
+
+    #[test]
+    fn break_all_breaks_between_letters_and_numbers_by_blinks_table() {
+        let all = |text| rows_of(text, WordBreak::BreakAll);
+        assert_eq!(all("abc"), ["a", "b", "c"]);
+        assert_eq!(all("a1b2"), ["a", "1", "b", "2"]);
+        assert_eq!(all("a b"), ["a ", "b"]);
+        // A closing character stays with the letter before it, an opening one with the one after.
+        assert_eq!(all("a)b"), ["a)", "b"]);
+        assert_eq!(all("a(b"), ["a", "(b"]);
+        assert_eq!(all("(ab)"), ["(a", "b)"]);
+        // A number keeps its percent sign and its currency sign, which no letter follows.
+        assert_eq!(all("50%"), ["5", "0%"]);
+        assert_eq!(all("$50"), ["$5", "0"]);
+        // And a slash stays with the letter before it.
+        assert_eq!(all("a/b"), ["a/", "b"]);
+        // What is glue is glue: U+00A0 and the non-breaking hyphen.
+        assert_eq!(all("a\u{A0}b"), ["a\u{A0}b"]);
+        assert_eq!(all("a\u{2011}b"), ["a\u{2011}b"]);
+        // The places `normal` has stay, and a hyphen is cut from the letter before it.
+        assert_eq!(all("ab-cd"), ["a", "b", "-", "c", "d"]);
+        assert_eq!(all("\u{4E2D}a"), ["\u{4E2D}", "a"]);
     }
 
     #[test]
