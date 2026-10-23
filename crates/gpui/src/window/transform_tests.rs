@@ -579,3 +579,347 @@ fn a_surface_is_exact_under_a_translation_and_the_bounding_box_under_a_rotation(
     // (x, y) goes to (-y, x): the box ends up at x in [-24, -4], y in [3, 23].
     assert_eq!(turned, Bounds::new(point(ScaledPixels(-48.), ScaledPixels(6.)), size(ScaledPixels(40.), ScaledPixels(40.))));
 }
+
+mod elements {
+    //! What a [`crate::Div`] does with `Style::transform`: where its box, its children and the
+    //! scrollable overflow and culling around it end up.
+
+    use crate::{
+        AnyElement, Context, Edges, ElementTransform, IntoElement, ParentElement, Quad, Render,
+        ScrollHandle, Styled, TestApp, TestAppWindow, TransformFunction, TransformLength,
+        TransformationMatrix, Window, blue, div, point, px, red, InteractiveElement,
+        StatefulInteractiveElement,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    struct Scene {
+        build: Rc<dyn Fn() -> AnyElement>,
+    }
+
+    impl Render for Scene {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            (self.build)()
+        }
+    }
+
+    fn open(build: impl Fn() -> AnyElement + 'static) -> (TestApp, TestAppWindow<Scene>) {
+        let mut app = TestApp::new();
+        let build: Rc<dyn Fn() -> AnyElement> = Rc::new(build);
+        let mut window = app.open_window(move |_, _| Scene { build });
+        window.draw();
+        (app, window)
+    }
+
+    fn quads(window: &mut TestAppWindow<Scene>) -> Vec<Quad> {
+        window.update(|_, window, _| window.painted_quads())
+    }
+
+    fn quad_with_width(quads: &[Quad], width: f32) -> Quad {
+        *quads
+            .iter()
+            .find(|quad| quad.bounds.size.width.0 == width * 2.)
+            .unwrap_or_else(|| panic!("no quad {width} wide in {quads:?}"))
+    }
+
+    fn about_center(functions: Vec<TransformFunction>) -> ElementTransform {
+        ElementTransform {
+            functions,
+            origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+        }
+    }
+
+    fn about_top_left(functions: Vec<TransformFunction>) -> ElementTransform {
+        ElementTransform {
+            functions,
+            origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+        }
+    }
+
+    fn assert_matrix(actual: TransformationMatrix, expected: TransformationMatrix) {
+        let close = |left: f32, right: f32| (left - right).abs() < 1e-3;
+        assert!(
+            (0..2).all(|row| (0..2).all(|column| close(
+                actual.rotation_scale[row][column],
+                expected.rotation_scale[row][column]
+            ))) && close(actual.translation[0], expected.translation[0])
+                && close(actual.translation[1], expected.translation[1]),
+            "{actual:?} is not {expected:?}"
+        );
+    }
+
+    /// 100 by 40 at (50, 60), with a 20 by 10 child at its top left.
+    fn card(transform: ElementTransform) -> AnyElement {
+        div()
+            .size_full()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(50.))
+                    .top(px(60.))
+                    .w(px(100.))
+                    .h(px(40.))
+                    .bg(red())
+                    .transform(transform)
+                    .child(div().w(px(20.)).h(px(10.)).bg(blue())),
+            )
+            .into_any_element()
+    }
+
+    #[test]
+    fn a_rotated_div_paints_with_the_matrix_about_its_center_and_its_child_inherits_it() {
+        let transform = about_center(vec![TransformFunction::Rotate(45f32.to_radians())]);
+        let expected = transform
+            .resolve(crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(100.), px(40.))))
+            .scaled(2.);
+        let (_app, mut window) = open({
+            let transform = transform.clone();
+            move || card(transform.clone())
+        });
+        let quads = quads(&mut window);
+        let parent = quad_with_width(&quads, 100.);
+        let child = quad_with_width(&quads, 20.);
+        assert_matrix(parent.transformation, expected);
+        assert_matrix(child.transformation, expected);
+        // The boxes stay where layout put them: the matrix does the turning.
+        assert_eq!(parent.bounds.origin, point(crate::ScaledPixels(100.), crate::ScaledPixels(120.)));
+        assert_eq!(child.bounds.origin, parent.bounds.origin);
+        // The center stays where it is.
+        let center = parent.transformation.apply_xy(100. + 100., 120. + 40.);
+        assert!((center[0] - 200.).abs() < 1e-3 && (center[1] - 160.).abs() < 1e-3, "{center:?}");
+    }
+
+    #[test]
+    fn a_translation_resolves_percentages_against_the_border_box_of_the_element() {
+        let transform = about_center(vec![TransformFunction::Translate(
+            TransformLength::fraction(0.5),
+            TransformLength::fraction(0.5),
+        )]);
+        let (_app, mut window) = open(move || card(transform.clone()));
+        let quads = quads(&mut window);
+        let parent = quad_with_width(&quads, 100.);
+        // 50% of 100 across and 50% of 40 down, in the translation path: no matrix on the quad.
+        assert_eq!(parent.transformation, TransformationMatrix::unit());
+        assert_eq!(parent.bounds.origin, point(crate::ScaledPixels(200.), crate::ScaledPixels(160.)));
+        let child = quad_with_width(&quads, 20.);
+        assert_eq!(child.bounds.origin, parent.bounds.origin);
+    }
+
+    #[test]
+    fn the_origin_the_transform_is_about_is_the_one_the_style_gives() {
+        let transform = about_top_left(vec![TransformFunction::Rotate(90f32.to_radians())]);
+        let (_app, mut window) = open(move || card(transform.clone()));
+        let quads = quads(&mut window);
+        let parent = quad_with_width(&quads, 100.);
+        // About (50, 60): (x, y) goes to (50 - (y - 60), 60 + (x - 50)), which is
+        // (110 - y, x + 10) in logical and (220 - y, x + 20) in device pixels.
+        assert_matrix(
+            parent.transformation,
+            TransformationMatrix {
+                rotation_scale: [[0., -1.], [1., 0.]],
+                translation: [220., 20.],
+            },
+        );
+    }
+
+    #[test]
+    fn a_lifted_element_is_painted_inside_the_transforms_it_was_prepainted_in() {
+        let turn = about_center(vec![TransformFunction::Rotate(45f32.to_radians())]);
+        let slide = about_top_left(vec![TransformFunction::Translate(
+            TransformLength::pixels(10.),
+            TransformLength::pixels(0.),
+        )]);
+        let (_app, mut window) = open({
+            let (turn, slide) = (turn.clone(), slide.clone());
+            move || {
+                div()
+                    .size_full()
+                    .child(
+                        div()
+                            .stacking_context()
+                            .absolute()
+                            .left(px(50.))
+                            .top(px(60.))
+                            .w(px(100.))
+                            .h(px(40.))
+                            .transform(turn.clone())
+                            .child(
+                                block(60., 20.).transform(slide.clone()).child(
+                                    block(20., 10.).absolute().z_index(1).bg(blue()),
+                                ),
+                            ),
+                    )
+                    .into_any_element()
+            }
+        });
+        let bounds = crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(100.), px(40.)));
+        let around = turn.resolve(bounds);
+        let slid = slide.resolve(crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(60.), px(20.))));
+        let leaf = quad_with_width(&quads(&mut window), 20.);
+        assert_matrix(leaf.transformation, around.compose(slid).scaled(2.));
+    }
+
+    fn scroller(content: AnyElement, handle: &ScrollHandle) -> AnyElement {
+        div()
+            .id("scroller")
+            .w(px(100.))
+            .h(px(100.))
+            .overflow_scroll()
+            .track_scroll(handle)
+            .child(content)
+            .into_any_element()
+    }
+
+    fn scroll_range(content: impl Fn() -> AnyElement + 'static) -> crate::Point<crate::Pixels> {
+        let handle = ScrollHandle::new();
+        let (_app, _window) = open({
+            let handle = handle.clone();
+            move || scroller(content(), &handle)
+        });
+        handle.max_offset()
+    }
+
+    fn block(width: f32, height: f32) -> crate::Div {
+        div().w(px(width)).h(px(height)).flex_shrink_0()
+    }
+
+    #[test]
+    fn a_scaled_child_grows_the_scroll_range_by_its_transformed_box() {
+        let range = scroll_range(|| {
+            block(100., 50.)
+                .transform(about_top_left(vec![TransformFunction::Scale(2., 3.)]))
+                .into_any_element()
+        });
+        assert_eq!(range, point(px(100.), px(50.)));
+
+        // About the center the box also grows toward the origin, which scrolling cannot reach.
+        let range = scroll_range(|| {
+            block(100., 50.)
+                .transform(about_center(vec![TransformFunction::Scale(2., 2.)]))
+                .into_any_element()
+        });
+        assert_eq!(range, point(px(50.), px(0.)));
+    }
+
+    #[test]
+    fn what_overflows_a_transformed_child_is_moved_by_the_transform_too() {
+        let range = scroll_range(|| {
+            block(50., 50.)
+                .transform(about_top_left(vec![TransformFunction::Scale(2., 2.)]))
+                .child(block(100., 10.))
+                .into_any_element()
+        });
+        // The 100 wide child overflows its parent, and the parent's overflow is doubled.
+        assert_eq!(range, point(px(100.), px(0.)));
+    }
+
+    #[test]
+    fn a_transform_deeper_in_the_tree_reaches_the_scroller() {
+        let range = scroll_range(|| {
+            div()
+                .child(
+                    block(60., 60.)
+                        .transform(about_top_left(vec![TransformFunction::Translate(
+                            TransformLength::pixels(100.),
+                            TransformLength::pixels(0.),
+                        )])),
+                )
+                .into_any_element()
+        });
+        assert_eq!(range, point(px(60.), px(0.)));
+    }
+
+    #[test]
+    fn the_transform_of_the_scroller_does_not_change_its_own_range() {
+        let plain = scroll_range(|| block(300., 20.).into_any_element());
+        let handle = ScrollHandle::new();
+        let (_app, _window) = open({
+            let handle = handle.clone();
+            move || {
+                div()
+                    .id("turned")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .overflow_scroll()
+                    .track_scroll(&handle)
+                    .transform(about_center(vec![TransformFunction::Rotate(30f32.to_radians())]))
+                    .child(block(300., 20.))
+                    .into_any_element()
+            }
+        });
+        assert_eq!(handle.max_offset(), plain);
+    }
+
+    #[test]
+    fn a_change_of_transform_alone_lays_nothing_out_and_moves_the_range() {
+        let transform = Rc::new(RefCell::new(about_top_left(vec![TransformFunction::Scale(2., 2.)])));
+        let handle = ScrollHandle::new();
+        let (_app, mut window) = open({
+            let handle = handle.clone();
+            let transform = transform.clone();
+            move || {
+                let content = block(100., 50.).transform(transform.borrow().clone()).into_any_element();
+                scroller(content, &handle)
+            }
+        });
+        assert_eq!(handle.max_offset(), point(px(100.), px(0.)));
+        let before = window.update(|_, window, _| window.layout_counters());
+
+        *transform.borrow_mut() = about_top_left(vec![TransformFunction::Scale(3., 3.)]);
+        window.update(|_, _, cx| cx.notify());
+        window.draw();
+        assert_eq!(handle.max_offset(), point(px(200.), px(50.)));
+        let after = window.update(|_, window, _| window.layout_counters());
+        assert_eq!(after.nodes_laid_out, before.nodes_laid_out);
+        assert_eq!(after.styles_set, before.styles_set);
+    }
+
+    /// A 100 by 100 clip holding a row that fills it and 10 more, and the rows `rows` make below
+    /// it; the subtrees one frame culls.
+    fn culled(rows: impl Fn() -> Vec<crate::Div> + 'static) -> u64 {
+        let (_app, mut window) = open(move || {
+            div()
+                .id("clip")
+                .w(px(100.))
+                .h(px(100.))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(block(100., 110.).cullable(Edges::default()))
+                .children(rows().into_iter().map(|row| row.cullable(Edges::default())))
+                .into_any_element()
+        });
+        let before = window.update(|_, window, _| window.culled_subtree_count());
+        window.draw();
+        window.update(|_, window, _| window.culled_subtree_count()) - before
+    }
+
+    fn shifted(down: f32) -> ElementTransform {
+        about_top_left(vec![TransformFunction::Translate(
+            TransformLength::pixels(0.),
+            TransformLength::pixels(down),
+        )])
+    }
+
+    #[test]
+    fn a_row_a_translate_moves_into_view_is_not_culled_and_one_it_moves_out_is() {
+        // Rows 110 and 150 down lie under the clip.
+        assert_eq!(culled(|| vec![block(100., 40.), block(100., 40.)]), 2);
+        assert_eq!(
+            culled(|| vec![block(100., 40.).transform(shifted(-80.)), block(100., 40.)]),
+            1
+        );
+        // A row in view that is moved out of it.
+        let (_app, mut window) = open(|| {
+            div()
+                .id("clip")
+                .w(px(100.))
+                .h(px(100.))
+                .overflow_hidden()
+                .child(block(100., 40.).cullable(Edges::default()).transform(shifted(300.)))
+                .into_any_element()
+        });
+        let before = window.update(|_, window, _| window.culled_subtree_count());
+        window.draw();
+        assert_eq!(window.update(|_, window, _| window.culled_subtree_count()) - before, 1);
+    }
+}
