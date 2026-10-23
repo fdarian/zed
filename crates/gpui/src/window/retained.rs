@@ -805,6 +805,7 @@ struct LiftStub {
     rel_ordinal: u32,
     hitboxes: RecordedHitboxes,
     context: PaintContext,
+    transforms: Vec<AmbientTransform>,
     content_mask: ContentMask<Pixels>,
     image_cache: Option<AnyImageCache>,
 }
@@ -1948,6 +1949,7 @@ impl Window {
                     roots,
                 },
                 context: entry.context.clone(),
+                transforms: entry.transforms.clone(),
                 content_mask: entry.content_mask,
                 image_cache: entry.image_cache.clone(),
             });
@@ -2085,6 +2087,7 @@ impl Window {
                 ordinal,
                 hitboxes,
                 context: stub.context.clone(),
+                transforms: stub.transforms.clone(),
                 content_mask: stub.content_mask,
                 // A recording made in a region hands nothing to a context outside.
                 derived_mask: false,

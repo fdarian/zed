@@ -1802,12 +1802,15 @@ impl Element for List {
         style.refine(&self.style);
 
         let rem_size = window.rem_size();
-        let hitbox = window.insert_hitbox_shaped(
-            bounds,
-            HitboxBehavior::Normal,
-            style.border_box_radii(bounds, rem_size),
-            style.hit_clip_path(bounds, rem_size),
-        );
+        let transform = style.transform_matrix(bounds);
+        let hitbox = window.with_transform(transform, |window| {
+            window.insert_hitbox_shaped(
+                bounds,
+                HitboxBehavior::Normal,
+                style.border_box_radii(bounds, rem_size),
+                style.hit_clip_path(bounds, rem_size),
+            )
+        });
 
         let layout_id = self
             .interactivity
@@ -1846,16 +1849,18 @@ impl Element for List {
         });
 
         let escapes_before = window.escapes_prepainted();
-        let layout = window.with_hitbox_parent(&hitbox, |window| {
-            match state.prepaint_items(viewport, unsnapped, padding, true, &mut self.render_item, window, cx) {
-                Ok(layout) => layout,
-                Err(autoscroll_request) => {
-                    state.logical_scroll_top = Some(autoscroll_request);
-                    state
-                        .prepaint_items(viewport, unsnapped, padding, false, &mut self.render_item, window, cx)
-                        .unwrap()
+        let layout = window.with_transform(transform, |window| {
+            window.with_hitbox_parent(&hitbox, |window| {
+                match state.prepaint_items(viewport, unsnapped, padding, true, &mut self.render_item, window, cx) {
+                    Ok(layout) => layout,
+                    Err(autoscroll_request) => {
+                        state.logical_scroll_top = Some(autoscroll_request);
+                        state
+                            .prepaint_items(viewport, unsnapped, padding, false, &mut self.render_item, window, cx)
+                            .unwrap()
+                    }
                 }
-            }
+            })
         });
 
         state.last_layout_bounds = Some(viewport);
@@ -1878,7 +1883,9 @@ impl Element for List {
                 .publish_layout(bounds, style.visibility.unwrap_or(window.visibility()), window);
         }
         if let Some(prepainter) = self.interactivity.overlay_prepainter.take() {
-            window.with_hitbox_parent(&hitbox, |window| prepainter(bounds, window, cx));
+            window.with_transform(transform, |window| {
+                window.with_hitbox_parent(&hitbox, |window| prepainter(bounds, window, cx))
+            });
         }
         ListPrepaintState {
             hitbox,
@@ -1899,90 +1906,93 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let current_view = window.current_view();
+        let transform = prepaint.style.transform_matrix(bounds);
+        window.with_transform(transform, |window| {
+            let current_view = window.current_view();
 
-        // Register the scroll listener before painting children so that, in
-        // the bubble phase (which runs in reverse registration order),
-        // children's scroll-wheel handlers run first and can stop propagation
-        // to prevent the list from scrolling. This matches the ordering of
-        // div-based scroll containers.
-        let list_state = self.state.clone();
-        let viewport = prepaint.viewport;
-        let height = viewport.size.height;
-        let scroll_top = prepaint.layout.scroll_top;
-        let hitbox = prepaint.hitbox.clone();
-        // Set with `InteractiveElement::overscroll_behavior`; a list scrolls along y only.
-        let overscroll = self.interactivity.overscroll_behavior.y;
-        let scroller = scroll_routing::scroller_id_of_state(&list_state.0);
-        // How far the content has been moved this frame, measured from where the frame began:
-        // `scroll` moves relative to `scroll_top`, which stays fixed until the next layout.
-        let mut moved = Pixels::ZERO;
-        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Capture {
-                scroll_routing::begin(window, cx, event, scroller);
-            }
-        });
-        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase != DispatchPhase::Bubble {
-                return;
-            }
-            let (base_top, scroll_max) = list_state.0.borrow().scroll_extent(&scroll_top);
-            let offset = point(Pixels::ZERO, moved - base_top);
-            let claim = scroll_routing::Claim {
-                scroller,
-                under_pointer: scroll_routing::is_candidate(window, &hitbox),
-                pass_through: scroll_routing::passes_through(&hitbox),
-                event: event.clone(),
-                // Lists have always read a line of a mouse wheel as 20 pixels.
-                line_height: px(20.),
-                overflow: point(Overflow::Visible, Overflow::Scroll),
-                overscroll: point(OverscrollBehavior::Auto, overscroll),
-                offset,
-                max_offset: point(Pixels::ZERO, scroll_max),
-            };
-            let Some(new_offset) = scroll_routing::claim(window, cx, claim) else {
-                return;
-            };
-            let taken = new_offset.y - offset.y;
-            if taken.is_zero() {
-                return;
-            }
-            moved += taken;
-            list_state.0.borrow_mut().scroll(
-                &scroll_top,
-                height,
-                point(Pixels::ZERO, moved),
-                current_view,
-                window,
-                cx,
-            );
-        });
-
-        // A hidden list paints nothing and keeps its box, as a hidden div does.
-        window.with_visibility(
-            prepaint.style.visibility.unwrap_or(window.visibility()),
-            |window| self.interactivity.run_paint_listeners(bounds, window, cx),
-        );
-
-        let overlay_painter = self.interactivity.overlay_painter.take();
-        let escape_inside = prepaint.escape_inside;
-        let layout = &mut prepaint.layout;
-        prepaint
-            .style
-            .paint_with_effects(bounds, window, cx, |window, cx| {
-                window.with_overflow_clip(
-                    Some(ContentMask::from_bounds(viewport)),
-                    escape_inside,
-                    |window| {
-                        for item in &mut layout.item_layouts {
-                            item.element.paint(window, cx);
-                        }
-                        if let Some(painter) = overlay_painter {
-                            painter(bounds, window, cx);
-                        }
-                    },
+            // Register the scroll listener before painting children so that, in
+            // the bubble phase (which runs in reverse registration order),
+            // children's scroll-wheel handlers run first and can stop propagation
+            // to prevent the list from scrolling. This matches the ordering of
+            // div-based scroll containers.
+            let list_state = self.state.clone();
+            let viewport = prepaint.viewport;
+            let height = viewport.size.height;
+            let scroll_top = prepaint.layout.scroll_top;
+            let hitbox = prepaint.hitbox.clone();
+            // Set with `InteractiveElement::overscroll_behavior`; a list scrolls along y only.
+            let overscroll = self.interactivity.overscroll_behavior.y;
+            let scroller = scroll_routing::scroller_id_of_state(&list_state.0);
+            // How far the content has been moved this frame, measured from where the frame began:
+            // `scroll` moves relative to `scroll_top`, which stays fixed until the next layout.
+            let mut moved = Pixels::ZERO;
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture {
+                    scroll_routing::begin(window, cx, event, scroller);
+                }
+            });
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let (base_top, scroll_max) = list_state.0.borrow().scroll_extent(&scroll_top);
+                let offset = point(Pixels::ZERO, moved - base_top);
+                let claim = scroll_routing::Claim {
+                    scroller,
+                    under_pointer: scroll_routing::is_candidate(window, &hitbox),
+                    pass_through: scroll_routing::passes_through(&hitbox),
+                    event: event.clone(),
+                    // Lists have always read a line of a mouse wheel as 20 pixels.
+                    line_height: px(20.),
+                    overflow: point(Overflow::Visible, Overflow::Scroll),
+                    overscroll: point(OverscrollBehavior::Auto, overscroll),
+                    offset,
+                    max_offset: point(Pixels::ZERO, scroll_max),
+                };
+                let Some(new_offset) = scroll_routing::claim(window, cx, claim) else {
+                    return;
+                };
+                let taken = new_offset.y - offset.y;
+                if taken.is_zero() {
+                    return;
+                }
+                moved += taken;
+                list_state.0.borrow_mut().scroll(
+                    &scroll_top,
+                    height,
+                    point(Pixels::ZERO, moved),
+                    current_view,
+                    window,
+                    cx,
                 );
             });
+
+            // A hidden list paints nothing and keeps its box, as a hidden div does.
+            window.with_visibility(
+                prepaint.style.visibility.unwrap_or(window.visibility()),
+                |window| self.interactivity.run_paint_listeners(bounds, window, cx),
+            );
+
+            let overlay_painter = self.interactivity.overlay_painter.take();
+            let escape_inside = prepaint.escape_inside;
+            let layout = &mut prepaint.layout;
+            prepaint
+                .style
+                .paint_with_effects(bounds, window, cx, |window, cx| {
+                    window.with_overflow_clip(
+                        Some(ContentMask::from_bounds(viewport)),
+                        escape_inside,
+                        |window| {
+                            for item in &mut layout.item_layouts {
+                                item.element.paint(window, cx);
+                            }
+                            if let Some(painter) = overlay_painter {
+                                painter(bounds, window, cx);
+                            }
+                        },
+                    );
+                });
+        });
     }
 }
 

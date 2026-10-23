@@ -1296,6 +1296,9 @@ pub(crate) struct LiftedElement {
     /// Moved to the context's place in `Frame::hitboxes` once the context has all its entries.
     hitboxes: Vec<Hitbox>,
     context: PaintContext,
+    /// The transforms the element was prepainted inside, innermost last. Its context paints it
+    /// inside the same ones, whichever of them are not around the context.
+    transforms: Vec<AmbientTransform>,
     content_mask: ContentMask<Pixels>,
     /// Whether `content_mask` is cut from the region of the subtree being recorded in one, as the
     /// masks inside the subtree are, and so is cut by the content mask where the recording is put.
@@ -4444,11 +4447,26 @@ impl Window {
     ) -> bool {
         let mask = self.content_mask().bounds;
         let slack = px(1.);
+        let scale_factor = self.scale_factor();
+        let own_transform = self
+            .layout_engine
+            .as_ref()
+            .unwrap()
+            .element_transform(layout_id, bounds);
+        // The outset is in the child's own space; this is how far it can reach in the window.
+        let composed = match &own_transform {
+            Some(own) => self.transform().compose(*own),
+            None => self.transform(),
+        };
+        let stretch = if composed.is_translation() { 1. } else { composed.stretch_bound() };
         let inflate = |bounds: Bounds<Pixels>| {
-            let origin = point(bounds.origin.x - outset.left - slack, bounds.origin.y - outset.top - slack);
+            let origin = point(
+                bounds.origin.x - outset.left * stretch - slack,
+                bounds.origin.y - outset.top * stretch - slack,
+            );
             let far = point(
-                bounds.right() + outset.right + slack,
-                bounds.bottom() + outset.bottom + slack,
+                bounds.right() + outset.right * stretch + slack,
+                bounds.bottom() + outset.bottom * stretch + slack,
             );
             Bounds::from_corners(origin, far)
         };
@@ -4458,7 +4476,11 @@ impl Window {
                 || reach.bottom() < mask.top()
                 || reach.top() > mask.bottom()
         };
-        let reach = inflate(bounds);
+        let box_in_window = self.bounds_in_window(match &own_transform {
+            Some(own) => own.bounding_box(bounds),
+            None => bounds,
+        });
+        let reach = inflate(box_in_window);
         // Noted before the capture is looked at: a layout record made while an element holds the
         // capture is skipped after it lets go.
         self.note_cull_reach(reach);
@@ -4470,7 +4492,6 @@ impl Window {
         if !apart(reach) {
             return false;
         }
-        let scale_factor = self.scale_factor();
         let snapped_offset = self.pixel_snap_point(self.element_offset());
         let Some(extent) = self
             .layout_engine
@@ -4482,7 +4503,7 @@ impl Window {
         };
         let mut extent = extent;
         extent.origin += snapped_offset;
-        let extent = inflate(extent);
+        let extent = inflate(self.bounds_in_window(extent));
         self.note_cull_reach(extent);
         apart(extent)
     }
@@ -6239,6 +6260,7 @@ impl Window {
             ordinal: ticket.ordinal,
             hitboxes,
             context: PaintContext::capture(self),
+            transforms: self.transform_stack.clone(),
             content_mask: self.content_mask(),
             derived_mask: self.content_mask_is_derived(),
             cut: None,
@@ -6332,6 +6354,7 @@ impl Window {
             &mut self.text_style_stack,
             &mut entry.context.text_style_stack,
         );
+        mem::swap(&mut self.transform_stack, &mut entry.transforms);
         let current_view = entry.context.current_view;
         let rem_size = entry.context.rem_size;
         let visibility = entry.context.visibility;
@@ -6366,6 +6389,7 @@ impl Window {
         if let Some(outer_cut) = outer_cut {
             self.paint_cut = outer_cut;
         }
+        mem::swap(&mut self.transform_stack, &mut entry.transforms);
         mem::swap(
             &mut self.element_id_stack,
             &mut entry.context.element_id_stack,

@@ -6,7 +6,7 @@ use crate::{
     FlexBasisKeyword, FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
     JustifyContent, Length, LineHeight, OverflowAnchor, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
     StyleRefinement, TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace,
+    TextStyleRefinement, UnderlineStyle, WhiteSpace, ElementTransform,
     px, relative, rems,
 };
 pub use gpui_macros::{
@@ -1034,6 +1034,12 @@ pub trait Styled: Sized {
     /// Sets the opacity of this element and its children.
     fn opacity(mut self, opacity: f32) -> Self {
         self.style().opacity = Some(opacity);
+        self
+    }
+
+    /// Sets the CSS `transform` of this element, resolved against its border box.
+    fn transform(mut self, transform: ElementTransform) -> Self {
+        self.style().transform = Some(transform);
         self
     }
 

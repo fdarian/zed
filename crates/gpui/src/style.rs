@@ -12,7 +12,7 @@ use crate::{
     FontFallbacks, FontFeatures, FontSmoothing, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions, TextWrapStyle,
-    TextRun, TextSystem, Window, OverflowWrap, TextBoxEdge, WordBreak, black, point, px, quad, rems, size,
+    TextRun, TextSystem, Window, OverflowWrap, ElementTransform, TransformationMatrix, TextBoxEdge, WordBreak, black, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use gpui_util::ResultExt;
@@ -430,6 +430,11 @@ pub struct Style {
 
     /// The opacity of this element
     pub opacity: Option<f32>,
+
+    /// CSS `transform` with `transform-origin`: moves, scales, rotates and skews the element and
+    /// everything in it, hit testing included, after layout. A refinement cannot unset it, so
+    /// `none` is a transform with no functions.
+    pub transform: Option<ElementTransform>,
 
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
@@ -1112,6 +1117,14 @@ impl Style {
         }
     }
 
+    /// The matrix of the element's `transform` for its border box `bounds`, from its local
+    /// space to the space it is in.
+    pub(crate) fn transform_matrix(&self, bounds: Bounds<Pixels>) -> TransformationMatrix {
+        self.transform
+            .as_ref()
+            .map_or_else(TransformationMatrix::unit, |transform| transform.resolve(bounds))
+    }
+
     /// Whether the element shows nothing, because its opacity is 0.
     ///
     /// Not while an opacity animation is current: the element paints as a group of opacity 0, which
@@ -1639,6 +1652,7 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            transform: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

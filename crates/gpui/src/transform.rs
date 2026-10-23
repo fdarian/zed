@@ -4,6 +4,8 @@
 use crate::{
     Bounds, ContentMask, Corners, Pixels, ScaledPixels, Size, TransformationMatrix, point, px, size,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// How far from the identity a matrix entry may be and still count as the identity. Composing a
 /// rotation with its inverse leaves rounding error of this order.
@@ -80,6 +82,13 @@ impl TransformationMatrix {
     /// scale. It is the one number that says how thick an antialiased edge is in local units.
     pub fn scale_factor(&self) -> f32 {
         self.determinant().abs().sqrt()
+    }
+
+    /// A number no vector is lengthened by more than: the Frobenius norm of the linear part, which
+    /// is at least the largest singular value. For padding that is in a space the matrix maps.
+    pub fn stretch_bound(&self) -> f32 {
+        let [[a, b], [c, d]] = self.rotation_scale;
+        (a * a + b * b + c * c + d * d).sqrt()
     }
 
     /// The point after the matrix, in the units of the matrix.
@@ -238,7 +247,7 @@ impl ContentMask<ScaledPixels> {
 /// A length that is a number of pixels plus a fraction of the element's own border box, which
 /// is what `translate()` and `transform-origin` percentages are. Units that are not pixels
 /// (`em`, `vw`, ...) are resolved to pixels by the caller.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TransformLength {
     /// The pixels.
     pub px: f32,
@@ -264,7 +273,7 @@ impl TransformLength {
 }
 
 /// One function of a CSS `transform` list. Angles are in radians.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum TransformFunction {
     /// `translate(x, y)`
     Translate(TransformLength, TransformLength),
@@ -330,7 +339,7 @@ pub fn list_matrix(functions: &[TransformFunction], size: Size<Pixels>) -> Trans
 }
 
 /// A `transform` list and the point it is applied around.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ElementTransform {
     /// The functions, outermost first.
     pub functions: Vec<TransformFunction>,

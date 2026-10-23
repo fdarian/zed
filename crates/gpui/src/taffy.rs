@@ -1,6 +1,6 @@
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
-    Style, Window, point, size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Edges, ElementTransform, GridTemplate, Length, Pixels, Point, Size,
+    Style, TransformationMatrix, Window, point, size,
     util::{
         LAYOUT_UNIT, ceil_measured_size_to_layout_unit, round_half_up, round_to_device_pixel,
         snap_border_spacing_to_device_pixel, snap_border_width_to_device_pixel, truncate_to_layout_unit,
@@ -264,6 +264,10 @@ struct NodeMeta {
     /// anchoring does not follow (its insets, margin, padding, size, position), so the layout
     /// that moves the anchor must not be compensated for. Dropped by [`TaffyLayoutEngine::end_pass`].
     anchor_restyled: bool,
+    /// The node's `transform`, which is no concern of layout: it moves what is painted, and the
+    /// extents below count the boxes where it puts them. Nothing but an extent reads it, so a
+    /// change of it is no change of layout, only of the extents (see `extent_epoch`).
+    transform: Option<ElementTransform>,
 }
 
 impl NodeMeta {
@@ -338,8 +342,9 @@ pub struct TaffyLayoutEngine {
     scroll_reaches: FxHashMap<LayoutId, Memo<ScrollReach>>,
     /// [`Self::scroll_reaches`] from the unsnapped boxes, which are not the snapped ones' values.
     unsnapped_scroll_reaches: FxHashMap<LayoutId, Memo<ScrollReach>>,
-    /// Changes when a node became or stopped being static, escapable or detached with no change
-    /// to its style, which no layout generation follows, so that no extent computed before is kept.
+    /// Changes when a node became or stopped being static, escapable or detached, or got another
+    /// `transform`, with no change to its layout, which no layout generation follows, so that no
+    /// extent computed before is kept.
     extent_epoch: u64,
     /// The nodes that were detached when their request reset that, to be checked once the
     /// requests are done, for the ones that stopped being.
@@ -993,7 +998,10 @@ impl TaffyLayoutEngine {
             || old.unforced_width.is_some();
         let requested = old.requested.take();
         let escapable_kind = |meta: &NodeMeta| meta.escapable.as_deref().map(|escapable| escapable.kind);
-        if old.is_static != meta.is_static || escapable_kind(old) != escapable_kind(&meta) {
+        if old.is_static != meta.is_static
+            || escapable_kind(old) != escapable_kind(&meta)
+            || old.transform != meta.transform
+        {
             self.extent_epoch += 1;
         }
         meta.was_detached = old.detached;
@@ -1245,6 +1253,10 @@ impl TaffyLayoutEngine {
                 .any(|edge| *edge != crate::Length::Auto),
             is_static: style.position == crate::Position::Static && !style.contain_layout,
             contains_layout: style.contain_layout,
+            transform: style
+                .transform
+                .clone()
+                .filter(|transform| !transform.functions.is_empty()),
             // A new node has no extent kept, and its parent changed to get it: only a node found
             // again says what it was.
             was_detached: true,
@@ -1657,6 +1669,16 @@ impl TaffyLayoutEngine {
     // (`snap_border_width_to_device_pixel`), as Chrome does, so it is the same in layout and
     // paint. A collapsed border is not: half of it is a half pixel.
 
+    /// The matrix of the node's own `transform` for its border box `border_box`, in the space
+    /// the box is in, if it has one.
+    pub(crate) fn element_transform(
+        &self,
+        id: LayoutId,
+        border_box: Bounds<Pixels>,
+    ) -> Option<TransformationMatrix> {
+        self.meta(id).transform.as_ref().map(|transform| transform.resolve(border_box))
+    }
+
     /// The layout parent of a node, if it has one.
     pub fn layout_parent(&self, id: LayoutId) -> Option<LayoutId> {
         self.taffy.parent(id.0).map(LayoutId)
@@ -1905,6 +1927,17 @@ impl TaffyLayoutEngine {
                 None => {}
             }
 
+            if meta.transform.is_some() {
+                let child_positioned = positioned || !meta.is_static;
+                let (overflow_rect, inner_open) =
+                    self.transformed_overflow(child, child_positioned, scale_factor, snapped);
+                open_absolute |= inner_open;
+                let far = overflow_rect.bottom_right();
+                end.x = end.x.max(far.x);
+                end.y = end.y.max(far.y);
+                continue;
+            }
+
             let bounds = if snapped {
                 self.layout_bounds(child, scale_factor)
             } else {
@@ -1951,12 +1984,82 @@ impl TaffyLayoutEngine {
         (end, open_absolute)
     }
 
+    /// The rectangle in the layout root's coordinates that the scrollable overflow of `id` takes
+    /// in the space around it: its border box and the overflow of what is below it, in every
+    /// direction (a rotation can turn what reaches before the origin into what reaches past it),
+    /// moved by the node's own `transform`. Chrome adds the same rectangle to the overflow of the
+    /// scroller. The second value is [`Self::scrollable_reach`]'s `open_absolute`.
+    ///
+    /// Left out like there: `display: none`, `fixed` and detached nodes, and absolute ones whose
+    /// containing block is above `id` unless `positioned`.
+    fn transformed_overflow(
+        &mut self,
+        id: LayoutId,
+        positioned: bool,
+        scale_factor: f32,
+        snapped: bool,
+    ) -> (Bounds<Pixels>, bool) {
+        let border_box = if snapped {
+            self.layout_bounds(id, scale_factor)
+        } else {
+            self.layout_unsnapped_bounds(id, scale_factor)
+        };
+        let overflow = self.taffy.style(id.0).expect(EXPECT_MESSAGE).overflow;
+        let visible_x = overflow.x == taffy::style::Overflow::Visible;
+        let visible_y = overflow.y == taffy::style::Overflow::Visible;
+        let mut rect = border_box;
+        let mut open_absolute = false;
+        if visible_x || visible_y {
+            for index in 0..self.taffy.child_count(id.0) {
+                let child = LayoutId(self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE));
+                let style = self.taffy.style(child.0).expect(EXPECT_MESSAGE);
+                let meta = self.meta(child);
+                if style.display == taffy::style::Display::None || meta.detached {
+                    continue;
+                }
+                match meta.escapable.as_deref().map(|escapable| escapable.kind) {
+                    Some(containing_block::EscapableKind::Fixed) => continue,
+                    Some(containing_block::EscapableKind::Ancestor) if !positioned => continue,
+                    Some(containing_block::EscapableKind::Ancestor) => open_absolute = true,
+                    None => {}
+                }
+                let child_positioned = positioned || !meta.is_static;
+                let (inner, inner_open) =
+                    self.transformed_overflow(child, child_positioned, scale_factor, snapped);
+                open_absolute |= inner_open;
+                if visible_x {
+                    let left = rect.left().min(inner.left());
+                    let right = rect.right().max(inner.right());
+                    rect.origin.x = left;
+                    rect.size.width = right - left;
+                }
+                if visible_y {
+                    let top = rect.top().min(inner.top());
+                    let bottom = rect.bottom().max(inner.bottom());
+                    rect.origin.y = top;
+                    rect.size.height = bottom - top;
+                }
+            }
+        }
+        if open_absolute && !self.meta(id).is_static {
+            open_absolute = false;
+        }
+        if let Some(transform) = &self.meta(id).transform {
+            rect = transform.resolve(border_box).bounding_box(rect);
+        }
+        (rect, open_absolute)
+    }
+
     /// The rectangle in the layout root's coordinates that holds the border box of `id` and of
     /// everything below it that can be seen outside a box that clips it: a descendant's border box
     /// counts, and so do the boxes inside it unless it clips that axis (overflow other than
     /// `visible`), which then contributes only its own border box. Unlike
     /// [`Self::layout_scrollable_overflow_end`] it reaches before the origin too, since a box
     /// paints there; and it keeps `absolute` boxes whose containing block is inside `id`.
+    ///
+    /// The rectangle is of the node as it is painted: a box with a `transform`, and the boxes
+    /// inside it, are where the transform puts them, and so are the boxes of descendants with
+    /// one.
     ///
     /// `None` when a box below is placed outside what this can say: a `fixed` box, an `absolute`
     /// one whose containing block is above `id`, or a detached one (a popup or a portal). Such a
@@ -2025,6 +2128,12 @@ impl TaffyLayoutEngine {
         // A positioned node is the containing block of the absolute boxes below it.
         if extent.open_absolute && !self.meta(id).is_static {
             extent.open_absolute = false;
+        }
+        if self.meta(id).transform.is_some() {
+            let border_box = self.layout_bounds(id, scale_factor);
+            if let Some(matrix) = self.element_transform(id, border_box) {
+                extent.bounds = matrix.bounding_box(extent.bounds);
+            }
         }
         if !self.taffy.dirty(id.0).expect(EXPECT_MESSAGE) {
             self.painted_extents.insert(

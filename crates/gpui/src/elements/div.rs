@@ -3179,6 +3179,7 @@ impl Interactivity {
                 // replayed only where it was recorded faded out: see `ReplayKey`.
                 window.with_visibility(visibility, |window| {
                     window.with_faded_out_if(style.is_faded_out(), |window| {
+                    window.with_transform(style.transform_matrix(bounds), |window| {
                     window.with_text_style(style.text_style().cloned(), |window| {
                         window.with_exact_hit_mask(
                             style.overflow_mask(bounds, window.rem_size()),
@@ -3207,6 +3208,7 @@ impl Interactivity {
                                 (result, element_state)
                             },
                         )
+                    })
                     })
                     })
                 })
@@ -3570,6 +3572,7 @@ impl Interactivity {
                             .map(|lines| (borders.clone(), lines)),
                         _ => None,
                     };
+                    window.with_transform(style.transform_matrix(bounds), |window| {
                     style.paint_box_with_effects(bounds, box_bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_overflow_clip(
@@ -3662,6 +3665,7 @@ impl Interactivity {
                         if let Some((borders, lines)) = &collapsed {
                             borders.paint(bounds, lines, window);
                         }
+                    });
                     });
                 });
 
