@@ -287,8 +287,6 @@ impl Generator {
             let count = self.random.below(5);
             Content::Container((0..count).map(|_| self.node(depth - 1, scope)).collect())
         };
-        // A host is one from the start, so the node of a container does not change with its lock
-        // (an ordinary request and a parking one do not share a node).
         let lock = if matches!(content, Content::Container(_)) && Random::new(u64::from(key) ^ 0x10C4).one_in(4) {
             Lock::Forced
         } else {
@@ -368,18 +366,19 @@ struct Scene {
 }
 
 fn edit_scene(scene: &mut Scene, generator: &mut Generator) {
-    // A host asks for its content or does not: drawn from a generator of its own, so that the
-    // trees stay what they were before locks.
+    // A container is locked or not, and a host asks for its content or does not: drawn from a
+    // generator of its own, so that the trees stay what they were before locks. An ordinary
+    // container that becomes a host is another node to the engine (an ordinary request and a
+    // parking one do not share a node), and so is a host that becomes ordinary.
     let mut aside = Random(generator.random.0.rotate_left(29) ^ 0x10C4);
     if aside.one_in(2) {
-        let hosts: Vec<_> = container_paths(&mut scene.root)
-            .into_iter()
-            .filter(|path| node_at(&mut scene.root, path).lock != Lock::None)
-            .collect();
-        if !hosts.is_empty() {
-            let host = node_at(&mut scene.root, &hosts[aside.below(hosts.len())]);
-            host.lock = if aside.one_in(3) { Lock::Forced } else { Lock::Skipped };
-        }
+        let containers = container_paths(&mut scene.root);
+        let container = node_at(&mut scene.root, &containers[aside.below(containers.len())]);
+        container.lock = match aside.below(6) {
+            0 => Lock::None,
+            1 | 2 => Lock::Forced,
+            _ => Lock::Skipped,
+        };
     }
     match generator.random.below(14) {
         0 => {
@@ -850,7 +849,8 @@ fn an_engine_that_lives_through_edits_lays_out_like_a_new_one(cx: &mut TestAppCo
 }
 
 /// `GPUI_ENGINE_FUZZ_SEEDS=first..last cargo test --release -p gpui --lib --features test-support
-/// -- --ignored a_long_run_of_edits` runs the sequences of more seeds than the suite does.
+/// -- --ignored a_long_run_of_edits` runs the sequences of more seeds than the suite does, and
+/// names every seed that differs.
 #[gpui::test]
 #[ignore]
 fn a_long_run_of_edits_lays_out_like_a_new_engine(cx: &mut TestAppContext) {
@@ -858,7 +858,18 @@ fn a_long_run_of_edits_lays_out_like_a_new_engine(cx: &mut TestAppContext) {
     let (first, last) = range.split_once("..").expect("GPUI_ENGINE_FUZZ_SEEDS=first..last");
     let (first, last) = (first.parse().expect("first seed"), last.parse().expect("last seed"));
     let cx = cx.add_empty_window();
-    cx.update(|window, cx| assert_reuse_matches_new_engine(first..=last, 40, window, cx));
+    cx.update(|window, cx| {
+        let mut failed = Vec::new();
+        for seed in first..=last {
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_reuse_matches_new_engine(seed..=seed, 40, window, cx)
+            }));
+            if run.is_err() {
+                failed.push(seed);
+            }
+        }
+        assert!(failed.is_empty(), "the seeds that differ: {failed:?}");
+    });
 }
 
 fn node(key: Key, style: Style, content: Content) -> Node {
@@ -1031,15 +1042,61 @@ fn a_subtree_that_becomes_a_root_lays_out_as_one_that_always_was(cx: &mut TestAp
 }
 
 
+#[gpui::test]
+fn a_root_whose_old_parent_the_frame_does_not_ask_for_is_no_row_item_for_its_width_keyword(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        let mut row = Style::default();
+        row.display = Display::Flex;
+        row.flex_direction = crate::FlexDirection::Row;
+        let mut fit = Style::default();
+        fit.intrinsic_widths.width = Some(Some(IntrinsicSize::FitContent));
+        let shown = container(1, fit, vec![text_node(2, Style::default(), 40., 10., true)]);
+        let inside = Scene {
+            root: container(0, row.clone(), vec![shown.clone()]),
+            detached: None,
+        };
+        // The row is a host now, a node of its own: the node that held `shown` is not asked for
+        // and `shown` is a root of the frame. The host is laid out first.
+        let mut host = container(0, row, Vec::new());
+        host.lock = Lock::Forced;
+        let on_its_own = Scene { root: host, detached: Some(shown) };
+        let space = Size {
+            width: AvailableSpace::Definite(px(100.)),
+            height: AvailableSpace::MaxContent,
+        };
+
+        // What the width keyword of `shown` came to, as the style layout gave it.
+        let mut width_bounds = |engine: &mut TaffyLayoutEngine, scene: &Scene| {
+            let (requested, roots) = request_scene(engine, scene, window.scale_factor());
+            for root in &roots {
+                engine.compute_layout(*root, space, window, cx);
+            }
+            let shown = requested.iter().find(|node| node.key == 1).expect("shown was requested");
+            let style = engine.taffy.style(shown.id.0).expect(EXPECT_MESSAGE);
+            (style.min_size.width, style.max_size.width)
+        };
+        let mut kept = TaffyLayoutEngine::new();
+        width_bounds(&mut kept, &inside);
+        kept.end_frame();
+        let kept = width_bounds(&mut kept, &on_its_own);
+        let new = width_bounds(&mut TaffyLayoutEngine::new(), &on_its_own);
+        assert!(kept == new, "{kept:?} against {new:?}");
+    });
+}
+
 /// The seeds that found a way for the engine that lives to differ from a new one: a cache that
 /// told apart too little, a measured size that lost the margins that collapse through a node, and
-/// a scroll container as tall as the top of the last box in it. Each has a test of its own; these
-/// are the sequences that led to them.
+/// a scroll container as tall as the top of the last box in it, and a width keyword resolved
+/// against a parent that the frame did not ask for. Each has a test of its own; these are the
+/// sequences that led to them.
 #[gpui::test]
 fn the_seeds_that_found_a_difference_lay_out_like_a_new_engine(cx: &mut TestAppContext) {
     let cx = cx.add_empty_window();
     cx.update(|window, cx| {
-        for seed in [104, 380, 580, 1592, 1769, 2126] {
+        for seed in [
+            104, 380, 580, 1592, 1769, 2126, 465, 1540, 4673, 6024, 6761, 9844, 11472, 11508, 12265, 18134, 18286,
+        ] {
             assert_reuse_matches_new_engine(seed..=seed, 40, window, cx);
         }
     });

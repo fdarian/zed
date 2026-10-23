@@ -263,10 +263,19 @@ impl TaffyLayoutEngine {
     }
 
     /// Whether the main axis of the node's flex container is the inline one.
+    ///
+    /// A parent that the pass did not request is not one: the node is a root of this pass whose
+    /// request left that parent alone, as a node does when the request of an ordinary container
+    /// becomes the request of a parking host (a node of its own) and the old container is garbage.
+    /// Layout detaches the root from it when it gets to the root, which is after every keyword of
+    /// the pass was resolved, so this looks at the parent itself.
     fn is_row_flex_item(&self, id: LayoutId) -> bool {
         let Some(parent) = self.taffy.parent(id.0) else {
             return false;
         };
+        if self.meta(LayoutId(parent)).requested_in_pass != self.pass {
+            return false;
+        }
         let parent = self.taffy.style(parent).expect(EXPECT_MESSAGE);
         parent.display == Display::Flex
             && matches!(
