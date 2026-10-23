@@ -103,6 +103,9 @@ pub struct PatchCounters {
     pub patched_frames: u64,
     /// Retained roots repainted by those frames.
     pub patched_units: u64,
+    /// Ticks that repainted no root, because nothing that is drawn changed: no frame was built
+    /// and none is presented.
+    pub empty_ticks: u64,
     declines: [u64; PatchDecline::ALL.len()],
 }
 
@@ -320,8 +323,12 @@ impl Window {
     ) -> Result<PatchOutcome, PatchDecline> {
         match self.try_repaint_in_place(units, cx, accept) {
             Ok(outcome) => {
-                self.patch.counters.patched_frames += 1;
-                self.patch.counters.patched_units += outcome.units as u64;
+                if outcome.units == 0 {
+                    self.patch.counters.empty_ticks += 1;
+                } else {
+                    self.patch.counters.patched_frames += 1;
+                    self.patch.counters.patched_units += outcome.units as u64;
+                }
                 self.patch.outcome = Some(outcome);
                 Ok(outcome)
             }

@@ -677,6 +677,21 @@ fn a_tick_that_changes_no_operation_presents_nothing(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_tick_with_no_root_to_repaint_builds_and_presents_nothing(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.present(cx);
+    *page.knobs.ids.borrow_mut() = Some(Vec::new());
+    let builds = page.retained(cx).builds;
+    page.request_tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!(patches.empty_ticks, 1);
+    assert_eq!(patches.patched_frames, 0);
+    assert_eq!(patches.total_declines(), 0);
+    assert_eq!(page.retained(cx).builds, builds, "no frame is built");
+    assert!(!page.needs_present(cx));
+}
+
+#[gpui::test]
 fn a_unit_that_changes_size_declines(cx: &mut TestAppContext) {
     let page = Fixture::new(cx, 3);
     page.tick(cx);
