@@ -4354,9 +4354,6 @@ impl Window {
         bounds: Bounds<Pixels>,
         outset: Edges<Pixels>,
     ) -> bool {
-        if self.captured_identity.is_some() || self.captured_hitbox.is_some() {
-            return false;
-        }
         let mask = self.content_mask().bounds;
         let slack = px(1.);
         let inflate = |bounds: Bounds<Pixels>| {
@@ -4373,9 +4370,16 @@ impl Window {
                 || reach.bottom() < mask.top()
                 || reach.top() > mask.bottom()
         };
+        let reach = inflate(bounds);
+        // Noted before the capture is looked at: a layout record made while an element holds the
+        // capture is skipped after it lets go.
+        self.note_cull_reach(reach);
+        if self.captured_identity.is_some() || self.captured_hitbox.is_some() {
+            return false;
+        }
         // Most children are inside the mask, and their own box says so before anything below
         // them is looked at.
-        if !apart(inflate(bounds)) {
+        if !apart(reach) {
             return false;
         }
         let scale_factor = self.scale_factor();
@@ -4390,7 +4394,9 @@ impl Window {
         };
         let mut extent = extent;
         extent.origin += snapped_offset;
-        apart(inflate(extent))
+        let extent = inflate(extent);
+        self.note_cull_reach(extent);
+        apart(extent)
     }
 
     /// How many layout-only passes this window has run, see [`Window::draw_if_dirty`].

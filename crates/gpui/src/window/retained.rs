@@ -527,6 +527,8 @@ struct OpenLayoutRecording {
     /// The [`NonRelocatable`] reasons of the subtrees inside that were skipped.
     blockers: u16,
     handles: Vec<HandleEntry>,
+    /// The union of what culling tested inside, see [`LayoutOutcome::cull_reach`].
+    cull_reach: Option<Bounds<Pixels>>,
 }
 
 /// What a subtree holds outside the frame that moves with it: the handles it noted itself and the
@@ -885,6 +887,17 @@ pub(crate) struct LayoutOutcome {
     /// A subtree inside it was skipped from the recording of a presented frame, whose tape is not
     /// part of one that a layout record could hold.
     pub(crate) holds_painted: bool,
+    /// The union of the extents culling tested inside the subtree, inflated as the test does, and
+    /// those of the subtrees skipped inside it where they are now. `None` if it tested nothing.
+    pub(crate) cull_reach: Option<Bounds<Pixels>>,
+}
+
+fn union_reach(a: Option<Bounds<Pixels>>, b: Option<Bounds<Pixels>>) -> Option<Bounds<Pixels>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.union(&b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
 }
 
 /// What the prepaint of a retained subtree left in the frame, in a form that outlives the frame
@@ -1122,7 +1135,15 @@ impl ReplayKey {
     /// ([`NonRelocatable::Escape`]), and the others are placed by the subtree. Needs a scale
     /// factor that is a power of two, where a position shifted by whole device pixels is exactly
     /// the shifted position, and no exact clip.
-    pub(crate) fn translation(&self, later: &ReplayKey) -> Option<Point<Pixels>> {
+    ///
+    /// `cull_reach` is the union of what culling tested inside the subtree when it was recorded
+    /// ([`LayoutOutcome::cull_reach`]): a mask that did not move with the subtree leaves what is
+    /// culled inside the same only if all of it is inside the mask before and after.
+    pub(crate) fn translation(
+        &self,
+        later: &ReplayKey,
+        cull_reach: Option<Bounds<Pixels>>,
+    ) -> Option<Point<Pixels>> {
         let power_of_two = self.scale_factor > 0. && self.scale_factor.to_bits() & 0x007f_ffff == 0;
         if !power_of_two
             || !self.exact_clips.is_empty()
@@ -1165,18 +1186,32 @@ impl ReplayKey {
         }
         // A mask that moved with the subtree is the same around it. One that did not is cut
         // differently from the subtree where it ended up, and what is culled inside is not the
-        // same. (A culled subtree is under the empty mask, wherever it is.)
+        // same unless nothing that culling tested inside is near an edge of the mask, before or
+        // after. (A culled subtree is under the empty mask, wherever it is.)
         if !self.culling {
             let mask = |mask: &ContentMask<Pixels>| (mask.bounds, mask.corner_radii, mask.corner_radii_y);
             let (before, after) = (mask(&self.content_mask), mask(&later.content_mask));
             let origin = after.0.origin - before.0.origin;
-            if before.0.size != after.0.size
-                || before.1 != after.1
-                || before.2 != after.2
-                || !close(origin.x, delta.x)
-                || !close(origin.y, delta.y)
-            {
+            if before.0.size != after.0.size || before.1 != after.1 || before.2 != after.2 {
                 return None;
+            }
+            if (!close(origin.x, delta.x) || !close(origin.y, delta.y))
+                && let Some(reach) = cull_reach
+            {
+                // A position inside the subtree is as close to where the delta puts it as `moved`
+                // is to `delta`. Strictly inside, since the content mask of a clip inside that
+                // misses the one around is empty at a corner of it, where touching the edge
+                // is not the same as being apart from the clip inside.
+                let margin = px(SubpixelPhase::TOLERANCE / self.scale_factor);
+                let inside = |reach: Bounds<Pixels>, mask: Bounds<Pixels>| {
+                    reach.left() - margin > mask.left()
+                        && reach.top() - margin > mask.top()
+                        && reach.right() + margin < mask.right()
+                        && reach.bottom() + margin < mask.bottom()
+                };
+                if !inside(reach, before.0) || !inside(Bounds::new(reach.origin + delta, reach.size), after.0) {
+                    return None;
+                }
             }
         }
         Some(delta)
@@ -1631,6 +1666,7 @@ impl Window {
             unframed_escapes: Cell::new(0),
             blockers: 0,
             handles: Vec::new(),
+            cull_reach: None,
         });
         LayoutMark { effects: self.effects(), painted_skips: self.retained.layout_painted_skips }
     }
@@ -1654,6 +1690,7 @@ impl Window {
             if !handles.is_empty() {
                 outer.handles.push(HandleEntry::Nested(handles.clone(), Point::default()));
             }
+            outer.cull_reach = union_reach(outer.cull_reach, open.cull_reach);
         }
         // A pass that only lays out paints nothing, so where the subtree's lifted boxes went in
         // the stacking context around it is not something a skip has to repeat: their layout
@@ -1667,14 +1704,30 @@ impl Window {
             reason: first_reason(mark.effects.reasons(&effects) & repeatable),
             published: mark.effects.published(&effects),
             holds_painted: mark.painted_skips != self.retained.layout_painted_skips,
+            cull_reach: open.cull_reach,
+        }
+    }
+
+    /// Notes that culling tested `reach` (what [`Window::lies_outside_the_mask`] compares with the
+    /// content mask) inside the subtree being built for a layout record.
+    pub(crate) fn note_cull_reach(&mut self, reach: Bounds<Pixels>) {
+        if let Some(open) = self.retained.layout_recordings.last_mut() {
+            open.cull_reach = union_reach(open.cull_reach, Some(reach));
         }
     }
 
     /// Notes that a subtree was skipped with its layout record, `delta` away from where it was
     /// recorded, for the layout record of the subtree being built around it, if any.
-    pub(crate) fn note_layout_replay(&mut self, handles: &Rc<HandleList>, blockers: u16, delta: Point<Pixels>) {
+    pub(crate) fn note_layout_replay(
+        &mut self,
+        handles: &Rc<HandleList>,
+        blockers: u16,
+        cull_reach: Option<Bounds<Pixels>>,
+        delta: Point<Pixels>,
+    ) {
         if let Some(outer) = self.retained.layout_recordings.last_mut() {
             outer.blockers |= blockers;
+            outer.cull_reach = union_reach(outer.cull_reach, cull_reach.map(|reach| Bounds::new(reach.origin + delta, reach.size)));
             if !handles.is_empty() {
                 outer.handles.push(HandleEntry::Nested(handles.clone(), delta));
             }

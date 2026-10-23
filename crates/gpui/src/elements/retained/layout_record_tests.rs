@@ -938,6 +938,8 @@ enum Piece {
     Fixed,
     /// Its owner does not take the offset of a replay.
     Blind,
+    /// Has a box that is culled when it lies outside the content mask, and says whether it was.
+    Culls,
 }
 
 /// What the texts and the scrollers of the cards hold of their bounds, which a read sees.
@@ -1055,9 +1057,26 @@ impl Moving {
                                 )
                         }
                     };
+                    let cullable = {
+                        let (registry, laid_out, painted) = (registry.clone(), laid_out.clone(), painted.clone());
+                        move || {
+                            let (registry, laid_out, painted) = (registry.clone(), laid_out.clone(), painted.clone());
+                            div()
+                                .id(("cullable", index))
+                                .cullable(crate::Edges::default())
+                                .w(px(30.))
+                                .h(px(10.))
+                                .on_prepainted_layout(move |bounds, _, window, _| {
+                                    let name = format!("cullable {index} culled {}", window.is_culling());
+                                    registry.borrow_mut().insert(name.clone(), bounds);
+                                    let tapes = if window.is_layout_pass() { &laid_out } else { &painted };
+                                    tapes.borrow_mut().entry(format!("card {index}")).or_default().push((name, bounds));
+                                })
+                        }
+                    };
                     let outer = retained(("moving-card", index), keys.borrow()[index], {
-                        let (builds, publish, forget, contents) =
-                            (builds.clone(), publisher(name.clone()), forget.clone(), contents.clone());
+                        let (builds, publish, forget, contents, cullable) =
+                            (builds.clone(), publisher(name.clone()), forget.clone(), contents.clone(), cullable);
                         move |window, _| {
                             builds.set(builds.get() + 1);
                             forget(window);
@@ -1088,6 +1107,7 @@ impl Moving {
                                     placed.style().position = Some(crate::Position::Fixed);
                                     card = card.child(placed);
                                 }
+                                Piece::Culls => card = card.child(cullable()),
                                 Piece::Plain | Piece::Scrolled | Piece::Blind => {}
                             }
                             if !nested {
@@ -1130,7 +1150,7 @@ impl Moving {
                     .flex_col()
                     .child(reset)
                     .child(div().id("spacer").flex_none().h(px(spacer.get())).w(px(10.)))
-                    .child(div().id("frame").relative().when(clipped.get(), |frame| frame.overflow_hidden()).flex().flex_col().flex_none().w(px(200.)).h(px(200.)).children(cards))
+                    .child(div().id("frame").relative().ml(px(4.)).when(clipped.get(), |frame| frame.overflow_hidden()).flex().flex_col().flex_none().w(px(200.)).h(px(200.)).children(cards))
                     .into_any_element()
             })
         });
@@ -1164,6 +1184,12 @@ impl Moving {
         Box::new(move |_| keys.borrow_mut()[index] = key)
     }
 
+    /// Whether the frame around the cards clips them, which is the content mask that moves with them.
+    fn clip(&self, on: bool) -> Change {
+        let clipped = self.clipped.clone();
+        Box::new(move |_| clipped.set(on))
+    }
+
     fn rekey(&self) -> Change {
         let keys = self.keys.clone();
         Box::new(move |_| keys.borrow_mut().iter_mut().for_each(|key| *key += 1000))
@@ -1171,8 +1197,9 @@ impl Moving {
 }
 
 /// What a page that is built whole at `spacer` publishes and holds.
-fn built_at(cx: &mut TestAppContext, pieces: &[Piece], nested: bool, spacer: f32) -> Vec<String> {
+fn built_at(cx: &mut TestAppContext, pieces: &[Piece], nested: bool, clipped: bool, spacer: f32) -> Vec<String> {
     let page = Moving::new(cx, pieces.to_vec(), nested);
+    page.clipped.set(clipped);
     let change = page.spacer(spacer);
     page.passes(cx, vec![change]).pop().unwrap().published
 }
@@ -1190,7 +1217,7 @@ fn a_subtree_that_a_box_before_it_moved_is_skipped_where_it_is_and_what_it_holds
     assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [3, 0, 0, 0, 0, 0]);
     assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 3, 6, 6, 9, 12]);
     for (pass, spacer) in passes.iter().zip(spacers) {
-        assert_eq!(pass.published, built_at(cx, &pieces, false, spacer), "at {spacer}");
+        assert_eq!(pass.published, built_at(cx, &pieces, false, true, spacer), "at {spacer}");
     }
     assert!(passes[1].published.iter().any(|line| line.contains("y: 17px")), "{:?}", passes[1].published);
 }
@@ -1206,25 +1233,46 @@ fn a_subtree_moved_by_a_fraction_of_a_pixel_is_built_where_it_is(cx: &mut TestAp
     assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [3, 3, 0, 3, 0]);
     assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 0, 3, 3, 6]);
     for (pass, spacer) in passes.iter().zip(spacers) {
-        assert_eq!(pass.published, built_at(cx, &pieces, false, spacer), "at {spacer}");
+        assert_eq!(pass.published, built_at(cx, &pieces, false, true, spacer), "at {spacer}");
     }
 }
 
 #[gpui::test]
-fn a_subtree_whose_content_mask_did_not_move_with_it_is_built_where_it_is(cx: &mut TestAppContext) {
-    // What is culled inside it depends on where it is in the mask, and a culled box is told so.
-    let pieces = vec![Piece::Plain; 3];
+fn a_subtree_whose_content_mask_did_not_move_with_it_is_moved_when_what_is_culled_inside_it_cannot_change(cx: &mut TestAppContext) {
+    // The window is 300 high and is the mask: the cards are not clipped by a frame that moves with them. The box that
+    // is culled inside each is 10 high at the top of the card, and what culling compares is a pixel more on each side, so
+    // the first card is not at the top of the window.
+    let pieces = vec![Piece::Culls; 3];
     let page = Moving::new(cx, pieces.clone(), false);
     page.clipped.set(false);
-    let passes = page.passes(cx, vec![nothing(), page.spacer(17.), page.spacer(30.)]);
-    assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [3, 3, 3]);
-    assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 0, 0]);
-    assert_eq!(passes[2].published, {
-        let fresh = Moving::new(cx, pieces.clone(), false);
-        fresh.clipped.set(false);
-        let change = fresh.spacer(30.);
-        fresh.passes(cx, vec![change]).pop().unwrap().published
-    });
+    let spacers = [4., 17., 30., 4.];
+    let passes = page.passes(cx, spacers.iter().map(|spacer| page.spacer(*spacer)).collect());
+    assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [3, 0, 0, 0]);
+    assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 3, 6, 6]);
+    for (pass, spacer) in passes.iter().zip(spacers) {
+        assert_eq!(pass.published, built_at(cx, &pieces, false, false, spacer), "at {spacer}");
+    }
+}
+
+#[gpui::test]
+fn a_subtree_whose_content_mask_did_not_move_with_it_is_built_where_it_is_when_what_is_culled_inside_it_reaches_the_edge(
+    cx: &mut TestAppContext,
+) {
+    // The box inside the last card is across the bottom of the window at 212 (with the pixel it is inflated by), the one
+    // in the second card is at 260, and the last is culled there.
+    let pieces = vec![Piece::Culls; 3];
+    let page = Moving::new(cx, pieces.clone(), false);
+    page.clipped.set(false);
+    let spacers = [5., 212., 260., 8.];
+    let passes = page.passes(cx, spacers.iter().map(|spacer| page.spacer(*spacer)).collect());
+    // The first card is inside every time, from its record at 0. The last was built at 212 across the edge, and the
+    // second at 260, so the records they left do not skip them.
+    assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), [3, 1, 2, 2]);
+    assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 2, 3, 4]);
+    for (pass, spacer) in passes.iter().zip(spacers) {
+        assert_eq!(pass.published, built_at(cx, &pieces, false, false, spacer), "at {spacer}");
+    }
+    assert!(passes[2].published.iter().any(|line| line.contains("cullable 2 culled true")), "{:?}", passes[2].published);
 }
 
 #[gpui::test]
@@ -1238,8 +1286,8 @@ fn a_subtree_that_holds_something_tied_to_its_place_is_built_where_it_is_moved(c
         let builds = if matches!(piece, Piece::Escapes | Piece::Fixed) { [3, 1, 1, 1] } else { [3, 1, 0, 1] };
         assert_eq!(passes.iter().map(|pass| pass.built).collect::<Vec<_>>(), builds, "{piece:?}");
         assert_eq!(passes.iter().map(translations).collect::<Vec<_>>(), [0, 2, 4, 6], "{piece:?}");
-        assert_eq!(passes[1].published, built_at(cx, &pieces, false, 17.), "{piece:?}");
-        assert_eq!(passes[3].published, built_at(cx, &pieces, false, 40.), "{piece:?}");
+        assert_eq!(passes[1].published, built_at(cx, &pieces, false, true, 17.), "{piece:?}");
+        assert_eq!(passes[3].published, built_at(cx, &pieces, false, true, 40.), "{piece:?}");
     }
 }
 
@@ -1257,7 +1305,7 @@ fn a_subtree_inside_one_that_is_moved_moves_with_it_or_alone(cx: &mut TestAppCon
     // The inner one of the card that was built again is put 17 away inside it, and then both move.
     assert_eq!(passes[2].counters.layout_replays, passes[1].counters.layout_replays + 2);
     for (pass, spacer) in passes.iter().zip(spacers) {
-        assert_eq!(pass.published, built_at(cx, &pieces, true, spacer), "at {spacer}");
+        assert_eq!(pass.published, built_at(cx, &pieces, true, true, spacer), "at {spacer}");
     }
 }
 
@@ -1286,7 +1334,7 @@ fn a_verified_pass_that_moved_subtrees_leaves_what_a_build_leaves(cx: &mut TestA
 fn pages_changed_at_random_between_passes_that_lay_out_hold_what_a_build_holds(cx: &mut TestAppContext) {
     use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
 
-    let kinds = [Piece::Plain, Piece::Plain, Piece::Plain, Piece::Sticky, Piece::Captures, Piece::Scrolled, Piece::Escapes, Piece::Fixed, Piece::Blind];
+    let kinds = [Piece::Plain, Piece::Plain, Piece::Culls, Piece::Culls, Piece::Plain, Piece::Sticky, Piece::Captures, Piece::Scrolled, Piece::Escapes, Piece::Fixed, Piece::Blind];
     let seeds = std::env::var("TRANSLATION_FUZZ_SEEDS").ok().and_then(|seeds| seeds.parse().ok()).unwrap_or(12u64);
     let mut translated = 0;
     for seed in 0..seeds {
@@ -1299,9 +1347,9 @@ fn pages_changed_at_random_between_passes_that_lay_out_hold_what_a_build_holds(c
         let mut spacer = 0.;
         let (mut changes, mut mirrors) = (Vec::<Change>::new(), Vec::<Change>::new());
         for _ in 0..14 {
-            let (change, mirror): (Change, Change) = match rng.random_range(0..6) {
+            let (change, mirror): (Change, Change) = match rng.random_range(0..8) {
                 0 | 1 => {
-                    spacer = rng.random_range(0..12u32) as f32 * 7.;
+                    spacer = rng.random_range(0..12u32) as f32 * 23.;
                     (page.spacer(spacer), reference.spacer(spacer))
                 }
                 2 => {
@@ -1314,6 +1362,10 @@ fn pages_changed_at_random_between_passes_that_lay_out_hold_what_a_build_holds(c
                     (page.key(at, key), reference.key(at, key))
                 }
                 4 => (nothing(), nothing()),
+                6 | 7 => {
+                    let clipped = rng.random_bool(0.5);
+                    (page.clip(clipped), reference.clip(clipped))
+                }
                 _ => {
                     spacer += rng.random_range(1..5u32) as f32;
                     (page.spacer(spacer), reference.spacer(spacer))

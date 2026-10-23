@@ -370,6 +370,8 @@ struct LayoutReplay {
     /// The reasons it cannot, and those of the subtrees skipped inside it: a subtree around it
     /// that skips it has them too.
     blockers: u16,
+    /// What culling tested inside, see [`LayoutOutcome::cull_reach`].
+    cull_reach: Option<Bounds<Pixels>>,
     /// What the build left outside the frame, which a skip moves with the subtree.
     handles: Rc<HandleList>,
 }
@@ -1313,14 +1315,14 @@ impl Retained {
                 let delta = if replay.key == key {
                     Point::default()
                 } else if replay.translatable {
-                    replay.key.translation(&key)?
+                    replay.key.translation(&key, replay.cull_reach)?
                 } else {
                     return None;
                 };
-                Some((delta, replay.blockers, replay.handles.clone()))
+                Some((delta, replay.blockers, replay.cull_reach, replay.handles.clone()))
             })
             .expect("a skipped subtree has its state");
-        let Some((delta, blockers, handles)) = placed else {
+        let Some((delta, blockers, cull_reach, handles)) = placed else {
             window.retained.counters.layout_builds += 1;
             return self.build_skipped(global_id, bounds, key, SkipBasis::LaidOut, window, cx);
         };
@@ -1332,7 +1334,7 @@ impl Retained {
             window.retained.replayed.push((global_id.clone(), TypeId::of::<RetainedState>()));
         }
         handles.place(delta);
-        window.note_layout_replay(&handles, blockers, delta);
+        window.note_layout_replay(&handles, blockers, cull_reach, delta);
         if let Some(hook) = self.on_replay.clone() {
             window.publish_layout(move |window, cx| hook(RetainedPhase::LayoutRecorded, delta, window, cx));
         }
@@ -1395,6 +1397,7 @@ impl Retained {
                         key,
                         translatable: outcome.blockers == 0 && (!outcome.published || translates),
                         blockers: outcome.blockers,
+                        cull_reach: outcome.cull_reach,
                         handles: outcome.handles,
                     });
                     let published = layout.published.clone();
