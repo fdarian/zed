@@ -3041,6 +3041,84 @@ mod tests {
         }
     }
 
+    // fdarian fork patch: a percentage inset of a relatively positioned block child is of the height of its container.
+    mod relative_insets {
+        use super::*;
+        use crate::geometry::Rect;
+        use crate::style::{LengthPercentageAuto, Position};
+
+        fn inset(top: LengthPercentageAuto, bottom: LengthPercentageAuto) -> Rect<LengthPercentageAuto> {
+            Rect { left: auto(), right: auto(), top, bottom }
+        }
+
+        /// The offset of a `position: relative` child with the given `top` and `bottom` in a block container of the given
+        /// size (its child 20px high), and the height of a `height: 50%` child of that container
+        fn offset_in(container: Size<Dimension>, min_height: Dimension, top: LengthPercentageAuto, bottom: LengthPercentageAuto) -> (f32, f32) {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            taffy.disable_rounding();
+            let child = taffy
+                .new_leaf(Style {
+                    display: Display::Block,
+                    position: Position::Relative,
+                    size: Size { width: length(20.0), height: length(20.0) },
+                    inset: inset(top, bottom),
+                    ..Default::default()
+                })
+                .unwrap();
+            let percent_child = taffy
+                .new_leaf(Style { display: Display::Block, size: Size { width: auto(), height: percent(0.5) }, ..Default::default() })
+                .unwrap();
+            let parent = taffy
+                .new_with_children(
+                    Style { display: Display::Block, size: container, min_size: Size { width: auto(), height: min_height }, ..Default::default() },
+                    &[child, percent_child],
+                )
+                .unwrap();
+            taffy.compute_layout(parent, Size::MAX_CONTENT).unwrap();
+            (taffy.layout(child).unwrap().location.y, taffy.layout(percent_child).unwrap().size.height)
+        }
+
+        fn definite() -> Size<Dimension> {
+            Size { width: length(200.0), height: length(140.296875) }
+        }
+
+        fn indefinite() -> Size<Dimension> {
+            Size { width: length(200.0), height: auto() }
+        }
+
+        #[test]
+        fn a_percentage_top_is_of_the_height_of_a_container_that_has_one_and_is_cut_to_a_64th() {
+            // 10% of 140.296875 is 14.0296875
+            assert_eq!(offset_in(definite(), auto(), percent(0.1), auto()).0, 14.015625);
+            assert_eq!(offset_in(definite(), auto(), auto(), percent(0.073)).0, -10.234375);
+        }
+
+        #[test]
+        fn the_top_wins_over_the_bottom() {
+            assert_eq!(offset_in(definite(), auto(), percent(0.1), percent(0.2)).0, 14.015625);
+        }
+
+        #[test]
+        fn a_percentage_top_is_auto_when_the_height_of_the_container_is_not_known_before_its_content() {
+            assert_eq!(offset_in(indefinite(), auto(), percent(0.1), auto()).0, 0.0);
+            assert_eq!(offset_in(indefinite(), auto(), percent(0.1), percent(0.2)).0, 0.0);
+            assert_eq!(offset_in(indefinite(), auto(), length(5.0), percent(0.2)).0, 5.0);
+            assert_eq!(offset_in(indefinite(), auto(), percent(0.1), length(5.0)).0, -5.0);
+        }
+
+        /// A `min-height` is not a height to take a percentage of: the container is auto before its content is laid out
+        #[test]
+        fn a_min_height_is_not_a_height_to_take_a_percentage_of() {
+            assert_eq!(offset_in(indefinite(), length(100.0), percent(0.1), auto()), (0.0, 0.0));
+        }
+
+        #[test]
+        fn a_height_that_a_min_height_makes_taller_is_one() {
+            let size = Size { width: length(200.0), height: length(50.0) };
+            assert_eq!(offset_in(size, length(100.0), percent(0.1), auto()), (10.0, 50.0));
+        }
+    }
+
     // fdarian fork patch: layout containment, and the percentage base under size containment.
     mod containment {
         use super::*;

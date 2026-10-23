@@ -554,7 +554,7 @@ fn compute_inner(
     }
 
     let container_percentage_resolution_height =
-        percentage_known_dimensions.height.or(size.height.maybe_max(min_size.height)).or(min_size.height);
+        percentage_known_dimensions.height.or(size.height.maybe_max(min_size.height));
 
     // 3. Perform final item layout and return content height
     let resolved_content_box_inset = padding + border + scrollbar_gutter;
@@ -1218,10 +1218,9 @@ fn perform_final_layout_on_in_flow_children(
                 bottom: bottom_margin_set.resolve(),
             };
 
-            // Resolve item inset
-            let inset = item.inset.zip_size(Size { width: container_inner_width, height: 0.0 }, |p, s| {
-                p.maybe_resolve(s, |val, basis| tree.calc(val, basis))
-            });
+            // Resolve item inset. A percentage of the height is `auto` when the container's height is not known
+            // before its children are laid out, as in Chrome.
+            let inset = item.inset.zip_size(parent_size, |p, s| p.maybe_resolve(s, |val, basis| tree.calc(val, basis)));
             let inset_offset = Point {
                 x: if direction.is_rtl() {
                     inset.right.map(|x| -x).or(inset.left).unwrap_or(0.0)
