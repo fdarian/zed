@@ -798,7 +798,7 @@ fn determine_flex_base_size(
         }
         .main(dir);
         let basis_style = child_style.flex_basis();
-        let basis_keyword = BasisKeyword::of(basis_style, constants.is_column);
+        let mut basis_keyword = BasisKeyword::of(basis_style, constants.is_column);
         let flex_basis = if basis_keyword.is_some() {
             None
         } else {
@@ -806,6 +806,13 @@ fn determine_flex_base_size(
                 .maybe_resolve(constants.percentage_base().main(dir), |val, basis| tree.calc(val, basis))
                 .maybe_add(box_sizing_adjustment)
         };
+        // A percentage of a height that is not known is `content`: the item's `height` is not the basis then (Blink
+        // length_utils.cc ResolveBlockLengthInternal `kMain`). Along a row Blink falls back to the max-content width
+        // the same way, but a container sized by its items takes the contributions of its items, not their bases, and
+        // taffy sizes a row from the bases, so a row keeps the item's `width` there.
+        if constants.is_column && basis_keyword.is_none() && flex_basis.is_none() && !basis_style.is_auto() {
+            basis_keyword = Some(BasisKeyword::Content);
+        }
 
         drop(child_style);
 
@@ -2925,6 +2932,43 @@ mod basis_tests {
         }
         let auto = item(column(40.0, 500.0), Size::MAX_CONTENT, |style| style.size.height = length(200.0));
         assert_eq!(auto.height, 200.0);
+    }
+
+    #[test]
+    fn a_percentage_basis_of_a_height_that_is_not_known_is_the_content_height_not_the_height_of_the_item() {
+        let with_height = |container: Style, percentage: f32| {
+            item(container, Size::MAX_CONTENT, |style| {
+                style.size.height = length(200.0);
+                style.flex_basis = percent(percentage);
+            })
+        };
+        let auto_column = Style { size: Size { width: length(40.0), height: auto() }, ..column(40.0, 0.0) };
+        // 40px wide: two words a line, three lines
+        assert_eq!(with_height(auto_column.clone(), 0.0), Size { width: 40.0, height: 30.0 });
+        assert_eq!(with_height(auto_column, 0.5), Size { width: 40.0, height: 30.0 });
+        // in a column that is 500px high the percentage is of that, and the height of the item is not the basis either
+        assert_eq!(with_height(column(40.0, 500.0), 0.5), Size { width: 40.0, height: 250.0 });
+    }
+
+    #[test]
+    fn a_percentage_basis_of_a_width_that_is_not_known_stays_the_width_of_the_item() {
+        let with_width = |container: Style, available: Size<AvailableSpace>, percentage: f32| {
+            item(container, available, |style| {
+                style.size.width = length(50.0);
+                style.flex_basis = percent(percentage);
+            })
+            .width
+        };
+        // A row sized by its items takes their bases, which are their widths: Chrome is 50px wide there, as it is
+        // with `flex-basis: auto` (`flex-column-size-oracle`, the `row` cases)
+        let max_content = Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent };
+        let auto_row = || Style { size: Size { width: auto(), height: auto() }, ..row(0.0) };
+        assert_eq!(with_width(auto_row(), max_content, 0.0), 50.0);
+        assert_eq!(with_width(auto_row(), max_content, 0.5), 50.0);
+        // a row that has its width: half of it
+        assert_eq!(with_width(row(300.0), definite(300.0), 0.5), 150.0);
+        // its automatic minimum size is the smaller of its width and its content, 20px at the narrowest
+        assert_eq!(with_width(row(300.0), definite(300.0), 0.0), 20.0);
     }
 
     #[test]
