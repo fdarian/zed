@@ -283,6 +283,10 @@ pub enum TransformFunction {
     Rotate(f32),
     /// `skew(x, y)`
     Skew(f32, f32),
+    /// `skewX(angle)`. The same matrix as `skew(angle, 0)`, but a list animates it only against another `skewX`.
+    SkewX(f32),
+    /// `skewY(angle)`, see [`TransformFunction::SkewX`].
+    SkewY(f32),
     /// `matrix(a, b, c, d, e, f)`
     Matrix([f32; 6]),
     /// `from` and `to` blended by `progress`, which is how lists that do not pair up function
@@ -316,6 +320,14 @@ impl TransformFunction {
             },
             TransformFunction::Skew(x, y) => TransformationMatrix {
                 rotation_scale: [[1., x.tan()], [y.tan(), 1.]],
+                translation: [0., 0.],
+            },
+            TransformFunction::SkewX(x) => TransformationMatrix {
+                rotation_scale: [[1., x.tan()], [0., 1.]],
+                translation: [0., 0.],
+            },
+            TransformFunction::SkewY(y) => TransformationMatrix {
+                rotation_scale: [[1., 0.], [y.tan(), 1.]],
                 translation: [0., 0.],
             },
             TransformFunction::Matrix(values) => TransformationMatrix::from_css(*values),
@@ -373,12 +385,14 @@ impl ElementTransform {
 struct Decomposed {
     translate: [f32; 2],
     scale: [f32; 2],
+    /// The shear along x, as the factor `c` of `matrix(1, 0, c, 1, 0, 0)` applied before the scale.
+    skew: f32,
     angle: f32,
-    /// The columns of what is left once rotation and scale are taken out, `[m11, m12, m21, m22]`.
-    remainder: [f32; 4],
 }
 
-/// CSS Transforms 1, "Decomposing a 2D matrix". `None` for a matrix that flattens the plane.
+/// CSS Transforms 1, "Decomposing a 2D matrix": the first column is scaled and turned to point along x,
+/// the second is made orthogonal to it (what it had along the first is the skew) and scaled. `None` for a
+/// matrix that flattens the plane.
 fn decompose(matrix: &TransformationMatrix) -> Option<Decomposed> {
     if matrix.determinant().abs() < 1e-12 || !matrix.determinant().is_finite() {
         return None;
@@ -386,27 +400,27 @@ fn decompose(matrix: &TransformationMatrix) -> Option<Decomposed> {
     let mut column_x = [matrix.rotation_scale[0][0], matrix.rotation_scale[1][0]];
     let mut column_y = [matrix.rotation_scale[0][1], matrix.rotation_scale[1][1]];
     let mut scale_x = column_x[0].hypot(column_x[1]);
+    column_x = [column_x[0] / scale_x, column_x[1] / scale_x];
+    let mut skew = column_x[0] * column_y[0] + column_x[1] * column_y[1];
+    column_y = [column_y[0] - column_x[0] * skew, column_y[1] - column_x[1] * skew];
     let mut scale_y = column_y[0].hypot(column_y[1]);
-    if matrix.determinant() < 0. {
+    column_y = [column_y[0] / scale_y, column_y[1] / scale_y];
+    skew /= scale_y;
+    if column_x[0] * column_y[1] - column_x[1] * column_y[0] < 0. {
         // One axis was flipped; flip the one whose unit vector points least along its axis.
+        skew = -skew;
         if column_x[0] < column_y[1] {
             scale_x = -scale_x;
+            column_x = [-column_x[0], -column_x[1]];
         } else {
             scale_y = -scale_y;
         }
     }
-    column_x = [column_x[0] / scale_x, column_x[1] / scale_x];
-    column_y = [column_y[0] / scale_y, column_y[1] / scale_y];
-    let angle = column_x[1].atan2(column_x[0]);
-    let (sin, cos) = (-column_x[1], column_x[0]);
-    let unrotate = |column: [f32; 2]| [cos * column[0] - sin * column[1], sin * column[0] + cos * column[1]];
-    let remainder_x = unrotate(column_x);
-    let remainder_y = unrotate(column_y);
     Some(Decomposed {
         translate: matrix.translation,
         scale: [scale_x, scale_y],
-        angle,
-        remainder: [remainder_x[0], remainder_x[1], remainder_y[0], remainder_y[1]],
+        skew,
+        angle: column_x[1].atan2(column_x[0]),
     })
 }
 
@@ -422,18 +436,15 @@ fn recompose(parts: &Decomposed) -> TransformationMatrix {
         ],
         translation: [0., 0.],
     };
-    let remainder = TransformationMatrix {
-        rotation_scale: [
-            [parts.remainder[0], parts.remainder[2]],
-            [parts.remainder[1], parts.remainder[3]],
-        ],
+    let skew = TransformationMatrix {
+        rotation_scale: [[1., parts.skew], [0., 1.]],
         translation: [0., 0.],
     };
     let scale = TransformationMatrix {
         rotation_scale: [[parts.scale[0], 0.], [0., parts.scale[1]]],
         translation: [0., 0.],
     };
-    translate.compose(rotate).compose(remainder).compose(scale)
+    translate.compose(rotate).compose(skew).compose(scale)
 }
 
 /// CSS Transforms 1, "Interpolation of 2D matrices". A matrix that cannot be decomposed makes
@@ -465,13 +476,8 @@ pub fn interpolate_matrices(
             mix(from_parts.scale[0], to_parts.scale[0]),
             mix(from_parts.scale[1], to_parts.scale[1]),
         ],
+        skew: mix(from_parts.skew, to_parts.skew),
         angle: mix(from_angle, to_angle),
-        remainder: [
-            mix(from_parts.remainder[0], to_parts.remainder[0]),
-            mix(from_parts.remainder[1], to_parts.remainder[1]),
-            mix(from_parts.remainder[2], to_parts.remainder[2]),
-            mix(from_parts.remainder[3], to_parts.remainder[3]),
-        ],
     })
 }
 
@@ -617,6 +623,8 @@ mod tests {
         let size = box_of(10., 10.);
         let skew = TransformFunction::Skew(0.5, 0.25).matrix(size);
         assert_matrix(skew, [1., 0.25f32.tan(), 0.5f32.tan(), 1., 0., 0.]);
+        assert_matrix(TransformFunction::SkewX(0.5).matrix(size), [1., 0., 0.5f32.tan(), 1., 0., 0.]);
+        assert_matrix(TransformFunction::SkewY(0.25).matrix(size), [1., 0.25f32.tan(), 0., 1., 0., 0.]);
         let matrix = TransformFunction::Matrix([1., 2., 3., 4., 5., 6.]).matrix(size);
         assert_eq!(matrix.apply_xy(1., 1.), [1. + 3. + 5., 2. + 4. + 6.]);
     }
@@ -631,6 +639,17 @@ mod tests {
         .matrix(box_of(10., 10.));
         let angle = radians(std::f32::consts::FRAC_PI_4);
         assert_matrix(blended, [angle.0.cos(), angle.0.sin(), -angle.0.sin(), angle.0.cos(), 0., 0.]);
+    }
+
+    #[test]
+    fn a_shear_blends_as_a_shear_and_a_mirror_stays_a_mirror() {
+        let shear = |c: f32| TransformationMatrix::from_css([1., 0., c, 1., 0., 0.]);
+        assert_matrix(interpolate_matrices(&shear(0.2), &shear(0.8), 0.5), [1., 0., 0.5, 1., 0., 0.]);
+        let mirror = TransformationMatrix::from_css([1., 0., 0., -1., 0., 0.]);
+        let halfway = interpolate_matrices(&mirror, &mirror, 0.5);
+        assert_matrix(halfway, [1., 0., 0., -1., 0., 0.]);
+        let flipped_shear = TransformationMatrix::from_css([-1., 0., 0.3, 1., 5., 6.]);
+        assert_matrix(interpolate_matrices(&flipped_shear, &flipped_shear, 0.37), [-1., 0., 0.3, 1., 5., 6.]);
     }
 
     #[test]
