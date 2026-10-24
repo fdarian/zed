@@ -2095,6 +2095,13 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// The bottom margin the node was laid out with, in logical pixels, with a percentage and `auto`
+    /// resolved.
+    pub fn layout_margin_bottom(&self, id: LayoutId, scale_factor: f32) -> Pixels {
+        let margin = self.taffy.layout(id.into()).expect(EXPECT_MESSAGE).margin.bottom;
+        Pixels(margin / scale_factor)
+    }
+
     /// The padding and border widths the node was laid out with, with percentages and
     /// the style of the current state (hover, focus) already resolved.
     pub fn layout_insets(&mut self, id: LayoutId, scale_factor: f32) -> LayoutInsets {

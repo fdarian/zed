@@ -7844,6 +7844,20 @@ impl Window {
         bounds
     }
 
+    /// The bottom margin the given layout node was laid out with, in logical pixels, with a percentage and
+    /// `auto` resolved.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_margin_bottom(&mut self, layout_id: LayoutId) -> Pixels {
+        self.invalidator.debug_assert_prepaint();
+
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .layout_margin_bottom(layout_id, scale_factor)
+    }
+
     /// The size of the given layout node as layout computed it, in logical pixels and before it is
     /// snapped to device pixels. It leaves no bounds behind, so it is safe to ask for a root that
     /// is not placed yet (see [`Self::with_fractional_element_origin`]).
