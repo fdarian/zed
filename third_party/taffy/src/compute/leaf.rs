@@ -189,7 +189,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
-    use crate::{MeasuredLeaf, TaffyTree};
+    use crate::{MeasuredLeaf, Overflow, Point, TaffyTree};
 
     /// What the measure function of a leaf returns: its size and its first baseline
     type Text = (Size<f32>, f32);
@@ -368,5 +368,139 @@ mod tests {
         taffy.compute_layout_with_measure(root, Size::MAX_CONTENT, |_, _, _, context, _| *context.unwrap()).unwrap();
         assert_eq!(taffy.layout(a).unwrap().location.y, 20.0);
         assert_eq!(taffy.layout(b).unwrap().location.y, 0.0);
+    }
+
+    fn scroll(overflow: Overflow) -> Style {
+        Style { overflow: Point { x: overflow, y: overflow }, ..Style::default() }
+    }
+
+    /// A box 10px high with a line of 20px in it, as `<div style="overflow:O;height:10px">A</div>`.
+    fn short_box(taffy: &mut TaffyTree<Text>, overflow: Overflow, margin_top: f32) -> NodeId {
+        let line = taffy
+            .new_leaf_with_context(
+                Style { margin: Rect { top: length(margin_top), ..Rect::zero() }, ..Style::default() },
+                (Size { width: 20.0, height: 20.0 }, 20.0),
+            )
+            .unwrap();
+        let style = Style { size: Size { width: auto(), height: length(10.0) }, ..scroll(overflow) };
+        taffy.new_with_children(style, &[line]).unwrap()
+    }
+
+    /// <div style="display:flex;align-items:baseline"> A at 40px, <div><div style="overflow:O;height:10px">A</div></div> </div>
+    ///
+    /// Chrome clamps the baseline of a scroll container to its border box (`LogicalBoxFragment::FirstBaseline`), so
+    /// the block around the box has the baseline 10 where `visible` and `clip` leave it at 20.
+    #[test]
+    fn a_block_around_a_scroll_container_has_its_baseline_clamped_to_the_box() {
+        for (overflow, want) in [
+            (Overflow::Visible, 20.0),
+            (Overflow::Clip, 20.0),
+            (Overflow::Hidden, 30.0),
+            (Overflow::Scroll, 30.0),
+        ] {
+            let mut taffy = TaffyTree::new();
+            let b = text(&mut taffy, 40.0, 40.0, 40.0);
+            let x = short_box(&mut taffy, overflow, 0.0);
+            let wrapper = taffy.new_with_children(Style::default(), &[x]).unwrap();
+            let root = container(Display::Flex, |_| {}, &mut taffy, &[b, wrapper]);
+            layout(&mut taffy, root);
+            assert_eq!(top(&taffy, wrapper), want, "{overflow:?}");
+        }
+    }
+
+    /// A line 30px above the box, <div style="overflow:hidden;height:10px"><div style="margin-top:-30px">A</div></div>,
+    /// has the baseline -10, which is clamped to the top of the box.
+    #[test]
+    fn a_baseline_above_a_scroll_container_is_clamped_to_its_top() {
+        let mut taffy = TaffyTree::new();
+        let b = text(&mut taffy, 40.0, 40.0, 40.0);
+        let x = short_box(&mut taffy, Overflow::Hidden, -30.0);
+        let root = container(Display::Flex, |_| {}, &mut taffy, &[b, x]);
+        layout(&mut taffy, root);
+        assert_eq!(top(&taffy, x), 40.0);
+    }
+
+    /// A scroll container on one axis is one: the horizontal `overflow-x: hidden` clamps the baseline too.
+    #[test]
+    fn a_scroll_container_on_one_axis_clamps_the_baseline() {
+        let mut taffy = TaffyTree::new();
+        let b = text(&mut taffy, 40.0, 40.0, 40.0);
+        let x = short_box(&mut taffy, Overflow::Visible, 0.0);
+        let mut style = taffy.style(x).unwrap().clone();
+        style.overflow.x = Overflow::Hidden;
+        taffy.set_style(x, style).unwrap();
+        let wrapper = taffy.new_with_children(Style::default(), &[x]).unwrap();
+        let root = container(Display::Flex, |_| {}, &mut taffy, &[b, wrapper]);
+        layout(&mut taffy, root);
+        assert_eq!(top(&taffy, wrapper), 30.0);
+    }
+
+    /// A leaf with text that scrolls: <div style="overflow:hidden;height:10px">A</div> in a flex row and in a grid.
+    #[test]
+    fn a_leaf_that_scrolls_has_its_baseline_clamped_to_its_box() {
+        for display in [Display::Flex, Display::Grid] {
+            let mut taffy = TaffyTree::new();
+            let b = text(&mut taffy, 40.0, 40.0, 40.0);
+            let a = taffy
+                .new_leaf_with_context(
+                    Style { size: Size { width: auto(), height: length(10.0) }, ..scroll(Overflow::Hidden) },
+                    (Size { width: 20.0, height: 20.0 }, 20.0),
+                )
+                .unwrap();
+            let root = container(
+                display,
+                |style| style.grid_template_columns = vec![length(50.0), length(50.0)],
+                &mut taffy,
+                &[b, a],
+            );
+            layout(&mut taffy, root);
+            assert_eq!(top(&taffy, a), 30.0, "{display:?}");
+        }
+    }
+
+    /// <div style="display:flex;align-items:baseline"> A at 40px, <div style="display:flex;flex-direction:column"> <div style="overflow:hidden;height:10px">A</div> </div> </div>
+    #[test]
+    fn a_flex_column_around_a_scroll_container_has_its_baseline_clamped() {
+        let mut taffy = TaffyTree::new();
+        let b = text(&mut taffy, 40.0, 40.0, 40.0);
+        let x = short_box(&mut taffy, Overflow::Hidden, 0.0);
+        let column = container(
+            Display::Flex,
+            |style| {
+                style.flex_direction = FlexDirection::Column;
+                style.align_items = None;
+            },
+            &mut taffy,
+            &[x],
+        );
+        let root = container(Display::Flex, |_| {}, &mut taffy, &[b, column]);
+        layout(&mut taffy, root);
+        assert_eq!(top(&taffy, column), 30.0);
+    }
+
+    /// <table><tr><td>A</td><td><div style="overflow:hidden;height:10px">A</div></td></tr></table>
+    ///
+    /// The cell takes the baseline 10 of the box, not 20 of the text in it: the row is 20 high and the box sits on
+    /// 10 of it.
+    #[test]
+    fn a_cell_takes_the_clamped_baseline_of_a_scroll_container() {
+        let mut taffy = TaffyTree::new();
+        let a = text(&mut taffy, 20.0, 20.0, 20.0);
+        let x = short_box(&mut taffy, Overflow::Hidden, 0.0);
+        let cell = |taffy: &mut TaffyTree<Text>, child| {
+            let style = Style { display: Display::Block, table_role: crate::TableRole::CELL, ..Style::default() };
+            taffy.new_with_children(style, &[child]).unwrap()
+        };
+        let (cell_a, cell_x) = (cell(&mut taffy, a), cell(&mut taffy, x));
+        let row = taffy
+            .new_with_children(
+                Style { display: Display::Block, table_role: crate::TableRole::Row, ..Style::default() },
+                &[cell_a, cell_x],
+            )
+            .unwrap();
+        let table = taffy.new_with_children(Style { display: Display::Table, ..Style::default() }, &[row]).unwrap();
+        layout(&mut taffy, table);
+        assert_eq!(taffy.layout(row).unwrap().size.height, 20.0);
+        assert_eq!((top(&taffy, a), top(&taffy, cell_x), top(&taffy, x)), (0.0, 0.0, 10.0));
     }
 }

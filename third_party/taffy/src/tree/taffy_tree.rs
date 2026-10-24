@@ -517,7 +517,7 @@ where
         //
         // If there was no cache match and a new result needs to be computed then that result will be added to the cache
         let original_inputs = inputs;
-        let output = compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
+        let mut output = compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
             match inputs.run_mode {
                 RunMode::PerformLayout => tree.taffy.layout_runs += 1,
                 RunMode::ComputeSize => tree.taffy.size_runs += 1,
@@ -572,6 +572,12 @@ where
                 }
             }
         });
+        // fdarian fork patch: a scroll container's baseline is clamped to its border box, wherever a parent
+        // takes it from (Blink's `LogicalBoxFragment::FirstBaseline`, logical_box_fragment.h).
+        let overflow = self.taffy.nodes[node_id.into()].style.overflow;
+        if overflow.x.is_scroll_container() || overflow.y.is_scroll_container() {
+            output.first_baselines.y = output.first_baselines.y.map(|baseline| baseline.min(output.size.height).max(0.0));
+        }
         if original_inputs.run_mode == RunMode::PerformLayout {
             self.taffy.nodes[node_id.into()].saved_layout = Some(SavedLayout { input: original_inputs, output });
         }
