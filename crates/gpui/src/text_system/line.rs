@@ -774,7 +774,8 @@ fn paint_line(
                 // its place paints itself.
                 if !run.inline.object
                     && scope.admits(group)
-                    && max_glyph_bounds.dilate(reach).intersects(&content_mask.bounds)
+                    && (window.paints_glyphs_outside_the_mask()
+                        || max_glyph_bounds.dilate(reach).intersects(&content_mask.bounds))
                 {
                     let baseline_offset = point(px(0.0), run_baseline);
                     let vertical_offset = point(px(0.0), glyph.position.y);

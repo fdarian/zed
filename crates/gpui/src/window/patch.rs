@@ -785,7 +785,7 @@ impl Window {
             Placement::Deferred { paint: Some(paint) } => Some(self.enter_surroundings(&around.id, paint)),
             _ => None,
         };
-        unit.element.paint(self, cx);
+        self.with_every_glyph_painted(|window| unit.element.paint(window, cx));
         if let Some(prepainted) = prepainted {
             self.leave_surroundings(prepainted);
         }

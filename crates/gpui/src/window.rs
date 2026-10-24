@@ -2036,6 +2036,8 @@ pub struct Window {
     culling: bool,
     /// The next element prepainted is the top of that subtree.
     cull_root_next: bool,
+    /// How many patchable roots are being painted: see [`Window::with_every_glyph_painted`].
+    every_glyph_painted: u32,
     /// How many subtrees have been culled over the life of the window.
     culled_subtrees: u64,
     /// How many times one draw may build the frame before it presents. See
@@ -2779,6 +2781,7 @@ impl Window {
             layout_passes: 0,
             culling: false,
             cull_root_next: false,
+            every_glyph_painted: 0,
             culled_subtrees: 0,
             max_draw_passes: 1,
             draw_pass: 0,
@@ -4587,6 +4590,22 @@ impl Window {
     /// How many subtrees this window has culled, see [`Element::cull_outset`].
     pub fn culled_subtree_count(&self) -> u64 {
         self.culled_subtrees
+    }
+
+    /// Whether text paints the glyphs that lie far outside the content mask too, which it
+    /// leaves out to save the work of looking them up.
+    pub(crate) fn paints_glyphs_outside_the_mask(&self) -> bool {
+        self.every_glyph_painted > 0
+    }
+
+    /// Calls `f` with the glyphs outside the content mask painted: the root of a patch is
+    /// painted so, whether it is recorded or patched, because a glyph that a transform moves
+    /// out of or into the mask would otherwise change how many operations it paints.
+    pub(crate) fn with_every_glyph_painted<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.every_glyph_painted += 1;
+        let result = f(self);
+        self.every_glyph_painted -= 1;
+        result
     }
 
     pub(crate) fn begin_culling(&mut self) {
@@ -7164,17 +7183,18 @@ impl Window {
 
         let content_mask = self.content_mask();
         let clipped_bounds = self.bounds_in_window(bounds).intersect(&content_mask.bounds);
-        if !clipped_bounds.is_empty() {
-            self.next_frame
-                .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
-        }
+        // A layer that is clipped away is still pushed, empty, so that the operations painted do
+        // not depend on where the content mask is.
+        let layer = if clipped_bounds.is_empty() {
+            Bounds::default()
+        } else {
+            self.cover_bounds(clipped_bounds)
+        };
+        self.next_frame.scene.push_layer(layer);
 
         let result = f(self);
 
-        if !clipped_bounds.is_empty() {
-            self.next_frame.scene.pop_layer();
-        }
+        self.next_frame.scene.pop_layer();
 
         result
     }

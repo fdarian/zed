@@ -1748,3 +1748,139 @@ mod transforms {
         assert_eq!(rig.hits(cx, x, y), ["card"]);
     }
 }
+
+mod clipped {
+    //! A box and a line of text that a tick slides out of a clipping parent and back are patched:
+    //! what the clip drops from the scene is still an operation, so the recording and the repaint
+    //! have the same ones.
+
+    use super::*;
+    use crate::{ElementTransform, TransformFunction, TransformLength};
+
+    #[derive(Default)]
+    struct Slide {
+        /// Pixels the mover is translated down by in the slot, which is 40 tall.
+        offset: Cell<f32>,
+    }
+
+    /// The slot clips at y in [10, 50]; the mover is 80 wide and 20 tall, at the top of the slot.
+    fn unit_for(slide: &Rc<Slide>) -> AnyElement {
+        div()
+            .id(UNIT)
+            .w(px(100.))
+            .h(px(100.))
+            .flex_none()
+            .bg(blue())
+            .child(
+                div().mt(px(10.)).w(px(100.)).h(px(40.)).flex_none().overflow_hidden().child(
+                    div()
+                        .w(px(80.))
+                        .h(px(20.))
+                        .bg(red())
+                        .text_color(green())
+                        .transform(ElementTransform {
+                            functions: vec![TransformFunction::Translate(
+                                TransformLength::pixels(0.),
+                                TransformLength::pixels(slide.offset.get()),
+                            )],
+                            origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+                        })
+                        .child("hello world"),
+                ),
+            )
+            .into_any_element()
+    }
+
+    struct SlidePage(Rc<Slide>);
+
+    impl Render for SlidePage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let slide = self.0.clone();
+            let unit = retained(UNIT, 1_000, move |_, _| unit_for(&slide)).patchable();
+            div().id("page").w(px(400.)).h(px(400.)).child(unit).into_any_element()
+        }
+    }
+
+    struct Rig {
+        window: AnyWindowHandle,
+        slide: Rc<Slide>,
+    }
+
+    impl Rig {
+        fn new(cx: &mut TestAppContext) -> Self {
+            let slide = Rc::new(Slide::default());
+            let window = cx.open_window(size(px(400.), px(400.)), {
+                let slide = slide.clone();
+                move |_, _| SlidePage(slide)
+            });
+            let window = AnyWindowHandle::from(window);
+            cx.update_window(window, |_, window, cx| {
+                let patched = slide.clone();
+                window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                    let element = unit_for(&patched);
+                    window.repaint_in_place(vec![(ElementId::from(UNIT), element)], cx, |_, _| true).is_ok()
+                })));
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+                window.present_cached_frame();
+            })
+            .unwrap();
+            Self { window, slide }
+        }
+
+        fn tick(&self, cx: &mut TestAppContext, offset: f32) {
+            self.slide.offset.set(offset);
+            cx.update_window(self.window, |_, window, cx| {
+                window.request_tick();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn draw_whole(&self, cx: &mut TestAppContext) {
+            cx.update_window(self.window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn patches(&self, cx: &mut TestAppContext) -> PatchCounters {
+            cx.update_window(self.window, |_, window, _| window.patch_counters()).unwrap()
+        }
+
+        /// How many quads the rendered frame draws. The test platform rasterizes no glyph, but the
+        /// text still paints its layer and its glyph lookups.
+        fn drawn(&self, cx: &mut TestAppContext) -> usize {
+            cx.update_window(self.window, |_, window, _| window.rendered_frame.scene.quads.len()).unwrap()
+        }
+
+        fn snapshot(&self, cx: &mut TestAppContext) -> String {
+            cx.update_window(self.window, |_, window, _| {
+                let scene = &window.rendered_frame.scene;
+                format!("{:#?}\n{:#?}", scene.quads, scene.monochrome_sprites)
+            })
+            .unwrap()
+        }
+    }
+
+    #[gpui::test]
+    fn a_box_and_text_that_slide_out_of_a_clip_and_back_keep_every_tick_patched(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx);
+        assert_eq!(rig.drawn(cx), 2, "the mover shows at first");
+
+        // Inside, half out at the bottom, fully out, and back.
+        let offsets = [10., 25., 39., 41., 60., 120., 60., 30., 0., -15., -30., -45., -80., -10., 0.];
+        for (tick, offset) in offsets.iter().enumerate() {
+            rig.tick(cx, *offset);
+            let patches = rig.patches(cx);
+            assert_eq!((patches.patched_frames, patches.total_declines()), (tick as u64 + 1, 0), "offset {offset}");
+            let patched = rig.snapshot(cx);
+            let outside = *offset >= 41. || *offset <= -30.;
+            // Nothing but the root's fill when the mover is out.
+            assert_eq!(rig.drawn(cx), if outside { 1 } else { 2 }, "offset {offset}");
+            rig.draw_whole(cx);
+            assert_same(&patched, &rig.snapshot(cx), &format!("a patched frame is the frame built whole at {offset}"));
+        }
+    }
+}

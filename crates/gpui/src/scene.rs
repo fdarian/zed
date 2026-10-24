@@ -44,6 +44,8 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    /// For each layer pushed and not popped, whether it opened one in `layer_stack`.
+    layer_opened: Vec<bool>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -144,6 +146,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.layer_opened.clear();
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -243,16 +246,28 @@ impl Scene {
         }
     }
 
+    /// Opens a layer over `bounds`. Empty bounds are recorded but open no layer, as a layer that
+    /// is clipped away: see [`Scene::insert_primitive`].
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        let opened = !bounds.is_empty();
+        // Whatever the empty bounds were cut to, a layer clipped away is recorded one way: a replay
+        // and a painter must record the same operations.
+        let bounds = if opened { bounds } else { Bounds::default() };
         self.record(PaintOperation::StartLayer(bounds));
         let current = self.current_mut();
-        let order = current.insert_bounds(bounds);
-        current.layer_stack.push(order);
+        current.layer_opened.push(opened);
+        if opened {
+            let order = current.insert_bounds(bounds);
+            current.layer_stack.push(order);
+        }
     }
 
     pub fn pop_layer(&mut self) {
         self.record(PaintOperation::EndLayer);
-        self.current_mut().layer_stack.pop();
+        let current = self.current_mut();
+        if current.layer_opened.pop() == Some(true) {
+            current.layer_stack.pop();
+        }
     }
 
     /// A scene to record the operations of a painter in, instead of this one: it renders as this
@@ -304,20 +319,22 @@ impl Scene {
         if self.hidden {
             return;
         }
-        if primitive
+        // A primitive that the content mask clips away is recorded all the same: whether one
+        // slides under the mask must not change how many operations an element paints, which
+        // is what a patch holds the recording to.
+        let clipped_away = primitive
             .window_bounds()
             .intersect(&primitive.content_mask().bounds)
-            .is_empty()
-        {
-            return;
-        }
+            .is_empty();
         match (&primitive, glyph) {
             (Primitive::PolychromeSprite(sprite), false) => {
                 self.record(PaintOperation::Image(*sprite))
             }
             _ => self.record(PaintOperation::Primitive(primitive.clone())),
         }
-        self.route(primitive, glyph);
+        if !clipped_away {
+            self.route(primitive, glyph);
+        }
     }
 
     /// Puts an already recorded primitive where it is drawn: opacity of a flat group, the open text
@@ -354,10 +371,13 @@ impl Scene {
     /// here and not by the painter because the pieces are cut out of the quad's content mask,
     /// which a recording that is put elsewhere only knows once it is.
     pub(crate) fn insert_quad(&mut self, quad: Quad) {
-        if self.hidden || quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty() {
+        if self.hidden {
             return;
         }
         self.record(PaintOperation::Quad(quad));
+        if quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty() {
+            return;
+        }
         if !quad.background.is_transparent() {
             self.route(quad.into(), true);
             return;
@@ -861,9 +881,24 @@ impl Scene {
         use std::fmt::Write as _;
 
         let mut out = String::new();
+        // Whether each open layer is a clipped away one, which an element that is culled does not
+        // paint at all.
+        let mut layers: Vec<bool> = Vec::new();
         for operation in self.paint_operations.get(range).unwrap_or_default() {
             if !marks && matches!(operation, PaintOperation::Replaced { .. } | PaintOperation::EndReplaced) {
                 continue;
+            }
+            if operation.is_clipped_away() {
+                continue;
+            }
+            match operation {
+                PaintOperation::StartLayer(bounds) if bounds.is_empty() => {
+                    layers.push(true);
+                    continue;
+                }
+                PaintOperation::StartLayer(_) => layers.push(false),
+                PaintOperation::EndLayer if layers.pop() == Some(true) => continue,
+                _ => {}
             }
             match operation {
                 PaintOperation::Primitive(Primitive::Shadow(shadow)) => write!(out, "{shadow:?}"),
@@ -999,8 +1034,6 @@ impl Scene {
         // stacking context inside it, painted under the mask it was handed over with) replaces
         // that in turn.
         let mut clipping: Vec<bool> = Vec::new();
-        // Whether each layer open was skipped, as a painter skips one that is clipped away.
-        let mut layers: Vec<bool> = Vec::new();
         for operation in operations {
             let clipped = clipping.last().copied().unwrap_or(true);
             match operation {
@@ -1034,17 +1067,9 @@ impl Scene {
                     if clipped {
                         bounds = bounds.intersect(&clip.snapped);
                     }
-                    let skipped = bounds.is_empty();
-                    layers.push(skipped);
-                    if !skipped {
-                        self.push_layer(bounds);
-                    }
+                    self.push_layer(bounds);
                 }
-                PaintOperation::EndLayer => {
-                    if layers.pop() == Some(false) {
-                        self.pop_layer();
-                    }
-                }
+                PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartGroup {
                     effect,
                     content_mask,
@@ -1187,6 +1212,19 @@ pub(crate) enum PaintOperation {
 }
 
 impl PaintOperation {
+    /// Whether the content mask clips the primitive away, which draws nothing: what a painter
+    /// records, and an element that is culled does not paint.
+    fn is_clipped_away(&self) -> bool {
+        match self {
+            PaintOperation::Primitive(primitive) => {
+                primitive.window_bounds().intersect(&primitive.content_mask().bounds).is_empty()
+            }
+            PaintOperation::Quad(quad) => quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty(),
+            PaintOperation::Image(sprite) => sprite.window_bounds().intersect(&sprite.content_mask.bounds).is_empty(),
+            _ => false,
+        }
+    }
+
     /// Whether `other` is the same kind of operation: what a patch must keep, since the operations
     /// around it are not rebuilt.
     pub(crate) fn same_kind(&self, other: &PaintOperation) -> bool {
@@ -3044,6 +3082,8 @@ mod tests {
         let mut sprite = glyph(20., 30.);
         sprite.content_mask = masked(region, -100., &viewport.snapped);
         painted.insert_primitive(sprite);
+        painted.pop_layer();
+        painted.push_layer(Bounds::default());
         painted.pop_layer();
 
         assert_eq!(describe(&replayed), describe(&painted));

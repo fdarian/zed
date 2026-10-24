@@ -354,6 +354,10 @@ impl FrameIndex for PaintIndex {
 struct Placed<I> {
     start: I,
     serial: u64,
+    /// The pass of the frame that placed it, see [`RetainedWindow::state_pass`]: a frame that is
+    /// built twice, to compare the replay of its subtrees with their build, places a subtree that
+    /// only one of the passes paints in that one.
+    pass: u64,
     within: Option<(Rc<Origin>, I)>,
 }
 
@@ -362,6 +366,7 @@ impl<I: FrameIndex + Default> Default for Placed<I> {
         Self {
             start: I::default(),
             serial: u64::MAX,
+            pass: u64::MAX,
             within: None,
         }
     }
@@ -394,17 +399,27 @@ impl Origin {
         }
     }
 
+    /// The pass that placed the recording, or the recording around it that it is inside of.
+    fn pass_now<I: FrameIndex>(&self, side: fn(&Origin) -> &RefCell<Placed<I>>) -> u64 {
+        let placed = side(self).borrow();
+        match &placed.within {
+            None => placed.pass,
+            Some((outer, _)) => outer.pass_now(side),
+        }
+    }
+
     fn place<I: FrameIndex>(
         &self,
         side: fn(&Origin) -> &RefCell<Placed<I>>,
         start: I,
         serial: u64,
+        pass: u64,
         within: Option<&Rc<Origin>>,
     ) {
         #[cfg(any(test, feature = "test-support"))]
         PLACEMENTS.with(|placements| placements.set(placements.get() + 1));
         let within = within.map(|outer| (outer.clone(), outer.now(side).0));
-        *side(self).borrow_mut() = Placed { start, serial, within };
+        *side(self).borrow_mut() = Placed { start, serial, pass, within };
     }
 
     /// Where the prepaint starts, and the serial of the frame it is in.
@@ -417,12 +432,17 @@ impl Origin {
         self.now(|origin| &origin.paint)
     }
 
-    pub(crate) fn place_prepaint(&self, start: PrepaintStateIndex, serial: u64, within: Option<&Rc<Origin>>) {
-        self.place(|origin| &origin.prepaint, start, serial, within);
+    /// The pass of the frame that placed the paint, see [`Placed::pass`].
+    pub(crate) fn paint_pass(&self) -> u64 {
+        self.pass_now(|origin| &origin.paint)
     }
 
-    pub(crate) fn place_paint(&self, start: PaintIndex, serial: u64, within: Option<&Rc<Origin>>) {
-        self.place(|origin| &origin.paint, start, serial, within);
+    pub(crate) fn place_prepaint(&self, start: PrepaintStateIndex, serial: u64, pass: u64, within: Option<&Rc<Origin>>) {
+        self.place(|origin| &origin.prepaint, start, serial, pass, within);
+    }
+
+    pub(crate) fn place_paint(&self, start: PaintIndex, serial: u64, pass: u64, within: Option<&Rc<Origin>>) {
+        self.place(|origin| &origin.paint, start, serial, pass, within);
     }
 
     /// The recording is in no frame, nor are the ones inside it.
@@ -621,6 +641,12 @@ impl PlainPaint {
         recorded.paint.is_some()
             && self.origin.paint_now().1 == window.rendered_serial()
             && !recorded.entities.iter().any(|entity| window.retained.notified.contains(entity))
+    }
+
+    /// Whether the paint was placed by another pass of the frame being built, see
+    /// [`PaintRecord::is_from_another_pass`].
+    pub(crate) fn is_from_another_pass(&self, window: &Window) -> bool {
+        self.origin.paint_now().1 == window.building_serial() && self.origin.paint_pass() != window.retained.state_pass
     }
 
     /// What the element painted, as text, if it painted in the frame being built.
@@ -1772,6 +1798,7 @@ impl Window {
         origin.place_prepaint(
             index.clone(),
             self.building_serial(),
+            self.retained.state_pass,
             self.retained.open_recordings.last().map(|recording| &recording.origin),
         );
         self.retained.open_recordings.push(OpenRecording {
@@ -2030,6 +2057,7 @@ impl Window {
         record.origin.place_prepaint(
             start.clone(),
             self.building_serial(),
+            self.retained.state_pass,
             self.retained.open_recordings.last().map(|recording| &recording.origin),
         );
         let lift_base = record.lifts.as_ref().map(|lifts| {
@@ -2212,7 +2240,7 @@ impl Window {
     pub(crate) fn begin_paint_recording(&mut self, origin: &Rc<Origin>) -> PaintMark {
         self.invalidator.debug_assert_paint();
         let index = self.paint_index();
-        origin.place_paint(index.clone(), self.building_serial(), self.retained.open_paints.last());
+        origin.place_paint(index.clone(), self.building_serial(), self.retained.state_pass, self.retained.open_paints.last());
         self.retained.open_paints.push(origin.clone());
         PaintMark {
             index,
@@ -2347,7 +2375,7 @@ impl Window {
             self.note_publication();
         }
         // The subtrees that painted inside are where this one puts them, as of this frame.
-        record.origin.place_paint(start.clone(), self.building_serial(), self.retained.open_paints.last());
+        record.origin.place_paint(start.clone(), self.building_serial(), self.retained.state_pass, self.retained.open_paints.last());
         start..self.paint_index()
     }
 
@@ -2739,6 +2767,16 @@ impl PaintRecord {
     pub(crate) fn range_now(&self) -> Range<PaintIndex> {
         let (start, _) = self.origin.paint_now();
         self.range.start.moved(&self.range.start, &start)..self.range.end.moved(&self.range.start, &start)
+    }
+
+    /// Whether the paint was placed by another pass of the frame being built, and this pass did not
+    /// paint it. The pass that builds every subtree, to compare the replayed ones with, builds the
+    /// content of a unit whole: the subtrees inside that wrap themselves are not painted by it, and
+    /// keep the range of the pass before. That is a range of another scene, which holds the
+    /// operations that draw nothing that a replay records and a build culls (see
+    /// [`Scene::describe_operations`]), so it is not the same range of this pass's scene.
+    pub(crate) fn is_from_another_pass(&self, window: &Window) -> bool {
+        self.origin.paint_now().1 == window.building_serial() && self.origin.paint_pass() != window.retained.state_pass
     }
 
     /// Notes where the paint is, which the origin knows.

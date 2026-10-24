@@ -471,6 +471,17 @@ impl RetainedState {
     pub(crate) fn describe(&self, window: &Window) -> Option<SubtreeText> {
         let recorded = self.recorded.as_ref()?;
         let paint = recorded.paint.as_ref()?;
+        // Nothing to compare it with if this pass did not paint it: see
+        // `PaintRecord::is_from_another_pass`.
+        if paint.is_from_another_pass(window)
+            || recorded
+                .prepaint
+                .lifts
+                .as_ref()
+                .is_some_and(|lifts| lifts.cells().any(|cell| cell.is_from_another_pass(window)))
+        {
+            return None;
+        }
         // A subtree recorded in a region prepaints and paints what lies between the content mask
         // around it and the region too, which a build under the mask leaves out: what cannot be
         // seen or hit is not compared.
@@ -693,6 +704,14 @@ impl Element for Retained {
     }
 }
 
+fn paint_root(patchable: bool, element: &mut AnyElement, window: &mut Window, cx: &mut App) {
+    if patchable {
+        window.with_every_glyph_painted(|window| element.paint(window, cx));
+    } else {
+        element.paint(window, cx);
+    }
+}
+
 /// Puts what the paint of the subtree `global_id` recorded into the frame being built.
 fn replay_recorded_paint(
     global_id: &GlobalElementId,
@@ -764,15 +783,18 @@ impl Retained {
                 if let Some(relocation) = relocation {
                     window.begin_relocation(relocation, true);
                 }
+                let patchable = self.patchable && self.overscan.is_none();
                 let accessed_entities = if *record {
                     let owner = self.state_owner(global_id, window);
                     window
                         .with_state_owner(&owner, |window| {
-                            window.detect_observed_entities(cx, |window, cx| element.paint(window, cx))
+                            window.detect_observed_entities(cx, |window, cx| {
+                                paint_root(patchable, element, window, cx)
+                            })
                         })
                         .1
                 } else {
-                    element.paint(window, cx);
+                    paint_root(patchable, element, window, cx);
                     Default::default()
                 };
                 let (relocation, operations) = if relocating {
@@ -1869,7 +1891,8 @@ mod tests {
             let scene = &window.rendered_frame.scene;
             let scene = format!(
                 "{} operations\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{} groups",
-                scene.len(),
+                // Not the ones a clip drops: an element that is culled records none of those.
+                scene.describe_drawn().lines().count(),
                 scene.shadows,
                 scene.quads,
                 scene.underlines,
