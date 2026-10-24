@@ -3786,10 +3786,18 @@ mod tests {
         #[crate::test]
         fn break_all_makes_the_box_one_letter_wide(cx: &mut TestAppContext) {
             for scale in [1., 2.] {
+                // Chrome (`white-space: normal`, `width: min-content`): 9.64 px of 16 px Menlo, one
+                // letter, since the space after `f` hangs.
                 let (width, _) = laid_out(cx, scale, "abcdef ghi", |style| {
                     style.text_style().word_break = Some(WordBreak::BreakAll);
+                    style.text_style().hang_trailing_spaces = Some(true);
                 });
                 assert_eq!(width, wide(space(cx), 1., scale), "scale {scale}");
+                // A space that does not hang stays with the letter before it.
+                let (kept, _) = laid_out(cx, scale, "abcdef ghi", |style| {
+                    style.text_style().word_break = Some(WordBreak::BreakAll);
+                });
+                assert_eq!(kept, wide(space(cx), 2., scale), "scale {scale}");
             }
         }
     }
