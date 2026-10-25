@@ -316,7 +316,8 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
         for row in &structure.rows {
             let mut height = 0.0;
             let mut baseline: Option<f32> = None;
-            let mut below_baseline = 0.0;
+            // Negative when the baseline of the first cell lies below its bottom, as in Blink's `RowBaselineTabulator`.
+            let mut below_baseline: Option<f32> = None;
             let mut fallback_descent: Option<f32> = None;
             for &cell in &row.cells {
                 let placed = &structure.cells[cell];
@@ -332,12 +333,15 @@ impl<Tree: LayoutTableContainer> Table<'_, Tree> {
                     let ascent = fits[cell].baseline;
                     baseline = Some(baseline.map_or(ascent, |current| f32_max(current, ascent)));
                     if placed.row_span == 1 {
-                        below_baseline = f32_max(below_baseline, fits[cell].content_height - ascent);
+                        let descent = fits[cell].content_height - ascent;
+                        below_baseline = Some(below_baseline.map_or(descent, |current| f32_max(current, descent)));
+                    } else {
+                        below_baseline.get_or_insert(0.0);
                     }
                 }
             }
             if let Some(baseline) = baseline {
-                height = f32_max(height, baseline + below_baseline);
+                height = f32_max(height, baseline + below_baseline.unwrap_or(0.0));
             }
             let mut fixed = row.cells.iter().any(|cell| {
                 structure.cells[*cell].row_span == 1 && matches!(self.cell_styles[*cell].height, Specified::Length(_))

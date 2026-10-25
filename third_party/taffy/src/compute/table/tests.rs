@@ -26,7 +26,7 @@
 //! run as `chrome-headless-shell --headless --dump-dom file:///page.html`. The `<col>` and `<colgroup>` nodes are not
 //! compared: Chrome gives boxes to `<col>`s that have no layout of their own.
 use crate::prelude::*;
-use crate::{CaptionSide, Point, RowGroupKind, TableLayout, TableRole, VerticalAlign};
+use crate::{CaptionSide, MeasuredLeaf, Point, RowGroupKind, TableLayout, TableRole, VerticalAlign};
 
 /// A node of a test tree
 pub(super) struct Spec {
@@ -174,6 +174,16 @@ fn build(tree: &mut TaffyTree<(Vec<f32>, f32)>, spec: Spec, order: &mut Vec<Node
 /// The border boxes `[x, y, width, height]` of the nodes of the tree, in document order, relative to a block of the
 /// given width that holds them
 pub(super) fn rects(children: Vec<Spec>, width: f32) -> Vec<[f32; 4]> {
+    rects_with(children, width, false)
+}
+
+/// Like `rects`, with the bottom of the first line of a leaf with words for its first baseline, as a line of text has
+/// its baseline in a box that is shorter than it
+pub(super) fn rects_with_baselines(children: Vec<Spec>, width: f32) -> Vec<[f32; 4]> {
+    rects_with(children, width, true)
+}
+
+fn rects_with(children: Vec<Spec>, width: f32, baselines: bool) -> Vec<[f32; 4]> {
     let mut tree: TaffyTree<(Vec<f32>, f32)> = TaffyTree::new();
     tree.disable_rounding();
     let mut order = Vec::new();
@@ -186,12 +196,15 @@ pub(super) fn rects(children: Vec<Spec>, width: f32) -> Vec<[f32; 4]> {
         })
         .collect();
     let root = tree.new_with_children(Style { size: Size { width: length(width), height: auto() }, ..block() }, &children).unwrap();
-    tree.compute_layout_with_measure(
+    tree.compute_layout_with_leaf_measure(
         root,
         Size { width: AvailableSpace::Definite(width), height: AvailableSpace::MaxContent },
         |known, available, _, context, _| match context {
-            Some((words, line_height)) => measure_words(known, available, words, *line_height),
-            None => Size::ZERO,
+            Some((words, line_height)) => MeasuredLeaf {
+                size: measure_words(known, available, words, *line_height),
+                first_baseline: baselines.then_some(*line_height),
+            },
+            None => MeasuredLeaf { size: Size::ZERO, first_baseline: None },
         },
     )
     .unwrap();
@@ -1995,6 +2008,51 @@ mod chrome {
                 [0.0, 0.0, 20.0, 30.0], // box
                 [20.0, 0.0, 20.0, 39.0], // td
                 [20.0, 20.0, 20.0, 10.0], // box
+            ],
+        );
+    }
+
+    /// The baseline of a cell may lie below its bottom: a line of text overflowing a box shorter than it. Below the
+    /// baseline that is a negative height for the first baseline aligned cell, and the row does not get taller for it
+    /// (Blink's `RowBaselineTabulator::ProcessCell` starts the descent at the first cell, not at 0). A taller cell
+    /// beside it raises the descent as usual.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <table>
+    ///   <tr>
+    ///     <td><div style="height:10px">A<!-- a line 20px high --></div></td>
+    ///   </tr>
+    ///   <tr>
+    ///     <td><div style="height:10px">A</div></td>
+    ///     <td><div style="width:20px;height:30px"></div></td>
+    ///   </tr>
+    /// </table>
+    /// ```
+    #[test]
+    fn baseline_below_the_bottom_of_the_cell_does_not_make_the_row_taller() {
+        let short = || div(|s| s.size.height = length(10.0), vec![text(&[10.0], 20.0)]);
+        let tree = vec![table(
+            |_| {},
+            vec![
+                tr(|_| {}, vec![td(|_| {}, vec![short()])]),
+                tr(|_| {}, vec![td(|_| {}, vec![short()]), td(|_| {}, vec![boxed(20.0, 30.0)])]),
+            ],
+        )];
+        assert_rects(
+            rects_with_baselines(tree, 300.0),
+            &[
+                [0.0, 0.0, 30.0, 40.0], // table
+                [0.0, 0.0, 30.0, 10.0], // tr
+                [0.0, 0.0, 10.0, 10.0], // td
+                [0.0, 0.0, 10.0, 10.0], // div
+                [0.0, 0.0, 10.0, 20.0], // line
+                [0.0, 10.0, 30.0, 30.0], // tr
+                [0.0, 10.0, 10.0, 30.0], // td
+                [0.0, 20.0, 10.0, 10.0], // div, on the baseline of the box (its bottom) beside it
+                [0.0, 20.0, 10.0, 20.0], // line
+                [10.0, 10.0, 20.0, 30.0], // td
+                [10.0, 10.0, 20.0, 30.0], // box
             ],
         );
     }
