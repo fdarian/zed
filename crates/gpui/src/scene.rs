@@ -1565,6 +1565,18 @@ fn move_through(transformation: &mut TransformationMatrix, delta: Point<ScaledPi
     true
 }
 
+/// Moves the window the clip of a sprite drawn untransformed is found through (see
+/// [`MonochromeSprite::clip_transformation`]) by `delta`: the sprite's bounds moved by it, so a
+/// window position is that much further along than the position it had in the clip's space.
+fn move_clip_through(clip_transformation: &mut TransformationMatrix, delta: Point<ScaledPixels>) {
+    if *clip_transformation == TransformationMatrix::unit() {
+        return;
+    }
+    let [[a, b], [c, d]] = clip_transformation.rotation_scale;
+    clip_transformation.translation[0] -= a * delta.x.0 + b * delta.y.0;
+    clip_transformation.translation[1] -= c * delta.x.0 + d * delta.y.0;
+}
+
 fn translate_bounds(bounds: &mut Bounds<ScaledPixels>, delta: Point<ScaledPixels>) {
     bounds.origin = bounds.origin + delta;
 }
@@ -1625,6 +1637,7 @@ impl MonochromeSprite {
         translate_mask(&mut self.content_mask, delta);
         if !move_through(&mut self.transformation, delta) {
             translate_bounds(&mut self.bounds, delta);
+            move_clip_through(&mut self.clip_transformation, delta);
         }
     }
 
@@ -1648,6 +1661,7 @@ impl PolychromeSprite {
         translate_mask(&mut self.content_mask, delta);
         if !move_through(&mut self.transformation, delta) {
             translate_bounds(&mut self.bounds, delta);
+            move_clip_through(&mut self.clip_transformation, delta);
         }
     }
 
@@ -2288,6 +2302,10 @@ pub struct MonochromeSprite {
     pub transformation: TransformationMatrix,
     /// A clip in the sprite's own space, see [`Quad::local_clip`].
     pub local_clip: ContentMask<ScaledPixels>,
+    /// From the window to the space `local_clip` is in, for a sprite that is drawn untransformed
+    /// (`transformation` is the unit matrix, `bounds` are in the window) inside a transform with a
+    /// clip: a glyph rasterized through the matrix. The unit matrix for every other sprite.
+    pub clip_transformation: TransformationMatrix,
 }
 
 /// What the sprite of a glyph holds but its atlas tile: the glyph of a patchable root that the
@@ -2309,7 +2327,11 @@ pub(crate) struct PendingGlyph {
     pub color: Hsla,
     /// The opacity of an emoji.
     pub opacity: f32,
+    /// How big a pixel of the tile is in the space of the sprite: 1 but for a glyph rasterized
+    /// larger than it is drawn.
+    pub tile_scale: f32,
     pub transformation: TransformationMatrix,
+    pub clip_transformation: TransformationMatrix,
     pub local_clip: ContentMask<ScaledPixels>,
 }
 
@@ -2326,12 +2348,16 @@ impl PendingGlyph {
         translate_mask(&mut self.content_mask, delta);
         if !move_through(&mut self.transformation, delta) {
             translate_bounds(&mut self.bounds, delta);
+            move_clip_through(&mut self.clip_transformation, delta);
         }
     }
 
     /// The sprite of the glyph, whose tile is `tile`.
     pub(crate) fn sprite(&self, tile: AtlasTile) -> Primitive {
-        let size: Size<ScaledPixels> = tile.bounds.size.map(Into::into);
+        let size: Size<ScaledPixels> = tile
+            .bounds
+            .size
+            .map(|extent| ScaledPixels(extent.0 as f32 * self.tile_scale));
         debug_assert!(
             size.width <= self.bounds.size.width && size.height <= self.bounds.size.height,
             "the tile of a glyph is no larger than the bounds its sprite was held to"
@@ -2353,6 +2379,7 @@ impl PendingGlyph {
                 tile,
                 transformation: self.transformation,
                 local_clip: self.local_clip,
+                clip_transformation: self.clip_transformation,
             })
         } else {
             Primitive::MonochromeSprite(MonochromeSprite {
@@ -2364,6 +2391,7 @@ impl PendingGlyph {
                 tile,
                 transformation: self.transformation,
                 local_clip: self.local_clip,
+                clip_transformation: self.clip_transformation,
             })
         }
     }
@@ -2412,6 +2440,8 @@ pub struct PolychromeSprite {
     pub transformation: TransformationMatrix,
     /// See [`Quad::local_clip`].
     pub local_clip: ContentMask<ScaledPixels>,
+    /// See [`MonochromeSprite::clip_transformation`].
+    pub clip_transformation: TransformationMatrix,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -2682,6 +2712,7 @@ mod tests {
             },
             transformation: TransformationMatrix::unit(),
             local_clip: ContentMask::unbounded(),
+            clip_transformation: TransformationMatrix::unit(),
         }
     }
 
@@ -3016,6 +3047,7 @@ mod tests {
             tile: glyph(0., 0.).tile,
             transformation: TransformationMatrix::unit(),
             local_clip: ContentMask::unbounded(),
+            clip_transformation: TransformationMatrix::unit(),
         };
         scene.insert_primitive(sprite);
         scene.insert_image(sprite);
@@ -3396,12 +3428,15 @@ mod tests {
                 subpixel_rendering: false,
                 luminance_bucket: 0,
                 font_smoothing: crate::FontSmoothing::Auto,
+                transform: crate::GlyphTransform::IDENTITY,
             },
             bounds: bounds(x, y, 8., 8.),
             content_mask,
             color: red(),
             opacity: 1.,
+            tile_scale: 1.,
             transformation: TransformationMatrix::unit(),
+            clip_transformation: TransformationMatrix::unit(),
             local_clip: ContentMask::unbounded(),
         }
     }

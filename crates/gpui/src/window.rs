@@ -10,7 +10,7 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
     Capslock, Context, CornerRadii, Corners, CursorHideMode, CursorStyle, Escape, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragOperation, Edges, Effect, Entity,
-    EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, FontSmoothing, Global, GlobalElementId, GlyphId, GpuSpecs,
+    EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, FontSmoothing, Global, GlobalElementId, GlyphId, GlyphTransform, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
     Keystroke, KeystrokeEvent, LayoutCounters, LayoutId, LayoutInsets, LineLayoutIndex, MeasureRun, MeasuredLeaf, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, OverlineStyle, Path, Pixels,
@@ -2914,6 +2914,10 @@ struct AmbientTransform {
     local_clip: Option<ContentMask<Pixels>>,
     /// What a hitbox or mouse listener registered inside the transform keeps of it.
     space: Rc<HitSpace>,
+    /// Whether this transform or one around it is animating: text inside is rasterized at a
+    /// scale kept across the animation and drawn through the matrix, as a compositor keeps the
+    /// raster scale of an animating layer, and not rasterized through every matrix of the run.
+    animating: bool,
 }
 
 impl AmbientTransform {
@@ -2970,6 +2974,7 @@ pub(crate) struct AmbientKey {
     matrix: TransformationMatrix,
     kind: TransformKind,
     local_clip: Option<ContentMask<Pixels>>,
+    animating: bool,
 }
 
 impl AmbientKey {
@@ -2987,6 +2992,11 @@ struct Placement {
     local_clip: ContentMask<ScaledPixels>,
     /// Whether the transform is a general one, which the primitives carry as a matrix.
     general: bool,
+    /// The ambient matrix in logical pixels, with no translation rounded: where a glyph's origin
+    /// is in the window under a general transform.
+    logical: TransformationMatrix,
+    /// See [`Window::with_transform_animating`]; only ever set for a general transform.
+    animating: bool,
 }
 
 /// A clip a sprite is given, in the space it is clipped in.
@@ -3036,6 +3046,69 @@ impl Default for Placement {
             transformation: TransformationMatrix::unit(),
             local_clip: ContentMask::unbounded(),
             general: false,
+            logical: TransformationMatrix::unit(),
+            animating: false,
+        }
+    }
+}
+
+/// The longest side, in device pixels, of a glyph that is rasterized through a transform or at a
+/// raster scale: a glyph that would be larger is rasterized smaller and drawn through the matrix.
+const MAX_TRANSFORMED_GLYPH: f32 = 1024.;
+
+/// The scale an animating transform's text is rasterized at, relative to the window's: `scale`
+/// (how many pixels a unit of length covers after the matrix) rounded up to the next power of
+/// the square root of two within [1/4, 8], so that an animation re-rasters a glyph a few times
+/// and each raster is at least as detailed as it is drawn.
+pub(crate) fn animating_raster_scale(scale: f32) -> f32 {
+    if !scale.is_finite() || scale <= 0. {
+        return 1.;
+    }
+    // The few thousandths keep a scale of exactly a power from rounding up a step.
+    let steps = (scale.log2() * 2. - 1e-3).ceil();
+    2f32.powf(steps / 2.).clamp(0.25, 8.)
+}
+
+/// How a glyph reaches the pixels of the window, see [`Window::glyph_drawing`].
+struct GlyphDrawing {
+    /// What the glyph is rasterized through, on top of `raster_scale`.
+    transform: GlyphTransform,
+    /// The scale factor the glyph is rasterized at: the window's, or more when the glyph is drawn
+    /// through a matrix that animates.
+    raster_scale: f32,
+    /// The whole pixel of the raster the glyph's origin is in, and the subpixel variant it is at.
+    integer_origin: Point<ScaledPixels>,
+    subpixel_variant: Point<u8>,
+    /// How big a pixel of the raster is in the space of the sprite: 1 but for text that is
+    /// rasterized larger than it is drawn.
+    tile_scale: f32,
+    /// The sprite's matrix and the one its fragments find their local clip through, see
+    /// [`MonochromeSprite::clip_transformation`].
+    transformation: TransformationMatrix,
+    clip_transformation: TransformationMatrix,
+}
+
+impl GlyphDrawing {
+    /// The origin of the sprite and the most it can cover, in the space of the sprite: the raster
+    /// bounds of the glyph, and the pixel the rasterizer adds to its tile at a subpixel position.
+    fn sprite_bounds(
+        &self,
+        params: &RenderGlyphParams,
+        raster_bounds: Bounds<DevicePixels>,
+    ) -> Bounds<ScaledPixels> {
+        let padding = |variant: u8| DevicePixels(i32::from(variant > 0));
+        let origin = self.integer_origin + raster_bounds.origin.map(Into::into);
+        let extent: Size<ScaledPixels> = size(
+            raster_bounds.size.width + padding(params.subpixel_variant.x),
+            raster_bounds.size.height + padding(params.subpixel_variant.y),
+        )
+        .map(Into::into);
+        Bounds {
+            origin: point(ScaledPixels(origin.x.0 * self.tile_scale), ScaledPixels(origin.y.0 * self.tile_scale)),
+            size: size(
+                ScaledPixels(extent.width.0 * self.tile_scale),
+                ScaledPixels(extent.height.0 * self.tile_scale),
+            ),
         }
     }
 }
@@ -6160,10 +6233,24 @@ impl Window {
         matrix: TransformationMatrix,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.with_transform_animating(matrix, false, f)
+    }
+
+    /// [`Window::with_transform`] for a transform that `animating` says is being animated. The
+    /// text inside it, and inside any transform in it, is then rasterized upright at a scale that
+    /// holds across a range of matrices (see [`animating_raster_scale`]) and drawn through the
+    /// matrix, where inside a static transform it is rasterized through the matrix itself.
+    pub fn with_transform_animating<R>(
+        &mut self,
+        matrix: TransformationMatrix,
+        animating: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if matrix.is_identity() {
             return f(self);
         }
+        let animating = animating || self.transform_stack.last().is_some_and(|ambient| ambient.animating);
         let outer = self.transform();
         let composed = outer.compose(matrix);
         let carried_clip = self.transform_stack.last().and_then(|ambient| ambient.local_clip);
@@ -6215,6 +6302,7 @@ impl Window {
             device_offset,
             local_clip,
             space: Rc::new(space),
+            animating,
         });
         let result = match window_clip {
             Some(clip) => self.with_window_content_mask(clip, f),
@@ -6229,6 +6317,8 @@ impl Window {
             matrix: ambient.matrix,
             kind: ambient.kind,
             local_clip: ambient.local_clip,
+            // Only a general transform rasterizes text by it.
+            animating: ambient.animating && ambient.kind == TransformKind::General,
         })
     }
 
@@ -6292,6 +6382,8 @@ impl Window {
                     .local_clip
                     .map_or_else(ContentMask::unbounded, |clip| clip.scale(self.scale_factor())),
                 general: true,
+                logical: ambient.matrix,
+                animating: ambient.animating,
             },
         }
     }
@@ -7738,14 +7830,10 @@ impl Window {
 
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
         let placement = self.placement();
-        let glyph_origin = origin.scale(scale_factor) + placement.offset;
-
-        let (integer_x, subpixel_x) = split_glyph_origin(glyph_origin.x.0, SUBPIXEL_VARIANTS_X);
-        let (integer_y, subpixel_y) = split_glyph_origin(glyph_origin.y.0, SUBPIXEL_VARIANTS_Y);
-        let subpixel_variant = Point::new(subpixel_x, subpixel_y);
-        let integer_origin = point(ScaledPixels(integer_x), ScaledPixels(integer_y));
+        let Some(drawing) = self.glyph_drawing(&placement, origin, font_size, true) else {
+            return Ok(());
+        };
         // Subpixel rendering is tied to the pixel grid, which a matrix does not keep.
         let subpixel_rendering =
             !placement.general && self.should_use_subpixel_rendering(font_id, font_size);
@@ -7757,12 +7845,13 @@ impl Window {
             font_id,
             glyph_id,
             font_size,
-            subpixel_variant,
-            scale_factor,
+            subpixel_variant: drawing.subpixel_variant,
+            scale_factor: drawing.raster_scale,
             is_emoji: false,
             subpixel_rendering,
             luminance_bucket,
             font_smoothing,
+            transform: drawing.transform,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
@@ -7775,7 +7864,7 @@ impl Window {
                     order: 0,
                     pad: 0,
                     bounds: Bounds {
-                        origin: integer_origin + raster_bounds.origin.map(Into::into),
+                        origin: drawing.integer_origin + raster_bounds.origin.map(Into::into),
                         size: tile.bounds.size.map(Into::into),
                     },
                     content_mask,
@@ -7784,27 +7873,111 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             } else {
-                let subpixel_padding = |variant: u8| DevicePixels(i32::from(variant > 0));
                 let glyph = PendingGlyph {
-                    bounds: Bounds {
-                        origin: integer_origin + raster_bounds.origin.map(Into::into),
-                        size: size(
-                            raster_bounds.size.width + subpixel_padding(params.subpixel_variant.x),
-                            raster_bounds.size.height + subpixel_padding(params.subpixel_variant.y),
-                        )
-                        .map(Into::into),
-                    },
+                    bounds: drawing.sprite_bounds(&params, raster_bounds),
+                    tile_scale: drawing.tile_scale,
                     params,
                     content_mask,
                     color: color.opacity(element_opacity),
                     opacity: 1.,
-                    transformation: placement.transformation,
+                    transformation: drawing.transformation,
+                    clip_transformation: drawing.clip_transformation,
                     local_clip: placement.local_clip,
                 };
                 self.paint_pending_glyph(glyph)?;
             }
         }
         Ok(())
+    }
+
+    /// How a glyph with its origin at `origin` in the local space reaches the window pixels, or
+    /// `None` when a transform that flattens the plane leaves nothing to show.
+    ///
+    /// Without a general transform the glyph is upright at the scale factor of the window. Inside
+    /// one that is static it is rasterized through the matrix itself and drawn untransformed, a
+    /// tile per device pixel at the origin the matrix maps it to: that origin keeps the subpixel
+    /// positions along the baseline when the matrix keeps the baseline on an axis, and is rounded
+    /// to the pixel otherwise, as Skia does. Inside an animating one the glyph is rasterized
+    /// upright at [`animating_raster_scale`] of the matrix and drawn through the matrix, whatever
+    /// it is during the animation.
+    fn glyph_drawing(
+        &self,
+        placement: &Placement,
+        origin: Point<Pixels>,
+        font_size: Pixels,
+        positioned_in_subpixels: bool,
+    ) -> Option<GlyphDrawing> {
+        let scale_factor = self.scale_factor();
+        let (steps_x, steps_y) = if positioned_in_subpixels {
+            (SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y)
+        } else {
+            (1, 1)
+        };
+        let split = |origin: Point<ScaledPixels>, steps: (u8, u8)| {
+            let (integer_x, subpixel_x) = split_glyph_origin(origin.x.0, steps.0);
+            let (integer_y, subpixel_y) = split_glyph_origin(origin.y.0, steps.1);
+            (
+                point(ScaledPixels(integer_x), ScaledPixels(integer_y)),
+                Point::new(subpixel_x, subpixel_y),
+            )
+        };
+        if !placement.general {
+            let (integer_origin, subpixel_variant) =
+                split(origin.scale(scale_factor) + placement.offset, (steps_x, steps_y));
+            return Some(GlyphDrawing {
+                transform: GlyphTransform::IDENTITY,
+                raster_scale: scale_factor,
+                integer_origin,
+                subpixel_variant,
+                tile_scale: 1.,
+                transformation: placement.transformation,
+                clip_transformation: TransformationMatrix::unit(),
+            });
+        }
+
+        let linear = placement.logical.rotation_scale;
+        let transform = GlyphTransform::quantize(linear);
+        let stretch = placement.logical.stretch_bound();
+        let glyph_reach = font_size.0 * scale_factor * stretch;
+        let exact = !placement.animating && glyph_reach <= MAX_TRANSFORMED_GLYPH;
+        if exact {
+            let inverse = placement.transformation.inverse()?;
+            let window_origin = placement.logical.apply(origin).scale(scale_factor);
+            let steps = if transform.is_axis_aligned() {
+                (steps_x, steps_y)
+            } else if transform.is_quarter_turn() {
+                (steps_y, steps_x)
+            } else {
+                (1, 1)
+            };
+            let (integer_origin, subpixel_variant) = split(window_origin, steps);
+            let clipped = placement.local_clip != ContentMask::unbounded();
+            return Some(GlyphDrawing {
+                transform,
+                raster_scale: scale_factor,
+                integer_origin,
+                subpixel_variant,
+                tile_scale: 1.,
+                transformation: TransformationMatrix::unit(),
+                clip_transformation: if clipped { inverse } else { TransformationMatrix::unit() },
+            });
+        }
+
+        let mut raster = animating_raster_scale(placement.logical.scale_factor());
+        while raster > 1. && font_size.0 * scale_factor * raster > MAX_TRANSFORMED_GLYPH {
+            raster /= std::f32::consts::SQRT_2;
+        }
+        let raster_scale = scale_factor * raster;
+        let (integer_origin, subpixel_variant) = split(origin.scale(raster_scale), (steps_x, steps_y));
+        Some(GlyphDrawing {
+            transform: GlyphTransform::IDENTITY,
+            raster_scale,
+            integer_origin,
+            subpixel_variant,
+            tile_scale: 1. / raster,
+            transformation: placement.transformation,
+            clip_transformation: TransformationMatrix::unit(),
+        })
     }
 
     /// Puts the glyph into the scene as a sprite, or, when a patchable root is painted and the
@@ -7876,34 +8049,34 @@ impl Window {
         }
 
 
-        let scale_factor = self.scale_factor();
         let placement = self.placement();
-        let glyph_origin = origin.scale(scale_factor) + placement.offset;
-        let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_up(c.0)));
+        let Some(drawing) = self.glyph_drawing(&placement, origin, font_size, false) else {
+            return Ok(());
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
             font_size,
             subpixel_variant: Default::default(),
-            scale_factor,
+            scale_factor: drawing.raster_scale,
             is_emoji: true,
             subpixel_rendering: false,
             luminance_bucket: 0,
             font_smoothing: FontSmoothing::Auto,
+            transform: drawing.transform,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
             let glyph = PendingGlyph {
+                bounds: drawing.sprite_bounds(&params, raster_bounds),
+                tile_scale: drawing.tile_scale,
                 params,
-                bounds: Bounds {
-                    origin: integer_origin + raster_bounds.origin.map(Into::into),
-                    size: raster_bounds.size.map(Into::into),
-                },
                 content_mask: self.snapped_content_mask(),
                 color: Hsla::default(),
                 opacity: self.element_opacity(),
-                transformation: placement.transformation,
+                transformation: drawing.transformation,
+                clip_transformation: drawing.clip_transformation,
                 local_clip: placement.local_clip,
             };
             self.paint_pending_glyph(glyph)?;
@@ -7984,6 +8157,7 @@ impl Window {
             tile,
             transformation: sprite_transformation,
             local_clip: placement.local_clip_through(&transformation),
+            clip_transformation: TransformationMatrix::unit(),
         });
 
         Ok(())
@@ -8182,6 +8356,7 @@ impl Window {
             opacity,
             transformation: placement.transformation,
             local_clip,
+            clip_transformation: TransformationMatrix::unit(),
         }))
     }
 

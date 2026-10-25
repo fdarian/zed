@@ -3193,7 +3193,7 @@ impl Interactivity {
                 self.transform_box = Some(transform_box);
                 window.with_visibility(visibility, |window| {
                     window.with_faded_out_if(style.is_faded_out(), |window| {
-                    window.with_transform(style.transform_matrix(transform_box), |window| {
+                    window.with_transform_animating(style.transform_matrix(transform_box), style.transform_animating(), |window| {
                     window.with_text_style(style.text_style().cloned(), |window| {
                         window.with_exact_hit_mask(
                             style.overflow_mask(bounds, window.rem_size()),
@@ -3599,7 +3599,7 @@ impl Interactivity {
                     let transform_box = self
                         .transform_box
                         .expect("an element is prepainted before it is painted");
-                    window.with_transform(style.transform_matrix(transform_box), |window| {
+                    window.with_transform_animating(style.transform_matrix(transform_box), style.transform_animating(), |window| {
                     style.paint_box_with_effects(bounds, box_bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_overflow_clip(

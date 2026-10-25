@@ -1135,6 +1135,11 @@ impl Style {
             .map_or_else(TransformationMatrix::unit, |transform| transform.resolve(bounds))
     }
 
+    /// Whether the element's `transform` is being animated.
+    pub(crate) fn transform_animating(&self) -> bool {
+        self.transform.as_ref().is_some_and(|transform| transform.animating)
+    }
+
     /// Whether the element shows nothing, because its opacity is 0.
     ///
     /// Not while an opacity animation is current: the element paints as a group of opacity 0, which

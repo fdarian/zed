@@ -2,6 +2,7 @@ use crate::{
     Bounds, DevicePixels, Font, FontId, FontMetrics, FontRun, GlyphId, LineLayout, NoopTextSystem,
     Pixels, PlatformTextSystem, RenderGlyphParams, ShapedGlyph, ShapedRun, Size, px,
 };
+use parking_lot::Mutex;
 use std::borrow::Cow;
 
 /// A [`NoopTextSystem`] with glyphs that rasterize to something, so
@@ -10,6 +11,9 @@ pub(crate) struct RasterizingTextSystem {
     noop: NoopTextSystem,
     ink_in_the_box: bool,
     distinct_glyphs: bool,
+    /// The parameters the raster bounds of a glyph were asked for, once each: the text system
+    /// that asks caches them.
+    asked: Mutex<Vec<RenderGlyphParams>>,
 }
 
 impl RasterizingTextSystem {
@@ -18,7 +22,13 @@ impl RasterizingTextSystem {
             noop: NoopTextSystem::new(),
             ink_in_the_box: false,
             distinct_glyphs: false,
+            asked: Mutex::default(),
         }
+    }
+
+    /// What glyphs were rasterized as, in the order they were first asked for.
+    pub(crate) fn asked(&self) -> Vec<RenderGlyphParams> {
+        self.asked.lock().clone()
     }
 
     /// A text system whose characters are glyphs of their own, so that the atlas holds one
@@ -76,6 +86,7 @@ impl PlatformTextSystem for RasterizingTextSystem {
     }
 
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> anyhow::Result<Bounds<DevicePixels>> {
+        self.asked.lock().push(params.clone());
         let above = if self.ink_in_the_box {
             (params.font_size.0 * params.scale_factor * 0.5) as i32
         } else {

@@ -1470,6 +1470,7 @@ mod transforms {
         ElementTransform {
             functions: vec![function],
             origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+            animating: false,
         }
     }
 
@@ -1487,6 +1488,7 @@ mod transforms {
                     TransformLength::pixels(0.),
                 )],
                 origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+                animating: false,
             }
         } else {
             turn(spin.degrees.get())
@@ -1785,6 +1787,7 @@ mod clipped {
                                 TransformLength::pixels(slide.offset.get()),
                             )],
                             origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+                            animating: false,
                         })
                         .child("hello world"),
                 ),
@@ -1928,6 +1931,7 @@ mod rasterized {
                                 TransformLength::pixels(0.),
                             )],
                             origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+                            animating: false,
                         })
                         .child(slide.text.clone()),
                 ),

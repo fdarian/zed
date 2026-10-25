@@ -1529,6 +1529,53 @@ pub struct RenderGlyphParams {
     pub subpixel_rendering: bool,
     pub luminance_bucket: u8,
     pub font_smoothing: FontSmoothing,
+    /// The linear part of the transform the glyph is drawn through, which the rasterizer applies
+    /// around the glyph's origin on top of `scale_factor`.
+    pub transform: GlyphTransform,
+}
+
+/// The 2x2 linear part of the transform a glyph is rasterized through, in logical pixels (without
+/// the scale factor), quantized so that it can key the atlas: nearby matrices share a raster.
+/// Row-major, in units of 1 / [`GlyphTransform::UNIT`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct GlyphTransform([i32; 4]);
+
+impl GlyphTransform {
+    /// How many steps make a unit.
+    pub const UNIT: i32 = 4096;
+
+    /// The glyph as it is, upright.
+    pub const IDENTITY: GlyphTransform = GlyphTransform([Self::UNIT, 0, 0, Self::UNIT]);
+
+    /// The nearest quantized transform to `linear`, row-major as in
+    /// [`TransformationMatrix::rotation_scale`].
+    pub fn quantize(linear: [[f32; 2]; 2]) -> Self {
+        let step = |value: f32| (value * Self::UNIT as f32).round() as i32;
+        GlyphTransform([step(linear[0][0]), step(linear[0][1]), step(linear[1][0]), step(linear[1][1])])
+    }
+
+    /// The matrix the transform stands for, row-major.
+    pub fn linear(&self) -> [[f32; 2]; 2] {
+        let value = |step: i32| step as f32 / Self::UNIT as f32;
+        [[value(self.0[0]), value(self.0[1])], [value(self.0[2]), value(self.0[3])]]
+    }
+
+    /// Whether the glyph is drawn upright.
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    /// Whether the transform only scales and flips, which keeps the glyphs of a line on the
+    /// horizontal baseline the rasterizer positions them along.
+    pub fn is_axis_aligned(&self) -> bool {
+        self.0[1] == 0 && self.0[2] == 0
+    }
+
+    /// Whether the transform turns the baseline a quarter, so that it runs along the vertical
+    /// axis: a scale and flip after a turn of 90 or 270 degrees.
+    pub fn is_quarter_turn(&self) -> bool {
+        self.0[0] == 0 && self.0[3] == 0
+    }
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1544,6 +1591,7 @@ impl Hash for RenderGlyphParams {
         self.subpixel_rendering.hash(state);
         self.luminance_bucket.hash(state);
         self.font_smoothing.hash(state);
+        self.transform.hash(state);
     }
 }
 
@@ -1865,6 +1913,7 @@ mod tests {
             subpixel_rendering: false,
             luminance_bucket: 0,
             font_smoothing,
+            transform: GlyphTransform::IDENTITY,
         };
         let (auto, antialiased) = (glyph(FontSmoothing::Auto), glyph(FontSmoothing::Antialiased));
         assert_eq!(auto, glyph(FontSmoothing::Auto));

@@ -357,6 +357,10 @@ pub struct ElementTransform {
     pub functions: Vec<TransformFunction>,
     /// `transform-origin`, from the top left of the border box.
     pub origin: (TransformLength, TransformLength),
+    /// Whether the transform is being animated. Text inside is then rasterized at a scale kept
+    /// across the animation, see [`Window::with_transform_animating`].
+    #[serde(default)]
+    pub animating: bool,
 }
 
 impl ElementTransform {
@@ -588,6 +592,7 @@ mod tests {
         let transform = ElementTransform {
             functions: vec![TransformFunction::Rotate(std::f32::consts::FRAC_PI_2)],
             origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+            animating: false,
         };
         let border_box = Bounds::new(point(px(100.), px(50.)), size(px(40.), px(40.)));
         let matrix = transform.resolve(border_box);
@@ -608,6 +613,7 @@ mod tests {
                 TransformFunction::Scale(2., 2.),
             ],
             origin: (TransformLength::pixels(10.), TransformLength::default()),
+            animating: false,
         };
         let matrix = transform.resolve(Bounds::new(point(px(0.), px(0.)), size(px(100.), px(20.))));
         // translate(55px) · scale(2) around (10, 0): the origin point itself moves by 55.

@@ -14,6 +14,7 @@ use core_graphics::{
     color_space::CGColorSpace,
     context::{CGContext, CGTextDrawingMode},
     display::CGPoint,
+    geometry::CGAffineTransform,
 };
 use core_text::{
     font::CTFont,
@@ -42,7 +43,7 @@ use gpui::{
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
     rect::{RectF, RectI},
-    transform2d::Transform2F,
+    transform2d::{Matrix2x2F, Transform2F},
     vector::Vector2F,
 };
 use smallvec::SmallVec;
@@ -647,7 +648,21 @@ impl MacTextSystemState {
 
     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let font = &self.fonts[params.font_id.0];
-        let scale = Transform2F::from_scale(params.scale_factor);
+        let scale = if params.transform.is_identity() {
+            Transform2F::from_scale(params.scale_factor)
+        } else {
+            let linear = params.transform.linear();
+            let factor = params.scale_factor;
+            Transform2F {
+                matrix: Matrix2x2F::row_major(
+                    linear[0][0] * factor,
+                    linear[0][1] * factor,
+                    linear[1][0] * factor,
+                    linear[1][1] * factor,
+                ),
+                vector: Vector2F::zero(),
+            }
+        };
         let bounds: Bounds<DevicePixels> = bounds_from_rect_i(font.raster_bounds(
             params.glyph_id.0,
             params.font_size.into(),
@@ -721,20 +736,45 @@ impl MacTextSystemState {
                 );
             }
 
-            // Move the origin to bottom left and account for scaling, this
-            // makes drawing text consistent with the font-kit's raster_bounds.
-            cx.translate(
-                -glyph_bounds.origin.x.0 as CGFloat,
-                (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
-            );
-            cx.scale(
-                params.scale_factor as CGFloat,
-                params.scale_factor as CGFloat,
-            );
-
             let subpixel_shift = params
                 .subpixel_variant
                 .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
+            let draw_at = if params.transform.is_identity() {
+                // Move the origin to bottom left and account for scaling, this
+                // makes drawing text consistent with the font-kit's raster_bounds.
+                cx.translate(
+                    -glyph_bounds.origin.x.0 as CGFloat,
+                    (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
+                );
+                cx.scale(
+                    params.scale_factor as CGFloat,
+                    params.scale_factor as CGFloat,
+                );
+                CGPoint::new(
+                    (subpixel_shift.x / params.scale_factor) as CGFloat,
+                    (subpixel_shift.y / params.scale_factor) as CGFloat,
+                )
+            } else {
+                // The glyph is drawn through the transform around its origin, which is where
+                // the subpixel shift (in device pixels, along the baseline of the window) puts it
+                // before the transform applies. CoreGraphics' y axis points up where the
+                // transform's points down, hence the signs.
+                cx.translate(
+                    (subpixel_shift.x - glyph_bounds.origin.x.0 as f32) as CGFloat,
+                    (glyph_bounds.origin.y.0 as f32 + bitmap_size.height.0 as f32 - subpixel_shift.y) as CGFloat,
+                );
+                let linear = params.transform.linear();
+                let factor = params.scale_factor;
+                cx.concat_ctm(CGAffineTransform::new(
+                    (linear[0][0] * factor) as CGFloat,
+                    (-linear[1][0] * factor) as CGFloat,
+                    (-linear[0][1] * factor) as CGFloat,
+                    (linear[1][1] * factor) as CGFloat,
+                    0.,
+                    0.,
+                ));
+                CGPoint::new(0., 0.)
+            };
             cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
             cx.set_allows_antialiasing(true);
             cx.set_should_antialias(true);
@@ -754,10 +794,7 @@ impl MacTextSystemState {
             self.sized_font(params.font_id, f32::from(params.font_size))
                 .draw_glyphs(
                     &[params.glyph_id.0 as CGGlyph],
-                    &[CGPoint::new(
-                        (subpixel_shift.x / params.scale_factor) as CGFloat,
-                        (subpixel_shift.y / params.scale_factor) as CGFloat,
-                    )],
+                    &[draw_at],
                     cx,
                 );
 
@@ -1686,6 +1723,7 @@ mod tests {
                     subpixel_rendering: false,
                     luminance_bucket: 0,
                     font_smoothing: FontSmoothing::Auto,
+                    transform: gpui::GlyphTransform::IDENTITY,
                 })
                 .unwrap()
                 .size
@@ -2116,5 +2154,129 @@ mod tests {
             let lines = text_system.shape_text(text, px(size), &runs, None, None).unwrap();
             assert_eq!(lines[0].size(px(20.)).width, px(width / 64.), "{family} {size} {nodes:?}");
         }
+    }
+
+    /// A real CoreText glyph turned 30 degrees: rasterized through the matrix and drawn upright it is
+    /// as heavy as the glyph resampled through the matrix, and sharper.
+    #[test]
+    fn test_a_glyph_rasterized_through_a_rotation_is_sharper_than_one_resampled_through_it() {
+        use gpui::{
+            AtlasKey, ContentMask, DevicePixels, GlyphTransform, MonochromeSprite, PlatformHeadlessRenderer,
+            ScaledPixels, Scene, TransformationMatrix, point,
+        };
+        use gpui_apple::metal_renderer::MetalHeadlessRenderer;
+
+        const SIDE: i32 = 120;
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+        let glyph_id = fonts.glyph_for_char(font_id, 'W').unwrap();
+        let radians = 30f32.to_radians();
+        let linear = [[radians.cos(), -radians.sin()], [radians.sin(), radians.cos()]];
+        let scale_factor = 2.;
+        let params = |transform| RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: px(24.),
+            subpixel_variant: Default::default(),
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering: false,
+            luminance_bucket: 0,
+            font_smoothing: FontSmoothing::Antialiased,
+            transform,
+        };
+
+        let coverage = |transform: GlyphTransform, drawn_through: Option<TransformationMatrix>| {
+            let mut renderer = MetalHeadlessRenderer::new();
+            let atlas = renderer.sprite_atlas();
+            let params = params(transform);
+            let raster_bounds = fonts.glyph_raster_bounds(&params).unwrap();
+            let tile = atlas
+                .get_or_insert_with(&AtlasKey::Glyph(params.clone()), &mut || {
+                    let (size, bytes) = fonts.rasterize_glyph(&params, raster_bounds)?;
+                    Ok(Some((size, bytes.into())))
+                })
+                .unwrap()
+                .unwrap();
+            let origin = point(ScaledPixels(SIDE as f32 / 2.), ScaledPixels(SIDE as f32 / 2.));
+            let mut scene = Scene::default();
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds: gpui::Bounds {
+                    origin: match drawn_through {
+                        // Upright in its own space, which the matrix turns around the glyph's origin.
+                        Some(_) => point(
+                            ScaledPixels(raster_bounds.origin.x.0 as f32),
+                            ScaledPixels(raster_bounds.origin.y.0 as f32),
+                        ),
+                        None => origin
+                            + point(
+                                ScaledPixels(raster_bounds.origin.x.0 as f32),
+                                ScaledPixels(raster_bounds.origin.y.0 as f32),
+                            ),
+                    },
+                    size: tile.bounds.size.map(Into::into),
+                },
+                content_mask: ContentMask {
+                    bounds: gpui::Bounds {
+                        origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                        size: gpui::size(ScaledPixels(SIDE as f32), ScaledPixels(SIDE as f32)),
+                    },
+                    ..Default::default()
+                },
+                color: gpui::red(),
+                tile,
+                transformation: drawn_through.unwrap_or_else(TransformationMatrix::unit),
+                local_clip: ContentMask::unbounded(),
+                clip_transformation: TransformationMatrix::unit(),
+            });
+            scene.finish();
+            let image = renderer
+                .render_scene_to_image(&scene, gpui::size(DevicePixels(SIDE), DevicePixels(SIDE)))
+                .unwrap();
+            // Coverage is the red of red text over black.
+            let grid: Vec<Vec<f32>> = (0..SIDE as u32)
+                .map(|y| (0..SIDE as u32).map(|x| image.get_pixel(x, y).0[0] as f32 / 255.).collect())
+                .collect();
+            let (mut ink, mut squares, mut edge, mut centroid) = (0f32, 0f32, 0f32, (0f32, 0f32));
+            for (y, row) in grid.iter().enumerate() {
+                for (x, c) in row.iter().enumerate() {
+                    ink += c;
+                    centroid.0 += c * x as f32;
+                    centroid.1 += c * y as f32;
+                    squares += c * c;
+                    if let Some(next) = row.get(x + 1) {
+                        edge += (next - c).powi(2);
+                    }
+                    if let Some(below) = grid.get(y + 1) {
+                        edge += (below[x] - c).powi(2);
+                    }
+                }
+            }
+            (ink, squares / ink, edge / ink, (centroid.0 / ink, centroid.1 / ink))
+        };
+
+        let turn = TransformationMatrix {
+            rotation_scale: linear,
+            translation: [SIDE as f32 / 2., SIDE as f32 / 2.],
+        };
+        // The scale factor is in the raster of either; the matrix works on device pixels.
+        let (exact_ink, exact_solid, exact_edge, exact_centroid) =
+            coverage(GlyphTransform::quantize(linear), None);
+        let (resampled_ink, resampled_solid, resampled_edge, resampled_centroid) =
+            coverage(GlyphTransform::IDENTITY, Some(turn));
+        println!("exact {exact_ink} {exact_solid} {exact_edge}; resampled {resampled_ink} {resampled_solid} {resampled_edge}");
+        assert!(exact_ink > 10., "the glyph is drawn: {exact_ink}");
+        assert!(
+            (exact_centroid.0 - resampled_centroid.0).abs() < 0.75 && (exact_centroid.1 - resampled_centroid.1).abs() < 0.75,
+            "the same place and turn: {exact_centroid:?} against {resampled_centroid:?}"
+        );
+        assert!(
+            (exact_ink / resampled_ink - 1.).abs() < 0.04,
+            "same weight: {exact_ink} against {resampled_ink}"
+        );
+        assert!(exact_solid > resampled_solid * 1.03, "more of the ink at full coverage: {exact_solid} against {resampled_solid}");
+        assert!(exact_edge > resampled_edge * 1.05, "steeper edges: {exact_edge} against {resampled_edge}");
     }
 }

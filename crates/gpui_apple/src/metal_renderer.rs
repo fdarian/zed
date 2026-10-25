@@ -4047,6 +4047,7 @@ mod tests {
             tile,
             transformation: gpui::TransformationMatrix::unit(),
             local_clip: ContentMask::unbounded(),
+            clip_transformation: gpui::TransformationMatrix::unit(),
         }
     }
 
@@ -4778,6 +4779,7 @@ mod tests {
             tile,
             transformation: gpui::TransformationMatrix::unit(),
             local_clip: ContentMask::unbounded(),
+            clip_transformation: gpui::TransformationMatrix::unit(),
         });
         scene.end_text_clip();
         scene.finish();
@@ -5333,6 +5335,7 @@ mod tests {
             tile,
             transformation,
             local_clip: ContentMask::unbounded(),
+            clip_transformation: gpui::TransformationMatrix::unit(),
         }
     }
 

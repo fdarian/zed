@@ -1000,6 +1000,12 @@ fragment float4 monochrome_sprite_fragment(
     tile_position = clamp(tile_position, tile_low, tile_high);
     coverage = rect_coverage(input.local_position, sprite.bounds, input.local_scale) *
                local_clip_coverage(input.local_position, sprite.local_clip, input.local_scale);
+  } else if (!is_identity_transform(sprite.clip_transformation)) {
+    // A sprite drawn upright inside a transform that clips: the clip is in the transform's
+    // local space, found from the window position of the fragment.
+    coverage = local_clip_coverage(
+        apply_transform(sprite.clip_transformation, input.position.xy), sprite.local_clip,
+        1.0 / transform_pixel_scale(sprite.clip_transformation));
   }
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, tile_position);
@@ -1091,6 +1097,10 @@ fragment float4 polychrome_sprite_fragment(
   float clip_alpha = 1.0;
   if (transformed) {
     clip_alpha = local_clip_coverage(local_position, sprite.local_clip, pixel);
+  } else if (!is_identity_transform(sprite.clip_transformation)) {
+    clip_alpha = local_clip_coverage(
+        apply_transform(sprite.clip_transformation, input.position.xy), sprite.local_clip,
+        1.0 / transform_pixel_scale(sprite.clip_transformation));
   }
   color.a *= sprite.opacity * saturate(0.5 - distance * pixel) * clip_alpha *
              content_mask_coverage(input.position.xy, sprite.content_mask);

@@ -350,19 +350,31 @@ fn a_rotation_gives_glyphs_emoji_lines_and_icons_the_matrix() {
     let sf = 2.;
     let expected = rotation(30.).scaled(sf);
     let matrix = format!("transformation: {expected:?}");
+    let upright = format!("transformation: {:?}", TransformationMatrix::unit());
+    let clip_matrix = format!("clip_transformation: {:?}", expected.inverse().unwrap());
     // 6 columns of an underline, a glyph, an emoji and an icon.
     let kinds = |name: &str| turned.iter().filter(|primitive| primitive.starts_with(name)).count();
     assert_eq!(
         (kinds("Underline"), kinds("MonochromeSprite"), kinds("PolychromeSprite")),
         (6, 12, 6)
     );
+    // Underlines and icons are drawn through the matrix. A glyph and an emoji are rasterized through
+    // it and drawn upright in the window, and find their clip through its inverse.
+    let mut through_the_matrix = 0;
+    let mut upright_sprites = 0;
     for primitive in &turned {
-        assert!(primitive.contains(&matrix), "{primitive}");
+        if primitive.contains(&matrix) {
+            through_the_matrix += 1;
+        } else {
+            assert!(primitive.contains(&upright) && primitive.contains(&clip_matrix), "{primitive}");
+            upright_sprites += 1;
+        }
         assert!(
             primitive.contains(&format!("{:?}", ContentMask::from_bounds(square(1., 2., 60.)).scale(sf))),
             "the local clip is the mask pushed inside the transform: {primitive}"
         );
     }
+    assert_eq!((through_the_matrix, upright_sprites), (12, 12));
 }
 
 #[test]
@@ -628,6 +640,7 @@ mod elements {
         ElementTransform {
             functions,
             origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+            animating: false,
         }
     }
 
@@ -635,6 +648,7 @@ mod elements {
         ElementTransform {
             functions,
             origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+            animating: false,
         }
     }
 
@@ -1516,5 +1530,227 @@ mod elements {
         let moved = hitbox.relocated(delta, &everywhere);
         assert_eq!(moved.bounds, bounds);
         assert!(moved.contains_window_point(point(px(80.), px(94.))));
+    }
+}
+
+/// How text reaches the pixels inside a transform: rasterized through a static matrix and drawn
+/// upright, or rasterized upright at a bucketed scale and drawn through the matrix when it animates.
+mod glyphs {
+    use super::*;
+    use crate::{
+        FontId, FontSmoothing, GlyphId, GlyphTransform, MonochromeSprite, PolychromeSprite, RasterizingTextSystem,
+        RenderGlyphParams, animating_raster_scale,
+    };
+    use std::sync::Arc;
+
+    struct Painted {
+        monochrome: Vec<MonochromeSprite>,
+        polychrome: Vec<PolychromeSprite>,
+        asked: Vec<RenderGlyphParams>,
+    }
+
+    fn painted_text(
+        scale_factor: f32,
+        paint: impl Fn(&mut Window, &mut crate::App) + 'static,
+    ) -> Painted {
+        struct Text(Rc<dyn Fn(&mut Window, &mut crate::App)>);
+        impl Render for Text {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let paint = self.0.clone();
+                canvas(|_, _, _| (), move |_, (): (), window, cx| paint(window, cx)).size_full()
+            }
+        }
+
+        let system = Arc::new(RasterizingTextSystem::new());
+        let mut app = TestApp::with_text_system(system.clone());
+        app.set_window_scale_factor(scale_factor);
+        let paint: Rc<dyn Fn(&mut Window, &mut crate::App)> = Rc::new(paint);
+        let mut window = app.open_window(move |_, _| Text(paint));
+        window.draw();
+        window.update(|_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            Painted {
+                monochrome: scene.monochrome_sprites.clone(),
+                polychrome: scene.polychrome_sprites.clone(),
+                asked: system.asked(),
+            }
+        })
+    }
+
+    fn glyph_at(window: &mut Window, at: crate::Point<Pixels>) {
+        window
+            .paint_glyph(at, FontId(0), GlyphId(1), px(16.), blue(), FontSmoothing::Auto)
+            .unwrap();
+    }
+
+    fn linear(matrix: TransformationMatrix) -> GlyphTransform {
+        GlyphTransform::quantize(matrix.rotation_scale)
+    }
+
+    #[test]
+    fn the_raster_scale_of_an_animation_is_the_scale_rounded_up_to_a_power_of_root_two() {
+        let root_two = std::f32::consts::SQRT_2;
+        for (scale, expected) in [
+            (1., 1.),
+            (1.0000001, 1.),
+            (1.2, root_two),
+            (root_two, root_two),
+            (1.5, 2.),
+            (2., 2.),
+            (2.01, 2. * root_two),
+            (0.5, 0.5),
+            (0.6, 1. / root_two),
+            (0.9, 1.),
+            (0.2, 0.25),
+            (0.001, 0.25),
+            (100., 8.),
+        ] {
+            let got = animating_raster_scale(scale);
+            assert!((got - expected).abs() < 1e-4, "{scale} gives {got}, not {expected}");
+        }
+        for nonsense in [0., -1., f32::NAN, f32::INFINITY] {
+            assert_eq!(animating_raster_scale(nonsense), 1.);
+        }
+    }
+
+    #[test]
+    fn a_glyph_in_a_translation_or_outside_any_transform_is_rasterized_upright() {
+        let painted = painted_text(2., |window, _| {
+            glyph_at(window, point(px(3.3), px(12.)));
+            window.with_transform(css([1., 0., 0., 1., 10.25, 5.1]), |window| glyph_at(window, point(px(3.3), px(12.))));
+        });
+        assert!(painted.asked.iter().all(|params| params.transform.is_identity() && params.scale_factor == 2.));
+        assert!(painted.monochrome.iter().all(|sprite| sprite.clip_transformation == TransformationMatrix::unit()));
+    }
+
+    #[test]
+    fn a_glyph_in_a_static_rotation_is_rasterized_through_it_and_drawn_upright_at_the_mapped_origin() {
+        let matrix = rotation(30.);
+        let painted = painted_text(2., move |window, _| {
+            window.with_transform(matrix, |window| {
+                window.with_content_mask(Some(ContentMask::from_bounds(square(1., 2., 60.))), |window| {
+                    glyph_at(window, point(px(50.), px(30.)))
+                })
+            });
+        });
+        assert_eq!(painted.asked.len(), 1);
+        let params = &painted.asked[0];
+        assert_eq!(params.transform, linear(matrix));
+        assert_eq!(params.scale_factor, 2.);
+        // Not on an axis: no subpixel positions, the origin is a whole device pixel.
+        assert_eq!(params.subpixel_variant, crate::Point::default());
+        assert_eq!(painted.monochrome.len(), 1);
+        let sprite = painted.monochrome[0];
+        let mapped = matrix.apply(point(px(50.), px(30.))).scale(2.);
+        assert_eq!(sprite.transformation, TransformationMatrix::unit());
+        assert_eq!(sprite.bounds.origin.x.0, (mapped.x.0 + 0.5).floor());
+        assert_eq!(sprite.bounds.origin.y.0, (mapped.y.0 + 0.5).floor());
+        // The clip stays in the local space: the sprite finds it through the window's inverse.
+        assert_eq!(sprite.clip_transformation, matrix.scaled(2.).inverse().unwrap());
+        assert_eq!(sprite.local_clip, ContentMask::from_bounds(square(1., 2., 60.)).scale(2.));
+    }
+
+    #[test]
+    fn a_glyph_in_a_rotation_with_no_clip_has_no_clip_matrix() {
+        let painted = painted_text(2., |window, _| {
+            window.with_transform(rotation(30.), |window| glyph_at(window, point(px(50.), px(30.))));
+        });
+        assert_eq!(painted.monochrome[0].clip_transformation, TransformationMatrix::unit());
+    }
+
+    #[test]
+    fn a_glyph_in_a_scale_keeps_its_subpixel_position_in_the_window() {
+        let matrix = css([2., 0., 0., 2., 0., 0.]);
+        let origin = point(px(3.3), px(12.));
+        let painted = painted_text(1., move |window, _| {
+            window.with_transform(matrix, |window| glyph_at(window, origin));
+        });
+        let params = &painted.asked[0];
+        assert_eq!(params.transform, linear(matrix));
+        // 6.6 device pixels along x: 6 and a half, to the nearest quarter 6.5, variant 2.
+        assert_eq!(params.subpixel_variant, crate::Point::new(2, 0));
+        assert_eq!(painted.monochrome[0].bounds.origin.x.0, 6.);
+        assert_eq!(painted.monochrome[0].bounds.origin.y.0, 24.);
+    }
+
+    #[test]
+    fn a_glyph_turned_a_quarter_keeps_its_subpixel_position_along_the_baseline() {
+        let matrix = css([0., 1., -1., 0., 0., 0.]);
+        let painted = painted_text(1., move |window, _| {
+            window.with_transform(matrix, |window| glyph_at(window, point(px(3.3), px(12.3))));
+        });
+        let params = &painted.asked[0];
+        // (3.3, 12.3) goes to (-12.3, 3.3): the baseline is vertical, so y has the variants.
+        assert_eq!(params.subpixel_variant, crate::Point::new(0, 1));
+    }
+
+    #[test]
+    fn an_emoji_in_a_rotation_is_rasterized_through_it_and_drawn_upright() {
+        let matrix = rotation(20.);
+        let painted = painted_text(2., move |window, _| {
+            window.with_transform(matrix, |window| {
+                window.paint_emoji(point(px(30.), px(30.)), FontId(0), GlyphId(2), px(16.)).unwrap()
+            });
+        });
+        assert_eq!(painted.polychrome.len(), 1);
+        assert_eq!(painted.polychrome[0].transformation, TransformationMatrix::unit());
+        assert!(painted.asked[0].is_emoji);
+        assert_eq!(painted.asked[0].transform, linear(matrix));
+    }
+
+    #[test]
+    fn a_glyph_in_an_animating_transform_is_rasterized_upright_at_a_bucketed_scale_and_drawn_through_it() {
+        let matrix = css([1.5, 0., 0., 1.5, 0., 0.]).compose(rotation(10.));
+        let painted = painted_text(2., move |window, _| {
+            window.with_transform_animating(matrix, true, |window| {
+                window.with_content_mask(Some(ContentMask::from_bounds(square(1., 2., 60.))), |window| {
+                    glyph_at(window, point(px(20.), px(30.)))
+                })
+            });
+        });
+        let params = &painted.asked[0];
+        assert!(params.transform.is_identity());
+        // 1.5 rounds up to 2: the glyph is rasterized at 4 and drawn at a half.
+        assert_eq!(params.scale_factor, 4.);
+        let sprite = painted.monochrome[0];
+        assert_eq!(sprite.transformation, matrix.scaled(2.));
+        assert_eq!(sprite.clip_transformation, TransformationMatrix::unit());
+        assert_eq!(sprite.bounds.size.width.0, 0.5);
+        assert_eq!(sprite.local_clip, ContentMask::from_bounds(square(1., 2., 60.)).scale(2.));
+    }
+
+    #[test]
+    fn a_transform_inside_an_animating_one_animates_too() {
+        let painted = painted_text(1., |window, _| {
+            window.with_transform_animating(rotation(10.), true, |window| {
+                window.with_transform(css([2., 0., 0., 2., 0., 0.]), |window| glyph_at(window, point(px(5.), px(10.))));
+            });
+        });
+        assert!(painted.asked[0].transform.is_identity());
+        assert_eq!(painted.asked[0].scale_factor, 2.);
+    }
+
+    #[test]
+    fn an_animating_translation_leaves_text_as_it_is() {
+        let painted = painted_text(2., |window, _| {
+            window.with_transform_animating(css([1., 0., 0., 1., 7.3, 0.]), true, |window| {
+                glyph_at(window, point(px(5.), px(10.)))
+            });
+        });
+        assert_eq!(painted.asked[0].scale_factor, 2.);
+        assert!(painted.asked[0].transform.is_identity());
+    }
+
+    #[test]
+    fn the_matrices_of_a_static_run_share_a_raster_only_when_they_quantize_alike() {
+        let at = |degrees: f32| {
+            painted_text(1., move |window, _| {
+                window.with_transform(rotation(degrees), |window| glyph_at(window, point(px(5.), px(10.))));
+            })
+            .asked[0]
+                .transform
+        };
+        assert_eq!(at(30.), at(30.0001));
+        assert_ne!(at(30.), at(31.));
     }
 }
