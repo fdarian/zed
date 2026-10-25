@@ -24,7 +24,7 @@
 //! viewport is not.
 
 use super::*;
-use crate::elements::RetainedState;
+use crate::elements::{RetainedState, ScrollExtent, ScrollHandle};
 use crate::scene::PaintOperation;
 use std::fmt::Write as _;
 
@@ -66,13 +66,17 @@ pub enum PatchDecline {
     Registrations,
     /// The operations painted differ in number or kind from the recorded ones.
     Operations,
+    /// The transforms that ticked moved the scrollable overflow of a scroller around the roots so
+    /// that the frame would show it: its offset has to clamp, or it paints a scrollbar whose thumb
+    /// changes.
+    ScrollExtent,
     /// The embedder refused the patch.
     Rejected,
 }
 
 impl PatchDecline {
     /// Every reason.
-    pub const ALL: [PatchDecline; 13] = [
+    pub const ALL: [PatchDecline; 14] = [
         PatchDecline::PendingView,
         PatchDecline::Refreshing,
         PatchDecline::UnknownUnit,
@@ -85,6 +89,7 @@ impl PatchDecline {
         PatchDecline::Hitboxes,
         PatchDecline::Registrations,
         PatchDecline::Operations,
+        PatchDecline::ScrollExtent,
         PatchDecline::Rejected,
     ];
 
@@ -122,13 +127,32 @@ impl PatchCounters {
 }
 
 /// What a successful [`Window::repaint_in_place`] did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PatchOutcome {
     /// Roots repainted.
     pub units: usize,
     /// Whether anything they paint is different from what the frame had: the frame is presented
     /// only then.
     pub changed: bool,
+    /// The scrollers around the roots whose scrollable overflow the transforms that ticked
+    /// changed, without anything visible changing: their handles have the new range.
+    pub scroll_extents: Vec<ScrollExtentChange>,
+}
+
+/// A scroller whose scrollable overflow a patch changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScrollExtentChange {
+    /// The handle the scroller is tracked by.
+    pub handle: ScrollHandle,
+    /// The scrollable overflow as `layout_unsnapped_scrollable_overflow` measures it, less the
+    /// border and with the padding after the children: what `scrollWidth` and `scrollHeight` round.
+    pub content: Size<Pixels>,
+}
+
+/// A scroller that a patch moves the range of, once it is accepted.
+struct ScrollRangeMove {
+    index: usize,
+    extent: ScrollExtent,
 }
 
 /// What the window keeps for patching.
@@ -256,6 +280,8 @@ struct UnitRun {
     changed: bool,
     /// Where the unit's places are in the rendered frame, and what the patch made of them.
     places: Places,
+    /// Where the unit's scrollers are in the scratch scene and in the rendered one.
+    scrollers: (Range<usize>, Range<usize>),
 }
 
 /// What the rendered frame takes from a patch besides its operations: the transforms, which a
@@ -346,7 +372,7 @@ impl Window {
                     self.patch.counters.patched_frames += 1;
                     self.patch.counters.patched_units += outcome.units as u64;
                 }
-                self.patch.outcome = Some(outcome);
+                self.patch.outcome = Some(outcome.clone());
                 Ok(outcome)
             }
             Err(reason) => {
@@ -563,14 +589,15 @@ impl Window {
             resolved.push(ResolvedUnit { id, unit, source, element });
         }
         if resolved.is_empty() {
-            return Ok(PatchOutcome { units: 0, changed: false });
+            return Ok(PatchOutcome { units: 0, changed: false, scroll_extents: Vec::new() });
         }
 
         let scratch = self.begin_scratch(cx);
-        let runs = self.patch_units(&mut resolved, cx);
+        let patched = self.patch_units(&mut resolved, cx);
         let operations = mem::take(&mut self.next_frame.scene.paint_operations);
+        let scrollers = mem::take(&mut self.next_frame.scrollers);
         self.finish_scratch(scratch, cx);
-        let runs = runs?;
+        let (runs, moves) = patched?;
         let runs_len = runs.len();
 
         if !accept(self, cx) {
@@ -597,6 +624,11 @@ impl Window {
             }
             self.rendered_frame.scene.rebuild_from_operations();
         }
+        for run in &runs {
+            self.rendered_frame.scrollers[run.scrollers.1.clone()]
+                .clone_from_slice(&scrollers[run.scrollers.0.clone()]);
+        }
+        let scroll_extents = self.apply_scroll_range_moves(moves);
         let mut moved_hitboxes = false;
         for run in runs {
             moved_hitboxes |= self.put_places(run.places);
@@ -608,7 +640,7 @@ impl Window {
                 self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position, self.dom_hit_testing);
             }
         }
-        Ok(PatchOutcome { units: runs_len, changed })
+        Ok(PatchOutcome { units: runs_len, changed, scroll_extents })
     }
 
     /// Makes the scratch frame a clean one to draw the roots into.
@@ -650,9 +682,10 @@ impl Window {
         &mut self,
         units: &mut [ResolvedUnit],
         cx: &mut App,
-    ) -> Result<Vec<UnitRun>, PatchDecline> {
+    ) -> Result<(Vec<UnitRun>, Vec<ScrollRangeMove>), PatchDecline> {
+        let extent_epoch = self.layout_engine().extent_epoch();
         let mut runs = Vec::with_capacity(units.len());
-        for unit in units {
+        for unit in units.iter_mut() {
             let around = unit.unit.clone();
             let saved = self.enter_surroundings(&around.id, &around.prepaint);
             let owner = unit.source.owner.clone();
@@ -660,7 +693,69 @@ impl Window {
             self.leave_surroundings(saved);
             runs.push(run?);
         }
-        Ok(runs)
+        let roots: Vec<LayoutId> = units.iter().map(|unit| unit.source.root).collect();
+        let moves = self.scroll_range_moves(&roots, extent_epoch)?;
+        Ok((runs, moves))
+    }
+
+    /// The scrollers around `roots` whose scrollable overflow the transforms below them moved,
+    /// once every root has laid out again. A scroller is not prepainted by a patch, so its range is
+    /// worked out here; the patch is declined when the frame would show the difference, which a
+    /// frame built whole shows.
+    fn scroll_range_moves(&mut self, roots: &[LayoutId], extent_epoch: u64) -> Result<Vec<ScrollRangeMove>, PatchDecline> {
+        if self.layout_engine().extent_epoch() == extent_epoch || self.rendered_frame.scrollers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut around: FxHashSet<LayoutId> = FxHashSet::default();
+        for root in roots {
+            let mut node = self.layout_engine().layout_parent(*root);
+            while let Some(id) = node {
+                if !around.insert(id) {
+                    break;
+                }
+                node = self.layout_engine().layout_parent(id);
+            }
+        }
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        let scale_factor = self.scale_factor();
+        let mut moves = Vec::new();
+        for index in 0..self.rendered_frame.scrollers.len() {
+            let scroller = &self.rendered_frame.scrollers[index];
+            if !around.contains(&scroller.layout_id) {
+                continue;
+            }
+            let (layout_id, previous, offset, user_scroll) =
+                (scroller.layout_id, scroller.extent, *scroller.offset.borrow(), scroller.user_scroll);
+            let scrollbar_size = self.layout_scrollbar_size(layout_id);
+            let extent = ScrollExtent::measure(layout_id, scrollbar_size, self);
+            if extent == previous {
+                continue;
+            }
+            let (before, after) = (previous.max_offset(scale_factor), extent.max_offset(scale_factor));
+            let clamps = offset.x < -after.x || offset.y < -after.y;
+            let thumb_moves = (user_scroll.x && before.x != after.x) || (user_scroll.y && before.y != after.y);
+            if clamps || thumb_moves {
+                return Err(PatchDecline::ScrollExtent);
+            }
+            moves.push(ScrollRangeMove { index, extent });
+        }
+        Ok(moves)
+    }
+
+    /// Gives the scrollers the range that [`Self::scroll_range_moves`] worked out, and says which
+    /// have a handle to read it from.
+    fn apply_scroll_range_moves(&mut self, moves: Vec<ScrollRangeMove>) -> Vec<ScrollExtentChange> {
+        let scale_factor = self.scale_factor();
+        let mut changes = Vec::with_capacity(moves.len());
+        for moved in moves {
+            let scroller = &mut self.rendered_frame.scrollers[moved.index];
+            scroller.extent = moved.extent;
+            if let Some(handle) = &scroller.handle {
+                handle.set_max_offset(moved.extent.max_offset(scale_factor));
+                changes.push(ScrollExtentChange { handle: handle.clone(), content: moved.extent.content });
+            }
+        }
+        changes
     }
 
     fn enter_surroundings(&mut self, id: &GlobalElementId, unit: &Surroundings) -> SavedSurroundings {
@@ -815,7 +910,11 @@ impl Window {
             return Err(PatchDecline::Operations);
         }
         let changed = painted.iter().zip(recorded).any(|(painted, recorded)| painted.differs_from(recorded));
-        Ok(UnitRun { scratch, rendered, changed, places })
+        let scrollers = (
+            prepaint_start.scrollers_index..prepaint_end.scrollers_index,
+            source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
+        );
+        Ok(UnitRun { scratch, rendered, changed, places, scrollers })
     }
 
     /// Where in the rendered frame the hitboxes and mouse listeners that the scratch frame got
@@ -903,6 +1002,7 @@ impl Window {
             (prepaint.end.tooltips_index - prepaint.start.tooltips_index, recorded_prepaint.end.tooltips_index - recorded_prepaint.start.tooltips_index),
             (prepaint.end.dispatch_tree_index - prepaint.start.dispatch_tree_index, recorded_prepaint.end.dispatch_tree_index - recorded_prepaint.start.dispatch_tree_index),
             (prepaint.end.deferred_draws_index - prepaint.start.deferred_draws_index, recorded_prepaint.end.deferred_draws_index - recorded_prepaint.start.deferred_draws_index),
+            (prepaint.end.scrollers_index - prepaint.start.scrollers_index, recorded_prepaint.end.scrollers_index - recorded_prepaint.start.scrollers_index),
             (paint.end.mouse_listeners_index - paint.start.mouse_listeners_index, recorded_paint.end.mouse_listeners_index - recorded_paint.start.mouse_listeners_index),
             (paint.end.root_key_listeners_index - paint.start.root_key_listeners_index, recorded_paint.end.root_key_listeners_index - recorded_paint.start.root_key_listeners_index),
             (paint.end.input_handlers_index - paint.start.input_handlers_index, recorded_paint.end.input_handlers_index - recorded_paint.start.input_handlers_index),

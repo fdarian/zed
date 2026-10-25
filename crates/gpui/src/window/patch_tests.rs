@@ -1199,9 +1199,10 @@ fn a_lifted_root_that_moves_in_its_context_declines(cx: &mut TestAppContext) {
             let element = unit_element(1, 100., Some(0.5), false, Hot::Same, Lift::Alone, None).into_any_element();
             let raised = if logged.is_empty() { element } else { unit_element(1, 100., Some(0.5), false, Hot::Same, Lift::No, None) };
             let result = window.repaint_in_place(vec![(ElementId::from(UNIT), raised)], cx, |_, _| true);
+            let patched = result.is_ok();
             logged.push(result);
             log.set(logged);
-            result.is_ok()
+            patched
         })));
         window.request_tick();
         window.draw(cx).clear(cx);
@@ -2048,5 +2049,200 @@ mod rasterized {
             assert_same(&patched, &rig.snapshot(), &format!("a patched frame is the frame built whole at {offset}"));
         }
         assert_eq!(rig.rasterized(), 6, "every glyph of the word showed at some point");
+    }
+}
+
+mod scroll_extents {
+    //! A tick of a transform inside a patchable root moves the scrollable overflow of the scroller
+    //! around it: the patch gives the handle the range, and is declined only when the frame would
+    //! show the difference.
+
+    use super::*;
+    use crate::{ElementTransform, Size, TransformFunction, TransformLength};
+
+    struct Slide {
+        /// How far the card in the unit is moved right.
+        distance: Cell<f32>,
+        /// Whether the scroller is one the user scrolls, which has scrollbars.
+        user_scroll: bool,
+        reported: RefCell<Vec<Size<Pixels>>>,
+    }
+
+    /// The root is 50 by 50; the card in it is 40 by 20 at the origin of the root.
+    fn unit_for(slide: &Slide) -> AnyElement {
+        div()
+            .id(UNIT)
+            .w(px(50.))
+            .h(px(50.))
+            .flex_none()
+            .child(
+                div().id("card").w(px(40.)).h(px(20.)).bg(red()).transform(ElementTransform {
+                    functions: vec![TransformFunction::Translate(
+                        TransformLength::pixels(slide.distance.get()),
+                        TransformLength::pixels(0.),
+                    )],
+                    origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+                    animating: false,
+                }),
+            )
+            .into_any_element()
+    }
+
+    struct SlidePage {
+        slide: Rc<Slide>,
+        scroll: ScrollHandle,
+    }
+
+    impl Render for SlidePage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let slide = self.slide.clone();
+            let key = 1_000 + slide.distance.get() as u64;
+            let unit = retained(UNIT, key, {
+                let slide = slide.clone();
+                move |_, _| unit_for(&slide)
+            })
+            .patchable();
+            let scroller = div()
+                .id("scroller")
+                .w(px(100.))
+                .h(px(100.))
+                .overflow_scroll()
+                .programmatic_scroll_only(!slide.user_scroll, !slide.user_scroll)
+                .track_scroll(&self.scroll)
+                .child(unit);
+            div().id("page").w(px(400.)).h(px(400.)).child(scroller).into_any_element()
+        }
+    }
+
+    struct Rig {
+        window: AnyWindowHandle,
+        slide: Rc<Slide>,
+        scroll: ScrollHandle,
+    }
+
+    impl Rig {
+        fn new(cx: &mut TestAppContext, distance: f32, user_scroll: bool) -> Self {
+            let slide = Rc::new(Slide { distance: Cell::new(distance), user_scroll, reported: RefCell::new(Vec::new()) });
+            let scroll = ScrollHandle::new();
+            let window = cx.open_window(size(px(400.), px(400.)), {
+                let (slide, scroll) = (slide.clone(), scroll.clone());
+                move |_, _| SlidePage { slide, scroll }
+            });
+            let window = AnyWindowHandle::from(window);
+            cx.update_window(window, |_, window, cx| {
+                let patched = slide.clone();
+                window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                    let element = unit_for(&patched);
+                    match window.repaint_in_place(vec![(ElementId::from(UNIT), element)], cx, |_, _| true) {
+                        Ok(outcome) => {
+                            patched.reported.borrow_mut().extend(outcome.scroll_extents.iter().map(|change| change.content));
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                })));
+                // The second frame replays the unit, which registers it again.
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+                window.present_cached_frame();
+            })
+            .unwrap();
+            Self { window, slide, scroll }
+        }
+
+        fn tick(&self, cx: &mut TestAppContext, distance: f32) {
+            self.slide.distance.set(distance);
+            cx.update_window(self.window, |_, window, cx| {
+                window.request_tick();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn draw_whole(&self, cx: &mut TestAppContext) {
+            cx.update_window(self.window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        fn patches(&self, cx: &mut TestAppContext) -> PatchCounters {
+            cx.update_window(self.window, |_, window, _| window.patch_counters()).unwrap()
+        }
+    }
+
+    #[gpui::test]
+    fn a_tick_that_slides_a_card_out_of_a_scroller_that_hides_its_overflow_moves_the_range_in_the_patched_frame(
+        cx: &mut TestAppContext,
+    ) {
+        let rig = Rig::new(cx, 0., false);
+        assert_eq!(rig.scroll.max_offset(), point(px(0.), px(0.)));
+        for (tick, distance) in [100., 150., 90., 20.].into_iter().enumerate() {
+            rig.tick(cx, distance);
+            let patches = rig.patches(cx);
+            assert_eq!((patches.patched_frames, patches.total_declines()), (tick as u64 + 1, 0), "distance {distance}");
+            let patched = rig.scroll.max_offset();
+            assert_eq!(patched, point(px((distance + 40. - 100.).max(0.)), px(0.)), "distance {distance}");
+            rig.draw_whole(cx);
+            assert_eq!(rig.scroll.max_offset(), patched, "the frame built whole has the range of the patch at {distance}");
+        }
+        let reported = rig.slide.reported.borrow();
+        // The tick to 20 moves the content from 130 to 60 wide, which is the last report.
+        assert_eq!(reported.first().copied(), Some(size(px(140.), px(50.))));
+        assert_eq!(reported.last().copied(), Some(size(px(60.), px(50.))));
+    }
+
+    #[gpui::test]
+    fn a_tick_inside_the_scroller_still_reports_the_size_of_its_content(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx, 0., false);
+        // The card stays within the root until 10, and the root within the scroller until it passes 100.
+        rig.tick(cx, 10.);
+        assert!(rig.slide.reported.borrow().is_empty(), "the content is as wide as the root still");
+        rig.tick(cx, 20.);
+        rig.tick(cx, 30.);
+        let patches = rig.patches(cx);
+        assert_eq!((patches.patched_frames, patches.total_declines()), (3, 0));
+        assert_eq!(*rig.slide.reported.borrow(), [size(px(60.), px(50.)), size(px(70.), px(50.))]);
+        assert_eq!(rig.scroll.max_offset(), point(px(0.), px(0.)));
+    }
+
+    #[gpui::test]
+    fn a_tick_that_shrinks_the_range_under_the_offset_is_declined_and_the_frame_clamps(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx, 100., false);
+        assert_eq!(rig.scroll.max_offset(), point(px(40.), px(0.)));
+        rig.scroll.set_offset(point(px(-40.), px(0.)));
+        rig.draw_whole(cx);
+        assert_eq!(rig.scroll.offset(), point(px(-40.), px(0.)));
+        let before = rig.patches(cx);
+
+        rig.tick(cx, 80.);
+        let patches = rig.patches(cx);
+        assert_eq!(patches.declines(PatchDecline::ScrollExtent) - before.declines(PatchDecline::ScrollExtent), 1);
+        assert_eq!(patches.patched_frames, before.patched_frames);
+        assert_eq!(rig.scroll.max_offset(), point(px(20.), px(0.)));
+        assert_eq!(rig.scroll.offset(), point(px(-20.), px(0.)), "the frame built whole clamped the offset");
+
+        // The offset is within the range now: a tick that widens it is patched.
+        rig.tick(cx, 90.);
+        let patches = rig.patches(cx);
+        assert_eq!(patches.total_declines() - before.total_declines(), 1);
+        assert_eq!(rig.scroll.max_offset(), point(px(30.), px(0.)));
+        assert_eq!(rig.scroll.offset(), point(px(-20.), px(0.)));
+    }
+
+    #[gpui::test]
+    fn a_scroller_that_paints_scrollbars_is_declined_when_its_range_changes(cx: &mut TestAppContext) {
+        let rig = Rig::new(cx, 0., true);
+        let before = rig.patches(cx);
+        // The content stays within the scroller's width: no thumb moves.
+        rig.tick(cx, 30.);
+        let patches = rig.patches(cx);
+        assert_eq!((patches.patched_frames - before.patched_frames, patches.total_declines()), (1, before.total_declines()));
+
+        rig.tick(cx, 100.);
+        let patches = rig.patches(cx);
+        assert_eq!(patches.declines(PatchDecline::ScrollExtent) - before.declines(PatchDecline::ScrollExtent), 1);
+        assert_eq!(rig.scroll.max_offset(), point(px(40.), px(0.)), "the frame built whole has the range");
     }
 }

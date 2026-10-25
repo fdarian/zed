@@ -1610,7 +1610,7 @@ impl Window {
         self.next_frame.retained_recordings.push((key, origin));
     }
 
-    fn layout_engine(&self) -> &TaffyLayoutEngine {
+    pub(super) fn layout_engine(&self) -> &TaffyLayoutEngine {
         self.layout_engine
             .as_ref()
             .expect("the layout engine is out of the window only while it computes layout")

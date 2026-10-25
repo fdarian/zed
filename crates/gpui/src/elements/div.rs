@@ -2459,28 +2459,11 @@ impl Div {
         }
         self.interactivity.content_end = Some(child_max - bounds.origin);
         self.interactivity.scroll_extent = if self.interactivity.scroll_offset.is_some() {
-            let insets = window.layout_insets(request_layout.layout_id);
-            let unsnapped = window.layout_unsnapped_bounds(request_layout.layout_id);
-            let reach = window
-                .layout_unsnapped_scrollable_overflow(request_layout.layout_id)
-                .unwrap_or_default();
-            let scrollbar_size = self.interactivity.scrollbar_size;
-            Some(ScrollExtent {
-                content: size(
-                    reach.width - insets.border.left + insets.padding.right,
-                    reach.height - insets.border.top + insets.padding.bottom,
-                ),
-                client: size(
-                    unsnapped.size.width
-                        - insets.border.left
-                        - insets.border.right
-                        - scrollbar_size.width,
-                    unsnapped.size.height
-                        - insets.border.top
-                        - insets.border.bottom
-                        - scrollbar_size.height,
-                ),
-            })
+            Some(ScrollExtent::measure(
+                request_layout.layout_id,
+                self.interactivity.scrollbar_size,
+                window,
+            ))
         } else {
             None
         };
@@ -2834,6 +2817,49 @@ pub(crate) struct ScrollExtent {
     pub(crate) content: Size<Pixels>,
     /// The padding box less the space reserved for scrollbars.
     pub(crate) client: Size<Pixels>,
+}
+
+impl ScrollExtent {
+    /// The extent of the scroller `layout_id` from its layout as it is now, in the prepaint of the
+    /// scroller or, for a patch, once the transforms below it moved.
+    pub(crate) fn measure(layout_id: LayoutId, scrollbar_size: Size<Pixels>, window: &mut Window) -> Self {
+        let insets = window.layout_insets(layout_id);
+        let border_box = window.layout_unsnapped_size(layout_id);
+        let reach = window
+            .layout_unsnapped_scrollable_overflow(layout_id)
+            .unwrap_or_default();
+        Self {
+            content: size(
+                reach.width - insets.border.left + insets.padding.right,
+                reach.height - insets.border.top + insets.padding.bottom,
+            ),
+            client: size(
+                border_box.width - insets.border.left - insets.border.right - scrollbar_size.width,
+                border_box.height - insets.border.top - insets.border.bottom - scrollbar_size.height,
+            ),
+        }
+    }
+
+    /// How far each axis scrolls, see [`max_scroll_offset`].
+    pub(crate) fn max_offset(&self, scale_factor: f32) -> Point<Pixels> {
+        point(
+            max_scroll_offset(self.content.width, self.client.width, scale_factor),
+            max_scroll_offset(self.content.height, self.client.height, scale_factor),
+        )
+    }
+}
+
+/// A scroller of the frame that prepainted it, which a patch finds again to move its range when
+/// the transforms below it ticked.
+#[derive(Clone)]
+pub(crate) struct ScrollerRecord {
+    pub(crate) layout_id: LayoutId,
+    pub(crate) extent: ScrollExtent,
+    pub(crate) offset: Rc<RefCell<Point<Pixels>>>,
+    /// Where the range is kept for those who read it from outside the element.
+    pub(crate) handle: Option<ScrollHandle>,
+    /// The axes that the wheel and the keys scroll, which is where a bar is painted.
+    pub(crate) user_scroll: Point<bool>,
 }
 
 /// The interactivity struct. Powers all of the general-purpose
@@ -3439,14 +3465,12 @@ impl Interactivity {
             let rem_size = window.rem_size();
             let padding = style.padding.to_pixels(bounds.size.into(), rem_size);
             let border = style.border_widths.to_pixels(rem_size);
+            let user_scroll = point(
+                style.overflow.x == Overflow::Scroll && !self.programmatic_scroll_only.x,
+                style.overflow.y == Overflow::Scroll && !self.programmatic_scroll_only.y,
+            );
             let scroll_max = match self.scroll_extent {
-                Some(extent) => {
-                    let scale_factor = window.scale_factor();
-                    point(
-                        max_scroll_offset(extent.content.width, extent.client.width, scale_factor),
-                        max_scroll_offset(extent.content.height, extent.client.height, scale_factor),
-                    )
-                }
+                Some(extent) => extent.max_offset(window.scale_factor()),
                 // A scroller that is not a `Div` (a list) knows only the size of its content.
                 None => {
                     let padding_size =
@@ -3488,14 +3512,22 @@ impl Interactivity {
                     window,
                 );
             }
+            if let (Some(layout_id), Some(extent), Some(offset)) =
+                (self.layout_id, self.scroll_extent, self.scroll_offset.clone())
+            {
+                window.record_scroller(ScrollerRecord {
+                    layout_id,
+                    extent,
+                    offset,
+                    handle: self.tracked_scroll_handle.clone(),
+                    user_scroll,
+                });
+            }
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.scale_factor = Some(window.scale_factor());
                 scroll_handle_state.bounds = bounds;
-                scroll_handle_state.user_scroll = point(
-                    style.overflow.x == Overflow::Scroll && !self.programmatic_scroll_only.x,
-                    style.overflow.y == Overflow::Scroll && !self.programmatic_scroll_only.y,
-                );
+                scroll_handle_state.user_scroll = user_scroll;
                 scroll_handle_state.scrollbar_size = self.scrollbar_size;
                 scroll_handle_state.padding_box = Bounds::new(
                     point(bounds.origin.x + border.left, bounds.origin.y + border.top),
@@ -5458,6 +5490,15 @@ enum ScrollStrategy {
 #[derive(Clone, Debug)]
 pub struct ScrollHandle(Rc<RefCell<ScrollHandleState>>);
 
+/// Two handles are equal when they are the same handle, not when they hold the same offset.
+impl PartialEq for ScrollHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ScrollHandle {}
+
 impl Default for ScrollHandle {
     fn default() -> Self {
         Self::new()
@@ -5556,6 +5597,11 @@ impl ScrollHandle {
     /// scrolls only when code says so.
     pub fn user_scrollable(&self) -> Point<bool> {
         self.0.borrow().user_scroll
+    }
+
+    /// Gives the handle the range of a patch (see [`Window::repaint_in_place`]).
+    pub(crate) fn set_max_offset(&self, max_offset: Point<Pixels>) {
+        self.0.borrow_mut().max_offset = max_offset;
     }
 
     /// Return the bounds into which this child is painted

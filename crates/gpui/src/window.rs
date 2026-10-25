@@ -74,7 +74,7 @@ mod prompts;
 mod retained;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
-pub use patch::{PatchCounters, PatchDecline, PatchOutcome};
+pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
 pub(crate) use retained::{
@@ -1539,6 +1539,9 @@ pub(crate) struct Frame {
     /// What a layout-only pass publishes once the whole tree is prepainted. See
     /// [`Window::publish_layout`].
     layout_publications: Vec<LayoutPublication>,
+    /// The scrollers prepainted this frame, for a patch to move the range of the ones that
+    /// contain what it repaints (see [`Window::move_scroll_ranges`]).
+    scrollers: Vec<crate::elements::ScrollerRecord>,
     /// The element states of the retained subtrees (see [`crate::retained`]) recorded this
     /// frame, so that a rolled-back prepaint can drop the recordings it made.
     retained_recordings: Vec<((GlobalElementId, TypeId), Rc<Origin>)>,
@@ -1566,6 +1569,7 @@ pub(crate) struct PrepaintStateIndex {
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
     layout_publications_index: usize,
+    scrollers_index: usize,
     retained_recordings_index: usize,
     line_layout_index: LineLayoutIndex,
     /// The innermost enclosing hitbox when the snapshot was taken.
@@ -1592,6 +1596,7 @@ impl PrepaintStateIndex {
                 from.layout_publications_index,
                 to.layout_publications_index,
             ),
+            scrollers_index: moved(self.scrollers_index, from.scrollers_index, to.scrollers_index),
             retained_recordings_index: moved(
                 self.retained_recordings_index,
                 from.retained_recordings_index,
@@ -1717,6 +1722,7 @@ impl Frame {
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
             layout_publications: Vec::new(),
+            scrollers: Vec::new(),
             retained_recordings: Vec::new(),
             patchable: FxHashMap::default(),
 
@@ -1745,6 +1751,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.layout_publications.clear();
+        self.scrollers.clear();
         self.retained_recordings.clear();
         self.patchable.clear();
         self.hitboxes.clear();
@@ -5838,6 +5845,7 @@ impl Window {
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             layout_publications_index: self.next_frame.layout_publications.len(),
+            scrollers_index: self.next_frame.scrollers.len(),
             retained_recordings_index: self.next_frame.retained_recordings.len(),
             line_layout_index: self.text_system.layout_index(),
             hitbox_parent: self.hitbox_parent_stack.last().copied(),
@@ -5905,6 +5913,10 @@ impl Window {
         if reused_subtree.contains_focus() {
             self.next_frame.focus = self.focus;
         }
+
+        self.next_frame
+            .scrollers
+            .extend_from_slice(&self.rendered_frame.scrollers[range.start.scrollers_index..range.end.scrollers_index]);
 
         self.next_frame.deferred_draws.extend(
             self.rendered_frame.deferred_draws
@@ -7118,6 +7130,7 @@ impl Window {
             self.next_frame
                 .layout_publications
                 .truncate(index.layout_publications_index);
+            self.next_frame.scrollers.truncate(index.scrollers_index);
             // What a retained subtree recorded in the attempt indexes the vectors truncated above.
             for (key, origin) in self
                 .next_frame
@@ -8768,6 +8781,16 @@ impl Window {
     pub fn layout_parent_bounds(&mut self, layout_id: LayoutId) -> Option<Bounds<Pixels>> {
         let parent = self.layout_engine.as_ref().unwrap().layout_parent(layout_id)?;
         Some(self.layout_bounds(parent))
+    }
+
+    /// Notes a scroller prepainted in this frame for [`Window::move_scroll_ranges`]. One in an atomic
+    /// inline is in an engine of its own, whose ids a patch cannot look up.
+    pub(crate) fn record_scroller(&mut self, scroller: crate::elements::ScrollerRecord) {
+        self.invalidator.debug_assert_prepaint();
+
+        if self.borrowed_layout_engine.is_none() {
+            self.next_frame.scrollers.push(scroller);
+        }
     }
 
     /// Marks a layout node as belonging to another layer, like a popup or a portal: it and its

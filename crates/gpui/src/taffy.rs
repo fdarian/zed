@@ -1696,6 +1696,11 @@ impl TaffyLayoutEngine {
         self.meta(id).transform.as_ref().map(|transform| transform.resolve(border_box))
     }
 
+    /// Changes whenever the extents of some node may have, see [`NodeMeta::transform`].
+    pub(crate) fn extent_epoch(&self) -> u64 {
+        self.extent_epoch
+    }
+
     /// The layout parent of a node, if it has one.
     pub fn layout_parent(&self, id: LayoutId) -> Option<LayoutId> {
         self.taffy.parent(id.0).map(LayoutId)
