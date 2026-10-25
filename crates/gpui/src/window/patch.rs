@@ -683,7 +683,7 @@ impl Window {
         units: &mut [ResolvedUnit],
         cx: &mut App,
     ) -> Result<(Vec<UnitRun>, Vec<ScrollRangeMove>), PatchDecline> {
-        let extent_epoch = self.layout_engine().extent_epoch();
+        let extent_changes = self.layout_engine().extent_changes();
         let mut runs = Vec::with_capacity(units.len());
         for unit in units.iter_mut() {
             let around = unit.unit.clone();
@@ -694,7 +694,7 @@ impl Window {
             runs.push(run?);
         }
         let roots: Vec<LayoutId> = units.iter().map(|unit| unit.source.root).collect();
-        let moves = self.scroll_range_moves(&roots, extent_epoch)?;
+        let moves = self.scroll_range_moves(&roots, extent_changes)?;
         Ok((runs, moves))
     }
 
@@ -702,8 +702,8 @@ impl Window {
     /// once every root has laid out again. A scroller is not prepainted by a patch, so its range is
     /// worked out here; the patch is declined when the frame would show the difference, which a
     /// frame built whole shows.
-    fn scroll_range_moves(&mut self, roots: &[LayoutId], extent_epoch: u64) -> Result<Vec<ScrollRangeMove>, PatchDecline> {
-        if self.layout_engine().extent_epoch() == extent_epoch || self.rendered_frame.scrollers.is_empty() {
+    fn scroll_range_moves(&mut self, roots: &[LayoutId], extent_changes: u64) -> Result<Vec<ScrollRangeMove>, PatchDecline> {
+        if self.layout_engine().extent_changes() == extent_changes || self.rendered_frame.scrollers.is_empty() {
             return Ok(Vec::new());
         }
         let mut around: FxHashSet<LayoutId> = FxHashSet::default();

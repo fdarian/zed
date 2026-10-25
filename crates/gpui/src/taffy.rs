@@ -266,7 +266,7 @@ struct NodeMeta {
     anchor_restyled: bool,
     /// The node's `transform`, which is no concern of layout: it moves what is painted, and the
     /// extents below count the boxes where it puts them. Nothing but an extent reads it, so a
-    /// change of it is no change of layout, only of the extents (see `extent_epoch`).
+    /// change of it is no change of layout, only of the extents (see `transform_changes`).
     transform: Option<ElementTransform>,
 }
 
@@ -342,10 +342,13 @@ pub struct TaffyLayoutEngine {
     scroll_reaches: FxHashMap<LayoutId, Memo<ScrollReach>>,
     /// [`Self::scroll_reaches`] from the unsnapped boxes, which are not the snapped ones' values.
     unsnapped_scroll_reaches: FxHashMap<LayoutId, Memo<ScrollReach>>,
-    /// Changes when a node became or stopped being static, escapable or detached, or got another
-    /// `transform`, with no change to its layout, which no layout generation follows, so that no
-    /// extent computed before is kept.
+    /// Changes when a node became or stopped being static, escapable or detached with no change
+    /// to its layout, which no layout generation follows, so that no extent computed before is kept.
     extent_epoch: u64,
+    /// How many times a node got another `transform`, with no change to its layout. The extents
+    /// of the node and of what it is in are forgotten when it does (see
+    /// [`Self::forget_extents_from`]): the ones of what is beside it are as they were.
+    transform_changes: u64,
     /// The nodes that were detached when their request reset that, to be checked once the
     /// requests are done, for the ones that stopped being.
     detach_rechecks: Vec<LayoutId>,
@@ -478,6 +481,7 @@ impl TaffyLayoutEngine {
             scroll_reaches: FxHashMap::default(),
             unsnapped_scroll_reaches: FxHashMap::default(),
             extent_epoch: 0,
+            transform_changes: 0,
             detach_rechecks: Vec::new(),
             calcs_after_sweep: 0,
             keys: FxHashMap::default(),
@@ -1015,12 +1019,10 @@ impl TaffyLayoutEngine {
             || old.unforced_width.is_some();
         let requested = old.requested.take();
         let escapable_kind = |meta: &NodeMeta| meta.escapable.as_deref().map(|escapable| escapable.kind);
-        if old.is_static != meta.is_static
-            || escapable_kind(old) != escapable_kind(&meta)
-            || old.transform != meta.transform
-        {
+        if old.is_static != meta.is_static || escapable_kind(old) != escapable_kind(&meta) {
             self.extent_epoch += 1;
         }
+        let transform_changed = old.transform != meta.transform;
         meta.was_detached = old.detached;
         if old.detached {
             self.detach_rechecks.push(id);
@@ -1055,6 +1057,10 @@ impl TaffyLayoutEngine {
         }
         if let Some(escapable_requested) = escapable_requested {
             self.meta_mut(id).requested.get_or_insert(escapable_requested);
+        }
+        if transform_changed {
+            self.transform_changes += 1;
+            self.forget_extents_from(id);
         }
         was_measured
     }
@@ -1696,9 +1702,21 @@ impl TaffyLayoutEngine {
         self.meta(id).transform.as_ref().map(|transform| transform.resolve(border_box))
     }
 
-    /// Changes whenever the extents of some node may have, see [`NodeMeta::transform`].
-    pub(crate) fn extent_epoch(&self) -> u64 {
-        self.extent_epoch
+    /// Changes whenever the extents of some node may have changed with no change to its layout.
+    pub(crate) fn extent_changes(&self) -> u64 {
+        self.extent_epoch + self.transform_changes
+    }
+
+    /// Forgets the extents kept for `id` and for every node it is in, which a change of the
+    /// `transform` of `id` changes: a tick of a transform costs the nodes around it, not the page.
+    fn forget_extents_from(&mut self, id: LayoutId) {
+        let mut node = Some(id);
+        while let Some(current) = node {
+            self.painted_extents.remove(&current);
+            self.scroll_reaches.remove(&current);
+            self.unsnapped_scroll_reaches.remove(&current);
+            node = self.taffy.parent(current.0).map(LayoutId);
+        }
     }
 
     /// The layout parent of a node, if it has one.
