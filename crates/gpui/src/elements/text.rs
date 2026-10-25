@@ -1611,6 +1611,27 @@ impl TextLayout {
         Pixels::ZERO
     }
 
+    /// How wide the hyphen is that the row ending at the byte `index` is given, when it breaks at
+    /// a soft hyphen there: zero if `index` is not where a hyphenated row ends. The hyphen is no
+    /// part of the text, so the box of an element that holds the soft hyphen is that much wider
+    /// on the row, as it is in Chrome.
+    pub fn hyphen_width_at_break(&self, index: usize) -> Pixels {
+        let element_state = self.0.borrow();
+        let element_state = element_state
+            .as_ref()
+            .expect("measurement has not been performed");
+        let mut line_start_ix = 0;
+        for line in element_state.lines.iter() {
+            let line_end_ix = line_start_ix + line.len();
+            if index > line_end_ix {
+                line_start_ix = line_end_ix + 1;
+                continue;
+            }
+            return line.layout.hyphen_width_at_break(index.saturating_sub(line_start_ix));
+        }
+        Pixels::ZERO
+    }
+
     /// The space `text-box-trim` cut above the first line and below the last, as
     /// measured. Zero before the text is measured and for an untrimmed text.
     pub fn text_box_trim_amounts(&self) -> (Pixels, Pixels) {

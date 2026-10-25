@@ -1,7 +1,7 @@
 use crate::{
     App, Bounds, DecorationThickness, DevicePixels, ExtraDecoration, FontId, FontSmoothing, GlyphInset, Half, Hsla, LineLayout, RowMetrics,
     OverlineStyle, Pixels, Point, RenderGlyphParams, Result, ShapedRun, SharedString,
-    StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
+    Hyphen, StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
@@ -132,6 +132,7 @@ impl ShapedLine {
             &[],
             &[],
             &[],
+            &[],
             PaintScope::Ungrouped,
             window,
             cx,
@@ -157,6 +158,7 @@ impl ShapedLine {
             align,
             align_width,
             &self.decoration_runs,
+            &[],
             &[],
             &[],
             PaintScope::Ungrouped,
@@ -276,6 +278,7 @@ impl LineLayout {
             &[],
             &[],
             &[],
+            &[],
             PaintScope::Ungrouped,
             window,
             cx,
@@ -304,6 +307,7 @@ impl LineLayout {
             align,
             align_width,
             decoration_runs,
+            &[],
             &[],
             &[],
             PaintScope::Ungrouped,
@@ -356,6 +360,7 @@ impl WrappedLine {
             &self.wrap_boundaries,
             &self.hanging_widths,
             &self.layout.insets,
+            self.layout.row_hyphens(),
             PaintScope::Ungrouped,
             window,
             cx,
@@ -390,6 +395,7 @@ impl WrappedLine {
             &self.decoration_runs,
             &self.wrap_boundaries,
             &self.hanging_widths,
+            self.layout.row_hyphens(),
             scope,
             window,
             cx,
@@ -404,6 +410,7 @@ impl WrappedLine {
             &self.wrap_boundaries,
             &self.hanging_widths,
             &self.layout.insets,
+            self.layout.row_hyphens(),
             scope,
             window,
             cx,
@@ -429,6 +436,7 @@ impl WrappedLine {
             layout,
             self.wrap_boundaries.get(row_ix).as_ref(),
             hanging_width(&self.hanging_widths, row_ix),
+            self.layout.hyphen_width(row_ix),
         )
     }
 
@@ -496,6 +504,7 @@ impl WrappedLine {
                     layout,
                     self.wrap_boundaries.get(object.row_ix).as_ref(),
                     hanging_width(&self.hanging_widths, object.row_ix),
+                    self.layout.hyphen_width(object.row_ix),
                 );
                 (object.index, point(row_x + object.x, origin.y + object.y))
             })
@@ -526,6 +535,7 @@ impl WrappedLine {
             &self.decoration_runs,
             &self.wrap_boundaries,
             &self.hanging_widths,
+            self.layout.row_hyphens(),
             PaintScope::Ungrouped,
             window,
             cx,
@@ -573,6 +583,7 @@ fn paint_line(
     wrap_boundaries: &[WrapBoundary],
     hanging_widths: &[Pixels],
     insets: &[GlyphInset],
+    hyphens: &[(usize, Hyphen)],
     scope: PaintScope,
     window: &mut Window,
     cx: &mut App,
@@ -604,6 +615,7 @@ fn paint_line(
                 layout,
                 wraps.peek(),
                 hanging_width(hanging_widths, 0),
+                hyphen_width(hyphens, 0, layout.scale_factor),
             ),
             origin.y,
         );
@@ -629,10 +641,12 @@ fn paint_line(
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
-                    // The spaces that hang past the end of a row are not decorated.
-                    let end_x = glyph_origin.x
-                        - previous_trailing
-                        - hanging_width(hanging_widths, line_ix);
+                    // The spaces that hang past the end of a row are not decorated, and the
+                    // hyphen a soft hyphen adds to it is.
+                    let hyphen_end = hyphen_width(hyphens, line_ix, layout.scale_factor);
+                    let end_x = glyph_origin.x - previous_trailing
+                        - hanging_width(hanging_widths, line_ix)
+                        + hyphen_end;
                     let carried_on = glyph.index < run_end;
                     for line in std::mem::take(&mut open) {
                         finish_decoration_line(
@@ -647,6 +661,37 @@ fn paint_line(
                         }
                     }
 
+                    // The hyphen is in the style of the text before the break: `color`, `group`
+                    // and `font_smoothing` are still those of the glyph before this one.
+                    if let Some((_, hyphen)) = hyphens.iter().find(|(row, _)| *row == line_ix)
+                        && scope.admits(group)
+                    {
+                        let hyphen_origin = point(
+                            glyph_origin.x - previous_trailing,
+                            glyph_origin.y
+                                + rows[line_ix].baseline
+                                - line_rows.raise(hyphen.run_ix, line_ix),
+                        );
+                        let hyphen_size = text_system.bounding_box(hyphen.font_id, hyphen.font_size).size;
+                        let reach = hyphen_size.width.max(hyphen_size.height);
+                        let hyphen_bounds = Bounds {
+                            origin: point(hyphen_origin.x, glyph_origin.y),
+                            size: hyphen_size,
+                        };
+                        if window.paints_glyphs_outside_the_mask()
+                            || hyphen_bounds.dilate(reach).intersects(&window.content_mask().bounds)
+                        {
+                            window.paint_glyph(
+                                hyphen_origin,
+                                hyphen.font_id,
+                                hyphen.glyph_id,
+                                hyphen.font_size,
+                                color,
+                                font_smoothing,
+                            )?;
+                        }
+                    }
+
                     glyph_origin.y += rows[line_ix].height;
                     line_ix += 1;
                     glyph_origin.x = aligned_origin_x(
@@ -657,6 +702,7 @@ fn paint_line(
                         layout,
                         wraps.peek(),
                         hanging_width(hanging_widths, line_ix),
+                        hyphen_width(hyphens, line_ix, layout.scale_factor),
                     );
                     for line in &mut open {
                         line.x = glyph_origin.x + leading;
@@ -857,6 +903,7 @@ fn paint_line_background(
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
     hanging_widths: &[Pixels],
+    hyphens: &[(usize, Hyphen)],
     scope: PaintScope,
     window: &mut Window,
     cx: &mut App,
@@ -884,6 +931,7 @@ fn paint_line_background(
                 layout,
                 wraps.peek(),
                 hanging_width(hanging_widths, 0),
+                hyphen_width(hyphens, 0, layout.scale_factor),
             ),
             origin.y,
         );
@@ -906,7 +954,8 @@ fn paint_line_background(
                                 Bounds {
                                     origin: *background_origin,
                                     size: size(
-                                        glyph_origin.x - background_origin.x,
+                                        glyph_origin.x - background_origin.x
+                                            + hyphen_width(hyphens, line_ix, layout.scale_factor),
                                         rows[line_ix].height,
                                     ),
                                 },
@@ -931,6 +980,7 @@ fn paint_line_background(
                         layout,
                         wraps.peek(),
                         hanging_width(hanging_widths, line_ix),
+                        hyphen_width(hyphens, line_ix, layout.scale_factor),
                     );
                 }
                 prev_glyph_position = glyph.position;
@@ -1199,6 +1249,14 @@ fn hanging_width(hanging_widths: &[Pixels], line_ix: usize) -> Pixels {
     hanging_widths.get(line_ix).copied().unwrap_or(Pixels::ZERO)
 }
 
+/// How much wider row `row_ix` is for the hyphen it ends with, if it has one.
+fn hyphen_width(hyphens: &[(usize, Hyphen)], row_ix: usize, scale_factor: f32) -> Pixels {
+    hyphens
+        .iter()
+        .find(|(hyphenated, _)| *hyphenated == row_ix)
+        .map_or(Pixels::ZERO, |(_, hyphen)| hyphen.snapped_width(scale_factor))
+}
+
 fn aligned_origin_x(
     origin: Point<Pixels>,
     align_width: Pixels,
@@ -1207,6 +1265,7 @@ fn aligned_origin_x(
     layout: &LineLayout,
     wrap_boundary: Option<&&WrapBoundary>,
     hanging_width: Pixels,
+    hyphen_width: Pixels,
 ) -> Pixels {
     let end_of_line = if let Some(WrapBoundary { run_ix, glyph_ix }) = wrap_boundary {
         layout.runs[*run_ix].glyphs[*glyph_ix].position.x
@@ -1214,7 +1273,7 @@ fn aligned_origin_x(
         layout.width
     };
 
-    let line_width = end_of_line - last_glyph_x - hanging_width;
+    let line_width = end_of_line - last_glyph_x - hanging_width + hyphen_width;
 
     match align {
         TextAlign::Left => origin.x,
@@ -1546,6 +1605,17 @@ mod tests {
         boundary: Option<WrapBoundary>,
         hanging: f32,
     ) -> Pixels {
+        aligned_hyphenated(layout, align, last_glyph_x, boundary, hanging, 0.)
+    }
+
+    fn aligned_hyphenated(
+        layout: &LineLayout,
+        align: TextAlign,
+        last_glyph_x: f32,
+        boundary: Option<WrapBoundary>,
+        hanging: f32,
+        hyphen: f32,
+    ) -> Pixels {
         aligned_origin_x(
             point(px(0.), px(0.)),
             px(100.),
@@ -1554,6 +1624,7 @@ mod tests {
             layout,
             boundary.as_ref().as_ref(),
             px(hanging),
+            px(hyphen),
         )
     }
 
@@ -1587,6 +1658,19 @@ mod tests {
         // The last line has nothing hanging here.
         assert_eq!(aligned(layout, TextAlign::Center, 50., None, 0.), px(30.));
         assert_eq!(aligned(layout, TextAlign::Right, 50., None, 0.), px(60.));
+    }
+
+    #[test]
+    fn test_a_hyphen_is_part_of_the_aligned_width() {
+        // "aaaa" and "bbbb" in rows of 40 wide, the first with a hyphen of 6 at its end.
+        let glyphs: Vec<(usize, f32)> = (0..8).map(|ix| (ix, ix as f32 * 10.)).collect();
+        let line = make_shaped_line("aaaabbbb", &glyphs, 80., &[]);
+        let layout = &*line.layout;
+        let boundary = Some(WrapBoundary { run_ix: 0, glyph_ix: 4 });
+        assert_eq!(aligned_hyphenated(layout, TextAlign::Left, 0., boundary, 0., 6.), px(0.));
+        assert_eq!(aligned_hyphenated(layout, TextAlign::Center, 0., boundary, 0., 6.), px(27.));
+        assert_eq!(aligned_hyphenated(layout, TextAlign::Right, 0., boundary, 0., 6.), px(54.));
+        assert_eq!(aligned_hyphenated(layout, TextAlign::Right, 0., boundary, 0., 0.), px(60.));
     }
 
     #[test]
@@ -1636,6 +1720,8 @@ mod tests {
             /// The y of each glyph's baseline, in logical pixels, ascending: the scene
             /// does not keep the sprites in the order of the text.
             glyphs: Vec<f32>,
+            /// The x and y of every glyph sprite, in logical pixels, in the order of the scene.
+            sprites: Vec<(f32, f32)>,
             /// The y and the height of each quad.
             quads: Vec<(f32, f32)>,
             /// The y and the thickness of each underline and strikethrough.
@@ -1773,8 +1859,14 @@ mod tests {
                     .map(|sprite| sprite.bounds.origin.y.0 / scale)
                     .collect::<Vec<_>>();
                 glyphs.sort_by(f32::total_cmp);
+                let sprites = scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| (sprite.bounds.origin.x.0 / scale, sprite.bounds.origin.y.0 / scale))
+                    .collect();
                 Painted {
                     layout: wrapped,
+                    sprites,
                     rows,
                     row_tops,
                     glyphs,
@@ -1810,6 +1902,59 @@ mod tests {
             for (ix, (actual, expected)) in actual.iter().zip(expected).enumerate() {
                 assert_close(*actual, *expected, &format!("{context} {ix}"));
             }
+        }
+
+        /// Ten pixel characters in a box of 60: a row holds ten.
+        #[test]
+        fn a_row_that_breaks_at_a_soft_hyphen_is_painted_with_a_hyphen_that_is_not_text() {
+            let text = "aaaaa\u{AD}bbbbbbbbbb";
+            let painted = paint(text, vec![plain(text.len())]);
+            let layout = &painted.layout;
+            assert_eq!(layout.wrap_boundaries().len(), 1);
+            let hyphen = layout.hyphen_of_row(0).expect("the first row breaks at the soft hyphen");
+            assert_eq!(layout.hyphen_of_row(1), None, "the last row is not hyphenated");
+            // The hyphen is a character of the font the row is in, one em tenth of 6 pixels wide.
+            assert_close(f32::from(hyphen.advance), 6., "hyphen advance");
+
+            // The row is as wide as its glyphs and the hyphen: 6 characters, then the hyphen.
+            let widths: Vec<f32> = layout.line_widths().map(f32::from).collect();
+            assert_eq!(widths.len(), 2);
+            assert!((widths[0] - 42.).abs() < 0.05, "{widths:?}");
+            assert!((widths[1] - 60.).abs() < 0.05, "{widths:?}");
+
+            // 16 glyphs are text, the 17th is the hyphen, painted where the row's text ends.
+            assert_eq!(painted.sprites.len(), 17);
+            let first_row: Vec<f32> = painted
+                .sprites
+                .iter()
+                .filter(|(_, y)| (*y - painted.baseline(0)).abs() <= 1.)
+                .map(|(x, _)| *x)
+                .collect();
+            assert_eq!(first_row.len(), 7);
+            let end_of_text = 6. * 6.;
+            assert!(
+                first_row.iter().any(|x| (*x - end_of_text).abs() <= 1.),
+                "{first_row:?}"
+            );
+
+            // Nothing in the text is at the hyphen.
+            assert_eq!(layout.index_for_position(point(px(40.), px(5.)), px(LINE_HEIGHT)), Err(7));
+            // The caret at the end of the row is after the text, not after the hyphen.
+            assert_close(
+                f32::from(layout.position_for_index(7, px(LINE_HEIGHT)).unwrap().x),
+                36.,
+                "caret at the break",
+            );
+        }
+
+        #[test]
+        fn a_soft_hyphen_that_does_not_break_the_row_paints_no_hyphen() {
+            // Ten characters fit in a row of 60.
+            let text = "aaaaa\u{AD}bbbb";
+            let painted = paint(text, vec![plain(text.len())]);
+            assert!(painted.layout.wrap_boundaries().is_empty());
+            assert_eq!(painted.layout.hyphen_of_row(0), None);
+            assert_eq!(painted.sprites.len(), 10);
         }
 
         #[test]

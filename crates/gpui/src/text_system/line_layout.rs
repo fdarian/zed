@@ -20,6 +20,7 @@ mod shape_store;
 mod snap;
 
 use self::shape_store::{SHAPE_STORE_BUDGET_BYTES, ShapeStore};
+pub use self::snap::Hyphen;
 pub(super) use self::snap::SnapMarks;
 use self::snap::glyph_positions;
 use super::line_break::LineBreaks;
@@ -1381,6 +1382,10 @@ pub struct WrappedLineLayout {
     /// How wide the line is whole, measured the same way and counting the spaces
     /// that hang.
     snapped_width: Pixels,
+
+    /// The hyphen at the end of each row that breaks at a soft hyphen, by the index of the row.
+    /// Ascending by row.
+    hyphens: Vec<(usize, Hyphen)>,
 }
 
 /// Where the placeholder of an atomic inline sits in a wrapped line: the top left corner
@@ -1418,11 +1423,25 @@ impl WrappedLineLayout {
     ) -> Self {
         let x = glyph_positions(&unwrapped_layout);
         let scale_factor = unwrapped_layout.scale_factor;
+        let hyphens: Vec<(usize, Hyphen)> = computation
+            .line_starts
+            .iter()
+            .skip(1)
+            .enumerate()
+            .filter_map(|(row_ix, start)| Some((row_ix, *marks.hyphen(*start)?)))
+            .collect();
         let line_widths = computation
             .line_starts
             .iter()
             .zip(&computation.line_ends)
-            .map(|(start, end)| marks.width(&x, scale_factor, *start, *end))
+            .enumerate()
+            .map(|(row_ix, (start, end))| {
+                let hyphen = hyphens
+                    .iter()
+                    .find(|(hyphenated, _)| *hyphenated == row_ix)
+                    .map_or(Pixels::ZERO, |(_, hyphen)| hyphen.snapped_width(scale_factor));
+                marks.width(&x, scale_factor, *start, *end) + hyphen
+            })
             .collect();
         let snapped_width = marks.width(&x, scale_factor, 0, x.len() - 1);
         Self {
@@ -1433,7 +1452,43 @@ impl WrappedLineLayout {
             insets: computation.glyph_insets,
             line_widths,
             snapped_width,
+            hyphens,
         }
+    }
+
+    /// The hyphens that end rows, by the index of the row.
+    pub(crate) fn row_hyphens(&self) -> &[(usize, Hyphen)] {
+        &self.hyphens
+    }
+
+    /// The hyphen that ends wrapped row `row_ix`, which breaks at a soft hyphen. It is painted
+    /// after the text of the row and is not part of the text: no index is at it.
+    pub fn hyphen_of_row(&self, row_ix: usize) -> Option<&Hyphen> {
+        self.hyphens
+            .iter()
+            .find(|(hyphenated, _)| *hyphenated == row_ix)
+            .map(|(_, hyphen)| hyphen)
+    }
+
+    /// How wide the hyphen is that the row ending at the byte `index` has, or zero if `index` is not
+    /// where a hyphenated row ends.
+    pub fn hyphen_width_at_break(&self, index: usize) -> Pixels {
+        self.hyphens
+            .iter()
+            .find(|(row_ix, _)| {
+                self.wrap_boundaries.get(*row_ix).is_some_and(|boundary| {
+                    self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index == index
+                })
+            })
+            .map_or(Pixels::ZERO, |(row_ix, _)| self.hyphen_width(*row_ix))
+    }
+
+    /// How much wider wrapped row `row_ix` is for its hyphen, as Chrome counts it, which is what
+    /// alignment places the row by.
+    pub fn hyphen_width(&self, row_ix: usize) -> Pixels {
+        self.hyphen_of_row(row_ix).map_or(Pixels::ZERO, |hyphen| {
+            hyphen.snapped_width(self.unwrapped_layout.scale_factor)
+        })
     }
 
     /// The length of the underlying text, in utf8 bytes.

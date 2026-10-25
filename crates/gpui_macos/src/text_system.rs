@@ -1553,6 +1553,69 @@ mod tests {
         assert_eq!(position.y, px(0.));
     }
 
+    /// A row that breaks at a soft hyphen is as wide as its text and the hyphen Blink adds, which
+    /// the layout knows the font and glyph of; the soft hyphen is not shaped to anything visible.
+    #[test]
+    fn test_a_row_that_breaks_at_a_soft_hyphen_has_a_hyphen_of_the_font_of_its_text() {
+        use gpui::{TextLayoutOptions, TextRun, TextSystem, WindowTextSystem};
+        use std::sync::Arc;
+
+        let fonts = Arc::new(MacTextSystem::new());
+        let text_system = WindowTextSystem::new(Arc::new(TextSystem::new(fonts.clone())));
+        let text = "abc\u{AD}defghijkl";
+        let run = TextRun {
+            len: text.len(),
+            font: font("Helvetica Neue"),
+            ..Default::default()
+        };
+        let lines = |wrap_width: Option<f32>| {
+            text_system
+                .shape_text_inline(
+                    text.into(),
+                    px(16.),
+                    &[run.clone()],
+                    wrap_width.map(px),
+                    None,
+                    TextLayoutOptions::default(),
+                    &[],
+                    &[],
+                    px(20.),
+                )
+                .unwrap()
+        };
+        let whole = lines(None);
+        let whole: &gpui::WrappedLineLayout = &whole[0];
+        let x = |index| f32::from(whole.unwrapped_layout.x_for_index(index));
+        assert!(
+            whole.runs().iter().flat_map(|run| &run.glyphs).all(|glyph| glyph.index != 3),
+            "the soft hyphen is not shaped to a glyph"
+        );
+
+        // "abc" and a hyphen fit, the whole word does not, and the rest of it fills a row.
+        let wrapped = lines(Some(x(14) - x(5) + 2.));
+        let layout: &gpui::WrappedLineLayout = &wrapped[0];
+        assert_eq!(layout.wrap_boundaries().len(), 1);
+        let hyphen = layout.hyphen_of_row(0).expect("the row breaks at the soft hyphen");
+        assert_eq!(layout.hyphen_of_row(1), None);
+        assert_eq!(hyphen.font_id, layout.runs()[0].font_id);
+        assert_eq!(hyphen.font_size, px(16.));
+        let expected = fonts
+            .glyph_for_char(hyphen.font_id, '\u{2010}')
+            .or_else(|| fonts.glyph_for_char(hyphen.font_id, '-'))
+            .unwrap();
+        assert_eq!(hyphen.glyph_id, expected);
+        assert!(hyphen.advance > px(3.) && hyphen.advance < px(10.), "{:?}", hyphen.advance);
+
+        let widths: Vec<f32> = layout.line_widths().map(f32::from).collect();
+        let hyphen_width = f32::from(hyphen.advance);
+        assert!(
+            (widths[0] - (x(3) + hyphen_width)).abs() < 3. / 64.,
+            "{widths:?} abc is {} and the hyphen {hyphen_width}",
+            x(3)
+        );
+        assert!(layout.hyphen_width(0) >= hyphen.advance);
+    }
+
     fn weight_variations(weight: f32) -> FontVariations {
         FontVariations::new([(FontVariations::tag(*b"wght"), weight)])
     }

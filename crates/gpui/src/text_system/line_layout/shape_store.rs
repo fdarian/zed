@@ -13,7 +13,7 @@ use super::{
     AsCacheKeyRef, CacheKey, FontRun, GlyphInset, InlineSpec, LineLayout, PlacedBox, ShapedGlyph,
     ShapedRun, TextInset, WrapBoundary, WrappedLineLayout,
 };
-use crate::Pixels;
+use crate::{Hyphen, Pixels};
 
 /// What the layouts of one window may take, by `estimated_bytes`.
 pub(super) const SHAPE_STORE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -239,6 +239,7 @@ fn wrapped_line_layout_bytes(layout: &WrappedLineLayout) -> usize {
         + layout.hanging_widths.len() * size_of::<Pixels>()
         + layout.line_widths().count() * size_of::<Pixels>()
         + layout.insets.len() * size_of::<GlyphInset>()
+        + layout.row_hyphens().len() * size_of::<(usize, Hyphen)>()
 }
 
 #[cfg(test)]

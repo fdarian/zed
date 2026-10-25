@@ -18,10 +18,37 @@
 
 use super::{LineLayout, LineLayoutCache};
 use super::ShapedRun;
-use crate::{FontId, FontRun, Pixels, px, util::{LAYOUT_UNIT, ceil_layout_units}};
+use crate::{FontId, FontRun, GlyphId, Pixels, px, util::{LAYOUT_UNIT, ceil_layout_units}};
 use gpui_util::ResultExt as _;
 use smallvec::SmallVec;
 use std::ops::Range;
+
+/// The hyphen Blink adds to a line that breaks at a soft hyphen: a glyph of its own after the text
+/// of the row, in the style of the text before the break. It is not part of the text, so no index
+/// of it exists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hyphen {
+    /// The run the glyph before the break is in, whose colour, decorations and baseline the
+    /// hyphen takes.
+    pub run_ix: usize,
+    /// The font of that run: U+2010 if it has the character, and a hyphen-minus if not
+    /// (`ComputedStyle::HyphenString`).
+    pub font_id: FontId,
+    /// The size of that run.
+    pub font_size: Pixels,
+    /// The glyph of the hyphen character in `font_id`.
+    pub glyph_id: GlyphId,
+    /// How far the hyphen advances.
+    pub advance: Pixels,
+}
+
+impl Hyphen {
+    /// How much wider the row is for the hyphen: its advance ceiled to a layout unit
+    /// (`ShapeResult::SnappedWidth`), as the fit test counts it.
+    pub(crate) fn snapped_width(&self, scale_factor: f32) -> Pixels {
+        Pixels(ceil_layout_units(self.advance.0, scale_factor) as f32 * LAYOUT_UNIT / scale_factor)
+    }
+}
 
 /// What Blink's measure of a line needs besides where its glyphs are: where the items start, and
 /// the kerns of the glyphs that follow one. The glyphs are counted through all the runs of the
@@ -33,9 +60,9 @@ pub struct SnapMarks {
     /// The glyphs that follow a kern of a font with no GPOS table, with the part of the kern that
     /// HarfBuzz leaves out of the advance before them. Ascending by glyph.
     kern_shares: Vec<(usize, Pixels)>,
-    /// The glyphs that follow a soft hyphen, with the advance of the hyphen Blink adds to a line
-    /// that breaks before one. Ascending by glyph.
-    hyphens: Vec<(usize, Pixels)>,
+    /// The glyphs that follow a soft hyphen, with the hyphen Blink adds to a line that breaks
+    /// before one. Ascending by glyph.
+    hyphens: Vec<(usize, Hyphen)>,
 }
 
 impl SnapMarks {
@@ -109,12 +136,18 @@ impl SnapMarks {
         ceil_layout_units((measured(glyph) - measured(item.start)).0, scale_factor)
     }
 
+    /// The hyphen a line gets when it breaks before `glyph`, or `None` if `glyph` does not
+    /// follow a soft hyphen.
+    pub(super) fn hyphen(&self, glyph: usize) -> Option<&Hyphen> {
+        let ix = self.hyphens.binary_search_by_key(&glyph, |(ix, _)| *ix).ok()?;
+        Some(&self.hyphens[ix].1)
+    }
+
     /// How wide the hyphen is that a line gets when it breaks before `glyph`, in layout units
     /// (`ShapeResult::SnappedWidth` of the hyphen), or `None` if `glyph` does not follow a soft
-    /// hyphen. The hyphen is not painted, only measured.
+    /// hyphen.
     pub(super) fn hyphen_units(&self, glyph: usize, scale_factor: f32) -> Option<i64> {
-        let ix = self.hyphens.binary_search_by_key(&glyph, |(ix, _)| *ix).ok()?;
-        Some(ceil_layout_units(self.hyphens[ix].1.0, scale_factor))
+        Some(ceil_layout_units(self.hyphen(glyph)?.advance.0, scale_factor))
     }
 
     fn kern_share(&self, glyph: usize) -> Pixels {
@@ -172,43 +205,50 @@ impl LineLayoutCache {
         }
     }
 
-    /// The glyphs of `shaped` that follow a soft hyphen, with the advance of the hyphen Blink draws
-    /// where a line breaks before them: U+2010 if the font of the glyph before has it, and a
-    /// hyphen-minus if not. The soft hyphen itself has no glyph to count on.
-    fn hyphens(&self, shaped: &LineLayout, text: &str) -> Vec<(usize, Pixels)> {
+    /// The glyphs of `shaped` that follow a soft hyphen, with the hyphen Blink draws where a line
+    /// breaks before them: U+2010 if the font of the glyph before has it, and a hyphen-minus if
+    /// not.
+    fn hyphens(&self, shaped: &LineLayout, text: &str) -> Vec<(usize, Hyphen)> {
         if !text.contains('\u{AD}') {
             return Vec::new();
         }
-        let glyphs: Vec<(usize, &ShapedRun)> = shaped
+        let glyphs: Vec<(usize, usize, &ShapedRun)> = shaped
             .runs
             .iter()
-            .flat_map(|run| run.glyphs.iter().map(move |glyph| (glyph.index, run)))
+            .enumerate()
+            .flat_map(|(run_ix, run)| run.glyphs.iter().map(move |glyph| (glyph.index, run_ix, run)))
             .collect();
-        let mut hyphens: Vec<(usize, Pixels)> = Vec::new();
+        let mut hyphens: Vec<(usize, Hyphen)> = Vec::new();
         for (byte, _) in text.match_indices('\u{AD}') {
-            let after = glyphs.partition_point(|(index, _)| *index < byte + '\u{AD}'.len_utf8());
+            let after = glyphs.partition_point(|(index, _, _)| *index < byte + '\u{AD}'.len_utf8());
             let before = after.checked_sub(1).and_then(|glyph| glyphs.get(glyph));
-            if let Some((_, run)) = before
+            if let Some((_, run_ix, run)) = before
                 && after < glyphs.len()
                 && hyphens.last().is_none_or(|(last, _)| *last < after)
-                && let Some(advance) = self.hyphen_advance(run.font_id, run.font_size)
+                && let Some(hyphen) = self.hyphen_glyph(*run_ix, run)
             {
-                hyphens.push((after, advance));
+                hyphens.push((after, hyphen));
             }
         }
         hyphens
     }
 
-    fn hyphen_advance(&self, font_id: FontId, font_size: Pixels) -> Option<Pixels> {
+    fn hyphen_glyph(&self, run_ix: usize, run: &ShapedRun) -> Option<Hyphen> {
         let glyph_id = ['\u{2010}', '-']
             .into_iter()
-            .find_map(|hyphen| self.platform_text_system.glyph_for_char(font_id, hyphen))?;
+            .find_map(|hyphen| self.platform_text_system.glyph_for_char(run.font_id, hyphen))?;
         let advance = self
             .platform_text_system
-            .advance(font_id, glyph_id)
+            .advance(run.font_id, glyph_id)
             .log_err()?;
-        let units_per_em = self.platform_text_system.font_metrics(font_id).units_per_em;
-        Some(px(advance.width / units_per_em as f32 * f32::from(font_size)))
+        let units_per_em = self.platform_text_system.font_metrics(run.font_id).units_per_em;
+        Some(Hyphen {
+            run_ix,
+            font_id: run.font_id,
+            font_size: run.font_size,
+            glyph_id,
+            advance: px(advance.width / units_per_em as f32 * f32::from(run.font_size)),
+        })
     }
 
     /// The part of every legacy kern in `shaped` that HarfBuzz leaves out of the advance of the
@@ -369,7 +409,21 @@ mod tests {
     #[test]
     fn test_a_line_that_breaks_after_a_soft_hyphen_has_the_hyphen_to_fit() {
         let soft_hyphen = |hyphens: &[(usize, f32)]| SnapMarks {
-            hyphens: hyphens.iter().map(|(ix, width)| (*ix, px(*width))).collect(),
+            hyphens: hyphens
+                .iter()
+                .map(|(ix, width)| {
+                    (
+                        *ix,
+                        Hyphen {
+                            run_ix: 0,
+                            font_id: FontId(0),
+                            font_size: px(16.),
+                            glyph_id: GlyphId(0),
+                            advance: px(*width),
+                        },
+                    )
+                })
+                .collect(),
             ..SnapMarks::default()
         };
         let marks = soft_hyphen(&[(4, 5. * UNIT)]);
