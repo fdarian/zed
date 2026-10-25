@@ -659,7 +659,9 @@ fn compute_inner(
     // group then shifts by one offset, with zero inter-item gap.
     if let Some(align_content) = align_content {
         let container_inner_height = container_outer_height - resolved_content_box_inset.vertical_axis_sum();
-        let inflow_content_height = intrinsic_outer_height - resolved_content_box_inset.vertical_axis_sum();
+        // fdarian fork patch: content that ends above the content box (a child with a negative margin) is no taller than
+        // nothing: the padding and border around it are not negative room that `align-content` would fill
+        let inflow_content_height = f32_max(0.0, intrinsic_outer_height - resolved_content_box_inset.vertical_axis_sum());
         let free_space = container_inner_height - inflow_content_height;
         let any_in_flow = items.iter().any(|item| item.final_layout.is_some());
         if any_in_flow {

@@ -2057,6 +2057,63 @@ mod chrome {
         );
     }
 
+    /// A cell with padding above its content, whose line is 30px above its box (`margin-top:-30px`): the content ends above
+    /// the content box, which is no room to align it in, and the row is as tall as the padding when the cell is alone.
+    /// Next to a cell of text the line is on the baseline of the text.
+    ///
+    /// ```html
+    /// <!-- container width: 300px -->
+    /// <table>
+    ///   <tr>
+    ///     <td><!-- next to text only: --><span>A</span></td>
+    ///     <td style="padding-top:4px;padding-bottom:7px;border-bottom:3px solid">
+    ///       <div style="height:10px"><div style="margin-top:-30px">A</div></div>
+    ///     </td>
+    ///   </tr>
+    /// </table>
+    /// ```
+    #[test]
+    fn content_above_the_content_box_of_a_cell_with_padding_is_not_aligned() {
+        let padded = |s: &mut Style| {
+            s.padding.top = length(4.0);
+            s.padding.bottom = length(7.0);
+            s.border.bottom = length(3.0);
+        };
+        let above = || {
+            div(
+                |s| s.size.height = length(10.0),
+                vec![div(|s| s.margin.top = length(-30.0), vec![text(&[20.0], 20.0)])],
+            )
+        };
+        assert_rects(
+            rects_with_baselines(vec![table(|_| {}, vec![tr(|_| {}, vec![td(padded, vec![above()])])])], 300.0),
+            &[
+                [0.0, 0.0, 20.0, 14.0],  // table
+                [0.0, 0.0, 20.0, 14.0],  // tr
+                [0.0, 0.0, 20.0, 14.0],  // td
+                [0.0, -26.0, 20.0, 10.0], // box
+                [0.0, -26.0, 20.0, 20.0], // div
+                [0.0, -26.0, 20.0, 20.0], // line
+            ],
+        );
+        assert_rects(
+            rects_with_baselines(
+                vec![table(|_| {}, vec![tr(|_| {}, vec![td(|_| {}, vec![text(&[20.0], 20.0)]), td(padded, vec![above()])])])],
+                300.0,
+            ),
+            &[
+                [0.0, 0.0, 40.0, 40.0],  // table
+                [0.0, 0.0, 40.0, 40.0],  // tr
+                [0.0, 0.0, 20.0, 40.0],  // td
+                [0.0, 0.0, 20.0, 20.0],  // line
+                [20.0, 0.0, 20.0, 40.0], // td
+                [20.0, 0.0, 20.0, 10.0], // box
+                [20.0, 0.0, 20.0, 20.0], // div
+                [20.0, 0.0, 20.0, 20.0], // line
+            ],
+        );
+    }
+
     /// The height of a row or a cell is a least height of the row.
     ///
     /// ```html
