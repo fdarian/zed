@@ -1085,6 +1085,55 @@ fn a_root_whose_old_parent_the_frame_does_not_ask_for_is_no_row_item_for_its_wid
     });
 }
 
+fn pixels_definite(length: f32) -> DefiniteLength {
+    DefiniteLength::Absolute(AbsoluteLength::Pixels(px(length)))
+}
+
+#[gpui::test]
+fn a_host_that_stops_having_children_in_a_block_is_as_tall_as_its_padding_like_one_that_never_had_any(
+    cx: &mut TestAppContext,
+) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        // 130x35 with 85px of padding at the bottom, a boundary for its relayout when its parent is a
+        // block: its parent is 85px high with the children of the host or without.
+        let mut root_style = Style::default();
+        root_style.display = Display::Flex;
+        root_style.flex_direction = crate::FlexDirection::Column;
+        root_style.intrinsic_widths.width = Some(Some(IntrinsicSize::MaxContent));
+        let mut host_style = Style::default();
+        host_style.display = Display::Flex;
+        host_style.size = Size { width: pixels_length(130.), height: pixels_length(35.) };
+        host_style.padding.bottom = pixels_definite(85.);
+        host_style.overflow = crate::Point { x: Overflow::Hidden, y: Overflow::Scroll };
+        let scene = |lock: Lock| {
+            let mut host = container(5, host_style.clone(), vec![text_node(7, Style::default(), 110., 12., true)]);
+            host.scope = 1;
+            host.lock = lock;
+            let mut block = container(3, Style::default(), vec![host]);
+            block.scope = 2;
+            let mut root = container(0, root_style.clone(), vec![block]);
+            root.lock = Lock::Forced;
+            Scene { root, detached: None }
+        };
+        let space = |width: AvailableSpace| Size { width, height: AvailableSpace::MaxContent };
+        let min = space(AvailableSpace::MinContent);
+        let definite = Size { width: AvailableSpace::Definite(px(200.)), height: AvailableSpace::Definite(px(300.)) };
+        // The host was childless, and gets its content.
+        assert_last_frame_matches_new_engine(
+            &[(scene(Lock::Skipped), vec![min, definite]), (scene(Lock::Forced), vec![definite])],
+            window,
+            cx,
+        );
+        // And the other way round.
+        assert_last_frame_matches_new_engine(
+            &[(scene(Lock::Forced), vec![min, definite]), (scene(Lock::Skipped), vec![definite])],
+            window,
+            cx,
+        );
+    });
+}
+
 /// The seeds that found a way for the engine that lives to differ from a new one: a cache that
 /// told apart too little, a measured size that lost the margins that collapse through a node, and
 /// a scroll container as tall as the top of the last box in it, and a width keyword resolved
@@ -1096,6 +1145,7 @@ fn the_seeds_that_found_a_difference_lay_out_like_a_new_engine(cx: &mut TestAppC
     cx.update(|window, cx| {
         for seed in [
             104, 380, 580, 1592, 1769, 2126, 465, 1540, 4673, 6024, 6761, 9844, 11472, 11508, 12265, 18134, 18286,
+            2366, 7528, 8371, 11019, 11045, 11429, 14441, 19154, 19415,
         ] {
             assert_reuse_matches_new_engine(seed..=seed, 40, window, cx);
         }

@@ -231,9 +231,14 @@ pub fn compute_flexbox_layout(
         _ => None,
     });
 
-    // The size of the container should be floored by the padding and border
+    // The size of the container should be floored by the padding and border, the one a parent gives as well:
+    // a block gives a flex container the height of its style, which is less than its padding in a box that
+    // has no room for its content, and the parent of one that has children read that height where one
+    // without any is as tall as its padding.
+    //
+    // fdarian fork patch.
     let styled_based_known_dimensions =
-        known_dimensions.or(min_max_definite_size.or(clamped_style_size).maybe_max(padding_border_sum));
+        known_dimensions.or(min_max_definite_size.or(clamped_style_size)).maybe_max(padding_border_sum);
 
     // Short-circuit layout if the container's size is fully determined by the container's size and the run mode
     // is ComputeSize (and thus the container's size is all that we're interested in)

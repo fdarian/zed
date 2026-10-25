@@ -747,7 +747,16 @@ where
         }
         if node.unrounded_layout.differs_box(layout) {
             taffy.box_generation += 1;
+            // The nodes above it hold the box in what they reach: a box with no area is left out of
+            // their content size, so a node whose content size is the same may hold it somewhere
+            // else, and nothing else of theirs says so.
+            let mut ancestor = taffy.parents[node_id.into()];
+            while let Some(parent) = ancestor {
+                taffy.nodes[parent.into()].layout_generation += 1;
+                ancestor = taffy.parents[parent.into()];
+            }
         }
+        let node = &mut taffy.nodes[node_id.into()];
         node.unrounded_layout = *layout;
     }
 
@@ -1529,7 +1538,9 @@ impl<NodeContext> TaffyTree<NodeContext> {
     /// How many times the layout of what is inside this node may have changed: its results were thrown away, or the
     /// node was laid out with another size, padding, border, scrollbar or content size (a percentage of the parent
     /// moves the padding of a node whose box is the same). A generation equal to one read after a layout means that
-    /// the layout of the subtree is the one it had then. Where the node is in its parent is not part of it.
+    /// the layout of the subtree is the one it had then. Where the node is in its parent is not part of it, but
+    /// where the boxes below it are in theirs is: a box below that is another one (see [`Layout::differs_box`]) counts
+    /// for every node above it, since a box with no area is not in a content size and moves without a trace there.
     ///
     /// A change below a relayout boundary counts here for each node above the boundary too.
     ///
@@ -2157,6 +2168,34 @@ mod tests {
         taffy.set_style(sibling, Style { display: Display::None, ..Default::default() }).unwrap();
         assert_eq!(taffy.dirty_generation(sibling), Ok(before_hiding[1] + 1));
         assert_eq!(taffy.dirty_generation(root), Ok(before_hiding[2] + 1));
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn a_flex_container_with_children_is_as_tall_as_its_padding_when_its_height_is_less() {
+        use crate::geometry::Rect;
+
+        // A block that holds a flex container of 35px height and 85px of padding at the bottom: the
+        // container is 85px high, with children or none, and so is what holds it.
+        let heights = [false, true].map(|with_child| {
+            let mut taffy: TaffyTree<()> = TaffyTree::new();
+            let item_style = Style {
+                display: Display::Flex,
+                size: Size { width: length(130.0), height: length(35.0) },
+                padding: Rect { left: zero(), right: zero(), top: zero(), bottom: length(85.0) },
+                ..Default::default()
+            };
+            let item = if with_child {
+                let leaf = taffy.new_leaf(Style { size: Size { width: length(10.0), height: length(10.0) }, ..Default::default() }).unwrap();
+                taffy.new_with_children(item_style, &[leaf]).unwrap()
+            } else {
+                taffy.new_leaf(item_style).unwrap()
+            };
+            let root = taffy.new_with_children(Style { display: Display::Block, ..Default::default() }, &[item]).unwrap();
+            taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+            (taffy.layout(item).unwrap().size.height, taffy.layout(root).unwrap().size.height)
+        });
+        assert_eq!(heights, [(85.0, 85.0), (85.0, 85.0)]);
     }
 
     // fdarian fork patch.
