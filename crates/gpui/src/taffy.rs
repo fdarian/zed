@@ -1,5 +1,5 @@
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, ElementTransform, GridTemplate, Length, Pixels, Point, Size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Edges, ElementSpace, ElementTransform, GridTemplate, Length, Matrix3d, Perspective, Pixels, Point, Size,
     Style, TransformationMatrix, Window, point, size,
     util::{
         LAYOUT_UNIT, ceil_measured_size_to_layout_unit, round_half_up, round_to_device_pixel,
@@ -268,6 +268,10 @@ struct NodeMeta {
     /// extents below count the boxes where it puts them. Nothing but an extent reads it, so a
     /// change of it is no change of layout, only of the extents (see `transform_changes`).
     transform: Option<ElementTransform>,
+    /// The node's `perspective`, which its children's extents are seen through.
+    perspective: Option<Perspective>,
+    /// The node's `transform-style` is `preserve-3d`.
+    preserve_3d: bool,
 }
 
 impl NodeMeta {
@@ -1023,6 +1027,10 @@ impl TaffyLayoutEngine {
             self.extent_epoch += 1;
         }
         let transform_changed = old.transform != meta.transform;
+        if old.perspective != meta.perspective {
+            // The extent of every child is seen through it.
+            self.extent_epoch += 1;
+        }
         meta.was_detached = old.detached;
         if old.detached {
             self.detach_rechecks.push(id);
@@ -1280,6 +1288,8 @@ impl TaffyLayoutEngine {
                 .transform
                 .clone()
                 .filter(|transform| !transform.functions.is_empty()),
+            perspective: style.perspective_spec(),
+            preserve_3d: style.transform_style_preserve_3d,
             // A new node has no extent kept, and its parent changed to get it: only a node found
             // again says what it was.
             was_detached: true,
@@ -1693,13 +1703,54 @@ impl TaffyLayoutEngine {
     // paint. A collapsed border is not: half of it is a half pixel.
 
     /// The matrix of the node's own `transform` for its border box `border_box`, in the space
-    /// the box is in, if it has one.
+    /// the box is in, if it has one: its 4x4 with the parent's `perspective` in front, as the
+    /// plane of the node's primitives is drawn through it. The extents count the boxes where it puts
+    /// them; a node in a 3D rendering context is counted as in a flat one, level by level.
     pub(crate) fn element_transform(
+        &mut self,
+        id: LayoutId,
+        border_box: Bounds<Pixels>,
+        scale_factor: f32,
+    ) -> Option<TransformationMatrix> {
+        let own = self.meta(id).transform.as_ref()?.resolve(border_box);
+        let seen = match self.parent_perspective(id, border_box, scale_factor) {
+            Some(perspective) => perspective.compose(own),
+            None => own,
+        };
+        Some(seen.flatten())
+    }
+
+    /// What the node puts into the ambient transform for its border box `border_box`, or `None`
+    /// for a node with no `transform`, `perspective` or `preserve-3d`. Its `backface-visibility`
+    /// is no concern of layout, so it is not in it.
+    pub(crate) fn element_space(
         &self,
         id: LayoutId,
         border_box: Bounds<Pixels>,
-    ) -> Option<TransformationMatrix> {
-        self.meta(id).transform.as_ref().map(|transform| transform.resolve(border_box))
+    ) -> Option<ElementSpace> {
+        let meta = self.meta(id);
+        if meta.transform.is_none() && meta.perspective.is_none() && !meta.preserve_3d {
+            return None;
+        }
+        Some(ElementSpace::of(
+            meta.transform.as_ref(),
+            meta.perspective.as_ref(),
+            meta.preserve_3d,
+            false,
+            border_box,
+        ))
+    }
+
+    /// The `perspective` of the parent of `id` in front of the transform of `id`, resolved in the
+    /// space `border_box` (the box of `id`) is in.
+    fn parent_perspective(&mut self, id: LayoutId, border_box: Bounds<Pixels>, scale_factor: f32) -> Option<Matrix3d> {
+        let parent = LayoutId(self.taffy.parent(id.0)?);
+        let perspective = self.meta(parent).perspective?;
+        let own = self.layout_unsnapped_bounds(id, scale_factor);
+        let parent_box = self.layout_unsnapped_bounds(parent, scale_factor);
+        // `border_box` may be in the window, where the layout is in the root's coordinates.
+        let shift = border_box.origin - own.origin;
+        Some(perspective.resolve(Bounds::new(parent_box.origin + shift, parent_box.size)))
     }
 
     /// Changes whenever the extents of some node may have changed with no change to its layout.
@@ -2088,7 +2139,7 @@ impl TaffyLayoutEngine {
         // whichever boxes `rect` is made of.
         if self.meta(id).transform.is_some() {
             let transform_box = self.layout_unsnapped_bounds(id, scale_factor);
-            if let Some(matrix) = self.element_transform(id, transform_box) {
+            if let Some(matrix) = self.element_transform(id, transform_box, scale_factor) {
                 rect = matrix.bounding_box(rect);
             }
         }
@@ -2176,7 +2227,7 @@ impl TaffyLayoutEngine {
         }
         if self.meta(id).transform.is_some() {
             let transform_box = self.layout_unsnapped_bounds(id, scale_factor);
-            if let Some(matrix) = self.element_transform(id, transform_box) {
+            if let Some(matrix) = self.element_transform(id, transform_box, scale_factor) {
                 extent.bounds = matrix.bounding_box(extent.bounds);
             }
         }

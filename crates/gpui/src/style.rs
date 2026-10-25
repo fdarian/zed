@@ -12,7 +12,7 @@ use crate::{
     FontFallbacks, FontFeatures, FontSmoothing, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions, TextWrapStyle,
-    TextRun, TextSystem, Window, OverflowWrap, ElementTransform, TransformationMatrix, TextBoxEdge, WordBreak, black, point, px, quad, rems, size,
+    TextRun, TextSystem, Window, OverflowWrap, ElementTransform, ElementSpace, Perspective, TransformLength, TransformationMatrix, TextBoxEdge, WordBreak, black, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use gpui_util::ResultExt;
@@ -439,6 +439,22 @@ pub struct Style {
     /// everything in it, hit testing included, after layout. A refinement cannot unset it, so
     /// `none` is a transform with no functions.
     pub transform: Option<ElementTransform>,
+
+    /// CSS `perspective`: the distance in pixels of the viewer in front of this element's plane, who
+    /// sees the children through it. `None` is `none`. It is in front of the transform of each child.
+    pub perspective: Option<f32>,
+
+    /// CSS `perspective-origin`: the point of this element's border box the viewer looks at.
+    pub perspective_origin: (TransformLength, TransformLength),
+
+    /// CSS `transform-style: preserve-3d`. The children are planes of the same 3D rendering context as
+    /// this element, and are not flattened onto it; drawn in paint order, not by depth. Properties that
+    /// force `flat` (overflow other than `visible`, opacity below 1, filters, ...) are the caller's to apply.
+    pub transform_style_preserve_3d: bool,
+
+    /// CSS `backface-visibility: hidden`: this element, and what is in it, is neither drawn nor hit
+    /// while its back faces the viewer.
+    pub backface_hidden: bool,
 
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
@@ -1127,17 +1143,24 @@ impl Style {
         }
     }
 
-    /// The matrix of the element's `transform` for its border box `bounds`, from its local
-    /// space to the space it is in.
-    pub(crate) fn transform_matrix(&self, bounds: Bounds<Pixels>) -> TransformationMatrix {
-        self.transform
-            .as_ref()
-            .map_or_else(TransformationMatrix::unit, |transform| transform.resolve(bounds))
+    /// What the element puts into the ambient transform for its border box `bounds`: its `transform`
+    /// from its local space to the space it is in, and what it does to its children.
+    pub(crate) fn element_space(&self, bounds: Bounds<Pixels>) -> ElementSpace {
+        ElementSpace::of(
+            self.transform.as_ref(),
+            self.perspective_spec().as_ref(),
+            self.transform_style_preserve_3d,
+            self.backface_hidden,
+            bounds,
+        )
     }
 
-    /// Whether the element's `transform` is being animated.
-    pub(crate) fn transform_animating(&self) -> bool {
-        self.transform.as_ref().is_some_and(|transform| transform.animating)
+    /// The element's `perspective` and `perspective-origin`, or `None` for `perspective: none`.
+    pub(crate) fn perspective_spec(&self) -> Option<Perspective> {
+        self.perspective.map(|distance| Perspective {
+            distance,
+            origin: self.perspective_origin,
+        })
     }
 
     /// Whether the element shows nothing, because its opacity is 0.
@@ -1670,6 +1693,10 @@ impl Default for Style {
             mouse_cursor: None,
             opacity: None,
             transform: None,
+            perspective: None,
+            perspective_origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+            transform_style_preserve_3d: false,
+            backface_hidden: false,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

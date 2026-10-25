@@ -1808,8 +1808,8 @@ impl Element for List {
             .interactivity
             .layout_id
             .map_or(bounds, |layout_id| window.layout_unsnapped_bounds(layout_id));
-        let transform = style.transform_matrix(transform_box);
-        let hitbox = window.with_transform(transform, |window| {
+        let space = style.element_space(transform_box);
+        let hitbox = window.with_element_space(space.clone(), |window| {
             window.insert_hitbox_shaped(
                 bounds,
                 HitboxBehavior::Normal,
@@ -1855,7 +1855,7 @@ impl Element for List {
         });
 
         let escapes_before = window.escapes_prepainted();
-        let layout = window.with_transform(transform, |window| {
+        let layout = window.with_element_space(space.clone(), |window| {
             window.with_hitbox_parent(&hitbox, |window| {
                 match state.prepaint_items(viewport, unsnapped, padding, true, &mut self.render_item, window, cx) {
                     Ok(layout) => layout,
@@ -1889,7 +1889,7 @@ impl Element for List {
                 .publish_layout(bounds, style.visibility.unwrap_or(window.visibility()), window);
         }
         if let Some(prepainter) = self.interactivity.overlay_prepainter.take() {
-            window.with_transform(transform, |window| {
+            window.with_element_space(space, |window| {
                 window.with_hitbox_parent(&hitbox, |window| prepainter(bounds, window, cx))
             });
         }
@@ -1913,8 +1913,8 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let transform = prepaint.style.transform_matrix(prepaint.transform_box);
-        window.with_transform(transform, |window| {
+        let space = prepaint.style.element_space(prepaint.transform_box);
+        window.with_element_space(space, |window| {
             let current_view = window.current_view();
 
             // Register the scroll listener before painting children so that, in

@@ -24,7 +24,7 @@ use crate::{
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, OverflowAnchor, OverscrollBehavior,
     ParentElement, Position, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, TransformationMatrix, Visibility, Window, WindowControlArea, point, px,
+    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     scroll_routing, size,
     sticky::{self, StickyInsets},
     tab_stop::PaintedChild,
@@ -3219,7 +3219,7 @@ impl Interactivity {
                 self.transform_box = Some(transform_box);
                 window.with_visibility(visibility, |window| {
                     window.with_faded_out_if(style.is_faded_out(), |window| {
-                    window.with_transform_animating(style.transform_matrix(transform_box), style.transform_animating(), |window| {
+                    window.with_element_space(style.element_space(transform_box), |window| {
                     window.with_text_style(style.text_style().cloned(), |window| {
                         window.with_exact_hit_mask(
                             style.overflow_mask(bounds, window.rem_size()),
@@ -3314,11 +3314,11 @@ impl Interactivity {
         // Nothing is drawn or hit here, but the boxes of the descendants are reported through the
         // transform around them (`getBoundingClientRect`), and the layout holds the element's own.
         let transform_box = self.unsnapped_transform_box(bounds, window);
-        let own_transform = self
+        let own_space = self
             .layout_id
-            .and_then(|layout_id| window.layout_own_transform(layout_id, transform_box))
-            .unwrap_or_else(TransformationMatrix::unit);
-        window.with_transform(own_transform, |window| {
+            .and_then(|layout_id| window.layout_own_space(layout_id, transform_box))
+            .unwrap_or_default();
+        window.with_element_space(own_space, |window| {
             window.with_visibility(visibility, |window| {
                 f(display_none, position, contains_fixed, scroll_offset, window, cx)
             })
@@ -3631,7 +3631,7 @@ impl Interactivity {
                     let transform_box = self
                         .transform_box
                         .expect("an element is prepainted before it is painted");
-                    window.with_transform_animating(style.transform_matrix(transform_box), style.transform_animating(), |window| {
+                    window.with_element_space(style.element_space(transform_box), |window| {
                     style.paint_box_with_effects(bounds, box_bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_overflow_clip(

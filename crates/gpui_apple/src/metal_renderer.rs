@@ -6120,4 +6120,102 @@ mod tests {
         assert_matches_reference(&image, &reference);
         assert!(image.get_pixel(38, 20).0[0] > 200);
     }
+    /// What a CPU makes of a plane `rect` (left, top, width, height) drawn through a 4x4 matrix in device
+    /// pixels: the corners go through the 4x4 as CSS defines it, `(X, Y, Z, W)` to `(X / W, Y / W)`, and each
+    /// pixel is the share of its 8 by 8 samples inside the convex quad they make. Unlike
+    /// [`reference_through`] it does not go through the matrix's inverse nor through its flattening.
+    fn reference_of_4x4(matrix: &gpui::Matrix3d, rect: (f32, f32, f32, f32)) -> image::RgbaImage {
+        const SUBSAMPLES: u32 = 8;
+        let (left, top, width, height) = rect;
+        let corners: Vec<[f32; 2]> = [(left, top), (left + width, top), (left + width, top + height), (left, top + height)]
+            .iter()
+            .map(|(x, y)| matrix.project(*x, *y, 0.).expect("the corners are in front of the eye"))
+            .collect();
+        let inside = |x: f32, y: f32| {
+            let signs: Vec<f32> = (0..4)
+                .map(|index| {
+                    let (from, to) = (corners[index], corners[(index + 1) % 4]);
+                    (to[0] - from[0]) * (y - from[1]) - (to[1] - from[1]) * (x - from[0])
+                })
+                .collect();
+            signs.iter().all(|sign| *sign >= 0.) || signs.iter().all(|sign| *sign <= 0.)
+        };
+        let mut image = image::RgbaImage::new(SIZE as u32, SIZE as u32);
+        for y in 0..SIZE as u32 {
+            for x in 0..SIZE as u32 {
+                let mut lit = 0;
+                for sub_y in 0..SUBSAMPLES {
+                    for sub_x in 0..SUBSAMPLES {
+                        let at_x = x as f32 + (sub_x as f32 + 0.5) / SUBSAMPLES as f32;
+                        let at_y = y as f32 + (sub_y as f32 + 0.5) / SUBSAMPLES as f32;
+                        lit += u32::from(inside(at_x, at_y));
+                    }
+                }
+                let red = (lit as f32 / (SUBSAMPLES * SUBSAMPLES) as f32 * 255.).round() as u8;
+                image.put_pixel(x, y, image::Rgba([red, 0, 0, 255]));
+            }
+        }
+        image
+    }
+
+    fn drawn_through_4x4(matrix: &gpui::Matrix3d, rect: (f32, f32, f32, f32)) -> image::RgbaImage {
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            transformation: matrix.flatten(),
+            ..solid(rect.0, rect.1, rect.2, rect.3, 0xff0000)
+        });
+        render(&mut scene)
+    }
+
+    fn about_in_3d(center: (f32, f32), matrix: gpui::Matrix3d) -> gpui::Matrix3d {
+        gpui::Matrix3d::translate(center.0, center.1, 0.)
+            .compose(matrix)
+            .compose(gpui::Matrix3d::translate(-center.0, -center.1, 0.))
+    }
+
+    #[test]
+    fn a_quad_turned_about_y_under_a_perspective_is_where_the_4x4_puts_it() {
+        // rotateY(60deg) about the middle of a 20 square, seen from 50 pixels away along its center.
+        let matrix = gpui::Matrix3d::perspective_about(50., 20., 20.)
+            .compose(about_in_3d((20., 20.), gpui::Matrix3d::rotate(0., 1., 0., 60f32.to_radians())));
+        let rect = (10., 10., 20., 20.);
+        let image = drawn_through_4x4(&matrix, rect);
+        assert_matches_reference(&image, &reference_of_4x4(&matrix, rect));
+        // The left edge came toward the viewer and is the taller one.
+        let column_height = |x: u32| (0..SIZE as u32).filter(|y| image.get_pixel(x, *y).0[0] > 128).count();
+        assert!(column_height(15) > column_height(23), "{} {}", column_height(15), column_height(23));
+    }
+
+    #[test]
+    fn a_quad_moved_toward_the_viewer_is_larger_about_the_perspective_origin() {
+        // 15 toward an eye 60 away: 4/3 as large, growing from the point the eye looks at.
+        let rect = (14., 14., 12., 12.);
+        for origin in [(20., 20.), (8., 30.)] {
+            let matrix = gpui::Matrix3d::perspective_about(60., origin.0, origin.1)
+                .compose(gpui::Matrix3d::translate(0., 0., 15.));
+            let image = drawn_through_4x4(&matrix, rect);
+            assert_matches_reference(&image, &reference_of_4x4(&matrix, rect));
+            let left = matrix.project(14., 14., 0.).unwrap();
+            assert!((left[0] - (origin.0 + (14. - origin.0) * 4. / 3.)).abs() < 1e-3, "{left:?}");
+        }
+    }
+
+    #[test]
+    fn two_planes_of_a_3d_context_flatten_once() {
+        // A plane turned 35 about x inside one turned 40 about y: the 4x4s multiply, then the primitive is
+        // flattened; flattening the parent first would put the child somewhere else.
+        let parent = about_in_3d((20., 20.), gpui::Matrix3d::rotate(0., 1., 0., 40f32.to_radians()));
+        let child = about_in_3d((20., 20.), gpui::Matrix3d::rotate(1., 0., 0., 35f32.to_radians()));
+        let matrix = gpui::Matrix3d::perspective_about(70., 20., 20.).compose(parent).compose(child);
+        let rect = (9., 9., 22., 22.);
+        let image = drawn_through_4x4(&matrix, rect);
+        assert_matches_reference(&image, &reference_of_4x4(&matrix, rect));
+        let flattened_first = gpui::Matrix3d::perspective_about(70., 20., 20.)
+            .compose(gpui::Matrix3d::from_2d(&parent.flatten()))
+            .compose(child);
+        let other = matrix.project(31., 31., 0.).unwrap();
+        let apart = flattened_first.project(31., 31., 0.).unwrap();
+        assert!((other[1] - apart[1]).abs() > 0.5, "{other:?} {apart:?}");
+    }
 }

@@ -6,7 +6,7 @@ use crate::{
     FlexBasisKeyword, FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, IntrinsicSize,
     JustifyContent, Length, LineHeight, OverflowAnchor, OverlineStyle, Pixels, SharedString, StrikethroughStyle,
     StyleRefinement, TableLayout, TableRole, TextAlign, TextDecorationStyle, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, ElementTransform,
+    TextStyleRefinement, TransformLength, UnderlineStyle, WhiteSpace, ElementTransform,
     px, relative, rems,
 };
 pub use gpui_macros::{
@@ -1040,6 +1040,31 @@ pub trait Styled: Sized {
     /// Sets the CSS `transform` of this element, resolved against its border box.
     fn transform(mut self, transform: ElementTransform) -> Self {
         self.style().transform = Some(transform);
+        self
+    }
+
+    /// Sets the CSS `perspective` of this element: the viewer is `distance` pixels in front of its
+    /// plane, and its children are seen through it.
+    fn perspective(mut self, distance: f32) -> Self {
+        self.style().perspective = Some(distance);
+        self
+    }
+
+    /// Sets the CSS `perspective-origin` of this element.
+    fn perspective_origin(mut self, x: TransformLength, y: TransformLength) -> Self {
+        self.style().perspective_origin = Some((x, y));
+        self
+    }
+
+    /// Sets the CSS `transform-style` of this element to `preserve-3d`.
+    fn preserve_3d(mut self) -> Self {
+        self.style().transform_style_preserve_3d = Some(true);
+        self
+    }
+
+    /// Sets the CSS `backface-visibility` of this element to `hidden`.
+    fn backface_hidden(mut self) -> Self {
+        self.style().backface_hidden = Some(true);
         self
     }
 

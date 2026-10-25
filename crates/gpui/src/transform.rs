@@ -351,6 +351,254 @@ impl TransformationMatrix {
     }
 }
 
+/// A 4x4 transform of 3D space, CSS Transforms 2's matrix: it takes the column `(x, y, z, 1)` to
+/// `(X, Y, Z, W)`, and the point lands on the screen at `(X / W, Y / W)`.
+///
+/// `rows` is row-major, like [`TransformationMatrix::rows`], so `rows[row][column]` is the entry CSS
+/// calls `m{column+1}{row+1}`; `matrix3d(a1, b1, ..., d4)` lists the columns one after the other, which
+/// [`Matrix3d::from_css`] undoes. [`Matrix3d::compose`] has the same order as
+/// [`TransformationMatrix::compose`]: the argument applies first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Matrix3d {
+    /// The entries, row by row.
+    pub rows: [[f32; 4]; 4],
+}
+
+impl Default for Matrix3d {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+impl Matrix3d {
+    /// The matrix that moves nothing.
+    pub fn identity() -> Self {
+        let mut rows = [[0.; 4]; 4];
+        for (index, row) in rows.iter_mut().enumerate() {
+            row[index] = 1.;
+        }
+        Self { rows }
+    }
+
+    /// The matrix of CSS `matrix3d(...)`, whose sixteen numbers are the columns one after the other.
+    pub fn from_css(values: [f32; 16]) -> Self {
+        let mut rows = [[0.; 4]; 4];
+        for (column, entries) in values.chunks_exact(4).enumerate() {
+            for (row, entry) in entries.iter().enumerate() {
+                rows[row][column] = *entry;
+            }
+        }
+        Self { rows }
+    }
+
+    /// The matrix of CSS `translate3d(x, y, z)`.
+    pub fn translate(x: f32, y: f32, z: f32) -> Self {
+        let mut matrix = Self::identity();
+        matrix.rows[0][3] = x;
+        matrix.rows[1][3] = y;
+        matrix.rows[2][3] = z;
+        matrix
+    }
+
+    /// The matrix of CSS `scale3d(x, y, z)`.
+    pub fn scale(x: f32, y: f32, z: f32) -> Self {
+        let mut matrix = Self::identity();
+        matrix.rows[0][0] = x;
+        matrix.rows[1][1] = y;
+        matrix.rows[2][2] = z;
+        matrix
+    }
+
+    /// The matrix of CSS `rotate3d(x, y, z, angle)`: a turn of `angle` radians about the axis
+    /// `(x, y, z)`, clockwise looking along the axis toward the origin as `rotate()` is for the z axis.
+    /// A zero axis turns nothing. A turn by a multiple of a right angle has the exact entries.
+    pub fn rotate(x: f32, y: f32, z: f32, angle: f32) -> Self {
+        let length = f64::from(x).hypot(f64::from(y)).hypot(f64::from(z));
+        if length == 0. {
+            return Self::identity();
+        }
+        let (x, y, z) = (f64::from(x) / length, f64::from(y) / length, f64::from(z) / length);
+        let angle = f64::from(angle);
+        let quarters = angle / std::f64::consts::FRAC_PI_2;
+        let (sin, cos) = if (quarters - quarters.round()).abs() < 1e-6 {
+            [(0., 1.), (1., 0.), (0., -1.), (-1., 0.)][quarters.round().rem_euclid(4.) as usize]
+        } else {
+            (angle.sin(), angle.cos())
+        };
+        // The quaternion form of CSS Transforms 2: sq = sin^2(a/2), sc = sin(a/2) cos(a/2).
+        let (sq, sc) = ((1. - cos) / 2., sin / 2.);
+        let entries = [
+            [1. - 2. * (y * y + z * z) * sq, 2. * (x * y * sq - z * sc), 2. * (x * z * sq + y * sc)],
+            [2. * (x * y * sq + z * sc), 1. - 2. * (x * x + z * z) * sq, 2. * (y * z * sq - x * sc)],
+            [2. * (x * z * sq - y * sc), 2. * (y * z * sq + x * sc), 1. - 2. * (x * x + y * y) * sq],
+        ];
+        let mut matrix = Self::identity();
+        for (row, values) in entries.iter().enumerate() {
+            for (column, value) in values.iter().enumerate() {
+                matrix.rows[row][column] = *value as f32;
+            }
+        }
+        matrix
+    }
+
+    /// The matrix of CSS `perspective(distance)`: the eye is `distance` in front of the z = 0 plane.
+    /// A distance under a pixel counts as a pixel, as the specification has it.
+    pub fn perspective(distance: f32) -> Self {
+        let mut matrix = Self::identity();
+        matrix.rows[3][2] = -1. / distance.max(1.);
+        matrix
+    }
+
+    /// The matrix a parent's `perspective` and `perspective-origin` put in front of the transform of each
+    /// child: the perspective about the point `(origin_x, origin_y)`, which is in the space the children are in.
+    pub fn perspective_about(distance: f32, origin_x: f32, origin_y: f32) -> Self {
+        Self::translate(origin_x, origin_y, 0.)
+            .compose(Self::perspective(distance))
+            .compose(Self::translate(-origin_x, -origin_y, 0.))
+    }
+
+    /// The matrix that does to the plane what `matrix` does, and leaves z alone.
+    pub fn from_2d(matrix: &TransformationMatrix) -> Self {
+        let mut rows = Self::identity().rows;
+        for (row, source_row) in [0, 1, 3].into_iter().zip(0..3) {
+            for (column, source_column) in [0, 1, 3].into_iter().zip(0..3) {
+                rows[row][column] = matrix.rows[source_row][source_column];
+            }
+        }
+        Self { rows }
+    }
+
+    /// The matrix of the z = 0 plane: where `(x, y, 0)` goes, as the homography the primitives of the
+    /// element are drawn through. This is the flattening a flat element does to what is in it: the z of the
+    /// result, and what the matrix does to z of the input, are dropped.
+    pub fn flatten(&self) -> TransformationMatrix {
+        let mut rows = [[0.; 3]; 3];
+        for (row, source_row) in [0, 1, 3].into_iter().enumerate() {
+            for (column, source_column) in [0, 1, 3].into_iter().enumerate() {
+                rows[row][column] = self.rows[source_row][source_column];
+            }
+        }
+        TransformationMatrix { rows }
+    }
+
+    /// Whether the matrix only acts on the z = 0 plane (it is [`Matrix3d::from_2d`] of something):
+    /// z goes to z, and no x, y or w depends on z.
+    pub fn is_2d(&self) -> bool {
+        self.rows[2] == [0., 0., 1., 0.]
+            && self.rows[0][2] == 0.
+            && self.rows[1][2] == 0.
+            && self.rows[3][2] == 0.
+    }
+
+    /// Whether the matrix moves nothing.
+    pub fn is_identity(&self) -> bool {
+        self.is_2d() && self.flatten().is_identity()
+    }
+
+    /// The matrix that does `other` first and `self` after it.
+    pub fn compose(self, other: Matrix3d) -> Matrix3d {
+        // Two matrices of the plane multiply as they did before there was a third dimension.
+        if self.is_2d() && other.is_2d() {
+            return Self::from_2d(&self.flatten().compose(other.flatten()));
+        }
+        let mut rows = [[0.; 4]; 4];
+        for (row, output_row) in rows.iter_mut().enumerate() {
+            for (column, output_cell) in output_row.iter_mut().enumerate() {
+                let (mut sum, mut magnitude) = (0f64, 0f64);
+                for k in 0..4 {
+                    let term = f64::from(self.rows[row][k]) * f64::from(other.rows[k][column]);
+                    sum += term;
+                    magnitude += term.abs();
+                }
+                // What cancels to the rounding error of the entries is zero: two turns of 45 degrees
+                // about y leave a plane exactly edge-on, not nearly so.
+                *output_cell = if sum.abs() < magnitude * 2. * f64::from(f32::EPSILON) { 0. } else { sum as f32 };
+            }
+        }
+        Matrix3d { rows }
+    }
+
+    /// `(X, Y, Z, W)` of the point `(x, y, z)`.
+    pub fn homogeneous(&self, x: f32, y: f32, z: f32) -> [f32; 4] {
+        let point = [x, y, z, 1.];
+        self.rows.map(|row| row.iter().zip(point).map(|(entry, coordinate)| entry * coordinate).sum())
+    }
+
+    /// The point `(x, y, z)` on the screen, or `None` for one at the horizon or behind the eye.
+    pub fn project(&self, x: f32, y: f32, z: f32) -> Option<[f32; 2]> {
+        let [x, y, _, w] = self.homogeneous(x, y, z);
+        (w >= MIN_W).then(|| [x / w, y / w])
+    }
+
+    /// The determinant, computed in double precision.
+    pub fn determinant(&self) -> f64 {
+        determinant(&self.rows.map(|row| row.map(f64::from)))
+    }
+
+    /// The matrix that undoes this one, or `None` when it flattens space.
+    pub fn inverse(&self) -> Option<Matrix3d> {
+        let m = self.rows.map(|row| row.map(f64::from));
+        let determinant = determinant(&m);
+        if !determinant.is_finite() || determinant.abs() < 1e-18 {
+            return None;
+        }
+        let mut rows = [[0f32; 4]; 4];
+        for (row, output_row) in rows.iter_mut().enumerate() {
+            for (column, output_cell) in output_row.iter_mut().enumerate() {
+                // The adjugate: the transposed matrix of cofactors.
+                let sign = if (row + column) % 2 == 0 { 1. } else { -1. };
+                let entry = sign * minor_determinant(&m, column, row) / determinant;
+                if !entry.is_finite() {
+                    return None;
+                }
+                *output_cell = entry as f32;
+            }
+        }
+        Some(Matrix3d { rows })
+    }
+
+    /// Whether a plane drawn through this matrix, whose front faces the viewer when it is not
+    /// transformed, shows its back.
+    ///
+    /// This is Chromium's `gfx::Transform::IsBackFaceVisible` (ui/gfx/geometry/transform.cc), which
+    /// cc's `EffectTree::UpdateBackfaceVisibility` asks of the transform to the screen: the plane's
+    /// normal `(0, 0, 1, 0)` goes through the inverse transpose, so the sign of the z it comes out
+    /// with is the sign of the (2,2) entry of the inverse, that of the cofactor of that entry
+    /// times the determinant. The cofactor of (2,2) is the determinant of the flattened 3x3 (rows and
+    /// columns 0, 1 and 3). Chromium's tolerance is the epsilon of a float.
+    pub fn shows_backface(&self) -> bool {
+        if self.is_identity() {
+            return false;
+        }
+        let m = self.rows.map(|row| row.map(f64::from));
+        let determinant = determinant(&m);
+        if determinant == 0. {
+            return false;
+        }
+        let cofactor = minor_determinant(&m, 2, 2);
+        cofactor * determinant < -f64::from(f32::EPSILON)
+    }
+}
+
+/// The determinant of the 3x3 matrix left of `m` when `row` and `column` are removed.
+fn minor_determinant(m: &[[f64; 4]; 4], row: usize, column: usize) -> f64 {
+    let rows: Vec<usize> = (0..4).filter(|index| *index != row).collect();
+    let columns: Vec<usize> = (0..4).filter(|index| *index != column).collect();
+    let at = |r: usize, c: usize| m[rows[r]][columns[c]];
+    at(0, 0) * (at(1, 1) * at(2, 2) - at(1, 2) * at(2, 1))
+        - at(0, 1) * (at(1, 0) * at(2, 2) - at(1, 2) * at(2, 0))
+        + at(0, 2) * (at(1, 0) * at(2, 1) - at(1, 1) * at(2, 0))
+}
+
+fn determinant(m: &[[f64; 4]; 4]) -> f64 {
+    (0..4)
+        .map(|column| {
+            let sign = if column % 2 == 0 { 1. } else { -1. };
+            sign * m[0][column] * minor_determinant(m, 0, column)
+        })
+        .sum()
+}
+
 impl ContentMask<Pixels> {
     /// The mask after an axis-aligned matrix, rounded corners included, or `None` for a matrix
     /// that rotates or skews: the image of a rounded rectangle is then no rounded rectangle.
@@ -485,9 +733,21 @@ pub enum TransformFunction {
     SkewY(f32),
     /// `matrix(a, b, c, d, e, f)`
     Matrix([f32; 6]),
+    /// `translate3d(x, y, z)`, with `z` in pixels. `translateZ(z)` is `translate3d(0, 0, z)`.
+    Translate3d(TransformLength, TransformLength, f32),
+    /// `scale3d(x, y, z)`. `scaleZ(z)` is `scale3d(1, 1, z)`.
+    Scale3d(f32, f32, f32),
+    /// `rotate3d(x, y, z, angle)`. `rotateX(angle)` is `rotate3d(1, 0, 0, angle)`, `rotateY(angle)`
+    /// `rotate3d(0, 1, 0, angle)`.
+    Rotate3d(f32, f32, f32, f32),
+    /// `perspective(d)`, with the distance in pixels; `None` is `perspective(none)`.
+    Perspective(Option<f32>),
+    /// `matrix3d(...)`, the sixteen numbers column after column as CSS has them, see [`Matrix3d::from_css`].
+    Matrix3d([f32; 16]),
     /// `from` and `to` blended by `progress`, which is how lists that do not pair up function
     /// by function animate: each is multiplied out with the box size, then the two matrices
-    /// are interpolated through the 2D matrix decomposition of CSS Transforms 1.
+    /// are interpolated through the 2D matrix decomposition of CSS Transforms 1. A list with a 3D
+    /// function in it is not blended yet: it steps from `from` to `to` at the middle.
     Interpolated {
         /// The list at progress 0.
         from: Vec<TransformFunction>,
@@ -500,46 +760,72 @@ pub enum TransformFunction {
 
 impl TransformFunction {
     /// The matrix of the function for a border box of `size`.
-    pub fn matrix(&self, size: Size<Pixels>) -> TransformationMatrix {
+    pub fn matrix(&self, size: Size<Pixels>) -> Matrix3d {
         match self {
-            TransformFunction::Translate(x, y) => TransformationMatrix::affine(
+            TransformFunction::Translate(x, y) => Matrix3d::from_2d(&TransformationMatrix::affine(
                 [[1., 0.], [0., 1.]],
                 [x.resolve(size.width.0), y.resolve(size.height.0)],
-            ),
+            )),
             TransformFunction::Scale(x, y) => {
-                TransformationMatrix::affine([[*x, 0.], [0., *y]], [0., 0.])
+                Matrix3d::from_2d(&TransformationMatrix::affine([[*x, 0.], [0., *y]], [0., 0.]))
             }
-            TransformFunction::Rotate(angle) => TransformationMatrix::affine(
+            TransformFunction::Rotate(angle) => Matrix3d::from_2d(&TransformationMatrix::affine(
                 [[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]],
                 [0., 0.],
-            ),
+            )),
             TransformFunction::Skew(x, y) => {
-                TransformationMatrix::affine([[1., x.tan()], [y.tan(), 1.]], [0., 0.])
+                Matrix3d::from_2d(&TransformationMatrix::affine([[1., x.tan()], [y.tan(), 1.]], [0., 0.]))
             }
             TransformFunction::SkewX(x) => {
-                TransformationMatrix::affine([[1., x.tan()], [0., 1.]], [0., 0.])
+                Matrix3d::from_2d(&TransformationMatrix::affine([[1., x.tan()], [0., 1.]], [0., 0.]))
             }
             TransformFunction::SkewY(y) => {
-                TransformationMatrix::affine([[1., 0.], [y.tan(), 1.]], [0., 0.])
+                Matrix3d::from_2d(&TransformationMatrix::affine([[1., 0.], [y.tan(), 1.]], [0., 0.]))
             }
-            TransformFunction::Matrix(values) => TransformationMatrix::from_css(*values),
-            TransformFunction::Interpolated { from, to, progress } => interpolate_matrices(
-                &list_matrix(from, size),
-                &list_matrix(to, size),
-                *progress,
-            ),
+            TransformFunction::Matrix(values) => Matrix3d::from_2d(&TransformationMatrix::from_css(*values)),
+            TransformFunction::Translate3d(x, y, z) => {
+                Matrix3d::translate(x.resolve(size.width.0), y.resolve(size.height.0), *z)
+            }
+            TransformFunction::Scale3d(x, y, z) => Matrix3d::scale(*x, *y, *z),
+            TransformFunction::Rotate3d(x, y, z, angle) => Matrix3d::rotate(*x, *y, *z, *angle),
+            TransformFunction::Perspective(distance) => {
+                distance.map_or_else(Matrix3d::identity, Matrix3d::perspective)
+            }
+            TransformFunction::Matrix3d(values) => Matrix3d::from_css(*values),
+            TransformFunction::Interpolated { from, to, progress } => {
+                if from.iter().chain(to).any(TransformFunction::is_3d) {
+                    // TODO(9c): blend through the 3D decomposition of CSS Transforms 2.
+                    return list_matrix(if *progress < 0.5 { from } else { to }, size);
+                }
+                Matrix3d::from_2d(&interpolate_matrices(
+                    &list_matrix(from, size).flatten(),
+                    &list_matrix(to, size).flatten(),
+                    *progress,
+                ))
+            }
+        }
+    }
+
+    /// Whether the function is one of the 3D ones, or a blend holding one.
+    pub fn is_3d(&self) -> bool {
+        match self {
+            TransformFunction::Translate3d(..)
+            | TransformFunction::Scale3d(..)
+            | TransformFunction::Rotate3d(..)
+            | TransformFunction::Perspective(_)
+            | TransformFunction::Matrix3d(_) => true,
+            TransformFunction::Interpolated { from, to, .. } => from.iter().chain(to).any(TransformFunction::is_3d),
+            _ => false,
         }
     }
 }
 
 /// The matrix of a list of functions: the first is the outermost, so the last applies to a
 /// point first.
-pub fn list_matrix(functions: &[TransformFunction], size: Size<Pixels>) -> TransformationMatrix {
+pub fn list_matrix(functions: &[TransformFunction], size: Size<Pixels>) -> Matrix3d {
     functions
         .iter()
-        .fold(TransformationMatrix::unit(), |matrix, function| {
-            matrix.compose(function.matrix(size))
-        })
+        .fold(Matrix3d::identity(), |matrix, function| matrix.compose(function.matrix(size)))
 }
 
 /// A `transform` list and the point it is applied around.
@@ -549,6 +835,9 @@ pub struct ElementTransform {
     pub functions: Vec<TransformFunction>,
     /// `transform-origin`, from the top left of the border box.
     pub origin: (TransformLength, TransformLength),
+    /// The z of `transform-origin`, in pixels.
+    #[serde(default)]
+    pub origin_z: f32,
     /// Whether the transform is being animated. Text inside is then rasterized at a scale kept
     /// across the animation, see [`Window::with_transform_animating`].
     #[serde(default)]
@@ -559,15 +848,88 @@ impl ElementTransform {
     /// The matrix of the transform for an element with `border_box`, from the element's local
     /// space to the space the border box is in: translate to the origin, apply the functions,
     /// translate back.
-    pub fn resolve(&self, border_box: Bounds<Pixels>) -> TransformationMatrix {
+    pub fn resolve(&self, border_box: Bounds<Pixels>) -> Matrix3d {
         let origin = point(
             border_box.origin.x.0 + self.origin.0.resolve(border_box.size.width.0),
             border_box.origin.y.0 + self.origin.1.resolve(border_box.size.height.0),
         );
         let functions = list_matrix(&self.functions, border_box.size);
-        let to_origin = TransformationMatrix::affine([[1., 0.], [0., 1.]], [origin.x, origin.y]);
-        let from_origin = TransformationMatrix::affine([[1., 0.], [0., 1.]], [-origin.x, -origin.y]);
+        let to_origin = Matrix3d::translate(origin.x, origin.y, self.origin_z);
+        let from_origin = Matrix3d::translate(-origin.x, -origin.y, -self.origin_z);
         to_origin.compose(functions).compose(from_origin)
+    }
+}
+
+/// A parent's `perspective` and `perspective-origin`: the viewer is `distance` in front of the
+/// parent's plane, looking at the point `origin` of it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Perspective {
+    /// The distance of the viewer, in pixels.
+    pub distance: f32,
+    /// `perspective-origin`, from the top left of the parent's border box.
+    pub origin: (TransformLength, TransformLength),
+}
+
+impl Perspective {
+    /// The matrix that goes in front of the transform of each child of the element whose border box
+    /// is `border_box`, in the space that box is in.
+    pub fn resolve(&self, border_box: Bounds<Pixels>) -> Matrix3d {
+        Matrix3d::perspective_about(
+            self.distance,
+            border_box.origin.x.0 + self.origin.0.resolve(border_box.size.width.0),
+            border_box.origin.y.0 + self.origin.1.resolve(border_box.size.height.0),
+        )
+    }
+}
+
+/// What an element puts into the ambient transform of [`Window::with_element_space`]: how it
+/// is placed in the space it is in, and how its children are placed in the space it makes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElementSpace {
+    /// The element's own `transform`, from its local space to the one its border box is in.
+    pub matrix: Matrix3d,
+    /// See [`ElementTransform::animating`].
+    pub animating: bool,
+    /// The element's `transform-style` is `preserve-3d`: its children are planes of the same 3D
+    /// rendering context as the element, not flattened into it.
+    pub preserve_3d: bool,
+    /// The element's `backface-visibility` is `hidden`: it, and everything in it, is not drawn
+    /// or hit while its back faces the viewer.
+    pub backface_hidden: bool,
+    /// What goes in front of the transform of each child: the element's `perspective` about its
+    /// `perspective-origin`.
+    pub child_perspective: Option<Matrix3d>,
+}
+
+impl ElementSpace {
+    /// The space of an element with the given `transform`, `perspective` and `transform-style` and
+    /// `backface-visibility`, for its border box `border_box`.
+    pub fn of(
+        transform: Option<&ElementTransform>,
+        perspective: Option<&Perspective>,
+        preserve_3d: bool,
+        backface_hidden: bool,
+        border_box: Bounds<Pixels>,
+    ) -> Self {
+        Self {
+            matrix: transform.map_or_else(Matrix3d::identity, |transform| transform.resolve(border_box)),
+            animating: transform.is_some_and(|transform| transform.animating),
+            preserve_3d,
+            backface_hidden,
+            child_perspective: perspective.map(|perspective| perspective.resolve(border_box)),
+        }
+    }
+}
+
+impl Default for ElementSpace {
+    fn default() -> Self {
+        Self {
+            matrix: Matrix3d::identity(),
+            animating: false,
+            preserve_3d: false,
+            backface_hidden: false,
+            child_perspective: None,
+        }
     }
 }
 
@@ -768,10 +1130,11 @@ mod tests {
         let transform = ElementTransform {
             functions: vec![TransformFunction::Rotate(std::f32::consts::FRAC_PI_2)],
             origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+            origin_z: 0.,
             animating: false,
         };
         let border_box = Bounds::new(point(px(100.), px(50.)), size(px(40.), px(40.)));
-        let matrix = transform.resolve(border_box);
+        let matrix = transform.resolve(border_box).flatten();
         // The center stays; the top left corner goes to the top right.
         let center = matrix.apply_xy(120., 70.);
         assert_near(center[0], 120.);
@@ -789,9 +1152,10 @@ mod tests {
                 TransformFunction::Scale(2., 2.),
             ],
             origin: (TransformLength::pixels(10.), TransformLength::default()),
+            origin_z: 0.,
             animating: false,
         };
-        let matrix = transform.resolve(Bounds::new(point(px(0.), px(0.)), size(px(100.), px(20.))));
+        let matrix = transform.resolve(Bounds::new(point(px(0.), px(0.)), size(px(100.), px(20.)))).flatten();
         // translate(55px) · scale(2) around (10, 0): the origin point itself moves by 55.
         let origin = matrix.apply_xy(10., 0.);
         assert_near(origin[0], 65.);
@@ -803,11 +1167,11 @@ mod tests {
     #[test]
     fn a_skew_and_a_matrix_function_match_the_css_matrices() {
         let size = box_of(10., 10.);
-        let skew = TransformFunction::Skew(0.5, 0.25).matrix(size);
+        let skew = TransformFunction::Skew(0.5, 0.25).matrix(size).flatten();
         assert_matrix(skew, [1., 0.25f32.tan(), 0.5f32.tan(), 1., 0., 0.]);
-        assert_matrix(TransformFunction::SkewX(0.5).matrix(size), [1., 0., 0.5f32.tan(), 1., 0., 0.]);
-        assert_matrix(TransformFunction::SkewY(0.25).matrix(size), [1., 0.25f32.tan(), 0., 1., 0., 0.]);
-        let matrix = TransformFunction::Matrix([1., 2., 3., 4., 5., 6.]).matrix(size);
+        assert_matrix(TransformFunction::SkewX(0.5).matrix(size).flatten(), [1., 0., 0.5f32.tan(), 1., 0., 0.]);
+        assert_matrix(TransformFunction::SkewY(0.25).matrix(size).flatten(), [1., 0.25f32.tan(), 0., 1., 0., 0.]);
+        let matrix = TransformFunction::Matrix([1., 2., 3., 4., 5., 6.]).matrix(size).flatten();
         assert_eq!(matrix.apply_xy(1., 1.), [1. + 3. + 5., 2. + 4. + 6.]);
     }
 
@@ -818,7 +1182,7 @@ mod tests {
             to: vec![TransformFunction::Rotate(std::f32::consts::FRAC_PI_2)],
             progress: 0.5,
         }
-        .matrix(box_of(10., 10.));
+        .matrix(box_of(10., 10.)).flatten();
         let angle = radians(std::f32::consts::FRAC_PI_4);
         assert_matrix(blended, [angle.0.cos(), angle.0.sin(), -angle.0.sin(), angle.0.cos(), 0., 0.]);
     }
@@ -844,7 +1208,7 @@ mod tests {
             to: vec![TransformFunction::Scale(2., 2.)],
             progress: 0.5,
         }
-        .matrix(box_of(10., 10.));
+        .matrix(box_of(10., 10.)).flatten();
         assert_matrix(blended, [1.5, 0., 0., 1.5, 5., 0.]);
         let start = interpolate_matrices(
             &TransformationMatrix::unit(),
@@ -872,8 +1236,8 @@ mod tests {
             )],
             progress: 0.25,
         };
-        assert_near(blended.matrix(box_of(80., 10.)).translation()[0], 20.);
-        assert_near(blended.matrix(box_of(200., 10.)).translation()[0], 50.);
+        assert_near(blended.matrix(box_of(80., 10.)).flatten().translation()[0], 20.);
+        assert_near(blended.matrix(box_of(200., 10.)).flatten().translation()[0], 50.);
     }
 
     #[test]
@@ -1043,5 +1407,199 @@ mod tests {
         };
         assert!(contours[0].len() >= 4);
         assert!(contours[0].iter().all(|point| point.x.is_finite() && point.y.is_finite() && point.x >= 0.));
+    }
+
+    fn assert_close(actual: [f32; 4], expected: [f32; 4]) {
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-3, "{actual:?} is not {expected:?}");
+        }
+    }
+
+    #[test]
+    fn matrix3d_lists_its_columns_the_way_css_does() {
+        let matrix = Matrix3d::from_css([1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16.]);
+        // m14 = 13 is the x translation, m21 = 5 the entry of the second column, first row.
+        assert_eq!(matrix.rows[0][3], 13.);
+        assert_eq!(matrix.rows[0][1], 5.);
+        assert_eq!(matrix.rows[3][0], 4.);
+        let translated = Matrix3d::from_css([1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 10., 20., 30., 1.]);
+        assert_eq!(translated, Matrix3d::translate(10., 20., 30.));
+        assert_eq!(translated.homogeneous(1., 2., 3.), [11., 22., 33., 1.]);
+    }
+
+    #[test]
+    fn a_matrix_of_the_plane_goes_to_3d_and_back_unchanged() {
+        let plane = TransformationMatrix { rows: [[1.2, 0.1, 30.], [-0.2, 0.9, 12.], [0.001, -0.0005, 1.]] };
+        let lifted = Matrix3d::from_2d(&plane);
+        assert!(lifted.is_2d());
+        assert_eq!(lifted.flatten(), plane);
+        let other = TransformationMatrix::from_css([2., 1., 0., 3., 5., 6.]);
+        assert_eq!(lifted.compose(Matrix3d::from_2d(&other)).flatten(), plane.compose(other));
+        assert!(Matrix3d::identity().is_identity() && Matrix3d::from_2d(&TransformationMatrix::unit()).is_identity());
+        assert!(!Matrix3d::translate(0., 0., 5.).is_2d() && !Matrix3d::translate(0., 0., 5.).is_identity());
+    }
+
+    #[test]
+    fn rotations_about_the_axes_are_the_ones_css_lists() {
+        let angle = 0.7f32;
+        let (sin, cos) = angle.sin_cos();
+        let about_y = Matrix3d::rotate(0., 1., 0., angle);
+        let expected = Matrix3d::from_css([cos, 0., -sin, 0., 0., 1., 0., 0., sin, 0., cos, 0., 0., 0., 0., 1.]);
+        let about_x = Matrix3d::rotate(1., 0., 0., angle);
+        let expected_x = Matrix3d::from_css([1., 0., 0., 0., 0., cos, sin, 0., 0., -sin, cos, 0., 0., 0., 0., 1.]);
+        for row in 0..4 {
+            for column in 0..4 {
+                assert!((about_y.rows[row][column] - expected.rows[row][column]).abs() < 1e-6);
+                assert!((about_x.rows[row][column] - expected_x.rows[row][column]).abs() < 1e-6);
+            }
+        }
+        // About z it is rotate(), clockwise on the screen.
+        let about_z = Matrix3d::rotate(0., 0., 1., angle).flatten();
+        assert_matrix(about_z, [cos, sin, -sin, cos, 0., 0.]);
+        // The axis is normalized, and a zero axis turns nothing.
+        assert_eq!(Matrix3d::rotate(0., 5., 0., angle), about_y);
+        assert!(Matrix3d::rotate(0., 0., 0., angle).is_identity());
+        // A right angle has exact entries.
+        let quarter = Matrix3d::rotate(0., 1., 0., 90f32.to_radians());
+        assert_eq!(quarter.rows[0], [0., 0., 1., 0.]);
+        assert_eq!(quarter.rows[2], [-1., 0., 0., 0.]);
+        let half = Matrix3d::rotate(0., 1., 0., 180f32.to_radians());
+        assert_eq!((half.rows[0][0], half.rows[2][2], half.rows[0][2]), (-1., -1., 0.));
+    }
+
+    #[test]
+    fn perspective_puts_a_point_nearer_the_viewer_further_from_the_center() {
+        let perspective = Matrix3d::perspective(400.);
+        assert_eq!(perspective.rows[3][2], -1. / 400.);
+        // A point 100 in front of the plane (z = 100) is 300 from the eye: 4/3 as large.
+        let near = perspective.project(60., 30., 100.).unwrap();
+        assert_near(near[0], 80.);
+        assert_near(near[1], 40.);
+        let far = perspective.project(60., 30., -400.).unwrap();
+        assert_near(far[0], 30.);
+        // At the eye, and behind it, there is nothing to see.
+        assert!(perspective.project(60., 30., 400.).is_none() && perspective.project(60., 30., 500.).is_none());
+        // Under a pixel is a pixel.
+        assert_eq!(Matrix3d::perspective(0.).rows[3][2], -1.);
+        // About a point, that point stays where it is at any depth.
+        let about = Matrix3d::perspective_about(400., 100., 50.);
+        assert_close(about.homogeneous(100., 50., 0.), [100., 50., 0., 1.]);
+        let shifted = about.project(100., 50., 200.).unwrap();
+        assert_near(shifted[0], 100.);
+        assert_near(shifted[1], 50.);
+    }
+
+    #[test]
+    fn the_inverse_of_a_4x4_undoes_it() {
+        let matrix = Matrix3d::translate(10., -20., 5.)
+            .compose(Matrix3d::rotate(1., 2., 3., 0.9))
+            .compose(Matrix3d::perspective(300.))
+            .compose(Matrix3d::scale(2., 0.5, 3.));
+        let inverse = matrix.inverse().unwrap();
+        let product = matrix.compose(inverse);
+        for row in 0..4 {
+            for column in 0..4 {
+                let expected = if row == column { 1. } else { 0. };
+                assert!((product.rows[row][column] - expected).abs() < 1e-4, "{product:?}");
+            }
+        }
+        assert!(Matrix3d::scale(1., 0., 1.).inverse().is_none());
+    }
+
+    #[test]
+    fn two_turns_of_forty_five_degrees_are_exactly_edge_on() {
+        let turn = Matrix3d::rotate(0., 1., 0., 45f32.to_radians());
+        let both = turn.compose(turn);
+        assert_eq!(both.rows[0][0], 0.);
+        assert!(both.flatten().inverse().is_none());
+        // A turn by 40 and one by 40 is not.
+        let forty = Matrix3d::rotate(0., 1., 0., 40f32.to_radians());
+        assert!(forty.compose(forty).flatten().inverse().is_some());
+    }
+
+    #[test]
+    fn the_back_of_a_plane_shows_after_a_turn_past_a_right_angle() {
+        let about_y = |degrees: f32| Matrix3d::rotate(0., 1., 0., degrees.to_radians());
+        assert!(!Matrix3d::identity().shows_backface());
+        assert!(!about_y(0.).shows_backface() && !about_y(60.).shows_backface() && !about_y(80.).shows_backface());
+        assert!(about_y(100.).shows_backface() && about_y(180.).shows_backface() && about_y(260.).shows_backface());
+        assert!(!about_y(280.).shows_backface() && !about_y(360.).shows_backface());
+        assert!(Matrix3d::rotate(1., 0., 0., 135f32.to_radians()).shows_backface());
+        // A turn of the plane in its own plane and a mirror of it are no turn over.
+        assert!(!Matrix3d::rotate(0., 0., 1., 3.).shows_backface());
+        assert!(!Matrix3d::scale(-1., 1., 1.).shows_backface());
+        // The sign is that of the inverse's (2,2) entry, which perspective does not change.
+        let seen = Matrix3d::perspective(400.).compose(about_y(150.));
+        assert!(seen.shows_backface());
+        assert!(!Matrix3d::perspective(400.).compose(about_y(30.)).shows_backface());
+        // Two turns of 100 degrees are one of 200.
+        assert!(about_y(100.).compose(about_y(100.)).shows_backface());
+        // Moving it forward does not turn it.
+        assert!(!Matrix3d::translate(0., 0., 80.).shows_backface());
+    }
+
+    #[test]
+    fn a_transform_with_a_3d_function_resolves_to_a_4x4_about_the_origin_in_3d() {
+        let transform = ElementTransform {
+            functions: vec![TransformFunction::Rotate3d(0., 1., 0., 90f32.to_radians())],
+            origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+            origin_z: 30.,
+            animating: false,
+        };
+        let matrix = transform.resolve(Bounds::new(point(px(100.), px(50.)), size(px(40.), px(40.))));
+        // The origin (120, 70, 30) is fixed; a point 10 to its right, at the same depth, comes out 10
+        // behind the plane (z - 10), over the origin's x.
+        assert_close(matrix.homogeneous(120., 70., 30.), [120., 70., 30., 1.]);
+        assert_close(matrix.homogeneous(130., 70., 30.), [120., 70., 20., 1.]);
+        assert!(!matrix.is_2d());
+        // A list of 2D functions is a 2D matrix.
+        let flat = ElementTransform {
+            functions: vec![TransformFunction::Rotate(0.3), TransformFunction::Scale(2., 1.)],
+            ..ElementTransform::default()
+        };
+        assert!(flat.resolve(Bounds::new(point(px(0.), px(0.)), size(px(10.), px(10.)))).is_2d());
+    }
+
+    #[test]
+    fn the_3d_functions_have_the_matrices_of_css_transforms_2() {
+        let size = box_of(200., 100.);
+        assert_eq!(
+            TransformFunction::Translate3d(TransformLength::fraction(0.5), TransformLength::pixels(4.), 7.).matrix(size),
+            Matrix3d::translate(100., 4., 7.)
+        );
+        assert_eq!(TransformFunction::Scale3d(2., 3., 4.).matrix(size), Matrix3d::scale(2., 3., 4.));
+        assert!(TransformFunction::Perspective(None).matrix(size).is_identity());
+        assert_eq!(TransformFunction::Perspective(Some(250.)).matrix(size).rows[3][2], -1. / 250.);
+        let values = [1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16.];
+        assert_eq!(TransformFunction::Matrix3d(values).matrix(size), Matrix3d::from_css(values));
+    }
+
+    #[test]
+    fn a_blend_with_a_3d_function_steps_at_the_middle_until_the_3d_decomposition_is_there() {
+        let size = box_of(10., 10.);
+        let blend = |progress: f32| TransformFunction::Interpolated {
+            from: vec![TransformFunction::Rotate3d(0., 1., 0., 0.)],
+            to: vec![TransformFunction::Translate3d(TransformLength::pixels(8.), TransformLength::pixels(0.), 0.)],
+            progress,
+        };
+        assert!(blend(0.25).matrix(size).is_identity());
+        assert_eq!(blend(0.75).matrix(size), Matrix3d::translate(8., 0., 0.));
+        assert!(blend(0.75).is_3d());
+    }
+
+    #[test]
+    fn a_perspective_resolves_about_its_origin_in_the_border_box() {
+        let perspective = Perspective {
+            distance: 400.,
+            origin: (TransformLength::fraction(0.5), TransformLength::pixels(10.)),
+        };
+        let matrix = perspective.resolve(Bounds::new(point(px(100.), px(50.)), size(px(200.), px(100.))));
+        // The origin is (200, 60); it does not move at any depth.
+        let at_origin = matrix.project(200., 60., 120.).unwrap();
+        assert_near(at_origin[0], 200.);
+        assert_near(at_origin[1], 60.);
+        // A point 100 right of it at z = 100 is 4/3 as far from it.
+        let right = matrix.project(300., 60., 100.).unwrap();
+        assert_near(right[0], 200. + 100. * 400. / 300.);
     }
 }

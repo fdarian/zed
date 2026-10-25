@@ -20,7 +20,7 @@ use crate::{
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SharedLayoutEngine, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    DecorationThickness, TextDecorationStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle, Visibility,
+    DecorationThickness, TextDecorationStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Matrix3d, ElementSpace, Underline, UnderlineStyle, Visibility,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowInsets, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
     transparent_black,
@@ -2926,6 +2926,20 @@ struct AmbientTransform {
     /// scale kept across the animation and drawn through the matrix, as a compositor keeps the
     /// raster scale of an animating layer, and not rasterized through every matrix of the run.
     animating: bool,
+    /// From the space the 3D rendering context this transform is in starts in (the space of the
+    /// parent of the context's root) to the window: the flat transforms around the context
+    /// multiplied out. For a transform not in a 3D context, it is the transform around it.
+    outer: TransformationMatrix,
+    /// From the local space to the space `outer` takes, the 4x4 transforms of the 3D rendering context
+    /// multiplied out: `matrix` is `outer` after the flattening of this.
+    accumulated: Matrix3d,
+    /// The element's children are planes of its 3D rendering context (`transform-style: preserve-3d`).
+    preserve_3d: bool,
+    /// The perspective the element puts in front of the transform of each child.
+    child_perspective: Option<Matrix3d>,
+    /// Nothing inside is drawn or hit: this transform or one around it has `backface-visibility: hidden`
+    /// and faces away from the viewer. The window mask is empty inside, which does it.
+    hidden: bool,
 }
 
 impl AmbientTransform {
@@ -2935,6 +2949,18 @@ impl AmbientTransform {
             TransformKind::General => self.matrix.bounding_box(bounds),
         }
     }
+}
+
+/// See [`Window::enter_space`].
+struct Entered {
+    outer: TransformationMatrix,
+    accumulated: Matrix3d,
+    /// From the local space to the window.
+    matrix: TransformationMatrix,
+    /// From the local space to the space around it, when the element is flattened onto it: `None`
+    /// for a plane of the parent's 3D rendering context, which is somewhere else in space.
+    step: Option<TransformationMatrix>,
+    hidden: bool,
 }
 
 /// How a point maps between the window and the local space of a hitbox or mouse listener that
@@ -2982,6 +3008,13 @@ pub(crate) struct AmbientKey {
     kind: TransformKind,
     local_clip: Option<ContentMask<Pixels>>,
     animating: bool,
+    // What a transform inside this one is composed with: two ambients with the same matrix put a
+    // child with a 3D transform in different places when one is in a 3D context and the other is not.
+    outer: TransformationMatrix,
+    accumulated: Matrix3d,
+    preserve_3d: bool,
+    child_perspective: Option<Matrix3d>,
+    hidden: bool,
 }
 
 impl AmbientKey {
@@ -4808,15 +4841,22 @@ impl Window {
         let mask = self.content_mask().bounds;
         let slack = px(1.);
         let scale_factor = self.scale_factor();
-        let own_transform = self
+        let space = self
             .layout_engine
             .as_ref()
             .unwrap()
-            .element_transform(layout_id, bounds);
+            .element_space(layout_id, bounds);
         // The outset is in the child's own space; this is how far it can reach in the window.
-        let composed = match &own_transform {
-            Some(own) => self.transform().compose(*own),
-            None => self.transform(),
+        let (composed, own_transform) = match &space {
+            Some(space) => {
+                let entered = self.enter_space(space);
+                match entered.step {
+                    Some(step) => (entered.matrix, Some(step)),
+                    // A plane of a 3D rendering context is not where a transform of its own puts a box.
+                    None => return false,
+                }
+            }
+            None => (self.transform(), None),
         };
         if !composed.is_affine() {
             // How far the outset reaches in the window is not bounded by one number under perspective.
@@ -6269,14 +6309,45 @@ impl Window {
         animating: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.with_element_space(
+            ElementSpace {
+                matrix: Matrix3d::from_2d(&matrix),
+                animating,
+                ..ElementSpace::default()
+            },
+            f,
+        )
+    }
+
+    /// [`Window::with_transform`] for an element's whole [`ElementSpace`]: a 4x4 transform, the
+    /// `perspective` it puts in front of its children, and its `transform-style` and
+    /// `backface-visibility`.
+    ///
+    /// The transform of an element that is not in a 3D rendering context (its parent's
+    /// `transform-style` is flat) is flattened onto the plane of the transform around it: the
+    /// matrix the element's primitives are drawn through is that of the parent times the z = 0 plane of
+    /// the element's 4x4, with the parent's `perspective` in front of it. When the parent
+    /// has `preserve-3d`, the element is a plane of the parent's 3D rendering context: the 4x4s of the
+    /// chain multiply out, and are flattened once, at the primitives. The context starts at the first
+    /// element of the chain whose parent is flat, and what is in it is drawn in paint order, not
+    /// sorted by depth, and not cut where planes intersect.
+    ///
+    /// An element with `backface-visibility: hidden` draws nothing, and is not hit, nor is anything in
+    /// it, while the 4x4 it has accumulated within its 3D rendering context shows its back (see
+    /// [`Matrix3d::shows_backface`]).
+    pub fn with_element_space<R>(&mut self, space: ElementSpace, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
-        if matrix.is_identity() {
+        let parent = self.transform_stack.last();
+        let parent_shapes_children = parent.is_some_and(|parent| parent.preserve_3d || parent.child_perspective.is_some());
+        if space.matrix.is_identity() && !space.preserve_3d && !space.backface_hidden && space.child_perspective.is_none() && !parent_shapes_children {
             return f(self);
         }
-        let animating = animating || self.transform_stack.last().is_some_and(|ambient| ambient.animating);
-        let outer = self.transform();
-        let composed = outer.compose(matrix);
-        let carried_clip = self.transform_stack.last().and_then(|ambient| ambient.local_clip);
+        let animating = space.animating || parent.is_some_and(|parent| parent.animating);
+        let parent_matrix = self.transform();
+        let carried_clip = parent.and_then(|parent| parent.local_clip);
+        let entered = self.enter_space(&space);
+        let (accumulated, composed, step, hidden, outer) =
+            (entered.accumulated, entered.matrix, entered.step, entered.hidden, entered.outer);
 
         let scale_factor = self.scale_factor();
         let (kind, offset, device_offset) = if composed.is_translation() {
@@ -6292,16 +6363,18 @@ impl Window {
 
         let flat = kind == TransformKind::General && composed.inverse().is_none();
         let mut local_clip = None;
-        let mut window_clip = flat.then(ContentMask::default);
+        let mut window_clip = (flat || hidden).then(ContentMask::default);
         if let Some(clip) = carried_clip {
-            let in_new_space = match (kind, matrix.inverse()) {
+            // The clip is in the plane of the parent; a plane of the same 3D context is somewhere else
+            // in space, so the clip goes to the window as its bounding box.
+            let in_new_space = match (kind, step.and_then(|step| step.inverse())) {
                 (TransformKind::General, Some(inverse)) => clip.mapped_exactly(&inverse),
                 _ => None,
             };
             match in_new_space {
                 Some(mapped) => local_clip = Some(mapped),
                 None => {
-                    let in_window = clip.mapped_loosely(&outer);
+                    let in_window = clip.mapped_loosely(&parent_matrix);
                     window_clip = Some(match window_clip {
                         Some(flat) => flat.intersect(&in_window),
                         None => in_window,
@@ -6310,7 +6383,7 @@ impl Window {
             }
         }
 
-        let space = match kind {
+        let hit_space = match kind {
             TransformKind::Translation => {
                 let mut to_window = TransformationMatrix::unit();
                 to_window.rows[0][2] = offset.x.0;
@@ -6325,8 +6398,13 @@ impl Window {
             offset,
             device_offset,
             local_clip,
-            space: Rc::new(space),
+            space: Rc::new(hit_space),
             animating,
+            outer,
+            accumulated,
+            preserve_3d: space.preserve_3d,
+            child_perspective: space.child_perspective,
+            hidden,
         });
         let result = match window_clip {
             Some(clip) => self.with_window_content_mask(clip, f),
@@ -6336,6 +6414,27 @@ impl Window {
         result
     }
 
+    /// What entering `space` inside the transform in effect makes of the ambient transform.
+    fn enter_space(&self, space: &ElementSpace) -> Entered {
+        let parent = self.transform_stack.last();
+        let own = match parent.and_then(|parent| parent.child_perspective) {
+            Some(perspective) => perspective.compose(space.matrix),
+            None => space.matrix,
+        };
+        let (outer, accumulated, step) = match parent {
+            Some(parent) if parent.preserve_3d => (parent.outer, parent.accumulated.compose(own), None),
+            _ => (self.transform(), own, Some(own.flatten())),
+        };
+        Entered {
+            outer,
+            matrix: outer.compose(accumulated.flatten()),
+            hidden: parent.is_some_and(|parent| parent.hidden)
+                || (space.backface_hidden && accumulated.shows_backface()),
+            accumulated,
+            step,
+        }
+    }
+
     pub(crate) fn ambient_key(&self) -> Option<AmbientKey> {
         self.transform_stack.last().map(|ambient| AmbientKey {
             matrix: ambient.matrix,
@@ -6343,6 +6442,11 @@ impl Window {
             local_clip: ambient.local_clip,
             // Only a general transform rasterizes text by it.
             animating: ambient.animating && ambient.kind == TransformKind::General,
+            outer: ambient.outer,
+            accumulated: ambient.accumulated,
+            preserve_3d: ambient.preserve_3d,
+            child_perspective: ambient.child_perspective,
+            hidden: ambient.hidden,
         })
     }
 
@@ -8952,20 +9056,29 @@ impl Window {
             .layout_margin_bottom(layout_id, scale_factor)
     }
 
-    /// The matrix of the `transform` of the element of the given layout node for its border box
-    /// `border_box`, from the element's own space to the one the box is in (the space of
-    /// [`Window::layout_unsnapped_bounds`] and, composed onto [`Window::transform`] as asked from
-    /// the element's prepaint or paint listeners, to the window). `None` for an element with no
-    /// transform. Pass the unsnapped box to get the matrix a browser reports geometry through.
+    /// What the element of the given layout node puts into the ambient transform, for its border box
+    /// `border_box` (see [`Window::with_element_space`]): `None` for an element with no `transform`,
+    /// `perspective` or `transform-style`. Pass the unsnapped box to get the space a browser reports
+    /// geometry through.
     ///
     /// This method should only be called as part of element drawing.
-    pub fn layout_own_transform(
-        &self,
-        layout_id: LayoutId,
-        border_box: Bounds<Pixels>,
-    ) -> Option<TransformationMatrix> {
+    pub fn layout_own_space(&self, layout_id: LayoutId, border_box: Bounds<Pixels>) -> Option<ElementSpace> {
         self.invalidator.debug_assert_paint_or_prepaint();
-        self.layout_engine.as_ref().unwrap().element_transform(layout_id, border_box)
+        self.layout_engine.as_ref().unwrap().element_space(layout_id, border_box)
+    }
+
+    /// The matrix from the local space of the element of the given layout node to the window, as
+    /// it would be inside [`Window::with_element_space`] of [`Window::layout_own_space`]: the
+    /// transform in effect, and the element's own, seen through the perspective of its parent, in a 3D
+    /// rendering context accumulated with the planes before it. As asked from the element's
+    /// prepaint or paint listeners, that is the matrix the element's box is drawn through.
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_to_window(&self, layout_id: LayoutId, border_box: Bounds<Pixels>) -> TransformationMatrix {
+        match self.layout_own_space(layout_id, border_box) {
+            Some(space) => self.enter_space(&space).matrix,
+            None => self.transform(),
+        }
     }
 
     /// The size of the given layout node as layout computed it, in logical pixels and before it is

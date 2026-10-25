@@ -2,8 +2,8 @@
 //! translation path places them, the general path carries a matrix and a local clip.
 
 use crate::{
-    Bounds, ContentMask, Context, Corners, IntoElement, Pixels, Quad, Render, ScaledPixels, TestApp,
-    Styled, TransformationMatrix, Window, blue, canvas, fill, point, px, red, size,
+    Bounds, ContentMask, Context, Corners, ElementSpace, IntoElement, Matrix3d, Pixels, Quad, Render, ScaledPixels,
+    TestApp, Styled, TransformationMatrix, Window, blue, canvas, fill, point, px, red, size,
 };
 use std::rc::Rc;
 
@@ -782,6 +782,7 @@ mod elements {
         ElementTransform {
             functions,
             origin: (TransformLength::fraction(0.5), TransformLength::fraction(0.5)),
+            origin_z: 0.,
             animating: false,
         }
     }
@@ -790,6 +791,7 @@ mod elements {
         ElementTransform {
             functions,
             origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+            origin_z: 0.,
             animating: false,
         }
     }
@@ -825,6 +827,7 @@ mod elements {
         let transform = about_center(vec![TransformFunction::Rotate(45f32.to_radians())]);
         let expected = transform
             .resolve(crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(100.), px(40.))))
+            .flatten()
             .scaled(2.);
         let (_app, mut window) = open({
             let transform = transform.clone();
@@ -907,7 +910,122 @@ mod elements {
         let around = turn.resolve(bounds);
         let slid = slide.resolve(crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(60.), px(20.))));
         let leaf = quad_with_width(&quads(&mut window), 20.);
-        assert_matrix(leaf.transformation, around.compose(slid).scaled(2.));
+        assert_matrix(leaf.transformation, around.compose(slid).flatten().scaled(2.));
+    }
+
+    fn turned_about_y(degrees: f32) -> ElementTransform {
+        about_center(vec![TransformFunction::Rotate3d(0., 1., 0., degrees.to_radians())])
+    }
+
+    fn drawn_at(quad: &Quad, x: f32, y: f32) -> [f32; 2] {
+        let at = quad.transformation.project(x * 2., y * 2.).expect("in front of the eye");
+        [at[0] / 2., at[1] / 2.]
+    }
+
+    #[test]
+    fn a_child_of_a_perspective_is_drawn_through_the_perspective_about_its_origin() {
+        let (_app, mut window) = open(|| {
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(50.))
+                        .top(px(60.))
+                        .w(px(100.))
+                        .h(px(100.))
+                        .perspective(400.)
+                        .child(div().w(px(100.)).h(px(100.)).bg(red()).transform(turned_about_y(60.))),
+                )
+                .into_any_element()
+        });
+        let quad = quad_with_width(&quads(&mut window), 100.);
+        // The perspective-origin is the middle of the parent, (100, 110), the turn is about the same
+        // point: the corner (50, 60) is 25 to the left of it after the turn and 43.3 toward the viewer.
+        let angle = 60f64.to_radians();
+        let w = 1. + angle.sin() * 50. / 400.;
+        let expected = |x: f64, y: f64, w: f64| [(100. + angle.cos() * x / w) as f32, (110. + y / w) as f32];
+        let near = drawn_at(&quad, 50., 60.);
+        let [x, y] = expected(-50., -50., 1. - angle.sin() * 50. / 400.);
+        assert!((near[0] - x).abs() < 0.02 && (near[1] - y).abs() < 0.02, "{near:?} is not {x} {y}");
+        let far = drawn_at(&quad, 150., 160.);
+        let [x, y] = expected(50., 50., w);
+        assert!((far[0] - x).abs() < 0.02 && (far[1] - y).abs() < 0.02, "{far:?} is not {x} {y}");
+    }
+
+    #[test]
+    fn a_flipped_card_of_divs_shows_the_face_that_faces_the_viewer() {
+        let faces = |degrees: f32| {
+            let (_app, mut window) = open(move || {
+                div()
+                    .size_full()
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(50.))
+                            .top(px(60.))
+                            .w(px(100.))
+                            .h(px(100.))
+                            .perspective(600.)
+                            .child(
+                                div()
+                                    .w(px(100.))
+                                    .h(px(100.))
+                                    .preserve_3d()
+                                    .transform(turned_about_y(degrees))
+                                    .child(div().absolute().top(px(0.)).left(px(0.)).w(px(100.)).h(px(100.)).bg(red()).backface_hidden())
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top(px(0.))
+                                            .left(px(0.))
+                                            .w(px(80.))
+                                            .h(px(100.))
+                                            .bg(blue())
+                                            .backface_hidden()
+                                            .transform(turned_about_y(180.)),
+                                    ),
+                            ),
+                    )
+                    .into_any_element()
+            });
+            quads(&mut window)
+                .iter()
+                .map(|quad| quad.bounds.size.width.0 / 2.)
+                .filter(|width| *width == 100. || *width == 80.)
+                .collect::<Vec<f32>>()
+        };
+        assert_eq!(faces(0.), [100.]);
+        assert_eq!(faces(89.), [100.]);
+        assert!(faces(90.).is_empty());
+        assert_eq!(faces(91.), [80.]);
+        assert_eq!(faces(180.), [80.]);
+        assert_eq!(faces(271.), [100.]);
+    }
+
+    #[test]
+    fn what_a_child_moved_toward_the_viewer_reaches_is_seen_through_the_perspective_of_its_parent() {
+        let nearer = |perspective: Option<f32>| {
+            scroll_range(move || {
+                let parent = block(100., 50.);
+                let parent = match perspective {
+                    Some(distance) => parent.perspective(distance),
+                    None => parent,
+                };
+                parent
+                    .child(block(100., 50.).transform(about_top_left(vec![TransformFunction::Translate3d(
+                        TransformLength::pixels(0.),
+                        TransformLength::pixels(0.),
+                        100.,
+                    )])))
+                    .into_any_element()
+            })
+        };
+        assert_eq!(nearer(None), point(px(0.), px(0.)));
+        // The corner (100, 50) is (50, 25) from the middle of the parent, 4/3 as far away at z = 100.
+        let range = nearer(Some(400.));
+        assert!((range.x.0 - (50. * 400. / 300. + 50. - 100.)).abs() < 0.6, "{range:?}");
+        assert_eq!(range.y, px(0.));
     }
 
     fn scroller(content: AnyElement, handle: &ScrollHandle) -> AnyElement {
@@ -1198,6 +1316,7 @@ mod elements {
     fn parent_matrix() -> TransformationMatrix {
         about_center(vec![TransformFunction::Rotate(30f32.to_radians())])
             .resolve(crate::Bounds::new(point(px(50.), px(50.)), crate::size(px(100.), px(100.))))
+            .flatten()
     }
 
     #[test]
@@ -1225,7 +1344,7 @@ mod elements {
         });
         // The child's box in parent-local space, turned about its center by its own transform,
         // then by the parent's.
-        let child = own.resolve(crate::Bounds::new(point(px(110.), px(60.)), crate::size(px(100.), px(80.))));
+        let child = own.resolve(crate::Bounds::new(point(px(110.), px(60.)), crate::size(px(100.), px(80.)))).flatten();
         let both = parent_matrix().compose(child);
         // The child's center, (160, 100) in layout, is outside the clip of the parent (x < 150),
         // but its corner nearest the parent's center is inside.
@@ -1385,7 +1504,7 @@ mod elements {
             move || holder(turn.clone(), crate::deferred(marker()))
         });
         let bounds = crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(100.), px(40.)));
-        let around = turn.resolve(bounds);
+        let around = turn.resolve(bounds).flatten();
         let marker = quad_with_width(&quads(&mut window), 20.);
         assert_matrix(marker.transformation, around.scaled(2.));
 
@@ -1887,5 +2006,342 @@ mod glyphs {
         };
         assert_eq!(at(30.), at(30.0001));
         assert_ne!(at(30.), at(31.));
+    }
+}
+
+mod three_d {
+    //! `Window::with_element_space`: a 4x4 transform, the perspective of the parent in front of it,
+    //! `preserve-3d` and `backface-visibility`. The expected points are worked out here by hand
+    //! from the CSS definitions, not from the matrices the code builds.
+
+    use super::*;
+    use crate::HitboxBehavior;
+
+    /// The window of these tests has a scale factor of 2.
+    const SCALE: f32 = 2.;
+
+    fn about_y(degrees: f32) -> Matrix3d {
+        Matrix3d::rotate(0., 1., 0., degrees.to_radians())
+    }
+
+    /// `matrix` about the point `(x, y)` of the plane.
+    fn about(x: f32, y: f32, matrix: Matrix3d) -> Matrix3d {
+        Matrix3d::translate(x, y, 0.).compose(matrix).compose(Matrix3d::translate(-x, -y, 0.))
+    }
+
+    fn space(matrix: Matrix3d) -> ElementSpace {
+        ElementSpace { matrix, ..ElementSpace::default() }
+    }
+
+    fn perspective(distance: f32, x: f32, y: f32) -> ElementSpace {
+        ElementSpace {
+            child_perspective: Some(Matrix3d::perspective_about(distance, x, y)),
+            ..ElementSpace::default()
+        }
+    }
+
+    fn preserving(matrix: Matrix3d) -> ElementSpace {
+        ElementSpace { matrix, preserve_3d: true, ..ElementSpace::default() }
+    }
+
+    fn hidden_back(matrix: Matrix3d) -> ElementSpace {
+        ElementSpace { matrix, backface_hidden: true, ..ElementSpace::default() }
+    }
+
+    /// Where a corner of the quad of width `width * SCALE` is drawn, in logical pixels.
+    fn corner(quad: &Quad, x: f32, y: f32) -> [f32; 2] {
+        let at = quad.transformation.project(x * SCALE, y * SCALE).expect("in front of the eye");
+        [at[0] / SCALE, at[1] / SCALE]
+    }
+
+    fn assert_at(actual: [f32; 2], expected: [f32; 2]) {
+        assert!(
+            (actual[0] - expected[0]).abs() < 0.02 && (actual[1] - expected[1]).abs() < 0.02,
+            "{actual:?} is not {expected:?}"
+        );
+    }
+
+    /// CSS: a point `(x, y)` of a 100 square at (50, 50) turned by `rotateY(60deg)` about its center,
+    /// seen from 400 pixels away along the line through (100, 100).
+    fn seen(x: f32, y: f32) -> [f32; 2] {
+        let (relative_x, relative_y) = (f64::from(x) - 100., f64::from(y) - 100.);
+        let angle = 60f64.to_radians();
+        let turned_x = angle.cos() * relative_x;
+        let depth = -angle.sin() * relative_x;
+        let w = 1. - depth / 400.;
+        [(100. + turned_x / w) as f32, (100. + relative_y / w) as f32]
+    }
+
+    #[test]
+    fn a_quad_turned_about_y_under_a_perspective_is_drawn_where_css_puts_its_corners() {
+        let quads = painted(|window| {
+            window.with_element_space(perspective(400., 100., 100.), |window| {
+                window.with_element_space(space(about(100., 100., about_y(60.))), |window| {
+                    window.paint_quad(fill(square(50., 50., 100.), red()));
+                });
+            });
+        });
+        let quad = quad_with_width(&quads, 100., SCALE);
+        assert!(!quad.transformation.is_affine());
+        for (x, y) in [(50., 50.), (150., 50.), (150., 150.), (50., 150.), (100., 100.)] {
+            assert_at(corner(&quad, x, y), seen(x, y));
+        }
+        // The edge that turned toward the viewer is the longer.
+        let left = corner(&quad, 50., 150.)[1] - corner(&quad, 50., 50.)[1];
+        let right = corner(&quad, 150., 150.)[1] - corner(&quad, 150., 50.)[1];
+        assert!(left > 100. && right < 100., "{left} {right}");
+    }
+
+    #[test]
+    fn the_perspective_of_a_parent_reaches_its_children_and_not_their_children() {
+        // The perspective is in front of the transform of each child only; a plain child between
+        // flattens what is in it.
+        let quads = painted(|window| {
+            window.with_element_space(perspective(400., 100., 100.), |window| {
+                window.with_element_space(ElementSpace::default(), |window| {
+                    window.with_element_space(space(about(100., 100., about_y(60.))), |window| {
+                        window.paint_quad(fill(square(50., 50., 100.), red()));
+                    });
+                });
+            });
+        });
+        let quad = quad_with_width(&quads, 100., SCALE);
+        assert!(quad.transformation.is_affine());
+        assert!((quad.transformation.rows[0][0] - 0.5).abs() < 1e-4, "{:?}", quad.transformation);
+    }
+
+    #[test]
+    fn a_child_moved_toward_the_viewer_is_larger_and_the_perspective_origin_is_where_it_grows_from() {
+        let drawn = |origin: (f32, f32)| {
+            let quads = painted(move |window| {
+                window.with_element_space(perspective(400., origin.0, origin.1), |window| {
+                    window.with_element_space(space(Matrix3d::translate(0., 0., 100.)), |window| {
+                        window.paint_quad(fill(square(50., 50., 100.), red()));
+                    });
+                });
+            });
+            quad_with_width(&quads, 100., SCALE)
+        };
+        // 100 toward a viewer 400 away: 400 / 300 as large, about the vanishing point.
+        let at_center = drawn((100., 100.));
+        let size = 100. * 400. / 300.;
+        assert_at(corner(&at_center, 50., 50.), [100. - size / 2., 100. - size / 2.]);
+        assert_at(corner(&at_center, 150., 150.), [100. + size / 2., 100. + size / 2.]);
+        // Looking at another point of the plane moves where it grows from: that point stays.
+        let at_corner = drawn((0., 0.));
+        assert_at(corner(&at_corner, 50., 50.), [50. * 400. / 300., 50. * 400. / 300.]);
+        assert_at(corner(&at_corner, 150., 150.), [150. * 400. / 300., 150. * 400. / 300.]);
+        // Without the perspective, moving along z moves nothing.
+        let flat = painted(|window| {
+            window.with_element_space(space(Matrix3d::translate(0., 0., 100.)), |window| {
+                window.paint_quad(fill(square(50., 50., 100.), red()));
+            });
+        });
+        assert!(quad_with_width(&flat, 100., SCALE).transformation == TransformationMatrix::unit());
+    }
+
+    #[test]
+    fn a_plane_of_a_3d_context_turned_twice_by_45_degrees_is_edge_on_and_a_flat_one_is_not() {
+        let painted_in = |preserve_3d: bool| {
+            painted(move |window| {
+                let parent = ElementSpace {
+                    matrix: about(100., 100., about_y(45.)),
+                    preserve_3d,
+                    ..ElementSpace::default()
+                };
+                window.with_element_space(parent, |window| {
+                    window.paint_quad(fill(square(50., 50., 101.), red()));
+                    window.with_element_space(space(about(100., 100., about_y(45.))), |window| {
+                        window.paint_quad(fill(square(50., 50., 100.), red()));
+                    });
+                });
+            })
+        };
+        // In the context the two turns are one of 90 degrees: the child is a line, which draws nothing.
+        let in_context = painted_in(true);
+        assert!(in_context.iter().any(|quad| quad.bounds.size.width.0 == 101. * SCALE));
+        assert!(!in_context.iter().any(|quad| quad.bounds.size.width.0 == 100. * SCALE), "{in_context:?}");
+        // Flat, the parent's plane takes the child flattened onto it: 45 degrees of the child on
+        // the 45 of the parent, foreshortened twice.
+        let flat = painted_in(false);
+        let child = quad_with_width(&flat, 100., SCALE);
+        assert!(child.transformation.is_affine());
+        assert!((child.transformation.rows[0][0] - 0.5).abs() < 1e-4, "{:?}", child.transformation);
+        let parent = quad_with_width(&flat, 101., SCALE);
+        assert!((parent.transformation.rows[0][0] - 0.5f32.sqrt()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_plane_of_a_3d_context_is_flattened_once_at_the_primitive() {
+        // A child turned 30 degrees about y inside a parent turned 30 about x is the product of
+        // the 4x4s, flattened: not the product of the flattened ones.
+        let quads = painted(|window| {
+            let parent = ElementSpace {
+                matrix: Matrix3d::rotate(1., 0., 0., 30f32.to_radians()),
+                preserve_3d: true,
+                ..ElementSpace::default()
+            };
+            window.with_element_space(parent, |window| {
+                window.with_element_space(space(about_y(30.)), |window| {
+                    window.paint_quad(fill(square(0., 0., 100.), red()));
+                });
+            });
+        });
+        let quad = quad_with_width(&quads, 100., SCALE);
+        let (x, y) = (30f64.to_radians().sin(), 30f64.to_radians().cos());
+        // (1, 0, 0) goes to (cos30, 0, -sin30) by the child, and the parent's turn about x moves that z
+        // into y: sin30 * sin30 on the screen. Flattening the child first would leave it at y = 0.
+        let on_x = quad.transformation.apply_xy(SCALE, 0.);
+        assert!((f64::from(on_x[0]) - y * f64::from(SCALE)).abs() < 1e-3, "{on_x:?}");
+        assert!((f64::from(on_x[1]) - x * x * f64::from(SCALE)).abs() < 1e-3, "{on_x:?}");
+        let on_y = quad.transformation.apply_xy(0., SCALE);
+        assert!((f64::from(on_y[1]) - y * f64::from(SCALE)).abs() < 1e-3, "{on_y:?}");
+    }
+
+    #[test]
+    fn a_hidden_backface_hides_the_element_when_it_faces_away_and_not_otherwise() {
+        let drawn = |space: ElementSpace| {
+            painted(move |window| {
+                window.with_element_space(space.clone(), |window| {
+                    window.paint_quad(fill(square(50., 50., 100.), red()));
+                });
+            })
+        };
+        let turned = |degrees: f32, hidden: bool| ElementSpace {
+            matrix: about(100., 100., about_y(degrees)),
+            backface_hidden: hidden,
+            ..ElementSpace::default()
+        };
+        assert!(drawn(turned(180., true)).iter().all(|quad| quad.bounds.size.width.0 != 100. * SCALE));
+        // Visible, it is there, mirrored.
+        let shown = drawn(turned(180., false));
+        let quad = quad_with_width(&shown, 100., SCALE);
+        assert!((quad.transformation.rows[0][0] + 1.).abs() < 1e-4, "{:?}", quad.transformation);
+        assert!(!drawn(turned(0., true)).is_empty());
+        assert!(drawn(turned(80., true)).iter().any(|quad| quad.bounds.size.width.0 == 100. * SCALE));
+        assert!(drawn(turned(100., true)).iter().all(|quad| quad.bounds.size.width.0 != 100. * SCALE));
+        // A mirror is not a turn over.
+        let mirrored = ElementSpace {
+            matrix: about(100., 100., Matrix3d::scale(-1., 1., 1.)),
+            backface_hidden: true,
+            ..ElementSpace::default()
+        };
+        assert!(drawn(mirrored).iter().any(|quad| quad.bounds.size.width.0 == 100. * SCALE));
+    }
+
+    #[test]
+    fn what_is_inside_a_hidden_backface_is_hidden_too() {
+        let quads = painted(|window| {
+            window.with_element_space(hidden_back(about(100., 100., about_y(180.))), |window| {
+                window.paint_quad(fill(square(50., 50., 100.), red()));
+                window.with_element_space(space(Matrix3d::translate(5., 0., 0.)), |window| {
+                    window.paint_quad(fill(square(50., 50., 60.), blue()));
+                });
+            });
+            window.paint_quad(fill(square(0., 0., 21.), red()));
+        });
+        assert_eq!(quads.len(), 1, "{quads:?}");
+    }
+
+    #[test]
+    fn a_card_flip_shows_one_face_and_switches_at_the_middle() {
+        // A container with two faces, a front 100 wide and a back 60 wide turned over, each with its
+        // back hidden, and the container turned by `degrees` about y.
+        let faces = |degrees: f32| -> Vec<f32> {
+            painted(move |window| {
+                let container = ElementSpace {
+                    matrix: about(100., 100., about_y(degrees)),
+                    preserve_3d: true,
+                    ..ElementSpace::default()
+                };
+                window.with_element_space(container, |window| {
+                    window.with_element_space(hidden_back(Matrix3d::identity()), |window| {
+                        window.paint_quad(fill(square(50., 50., 100.), red()));
+                    });
+                    window.with_element_space(hidden_back(about(100., 100., about_y(180.))), |window| {
+                        window.paint_quad(fill(square(70., 70., 60.), blue()));
+                    });
+                });
+            })
+            .iter()
+            .map(|quad| quad.bounds.size.width.0 / SCALE)
+            .collect()
+        };
+        assert_eq!(faces(0.), [100.]);
+        assert_eq!(faces(89.), [100.]);
+        // Edge-on, the container is a line and shows neither.
+        assert!(faces(90.).is_empty() && faces(270.).is_empty());
+        assert_eq!(faces(91.), [60.]);
+        assert_eq!(faces(180.), [60.]);
+        assert_eq!(faces(269.), [60.]);
+        assert_eq!(faces(271.), [100.]);
+        assert_eq!(faces(360.), [100.]);
+        // The back face is not mirrored when its container is turned over: 180 + 180.
+        let quads = painted(|window| {
+            let container = preserving(about(100., 100., about_y(180.)));
+            window.with_element_space(container, |window| {
+                window.with_element_space(hidden_back(about(100., 100., about_y(180.))), |window| {
+                    window.paint_quad(fill(square(70., 70., 60.), blue()));
+                });
+            });
+        });
+        let back = quad_with_width(&quads, 60., SCALE);
+        assert!((back.transformation.rows[0][0] - 1.).abs() < 1e-4, "{:?}", back.transformation);
+    }
+
+    #[test]
+    fn nothing_is_hit_that_faces_away_and_a_tilted_quad_is_hit_inside_its_projected_edges() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| HitboxPainter(Rc::new(|window| {
+            window.with_element_space(perspective(400., 100., 100.), |window| {
+                window.with_element_space(space(about(100., 100., about_y(60.))), |window| {
+                    window.insert_hitbox(square(50., 50., 100.), HitboxBehavior::Normal);
+                });
+                // The same quad turned over, with its back hidden, and one with it shown.
+                window.with_element_space(hidden_back(about(100., 300., about_y(180.))), |window| {
+                    window.insert_hitbox(square(50., 250., 100.), HitboxBehavior::Normal);
+                });
+                window.with_element_space(space(about(100., 500., about_y(180.))), |window| {
+                    window.insert_hitbox(square(50., 450., 100.), HitboxBehavior::Normal);
+                });
+            });
+        })));
+        window.draw();
+        window.update(|_, window, _| {
+            let hit = |window: &Window, x: f32, y: f32| {
+                window.rendered_frame.hit_test(point(px(x), px(y)), true).ids.len()
+            };
+            // On the row y = 100 the left edge is at 71.97 and the right at 122.56 (see `seen`).
+            let (left, right) = (seen(50., 100.)[0], seen(150., 100.)[0]);
+            assert!((left - 71.97).abs() < 0.01 && (right - 122.56).abs() < 0.01, "{left} {right}");
+            assert_eq!(hit(window, left + 0.5, 100.), 1);
+            assert_eq!(hit(window, left - 0.5, 100.), 0);
+            assert_eq!(hit(window, right - 0.5, 100.), 1);
+            assert_eq!(hit(window, right + 0.5, 100.), 0);
+            // At the top edge of the right side the edge is lower: y = 50 shows at 100 - 50 / 1.108.
+            let top_right = seen(150., 50.);
+            assert_eq!(hit(window, top_right[0] - 0.5, top_right[1] + 0.5), 1);
+            assert_eq!(hit(window, top_right[0] - 0.5, top_right[1] - 0.5), 0);
+            // Facing away with its back hidden: not hit. Shown, it is, mirrored about its center.
+            assert_eq!(hit(window, 100., 300.), 0);
+            assert_eq!(hit(window, 60., 500.), 1);
+        });
+    }
+
+    #[test]
+    fn the_ambient_matrix_inside_a_perspective_and_a_turn_is_the_flattened_product() {
+        let seen_matrix = Rc::new(std::cell::RefCell::new(None));
+        let recorded = seen_matrix.clone();
+        painted(move |window| {
+            window.with_element_space(perspective(400., 100., 100.), |window| {
+                window.with_element_space(space(about(100., 100., about_y(60.))), |window| {
+                    *recorded.borrow_mut() = Some(window.transform());
+                });
+            });
+        });
+        let matrix = seen_matrix.borrow().unwrap();
+        for (x, y) in [(50., 50.), (150., 120.), (100., 100.)] {
+            assert_at(matrix.project(x, y).unwrap(), seen(x, y));
+        }
     }
 }
