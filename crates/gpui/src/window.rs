@@ -9081,6 +9081,17 @@ impl Window {
         }
     }
 
+    /// Whether the back of the element of the given layout node faces the viewer: the 4x4 it accumulates in
+    /// its 3D rendering context shows its back (see [`Matrix3d::shows_backface`]). What
+    /// `backface-visibility: hidden` hides, which is the element's to say and is not asked here, as for
+    /// [`Window::layout_own_space`].
+    ///
+    /// This method should only be called as part of element drawing.
+    pub fn layout_faces_away(&self, layout_id: LayoutId, border_box: Bounds<Pixels>) -> bool {
+        let space = self.layout_own_space(layout_id, border_box).unwrap_or_default();
+        self.enter_space(&space).accumulated.shows_backface()
+    }
+
     /// The size of the given layout node as layout computed it, in logical pixels and before it is
     /// snapped to device pixels. It leaves no bounds behind, so it is safe to ask for a root that
     /// is not placed yet (see [`Self::with_fractional_element_origin`]).
