@@ -139,18 +139,39 @@ impl DispatchPhase {
     }
 }
 
+/// Which counter of the [`LayoutStamp`] an invalidation moves.
+#[derive(Clone, Copy)]
+pub(crate) enum Counted {
+    /// A layout invalidation: anything may have changed in the layout.
+    Layout,
+    /// The frame of a running animation (see [`Window::request_animation_frame`]): it stales the
+    /// layout like a layout invalidation, but what it changes in the boxes shows in the box counters.
+    AnimationFrame,
+    /// Declared paint-only.
+    Nothing,
+}
+
 /// See [`Window::layout_stamp`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayoutStamp {
     layout_invalidations: usize,
+    animation_frames: usize,
     boxes: u64,
     nested_boxes: u64,
 }
 
 impl LayoutStamp {
-    /// Whether no layout invalidation came between the two stamps.
+    /// Whether no layout invalidation came between the two stamps. The frames of running
+    /// animations are not invalidations here: see [`Self::same_animation_frames`].
     pub fn same_invalidations(&self, other: &Self) -> bool {
         self.layout_invalidations == other.layout_invalidations
+    }
+
+    /// Whether no frame of a running animation was requested between the two stamps. An animation
+    /// that moves a box is seen by [`Self::same_boxes`]; one that changes the layout of what is
+    /// inside a box, as a font size does, is not.
+    pub fn same_animation_frames(&self, other: &Self) -> bool {
+        self.animation_frames == other.animation_frames
     }
 
     /// Whether no box of the window, a nested engine's included, moved or changed size between
@@ -169,6 +190,8 @@ struct WindowInvalidatorInner {
     pub update_count: usize,
     /// How many of those invalidations were not declared paint-only: see [`Window::layout_stamp`].
     pub layout_invalidations: usize,
+    /// How many of them were the frames of running animations: see [`Counted::AnimationFrame`].
+    pub animation_frames: usize,
     /// The `update_count` the layout the window last built was computed at, if nothing but
     /// paint-only invalidations came since. See [`WindowInvalidator::layout_is_current`].
     pub layout_current_at: Option<usize>,
@@ -209,6 +232,7 @@ impl WindowInvalidator {
                 dirty_views: FxHashSet::default(),
                 update_count: 0,
                 layout_invalidations: 0,
+                animation_frames: 0,
                 layout_current_at: None,
                 scroll_metrics_current_at: None,
                 #[cfg(feature = "profiler")]
@@ -219,16 +243,17 @@ impl WindowInvalidator {
     }
 
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
-        self.invalidate_view_as(entity, cx, true)
+        self.invalidate_view_as(entity, cx, Counted::Layout)
     }
 
-    /// [`WindowInvalidator::invalidate_view`] for an invalidation that is not declared
-    /// paint-only when `affects_layout`.
-    pub fn invalidate_view_as(&self, entity: EntityId, cx: &mut App, affects_layout: bool) -> bool {
+    /// [`WindowInvalidator::invalidate_view`] counted as `counted` in the [`LayoutStamp`].
+    pub(crate) fn invalidate_view_as(&self, entity: EntityId, cx: &mut App, counted: Counted) -> bool {
         let mut inner = self.inner.borrow_mut();
         inner.update_count += 1;
-        if affects_layout {
-            inner.layout_invalidations += 1;
+        match counted {
+            Counted::Layout => inner.layout_invalidations += 1,
+            Counted::AnimationFrame => inner.animation_frames += 1,
+            Counted::Nothing => {}
         }
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
@@ -330,6 +355,10 @@ impl WindowInvalidator {
 
     pub fn layout_invalidation_count(&self) -> usize {
         self.inner.borrow().layout_invalidations
+    }
+
+    pub fn animation_frame_count(&self) -> usize {
+        self.inner.borrow().animation_frames
     }
 
     /// Records that the layout being built now is the one the invalidations so far describe.
@@ -3813,7 +3842,7 @@ impl Window {
     /// and skip the frame request when it is set.
     pub fn request_animation_frame(&self) {
         let entity = self.current_view();
-        self.on_next_frame(move |_, cx| cx.notify(entity));
+        self.on_next_frame(move |_, cx| cx.notify_animation_frame(entity));
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.
@@ -4751,6 +4780,7 @@ impl Window {
     pub fn layout_stamp(&self) -> LayoutStamp {
         LayoutStamp {
             layout_invalidations: self.invalidator.layout_invalidation_count(),
+            animation_frames: self.invalidator.animation_frame_count(),
             boxes: self.layout_engine.as_ref().expect("the layout engine is out only while a pass runs").box_generation(),
             nested_boxes: self.nested_box_changes,
         }
@@ -12628,6 +12658,17 @@ mod tests {
 
             cx.notify(id);
             assert_ne!(window.layout_stamp(), grown, "and a layout invalidation moves it again");
+            assert!(!window.layout_stamp().same_invalidations(&grown));
+
+            let _ = window.draw(cx);
+            let settled = window.layout_stamp();
+            cx.notify_animation_frame(id);
+            let framed = window.layout_stamp();
+            assert_ne!(framed, settled, "the frame of an animation moves the stamp");
+            assert!(framed.same_invalidations(&settled), "but it is no layout invalidation");
+            assert!(framed.same_boxes(&settled));
+            assert!(!framed.same_animation_frames(&settled));
+            assert!(!window.invalidator.layout_is_current(), "it still stales the layout");
         });
     }
 

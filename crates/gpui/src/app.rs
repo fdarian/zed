@@ -57,7 +57,7 @@ use crate::{
     ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
     SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
     ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
+    Counted, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -683,6 +683,7 @@ impl GpuiMode {
 #[derive(Clone, Copy)]
 enum Invalidation {
     Layout,
+    AnimationFrame,
     Paint,
     Scroll,
 }
@@ -2756,6 +2757,12 @@ impl App {
         self.notify_entity(entity_id, Invalidation::Layout);
     }
 
+    /// [`App::notify`] for the frame of a running animation, which stales the layout as it does but
+    /// is counted apart in [`LayoutStamp`](crate::LayoutStamp): the boxes it moves are in the box counters.
+    pub(crate) fn notify_animation_frame(&mut self, entity_id: EntityId) {
+        self.notify_entity(entity_id, Invalidation::AnimationFrame);
+    }
+
     /// [`App::notify`] for a change the caller knows moves no box: a window whose layout was
     /// current before it stays current, so [`Window::draw_if_dirty`] runs no pass for a read
     /// of bounds. The next draw still happens. Any other invalidation that came before, or comes
@@ -2804,13 +2811,17 @@ impl App {
             for invalidator in &live_invalidators {
                 let layout_was_current = invalidator.layout_is_current();
                 let metrics_were_current = invalidator.scroll_metrics_are_current();
-                let affects_layout = !matches!(invalidation, Invalidation::Paint);
-                let invalidated = invalidator.invalidate_view_as(entity_id, self, affects_layout);
+                let counted = match invalidation {
+                    Invalidation::Layout | Invalidation::Scroll => Counted::Layout,
+                    Invalidation::AnimationFrame => Counted::AnimationFrame,
+                    Invalidation::Paint => Counted::Nothing,
+                };
+                let invalidated = invalidator.invalidate_view_as(entity_id, self, counted);
                 if !invalidated {
                     continue;
                 }
                 match invalidation {
-                    Invalidation::Layout => {}
+                    Invalidation::Layout | Invalidation::AnimationFrame => {}
                     Invalidation::Paint if layout_was_current => invalidator.mark_layout_current(),
                     Invalidation::Paint | Invalidation::Scroll if metrics_were_current => {
                         invalidator.mark_scroll_metrics_current()
