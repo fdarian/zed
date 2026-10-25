@@ -1202,6 +1202,254 @@ mod elements {
         }
     }
 
+    /// A 100 by 40 box at (50, 60) holding `content` at its top left, turned or scaled by
+    /// `transform`.
+    fn holder(transform: ElementTransform, content: impl IntoElement) -> AnyElement {
+        div()
+            .size_full()
+            .child(
+                div()
+                    .id("holder")
+                    .absolute()
+                    .left(px(50.))
+                    .top(px(60.))
+                    .w(px(100.))
+                    .h(px(40.))
+                    .transform(transform)
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    fn marker() -> crate::Stateful<crate::Div> {
+        div().id("marker").always_hitbox().w(px(20.)).h(px(10.)).bg(blue())
+    }
+
+    #[test]
+    fn a_deferred_child_is_painted_and_hit_inside_the_transform_of_its_parent() {
+        let turn = about_center(vec![
+            TransformFunction::Rotate(45f32.to_radians()),
+            TransformFunction::Scale(2., 2.),
+        ]);
+        let (_app, mut window) = open({
+            let turn = turn.clone();
+            move || holder(turn.clone(), crate::deferred(marker()))
+        });
+        let bounds = crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(100.), px(40.)));
+        let around = turn.resolve(bounds);
+        let marker = quad_with_width(&quads(&mut window), 20.);
+        assert_matrix(marker.transformation, around.scaled(2.));
+
+        // The box is at the top left of its parent, whose center is where it turns about.
+        let center = at(around, 60., 65.);
+        assert_eq!(hits(&mut window, center.0, center.1), ["marker"]);
+        assert!(hits(&mut window, 60., 65.).is_empty(), "where the box is without the transform");
+        let hitbox = hitbox_named(&mut window, "marker");
+        assert_eq!(hitbox.bounds, crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(20.), px(10.))));
+        let local = hitbox.to_local(point(px(center.0), px(center.1))).unwrap();
+        assert!((local.x.0 - 60.).abs() < 1e-3 && (local.y.0 - 65.).abs() < 1e-3, "{local:?}");
+    }
+
+    #[test]
+    fn a_deferred_child_is_placed_by_a_translation_of_its_parent() {
+        let slide = about_top_left(vec![TransformFunction::Translate(
+            TransformLength::pixels(30.),
+            TransformLength::pixels(0.),
+        )]);
+        let (_app, mut window) = open(move || holder(slide.clone(), crate::deferred(marker())));
+        let marker = quad_with_width(&quads(&mut window), 20.);
+        assert_eq!(marker.transformation, TransformationMatrix::unit());
+        assert_eq!(marker.bounds.origin, point(crate::ScaledPixels(160.), crate::ScaledPixels(120.)));
+        assert_eq!(hits(&mut window, 90., 65.), ["marker"]);
+        assert!(hits(&mut window, 60., 65.).is_empty());
+    }
+
+    #[test]
+    fn a_deferred_child_in_window_space_is_painted_and_hit_without_the_transform() {
+        let turn = about_center(vec![
+            TransformFunction::Rotate(45f32.to_radians()),
+            TransformFunction::Scale(2., 2.),
+        ]);
+        let (_app, mut window) = open(move || {
+            holder(turn.clone(), crate::deferred(marker()).in_window_space())
+        });
+        let marker = quad_with_width(&quads(&mut window), 20.);
+        assert_eq!(marker.transformation, TransformationMatrix::unit());
+        assert_eq!(marker.bounds.origin, point(crate::ScaledPixels(100.), crate::ScaledPixels(120.)));
+        assert_eq!(hits(&mut window, 60., 65.), ["marker"]);
+        assert!(hitbox_named(&mut window, "marker").to_local(point(px(60.), px(65.))).is_some());
+    }
+
+    #[test]
+    fn a_masked_deferred_child_keeps_the_local_clip_around_it_and_one_without_a_mask_does_not() {
+        use crate::{AvailableSpace, ContentMask};
+        for masked in [true, false] {
+            let (_app, mut window) = open(move || {
+                div()
+                    .size_full()
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(50.))
+                            .top(px(60.))
+                            .w(px(100.))
+                            .h(px(40.))
+                            .overflow_hidden()
+                            .transform(about_center(vec![TransformFunction::Rotate(45f32.to_radians())]))
+                            .child(
+                                canvas(
+                                    move |_, window, cx| {
+                                        let mut element = marker().w(px(80.)).into_any_element();
+                                        element.layout_as_root(
+                                            crate::size(AvailableSpace::MinContent, AvailableSpace::MinContent),
+                                            window,
+                                            cx,
+                                        );
+                                        let mask = masked.then(|| window.content_mask());
+                                        window.defer_draw(element, point(px(50.), px(60.)), 1, mask);
+                                    },
+                                    |_, (): (), _, _| {},
+                                )
+                                .size_0(),
+                            ),
+                    )
+                    .into_any_element()
+            });
+            let marker = quad_with_width(&quads(&mut window), 80.);
+            let clip = crate::Bounds::new(point(px(50.), px(60.)), crate::size(px(100.), px(40.)));
+            assert_eq!(
+                marker.local_clip,
+                if masked { ContentMask::from_bounds(clip).scale(2.) } else { ContentMask::unbounded() },
+                "masked: {masked}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deferred_child_is_prepainted_under_its_content_mask() {
+        use crate::{AvailableSpace, ContentMask};
+        let mask = ContentMask::from_bounds(crate::Bounds::new(point(px(0.), px(0.)), crate::size(px(50.), px(50.))));
+        let (_app, mut window) = open(move || {
+            canvas(
+                move |_, window, cx| {
+                    let mut element = marker().w(px(100.)).h(px(100.)).into_any_element();
+                    element.layout_as_root(
+                        crate::size(AvailableSpace::MinContent, AvailableSpace::MinContent),
+                        window,
+                        cx,
+                    );
+                    window.defer_draw(element, point(px(10.), px(10.)), 1, Some(mask));
+                },
+                |_, (): (), _, _| {},
+            )
+            .size_full()
+            .into_any_element()
+        });
+        let hitbox = hitbox_named(&mut window, "marker");
+        assert_eq!(hitbox.content_mask, mask);
+        assert!(hits(&mut window, 20., 20.).contains(&"marker".to_string()));
+        assert!(hits(&mut window, 80., 80.).is_empty());
+    }
+
+    fn popup() -> crate::Stateful<crate::Div> {
+        div().id("popup").always_hitbox().w(px(30.)).h(px(20.)).bg(red())
+    }
+
+    fn below_start(gap: f32) -> crate::AnchoredPlacement {
+        crate::AnchoredPlacement {
+            side: crate::PlacementSide::Bottom,
+            align: crate::PlacementAlign::Start,
+            gap: px(gap),
+            offset: point(px(0.), px(0.)),
+            flip: true,
+            margin: px(0.),
+        }
+    }
+
+    #[test]
+    fn anchored_content_in_window_space_is_placed_against_the_transformed_box_of_the_reference() {
+        // About its center (100, 80) the 100 by 40 box covers (0, 40) to (200, 120).
+        let grow = about_center(vec![TransformFunction::Scale(2., 2.)]);
+        for (in_site, expected) in [(true, point(px(0.), px(124.))), (false, point(px(50.), px(104.)))] {
+            let grow = grow.clone();
+            let (_app, mut window) = open(move || {
+                let mut anchored = crate::anchored().placement(below_start(4.)).child(popup());
+                if in_site {
+                    anchored = anchored.reference_in_deferral_site();
+                }
+                holder(grow.clone(), crate::deferred(anchored).in_window_space())
+            });
+            let popup = hitbox_named(&mut window, "popup");
+            assert_eq!(popup.bounds, crate::Bounds::new(expected, crate::size(px(30.), px(20.))), "{in_site}");
+            // Not scaled, and not in a space.
+            let quad = quad_with_width(&quads(&mut window), 30.);
+            assert_eq!(quad.transformation, TransformationMatrix::unit());
+            assert_eq!(hits(&mut window, expected.x.0 + 5., expected.y.0 + 5.), ["popup"]);
+        }
+    }
+
+    #[test]
+    fn a_corner_anchored_element_in_window_space_sits_at_the_mapped_corner() {
+        let grow = about_center(vec![TransformFunction::Scale(2., 2.)]);
+        let (_app, mut window) = open(move || {
+            let anchored = crate::anchored().reference_in_deferral_site().child(popup());
+            // The zero-size box at the bottom left of the holder, as the author puts one.
+            let corner = div().absolute().bottom_0().left_0().size_0().child(
+                crate::deferred(anchored).in_window_space(),
+            );
+            holder(grow.clone(), corner)
+        });
+        // (50, 100) in the holder is (0, 120) in the window.
+        let popup = hitbox_named(&mut window, "popup");
+        assert_eq!(popup.bounds.origin, point(px(0.), px(120.)));
+    }
+
+    #[test]
+    fn anchored_content_drawn_in_the_tree_flips_against_the_window_in_its_own_space() {
+        let height = {
+            let mut app = TestApp::new();
+            let mut window = app.open_window(|_, _| Scene { build: Rc::new(|| div().into_any_element()) });
+            window.update(|_, window, _| f32::from(window.viewport_size().height))
+        };
+        // Doubled, the room under the reference is half of what it is in the window.
+        let reference_top = (height / 2. - 100.).floor();
+        for (scaled, side) in [(false, crate::PlacementSide::Bottom), (true, crate::PlacementSide::Top)] {
+            let sides: Rc<RefCell<Vec<crate::PlacementSide>>> = Rc::default();
+            let (_app, _window) = open({
+                let sides = sides.clone();
+                move || {
+                    let sides = sides.clone();
+                    let transform = if scaled {
+                        about_top_left(vec![TransformFunction::Scale(2., 2.)])
+                    } else {
+                        about_top_left(vec![])
+                    };
+                    div()
+                        .size_full()
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .top(px(0.))
+                                .w(px(200.))
+                                .h(px(height / 2.))
+                                .transform(transform)
+                                .child(
+                                    div().absolute().left(px(10.)).top(px(reference_top)).w(px(40.)).h(px(20.)).child(
+                                        crate::anchored()
+                                            .placement(below_start(0.))
+                                            .on_placement(move |resolved, _, _| sides.borrow_mut().push(resolved.side))
+                                            .child(div().w(px(30.)).h(px(140.))),
+                                    ),
+                                ),
+                        )
+                        .into_any_element()
+                }
+            });
+            assert_eq!(sides.borrow().last(), Some(&side), "scaled: {scaled}");
+        }
+    }
+
     /// The hitboxes a prepaint inserts inside the transforms, named by the order they are in.
     fn inserted_in(
         transforms: Vec<TransformationMatrix>,

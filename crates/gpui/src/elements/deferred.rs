@@ -8,6 +8,7 @@ pub fn deferred(child: impl IntoElement) -> Deferred {
     Deferred {
         child: Some(child.into_any_element()),
         priority: 0,
+        in_window_space: false,
     }
 }
 
@@ -16,9 +17,20 @@ pub fn deferred(child: impl IntoElement) -> Deferred {
 pub struct Deferred {
     child: Option<AnyElement>,
     priority: usize,
+    in_window_space: bool,
 }
 
 impl Deferred {
+    /// Draws the child in window space, outside the transforms around this element, as a portal
+    /// does for content that lives elsewhere in the tree. By default the child is still the
+    /// element in place: drawn and hit inside the transforms of its ancestors.
+    /// [`Anchored::reference_in_deferral_site`](crate::Anchored::reference_in_deferral_site)
+    /// places a child against where the window has its reference.
+    pub fn in_window_space(mut self) -> Self {
+        self.in_window_space = true;
+        self
+    }
+
     /// Sets the `priority` value of the `deferred` element, which
     /// determines the drawing order relative to other deferred elements,
     /// with higher values being drawn on top.
@@ -63,7 +75,11 @@ impl Element for Deferred {
     ) {
         let child = self.child.take().unwrap();
         let element_offset = window.element_offset();
-        window.defer_draw(child, element_offset, self.priority, None)
+        if self.in_window_space {
+            window.defer_draw_in_window_space(child, element_offset, self.priority, None)
+        } else {
+            window.defer_draw(child, element_offset, self.priority, None)
+        }
     }
 
     fn paint(

@@ -24,6 +24,7 @@ pub struct Anchored {
     offset: Option<Point<Pixels>>,
     placement: Option<AnchoredPlacement>,
     on_placement: Option<Rc<dyn Fn(ResolvedPlacement, &mut Window, &mut App)>>,
+    reference_in_deferral_site: bool,
 }
 
 /// anchored gives you an element that will avoid overflowing the window bounds.
@@ -38,6 +39,7 @@ pub fn anchored() -> Anchored {
         offset: None,
         placement: None,
         on_placement: None,
+        reference_in_deferral_site: false,
     }
 }
 
@@ -90,6 +92,16 @@ impl Anchored {
         self
     }
 
+    /// The layout parent, or the corner the element sits at when there is no explicit
+    /// [`Anchored::position`], is in the space a window-space [`Deferred`](crate::Deferred) draw
+    /// was deferred from: the element is placed against where the window has it, the bounding box
+    /// of the transformed box, as a portal's content is against `getBoundingClientRect`. The
+    /// explicit position is in window coordinates and is not mapped.
+    pub fn reference_in_deferral_site(mut self) -> Self {
+        self.reference_in_deferral_site = true;
+        self
+    }
+
     /// Snap to window edge instead of switching anchor corner when an overflow would occur.
     pub fn snap_to_window(mut self) -> Self {
         self.fit_mode = AnchoredFitMode::SnapToWindow;
@@ -100,6 +112,28 @@ impl Anchored {
     pub fn snap_to_window_with_margin(mut self, edges: impl Into<Edges<Pixels>>) -> Self {
         self.fit_mode = AnchoredFitMode::SnapToWindowWithMargin(edges.into());
         self
+    }
+}
+
+impl Anchored {
+    /// `reference`, from the layout, as the element is placed against it.
+    fn reference_in_window(&self, reference: Bounds<Pixels>, window: &Window) -> Bounds<Pixels> {
+        if self.reference_in_deferral_site {
+            window.bounds_from_deferral_site(reference)
+        } else {
+            reference
+        }
+    }
+
+    /// The window, in the space the element is placed in. Under a transform that space is the
+    /// local one of the element, so the edges it flips and snaps against are the window's.
+    fn limits(window: &Window) -> Bounds<Pixels> {
+        let viewport = Bounds {
+            origin: Point::default(),
+            size: window.viewport_size(),
+        };
+        // A transform that flattens the plane paints nothing, wherever the element is put.
+        window.window_bounds_in_local(viewport).unwrap_or(viewport)
     }
 }
 
@@ -178,15 +212,18 @@ impl Element for Anchored {
                     origin: position,
                     size: Size::default(),
                 },
-                None => window
-                    .layout_parent_bounds(request_layout.layout_id)
-                    .unwrap_or(bounds),
+                None => {
+                    let parent = window
+                        .layout_parent_bounds(request_layout.layout_id)
+                        .unwrap_or(bounds);
+                    self.reference_in_window(parent, window)
+                }
             };
             let (origin, resolved) = place(
                 &placement,
                 reference,
                 children_bounds.size,
-                window.viewport_size(),
+                Self::limits(window),
                 window.client_inset.unwrap_or(px(0.)),
             );
             if let Some(on_placement) = self.on_placement.clone() {
@@ -204,18 +241,19 @@ impl Element for Anchored {
             return;
         }
 
+        let corner = Bounds {
+            origin: self.reference_in_window(Bounds { origin: bounds.origin, size: Size::default() }, window).origin,
+            size: bounds.size,
+        };
         let (origin, mut desired) = self.position_mode.get_position_and_bounds(
             self.anchor_position,
             self.anchor,
             children_bounds.size,
-            bounds,
+            corner,
             self.offset,
         );
 
-        let limits = Bounds {
-            origin: Point::default(),
-            size: window.viewport_size(),
-        };
+        let limits = Self::limits(window);
 
         if self.fit_mode == AnchoredFitMode::SwitchAnchor {
             let mut anchor = self.anchor;
@@ -380,13 +418,13 @@ fn place(
     placement: &AnchoredPlacement,
     reference: Bounds<Pixels>,
     size: Size<Pixels>,
-    viewport: Size<Pixels>,
+    limits: Bounds<Pixels>,
     client_inset: Pixels,
 ) -> (Point<Pixels>, ResolvedPlacement) {
     let margin = (placement.margin + client_inset).0;
-    let (left, top) = (margin, margin);
-    let right = (viewport.width.0 - margin).max(left);
-    let bottom = (viewport.height.0 - margin).max(top);
+    let (left, top) = (limits.left().0 + margin, limits.top().0 + margin);
+    let right = (limits.right().0 - margin).max(left);
+    let bottom = (limits.bottom().0 - margin).max(top);
     let gap = placement.gap.0;
     let (ref_left, ref_top) = (reference.left().0, reference.top().0);
     let (ref_right, ref_bottom) = (reference.right().0, reference.bottom().0);
@@ -607,6 +645,10 @@ mod tests {
         }
     }
 
+    fn viewport() -> crate::Bounds<Pixels> {
+        crate::Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.)))
+    }
+
     fn reference() -> crate::Bounds<Pixels> {
         crate::Bounds::new(point(px(100.), px(200.)), size(px(60.), px(20.)))
     }
@@ -622,7 +664,7 @@ mod tests {
             &placement(Bottom, Start),
             reference(),
             size(px(80.), px(100.)),
-            size(px(800.), px(600.)),
+            viewport(),
             px(0.),
         );
         assert_eq!(origin, point(px(100.), px(224.)));
@@ -637,7 +679,7 @@ mod tests {
             &placement(Bottom, Center),
             reference(),
             size(px(100.), px(40.)),
-            size(px(800.), px(600.)),
+            viewport(),
             px(0.),
         );
         assert_eq!(origin.x, px(130. - 50.));
@@ -650,7 +692,7 @@ mod tests {
             &placement(Bottom, Start),
             low_reference(),
             size(px(80.), px(300.)),
-            size(px(800.), px(600.)),
+            viewport(),
             px(0.),
         );
         assert_eq!(resolved.side, Top);
@@ -665,7 +707,7 @@ mod tests {
             &placement(Bottom, Start),
             low_reference(),
             size(px(80.), px(500.)),
-            size(px(800.), px(600.)),
+            viewport(),
             px(0.),
         );
         assert_eq!(resolved.side, Top);
@@ -678,7 +720,7 @@ mod tests {
             &placement(Bottom, Start),
             reference(),
             size(px(760.), px(40.)),
-            size(px(800.), px(600.)),
+            viewport(),
             px(0.),
         );
         assert_eq!(origin.x, px(800. - 8. - 760.));

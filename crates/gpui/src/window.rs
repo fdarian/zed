@@ -1499,7 +1499,15 @@ pub(crate) struct DeferredDraw {
     /// The innermost positioned frame where the draw was deferred, so a box inside the layer still
     /// finds its containing block.
     positioned_frame: Option<PositionedFrame>,
+    /// Window space: the content mask is not in the local space of `transforms`.
     content_mask: Option<ContentMask<Pixels>>,
+    /// The transforms the draw was deferred inside, innermost last, which it is prepainted and
+    /// painted inside again unless `in_window_space`. The local clip is kept only when there is a
+    /// content mask: a draw without one is not clipped by what is around its place.
+    transforms: Vec<AmbientTransform>,
+    /// A portal: the draw is in window space, and `transforms` are only what
+    /// [`Window::bounds_from_deferral_site`] maps by.
+    in_window_space: bool,
     element: Option<AnyElement>,
     /// The engine the element's layout ids are in, when it is not the window's own.
     layout_engine: Option<SharedLayoutEngine>,
@@ -1970,6 +1978,9 @@ pub struct Window {
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     /// The transforms [`Window::with_transform`] is inside, innermost last. Empty for none.
     transform_stack: Vec<AmbientTransform>,
+    /// The innermost transform of the place the window-space deferred draw being prepainted or
+    /// painted was deferred from.
+    deferral_site: Option<AmbientTransform>,
     /// How many boxes were prepainted so far that sit outside the clip they were prepainted in,
     /// see [`Window::note_escape`].
     escapes_prepainted: u32,
@@ -2760,6 +2771,7 @@ impl Window {
             root_seed: None,
             content_mask_stack: Vec::new(),
             transform_stack: Vec::new(),
+            deferral_site: None,
             escapes_prepainted: 0,
             root_escape: None,
             root_escapes_prepainted: 0,
@@ -2902,6 +2914,15 @@ struct AmbientTransform {
     local_clip: Option<ContentMask<Pixels>>,
     /// What a hitbox or mouse listener registered inside the transform keeps of it.
     space: Rc<HitSpace>,
+}
+
+impl AmbientTransform {
+    fn bounds_in_window(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        match self.kind {
+            TransformKind::Translation => Bounds::new(bounds.origin + self.offset, bounds.size),
+            TransformKind::General => self.matrix.bounding_box(bounds),
+        }
+    }
 }
 
 /// How a point maps between the window and the local space of a hitbox or mouse listener that
@@ -5574,6 +5595,7 @@ impl Window {
                     prepaint_range,
                     visibility,
                     layout_engine,
+                    space,
                 ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
@@ -5590,6 +5612,11 @@ impl Window {
                         deferred_draw.prepaint_range.clone(),
                         deferred_draw.context.visibility,
                         deferred_draw.layout_engine.clone(),
+                        (
+                            deferred_draw.transforms.clone(),
+                            deferred_draw.in_window_space,
+                            deferred_draw.content_mask,
+                        ),
                     )
                 };
                 self.next_frame.dispatch_tree.set_active_node(parent_node);
@@ -5602,8 +5629,10 @@ impl Window {
                         window.with_rendered_view(current_view, |window| {
                             window.with_visibility(visibility, |window| {
                                 window.with_rem_size(Some(rem_size), |window| {
-                                    window.with_absolute_element_offset(absolute_offset, |window| {
-                                        element.prepaint(window, cx);
+                                    window.with_deferred_space(&space.0, space.1, space.2, |window| {
+                                        window.with_absolute_element_offset(absolute_offset, |window| {
+                                            element.prepaint(window, cx);
+                                        });
                                     });
                                 });
                             });
@@ -5650,11 +5679,16 @@ impl Window {
                 self.with_layout_engine_if(deferred_draw.layout_engine.as_ref(), |window| {
                     window.with_rendered_view(deferred_draw.context.current_view, |window| {
                         window.with_visibility(deferred_draw.context.visibility, |window| {
-                            window.with_content_mask(content_mask, |window| {
-                                window.with_rem_size(Some(deferred_draw.context.rem_size), |window| {
-                                    element.paint(window, cx);
-                                });
-                            })
+                            window.with_deferred_space(
+                                &deferred_draw.transforms,
+                                deferred_draw.in_window_space,
+                                content_mask,
+                                |window| {
+                                    window.with_rem_size(Some(deferred_draw.context.rem_size), |window| {
+                                        element.paint(window, cx);
+                                    });
+                                },
+                            )
                         })
                     })
                 })
@@ -5666,6 +5700,47 @@ impl Window {
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
+    }
+
+    /// Runs `f` as a deferred draw is prepainted and painted: inside the transforms it was
+    /// deferred inside, so that it is still the element in place, or with none when it is in
+    /// window space. `mask` is in window space.
+    fn with_deferred_space<R>(
+        &mut self,
+        transforms: &[AmbientTransform],
+        in_window_space: bool,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        debug_assert!(self.transform_stack.is_empty() && self.deferral_site.is_none());
+        let flat = !in_window_space
+            && transforms.last().is_some_and(|ambient| {
+                ambient.kind == TransformKind::General && ambient.matrix.inverse().is_none()
+            });
+        if in_window_space {
+            self.deferral_site = transforms.last().cloned();
+        } else {
+            self.transform_stack.extend_from_slice(transforms);
+        }
+        // The window mask a flat transform sets is not part of what a draw deferred inside it
+        // captured, so it paints nothing here as well.
+        let result = self.with_optional_window_mask(flat.then(ContentMask::default), |window| {
+            window.with_optional_window_mask(mask, f)
+        });
+        self.transform_stack.clear();
+        self.deferral_site = None;
+        result
+    }
+
+    fn with_optional_window_mask<R>(
+        &mut self,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        match mask {
+            Some(mask) => self.with_window_content_mask(mask, f),
+            None => f(self),
+        }
     }
 
     fn deferred_draw_traversal_order(&mut self) -> SmallVec<[usize; 8]> {
@@ -5760,6 +5835,8 @@ impl Window {
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     positioned_frame: deferred_draw.positioned_frame,
                     content_mask: deferred_draw.content_mask,
+                    transforms: deferred_draw.transforms.clone(),
+                    in_window_space: deferred_draw.in_window_space,
                     priority: deferred_draw.priority,
                     element: None,
                     layout_engine: deferred_draw.layout_engine.clone(),
@@ -6168,9 +6245,31 @@ impl Window {
     pub(crate) fn bounds_in_window(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
         match self.transform_stack.last() {
             None => bounds,
+            Some(ambient) => ambient.bounds_in_window(bounds),
+        }
+    }
+
+    /// `bounds` in the local space of the place the window-space deferred draw being prepainted
+    /// was deferred from, as the window has them. Unchanged outside such a draw. This is the box
+    /// `getBoundingClientRect` reports for an element a portal's content belongs to.
+    pub(crate) fn bounds_from_deferral_site(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        match &self.deferral_site {
+            None => bounds,
+            Some(ambient) => ambient.bounds_in_window(bounds),
+        }
+    }
+
+    /// `bounds`, in the window, as the local space of what is being prepainted has them: the
+    /// bounding box of the corners taken back through the transform. `None` when the transform
+    /// flattens the plane, where nothing is painted.
+    pub(crate) fn window_bounds_in_local(&self, bounds: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
+        match self.transform_stack.last() {
+            None => Some(bounds),
             Some(ambient) => match ambient.kind {
-                TransformKind::Translation => Bounds::new(bounds.origin + ambient.offset, bounds.size),
-                TransformKind::General => ambient.matrix.bounding_box(bounds),
+                TransformKind::Translation => {
+                    Some(Bounds::new(bounds.origin - ambient.offset, bounds.size))
+                }
+                TransformKind::General => ambient.matrix.inverse().map(|inverse| inverse.bounding_box(bounds)),
             },
         }
     }
@@ -7225,8 +7324,12 @@ impl Window {
     /// at a later time. The `priority` parameter determines the drawing order relative to other deferred elements,
     /// with higher values being drawn on top.
     ///
-    /// When `content_mask` is provided, the deferred element will be clipped to that region during
-    /// both prepaint and paint. When `None`, no additional clipping is applied.
+    /// When `content_mask` is provided, in window space like [`Window::content_mask`], the deferred
+    /// element will be clipped to that region during both prepaint and paint, and by the local
+    /// clip of the transform it is deferred inside. When `None`, no additional clipping is applied.
+    ///
+    /// Inside [`Window::with_transform`] the element is still the element in place: it is
+    /// prepainted and painted inside the same transforms, and its hitboxes are hit through them.
     ///
     /// The deferred element starts a new hitbox root: its outermost hitboxes have no
     /// [`Hitbox::parent`], so under [`Window::set_dom_hit_testing`] the chain of a hit inside it
@@ -7243,13 +7346,47 @@ impl Window {
         priority: usize,
         content_mask: Option<ContentMask<Pixels>>,
     ) {
+        self.defer_draw_in(element, absolute_offset, priority, content_mask, false)
+    }
+
+    /// [`Window::defer_draw`] for content that lives elsewhere, as a portal does: the element is
+    /// drawn and hit in window space, outside the transforms around this call.
+    /// [`Window::bounds_from_deferral_site`] maps a box of this place to where the window has it.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn defer_draw_in_window_space(
+        &mut self,
+        element: AnyElement,
+        absolute_offset: Point<Pixels>,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+    ) {
+        self.defer_draw_in(element, absolute_offset, priority, content_mask, true)
+    }
+
+    fn defer_draw_in(
+        &mut self,
+        element: AnyElement,
+        absolute_offset: Point<Pixels>,
+        priority: usize,
+        content_mask: Option<ContentMask<Pixels>>,
+        in_window_space: bool,
+    ) {
         self.invalidator.debug_assert_prepaint();
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
+        let mut transforms = self.transform_stack.clone();
+        if content_mask.is_none()
+            && let Some(ambient) = transforms.last_mut()
+        {
+            ambient.local_clip = None;
+        }
         self.next_frame.deferred_draws.push(DeferredDraw {
             context: PaintContext::capture(self),
             parent_node,
             positioned_frame: self.positioned_frames.last().copied(),
             content_mask,
+            transforms,
+            in_window_space,
             priority,
             element: Some(element),
             layout_engine: self.borrowed_layout_engine.clone(),
