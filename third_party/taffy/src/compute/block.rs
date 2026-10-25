@@ -344,6 +344,7 @@ pub fn compute_block_layout(
     // Pull these out earlier to avoid borrowing issues
     let overflow = style.overflow();
     let is_scroll_container = overflow.x.is_scroll_container() || overflow.y.is_scroll_container();
+    let is_relative = style.position() == Position::Relative;
     let aspect_ratio = style.aspect_ratio();
     let padding = style.padding().resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
     let border = style.border().resolve_or_zero(parent_size.width, |val, basis| tree.calc(val, basis));
@@ -387,7 +388,30 @@ pub fn compute_block_layout(
     // is ComputeSize (and thus the container's size is all that we're interested in)
     if run_mode == RunMode::ComputeSize {
         if let Size { width: Some(width), height: Some(height) } = styled_based_known_dimensions {
-            return LayoutOutput::from_outer_size(Size { width, height });
+            // fdarian fork patch: the top margin of the box is that of its first child when nothing is between them,
+            // also in a size that is all there is to know of the box: a parent places the box by it. Only when the
+            // first child lets it through do the children have to be laid out, and `compute_inner` does that.
+            let top_margin = match &block_ctx {
+                Some(ctx)
+                    if inputs.vertical_margins_are_collapsible.start
+                        && !is_scroll_container
+                        && !ctx.is_bfc_root()
+                        && is_relative
+                        && padding.top == 0.0
+                        && border.top == 0.0 =>
+                {
+                    first_child_top_margin_without_layout(
+                        tree,
+                        node_id,
+                        width - padding_border_size.width,
+                        ctx,
+                    )
+                }
+                _ => Some(CollapsibleMarginSet::ZERO),
+            };
+            if let Some(top_margin) = top_margin {
+                return LayoutOutput { top_margin, ..LayoutOutput::from_outer_size(Size { width, height }) };
+            }
         }
 
         // We can also short-circuit if the width is known and only the width has been requested.
@@ -543,9 +567,45 @@ fn compute_inner(
         intrinsic_width.maybe_clamp(min_size.width, max_size.width).maybe_max(Some(padding_border_size.width))
     });
 
+    let container_percentage_resolution_height =
+        percentage_known_dimensions.height.or(size.height.maybe_max(min_size.height));
+    let resolved_content_box_inset = padding + border + scrollbar_gutter;
+
     // Short-circuit if computing size and both dimensions known
     if let (RunMode::ComputeSize, Some(container_outer_height)) = (run_mode, known_dimensions.height) {
-        return LayoutOutput::from_outer_size(Size { width: container_outer_width, height: container_outer_height });
+        // fdarian fork patch: the top margin of the box is that of its first child when nothing is between them (see
+        // `compute_block_layout`). The height is known and the bottom margins of the children cannot collapse with
+        // the box, so the children are laid out only as long as their top margins do.
+        let top_margin = if own_margins_collapse_with_children.start {
+            let container_inner_width = container_outer_width - resolved_content_box_inset.horizontal_axis_sum();
+            match first_child_top_margin_without_layout(tree, node_id, container_inner_width, block_ctx) {
+                Some(top_margin) => top_margin,
+                None => {
+                    perform_final_layout_on_in_flow_children(
+                        tree,
+                        run_mode,
+                        &mut items,
+                        container_outer_width,
+                        container_percentage_resolution_height,
+                        content_box_inset,
+                        resolved_content_box_inset,
+                        border,
+                        text_align,
+                        direction,
+                        own_margins_collapse_with_children,
+                        true,
+                        block_ctx,
+                    )
+                    .2
+                }
+            }
+        } else {
+            CollapsibleMarginSet::ZERO
+        };
+        return LayoutOutput {
+            top_margin,
+            ..LayoutOutput::from_outer_size(Size { width: container_outer_width, height: container_outer_height })
+        };
     }
 
     // We can also short-circuit if the width is known and only the width has been requested.
@@ -553,11 +613,7 @@ fn compute_inner(
         return LayoutOutput::from_outer_size(Size { width: container_outer_width, height: 0.0 });
     }
 
-    let container_percentage_resolution_height =
-        percentage_known_dimensions.height.or(size.height.maybe_max(min_size.height));
-
     // 3. Perform final item layout and return content height
-    let resolved_content_box_inset = padding + border + scrollbar_gutter;
     #[cfg_attr(not(feature = "content_size"), allow(unused_mut))]
     let (
         mut inflow_content_size,
@@ -577,6 +633,7 @@ fn compute_inner(
         text_align,
         direction,
         own_margins_collapse_with_children,
+        false,
         block_ctx,
     );
 
@@ -867,6 +924,50 @@ fn determine_content_based_container_width(
     max_child_width
 }
 
+/// fdarian fork patch: the top margin set of a block of a known height whose first in-flow child cannot let a margin
+/// through: the margin of that child, which is also what laying it out reports. `None` when the child may (a block with
+/// no padding and border at the top has the margin of its own first child), or a float or a clearance is in the way,
+/// and the children have to be laid out to tell. Reading the styles of the children up to the first one in flow is
+/// all it takes, so a box that is tall and full does not pay for its other children.
+fn first_child_top_margin_without_layout(
+    tree: &impl LayoutBlockContainer,
+    node_id: NodeId,
+    container_inner_width: f32,
+    #[allow(unused_variables)] block_ctx: &BlockContext<'_>,
+) -> Option<CollapsibleMarginSet> {
+    let basis = Some(container_inner_width);
+    for child in tree.child_ids(node_id) {
+        let style = tree.get_block_child_style(child);
+        if style.box_generation_mode() == BoxGenerationMode::None || style.position() == Position::Absolute {
+            continue;
+        }
+        #[cfg(feature = "float_layout")]
+        if style.float() != Float::None || style.clear() != Clear::None {
+            return None;
+        }
+        let overflow = style.overflow();
+        let is_in_same_bfc = style.is_block()
+            && !style.is_table()
+            && !overflow.x.is_scroll_container()
+            && !overflow.y.is_scroll_container();
+        if is_in_same_bfc {
+            let padding_top = style.padding().top.resolve_or_zero(basis, |val, basis| tree.calc(val, basis));
+            let border_top = style.border().top.resolve_or_zero(basis, |val, basis| tree.calc(val, basis));
+            if padding_top == 0.0 && border_top == 0.0 {
+                return None;
+            }
+        }
+        // A box of another formatting context may be pushed down by the floats of this one
+        #[cfg(feature = "float_layout")]
+        if !is_in_same_bfc && block_ctx.has_active_floats(f32::NEG_INFINITY) {
+            return None;
+        }
+        let margin_top = style.margin().top.resolve_to_option(container_inner_width, |val, basis| tree.calc(val, basis));
+        return Some(CollapsibleMarginSet::ZERO.collapse_with_margin(margin_top.unwrap_or(0.0)));
+    }
+    Some(CollapsibleMarginSet::ZERO)
+}
+
 /// Compute each child's final size and position
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -882,6 +983,9 @@ fn perform_final_layout_on_in_flow_children(
     text_align: TextAlign,
     direction: Direction,
     own_margins_collapse_with_children: Line<bool>,
+    // fdarian fork patch: stop with the first child that the top margin of the container does not collapse with, and
+    // return nothing but `first_child_top_margin_set`
+    first_margin_only: bool,
     block_ctx: &mut BlockContext<'_>,
 ) -> (Size<f32>, f32, CollapsibleMarginSet, CollapsibleMarginSet, Option<f32>) {
     // Resolve container_inner_width for sizing child nodes using initial content_box_inset
@@ -1451,6 +1555,10 @@ fn perform_final_layout_on_in_flow_children(
                 #[cfg(feature = "float_layout")]
                 block_ctx.commit_strut();
             }
+
+            if first_margin_only && !is_collapsing_with_first_margin_set {
+                break;
+            }
         }
     }
 
@@ -1709,4 +1817,138 @@ fn perform_absolute_layout_on_absolute_children(
     }
 
     absolute_content_size
+}
+
+/// A box of a known height that is measured by a flex or grid container (a size is all it asks for) is placed by the
+/// collapsed margin of its first child, as Chrome has it: `<div style="height:10px"><div style="margin-top:-30px">` is 30px
+/// above its parent and a parent that is as tall as its contents is 0 high, not 10. Pages checked against Chrome:
+/// `packages/react/src/__tests__/scroll-baseline.test.tsx`.
+#[cfg(test)]
+mod sized_box_margin_tests {
+    use crate::prelude::*;
+    use crate::{Overflow, Point, TaffyTree};
+
+    #[derive(Copy, Clone, Debug)]
+    enum Parent {
+        FlexRow,
+        Grid,
+    }
+
+    const PARENTS: [Parent; 2] = [Parent::FlexRow, Parent::Grid];
+
+    fn block(change: impl FnOnce(&mut Style)) -> Style {
+        let mut style = Style { display: Display::Block, ..Style::default() };
+        change(&mut style);
+        style
+    }
+
+    fn margin_top(margin: f32) -> Rect<LengthPercentageAuto> {
+        Rect { left: length(0.0), right: length(0.0), top: length(margin), bottom: length(0.0) }
+    }
+
+    fn leaf(tree: &mut TaffyTree<()>, margin: f32) -> NodeId {
+        tree.new_leaf(block(|s| {
+            s.size.height = length(20.0);
+            s.margin = margin_top(margin);
+        }))
+        .unwrap()
+    }
+
+    /// `<parent><div id=wrapper><div id=sized style="height:10px">first_child..., then leaf</div></div></parent>`: the height
+    /// of the wrapper and where the sized box is in it.
+    fn wrapper(parent: Parent, sized: impl FnOnce(&mut TaffyTree<()>) -> Vec<NodeId>) -> (f32, Point<f32>) {
+        let mut tree: TaffyTree<()> = TaffyTree::new();
+        tree.disable_rounding();
+        let children = sized(&mut tree);
+        let sized = tree.new_with_children(block(|s| s.size.height = length(10.0)), &children).unwrap();
+        let wrapper = tree.new_with_children(block(|_| {}), &[sized]).unwrap();
+        let display = match parent {
+            Parent::FlexRow => Display::Flex,
+            Parent::Grid => Display::Grid,
+        };
+        let root = tree
+            .new_with_children(Style { display, size: Size { width: length(100.0), height: auto() }, ..Style::default() }, &[wrapper])
+            .unwrap();
+        tree.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        (tree.layout(wrapper).unwrap().size.height, tree.layout(sized).unwrap().location)
+    }
+
+    #[test]
+    fn the_margin_of_the_first_child_places_the_box_and_the_box_around_it() {
+        for parent in PARENTS {
+            let (height, at) = wrapper(parent, |tree| vec![leaf(tree, -30.0)]);
+            assert_eq!((height, at.y), (0.0, -30.0), "{parent:?}, negative");
+            let (height, at) = wrapper(parent, |tree| vec![leaf(tree, 15.0)]);
+            assert_eq!((height, at.y), (25.0, 15.0), "{parent:?}, positive");
+        }
+    }
+
+    #[test]
+    fn the_margin_goes_through_the_first_children_that_let_it() {
+        for parent in PARENTS {
+            // sized > a > b > leaf
+            let (height, at) = wrapper(parent, |tree| {
+                let leaf = leaf(tree, -30.0);
+                let b = tree.new_with_children(block(|_| {}), &[leaf]).unwrap();
+                vec![tree.new_with_children(block(|_| {}), &[b]).unwrap()]
+            });
+            assert_eq!((height, at.y), (0.0, -30.0), "{parent:?}, boxes of automatic height");
+            // sized > a(height: 5px) > leaf: the box of a known height reports it too
+            let (height, at) = wrapper(parent, |tree| {
+                let leaf = leaf(tree, -30.0);
+                vec![tree.new_with_children(block(|s| s.size.height = length(5.0)), &[leaf]).unwrap()]
+            });
+            assert_eq!((height, at.y), (0.0, -30.0), "{parent:?}, a box of a known height");
+        }
+    }
+
+    #[test]
+    fn empty_boxes_before_the_child_collapse_with_it() {
+        for parent in PARENTS {
+            // sized > [empty with margins 5, leaf with -30]: the set is (5, -30), -25
+            let (height, at) = wrapper(parent, |tree| {
+                let empty = tree
+                    .new_with_children(
+                        block(|s| s.margin = Rect { left: length(0.0), right: length(0.0), top: length(5.0), bottom: length(5.0) }),
+                        &[],
+                    )
+                    .unwrap();
+                vec![empty, leaf(tree, -30.0)]
+            });
+            assert_eq!((height, at.y), (0.0, -25.0), "{parent:?}");
+        }
+    }
+
+    #[test]
+    fn what_the_margin_of_a_child_cannot_go_through_stays_inside() {
+        for parent in PARENTS {
+            // padding or a border at the top of the box, around the child
+            for padded in [
+                |s: &mut Style| s.padding.top = length(1.0),
+                |s: &mut Style| s.border.top = length(1.0),
+            ] {
+                let (height, at) = wrapper(parent, |tree| {
+                    let leaf = leaf(tree, -30.0);
+                    vec![tree.new_with_children(block(padded), &[leaf]).unwrap()]
+                });
+                assert_eq!((height, at.y), (10.0, 0.0), "{parent:?}, padding or border");
+            }
+            // a scroll container is a formatting context of its own
+            let (height, at) = wrapper(parent, |tree| {
+                let leaf = leaf(tree, -30.0);
+                vec![tree
+                    .new_with_children(block(|s| s.overflow = Point { x: Overflow::Hidden, y: Overflow::Hidden }), &[leaf])
+                    .unwrap()]
+            });
+            assert_eq!((height, at.y), (10.0, 0.0), "{parent:?}, a scroll container");
+            // a flex container is too, but its own margin is a margin of the box
+            let (height, at) = wrapper(parent, |tree| {
+                let leaf = leaf(tree, 0.0);
+                vec![tree
+                    .new_with_children(Style { display: Display::Flex, margin: margin_top(-30.0), ..Style::default() }, &[leaf])
+                    .unwrap()]
+            });
+            assert_eq!((height, at.y), (0.0, -30.0), "{parent:?}, the margin of a flex container");
+        }
+    }
 }
