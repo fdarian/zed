@@ -1277,6 +1277,8 @@ fn aligned_origin_x(
 
     match align {
         TextAlign::Left => origin.x,
+        // A row wider than its box starts at the start edge whatever the alignment (CSS Text 3 §7.1).
+        TextAlign::Center | TextAlign::Right if line_width > align_width => origin.x,
         TextAlign::Center => (origin.x * 2.0 + align_width - line_width) / 2.0,
         TextAlign::Right => origin.x + align_width - line_width,
     }
@@ -1671,6 +1673,23 @@ mod tests {
         assert_eq!(aligned_hyphenated(layout, TextAlign::Center, 0., boundary, 0., 6.), px(27.));
         assert_eq!(aligned_hyphenated(layout, TextAlign::Right, 0., boundary, 0., 6.), px(54.));
         assert_eq!(aligned_hyphenated(layout, TextAlign::Right, 0., boundary, 0., 0.), px(60.));
+    }
+
+    #[test]
+    fn test_a_row_wider_than_its_box_starts_at_its_start_edge() {
+        // "aaaa" is 130 wide in a box of 100: centre and right alignment would put it before the
+        // start edge.
+        let glyphs: Vec<(usize, f32)> = (0..4).map(|ix| (ix, ix as f32 * 32.5)).collect();
+        let line = make_shaped_line("aaaa", &glyphs, 130., &[]);
+        let layout = &*line.layout;
+        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            assert_eq!(aligned(layout, align, 0., None, 0.), px(0.));
+        }
+        // A row that only overflows by the space that hangs fits once the space is out of it.
+        assert_eq!(aligned(layout, TextAlign::Right, 0., None, 30.), px(0.));
+        assert_eq!(aligned(layout, TextAlign::Right, 0., None, 40.), px(10.));
+        // Exactly as wide as the box is the same as the start edge.
+        assert_eq!(aligned(layout, TextAlign::Center, 30., None, 0.), px(0.));
     }
 
     #[test]
