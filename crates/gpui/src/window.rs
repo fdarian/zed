@@ -162,16 +162,10 @@ pub struct LayoutStamp {
 
 impl LayoutStamp {
     /// Whether no layout invalidation came between the two stamps. The frames of running
-    /// animations are not invalidations here: see [`Self::same_animation_frames`].
+    /// animations are not invalidations here: they are counted apart (see [`Counted::AnimationFrame`]),
+    /// and two stamps that are equal as a whole also saw none.
     pub fn same_invalidations(&self, other: &Self) -> bool {
         self.layout_invalidations == other.layout_invalidations
-    }
-
-    /// Whether no frame of a running animation was requested between the two stamps. An animation
-    /// that moves a box is seen by [`Self::same_boxes`]; one that changes the layout of what is
-    /// inside a box, as a font size does, is not.
-    pub fn same_animation_frames(&self, other: &Self) -> bool {
-        self.animation_frames == other.animation_frames
     }
 
     /// Whether no box of the window, a nested engine's included, moved or changed size between
@@ -4584,7 +4578,20 @@ impl Window {
         {
             return false;
         }
-        self.layout_pass(cx, false)
+        self.layout_pass(cx, false, false)
+    }
+
+    /// [`Window::draw_if_dirty`] for a caller that reads boxes through the transforms of the tree as it
+    /// stands, after a change of one that was declared paint-only (see [`App::notify_paint_only`]) or a
+    /// write the frame has not drawn yet (see [`Window::request_tick`]): the boxes are where they were,
+    /// but a transform is read from the build, and prepaint reports it with the box. Lays out and
+    /// prepaints once more whether the layout is current or not, and again for every call (the caller
+    /// knows when its reading is stale).
+    pub fn draw_for_transforms(&mut self, cx: &mut App) -> bool {
+        if draw_in_progress() {
+            return false;
+        }
+        self.layout_pass(cx, false, true)
     }
 
     /// [`Window::draw_if_dirty`] for a caller that reads the size and extent of a scroller
@@ -4598,7 +4605,7 @@ impl Window {
         {
             return false;
         }
-        self.layout_pass(cx, false)
+        self.layout_pass(cx, false, false)
     }
 
     /// Draws now if the window has pending changes, for a caller that needs what a frame
@@ -4618,7 +4625,7 @@ impl Window {
             return false;
         }
         if self.dispatch_depth.get() > 0 {
-            return self.layout_pass(cx, true);
+            return self.layout_pass(cx, true, false);
         }
         self.draw(cx).clear(cx);
         // The frame request that was waiting on the dirty flag may already have
@@ -4849,14 +4856,18 @@ impl Window {
     /// the same, and are not replayed into the frame: their owner publishes what they reported,
     /// and their recordings stay for the draw that follows. Neither
     /// the focus path nor the input handler is touched, and no accessibility tree is built.
-    fn layout_pass(&mut self, cx: &mut App, paint: bool) -> bool {
+    ///
+    /// A pass that was run for the invalidations so far is not run again, unless `again` says the
+    /// reader has seen a change that is not one of them.
+    fn layout_pass(&mut self, cx: &mut App, paint: bool, again: bool) -> bool {
         if cx.mode.skip_drawing() {
             return false;
         }
         let invalidations = self.invalidator.update_count();
-        if self
-            .measured_at
-            .is_some_and(|(count, painted)| count == invalidations && (painted || !paint))
+        if !again
+            && self
+                .measured_at
+                .is_some_and(|(count, painted)| count == invalidations && (painted || !paint))
         {
             return false;
         }
@@ -12589,6 +12600,33 @@ mod tests {
         });
     }
 
+    /// A paint-only invalidation leaves the layout current, so a read of boxes lays out nothing; a read
+    /// of the transforms they are seen through lays out once more, and as often as it is asked to.
+    #[gpui::test]
+    fn test_a_read_of_transforms_lays_out_while_the_layout_is_current(cx: &mut TestAppContext) {
+        struct Page;
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(div().w(px(100.)).h(px(20.)))
+            }
+        }
+        let (view, cx) = cx.add_window_view(|_, _| Page);
+        let id = view.entity_id();
+        cx.update(|window, cx| {
+            let passes = window.layout_pass_count();
+
+            cx.notify_paint_only(id);
+            assert!(!window.draw_if_dirty(cx), "a paint-only change leaves the layout current");
+            assert_eq!(window.layout_pass_count(), passes);
+            assert!(window.draw_for_transforms(cx), "the transforms are read from the build");
+            assert_eq!(window.layout_pass_count(), passes + 1);
+            assert!(!window.draw_if_dirty(cx), "and the layout is still current");
+
+            assert!(window.draw_for_transforms(cx), "a reader that knows of a change lays out again");
+            assert_eq!(window.layout_pass_count(), passes + 2);
+        });
+    }
+
     /// The stamp moves with every layout invalidation and with every box laid out to another place
     /// or size, and with nothing else: a pass or a frame that gives every node the box it had leaves it.
     #[gpui::test]
@@ -12667,7 +12705,6 @@ mod tests {
             assert_ne!(framed, settled, "the frame of an animation moves the stamp");
             assert!(framed.same_invalidations(&settled), "but it is no layout invalidation");
             assert!(framed.same_boxes(&settled));
-            assert!(!framed.same_animation_frames(&settled));
             assert!(!window.invalidator.layout_is_current(), "it still stales the layout");
         });
     }
