@@ -6,36 +6,57 @@ use std::borrow::Cow;
 
 /// A [`NoopTextSystem`] with glyphs that rasterize to something, so
 /// that painting a glyph leaves a sprite in the scene.
-pub(crate) struct RasterizingTextSystem(NoopTextSystem, bool);
+pub(crate) struct RasterizingTextSystem {
+    noop: NoopTextSystem,
+    ink_in_the_box: bool,
+    distinct_glyphs: bool,
+}
 
 impl RasterizingTextSystem {
     pub(crate) fn new() -> Self {
-        Self(NoopTextSystem::new(), false)
+        Self {
+            noop: NoopTextSystem::new(),
+            ink_in_the_box: false,
+            distinct_glyphs: false,
+        }
+    }
+
+    /// A text system whose characters are glyphs of their own, so that the atlas holds one
+    /// entry per character and a count of the rasterized glyphs says which characters were
+    /// painted: the glyph of every character is the same one otherwise.
+    pub(crate) fn with_distinct_glyphs() -> Self {
+        Self {
+            distinct_glyphs: true,
+            ..Self::new()
+        }
     }
 
     /// A text system whose glyphs are drawn above the baseline, inside the box that the font says
     /// a glyph is in, as ink is: a painter that skips the glyphs whose box is outside the content
     /// mask then skips only glyphs that are not visible.
     pub(crate) fn with_ink_in_the_box() -> Self {
-        Self(NoopTextSystem::new(), true)
+        Self {
+            ink_in_the_box: true,
+            ..Self::new()
+        }
     }
 }
 
 impl PlatformTextSystem for RasterizingTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> anyhow::Result<()> {
-        self.0.add_fonts(fonts)
+        self.noop.add_fonts(fonts)
     }
 
     fn all_font_names(&self) -> Vec<String> {
-        self.0.all_font_names()
+        self.noop.all_font_names()
     }
 
     fn font_id(&self, descriptor: &Font) -> anyhow::Result<FontId> {
-        self.0.font_id(descriptor)
+        self.noop.font_id(descriptor)
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
-        self.0.font_metrics(font_id)
+        self.noop.font_metrics(font_id)
     }
 
     fn typographic_bounds(
@@ -43,19 +64,19 @@ impl PlatformTextSystem for RasterizingTextSystem {
         font_id: FontId,
         glyph_id: GlyphId,
     ) -> anyhow::Result<Bounds<f32>> {
-        self.0.typographic_bounds(font_id, glyph_id)
+        self.noop.typographic_bounds(font_id, glyph_id)
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> anyhow::Result<Size<f32>> {
-        self.0.advance(font_id, glyph_id)
+        self.noop.advance(font_id, glyph_id)
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
-        self.0.glyph_for_char(font_id, ch)
+        self.noop.glyph_for_char(font_id, ch)
     }
 
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> anyhow::Result<Bounds<DevicePixels>> {
-        let above = if self.1 {
+        let above = if self.ink_in_the_box {
             (params.font_size.0 * params.scale_factor * 0.5) as i32
         } else {
             0
@@ -81,7 +102,16 @@ impl PlatformTextSystem for RasterizingTextSystem {
         runs: &[FontRun],
         scale_factor: f32,
     ) -> LineLayout {
-        self.0.layout_line(text, font_size, runs, scale_factor)
+        let mut layout = self.noop.layout_line(text, font_size, runs, scale_factor);
+        if self.distinct_glyphs {
+            for run in &mut layout.runs {
+                for glyph in run.glyphs.iter_mut().filter(|glyph| !glyph.is_emoji) {
+                    let character = text[glyph.index..].chars().next().expect("a glyph is at a character");
+                    glyph.id = GlyphId(character as u32 + 16);
+                }
+            }
+        }
+        layout
     }
 
     fn recommended_rendering_mode(
@@ -89,7 +119,7 @@ impl PlatformTextSystem for RasterizingTextSystem {
         font_id: FontId,
         font_size: Pixels,
     ) -> crate::TextRenderingMode {
-        self.0.recommended_rendering_mode(font_id, font_size)
+        self.noop.recommended_rendering_mode(font_id, font_size)
     }
 }
 

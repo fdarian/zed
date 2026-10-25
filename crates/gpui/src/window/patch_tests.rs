@@ -513,6 +513,7 @@ fn spent(after: FrameWorkCounters, before: FrameWorkCounters) -> FrameWorkCounte
         painted_primitives: after.painted_primitives - before.painted_primitives,
         replayed_primitives: after.replayed_primitives - before.replayed_primitives,
         bounds_inserts: after.bounds_inserts - before.bounds_inserts,
+        rasterized_glyphs: after.rasterized_glyphs - before.rasterized_glyphs,
     }
 }
 
@@ -1882,5 +1883,166 @@ mod clipped {
             rig.draw_whole(cx);
             assert_same(&patched, &rig.snapshot(cx), &format!("a patched frame is the frame built whole at {offset}"));
         }
+    }
+}
+
+mod rasterized {
+    //! A patchable root keeps an operation for every glyph of its text, so that the operations do not
+    //! depend on the clip, but a glyph the clip hides is not rasterized: only a glyph that shows is.
+
+    use super::*;
+    use crate::{ElementTransform, RasterizingTextSystem, TestApp, TransformFunction, TransformLength};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    struct Slide {
+        /// Pixels the text is translated right by in the slot, which is 40 wide.
+        offset: Cell<f32>,
+        text: String,
+    }
+
+    /// One character is 6 px wide at 10 px, and each is a glyph of its own in the text system.
+    fn text_of(characters: usize) -> String {
+        (0..characters).map(|ix| char::from_u32(0x100 + ix as u32).expect("a character")).collect()
+    }
+
+    fn unit_for(slide: &Rc<Slide>) -> AnyElement {
+        div()
+            .id(UNIT)
+            .w(px(100.))
+            .h(px(100.))
+            .flex_none()
+            .bg(blue())
+            .child(
+                div().w(px(40.)).h(px(20.)).flex_none().overflow_hidden().child(
+                    div()
+                        .w(px(2_000.))
+                        .h(px(20.))
+                        .flex_none()
+                        .text_size(px(10.))
+                        .whitespace_nowrap()
+                        .text_color(green())
+                        .transform(ElementTransform {
+                            functions: vec![TransformFunction::Translate(
+                                TransformLength::pixels(slide.offset.get()),
+                                TransformLength::pixels(0.),
+                            )],
+                            origin: (TransformLength::pixels(0.), TransformLength::pixels(0.)),
+                        })
+                        .child(slide.text.clone()),
+                ),
+            )
+            .into_any_element()
+    }
+
+    struct SlidePage(Rc<Slide>);
+
+    impl Render for SlidePage {
+        fn render(&mut self, _: &mut crate::Window, _: &mut Context<Self>) -> impl IntoElement {
+            let slide = self.0.clone();
+            let unit = retained(UNIT, 1_000, move |_, _| unit_for(&slide)).patchable();
+            div().id("page").w(px(400.)).h(px(400.)).child(unit).into_any_element()
+        }
+    }
+
+    struct Rig {
+        app: TestApp,
+        window: AnyWindowHandle,
+        slide: Rc<Slide>,
+        /// The tiles of the glyphs that showed in a frame so far.
+        seen: HashSet<u32>,
+    }
+
+    impl Rig {
+        fn new(characters: usize, offset: f32) -> Self {
+            let mut app = TestApp::with_text_system(Arc::new(RasterizingTextSystem::with_distinct_glyphs()));
+            app.set_window_scale_factor(1.);
+            let slide = Rc::new(Slide { offset: Cell::new(offset), text: text_of(characters) });
+            let window = app.open_window({
+                let slide = slide.clone();
+                move |_, _| SlidePage(slide)
+            });
+            let window = AnyWindowHandle::from(window.handle());
+            let patched = slide.clone();
+            let mut rig = Self { app, window, slide, seen: HashSet::new() };
+            rig.in_window(|window, cx| {
+                window.set_frame_patcher(Some(Rc::new(move |window: &mut crate::Window, cx: &mut App| {
+                    let element = unit_for(&patched);
+                    window.repaint_in_place(vec![(ElementId::from(UNIT), element)], cx, |_, _| true).is_ok()
+                })));
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+                window.present_cached_frame();
+            });
+            rig
+        }
+
+        fn in_window<R>(&mut self, update: impl FnOnce(&mut crate::Window, &mut App) -> R) -> R {
+            let window = self.window;
+            self.app.update(|cx| cx.update_window(window, |_, window, cx| update(window, cx)).unwrap())
+        }
+
+        fn tick(&mut self, offset: f32) {
+            self.slide.offset.set(offset);
+            self.in_window(|window, cx| {
+                window.request_tick();
+                window.draw(cx).clear(cx);
+            });
+        }
+
+        fn draw_whole(&mut self) {
+            self.in_window(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        }
+
+        fn patches(&mut self) -> PatchCounters {
+            self.in_window(|window, _| window.patch_counters())
+        }
+
+        fn rasterized(&mut self) -> u64 {
+            self.in_window(|window, _| window.frame_work_counters().rasterized_glyphs)
+        }
+
+        /// The tiles of the glyphs the rendered frame draws.
+        fn shown(&mut self) -> Vec<u32> {
+            self.in_window(|window, _| {
+                window.rendered_frame.scene.monochrome_sprites.iter().map(|sprite| sprite.tile.tile_id.0).collect()
+            })
+        }
+
+        fn snapshot(&mut self) -> String {
+            self.in_window(|window, _| format!("{:#?}", window.rendered_frame.scene.monochrome_sprites))
+        }
+    }
+
+    #[test]
+    fn a_long_line_rasterizes_only_the_glyphs_that_show() {
+        let mut rig = Rig::new(120, 0.);
+        let shown = rig.shown();
+        let rasterized = rig.rasterized();
+        eprintln!("120 glyphs, {} show, {rasterized} rasterized", shown.len());
+        assert!(!shown.is_empty() && shown.len() < 20, "a slot 40 wide shows a few glyphs: {}", shown.len());
+        assert_eq!(rasterized, shown.len() as u64, "the glyphs outside the clip were not rasterized");
+    }
+
+    #[test]
+    fn a_word_sliding_into_the_clip_stays_patched_and_is_rasterized_when_it_first_shows() {
+        let mut rig = Rig::new(6, 200.);
+        assert_eq!((rig.shown().len(), rig.rasterized()), (0, 0), "the word is out of the slot at first");
+        let offsets = [150., 100., 60., 45., 41., 38., 30., 20., 10., 0., -10., -20., -30., -37., -40., -60., 60., 0., 38.];
+        for (tick, offset) in offsets.iter().enumerate() {
+            let rasterized = rig.rasterized();
+            rig.tick(*offset);
+            let patches = rig.patches();
+            assert_eq!((patches.patched_frames, patches.total_declines()), (tick as u64 + 1, 0), "offset {offset}");
+            let new: Vec<u32> = rig.shown().into_iter().filter(|tile| rig.seen.insert(*tile)).collect();
+            assert_eq!(rig.rasterized() - rasterized, new.len() as u64, "offset {offset}: a glyph is rasterized once, when it first shows");
+            let patched = rig.snapshot();
+            rig.draw_whole();
+            assert_same(&patched, &rig.snapshot(), &format!("a patched frame is the frame built whole at {offset}"));
+        }
+        assert_eq!(rig.rasterized(), 6, "every glyph of the word showed at some point");
     }
 }

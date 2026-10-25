@@ -178,6 +178,9 @@ pub struct FrameWorkCounters {
     /// Draw orders that were worked out with a scene's bounds tree: the cost of the number of
     /// primitives a scene holds, which a scene made again from the orders it had does not pay.
     pub bounds_inserts: u64,
+    /// Glyphs that were rasterized because the atlas did not have them. A glyph of a patchable root
+    /// that the clip hides is not.
+    pub rasterized_glyphs: u64,
 }
 
 impl FrameWorkCounters {
@@ -189,6 +192,7 @@ impl FrameWorkCounters {
         self.painted_primitives += other.painted_primitives;
         self.replayed_primitives += other.replayed_primitives;
         self.bounds_inserts += other.bounds_inserts;
+        self.rasterized_glyphs += other.rasterized_glyphs;
     }
 }
 

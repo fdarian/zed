@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Anchor, AtlasTextureId, AtlasTile, Background, BackgroundTile, Bounds, ContentMask, CornerRadii, Corners, Edges,
-    GroupEffect, Hsla, MAX_GROUP_EXTENT, Pixels, Point, Radians, ResolvedFilter, ScaledPixels, Size,
+    GroupEffect, Hsla, MAX_GROUP_EXTENT, Pixels, Point, Radians, RenderGlyphParams, ResolvedFilter, ScaledPixels, Size,
     bounds_tree::BoundsTree, filter_margin, point, visual_bounds,
 };
 use std::{
@@ -313,6 +313,18 @@ impl Scene {
     /// what a text clip masks by.
     pub fn insert_image(&mut self, sprite: PolychromeSprite) {
         self.insert(sprite.into(), false);
+    }
+
+    /// Records a glyph that the content mask clips away without a sprite: see [`PendingGlyph`].
+    pub(crate) fn insert_pending_glyph(&mut self, glyph: PendingGlyph) {
+        if self.hidden {
+            return;
+        }
+        assert!(
+            glyph.is_clipped_away(),
+            "a pending glyph is clipped away by its mask, which a replay moves it with and only narrows"
+        );
+        self.record(PaintOperation::PendingGlyph(glyph));
     }
 
     fn insert(&mut self, primitive: Primitive, glyph: bool) {
@@ -913,6 +925,7 @@ impl Scene {
                     write!(out, "{sprite:?}")
                 }
                 PaintOperation::Primitive(Primitive::Surface(surface)) => write!(out, "{surface:?}"),
+                PaintOperation::PendingGlyph(glyph) => write!(out, "{glyph:?}"),
                 PaintOperation::StartLayer(bounds) => write!(out, "layer {bounds:?}"),
                 PaintOperation::EndLayer => write!(out, "end layer"),
                 PaintOperation::StartGroup { content_mask, reserved, .. } => {
@@ -993,6 +1006,7 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::Quad(quad) => self.insert_quad(*quad),
                 PaintOperation::Image(sprite) => self.insert_image(*sprite),
+                PaintOperation::PendingGlyph(glyph) => self.insert_pending_glyph(glyph.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartGroup {
@@ -1060,6 +1074,14 @@ impl Scene {
                         clip_mask(&mut sprite.content_mask, &clip.snapped);
                     }
                     self.insert_image(sprite);
+                }
+                PaintOperation::PendingGlyph(glyph) => {
+                    let mut glyph = glyph.clone();
+                    glyph.translate(delta);
+                    if clipped {
+                        clip_mask(&mut glyph.content_mask, &clip.snapped);
+                    }
+                    self.insert_pending_glyph(glyph);
                 }
                 PaintOperation::StartLayer(bounds) => {
                     let mut bounds = *bounds;
@@ -1190,6 +1212,9 @@ pub(crate) enum PaintOperation {
     /// content mask it ends up with: see [`Scene::insert_quad`].
     Quad(Quad),
     Image(PolychromeSprite),
+    /// A glyph of a patchable root that the content mask clips away: it holds what the sprite
+    /// would, without the atlas tile, which painting it would have rasterized.
+    PendingGlyph(PendingGlyph),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
     StartGroup {
@@ -1221,6 +1246,7 @@ impl PaintOperation {
             }
             PaintOperation::Quad(quad) => quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty(),
             PaintOperation::Image(sprite) => sprite.window_bounds().intersect(&sprite.content_mask.bounds).is_empty(),
+            PaintOperation::PendingGlyph(glyph) => glyph.is_clipped_away(),
             _ => false,
         }
     }
@@ -1228,7 +1254,19 @@ impl PaintOperation {
     /// Whether `other` is the same kind of operation: what a patch must keep, since the operations
     /// around it are not rebuilt.
     pub(crate) fn same_kind(&self, other: &PaintOperation) -> bool {
+        // A glyph that slides into the mask is a sprite where it was a pending glyph, and back.
+        if self.is_glyph_slot() && other.is_glyph_slot() {
+            return true;
+        }
         mem::discriminant(self) == mem::discriminant(other)
+    }
+
+    fn is_glyph_slot(&self) -> bool {
+        matches!(
+            self,
+            PaintOperation::PendingGlyph(_)
+                | PaintOperation::Primitive(Primitive::MonochromeSprite(_) | Primitive::PolychromeSprite(_))
+        )
     }
 
     /// Whether the operations paint differently, compared field by field through their debug
@@ -2252,6 +2290,83 @@ pub struct MonochromeSprite {
     pub local_clip: ContentMask<ScaledPixels>,
 }
 
+/// What the sprite of a glyph holds but its atlas tile: the glyph of a patchable root that the
+/// content mask clips away is recorded as this, so that the operations of the root do not depend
+/// on the mask and no glyph out of view is rasterized. A glyph is made of this by
+/// [`PendingGlyph::sprite`] once painting finds it in the mask.
+///
+/// A replay moves it together with the mask it was recorded under and only narrows that, so a
+/// recorded one stays clipped away: none is ever routed, and none is made a sprite by a replay.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingGlyph {
+    pub params: RenderGlyphParams,
+    /// The origin of the sprite and the size of the glyph's raster bounds.
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The color of a monochrome glyph, with the opacity of its element.
+    pub color: Hsla,
+    /// The opacity of an emoji.
+    pub opacity: f32,
+    pub transformation: TransformationMatrix,
+    pub local_clip: ContentMask<ScaledPixels>,
+}
+
+impl PendingGlyph {
+    pub(crate) fn window_bounds(&self) -> Bounds<ScaledPixels> {
+        transformed_bounds(&self.transformation, self.bounds)
+    }
+
+    pub(crate) fn is_clipped_away(&self) -> bool {
+        self.window_bounds().intersect(&self.content_mask.bounds).is_empty()
+    }
+
+    fn translate(&mut self, delta: Point<ScaledPixels>) {
+        translate_mask(&mut self.content_mask, delta);
+        if !move_through(&mut self.transformation, delta) {
+            translate_bounds(&mut self.bounds, delta);
+        }
+    }
+
+    /// The sprite of the glyph, whose tile is `tile`.
+    pub(crate) fn sprite(&self, tile: AtlasTile) -> Primitive {
+        debug_assert_eq!(
+            tile.bounds.size.map(Into::into),
+            self.bounds.size,
+            "the tile of a glyph is as large as its raster bounds"
+        );
+        let bounds = Bounds {
+            origin: self.bounds.origin,
+            size: tile.bounds.size.map(Into::into),
+        };
+        if self.params.is_emoji {
+            Primitive::PolychromeSprite(PolychromeSprite {
+                order: 0,
+                nearest_neighbor: false.into(),
+                grayscale: false.into(),
+                opacity: self.opacity,
+                bounds,
+                content_mask: self.content_mask,
+                corner_radii: Default::default(),
+                corner_radii_y: Default::default(),
+                tile,
+                transformation: self.transformation,
+                local_clip: self.local_clip,
+            })
+        } else {
+            Primitive::MonochromeSprite(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds,
+                content_mask: self.content_mask,
+                color: self.color,
+                tile,
+                transformation: self.transformation,
+                local_clip: self.local_clip,
+            })
+        }
+    }
+}
+
 impl From<MonochromeSprite> for Primitive {
     fn from(sprite: MonochromeSprite) -> Self {
         Primitive::MonochromeSprite(sprite)
@@ -3265,5 +3380,109 @@ mod tests {
         assert!(same.differs_from(&PaintOperation::Quad(quad(0., 0., 10., 11.))));
         assert!(same.differs_from(&PaintOperation::Quad(Quad { background: crate::blue().into(), ..quad(0., 0., 10., 10.) })));
         assert!(same.differs_from(&PaintOperation::EndLayer));
+    }
+
+    fn pending_glyph(x: f32, y: f32, content_mask: ContentMask<ScaledPixels>) -> PendingGlyph {
+        PendingGlyph {
+            params: RenderGlyphParams {
+                font_id: crate::FontId(0),
+                glyph_id: crate::GlyphId(1),
+                font_size: crate::px(10.),
+                subpixel_variant: Point::default(),
+                scale_factor: 1.,
+                is_emoji: false,
+                subpixel_rendering: false,
+                luminance_bucket: 0,
+                font_smoothing: crate::FontSmoothing::Auto,
+            },
+            bounds: bounds(x, y, 8., 8.),
+            content_mask,
+            color: red(),
+            opacity: 1.,
+            transformation: TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
+        }
+    }
+
+    fn tile_of(glyph: &PendingGlyph) -> AtlasTile {
+        AtlasTile {
+            texture_id: AtlasTextureId { index: 0, kind: AtlasTextureKind::Monochrome },
+            tile_id: TileId(7),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size: glyph.bounds.size.map(|extent| crate::DevicePixels(extent.0 as i32)),
+            },
+        }
+    }
+
+    #[test]
+    fn a_pending_glyph_is_recorded_and_never_drawn() {
+        let narrow = ContentMask { bounds: bounds(0., 0., 50., 50.), ..mask() };
+        let mut scene = scene();
+        scene.insert_primitive(glyph(10., 10.));
+        scene.insert_pending_glyph(pending_glyph(100., 10., narrow));
+        scene.finish();
+        assert_eq!(scene.len(), 2, "both are operations");
+        assert_eq!(scene.monochrome_sprites.len(), 1, "and the pending one is no sprite");
+        assert_eq!(scene.describe_drawn().lines().count(), 1, "nor is it described as drawn");
+    }
+
+    #[test]
+    fn a_pending_glyph_is_the_same_kind_as_a_sprite_that_differs_from_it() {
+        let narrow = ContentMask { bounds: bounds(0., 0., 50., 50.), ..mask() };
+        let pending = PaintOperation::PendingGlyph(pending_glyph(100., 10., narrow));
+        let sprite = PaintOperation::Primitive(glyph(10., 10.).into());
+        assert!(pending.same_kind(&sprite) && sprite.same_kind(&pending));
+        assert!(pending.differs_from(&sprite) && sprite.differs_from(&pending));
+        assert!(!pending.differs_from(&PaintOperation::PendingGlyph(pending_glyph(100., 10., narrow))));
+        assert!(pending.differs_from(&PaintOperation::PendingGlyph(pending_glyph(101., 10., narrow))));
+        assert!(!pending.same_kind(&PaintOperation::Quad(quad(0., 0., 10., 10.))));
+        assert!(!pending.same_kind(&PaintOperation::EndLayer));
+    }
+
+    #[test]
+    fn replays_move_a_pending_glyph_with_its_mask_and_it_stays_pending() {
+        let region = ContentMask { bounds: bounds(0., 0., WINDOW, 3. * WINDOW), ..mask() };
+        let mut recorded = scene();
+        let mut visible = glyph(20., 130.);
+        visible.content_mask = region;
+        recorded.insert_primitive(visible);
+        // Below the region, as the glyph of a long line is.
+        recorded.insert_pending_glyph(pending_glyph(20., 1300., region));
+        recorded.insert_pending_glyph(pending_glyph(20., -300., region));
+
+        let mut again = scene();
+        again.replay(0..recorded.len(), &recorded);
+        let mut rebuilt = scene();
+        rebuilt.replay(0..recorded.len(), &recorded);
+        rebuilt.rebuild_from_operations();
+        let delta = point(ScaledPixels(0.), ScaledPixels(-100.));
+        // The viewport is wide enough to show what is at 1300 - 100, and the region still ends at 1100.
+        let viewport = clip(0., 0., WINDOW, 1500.);
+        let mut moved = scene();
+        moved.replay_translated(&recorded.paint_operations, delta, &viewport, PrimitiveCount::Replayed);
+        for scene in [&mut again, &mut rebuilt, &mut moved] {
+            scene.finish();
+            assert_eq!(scene.len(), 3);
+            assert_eq!(scene.monochrome_sprites.len(), 1);
+            assert!(scene.paint_operations.iter().filter(|operation| matches!(operation, PaintOperation::PendingGlyph(_))).count() == 2);
+        }
+    }
+
+    #[test]
+    fn a_pending_glyph_becomes_the_sprite_that_painting_it_in_the_mask_gives() {
+        let glyph = pending_glyph(10., 10., mask());
+        let Primitive::MonochromeSprite(sprite) = glyph.sprite(tile_of(&glyph)) else {
+            panic!("a glyph that is not an emoji is a monochrome sprite")
+        };
+        assert_eq!((sprite.bounds, sprite.content_mask, sprite.color), (glyph.bounds, glyph.content_mask, glyph.color));
+        let mut emoji = pending_glyph(10., 10., mask());
+        emoji.params.is_emoji = true;
+        emoji.opacity = 0.5;
+        let Primitive::PolychromeSprite(sprite) = emoji.sprite(tile_of(&emoji)) else {
+            panic!("an emoji is a polychrome sprite")
+        };
+        assert_eq!((sprite.bounds, sprite.opacity), (emoji.bounds, 0.5));
     }
 }

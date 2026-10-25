@@ -15,7 +15,7 @@ use crate::{
     Keystroke, KeystrokeEvent, LayoutCounters, LayoutId, LayoutInsets, LineLayoutIndex, MeasureRun, MeasuredLeaf, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NativeKey, OverlineStyle, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    PendingGlyph, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedClipPath, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
@@ -4647,7 +4647,8 @@ impl Window {
     }
 
     /// Whether text paints the glyphs that lie far outside the content mask too, which it
-    /// leaves out to save the work of looking them up.
+    /// leaves out to save the work of looking them up. They are painted as [`PendingGlyph`]s,
+    /// which cost no raster.
     pub(crate) fn paints_glyphs_outside_the_mask(&self) -> bool {
         self.every_glyph_painted > 0
     }
@@ -7629,43 +7630,68 @@ impl Window {
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
             let content_mask = self.snapped_content_mask();
 
             if subpixel_rendering {
+                let tile = self.glyph_tile(&params)?;
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
                     order: 0,
                     pad: 0,
-                    bounds,
+                    bounds: Bounds {
+                        origin: integer_origin + raster_bounds.origin.map(Into::into),
+                        size: tile.bounds.size.map(Into::into),
+                    },
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
                     transformation: TransformationMatrix::unit(),
                 });
             } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
+                let glyph = PendingGlyph {
+                    params,
+                    bounds: Bounds {
+                        origin: integer_origin + raster_bounds.origin.map(Into::into),
+                        size: raster_bounds.size.map(Into::into),
+                    },
                     content_mask,
                     color: color.opacity(element_opacity),
-                    tile,
+                    opacity: 1.,
                     transformation: placement.transformation,
                     local_clip: placement.local_clip,
-                });
+                };
+                self.paint_pending_glyph(glyph)?;
             }
         }
         Ok(())
+    }
+
+    /// Puts the glyph into the scene as a sprite, or, when a patchable root is painted and the
+    /// content mask clips it away, as a pending glyph that costs no raster.
+    fn paint_pending_glyph(&mut self, glyph: PendingGlyph) -> Result<()> {
+        if self.paints_glyphs_outside_the_mask() && glyph.is_clipped_away() {
+            self.next_frame.scene.insert_pending_glyph(glyph);
+            return Ok(());
+        }
+        let tile = self.glyph_tile(&glyph.params)?;
+        self.next_frame.scene.insert_primitive(glyph.sprite(tile));
+        Ok(())
+    }
+
+    /// The tile of a glyph in the atlas, which is rasterized into it if it is not there.
+    fn glyph_tile(&mut self, params: &RenderGlyphParams) -> Result<AtlasTile> {
+        let mut rasterized = false;
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.clone().into(), &mut || {
+                rasterized = true;
+                let (size, bytes) = self.text_system().rasterize_glyph(params)?;
+                Ok(Some((size, Cow::Owned(bytes))))
+            })?
+            .expect("Callback above only errors or returns Some");
+        if rasterized {
+            self.retained.work.rasterized_glyphs += 1;
+        }
+        Ok(tile)
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
@@ -7726,34 +7752,19 @@ impl Window {
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-
-            let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.snapped_content_mask();
-            let opacity = self.element_opacity();
-
-            self.next_frame.scene.insert_primitive(PolychromeSprite {
-                order: 0,
-                nearest_neighbor: false.into(),
-                grayscale: false.into(),
-                bounds,
-                corner_radii: Default::default(),
-                corner_radii_y: Default::default(),
-                content_mask,
-                tile,
-                opacity,
+            let glyph = PendingGlyph {
+                params,
+                bounds: Bounds {
+                    origin: integer_origin + raster_bounds.origin.map(Into::into),
+                    size: raster_bounds.size.map(Into::into),
+                },
+                content_mask: self.snapped_content_mask(),
+                color: Hsla::default(),
+                opacity: self.element_opacity(),
                 transformation: placement.transformation,
                 local_clip: placement.local_clip,
-            });
+            };
+            self.paint_pending_glyph(glyph)?;
         }
         Ok(())
     }

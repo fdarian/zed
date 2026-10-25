@@ -193,6 +193,7 @@ fn a_frame_that_replays_every_card_works_on_the_elements_around_them_only(cx: &m
         painted_primitives: 1,
         replayed_primitives: 3,
         bounds_inserts: 0,
+        rasterized_glyphs: 0,
     };
     assert_eq!(works[0], expected, "4 cards");
     assert_eq!(works[1], expected, "40 cards: what is culled costs no prepaint, paint or primitive");
