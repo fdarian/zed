@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, DecorationThickness, DevicePixels, ExtraDecoration, FontId, FontSmoothing, GlyphInset, Half, Hsla, LineLayout, RowMetrics,
+    App, Bounds, DecorationThickness, Direction, DevicePixels, ExtraDecoration, FontId, FontSmoothing, GlyphInset, Half, Hsla, LineLayout, RowMetrics,
     OverlineStyle, Pixels, Point, RenderGlyphParams, Result, ShapedRun, SharedString,
-    Hyphen, StrikethroughStyle, TextAlign, TextSystem, UnderlineStyle, Window, WrapBoundary,
+    Hyphen, StrikethroughStyle, TextAlign, TextAlignment, TextSystem, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
@@ -126,7 +126,7 @@ impl ShapedLine {
             origin,
             &self.layout,
             line_height,
-            align,
+            TextAlignment::ltr(align),
             align_width,
             &self.decoration_runs,
             &[],
@@ -155,7 +155,7 @@ impl ShapedLine {
             origin,
             &self.layout,
             line_height,
-            align,
+            TextAlignment::ltr(align),
             align_width,
             &self.decoration_runs,
             &[],
@@ -272,7 +272,7 @@ impl LineLayout {
             origin,
             self,
             line_height,
-            align,
+            TextAlignment::ltr(align),
             align_width,
             decoration_runs,
             &[],
@@ -304,7 +304,7 @@ impl LineLayout {
             origin,
             self,
             line_height,
-            align,
+            TextAlignment::ltr(align),
             align_width,
             decoration_runs,
             &[],
@@ -340,7 +340,7 @@ impl WrappedLine {
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
-        align: TextAlign,
+        align: TextAlignment,
         bounds: Option<Bounds<Pixels>>,
         window: &mut Window,
         cx: &mut App,
@@ -375,7 +375,7 @@ impl WrappedLine {
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
-        align: TextAlign,
+        align: TextAlignment,
         bounds: Option<Bounds<Pixels>>,
         group: u64,
         window: &mut Window,
@@ -419,7 +419,7 @@ impl WrappedLine {
 
     /// How far right of the left edge of `align_width` the wrapped row `row_ix` of this line starts
     /// when it is painted with `align`.
-    pub fn row_offset(&self, row_ix: usize, align: TextAlign, align_width: Pixels) -> Pixels {
+    pub fn row_offset(&self, row_ix: usize, align: TextAlignment, align_width: Pixels) -> Pixels {
         let layout = &self.layout.unwrapped_layout;
         let row_start = match row_ix.checked_sub(1) {
             Some(previous) => {
@@ -445,7 +445,7 @@ impl WrappedLine {
         &self,
         index: usize,
         line_height: Pixels,
-        align: TextAlign,
+        align: TextAlignment,
         align_width: Pixels,
     ) -> Option<Point<Pixels>> {
         let mut position = self.layout.position_for_index(index, line_height)?;
@@ -460,7 +460,7 @@ impl WrappedLine {
         &self,
         mut position: Point<Pixels>,
         line_height: Pixels,
-        align: TextAlign,
+        align: TextAlignment,
         align_width: Pixels,
     ) -> Result<usize, usize> {
         let row_ix = self.layout.row_at_y(position.y, line_height);
@@ -477,7 +477,7 @@ impl WrappedLine {
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
-        align: TextAlign,
+        align: TextAlignment,
         bounds: Option<Bounds<Pixels>>,
     ) -> SmallVec<[(usize, Point<Pixels>); 2]> {
         let align_width = match bounds {
@@ -516,7 +516,7 @@ impl WrappedLine {
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
-        align: TextAlign,
+        align: TextAlignment,
         bounds: Option<Bounds<Pixels>>,
         window: &mut Window,
         cx: &mut App,
@@ -577,7 +577,7 @@ fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
     line_height: Pixels,
-    align: TextAlign,
+    align: TextAlignment,
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
@@ -898,7 +898,7 @@ fn paint_line_background(
     origin: Point<Pixels>,
     layout: &LineLayout,
     line_height: Pixels,
-    align: TextAlign,
+    align: TextAlignment,
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
@@ -1261,7 +1261,7 @@ fn aligned_origin_x(
     origin: Point<Pixels>,
     align_width: Pixels,
     last_glyph_x: Pixels,
-    align: &TextAlign,
+    align: &TextAlignment,
     layout: &LineLayout,
     wrap_boundary: Option<&&WrapBoundary>,
     hanging_width: Pixels,
@@ -1275,10 +1275,16 @@ fn aligned_origin_x(
 
     let line_width = end_of_line - last_glyph_x - hanging_width + hyphen_width;
 
-    match align {
+    // A row wider than its box starts at the start edge whatever the alignment (CSS Text 3 §7.1),
+    // so its end is what sticks out.
+    if line_width > align_width {
+        return match align.direction {
+            Direction::Ltr => origin.x,
+            Direction::Rtl => origin.x + align_width - line_width,
+        };
+    }
+    match align.align {
         TextAlign::Left => origin.x,
-        // A row wider than its box starts at the start edge whatever the alignment (CSS Text 3 §7.1).
-        TextAlign::Center | TextAlign::Right if line_width > align_width => origin.x,
         TextAlign::Center => (origin.x * 2.0 + align_width - line_width) / 2.0,
         TextAlign::Right => origin.x + align_width - line_width,
     }
@@ -1610,6 +1616,26 @@ mod tests {
         aligned_hyphenated(layout, align, last_glyph_x, boundary, hanging, 0.)
     }
 
+    fn aligned_in(
+        direction: Direction,
+        layout: &LineLayout,
+        align: TextAlign,
+        last_glyph_x: f32,
+        boundary: Option<WrapBoundary>,
+        hanging: f32,
+    ) -> Pixels {
+        aligned_origin_x(
+            point(px(0.), px(0.)),
+            px(100.),
+            px(last_glyph_x),
+            &TextAlignment { align, direction },
+            layout,
+            boundary.as_ref().as_ref(),
+            px(hanging),
+            px(0.),
+        )
+    }
+
     fn aligned_hyphenated(
         layout: &LineLayout,
         align: TextAlign,
@@ -1622,7 +1648,7 @@ mod tests {
             point(px(0.), px(0.)),
             px(100.),
             px(last_glyph_x),
-            &align,
+            &TextAlignment::ltr(align),
             layout,
             boundary.as_ref().as_ref(),
             px(hanging),
@@ -1690,6 +1716,24 @@ mod tests {
         assert_eq!(aligned(layout, TextAlign::Right, 0., None, 40.), px(10.));
         // Exactly as wide as the box is the same as the start edge.
         assert_eq!(aligned(layout, TextAlign::Center, 30., None, 0.), px(0.));
+    }
+
+    #[test]
+    fn test_a_row_wider_than_its_box_starts_at_the_right_edge_in_a_right_to_left_box() {
+        let glyphs: Vec<(usize, f32)> = (0..4).map(|ix| (ix, ix as f32 * 32.5)).collect();
+        let line = make_shaped_line("aaaa", &glyphs, 130., &[]);
+        let layout = &*line.layout;
+        // Its right edge is the box's: it sticks out to the left, whatever the alignment.
+        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            assert_eq!(aligned_in(Direction::Rtl, layout, align, 0., None, 0.), px(-30.));
+        }
+        // Only its hanging space is past the edge, and the row fits without it.
+        assert_eq!(aligned_in(Direction::Rtl, layout, TextAlign::Right, 0., None, 40.), px(10.));
+        assert_eq!(aligned_in(Direction::Rtl, layout, TextAlign::Left, 0., None, 40.), px(0.));
+        // A row that fits is aligned as in a left to right box.
+        assert_eq!(aligned_in(Direction::Rtl, layout, TextAlign::Center, 50., None, 0.), px(10.));
+        assert_eq!(aligned_in(Direction::Rtl, layout, TextAlign::Right, 50., None, 0.), px(20.));
+        assert_eq!(aligned_in(Direction::Rtl, layout, TextAlign::Left, 50., None, 0.), px(0.));
     }
 
     #[test]

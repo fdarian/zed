@@ -674,6 +674,27 @@ pub enum TextAlign {
     Right,
 }
 
+/// A [`TextAlign`] and the [`Direction`] of the box the text is in, which says on which side the
+/// text starts: a row wider than its box starts at that side whatever the alignment (CSS Text 3
+/// 7.1), and gpui text has no direction of its own to tell it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextAlignment {
+    /// How the text is aligned in its box
+    pub align: TextAlign,
+    /// The direction of the box
+    pub direction: Direction,
+}
+
+impl TextAlignment {
+    /// `align` in a left to right box.
+    pub fn ltr(align: TextAlign) -> Self {
+        Self {
+            align,
+            direction: Direction::Ltr,
+        }
+    }
+}
+
 /// A CSS `line-height`.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum LineHeight {
@@ -804,6 +825,10 @@ pub struct TextStyle {
     /// How the text should be aligned within the element
     pub text_align: TextAlign,
 
+    /// The direction of the box the text is in, which decides where a row that does not fit
+    /// it starts (see [`TextAlignment`])
+    pub direction: Direction,
+
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
 
@@ -857,6 +882,7 @@ impl Default for TextStyle {
             white_space: WhiteSpace::Normal,
             text_overflow: None,
             text_align: TextAlign::default(),
+            direction: Direction::default(),
             line_clamp: None,
             tab_size: None,
             hang_trailing_spaces: false,
@@ -870,6 +896,14 @@ impl Default for TextStyle {
 }
 
 impl TextStyle {
+    /// The alignment and direction lines of this style are painted with.
+    pub fn alignment(&self) -> TextAlignment {
+        TextAlignment {
+            align: self.text_align,
+            direction: self.direction,
+        }
+    }
+
     /// Create a new text style with the given highlighting applied.
     pub fn highlight(mut self, style: impl Into<HighlightStyle>) -> Self {
         let style = style.into();

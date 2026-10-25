@@ -712,7 +712,7 @@ impl Element for StyledText {
     ) {
         self.layout.prepaint(bounds, &self.text, window);
         if let Some(atomics) = &self.atomics {
-            let origins = self.layout.atomic_origins(window.text_style().text_align);
+            let origins = self.layout.atomic_origins(window.text_style().alignment());
             atomics.borrow_mut().prepaint(&origins, window, cx);
         }
     }
@@ -820,7 +820,7 @@ struct TextLayoutInner {
     trim_top: Pixels,
     trim_bottom: Pixels,
     /// The alignment the lines are painted with, which the positions of the text are of.
-    align: crate::TextAlign,
+    align: crate::TextAlignment,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
     /// How far below the snapped top of `bounds` the box top is before taffy snaps it. A glyph
@@ -902,7 +902,7 @@ impl TextLayout {
         let line_height = window
             .text_system()
             .line_height(&text_style, window.rem_size(), scale_factor);
-        let text_align = text_style.text_align;
+        let alignment = text_style.alignment();
         let mut options = text_style.layout_options(window.text_system());
         // A box that wraps in text that does not makes lines, and the spaces at the end
         // of them hang as they do in text that wraps.
@@ -1001,7 +1001,7 @@ impl TextLayout {
                             options,
                             trim_top: Pixels::ZERO,
                             trim_bottom: Pixels::ZERO,
-                            align: text_align,
+                            align: alignment,
                             size: Some(Size::default()),
                             bounds: None,
                             phase_y: Pixels::ZERO,
@@ -1220,7 +1220,7 @@ impl TextLayout {
                     options,
                     trim_top,
                     trim_bottom,
-                    align: text_align,
+                    align: alignment,
                     size: Some(size),
                     bounds: None,
                     phase_y: Pixels::ZERO,
@@ -1351,7 +1351,7 @@ impl TextLayout {
             line.paint_background(
                 line_origin,
                 line_height,
-                text_style.text_align,
+                text_style.alignment(),
                 Some(bounds),
                 window,
                 cx,
@@ -1360,7 +1360,7 @@ impl TextLayout {
             line.paint(
                 line_origin,
                 line_height,
-                text_style.text_align,
+                text_style.alignment(),
                 Some(bounds),
                 window,
                 cx,
@@ -1391,7 +1391,7 @@ impl TextLayout {
             line.paint_group(
                 line_origin,
                 line_height,
-                text_style.text_align,
+                text_style.alignment(),
                 Some(bounds),
                 group,
                 window,
@@ -1426,7 +1426,7 @@ impl TextLayout {
     /// device pixel. `align` is the text alignment the text is painted with.
     pub fn atomic_origins(
         &self,
-        align: crate::TextAlign,
+        align: crate::TextAlignment,
     ) -> SmallVec<[(usize, Point<Pixels>); 2]> {
         let element_state = self.0.borrow();
         let element_state = element_state
@@ -2416,7 +2416,7 @@ mod tests {
                 (TextAlign::Right, px(100.) - line_width),
                 (TextAlign::Center, (px(100.) - line_width) / 2.),
             ] {
-                layout.0.borrow_mut().as_mut().unwrap().align = align;
+                layout.0.borrow_mut().as_mut().unwrap().align = crate::TextAlignment::ltr(align);
                 let at = layout.position_for_index(1).unwrap();
                 assert_eq!(at.x, left.x + offset, "{align:?}");
                 assert_eq!(layout.align_offset_at(1), offset, "{align:?}");
