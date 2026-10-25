@@ -58,6 +58,12 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the display type of the element to `flow-root`.
+    fn flow_root(mut self) -> Self {
+        self.style().display = Some(Display::FlowRoot);
+        self
+    }
+
     /// Sets the display type of the element to `flex`.
     /// [Docs](https://tailwindcss.com/docs/display)
     fn flex(mut self) -> Self {

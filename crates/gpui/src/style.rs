@@ -2117,6 +2117,9 @@ pub type JustifyContent = AlignContent;
 pub enum Display {
     /// The children will follow the block layout algorithm
     Block,
+    /// The children will follow the block layout algorithm in a formatting context of their own: the margins of the
+    /// children stay inside the element, as they do in a scroll container
+    FlowRoot,
     /// The children will follow the flexbox layout algorithm
     #[default]
     Flex,
@@ -2418,6 +2421,7 @@ impl From<Display> for taffy::style::Display {
     fn from(value: Display) -> Self {
         match value {
             Display::Block => Self::Block,
+            Display::FlowRoot => Self::FlowRoot,
             Display::Flex => Self::Flex,
             Display::Grid => Self::Grid,
             Display::Table => Self::Table,
