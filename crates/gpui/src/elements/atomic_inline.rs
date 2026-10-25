@@ -1621,6 +1621,55 @@ mod tests {
         insets_of_a_box_in_an_atomic_inline(true);
     }
 
+    struct Growing(Rc<Cell<f32>>);
+
+    impl Render for Growing {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // The box around the child is as big as it was whatever the child is.
+            let element = div()
+                .w(crate::px(50.))
+                .h(crate::px(20.))
+                .child(div().w(crate::px(self.0.get())).h(crate::px(10.)));
+            div().child(
+                div()
+                    .w(crate::px(400.))
+                    .text_size(crate::px(20.))
+                    .line_height(crate::px(20.))
+                    .child(
+                        StyledText::new(format!("xx{OBJECT}"))
+                            .with_atomic_inlines(vec![AtomicInline::new(2, element.into_any_element())]),
+                    ),
+            )
+        }
+    }
+
+    /// The layout stamp of the window counts the boxes of the engine of an atomic inline too, so a
+    /// reading taken before a box inside the inline changed size is not good after it.
+    #[test]
+    fn a_box_laid_out_to_another_size_in_an_atomic_inline_moves_the_layout_stamp() {
+        let mut app = TestApp::with_text_system(Arc::new(FixedMetricsTextSystem::menlo()));
+        let width = Rc::new(Cell::new(10.));
+        let mut window = app.open_window({
+            let width = width.clone();
+            move |_, _| Growing(width)
+        });
+        window.draw();
+        window.draw();
+        let stamp = window.update(|_, window, _| window.layout_stamp());
+
+        window.draw();
+        assert_eq!(window.update(|_, window, _| window.layout_stamp()), stamp, "a frame that changes no box");
+
+        width.set(20.);
+        window.update(|_, window, _| window.request_tick());
+        window.draw();
+        assert_ne!(
+            window.update(|_, window, _| window.layout_stamp()),
+            stamp,
+            "the child of the inline grew, and nothing outside it did"
+        );
+    }
+
     struct Nested;
 
     impl Render for Nested {

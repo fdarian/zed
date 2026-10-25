@@ -598,6 +598,23 @@ impl TaffyLayoutEngine {
         self.taffy.box_generation()
     }
 
+    /// Changes whenever the node, or a node above it, is laid out to another box: where the node is
+    /// on the page. A box elsewhere in the engine, a sibling's subtree that leaves the node where
+    /// it was, does not change it. `None` for an id the engine no longer has a node for. See
+    /// [`taffy::TaffyTree::box_changed_at`].
+    pub(crate) fn box_stamp(&self, id: LayoutId) -> Option<u64> {
+        if !self.meta.contains_key(&id) {
+            return None;
+        }
+        let mut stamp = 0;
+        let mut node = Some(id.0);
+        while let Some(current) = node {
+            stamp = stamp.max(self.taffy.box_changed_at(current).expect(EXPECT_MESSAGE));
+            node = self.taffy.parent(current);
+        }
+        Some(stamp)
+    }
+
     /// Whether the node holds no layout result, which is the case for a node nothing laid out
     /// and for one under `display: none`.
     pub(crate) fn is_dirty(&self, id: LayoutId) -> bool {

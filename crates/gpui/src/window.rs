@@ -144,6 +144,20 @@ impl DispatchPhase {
 pub struct LayoutStamp {
     layout_invalidations: usize,
     boxes: u64,
+    nested_boxes: u64,
+}
+
+impl LayoutStamp {
+    /// Whether no layout invalidation came between the two stamps.
+    pub fn same_invalidations(&self, other: &Self) -> bool {
+        self.layout_invalidations == other.layout_invalidations
+    }
+
+    /// Whether no box of the window, a nested engine's included, moved or changed size between
+    /// the two stamps.
+    pub fn same_boxes(&self, other: &Self) -> bool {
+        self.boxes == other.boxes && self.nested_boxes == other.nested_boxes
+    }
 }
 
 struct WindowInvalidatorInner {
@@ -2032,6 +2046,9 @@ pub struct Window {
     /// The pass running is one that does not paint: see [`Window::draw_if_dirty`].
     layout_only: bool,
     layout_passes: u64,
+    /// How many boxes the nested layout engines (see `with_layout_engine`) were laid out to another
+    /// one of, which the window's engine does not count; it is in [`Self::layout_stamp`].
+    nested_box_changes: u64,
     /// A culled subtree is being prepainted: see [`Element::cull_outset`].
     culling: bool,
     /// The next element prepainted is the top of that subtree.
@@ -2779,6 +2796,7 @@ impl Window {
             measuring: false,
             layout_only: false,
             layout_passes: 0,
+            nested_box_changes: 0,
             culling: false,
             cull_root_next: false,
             every_glyph_painted: 0,
@@ -4728,12 +4746,30 @@ impl Window {
     /// An invalidation declared paint-only (see [`App::notify_paint_only`]) leaves the stamp, as
     /// it leaves the layout: it moves no box and no extent. So does a frame that draws it, and any
     /// other build that gives every node the box it had. A frame that moves a box without an
-    /// invalidation, as one that ticks an animation of a width does, moves it.
+    /// invalidation, as one that ticks an animation of a width does, moves it. The boxes of the
+    /// nested engines of the atomic inlines count, as the window's own do.
     pub fn layout_stamp(&self) -> LayoutStamp {
         LayoutStamp {
             layout_invalidations: self.invalidator.layout_invalidation_count(),
             boxes: self.layout_engine.as_ref().expect("the layout engine is out only while a pass runs").box_generation(),
+            nested_boxes: self.nested_box_changes,
         }
+    }
+
+    /// Where the layout node `id` of the window's engine is on the page, as a number that changes
+    /// when the node, or one above it, is laid out to another box and not when a box elsewhere
+    /// moves, or one inside the node. `None` for an id that the engine has freed the node of.
+    ///
+    /// A node of a nested engine (an atomic inline's) has no stamp: use [`LayoutStamp::same_boxes`].
+    /// Meant for the id a pass published, asked after the pass: see [`Self::is_window_layout_engine`].
+    pub fn box_stamp(&self, id: LayoutId) -> Option<u64> {
+        self.layout_engine.as_ref().expect("the layout engine is out only while a pass runs").box_stamp(id)
+    }
+
+    /// Whether the layout ids now asked for are the window's own, not those of the nested engine of
+    /// an atomic inline: only those have a [`Self::box_stamp`].
+    pub fn is_window_layout_engine(&self) -> bool {
+        self.borrowed_layout_engine.is_none()
     }
 
     /// Whether the pass being built is a layout-only one, whose frame is thrown away without
@@ -8259,7 +8295,14 @@ impl Window {
     ) -> R {
         let outer = std::mem::replace(&mut self.layout_engine, engine.borrow_mut().take());
         let outer_handle = self.borrowed_layout_engine.replace(engine.clone());
+        let boxes_before = self.layout_engine.as_ref().map(|engine| engine.box_generation());
         let result = f(self);
+        let boxes_after = self.layout_engine.as_ref().map(|engine| engine.box_generation());
+        if boxes_before != boxes_after {
+            // Counted here and not in the engine of the window, which `compute_layout` has taken out
+            // while the nested ones measure.
+            self.nested_box_changes += 1;
+        }
         self.borrowed_layout_engine = outer_handle;
         *engine.borrow_mut() = std::mem::replace(&mut self.layout_engine, outer);
         result
@@ -12585,6 +12628,78 @@ mod tests {
 
             cx.notify(id);
             assert_ne!(window.layout_stamp(), grown, "and a layout invalidation moves it again");
+        });
+    }
+
+    /// A node's stamp moves when the node, or one above it, is laid out to another box: a box
+    /// inside it, or in a subtree beside it that leaves it where it was, does not.
+    #[gpui::test]
+    fn test_the_box_stamp_of_a_node_moves_with_its_own_box_and_those_above_it(cx: &mut TestAppContext) {
+        struct Page {
+            sizes: Rc<[Cell<f32>; 5]>,
+            host: Rc<Cell<Option<crate::LayoutId>>>,
+        }
+        const TOP: usize = 0;
+        const BEFORE: usize = 1;
+        const HOST: usize = 2;
+        const INSIDE: usize = 3;
+        const AFTER: usize = 4;
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let size = |index: usize| px(self.sizes[index].get());
+                let host = self.host.clone();
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(div().w(px(100.)).h(size(TOP)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .h(px(40.))
+                            .child(div().flex_none().w(size(BEFORE)).h(px(20.)))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(size(HOST))
+                                    .h(px(30.))
+                                    .on_painted_layout(move |_, layout_id, _, _| host.set(Some(layout_id)))
+                                    .child(div().w(size(INSIDE)).h(px(10.))),
+                            )
+                            .child(div().flex_none().w(size(AFTER)).h(px(20.))),
+                    )
+            }
+        }
+        let sizes = Rc::new([20., 30., 60., 10., 25.].map(Cell::new));
+        let host = Rc::new(Cell::new(None));
+        let (view, cx) = cx.add_window_view({
+            let (sizes, host) = (sizes.clone(), host.clone());
+            |_, _| Page { sizes, host }
+        });
+        let _ = view;
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let host = host.get().expect("the host was painted");
+            let stamp = window.box_stamp(host).expect("the node is alive");
+            assert_ne!(stamp, 0, "its box was laid out");
+
+            let mut change = |window: &mut Window, index: usize, value: f32| {
+                sizes[index].set(value);
+                window.request_tick();
+                let _ = window.draw(cx);
+                window.box_stamp(host).expect("the node is alive")
+            };
+            assert_eq!(change(window, INSIDE, 20.), stamp, "a box inside it changed size");
+            assert_eq!(change(window, AFTER, 35.), stamp, "a box after it in its row changed size");
+            let moved = change(window, BEFORE, 40.);
+            assert_ne!(moved, stamp, "a box before it grew and moved it");
+            assert_eq!(change(window, AFTER, 15.), moved, "and the one after it still leaves it where it is");
+            let own = change(window, HOST, 70.);
+            assert_ne!(own, moved, "its own width");
+            let ancestor = change(window, TOP, 50.);
+            assert_ne!(ancestor, own, "the row above it moved down, a box that is not its own");
+            assert_eq!(change(window, TOP, 50.), ancestor, "and a layout that moves nothing leaves it");
         });
     }
 

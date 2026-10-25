@@ -249,6 +249,13 @@ struct NodeData {
     /// fdarian fork patch.
     pub(crate) layout_generation: u64,
 
+    /// The tree's `box_generation` right after the last time this node was laid out to another box (see
+    /// [`Layout::differs_box`]); 0 for a node that never was. A node's place on the page follows from its own box
+    /// and those of its ancestors, so the greatest of these along the path to the root says whether it has moved.
+    ///
+    /// fdarian fork patch.
+    pub(crate) box_changed_at: u64,
+
     /// The last epoch given to [`TaffyTree::mark_reached`].
     ///
     /// fdarian fork patch.
@@ -279,6 +286,7 @@ impl NodeData {
             cache: Cache::new(),
             dirty_generation: 0,
             layout_generation: 0,
+            box_changed_at: 0,
             reached: 0,
             saved_layout: None,
             pending_relayout: false,
@@ -747,6 +755,7 @@ where
         }
         if node.unrounded_layout.differs_box(layout) {
             taffy.box_generation += 1;
+            taffy.nodes[node_id.into()].box_changed_at = taffy.box_generation;
             // The nodes above it hold the box in what they reach: a box with no area is left out of
             // their content size, so a node whose content size is the same may hold it somewhere
             // else, and nothing else of theirs says so.
@@ -1561,6 +1570,17 @@ impl<NodeContext> TaffyTree<NodeContext> {
         self.box_generation
     }
 
+    /// The [`box_generation`](Self::box_generation) of the tree right after this node was last laid out to another
+    /// box, 0 if it never was. The greatest value over a node and its ancestors changes exactly when the node has
+    /// moved or changed size on the page; a change of a sibling's subtree that leaves the node where it was does not
+    /// reach it.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn box_changed_at(&self, node: NodeId) -> TaffyResult<u64> {
+        Ok(self.nodes[node.into()].box_changed_at)
+    }
+
     /// Indicates whether the layout of this node needs to be recomputed
     #[inline]
     pub fn dirty(&self, node: NodeId) -> TaffyResult<bool> {
@@ -2295,6 +2315,57 @@ mod tests {
         taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
         assert_eq!(taffy.layout(child).unwrap().location.x, 30.0, "the sibling grew and the child moved with no change of its own");
         assert!(taffy.box_generation() > first, "a box that only moved counts");
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn a_node_is_stamped_with_the_box_generation_of_its_last_box_change() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let fixed = |width: f32| Style {
+            size: Size { width: length(width), height: length(10.0) },
+            flex_shrink: 0.0,
+            ..Default::default()
+        };
+        let inner = taffy.new_leaf(fixed(20.0)).unwrap();
+        let before = taffy.new_with_children(Style { display: Display::Flex, ..fixed(50.0) }, &[inner]).unwrap();
+        let after = taffy.new_leaf(fixed(30.0)).unwrap();
+        let root_style = Style {
+            display: Display::Flex,
+            size: Size { width: length(400.0), height: length(100.0) },
+            ..Default::default()
+        };
+        let root = taffy.new_with_children(root_style, &[before, after]).unwrap();
+        assert_eq!(taffy.box_changed_at(after), Ok(0), "a node nothing laid out");
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let first = taffy.box_generation();
+        for node in [root, before, inner, after] {
+            assert!(taffy.box_changed_at(node).unwrap() <= first);
+        }
+
+        taffy.mark_dirty(root).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let stamps = [root, before, inner, after].map(|node| taffy.box_changed_at(node).unwrap());
+        taffy.mark_dirty(root).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert_eq!(
+            [root, before, inner, after].map(|node| taffy.box_changed_at(node).unwrap()),
+            stamps,
+            "a layout that gives every node the box it had stamps none"
+        );
+
+        taffy.set_style(inner, fixed(25.0)).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert_eq!(taffy.layout(after).unwrap().location.x, 50.0, "the box around the inner one is as wide as it was");
+        assert_eq!(taffy.box_changed_at(inner).unwrap(), taffy.box_generation(), "the inner box grew");
+        assert_eq!(taffy.box_changed_at(before), Ok(stamps[1]), "a box above it did not change");
+        assert_eq!(taffy.box_changed_at(after), Ok(stamps[3]), "nor did the one beside it");
+
+        let grown = taffy.box_generation();
+        taffy.set_style(before, fixed(70.0)).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert!(taffy.box_changed_at(before).unwrap() > grown, "this one grew");
+        assert_eq!(taffy.box_changed_at(after).unwrap(), taffy.box_generation(), "and the one beside it moved, the last change");
+        assert_eq!(taffy.box_changed_at(root), Ok(stamps[0]), "the root's box is the same");
     }
 
     // fdarian fork patch.
