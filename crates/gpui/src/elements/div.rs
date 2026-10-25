@@ -11953,6 +11953,35 @@ mod tests {
             );
         }
 
+        /// An `overflow: hidden` box with no height: its content mask has no area.
+        fn flat_clip() -> Stateful<Div> {
+            div().id("flat").w(px(CLIP)).h(px(0.)).overflow_hidden()
+        }
+
+        #[gpui::test]
+        fn a_mask_with_no_area_culls_every_child_even_the_ones_at_its_edge(cx: &mut TestAppContext) {
+            let window = open_scene(cx, |_| {
+                flat_clip().children(rows(5, &Seen::default(), Some(Edges::default()))).into_any_element()
+            });
+            // Row 0 starts on the edge of the mask, which a 1 px slack used to count as touching.
+            assert_eq!(culled(&window, cx), 5);
+            assert_eq!(quads(&window, cx), 0);
+        }
+
+        #[gpui::test]
+        fn a_mask_with_no_width_culls_too(cx: &mut TestAppContext) {
+            let window = open_scene(cx, |_| {
+                div()
+                    .id("narrow")
+                    .w(px(0.))
+                    .h(px(CLIP))
+                    .overflow_hidden()
+                    .children(rows(3, &Seen::default(), Some(Edges::default())))
+                    .into_any_element()
+            });
+            assert_eq!(culled(&window, cx), 3);
+        }
+
         #[gpui::test]
         fn a_child_scrolled_into_view_is_painted_again(cx: &mut TestAppContext) {
             let handle = ScrollHandle::new();

@@ -4635,6 +4635,10 @@ impl Window {
     /// outside the content mask for good: its box and the scrollable overflow of what is below
     /// it, inflated by `outset` (and a pixel, for snapping), do not touch the mask.
     ///
+    /// A mask with no area is touched by nothing. Content that escapes the mask is not held to it:
+    /// a subtree with a box placed outside what [`TaffyLayoutEngine::painted_extent`] can say is
+    /// never outside.
+    ///
     /// Not while the pointer is captured by an element, which has to keep its hitbox. An
     /// accessibility tree does not stop it: a culled subtree still pushes its nodes, as clipped
     /// content stays in the tree.
@@ -4669,8 +4673,12 @@ impl Window {
             );
             Bounds::from_corners(origin, far)
         };
+        // A mask with no area hides everything, whatever touches its edge: a box wholly below an
+        // `overflow: hidden` clip has the clip's mask cut down to a line at its top edge.
+        let mask_is_empty = mask.size.width <= px(0.) || mask.size.height <= px(0.);
         let apart = |reach: Bounds<Pixels>| {
-            reach.right() < mask.left()
+            mask_is_empty
+                || reach.right() < mask.left()
                 || reach.left() > mask.right()
                 || reach.bottom() < mask.top()
                 || reach.top() > mask.bottom()
