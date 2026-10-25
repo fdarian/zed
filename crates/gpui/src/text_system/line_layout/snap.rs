@@ -15,10 +15,20 @@
 //! a kern stands `k - (k >> 1)` earlier than where CoreText puts it. Only the measure moves. A pair
 //! across the edge of two items is kerned all the same, so the item before it ends that earlier and
 //! the item after it is that much wider.
+//!
+//! Blink adds up integers. Skia hands HarfBuzz the advance of a glyph as an `f32` number of device
+//! pixels, which Blink cuts toward zero to a multiple of 1/65536 (`SkiaScalarToHarfBuzzPosition`),
+//! HarfBuzz adds a kern as a whole number of the same units, and `InlineLayoutUnit` sums them in
+//! 16.16 fixed point. So a sum of many advances is a little short of the exact one, and a line that
+//! exact arithmetic puts a hair over a layout unit can be under it there. [`SnapMarks`] measures
+//! as that sum does, from the advances of the glyphs and the kerns between them, and not from where
+//! CoreText puts the glyphs, which the glyphs are painted at and which carry the noise of an `f32`
+//! (and the next float up of the font size that keeps CoreText from forming ligatures).
 
 use super::{LineLayout, LineLayoutCache};
 use super::ShapedRun;
 use crate::{FontId, FontRun, GlyphId, Pixels, px, util::{LAYOUT_UNIT, ceil_layout_units}};
+use collections::FxHashMap;
 use gpui_util::ResultExt as _;
 use smallvec::SmallVec;
 use std::ops::Range;
@@ -63,6 +73,31 @@ pub struct SnapMarks {
     /// The glyphs that follow a soft hyphen, with the hyphen Blink adds to a line that breaks
     /// before one. Ascending by glyph.
     hyphens: Vec<(usize, Hyphen)>,
+    /// Blink's sum of the advances before every glyph and then before the end of the line, in 1/65536
+    /// of a device pixel, with the CoreText positions the glyphs were shaped at. Empty for a line
+    /// measured by its positions.
+    measure: Measure,
+}
+
+/// See [`SnapMarks::measure`].
+#[derive(Clone, Debug, Default)]
+struct Measure {
+    sums: Vec<i64>,
+    x: Vec<Pixels>,
+}
+
+/// The unit Blink's advances are whole numbers of, a 65536th of a device pixel.
+const FIXED_POINT_ONE: f64 = 65536.;
+
+/// `x`, a position in logical pixels, in 1/65536 of a device pixel.
+fn fixed_point(x: Pixels, scale_factor: f32) -> i64 {
+    (f64::from(x.0) * f64::from(scale_factor) * FIXED_POINT_ONE).round() as i64
+}
+
+/// A width of `fixed_point` 65536ths of a device pixel in layout units, rounded up: the float Blink
+/// makes of the sum (`FixedPoint::ToFloat`), taken up to a unit (`LayoutUnit::FromFloatCeil`).
+fn ceil_fixed_point(fixed_point: i64) -> i64 {
+    ((fixed_point as f32 / 65536.) * 64.).ceil() as i64
 }
 
 impl SnapMarks {
@@ -76,6 +111,23 @@ impl SnapMarks {
                 - self.position_units(x, scale_factor, item, glyph);
         });
         Pixels(units as f32 * LAYOUT_UNIT / scale_factor)
+    }
+
+    /// Where glyph `glyph`, which is at `x`, is in the sum of Blink's advances before it, in 1/65536
+    /// of a device pixel, less the share of a kern that is not in the advance before it.
+    fn measured(&self, x: Pixels, scale_factor: f32, glyph: usize) -> i64 {
+        self.sum(x, scale_factor, glyph) - fixed_point(self.kern_share(glyph), scale_factor)
+    }
+
+    /// Blink's sum of the advances before glyph `glyph`, which is at `x`: the sum it was shaped
+    /// with, moved as `x` is from where the glyph was shaped (by the tab stops and the insets before
+    /// it). The sum is not made again from `x`: a position that is a hair off, as one is that was
+    /// moved to the origin of a row, would turn a width that is a whole unit into the next one.
+    fn sum(&self, x: Pixels, scale_factor: f32, glyph: usize) -> i64 {
+        match (self.measure.sums.get(glyph), self.measure.x.get(glyph)) {
+            (Some(sum), Some(shaped)) => sum + fixed_point(x - *shaped, scale_factor),
+            _ => fixed_point(x, scale_factor),
+        }
     }
 
     /// How wide the glyphs `from..to` are to the line breaker, in layout units: the sum over the
@@ -95,10 +147,14 @@ impl SnapMarks {
     ) -> i64 {
         let mut units = 0;
         self.for_each_piece(glyph_count, from, to, |_, glyph, stop| {
-            let measured = |glyph: usize| x(glyph) - self.kern_share(glyph);
+            let measured = |glyph: usize| self.measured(x(glyph), scale_factor, glyph);
             // Blink shapes the line again from its first glyph, which then follows no kern.
-            let start = if glyph == from { x(glyph) } else { measured(glyph) };
-            units += ceil_layout_units((measured(stop) - start).0, scale_factor);
+            let start = if glyph == from {
+                self.sum(x(glyph), scale_factor, glyph)
+            } else {
+                measured(glyph)
+            };
+            units += ceil_fixed_point(measured(stop) - start);
         });
         units
     }
@@ -132,8 +188,9 @@ impl SnapMarks {
     /// at an edge between two items goes: the glyph after it is measured without it, so the item
     /// before ends that much earlier and the item it starts is that much wider.
     fn position_units(&self, x: &[Pixels], scale_factor: f32, item: Range<usize>, glyph: usize) -> i64 {
-        let measured = |glyph: usize| x[glyph] - self.kern_share(glyph);
-        ceil_layout_units((measured(glyph) - measured(item.start)).0, scale_factor)
+        ceil_fixed_point(
+            self.measured(x[glyph], scale_factor, glyph) - self.measured(x[item.start], scale_factor, item.start),
+        )
     }
 
     /// The hyphen a line gets when it breaks before `glyph`, or `None` if `glyph` does not
@@ -156,6 +213,56 @@ impl SnapMarks {
             Err(_) => Pixels::ZERO,
         }
     }
+}
+
+/// What the platform knows of one glyph, in device pixels, for [`measure_sums`].
+#[derive(Clone, Copy, Debug)]
+struct DeviceAdvance {
+    /// The advance of the glyph on its own, `None` if the platform could not say.
+    nominal: Option<f64>,
+    /// The size of a font unit (a kern is a whole number of them).
+    font_unit: f64,
+}
+
+/// The advance Blink has for a glyph whose own advance is `nominal` device pixels: Skia's `f32`, cut
+/// toward zero to a 65536th, in 65536ths.
+fn skia_advance(nominal: f64) -> i64 {
+    (f64::from(nominal as f32) * FIXED_POINT_ONE).trunc() as i64
+}
+
+/// The kern HarfBuzz adds to the advance of a glyph, in 65536ths of a device pixel, from the
+/// `kern` device pixels that CoreText puts between the glyph and the next beyond the advance. A
+/// kern of a font is mostly a whole number of font units, which `kern` is a hair off (the positions
+/// are `f32`), so it is taken to the unit it is within that hair of. Under the hair it is not a kern
+/// but the noise of the positions.
+fn kern_advance(kern: f64, font_unit: f64) -> i64 {
+    const NOISE: f64 = 2e-4;
+    if kern.abs() < NOISE {
+        return 0;
+    }
+    let whole = (kern / font_unit).round() * font_unit;
+    let kern = if (kern - whole).abs() < NOISE { whole } else { kern };
+    (kern * FIXED_POINT_ONE).round() as i64
+}
+
+/// Blink's sum of the advances before every glyph of a line and then before its end, in 65536ths
+/// of a device pixel at `scale_factor`. The advance of a glyph is its own advance, cut as Skia hands
+/// it to HarfBuzz, and the kern between it and the next glyph, which is what is left of the distance
+/// between them in `x`, where CoreText puts the glyphs (logical pixels, one more than there are
+/// glyphs). `glyphs` has one entry for each glyph.
+fn measure_sums(x: &[Pixels], glyphs: impl IntoIterator<Item = DeviceAdvance>, scale_factor: f32) -> Vec<i64> {
+    let scale = f64::from(scale_factor);
+    let mut sums = vec![0];
+    let mut sum = 0;
+    for (ix, glyph) in glyphs.into_iter().enumerate() {
+        let shaped = (f64::from(x[ix + 1].0) - f64::from(x[ix].0)) * scale;
+        sum += match glyph.nominal {
+            Some(nominal) => skia_advance(nominal) + kern_advance(shaped - nominal, glyph.font_unit),
+            None => skia_advance(shaped),
+        };
+        sums.push(sum);
+    }
+    sums
 }
 
 /// The x of every glyph of `layout`, and then of its end.
@@ -202,6 +309,36 @@ impl LineLayoutCache {
             item_starts,
             kern_shares: self.kern_shares(shaped),
             hyphens: self.hyphens(shaped, text),
+            measure: self.measure(shaped),
+        }
+    }
+
+    /// [`SnapMarks::measure`] of `shaped`.
+    fn measure(&self, shaped: &LineLayout) -> Measure {
+        let x = glyph_positions(shaped);
+        let scale = f64::from(shaped.scale_factor);
+        // A line has few distinct glyphs and a call for each is a platform call.
+        let mut advances: FxHashMap<(FontId, GlyphId, u32), Option<f64>> = FxHashMap::default();
+        let mut glyphs = Vec::with_capacity(x.len() - 1);
+        for run in &shaped.runs {
+            let units_per_em = f64::from(self.platform_text_system.font_metrics(run.font_id).units_per_em);
+            let font_unit = f64::from(run.font_size.0) / units_per_em * scale;
+            for glyph in &run.glyphs {
+                let key = (run.font_id, glyph.id, run.font_size.0.to_bits());
+                let nominal = *advances.entry(key).or_insert_with(|| {
+                    self.platform_text_system
+                        .glyph_advance(run.font_id, glyph.id, run.font_size)
+                        .log_err()
+                });
+                glyphs.push(DeviceAdvance {
+                    nominal: nominal.map(|nominal| nominal * scale),
+                    font_unit,
+                });
+            }
+        }
+        Measure {
+            sums: measure_sums(&x, glyphs, shaped.scale_factor),
+            x,
         }
     }
 
@@ -255,25 +392,23 @@ impl LineLayoutCache {
     /// glyph before it, which is what Chrome measures a glyph after the kern without.
     fn kern_shares(&self, shaped: &LineLayout) -> Vec<(usize, Pixels)> {
         let scale_factor = shaped.scale_factor;
+        let scale = f64::from(scale_factor);
         let mut shares = Vec::new();
         let mut glyph_ix = 0;
         for run in &shaped.runs {
             let metrics = self.platform_text_system.font_metrics(run.font_id);
             if metrics.legacy_kerning {
+                let font_unit = f64::from(run.font_size.0) / f64::from(metrics.units_per_em) * scale;
                 for (pair_ix, pair) in run.glyphs.windows(2).enumerate() {
-                    let Some(advance) = self
+                    let Some(nominal) = self
                         .platform_text_system
-                        .advance(run.font_id, pair[0].id)
+                        .glyph_advance(run.font_id, pair[0].id, run.font_size)
                         .log_err()
                     else {
                         continue;
                     };
-                    let nominal = advance.width / metrics.units_per_em as f32 * f32::from(run.font_size);
-                    // HarfBuzz's kern is a whole number of 1/65536 of a device pixel.
-                    let kern = ((f32::from(pair[1].position.x - pair[0].position.x) - nominal)
-                        * scale_factor
-                        * 65536.)
-                        .round() as i64;
+                    let kern = (f64::from(pair[1].position.x.0) - f64::from(pair[0].position.x.0) - nominal) * scale;
+                    let kern = kern_advance(kern, font_unit);
                     if kern != 0 {
                         let share = kern - (kern >> 1);
                         shares.push((
@@ -303,6 +438,7 @@ mod tests {
             item_starts: item_starts.iter().copied().collect(),
             kern_shares: kern_shares.iter().map(|(ix, share)| (*ix, px(*share))).collect(),
             hyphens: Vec::new(),
+            measure: Measure::default(),
         }
     }
 
@@ -451,5 +587,79 @@ mod tests {
         // At scale 2 an item 0.3 device pixels wide is 20 units of a device pixel, and 10/64 of a pixel.
         let width = SnapMarks::default().width(&x(&[0., 0.15]), 2., 0, 1);
         assert_eq!(width, px(20. * UNIT / 2.));
+    }
+
+    /// `count` glyphs of `advance` device pixels each at `scale_factor` that CoreText sums up, and
+    /// the marks of Blink's sum of them, with `kerns` (device pixels) after the glyphs they are
+    /// beside.
+    fn run_of(count: usize, advance: f64, scale_factor: f32, kerns: &[(usize, f64)]) -> (Vec<Pixels>, SnapMarks) {
+        let scale = f64::from(scale_factor);
+        let kern_after = |ix: usize| kerns.iter().find(|(kerned, _)| *kerned == ix).map_or(0., |(_, kern)| *kern);
+        let mut device = 0.;
+        let mut positions = vec![px(0.)];
+        for ix in 0..count {
+            device += advance + kern_after(ix);
+            positions.push(px((device / scale) as f32));
+        }
+        let glyph = DeviceAdvance { nominal: Some(advance), font_unit: 1. / 64. };
+        let sums = measure_sums(&positions, vec![glyph; count], scale_factor);
+        let measure = Measure { sums, x: positions.clone() };
+        (positions, SnapMarks { measure, ..SnapMarks::default() })
+    }
+
+    #[test]
+    fn test_an_advance_is_cut_to_a_65536th_of_a_device_pixel_before_it_is_summed() {
+        // 20 glyphs of 0.5 + 0.9/65536 add up to 10 + 18/65536 = 10.00027: a hair over 640 units,
+        // which is the next unit when the sum is the exact one. Each advance cut to 0.5 makes the
+        // sum 10 exactly, which fits 640 units.
+        for scale_factor in [1., 2.] {
+            let (positions, cut) = run_of(20, 0.5 + 0.9 / 65536., scale_factor, &[]);
+            let fit_units = |marks: &SnapMarks| {
+                marks.fit_units(|glyph| positions[glyph], 20, scale_factor, 0, 20)
+            };
+            assert_eq!(fit_units(&SnapMarks::default()), 641, "exact at {scale_factor}");
+            assert_eq!(fit_units(&cut), 640, "cut at {scale_factor}");
+            assert_eq!(
+                cut.width(&positions, scale_factor, 0, 20),
+                px(640. * UNIT / scale_factor),
+                "width at {scale_factor}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_advance_is_cut_as_an_f32() {
+        // 9 - 0.02/65536 is within half an f32 step of 9, which is the f32 Skia has, so it is not
+        // cut to 9 - 1/65536: 20 of them are 180 and not 180 - 20/65536.
+        let (positions, cut) = run_of(20, 9. - 0.02 / 65536., 1., &[]);
+        assert_eq!(cut.fit_units(|glyph| positions[glyph], 20, 1., 0, 20), 180 * 64);
+        assert_eq!(cut.measure.sums[20], 20 * 9 * 65536);
+    }
+
+    #[test]
+    fn test_a_kern_is_added_whole_and_a_hair_off_is_noise() {
+        // Glyph 3 follows a kern of 3 font units (3/64) and glyph 5 a hair of noise, the width of
+        // the f32 of a position: the units of Blink's sum are the advances and the 3 units.
+        let (positions, marks) = run_of(8, 0.5 + 0.9 / 65536., 1., &[(2, 3. / 64. + 1e-5), (4, 1e-5)]);
+        assert_eq!(marks.measure.sums[8], 8 * 32768 + 3 * 1024);
+        assert_eq!(marks.measured(positions[8], 1., 8), 8 * 32768 + 3 * 1024);
+    }
+
+    #[test]
+    fn test_a_position_a_hair_off_does_not_move_the_sum() {
+        // 5 glyphs of 19.265625 device pixels (Menlo at 16 px, scale 2) are 6165 units exactly. A
+        // position that was moved by a hair of an f32 is still the sum it was shaped with.
+        let (positions, marks) = run_of(10, 19.265625, 2., &[]);
+        let moved = |glyph: usize| positions[glyph] + px(1e-6 * (glyph % 3) as f32);
+        assert_eq!(marks.fit_units(|glyph| positions[glyph], 10, 2., 5, 10), 6165);
+        assert_eq!(marks.fit_units(moved, 10, 2., 5, 10), 6165);
+        assert_eq!(marks.fit_units(|glyph| positions[glyph] - px(30.), 10, 2., 5, 10), 6165);
+    }
+
+    #[test]
+    fn test_the_shaped_advance_is_cut_when_the_nominal_is_not_known() {
+        let positions = vec![px(0.), px(0.5 + 0.9 / 65536.)];
+        let sums = measure_sums(&positions, [DeviceAdvance { nominal: None, font_unit: 1. / 64. }], 1.);
+        assert_eq!(sums, [0, 32768]);
     }
 }

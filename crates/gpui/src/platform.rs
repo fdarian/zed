@@ -1153,6 +1153,14 @@ pub trait PlatformTextSystem: Send + Sync {
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
     /// Get the advance width for a glyph.
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;
+    /// The advance of a glyph on its own in a font of `font_size` logical pixels, as exactly as the
+    /// platform has it: an `f64`, not the `f32` of font units that [`Self::advance`] gives, which
+    /// is rounded twice on its way. What Chrome measures is that number cut to an `f32` of device
+    /// pixels, so the roundings of the `f32` of font units would move the cut.
+    fn glyph_advance(&self, font_id: FontId, glyph_id: GlyphId, font_size: Pixels) -> Result<f64> {
+        let units_per_em = f64::from(self.font_metrics(font_id).units_per_em);
+        Ok(f64::from(self.advance(font_id, glyph_id)?.width) / units_per_em * f64::from(font_size.0))
+    }
     /// Get the glyph ID for a character.
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId>;
     /// Get raster bounds for a glyph.

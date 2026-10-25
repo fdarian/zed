@@ -14,14 +14,14 @@ use core_graphics::{
     color_space::CGColorSpace,
     context::{CGContext, CGTextDrawingMode},
     display::CGPoint,
-    geometry::CGAffineTransform,
+    geometry::{CGAffineTransform, CGSize},
 };
 use core_text::{
     font::CTFont,
     font_collection::CTFontCollectionRef,
     font_descriptor::{
-        CTFontDescriptor, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
-        kCTFontWidthTrait,
+        CTFontDescriptor, kCTFontOrientationDefault, kCTFontSlantTrait, kCTFontSymbolicTrait,
+        kCTFontWeightTrait, kCTFontWidthTrait,
     },
     line::CTLine,
     string_attributes::kCTFontAttributeName,
@@ -221,6 +221,10 @@ impl PlatformTextSystem for MacTextSystem {
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
         self.0.read().advance(font_id, glyph_id)
+    }
+
+    fn glyph_advance(&self, font_id: FontId, glyph_id: GlyphId, font_size: Pixels) -> Result<f64> {
+        self.0.read().glyph_advance(font_id, glyph_id, font_size)
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
@@ -616,6 +620,21 @@ impl MacTextSystemState {
         Ok(size_from_vector2f(
             self.fonts[font_id.0].advance(glyph_id.0)?,
         ))
+    }
+
+    fn glyph_advance(&self, font_id: FontId, glyph_id: GlyphId, font_size: Pixels) -> Result<f64> {
+        let font = self.sized_font(font_id, f32::from(font_size));
+        let mut advance = CGSize::new(0., 0.);
+        // SAFETY: one glyph in, one advance out.
+        unsafe {
+            font.get_advances_for_glyphs(
+                kCTFontOrientationDefault,
+                &(glyph_id.0 as u16),
+                &mut advance,
+                1,
+            );
+        }
+        Ok(advance.width)
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
