@@ -7647,12 +7647,17 @@ impl Window {
                     transformation: TransformationMatrix::unit(),
                 });
             } else {
+                let subpixel_padding = |variant: u8| DevicePixels(i32::from(variant > 0));
                 let glyph = PendingGlyph {
-                    params,
                     bounds: Bounds {
                         origin: integer_origin + raster_bounds.origin.map(Into::into),
-                        size: raster_bounds.size.map(Into::into),
+                        size: size(
+                            raster_bounds.size.width + subpixel_padding(params.subpixel_variant.x),
+                            raster_bounds.size.height + subpixel_padding(params.subpixel_variant.y),
+                        )
+                        .map(Into::into),
                     },
+                    params,
                     content_mask,
                     color: color.opacity(element_opacity),
                     opacity: 1.,

@@ -2300,7 +2300,9 @@ pub struct MonochromeSprite {
 #[derive(Clone, Debug)]
 pub(crate) struct PendingGlyph {
     pub params: RenderGlyphParams,
-    /// The origin of the sprite and the size of the glyph's raster bounds.
+    /// The origin of the sprite and the most it can cover: the raster bounds of the glyph, and the
+    /// pixel the rasterizer adds to its tile at a subpixel position. The sprite is as large as the
+    /// tile it gets, so a glyph clipped away by these bounds has a sprite that is.
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     /// The color of a monochrome glyph, with the opacity of its element.
@@ -2329,14 +2331,14 @@ impl PendingGlyph {
 
     /// The sprite of the glyph, whose tile is `tile`.
     pub(crate) fn sprite(&self, tile: AtlasTile) -> Primitive {
-        debug_assert_eq!(
-            tile.bounds.size.map(Into::into),
-            self.bounds.size,
-            "the tile of a glyph is as large as its raster bounds"
+        let size: Size<ScaledPixels> = tile.bounds.size.map(Into::into);
+        debug_assert!(
+            size.width <= self.bounds.size.width && size.height <= self.bounds.size.height,
+            "the tile of a glyph is no larger than the bounds its sprite was held to"
         );
         let bounds = Bounds {
             origin: self.bounds.origin,
-            size: tile.bounds.size.map(Into::into),
+            size,
         };
         if self.params.is_emoji {
             Primitive::PolychromeSprite(PolychromeSprite {
