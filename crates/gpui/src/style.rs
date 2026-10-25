@@ -946,6 +946,7 @@ impl TextStyle {
             overflow_wrap: self.overflow_wrap,
             text_wrap_style: self.text_wrap_style,
             nowrap: self.white_space == WhiteSpace::Nowrap,
+            min_content: false,
         }
     }
 

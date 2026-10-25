@@ -73,10 +73,27 @@ pub struct SnapMarks {
     /// The glyphs that follow a soft hyphen, with the hyphen Blink adds to a line that breaks
     /// before one. Ascending by glyph.
     hyphens: Vec<(usize, Hyphen)>,
+    /// The glyphs a line can end before, between two kerned letters, with how Blink's reshaping of
+    /// the end of the line changes it. Ascending by glyph. Empty for a line that fits whole, for
+    /// the min-content of a text, and until [`Self::with_end_reshapes`].
+    end_reshapes: Vec<(usize, EndReshape)>,
     /// Blink's sum of the advances before every glyph and then before the end of the line, in 1/65536
     /// of a device pixel, with the CoreText positions the glyphs were shaped at. Empty for a line
     /// measured by its positions.
     measure: Measure,
+}
+
+/// What Blink does to a line that ends before a glyph, between it and a letter that kerns with it
+/// (`ShapingLineBreaker::ShapeLine`): the boundary is not safe to break at, so the glyph before it
+/// is shaped again with nothing after it, and loses the kern, or the contextual form, that it had.
+/// A boundary that is not safe is also an entry here when nothing of the width is lost, as it
+/// decides how far back the shaping starts again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct EndReshape {
+    /// How much narrower the line is for it, in 1/65536 of a device pixel: the advance the glyph
+    /// has in the text, with the kern it takes, less its advance on its own. Under zero when the
+    /// kern was a tightening.
+    loss: i64,
 }
 
 /// See [`SnapMarks::measure`].
@@ -100,15 +117,35 @@ fn ceil_fixed_point(fixed_point: i64) -> i64 {
     ((fixed_point as f32 / 65536.) * 64.).ceil() as i64
 }
 
+#[cfg(test)]
+impl SnapMarks {
+    /// Marks of a line shaped at one device pixel to a pixel whose line ends before each glyph of
+    /// `ends` are reshaped: how much `loss` that
+    /// takes off the width of the line, in pixels.
+    pub(super) fn reshaped_at(ends: &[(usize, f32)]) -> Self {
+        let fixed = |pixels: f32| (f64::from(pixels) * FIXED_POINT_ONE).round() as i64;
+        Self {
+            end_reshapes: ends
+                .iter()
+                .map(|(glyph, loss)| (*glyph, EndReshape { loss: fixed(*loss) }))
+                .collect(),
+            ..Self::default()
+        }
+    }
+}
+
 impl SnapMarks {
     /// Chrome's width of the glyphs `from..to` of a line whose glyph `i` starts at `x[i]` and
     /// whose end is at the last of `x`, at `scale_factor` device pixels to a pixel: a multiple of a
-    /// layout unit, which is 1/64 of a device pixel.
+    /// layout unit, which is 1/64 of a device pixel. A line that ends between two kerned letters is
+    /// as wide as it is with the last one shaped again ([`EndReshape`]).
     pub(super) fn width(&self, x: &[Pixels], scale_factor: f32, from: usize, to: usize) -> Pixels {
+        let at = |glyph: usize| x[glyph];
         let mut units = 0;
         self.for_each_piece(x.len() - 1, from, to, |item, glyph, stop| {
-            units += self.position_units(x, scale_factor, item.clone(), stop)
-                - self.position_units(x, scale_factor, item, glyph);
+            let reshaped = self.end_reshape(stop).filter(|_| stop == to).map_or(0, |reshape| reshape.loss);
+            units += self.position_units(&at, scale_factor, item.clone(), stop, reshaped)
+                - self.position_units(&at, scale_factor, item, glyph, 0);
         });
         Pixels(units as f32 * LAYOUT_UNIT / scale_factor)
     }
@@ -136,7 +173,8 @@ impl SnapMarks {
     /// [`Self::width`], which is the width the line is reported to have: the break is decided on
     /// the piece from where it starts on the line, the width of the line is the difference of two
     /// ceils from the start of the item. `x(i)` is the x of glyph `i`, and of the end of the line
-    /// at `glyph_count`, and `from` is where the line starts.
+    /// at `glyph_count`, and `from` is where the line starts. The end of the line is not shaped
+    /// again, which is the width Blink's `ShapingLineBreaker` starts from; see [`Self::fits`].
     pub(in crate::text_system) fn fit_units(
         &self,
         x: impl Fn(usize) -> Pixels,
@@ -147,16 +185,73 @@ impl SnapMarks {
     ) -> i64 {
         let mut units = 0;
         self.for_each_piece(glyph_count, from, to, |_, glyph, stop| {
-            let measured = |glyph: usize| self.measured(x(glyph), scale_factor, glyph);
-            // Blink shapes the line again from its first glyph, which then follows no kern.
-            let start = if glyph == from {
-                self.sum(x(glyph), scale_factor, glyph)
-            } else {
-                measured(glyph)
-            };
-            units += ceil_fixed_point(measured(stop) - start);
+            units += self.piece_units(&x, scale_factor, from, glyph, stop, 0);
         });
         units
+    }
+
+    /// [`Self::fit_units`] of a piece of an item from its glyph `glyph` to `stop`, on a line that
+    /// starts at `from`, with the end of it `reshaped` 65536ths of a device pixel narrower.
+    fn piece_units(
+        &self,
+        x: &impl Fn(usize) -> Pixels,
+        scale_factor: f32,
+        from: usize,
+        glyph: usize,
+        stop: usize,
+        reshaped: i64,
+    ) -> i64 {
+        let measured = |glyph: usize| self.measured(x(glyph), scale_factor, glyph);
+        // Blink shapes the line again from its first glyph, which then follows no kern.
+        let start = if glyph == from {
+            self.sum(x(glyph), scale_factor, glyph)
+        } else {
+            measured(glyph)
+        };
+        ceil_fixed_point(measured(stop) - reshaped - start)
+    }
+
+    /// Whether the glyphs `from..to` fit in `fit` layout units as a line that ends before `to`, the
+    /// way Blink's `ShapingLineBreaker` finds out: the line is as wide as it is with its last
+    /// glyph shaped again without what follows it, if that glyph is kerned with the next
+    /// ([`EndReshape`]). What is shaped again starts at the last boundary that is safe to break
+    /// at, the start of the run of kerned pairs the line ends in, and must have room, after that
+    /// boundary at the ceiled position it has, in the width the line has been given
+    /// (`shaping_line_breaker.cc` `ShapeLine`). The reshaped end is a part of the width of the
+    /// line, so a kern that was a tightening makes it wider.
+    pub(in crate::text_system) fn fits(
+        &self,
+        x: impl Fn(usize) -> Pixels,
+        glyph_count: usize,
+        scale_factor: f32,
+        from: usize,
+        to: usize,
+        fit: i64,
+    ) -> bool {
+        let mut units = 0;
+        let mut has_room = true;
+        self.for_each_piece(glyph_count, from, to, |item, glyph, stop| {
+            let end = self.end_reshape(stop).filter(|_| stop == to);
+            if let Some(end) = end {
+                let mut safe = stop - 1;
+                while safe > glyph && self.end_reshape(safe).is_some() {
+                    safe -= 1;
+                }
+                // Positions are those of the glyphs in the item, from its first glyph.
+                let before = self.position_units(&x, scale_factor, item.clone(), safe, 0)
+                    - self.position_units(&x, scale_factor, item, glyph, 0);
+                let shaped_again = self.measured(x(stop), scale_factor, stop)
+                    - end.loss
+                    - if safe == from {
+                        self.sum(x(safe), scale_factor, safe)
+                    } else {
+                        self.measured(x(safe), scale_factor, safe)
+                    };
+                has_room = shaped_again * 64 <= (fit - units - before) * FIXED_POINT_ONE as i64;
+            }
+            units += self.piece_units(&x, scale_factor, from, glyph, stop, end.map_or(0, |end| end.loss));
+        });
+        has_room && units <= fit
     }
 
     /// Calls `piece` with each item the glyphs `from..to` are in, the first glyph of the part of it
@@ -183,14 +278,30 @@ impl SnapMarks {
         }
     }
 
-    /// How far glyph `glyph` is from the start of `item`, in layout units rounded up. Both are
-    /// measured from the advances of the glyphs before them, which is where the share of a kern
-    /// at an edge between two items goes: the glyph after it is measured without it, so the item
-    /// before ends that much earlier and the item it starts is that much wider.
-    fn position_units(&self, x: &[Pixels], scale_factor: f32, item: Range<usize>, glyph: usize) -> i64 {
+    /// How far glyph `glyph` is from the start of `item`, in layout units rounded up, with
+    /// `reshaped` 65536ths of a device pixel taken off. Both are measured from the advances of the
+    /// glyphs before them, which is where the share of a kern at an edge between two items goes:
+    /// the glyph after it is measured without it, so the item before ends that much earlier and
+    /// the item it starts is that much wider.
+    fn position_units(
+        &self,
+        x: &impl Fn(usize) -> Pixels,
+        scale_factor: f32,
+        item: Range<usize>,
+        glyph: usize,
+        reshaped: i64,
+    ) -> i64 {
         ceil_fixed_point(
-            self.measured(x[glyph], scale_factor, glyph) - self.measured(x[item.start], scale_factor, item.start),
+            self.measured(x(glyph), scale_factor, glyph)
+                - reshaped
+                - self.measured(x(item.start), scale_factor, item.start),
         )
+    }
+
+    /// What Blink does to a line that ends before `glyph`, if that is between two kerned letters.
+    pub(super) fn end_reshape(&self, glyph: usize) -> Option<&EndReshape> {
+        let ix = self.end_reshapes.binary_search_by_key(&glyph, |(ix, _)| *ix).ok()?;
+        Some(&self.end_reshapes[ix].1)
     }
 
     /// The hyphen a line gets when it breaks before `glyph`, or `None` if `glyph` does not
@@ -265,6 +376,22 @@ fn measure_sums(x: &[Pixels], glyphs: impl IntoIterator<Item = DeviceAdvance>, s
     sums
 }
 
+/// Whether `character` is set in a CJK font: kana, bopomofo, Han ideographs, Hangul and the
+/// punctuation and forms that go with them.
+fn is_east_asian(character: char) -> bool {
+    matches!(
+        character,
+        '\u{1100}'..='\u{11FF}'
+            | '\u{2E80}'..='\u{9FFF}'
+            | '\u{A960}'..='\u{A97F}'
+            | '\u{AC00}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE30}'..='\u{FE4F}'
+            | '\u{FF00}'..='\u{FFEF}'
+            | '\u{20000}'..='\u{3FFFF}'
+    )
+}
+
 /// The x of every glyph of `layout`, and then of its end.
 pub(super) fn glyph_positions(layout: &LineLayout) -> Vec<Pixels> {
     layout
@@ -309,8 +436,126 @@ impl LineLayoutCache {
             item_starts,
             kern_shares: self.kern_shares(shaped),
             hyphens: self.hyphens(shaped, text),
+            end_reshapes: Vec::new(),
             measure: self.measure(shaped),
         }
+    }
+
+    /// `marks` of `shaped`, which is wrapped to `fit` layout units, with the line ends Blink would
+    /// reshape. They take a platform call for each distinct letter of the line, so a line that
+    /// fits whole, and is never cut, goes without; a text laid out for its min-content width goes
+    /// without too, which Blink measures from the positions of its glyphs
+    /// (`LineBreaker::HandleTextForFastMinContent`). `moved` is whether tab stops or insets move the
+    /// glyphs of `shaped`, which then may be wider than they are shaped.
+    pub(super) fn with_end_reshapes(
+        &self,
+        mut marks: SnapMarks,
+        shaped: &LineLayout,
+        text: &str,
+        fit: i64,
+        moved: bool,
+    ) -> SnapMarks {
+        let x = glyph_positions(shaped);
+        let glyph_count = x.len() - 1;
+        let fits_whole = !moved
+            && marks.fit_units(|glyph| x[glyph], glyph_count, shaped.scale_factor, 0, glyph_count) <= fit;
+        if !fits_whole {
+            marks.end_reshapes = self.end_reshapes(shaped, text, &marks.item_starts, &x);
+        }
+        marks
+    }
+
+    /// The [`EndReshape`] of every glyph of `shaped` that a line can end before, between two
+    /// letters of one item that the font kerns, or that it forms differently next to each other.
+    fn end_reshapes(
+        &self,
+        shaped: &LineLayout,
+        text: &str,
+        item_starts: &[usize],
+        x: &[Pixels],
+    ) -> Vec<(usize, EndReshape)> {
+        let scale_factor = shaped.scale_factor;
+        let scale = f64::from(scale_factor);
+        let mut reshapes = Vec::new();
+        let mut advances: FxHashMap<(FontId, GlyphId, u32), Option<f64>> = FxHashMap::default();
+        let mut alones: FxHashMap<(FontId, GlyphId, char, u32), f64> = FxHashMap::default();
+        let mut glyph_ix = 0;
+        for run in &shaped.runs {
+            let metrics = self.platform_text_system.font_metrics(run.font_id);
+            let font_unit = f64::from(run.font_size.0) / f64::from(metrics.units_per_em) * scale;
+            let size = run.font_size.0.to_bits();
+            for (pair_ix, pair) in run.glyphs.windows(2).enumerate() {
+                let after = glyph_ix + pair_ix + 1;
+                let (before, next) = (&pair[0], &pair[1]);
+                if before.is_emoji
+                    || before.index >= next.index
+                    || item_starts.binary_search(&after).is_ok()
+                {
+                    continue;
+                }
+                let cluster = &text[before.index..next.index];
+                if cluster.chars().count() != 1 {
+                    continue;
+                }
+                let letter = cluster.chars().next().expect("the cluster has a character");
+                let follows = text[next.index..].chars().next();
+                if letter.is_whitespace() || follows.is_none_or(char::is_whitespace) {
+                    continue;
+                }
+                // CoreText kerns kana, ideographs and fullwidth forms with the GPOS table of a
+                // fallback font that Chrome's text does not take: the widths do not agree
+                // whether the line is shaped again or not, so they are left as shaped.
+                if is_east_asian(letter) || follows.is_some_and(is_east_asian) {
+                    continue;
+                }
+                let Some(nominal) = *advances.entry((run.font_id, before.id, size)).or_insert_with(|| {
+                    self.platform_text_system
+                        .glyph_advance(run.font_id, before.id, run.font_size)
+                        .log_err()
+                        .map(|advance| advance * scale)
+                }) else {
+                    continue;
+                };
+                let alone = *alones.entry((run.font_id, before.id, letter, size)).or_insert_with(|| {
+                    self.alone_advance(run, before.id, letter, nominal, scale_factor)
+                });
+                let kern = kern_advance((f64::from(x[after].0) - f64::from(x[after - 1].0)) * scale - nominal, font_unit);
+                // A font with a `kern` table gives the glyph before a kern half of it.
+                let kerned = kern != 0;
+                let kern = if metrics.legacy_kerning { kern >> 1 } else { kern };
+                let loss = skia_advance(nominal) + kern - skia_advance(alone);
+                // A pair with a kern is not safe to break between, though a half of a kern of a
+                // font unit may leave nothing to lose.
+                if loss != 0 || kerned {
+                    reshapes.push((after, EndReshape { loss }));
+                }
+            }
+            glyph_ix += run.glyphs.len();
+        }
+        reshapes
+    }
+
+    /// The advance of `letter` shaped on its own in the font of `run`, in device pixels. `glyph` is
+    /// the glyph it was shaped to in the text, with the advance `nominal`.
+    fn alone_advance(
+        &self,
+        run: &ShapedRun,
+        glyph: GlyphId,
+        letter: char,
+        nominal: f64,
+        scale_factor: f32,
+    ) -> f64 {
+        // The glyph the font has for the letter is the one it has on its own, unless the font
+        // forms it differently: by its features, or by what is beside it.
+        if self.platform_text_system.glyph_for_char(run.font_id, letter) == Some(glyph) {
+            return nominal;
+        }
+        let text = letter.to_string();
+        let runs = [FontRun { len: text.len(), font_id: run.font_id, font_size: None, line_height: None }];
+        let alone = self
+            .platform_text_system
+            .layout_line(&text, run.font_size, &runs, scale_factor);
+        f64::from(alone.width.0) * f64::from(scale_factor)
     }
 
     /// [`SnapMarks::measure`] of `shaped`.
@@ -438,6 +683,7 @@ mod tests {
             item_starts: item_starts.iter().copied().collect(),
             kern_shares: kern_shares.iter().map(|(ix, share)| (*ix, px(*share))).collect(),
             hyphens: Vec::new(),
+            end_reshapes: Vec::new(),
             measure: Measure::default(),
         }
     }
@@ -570,7 +816,7 @@ mod tests {
         // whose hyphen is 5 units. The line is 40 units wide: 40 + 5 does not fit in 40
         // (and one more), so the line breaks at the earlier place, which fits what is left, 35.
         let units = |to: usize| to as i64 * 10;
-        let break_at = |fit: i64| LineLayout::break_candidate(&[2, 4], 0, fit, &marks, 1., units);
+        let break_at = |fit: i64| LineLayout::break_candidate(&[2, 4], 0, fit, &marks, 1., units, |to, fit| units(to) <= fit);
         assert_eq!(break_at(41), Some(2));
         // With room for the hyphen it stays.
         assert_eq!(break_at(45), Some(4));
@@ -578,8 +824,74 @@ mod tests {
         assert_eq!(break_at(30), Some(4));
         // No earlier place fits the narrower line: the first place there is.
         let marks = soft_hyphen(&[(4, 25. * UNIT)]);
-        let break_at = |fit: i64| LineLayout::break_candidate(&[2, 4], 0, fit, &marks, 1., units);
+        let break_at = |fit: i64| LineLayout::break_candidate(&[2, 4], 0, fit, &marks, 1., units, |to, fit| units(to) <= fit);
         assert_eq!(break_at(41), Some(2));
+    }
+
+    #[test]
+    fn test_a_line_that_ends_between_kerned_letters_is_as_wide_as_the_last_one_alone() {
+        // Glyph 1 is 12 wide in the text, with the kern it has before glyph 2, and 10 on its own.
+        let positions = x(&[0., 10., 22., 32.]);
+        let reshaped = SnapMarks::reshaped_at(&[(2, 2.)]);
+        let fit_units = |marks: &SnapMarks, to| marks.fit_units(|glyph| positions[glyph], 3, 1., 0, to);
+        // The break is decided on the line as it was shaped: 22 pixels.
+        assert_eq!(fit_units(&reshaped, 2), 22 * 64);
+        // It fits where it is as wide as the reshaped line is, 20 pixels.
+        let fits = |marks: &SnapMarks, to, fit| marks.fits(|glyph| positions[glyph], 3, 1., 0, to, fit);
+        assert!(fits(&reshaped, 2, 20 * 64 + 10));
+        assert!(!fits(&reshaped, 2, 20 * 64 - 1));
+        assert!(!fits(&SnapMarks::default(), 2, 20 * 64 + 10));
+        // The end of the text and a break before glyph 1 are not reshaped.
+        assert!(fits(&reshaped, 3, 32 * 64));
+        assert!(!fits(&reshaped, 3, 32 * 64 - 1));
+        assert!(fits(&reshaped, 1, 10 * 64));
+        assert_eq!(reshaped.width(&positions, 1., 0, 2), px(20.));
+        assert_eq!(reshaped.width(&positions, 1., 0, 3), px(32.));
+        assert_eq!(reshaped.width(&positions, 1., 1, 2), px(10.));
+    }
+
+    #[test]
+    fn test_a_kern_that_was_a_tightening_makes_the_reshaped_line_wider() {
+        // Glyph 1 is 8 wide with its kern and 10 on its own.
+        let positions = x(&[0., 10., 18., 28.]);
+        let reshaped = SnapMarks::reshaped_at(&[(2, -2.)]);
+        let fits = |to, fit| reshaped.fits(|glyph| positions[glyph], 3, 1., 0, to, fit);
+        assert_eq!(reshaped.fit_units(|glyph| positions[glyph], 3, 1., 0, 2), 18 * 64);
+        assert!(fits(2, 20 * 64));
+        assert!(!fits(2, 20 * 64 - 1));
+        assert_eq!(reshaped.width(&positions, 1., 0, 2), px(20.));
+    }
+
+    #[test]
+    fn test_the_end_shaped_again_needs_room_after_the_ceiled_position_of_the_boundary_it_starts_at() {
+        // Glyphs 10.5 units wide, and glyph 1 12 wide before a kern of 1.5. The line to glyph 2 is 21
+        // units shaped again and fits 21, but the last letter, 10.5 units, does not have them after
+        // the 11 that the ceiled position of glyph 1 takes.
+        let positions = x(&[0., 10.5 * UNIT, 22.5 * UNIT, 33. * UNIT]);
+        let reshaped = SnapMarks::reshaped_at(&[(2, 1.5 * UNIT)]);
+        let fits = |fit| reshaped.fits(|glyph| positions[glyph], 3, 1., 0, 2, fit);
+        assert_eq!(reshaped.width(&positions, 1., 0, 2), px(21. * UNIT));
+        assert!(!fits(21));
+        assert!(fits(22));
+        // A line of that glyph alone starts at its position and has room for it in 11 units.
+        assert!(reshaped.fits(|glyph| positions[glyph], 3, 1., 1, 2, 11));
+        assert!(!reshaped.fits(|glyph| positions[glyph], 3, 1., 1, 2, 10));
+    }
+
+    #[test]
+    fn test_the_end_is_shaped_again_from_the_start_of_the_run_of_kerned_pairs_it_is_in() {
+        // The pairs 1-2 and 2-3 are kerned, so glyph 3 is not safe to break before and nor is glyph
+        // 2: the end of a line to glyph 3 is shaped again from glyph 1, which starts 11 units
+        // in, and the 19.5 units after it need room. When only glyph 3 is kerned they are shaped
+        // again from glyph 2, at 21 units, and 9 units need room.
+        let positions = x(&[0., 10.5 * UNIT, 21. * UNIT, 31.5 * UNIT, 42. * UNIT]);
+        let chain = SnapMarks::reshaped_at(&[(2, 0.), (3, 1.5 * UNIT)]);
+        let single = SnapMarks::reshaped_at(&[(3, 1.5 * UNIT)]);
+        let fits = |marks: &SnapMarks, fit| marks.fits(|glyph| positions[glyph], 4, 1., 0, 3, fit);
+        assert!(!fits(&chain, 30));
+        assert!(fits(&chain, 31));
+        assert!(fits(&single, 30));
+        assert!(!fits(&single, 29));
     }
 
     #[test]

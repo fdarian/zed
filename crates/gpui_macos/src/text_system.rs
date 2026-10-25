@@ -2358,4 +2358,146 @@ mod tests {
         assert!(exact_solid > resampled_solid * 1.03, "more of the ink at full coverage: {exact_solid} against {resampled_solid}");
         assert!(exact_edge > resampled_edge * 1.05, "steeper edges: {exact_edge} against {resampled_edge}");
     }
+
+    /// Blink shapes the end of a line again where it breaks between two kerned letters
+    /// (`ShapingLineBreaker`): the letter before the break loses its kern, which moves the break of a cut
+    /// word or of `break-all` and widens the line by it, in Helvetica and Times (a `kern` table that
+    /// HarfBuzz splits between the glyphs) alike. The lines and their widths are headless Chrome's
+    /// at scale 1: each row is the text, the width of the box and for each line its text and its width, of which the
+    /// first is checked.
+    #[test]
+    fn test_a_line_that_breaks_between_kerned_letters_is_shaped_again_at_its_end() {
+        use gpui::{OverflowWrap, TextLayoutOptions, TextRun, TextSystem, WindowTextSystem, WordBreak};
+        use std::sync::Arc;
+
+        let text_system = WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(MacTextSystem::new()))));
+        let long = "AVATARTOWERWAYWARDTYPOGRAPHYVALVEFAVOURITEWATERYTAVERNVOYAGE";
+        let cut = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Anywhere,
+            ..Default::default()
+        };
+        let break_all = TextLayoutOptions {
+            word_break: WordBreak::BreakAll,
+            ..Default::default()
+        };
+        let rows: [(&str, &str, TextLayoutOptions, f32, &[(&str, f32)]); 5] = [
+            (
+                "Helvetica",
+                long,
+                cut,
+                40.9375,
+                &[
+                    ("AVAT", 38.25), ("ART", 31.71875), ("OWE", 38.21875), ("RWA", 36.46875), ("YWA", 35.859375),
+                    ("RDT", 32.890625), ("YPO", 33.796875), ("GRA", 34.671875), ("PHY", 32.90625),
+                    ("VALV", 38.5625), ("EFAV", 39.734375), ("OURI", 40.), ("TEW", 35.546875), ("ATE", 29.9375),
+                    ("RYT", 31.71875), ("AVE", 30.84375), ("RNV", 33.78125), ("OYA", 32.609375), ("GE", 23.125),
+                ],
+            ),
+            (
+                "Helvetica",
+                long,
+                break_all,
+                62.953125,
+                &[
+                    ("AVATAR", 59.296875), ("TOWER", 59.265625), ("WAYWA", 59.875), ("RDTYP", 54.234375),
+                    ("OGRAP", 57.796875), ("HYVALV", 60.78125), ("EFAVO", 52.1875), ("URITE", 48.),
+                    ("WATER", 56.015625), ("YTAVER", 61.65625), ("NVOYA", 54.84375), ("GE", 23.125),
+                ],
+            ),
+            (
+                "Times",
+                long,
+                cut,
+                121.40625,
+                &[
+                    ("AVATARTOWER", 115.140625), ("WAYWARDTYP", 112.3125), ("OGRAPHYVALV", 118.25),
+                    ("EFAVOURITEW", 112.296875), ("ATERYTAVERN", 112.234375), ("VOYAGE", 65.78125),
+                ],
+            ),
+            (
+                "Times",
+                long,
+                break_all,
+                59.3125,
+                &[
+                    ("AVATA", 48.828125), ("RTOWE", 55.640625), ("RWAY", 44.765625), ("WARDT", 56.890625),
+                    ("YPOGR", 54.234375), ("APHYV", 55.125), ("ALVEF", 50.09375), ("AVOUR", 54.828125),
+                    ("ITEWAT", 57.765625), ("ERYTA", 51.1875), ("VERNV", 55.109375), ("OYAGE", 54.21875),
+                ],
+            ),
+            (
+                "Helvetica",
+                "ToYoAVTaWaTyVaAyWoAwYaTeVeWe",
+                cut,
+                31.875,
+                &[
+                    ("ToY", 27.578125), ("oAV", 29.0625), ("Ta", 16.90625), ("Wa", 23.421875), ("TyV", 27.578125),
+                    ("aAy", 27.296875), ("Wo", 23.71875), ("Aw", 21.953125), ("YaT", 28.171875),
+                    ("eVe", 27.59375), ("We", 23.71875),
+                ],
+            ),
+        ];
+        for (family, text, options, wrap_width, expected) in rows {
+            let lines = text_system
+                .shape_text_inline(
+                    text.to_string().into(),
+                    px(16.),
+                    &[TextRun {
+                        len: text.len(),
+                        font: font(family),
+                        ..Default::default()
+                    }],
+                    Some(px(wrap_width)),
+                    None,
+                    options,
+                    &[],
+                    &[],
+                    px(20.),
+                )
+                .unwrap();
+            let layout: &gpui::WrappedLineLayout = &lines[0];
+            let mut starts = vec![0];
+            starts.extend(layout.wrap_boundaries().iter().map(|boundary| {
+                layout.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            }));
+            starts.push(text.len());
+            let rows: Vec<&str> = starts.windows(2).map(|bytes| &text[bytes[0]..bytes[1]]).collect();
+            let expected_rows: Vec<&str> = expected.iter().map(|(row, _)| *row).collect();
+            assert_eq!(rows, expected_rows, "{family} {wrap_width}");
+            // The first row, which starts at no kern, ends where the line was shaped again.
+            let (row, chrome) = expected[0];
+            let width = layout.line_widths().next().unwrap();
+            assert!(
+                (f32::from(width) - chrome).abs() <= 1.5 / 64.,
+                "{family} {wrap_width}: {row:?} is {width:?}, Chrome {chrome}"
+            );
+        }
+    }
+
+    /// Blink measures the min-content width of a text from the positions of its glyphs and does not
+    /// shape the end of a line again, so a letter that is cut from a kerned one is as wide as it is
+    /// in the text: Chrome's `width: min-content` is 14.8125 for "WA" cut between its letters, where
+    /// the W on its own is 15.109375.
+    #[test]
+    fn test_min_content_does_not_shape_the_end_of_a_line_again() {
+        use gpui::{OverflowWrap, TextLayoutOptions, TextRun, TextSystem, WindowTextSystem};
+        use std::sync::Arc;
+
+        let text_system = WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(MacTextSystem::new()))));
+        let cut = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Anywhere,
+            ..Default::default()
+        };
+        for (text, chrome) in [("WA", 14.8125), ("AVATAR", 11.546875)] {
+            let run = TextRun {
+                len: text.len(),
+                font: font("Helvetica"),
+                ..Default::default()
+            };
+            let measured = text_system
+                .min_content_width(text.to_string().into(), px(16.), &[run], cut, &[])
+                .unwrap();
+            assert_eq!(measured, px(chrome), "{text}");
+        }
+    }
 }

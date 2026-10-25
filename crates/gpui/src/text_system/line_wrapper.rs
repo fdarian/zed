@@ -1669,6 +1669,7 @@ mod tests {
         text_wrap_style: TextWrapStyle::Auto,
         strut_font: None,
         nowrap: false,
+        min_content: false,
     };
 
     #[cfg(target_os = "macos")]
@@ -1681,6 +1682,7 @@ mod tests {
         text_wrap_style: TextWrapStyle::Auto,
         strut_font: None,
         nowrap: false,
+        min_content: false,
     };
 
     #[cfg(target_os = "macos")]

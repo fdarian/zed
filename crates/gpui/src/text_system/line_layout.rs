@@ -125,6 +125,10 @@ pub struct TextLayoutOptions {
     /// says nothing about it inherits; a box can say otherwise. A text with no wrap
     /// width does not break whatever this is.
     pub nowrap: bool,
+    /// That the text is laid out to measure its min-content width, which Blink reads from the
+    /// positions of the glyphs: the end of a line is not shaped again where it breaks between two
+    /// letters that kern (see [`SnapMarks`]).
+    pub min_content: bool,
 }
 
 impl TextLayoutOptions {
@@ -145,6 +149,7 @@ impl TextLayoutOptions {
             },
             // The narrowest a text goes is where every place that may break does.
             text_wrap_style: TextWrapStyle::Auto,
+            min_content: true,
             ..self
         }
     }
@@ -698,6 +703,7 @@ impl LineLayout {
         let fit = wrap_width
             .map(|wrap_width| crate::util::fit_layout_units(wrap_width, self.scale_factor));
         let breaks_words = options.overflow_wrap != OverflowWrap::Normal;
+        let keeps_minus_before_digit = options.word_break != WordBreak::BreakAll;
         let mut boundaries = SmallVec::new();
         // The glyph each line starts at.
         let mut line_starts: SmallVec<[usize; 2]> = SmallVec::new();
@@ -765,6 +771,8 @@ impl LineLayout {
                 && first_non_whitespace_ix.is_some()
                 && may_break_here
                 && line_breaks.contains(positions.glyphs[ix].index)
+                && !(keeps_minus_before_digit
+                    && is_minus_before_digit(&positions.glyphs, line_starts[line_starts.len() - 1], ix))
             {
                 push_candidate(&mut candidates, ix);
             }
@@ -791,25 +799,56 @@ impl LineLayout {
                             to,
                         )
                     };
-                    (units(ix + 1) > fit).then(|| {
-                        Self::break_candidate(
+                    let fits = |to: usize, fit: i64| {
+                        marks.fits(
+                            |glyph| positions.x(glyph),
+                            glyph_count,
+                            self.scale_factor,
+                            line_start,
+                            to,
+                            fit,
+                        )
+                    };
+                    if units(ix + 1) > fit {
+                        match Self::break_candidate(
                             &candidates,
                             line_start,
                             fit,
                             marks,
                             self.scale_factor,
                             units,
-                        )
-                    })
+                            fits,
+                        ) {
+                            Some(candidate_ix) => Some((candidate_ix, false)),
+                            None if breaks_words
+                                && ix > 0
+                                && may_break_apart(&positions.glyphs[ix - 1], &positions.glyphs[ix]) =>
+                            {
+                                // The glyph that overflows starts the next line, unless the line
+                                // ends better before an earlier glyph, as Blink's last resort does.
+                                let cut_ix = (line_start + 1..=ix)
+                                    .rev()
+                                    .filter(|cut_ix| {
+                                        let (before, after) =
+                                            (&positions.glyphs[cut_ix - 1], &positions.glyphs[*cut_ix]);
+                                        *cut_ix == ix
+                                            || (before.wrap_char != ' '
+                                                && after.wrap_char != ' '
+                                                && may_break_apart(before, after))
+                                    })
+                                    .find(|cut_ix| fits(*cut_ix, fit))
+                                    .unwrap_or(ix);
+                                Some((cut_ix, true))
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
-            if let Some(candidate_ix) = chosen
-                && (candidate_ix.is_some()
-                    || (breaks_words
-                        && ix > 0
-                        && may_break_apart(&positions.glyphs[ix - 1], &positions.glyphs[ix])))
-            {
+            if let Some((line_start_ix, cut)) = chosen {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -817,9 +856,12 @@ impl LineLayout {
                     break;
                 }
 
-                broke_word |= candidate_ix.is_none();
-                let line_start_ix = candidate_ix.unwrap_or(ix);
-                candidates.retain(|candidate| *candidate > line_start_ix);
+                broke_word |= cut;
+                candidates.retain(|candidate| {
+                    *candidate > line_start_ix
+                        && !(keeps_minus_before_digit
+                            && is_minus_before_digit(&positions.glyphs, line_start_ix, *candidate))
+                });
                 last_boundary = positions.glyphs[line_start_ix].boundary;
                 last_boundary_x = positions.x(line_start_ix);
                 boundaries.push(last_boundary);
@@ -868,11 +910,17 @@ impl LineLayout {
         }
     }
 
-    /// The glyph a line that does not fit breaks at, among the `candidates` it has: the last, and
-    /// `None` when there is none. `units(to)` is the width the glyphs from the start of the line to
-    /// `to` have to the line breaker. A line that breaks at a soft hyphen is given a hyphen, and the
-    /// hyphen is part of what has to fit; Blink then shapes the line again a hyphen narrower
-    /// (`LineBreaker::BreakText`), so the break may be at any earlier candidate that fits that.
+    /// The glyph a line that does not fit breaks at, among the `candidates` it has: the last that
+    /// the line fits before, and `None` when there is none. `units(to)` is the width the glyphs
+    /// from the start of the line to `to` have to the line breaker, and `fits(to, fit)` whether
+    /// the line to `to` fits in `fit` once its end is shaped again ([`SnapMarks::fits`]). The line
+    /// the greedy rule ends at the last candidate is cut a candidate earlier when the end of it
+    /// does not fit shaped again (Blink's `ShapingLineBreaker::ShapeLine` takes the break
+    /// opportunity before), and when no candidate fits it ends at the last.
+    ///
+    /// A line that breaks at a soft hyphen is given a hyphen, and the hyphen is part of what has to
+    /// fit; Blink then shapes the line again a hyphen narrower (`LineBreaker::BreakText`), so the
+    /// break may be at any earlier candidate that fits that.
     fn break_candidate(
         candidates: &[usize],
         line_start: usize,
@@ -880,20 +928,32 @@ impl LineLayout {
         marks: &SnapMarks,
         scale_factor: f32,
         units: impl Fn(usize) -> i64,
+        fits: impl Fn(usize, i64) -> bool,
     ) -> Option<usize> {
         let last = *candidates.last()?;
-        let hyphen = marks.hyphen_units(last, scale_factor);
         let width = units(last);
-        match hyphen {
-            Some(hyphen) if width <= fit && width + hyphen > fit => candidates
-                .iter()
-                .rev()
-                .copied()
-                .filter(|candidate| *candidate > line_start)
-                .find(|candidate| units(*candidate) <= fit - hyphen)
-                .or_else(|| candidates.iter().copied().find(|candidate| *candidate > line_start)),
-            _ => Some(last),
+        // A line that is already too wide for its place gets no other break: it overflows to
+        // the last, where Blink's overflow takes the opportunity at or before the candidate.
+        if width > fit {
+            return Some(last);
         }
+        let hyphen_of = |candidate: usize| marks.hyphen_units(candidate, scale_factor).unwrap_or(0);
+        if fits(last, fit - hyphen_of(last)) {
+            return Some(last);
+        }
+        // The hyphen of the last candidate did not fit: Blink shapes the line again that much
+        // narrower.
+        let narrower = if width + hyphen_of(last) > fit { hyphen_of(last) } else { 0 };
+        candidates
+            .iter()
+            .rev()
+            .copied()
+            .filter(|candidate| *candidate > line_start && *candidate != last)
+            .find(|candidate| fits(*candidate, fit - narrower.max(hyphen_of(*candidate))))
+            .or_else(|| match narrower {
+                0 => Some(last),
+                _ => candidates.iter().copied().find(|candidate| *candidate > line_start),
+            })
     }
 
     /// Where the text may break, and the x of its glyphs. A text wrapped at no width
@@ -1069,6 +1129,16 @@ struct WrapGlyph {
     font_id: FontId,
     shaped_x: Pixels,
     wrap: RunWrap,
+}
+
+/// Whether a line that starts at glyph `line_start` may not break before glyph `at` because the
+/// glyph before it is the `-` the line starts with and a digit follows: Blink looks for a letter or
+/// digit before the hyphen on the line, to tell a hyphen from a minus sign
+/// (`text_break_iterator.cc` `ShouldBreakFast`).
+fn is_minus_before_digit(glyphs: &[WrapGlyph], line_start: usize, at: usize) -> bool {
+    at == line_start + 1
+        && glyphs[line_start].wrap_char == '-'
+        && glyphs.get(at).is_some_and(|glyph| glyph.wrap_char.is_ascii_digit())
 }
 
 /// Whether a line may break between two characters that are neither of them a space,
@@ -2103,6 +2173,7 @@ impl LineLayoutCache {
             },
             strut_font: options.strut_font,
             nowrap: options.nowrap && wrap_width.is_some(),
+            min_content: options.min_content && wrap_width.is_some(),
         };
         let max_lines = max_lines.filter(|_| wrap_width.is_some());
         let scale_factor = self.scale_factor();
@@ -2176,6 +2247,16 @@ impl LineLayoutCache {
                 || options.hang_trailing_spaces
                 || !insets.is_empty();
             let marks = self.snap_marks(&shaped_layout, text.as_ref(), runs, item_starts);
+            let marks = match wrap_width {
+                Some(wrap_width) if !options.min_content => self.with_end_reshapes(
+                    marks,
+                    &shaped_layout,
+                    text.as_ref(),
+                    crate::util::fit_layout_units(wrap_width, scale_factor),
+                    tab_stop.is_some() || !insets.is_empty(),
+                ),
+                _ => marks,
+            };
             let (unwrapped_layout, computation) = if needs_pass {
                 let computation = shaped_layout.compute_styled_wrap_boundaries(
                     text.as_ref(),
@@ -3828,6 +3909,70 @@ mod tests {
         // It breaks whatever overflow-wrap says.
         let all = word_break_line("aaaaaaaa", 35., WordBreak::BreakAll, OverflowWrap::Normal);
         assert_eq!(boundary_indices(&all), vec![3, 6]);
+    }
+
+    /// `text` as ten pixel wide characters wrapped at `wrap_width`, whose line ends before the glyphs in
+    /// `ends` are shaped again, each `(glyph, loss)` as [`SnapMarks::reshaped_at`] says.
+    fn reshaped_line(
+        text: &str,
+        wrap_width: f32,
+        options: TextLayoutOptions,
+        ends: &[(usize, f32)],
+    ) -> WrappedLineLayout {
+        let shaped = monospace_layout(text, 10.);
+        let marks = SnapMarks::reshaped_at(ends);
+        let computation =
+            shaped.compute_wrap_boundaries(text, Some(px(wrap_width)), None, options, None, &[], &marks);
+        WrappedLineLayout::new(Arc::new(shaped), Some(px(wrap_width)), computation, &marks)
+    }
+
+    #[test]
+    fn test_a_word_is_cut_before_the_letter_that_makes_the_reshaped_line_too_wide() {
+        // "aaa" is 30 in 35. Ending it before glyph 3 shapes the glyph again, 6 wider than it was
+        // with its kern: 36, which does not fit, so the word is cut a letter earlier. Glyph 5 is
+        // kerned too, with a kern that leaves the line it ends room.
+        let ends = [(3, -6.), (5, 4.)];
+        let cut = |ends: &[(usize, f32)], options| boundary_indices(&reshaped_line("aaaaaaaa", 35., options, ends));
+        assert_eq!(cut(&[], TextLayoutOptions::default()), vec![3, 6]);
+        assert_eq!(cut(&ends, TextLayoutOptions::default()), vec![2, 5]);
+        let break_all = TextLayoutOptions {
+            word_break: WordBreak::BreakAll,
+            ..Default::default()
+        };
+        assert_eq!(cut(&[], break_all), vec![3, 6]);
+        assert_eq!(cut(&ends, break_all), vec![2, 5]);
+        // The glyphs that stay where they are are not moved: only the end of the line changes.
+        let layout = reshaped_line("aaaaaaaa", 35., TextLayoutOptions::default(), &ends);
+        assert_eq!(layout.unwrapped_layout.runs[0].glyphs[3].position.x, px(30.));
+        // The line is as wide as it is shaped again: the second has 3 letters, less 4 of the kern.
+        assert_eq!(layout.line_widths().collect::<Vec<_>>(), pixels(&[20., 26., 30.]));
+    }
+
+    #[test]
+    fn test_a_line_that_ends_at_a_place_to_break_between_kerned_letters_breaks_at_the_one_before() {
+        // "a-b-cd": a line may end after either hyphen. In 45 the line to "c" is 40, but with the
+        // hyphen on its own it is 10 wider, so it breaks after the first. Where no place fits the line
+        // keeps the last, as before.
+        let wide = [(4, -10.)];
+        assert_eq!(boundary_indices(&reshaped_line("a-b-cd", 45., TextLayoutOptions::default(), &[])), vec![4]);
+        assert_eq!(boundary_indices(&reshaped_line("a-b-cd", 45., TextLayoutOptions::default(), &wide)), vec![2]);
+        let none = [(2, -40.), (4, -10.)];
+        assert_eq!(boundary_indices(&reshaped_line("a-b-cd", 45., TextLayoutOptions::default(), &none)), vec![4]);
+    }
+
+    #[test]
+    fn test_a_minus_sign_that_starts_a_line_does_not_break_before_a_digit() {
+        // Cut at 40, the second line starts at the hyphen, and Blink looks for a letter or a digit
+        // before it on the line to tell a hyphen from a minus sign: the line goes on to "-123".
+        let text = "abcd-12345";
+        let cut = |word_break| {
+            let options = TextLayoutOptions { word_break, ..Default::default() };
+            boundary_indices(&line_with_options(text, Some(40.), options))
+        };
+        assert_eq!(cut(WordBreak::Normal), vec![4, 8]);
+        // A hyphen after a letter on the line is a place to break.
+        assert_eq!(boundary_indices(&line_with_options("ab-12345", Some(40.), TextLayoutOptions::default())), vec![3, 7]);
+        assert_eq!(boundary_indices(&line_with_options("-12345", Some(40.), TextLayoutOptions::default())), vec![4]);
     }
 
     #[test]

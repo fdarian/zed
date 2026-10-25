@@ -104,13 +104,14 @@ impl LineLayout {
         let glyph_count = opportunities.x.len() - 1;
         let fit = crate::util::fit_layout_units(wrap_width, self.scale_factor);
         let fits = |from: usize, to: usize| {
-            marks.fit_units(
+            marks.fits(
                 |glyph| opportunities.x[glyph],
                 glyph_count,
                 self.scale_factor,
                 from,
                 to,
-            ) <= fit
+                fit,
+            )
         };
         let overflows = greedy
             .line_starts
