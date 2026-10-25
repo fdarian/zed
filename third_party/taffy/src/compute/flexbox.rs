@@ -832,11 +832,9 @@ fn determine_flex_base_size(
                 .maybe_resolve(constants.percentage_base().main(dir), |val, basis| tree.calc(val, basis))
                 .maybe_add(box_sizing_adjustment)
         };
-        // A percentage of a height that is not known is `content`: the item's `height` is not the basis then (Blink
-        // length_utils.cc ResolveBlockLengthInternal `kMain`). Along a row Blink falls back to the max-content width
-        // the same way, but a container sized by its items takes the contributions of its items, not their bases, and
-        // taffy sizes a row from the bases, so a row keeps the item's `width` there.
-        if constants.is_column && basis_keyword.is_none() && flex_basis.is_none() && !basis_style.is_auto() {
+        // A percentage of a size that is not known is `content`: the item's `height` or `width` is not the basis then
+        // (Blink length_utils.cc ResolveBlockLengthInternal `kMain`, flex_layout_algorithm.cc `resolve_main_length`).
+        if basis_keyword.is_none() && flex_basis.is_none() && !basis_style.is_auto() {
             basis_keyword = Some(BasisKeyword::Content);
         }
 
@@ -2932,7 +2930,7 @@ mod basis_tests {
     }
 
     #[test]
-    fn a_percentage_basis_of_a_width_that_is_not_known_stays_the_width_of_the_item() {
+    fn a_percentage_basis_of_a_width_that_is_not_known_is_the_content_not_the_width_of_the_item() {
         let with_width = |container: Style, available: Size<AvailableSpace>, percentage: f32| {
             item(container, available, |style| {
                 style.size.width = length(50.0);
@@ -2940,12 +2938,13 @@ mod basis_tests {
             })
             .width
         };
-        // A row sized by its items takes their bases, which are their widths: Chrome is 50px wide there, as it is
-        // with `flex-basis: auto` (`flex-column-size-oracle`, the `row` cases)
+        // The basis is the content of the item (100px here, and as the item cannot shrink it is that wide), not its `width`;
+        // the row sized by its items is as wide as that `width`, its contribution (`flex-row-fit-oracle`, the `percent
+        // basis` rows).
         let max_content = Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent };
         let auto_row = || Style { size: Size { width: auto(), height: auto() }, ..row(0.0) };
-        assert_eq!(with_width(auto_row(), max_content, 0.0), 50.0);
-        assert_eq!(with_width(auto_row(), max_content, 0.5), 50.0);
+        assert_eq!(with_width(auto_row(), max_content, 0.0), 100.0);
+        assert_eq!(with_width(auto_row(), max_content, 0.5), 100.0);
         // a row that has its width: half of it
         assert_eq!(with_width(row(300.0), definite(300.0), 0.5), 150.0);
         // its automatic minimum size is the smaller of its width and its content, 20px at the narrowest
