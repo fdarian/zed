@@ -1198,6 +1198,7 @@ impl Style {
                 .map(|clip_path| clip_path.resolve(boxes.region(clip_path.reference), scale_factor)),
             reference: bounds.scale(scale_factor),
             reference_radii: corner_radii.scale(scale_factor),
+            reference_transformation: TransformationMatrix::unit(),
             text_mask: false,
             exact_clip: false,
         })

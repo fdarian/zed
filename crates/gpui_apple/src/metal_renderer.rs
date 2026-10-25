@@ -9,7 +9,7 @@ use cocoa::{
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, MAX_GROUP_EXTENT,
     MaskComposite, MaskLayer, PaintSurface, Path, Point, PrimitiveBatch, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
-    filter_margin, point, size,
+    TransformationMatrix, filter_margin, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -1524,24 +1524,34 @@ impl MetalRenderer {
         });
     }
 
-    /// A Gaussian blur of the texture in a new texture of the same size. Large blurs run on a
-    /// reduced copy, which is how they stay affordable. With `edge`, the pixels at the end of the
-    /// image repeat instead of reading transparency past them; it is the part of the texture that
-    /// holds the image, in uv units.
+    /// A Gaussian blur of the texture in a new texture of the same size, by `sigma` along x and
+    /// along y. Large blurs run on a reduced copy, which is how they stay affordable. With `edge`,
+    /// the pixels at the end of the image repeat instead of reading transparency past them; it is
+    /// the part of the texture that holds the image, in uv units.
     fn blur_texture(
         &mut self,
         input: &metal::Texture,
-        sigma: f32,
+        sigma: [f32; 2],
         edge: Option<[f32; 2]>,
         command_buffer: &metal::CommandBufferRef,
     ) -> metal::Texture {
         const MAX_SIGMA_IN_PASS: f32 = 6.;
         let mut sizes = vec![(input.width() as u32, input.height() as u32)];
-        let mut scale = 1.;
-        while sigma / scale > MAX_SIGMA_IN_PASS && sizes.len() < 4 {
+        let mut scale = [1.; 2];
+        while sizes.len() < 4
+            && (sigma[0] / scale[0] > MAX_SIGMA_IN_PASS || sigma[1] / scale[1] > MAX_SIGMA_IN_PASS)
+        {
             let (width, height) = *sizes.last().expect("sizes starts with one entry");
-            sizes.push((width.div_ceil(2).max(1), height.div_ceil(2).max(1)));
-            scale *= 2.;
+            let halve = [sigma[0] / scale[0] > MAX_SIGMA_IN_PASS, sigma[1] / scale[1] > MAX_SIGMA_IN_PASS];
+            sizes.push((
+                if halve[0] { width.div_ceil(2).max(1) } else { width },
+                if halve[1] { height.div_ceil(2).max(1) } else { height },
+            ));
+            for axis in 0..2 {
+                if halve[axis] {
+                    scale[axis] *= 2.;
+                }
+            }
         }
 
         let mut working: Option<metal::Texture> = None;
@@ -1554,22 +1564,20 @@ impl MetalRenderer {
         }
 
         let (width, height) = *sizes.last().expect("sizes starts with one entry");
-        let sigma = sigma / scale;
-        let horizontal = self.acquire_texture(width, height);
-        self.blur_pass(
-            command_buffer,
-            working.as_ref().unwrap_or(input),
-            &horizontal,
-            false,
-            sigma,
-            edge,
-        );
-        if let Some(previous) = working.take() {
-            self.release_texture(previous);
+        let sigma = [sigma[0] / scale[0], sigma[1] / scale[1]];
+        // An axis with no blur is passed over: the weights of a zero deviation are not a number.
+        let mut result = working.take();
+        for (vertical, sigma) in [(false, sigma[0]), (true, sigma[1])] {
+            if sigma <= 0. {
+                continue;
+            }
+            let blurred = self.acquire_texture(width, height);
+            self.blur_pass(command_buffer, result.as_ref().unwrap_or(input), &blurred, vertical, sigma, edge);
+            if let Some(previous) = result.replace(blurred) {
+                self.release_texture(previous);
+            }
         }
-        let mut result = self.acquire_texture(width, height);
-        self.blur_pass(command_buffer, &horizontal, &result, true, sigma, edge);
-        self.release_texture(horizontal);
+        let mut result = result.expect("a blur has a deviation along some axis");
 
         for &(width, height) in sizes[..sizes.len() - 1].iter().rev() {
             let next = self.acquire_texture(width, height);
@@ -1601,11 +1609,11 @@ impl MetalRenderer {
                     }
                     texture = self.color_filter_pass(texture, &matrices, command_buffer);
                 }
-                ResolvedFilter::Blur(sigma) => {
+                ResolvedFilter::Blur { x, y } => {
                     index += 1;
-                    if sigma > 0. {
+                    if x > 0. || y > 0. {
                         let blurred =
-                            self.blur_texture(&texture, sigma, edge, command_buffer);
+                            self.blur_texture(&texture, [x, y], edge, command_buffer);
                         self.release_texture(mem::replace(&mut texture, blurred));
                     }
                 }
@@ -1617,7 +1625,7 @@ impl MetalRenderer {
                 } => {
                     index += 1;
                     let blurred = (sigma > 0.)
-                        .then(|| self.blur_texture(&texture, sigma, edge, command_buffer));
+                        .then(|| self.blur_texture(&texture, [sigma, sigma], edge, command_buffer));
                     let rgba = gpui::Rgba::from(color);
                     let params = DropShadowParams {
                         offset: [dx, dy],
@@ -1762,7 +1770,7 @@ impl MetalRenderer {
         source_size: [f32; 2],
         mask_a_size: Option<[f32; 2]>,
         mask_b_size: Option<[f32; 2]>,
-        reference: Option<(Bounds<ScaledPixels>, gpui::CornerRadii<ScaledPixels>)>,
+        clip_to_reference: bool,
     ) -> (CompositeParams, Option<Vec<[f32; 2]>>) {
         let effect = &group.effect;
         let origin = group.bounds.origin;
@@ -1792,10 +1800,37 @@ impl MetalRenderer {
         if let Some(size) = mask_b_size {
             params.mask_b = [origin.x.0, origin.y.0, 1. / size[0], 1. / size[1]];
         }
-        if let Some((bounds, radii)) = reference {
-            params.reference = rect_array(&bounds);
+        if clip_to_reference {
+            let radii = &effect.reference_radii;
             params.reference_radii = radii_array(&radii.x);
             params.reference_radii_y = radii_array(&radii.y);
+            if effect.reference_transformation == TransformationMatrix::unit() {
+                params.reference = rect_array(&Bounds {
+                    origin: effect.reference.origin + origin,
+                    size: effect.reference.size,
+                });
+            } else {
+                // The reference stays in the element's own space; the fragment maps its window
+                // position back into it.
+                let mut placed = effect.reference_transformation;
+                placed.translation[0] += origin.x.0;
+                placed.translation[1] += origin.y.0;
+                let inverse = placed
+                    .inverse()
+                    .expect("draw_backdrop leaves a matrix that can't be inverted out");
+                let [[a, b], [c, d]] = inverse.rotation_scale;
+                params.reference = rect_array(&effect.reference);
+                params.reference_matrix = [a, b, c, d];
+                params.reference_offset = [
+                    inverse.translation[0],
+                    inverse.translation[1],
+                    (placed.rotation_scale[0][0] * placed.rotation_scale[1][1]
+                        - placed.rotation_scale[0][1] * placed.rotation_scale[1][0])
+                        .abs()
+                        .sqrt(),
+                    1.,
+                ];
+            }
         }
 
         let mut polygon = None;
@@ -1998,7 +2033,7 @@ impl MetalRenderer {
             prepared.extent,
             prepared.mask_a.as_ref().map(|_| prepared.extent),
             prepared.mask_b.as_ref().map(|_| prepared.extent),
-            None,
+            false,
         );
         let polygon = match polygon {
             Some(points) if !points.is_empty() => Some(writer.write(&points)?),
@@ -2038,10 +2073,17 @@ impl MetalRenderer {
         }
         let effect = &group.effect;
         let origin = group.bounds.origin;
+        let reference_window = effect.reference_window_bounds();
         let reference = Bounds {
-            origin: effect.reference.origin + origin,
-            size: effect.reference.size,
+            origin: reference_window.origin + origin,
+            size: reference_window.size,
         };
+        if effect.reference_transformation != TransformationMatrix::unit()
+            && effect.reference_transformation.inverse().is_none()
+        {
+            // A matrix that flattens the plane leaves nothing of the box to show the backdrop in.
+            return Ok(());
+        }
         let viewport = Bounds::new(
             point(ScaledPixels(0.), ScaledPixels(0.)),
             size(
@@ -2121,7 +2163,7 @@ impl MetalRenderer {
             [texture_width as f32, texture_height as f32],
             prepared.mask_a.as_ref().map(|_| prepared.extent),
             prepared.mask_b.as_ref().map(|_| prepared.extent),
-            Some((reference, effect.reference_radii)),
+            true,
         );
         let polygon = match polygon {
             Some(points) if !points.is_empty() => Some(writer.write(&points)?),
@@ -2458,6 +2500,8 @@ struct CompositeParams {
     reference: [f32; 4],
     reference_radii: [f32; 4],
     reference_radii_y: [f32; 4],
+    reference_matrix: [f32; 4],
+    reference_offset: [f32; 4],
 }
 
 /// Mirrors `BlurParams` in the shaders.
@@ -2771,6 +2815,8 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
             bounds: surface.bounds,
             content_mask: surface.content_mask,
+            transformation: surface.transformation,
+            local_clip: surface.local_clip,
         }))?,
     })
 }
@@ -2963,6 +3009,8 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub transformation: gpui::TransformationMatrix,
+    pub local_clip: ContentMask<ScaledPixels>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -5603,5 +5651,241 @@ mod tests {
         assert_eq!(dominant_channel(&image, 20, 20), "red");
         assert!(is_cleared(&image, 8, 8));
         assert!(is_cleared(&image, 32, 32));
+    }
+
+    /// A 4:2:0 pixel buffer whose luma is `luma(x, y)` and whose chroma is neutral, so the
+    /// picture is a gray one that an RGBA image can hold too.
+    fn gray_surface(width: usize, height: usize, luma: impl Fn(usize, usize) -> u8) -> core_video::pixel_buffer::CVPixelBuffer {
+        use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
+        use core_video::pixel_buffer::{
+            CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+            CVPixelBufferLockBaseAddress, CVPixelBufferUnlockBaseAddress, CVPixelBufferKeys,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        };
+        // The texture cache only takes buffers an IOSurface backs.
+        let io_surface: CFDictionary<CFString, core_foundation::base::CFType> = CFDictionary::from_CFType_pairs(&[]);
+        let options = CFDictionary::from_CFType_pairs(&[(
+            CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
+            io_surface.as_CFType(),
+        )]);
+        let buffer = CVPixelBuffer::new(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, width, height, Some(&options))
+            .expect("a pixel buffer");
+        unsafe {
+            let pointer = buffer.as_concrete_TypeRef();
+            assert_eq!(CVPixelBufferLockBaseAddress(pointer, 0), 0);
+            let luma_stride = CVPixelBufferGetBytesPerRowOfPlane(pointer, 0);
+            let luma_plane = CVPixelBufferGetBaseAddressOfPlane(pointer, 0) as *mut u8;
+            for y in 0..height {
+                for x in 0..width {
+                    *luma_plane.add(y * luma_stride + x) = luma(x, y);
+                }
+            }
+            let chroma_stride = CVPixelBufferGetBytesPerRowOfPlane(pointer, 1);
+            let chroma_plane = CVPixelBufferGetBaseAddressOfPlane(pointer, 1) as *mut u8;
+            for y in 0..height / 2 {
+                for x in 0..width {
+                    *chroma_plane.add(y * chroma_stride + x) = 128;
+                }
+            }
+            assert_eq!(CVPixelBufferUnlockBaseAddress(pointer, 0), 0);
+        }
+        buffer
+    }
+
+    /// Blocks of 4 px, each a luma of its own, so a wrong turn or flip shows.
+    fn block_luma(x: usize, y: usize) -> u8 {
+        (30 + 50 * (x / 4) + 14 * (y / 4)) as u8
+    }
+
+    fn surface(
+        buffer: core_video::pixel_buffer::CVPixelBuffer,
+        bounds: (f32, f32, f32, f32),
+        transformation: gpui::TransformationMatrix,
+        local_clip: ContentMask<ScaledPixels>,
+    ) -> gpui::PaintSurface {
+        gpui::PaintSurface {
+            order: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(bounds.0), ScaledPixels(bounds.1)),
+                size(ScaledPixels(bounds.2), ScaledPixels(bounds.3)),
+            ),
+            content_mask: window_mask(),
+            transformation,
+            local_clip,
+            image_buffer: buffer,
+        }
+    }
+
+    /// The image the surface's pixels are, drawn as a sprite through the same matrix.
+    fn gray_image_sprite(
+        renderer: &MetalHeadlessRenderer,
+        id: usize,
+        bounds: (f32, f32, f32, f32),
+        transformation: gpui::TransformationMatrix,
+        local_clip: ContentMask<ScaledPixels>,
+    ) -> gpui::PolychromeSprite {
+        let mut bgra = Vec::new();
+        for y in 0..16 {
+            for x in 0..16 {
+                let luma = block_luma(x, y);
+                bgra.extend([luma, luma, luma, 255]);
+            }
+        }
+        let tile = atlas_image(renderer, id, 16, 16, bgra);
+        gpui::PolychromeSprite {
+            nearest_neighbor: false.into(),
+            transformation,
+            local_clip,
+            ..image_sprite(tile, bounds, window_mask())
+        }
+    }
+
+    fn render_with(renderer: &mut MetalHeadlessRenderer, mut scene: Scene) -> image::RgbaImage {
+        scene.finish();
+        renderer
+            .render_scene_to_image(&scene, size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .expect("scene should render")
+    }
+
+    fn assert_pictures_agree(surface: &image::RgbaImage, image: &image::RgbaImage) {
+        let worst = surface
+            .enumerate_pixels()
+            .map(|(x, y, pixel)| {
+                let other = image.get_pixel(x, y);
+                (0..3).map(|channel| pixel.0[channel].abs_diff(other.0[channel])).max().unwrap()
+            })
+            .max()
+            .unwrap();
+        assert!(worst <= 4, "the pictures differ by up to {worst}");
+    }
+
+    #[test]
+    fn a_rotated_surface_is_the_rotated_image_of_its_pixels() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let bounds = (8., 8., 24., 24.);
+        let turn = rotation_around(30., (20., 20.));
+
+        let mut with_surface = groups_scene();
+        with_surface.insert_primitive(surface(
+            gray_surface(16, 16, block_luma),
+            bounds,
+            turn,
+            ContentMask::unbounded(),
+        ));
+        let from_surface = render_with(&mut renderer, with_surface);
+
+        let mut with_image = groups_scene();
+        with_image.insert_primitive(gray_image_sprite(&renderer, 1, bounds, turn, ContentMask::unbounded()));
+        let from_image = render_with(&mut renderer, with_image);
+
+        // The picture is turned, and not the box around it.
+        assert!(is_cleared(&from_surface, 4, 4), "{:?}", from_surface.get_pixel(4, 4));
+        assert!(is_cleared(&from_surface, 35, 35));
+        assert!(!is_cleared(&from_surface, 20, 20));
+        assert_pictures_agree(&from_surface, &from_image);
+    }
+
+    #[test]
+    fn the_local_clip_of_a_rotated_surface_cuts_it_in_its_own_space() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let bounds = (8., 8., 24., 24.);
+        let turn = rotation_around(30., (20., 20.));
+        // The left half of the picture.
+        let clip = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(20.), ScaledPixels(SIZE)),
+            ),
+            corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
+        };
+
+        let mut with_surface = groups_scene();
+        with_surface.insert_primitive(surface(gray_surface(16, 16, block_luma), bounds, turn, clip));
+        let from_surface = render_with(&mut renderer, with_surface);
+
+        let mut whole = groups_scene();
+        whole.insert_primitive(surface(gray_surface(16, 16, block_luma), bounds, turn, ContentMask::unbounded()));
+        let uncut = render_with(&mut renderer, whole);
+
+        let mut with_image = groups_scene();
+        with_image.insert_primitive(gray_image_sprite(&renderer, 1, bounds, turn, clip));
+        let from_image = render_with(&mut renderer, with_image);
+
+        // Turned 30 degrees, the cut runs along the line through the centre that the picture's
+        // right half lies beyond: a point on each side of it.
+        let (sin, cos) = 30f32.to_radians().sin_cos();
+        let beyond = |distance: f32| ((20. + distance * cos) as u32, (20. + distance * sin) as u32);
+        let (kept_x, kept_y) = beyond(-6.);
+        let (cut_x, cut_y) = beyond(6.);
+        assert!(!is_cleared(&from_surface, kept_x, kept_y));
+        assert!(!is_cleared(&uncut, cut_x, cut_y));
+        assert!(is_cleared(&from_surface, cut_x, cut_y), "{:?}", from_surface.get_pixel(cut_x, cut_y));
+        assert_pictures_agree(&from_surface, &from_image);
+    }
+
+    #[test]
+    fn a_rotated_backdrop_blurs_only_inside_its_rotated_rounded_box() {
+        let mut scene = groups_scene();
+        stripes(&mut scene);
+        scene.start_group(
+            GroupEffect {
+                backdrop_filters: vec![gpui::FilterFunction::Blur(px(4.)).resolve(1.)],
+                reference: Bounds::new(
+                    point(ScaledPixels(8.), ScaledPixels(12.)),
+                    size(ScaledPixels(24.), ScaledPixels(16.)),
+                ),
+                reference_radii: CornerRadii::from(Corners::all(ScaledPixels(6.))),
+                reference_transformation: rotation_around(40., (20., 20.)),
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.end_group();
+        let image = render(&mut scene);
+        let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0] as i32;
+        let sharp = |x: u32, y: u32| brightness(x, y) > 250 || brightness(x, y) < 5;
+        // The centre is blurred.
+        assert!((100..155).contains(&brightness(20, 20)), "{}", brightness(20, 20));
+        // Along the long axis, turned 40 degrees: inside the end of the box and 4 px beyond it.
+        let (sin, cos) = 40f32.to_radians().sin_cos();
+        let along = |distance: f32| ((20. + distance * cos).round() as u32, (20. + distance * sin).round() as u32);
+        let (x, y) = along(9.);
+        assert!((100..155).contains(&brightness(x, y)), "{}", brightness(x, y));
+        let (x, y) = along(15.);
+        assert!(sharp(x, y), "{}", brightness(x, y));
+        // The corners of the box around the turned one, which a bounding box would have blurred.
+        for (x, y) in [(10, 10), (30, 10), (10, 30), (30, 30)] {
+            assert!(sharp(x, y), "({x}, {y}) is {}", brightness(x, y));
+        }
+        // Outside the box nothing is blurred.
+        assert!(sharp(2, 20) && sharp(37, 20));
+    }
+
+    #[test]
+    fn a_blur_along_one_axis_leaves_the_other_alone() {
+        let blur = |x: f32, y: f32| {
+            let mut scene = groups_scene();
+            stripes(&mut scene);
+            scene.start_group(
+                GroupEffect {
+                    backdrop_filters: vec![gpui::ResolvedFilter::Blur { x, y }],
+                    reference: full_bounds(),
+                    ..GroupEffect::default()
+                },
+                window_mask(),
+                None,
+            );
+            scene.end_group();
+            render(&mut scene)
+        };
+        // The stripes are vertical, so a blur along x runs them together and one along y changes nothing.
+        let along_x = blur(4., 0.);
+        assert!((100..155).contains(&(along_x.get_pixel(20, 20).0[0] as i32)));
+        let along_y = blur(0., 4.);
+        let value = along_y.get_pixel(20, 20).0[0] as i32;
+        let neighbour = along_y.get_pixel(22, 20).0[0] as i32;
+        assert!((value - neighbour).abs() > 200, "{value} {neighbour}");
     }
 }

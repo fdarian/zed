@@ -417,13 +417,15 @@ fn group_bounds(paint: impl Fn(&mut Window) + 'static) -> Vec<(Bounds<ScaledPixe
 }
 
 #[test]
-fn a_group_in_a_rotation_covers_the_bounding_box_of_what_it_paints() {
-    let groups = group_bounds(|window| {
+fn a_group_in_a_rotation_keeps_its_reference_box_in_local_space() {
+    let radii = crate::CornerRadii::from(crate::Corners::all(ScaledPixels(6.)));
+    let groups = group_bounds(move |window| {
         window.with_transform(css([1., 0., 0., 1., 40., 10.]).compose(rotation(45.)), |window| {
             let effect = crate::GroupEffect {
                 opacity: 0.5,
-                backdrop_filters: vec![crate::ResolvedFilter::Blur(1.)],
+                backdrop_filters: vec![crate::ResolvedFilter::blur(1.)],
                 reference: square(0., 0., 20.).scale(2.),
+                reference_radii: radii,
                 ..crate::GroupEffect::default()
             };
             window.with_effect_group(effect, None, |window| {
@@ -436,15 +438,48 @@ fn a_group_in_a_rotation_covers_the_bounding_box_of_what_it_paints() {
     let side = 20. * 2. * std::f32::consts::SQRT_2;
     assert!((bounds.size.width.0 - side).abs() < 4., "{bounds:?}");
     assert!((bounds.size.height.0 - side).abs() < 4., "{bounds:?}");
-    // The bounding box of the rotated box, from which the backdrop is clipped, in the group's
-    // own coordinates.
-    let mut reference = css([1., 0., 0., 1., 40., 10.])
-        .compose(rotation(45.))
-        .scaled(2.)
-        .bounding_box_scaled(square(0., 0., 20.).scale(2.));
-    reference.origin = reference.origin - bounds.origin;
-    assert_eq!(effect.reference, reference);
-    assert_eq!(effect.reference_radii, crate::CornerRadii::default());
+    // The box and its radii stay as the element has them, and the matrix that puts them in the
+    // window is in the group's own coordinates.
+    assert_eq!(effect.reference, square(0., 0., 20.).scale(2.));
+    assert_eq!(effect.reference_radii, radii);
+    let mut placed = css([1., 0., 0., 1., 40., 10.]).compose(rotation(45.)).scaled(2.);
+    placed.translation[0] -= bounds.origin.x.0;
+    placed.translation[1] -= bounds.origin.y.0;
+    assert_eq!(effect.reference_transformation, placed);
+    // The matrix turns without scaling, so the blur of the element is the one on screen.
+    let sigma = crate::ResolvedFilter::blur(1.);
+    for filter in &effect.backdrop_filters {
+        let crate::ResolvedFilter::Blur { x, y } = *filter else {
+            panic!("{filter:?}")
+        };
+        assert!((x - 1.).abs() < 1e-4 && (y - 1.).abs() < 1e-4, "{filter:?} is not {sigma:?}");
+    }
+    // The region the backdrop covers is the bounding box of the rotated box.
+    let mut covered = placed.bounding_box_scaled(square(0., 0., 20.).scale(2.));
+    covered = covered.dilate(ScaledPixels(1.));
+    assert_eq!(effect.reference_window_bounds(), covered);
+}
+
+#[test]
+fn a_blur_follows_the_scale_of_the_matrix_it_is_in() {
+    use crate::ResolvedFilter;
+    let blur = ResolvedFilter::blur(4.);
+    let close = |filter: ResolvedFilter, x: f32, y: f32| {
+        let ResolvedFilter::Blur { x: fx, y: fy } = filter else {
+            panic!("{filter:?}")
+        };
+        assert!((fx - x).abs() < 1e-3 && (fy - y).abs() < 1e-3, "{filter:?} is not ({x}, {y})");
+    };
+    close(blur.through(&TransformationMatrix::unit()), 4., 4.);
+    close(blur.through(&css([2., 0., 0., 2., 0., 0.])), 8., 8.);
+    close(blur.through(&css([2., 0., 0., 1., 0., 0.])), 8., 4.);
+    // A quarter turn swaps the axes.
+    close(blur.through(&rotation(90.).compose(css([2., 0., 0., 1., 0., 0.]))), 4., 8.);
+    // A turn of any other size, a skew and a turn inside a scale have no axes to follow: the
+    // blur is the same on both, scaled by the square root of the area.
+    close(blur.through(&rotation(30.)), 4., 4.);
+    close(blur.through(&css([1., 0., (20f32).to_radians().tan(), 1., 0., 0.])), 4., 4.);
+    close(blur.through(&rotation(30.).compose(css([0.5, 0., 0., 0.5, 0., 0.]))), 2., 2.);
 }
 
 #[test]
@@ -563,7 +598,7 @@ fn a_path_in_a_rotation_has_its_vertices_placed_and_a_loose_clip() {
 }
 
 #[test]
-fn a_surface_is_exact_under_a_translation_and_the_bounding_box_under_a_rotation() {
+fn a_surface_is_placed_as_a_quad_is_exactly_under_a_translation_and_a_rotation() {
     let mut app = TestApp::new();
     let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
     let recorded = seen.clone();
@@ -571,25 +606,42 @@ fn a_surface_is_exact_under_a_translation_and_the_bounding_box_under_a_rotation(
         let recorded = recorded.clone();
         Painter(Rc::new(move |window| {
             let target = square(3., 4., 20.);
-            recorded.borrow_mut().push(window.surface_bounds(target));
-            window.with_transform(css([1., 0., 0., 1., 10.25, 5.1]), |window| {
-                recorded.borrow_mut().push(window.surface_bounds(target));
-            });
-            window.with_transform(rotation(90.), |window| {
-                recorded.borrow_mut().push(window.surface_bounds(target));
+            let record = |window: &mut Window| {
+                let placement = window.surface_placement(target);
+                recorded.borrow_mut().push((placement.bounds, placement.transformation, placement.local_clip));
+                window.paint_quad(fill(target, red()));
+            };
+            record(window);
+            window.with_transform(css([1., 0., 0., 1., 10.25, 5.1]), &record);
+            window.with_transform(css([1., 0., 0., 1., 40., 0.]).compose(rotation(90.)), |window| {
+                window.with_content_mask(Some(ContentMask::from_bounds(square(0., 0., 12.))), &record);
             });
         }))
     });
     window.draw();
+    let quads = window.update(|_, window, _| window.rendered_frame.scene.quads.clone());
     let seen = seen.borrow();
     let [plain, moved, turned] = seen[seen.len() - 3..] else {
         unreachable!()
     };
-    assert_eq!(plain, square(3., 4., 20.).scale(2.));
-    assert_eq!(moved.origin, plain.origin + point(ScaledPixels(21.), ScaledPixels(10.)));
-    assert_eq!(moved.size, plain.size);
-    // (x, y) goes to (-y, x): the box ends up at x in [-24, -4], y in [3, 23].
-    assert_eq!(turned, Bounds::new(point(ScaledPixels(-48.), ScaledPixels(6.)), size(ScaledPixels(40.), ScaledPixels(40.))));
+    let quads = &quads[quads.len() - 3..];
+    for ((bounds, transformation, local_clip), quad) in [plain, moved, turned].into_iter().zip(quads) {
+        assert_eq!(bounds, quad.bounds);
+        assert_eq!(transformation, quad.transformation);
+        assert_eq!(local_clip, quad.local_clip);
+    }
+    assert_eq!(plain.0, square(3., 4., 20.).scale(2.));
+    assert_eq!(plain.1, TransformationMatrix::unit());
+    // A translation moves the bounds by the rounded offset and leaves the matrix alone.
+    assert_eq!(moved.0.origin, plain.0.origin + point(ScaledPixels(21.), ScaledPixels(10.)));
+    assert_eq!(moved.0.size, plain.0.size);
+    assert_eq!(moved.1, TransformationMatrix::unit());
+    // A rotation keeps the surface's own bounds and carries the matrix: (x, y) goes to (40 - y, x).
+    assert_eq!(turned.0, plain.0);
+    assert_ne!(turned.1, TransformationMatrix::unit());
+    let corner = turned.1.apply_xy(plain.0.origin.x.0, plain.0.origin.y.0);
+    assert!((corner[0] - 72.).abs() < 1e-3 && (corner[1] - 6.).abs() < 1e-3, "{corner:?}");
+    assert_ne!(turned.2, ContentMask::unbounded());
 }
 
 mod elements {

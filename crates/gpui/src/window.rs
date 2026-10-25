@@ -2999,6 +2999,13 @@ struct Placement {
     animating: bool,
 }
 
+/// What [`Window::surface_placement`] decides for a surface.
+pub(crate) struct SurfacePlacement {
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) transformation: TransformationMatrix,
+    pub(crate) local_clip: ContentMask<ScaledPixels>,
+}
+
 /// A clip a sprite is given, in the space it is clipped in.
 pub(crate) enum SpriteClip {
     /// The content mask of the window, as it is under any transform.
@@ -7007,7 +7014,8 @@ impl Window {
     /// Inside a transform, `effect` is in the local space and the group is composited in the
     /// window: the content is drawn through the matrix, so the group covers the bounding box of
     /// what it paints. A `clip-path` is mapped through the matrix. The `backdrop-filter` is
-    /// clipped to the bounding box of the element's box, not to its rotated outline.
+    /// clipped to the exact outline of the element's box, rotated with it, and the blur of a
+    /// filter is scaled by the matrix (see [`ResolvedFilter::through`]).
     pub fn with_effect_group<R>(
         &mut self,
         mut effect: GroupEffect,
@@ -7037,8 +7045,10 @@ impl Window {
     /// not touched: they were made by painters that put them where they go.
     fn place_group_effect(&self, placement: &Placement, effect: &mut GroupEffect) {
         if placement.general {
-            effect.reference = placement.transformation.bounding_box_scaled(effect.reference);
-            effect.reference_radii = CornerRadii::default();
+            effect.reference_transformation = placement.transformation;
+            for filter in effect.filters.iter_mut().chain(&mut effect.backdrop_filters) {
+                *filter = filter.through(&placement.transformation);
+            }
             if let Some(clip_path) = &mut effect.clip_path {
                 *clip_path = clip_path.transformed(&placement.transformation);
             }
@@ -8360,15 +8370,16 @@ impl Window {
         }))
     }
 
-    /// Where a surface is drawn in device pixels. The platform draws a surface as an upright
-    /// rectangle, so under a transform that is not a translation it is drawn in the bounding box
-    /// of the transformed bounds: scaled and moved right, but not rotated or skewed.
-    pub(crate) fn surface_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+    /// Where a surface is drawn: its bounds in its own space in device pixels, and the matrix and
+    /// local clip that put that space in the window. Under a translation the bounds are moved
+    /// there and the matrix is the unit one; under a general transform the surface is drawn
+    /// through the matrix, so it is exactly the rotated or skewed shape of its bounds.
+    pub(crate) fn surface_placement(&self, bounds: Bounds<Pixels>) -> SurfacePlacement {
         let placement = self.placement();
-        if placement.general {
-            self.snap_bounds(self.bounds_in_window(bounds))
-        } else {
-            placement.shift(self.snap_bounds(bounds))
+        SurfacePlacement {
+            bounds: placement.shift(self.snap_bounds(bounds)),
+            transformation: placement.transformation,
+            local_clip: placement.local_clip,
         }
     }
 
@@ -8384,13 +8395,14 @@ impl Window {
             return;
         }
 
-
-        let bounds = self.surface_bounds(bounds);
+        let placement = self.surface_placement(bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
-            bounds,
+            bounds: placement.bounds,
             content_mask,
+            transformation: placement.transformation,
+            local_clip: placement.local_clip,
             image_buffer,
         });
     }
@@ -8425,6 +8437,8 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            transformation: TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
             texture,
             texture_size,
         });

@@ -544,7 +544,7 @@ impl Scene {
             add(sprite.window_bounds(), &sprite.content_mask);
         }
         for surface in &self.surfaces {
-            add(surface.bounds, &surface.content_mask);
+            add(surface.window_bounds(), &surface.content_mask);
         }
         for group in &self.groups {
             add(group.bounds, &group.content_mask);
@@ -725,7 +725,7 @@ impl Scene {
         if has_backdrop || effect.text_mask {
             // Only the part of the element's box inside the content mask is ever composited, and
             // the box can be arbitrarily large.
-            let reference = visual_bounds(effect.reference.intersect(&content_mask.bounds), &[]);
+            let reference = visual_bounds(effect.reference_window_bounds().intersect(&content_mask.bounds), &[]);
             if !reference.is_empty() {
                 visual = Some(visual.map_or(reference, |visual| visual.union(&reference)));
             }
@@ -1416,7 +1416,8 @@ impl Primitive {
                 transformed_bounds(&sprite.transformation, sprite.bounds)
             }
             Primitive::PolychromeSprite(sprite) => sprite.window_bounds(),
-            Primitive::Path(_) | Primitive::Surface(_) => *self.bounds(),
+            Primitive::Surface(surface) => surface.window_bounds(),
+            Primitive::Path(_) => *self.bounds(),
         }
     }
 
@@ -1673,8 +1674,15 @@ impl PolychromeSprite {
 
 impl PaintSurface {
     fn translate(&mut self, delta: Point<ScaledPixels>) {
-        translate_bounds(&mut self.bounds, delta);
         translate_mask(&mut self.content_mask, delta);
+        if !move_through(&mut self.transformation, delta) {
+            translate_bounds(&mut self.bounds, delta);
+        }
+    }
+
+    /// The area the surface covers in the window, see [`Primitive::window_bounds`].
+    pub fn window_bounds(&self) -> Bounds<ScaledPixels> {
+        transformed_bounds(&self.transformation, self.bounds)
     }
 }
 
@@ -2456,6 +2464,11 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Where the surface's own space (`bounds`, `local_clip`) is in the window, see
+    /// [`Quad::transformation`].
+    pub transformation: TransformationMatrix,
+    /// A clip in the surface's own space, see [`Quad::local_clip`].
+    pub local_clip: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     /// Type-erased GPU texture (`Arc<wgpu::Texture>`). Ported from gpui-ce
@@ -2472,7 +2485,9 @@ impl std::fmt::Debug for PaintSurface {
         debug
             .field("order", &self.order)
             .field("bounds", &self.bounds)
-            .field("content_mask", &self.content_mask);
+            .field("content_mask", &self.content_mask)
+            .field("transformation", &self.transformation)
+            .field("local_clip", &self.local_clip);
         #[cfg(target_os = "macos")]
         debug.field("image_buffer", &self.image_buffer);
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -2731,7 +2746,7 @@ mod tests {
 
     fn blurred() -> GroupEffect {
         GroupEffect {
-            filters: vec![ResolvedFilter::Blur(2.)],
+            filters: vec![ResolvedFilter::blur(2.)],
             ..GroupEffect::default()
         }
     }
@@ -2832,7 +2847,7 @@ mod tests {
         assert!(scene.groups.is_empty());
 
         let backdrop = GroupEffect {
-            backdrop_filters: vec![ResolvedFilter::Blur(2.)],
+            backdrop_filters: vec![ResolvedFilter::blur(2.)],
             reference: bounds(10., 10., 50., 50.),
             ..GroupEffect::default()
         };
@@ -3109,7 +3124,7 @@ mod tests {
     fn a_huge_backdrop_box_is_cut_to_the_content_mask() {
         let mut scene = scene();
         let backdrop = GroupEffect {
-            backdrop_filters: vec![ResolvedFilter::Blur(crate::MAX_BLUR_SIGMA)],
+            backdrop_filters: vec![ResolvedFilter::blur(crate::MAX_BLUR_SIGMA)],
             reference: bounds(-1.0e7, -1.0e7, 2.0e7, 2.0e7),
             ..GroupEffect::default()
         };
@@ -3159,7 +3174,7 @@ mod tests {
         let mut scene = scene();
         let effect = GroupEffect {
             opacity: 0.,
-            backdrop_filters: vec![ResolvedFilter::Blur(2.)],
+            backdrop_filters: vec![ResolvedFilter::blur(2.)],
             reference: bounds(10., 10., 50., 50.),
             ..GroupEffect::default()
         };
@@ -3316,6 +3331,8 @@ mod tests {
             order: 0,
             bounds: bounds(10., 10., 20., 20.),
             content_mask: mask(),
+            transformation: TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
             image_buffer,
         });
         scene.end_group();

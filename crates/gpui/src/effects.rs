@@ -102,8 +102,14 @@ pub const MAX_GROUP_EXTENT: f32 = 16384.;
 /// A filter with its lengths in device pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ResolvedFilter {
-    /// A Gaussian blur, by standard deviation.
-    Blur(f32),
+    /// A Gaussian blur, by standard deviation along each axis of the window: they differ only
+    /// where a transform scales the axes differently.
+    Blur {
+        /// Horizontal standard deviation.
+        x: f32,
+        /// Vertical standard deviation.
+        y: f32,
+    },
     /// Any of the colour filters.
     Color(ColorMatrix),
     /// A drop shadow.
@@ -119,13 +125,57 @@ pub enum ResolvedFilter {
     },
 }
 
+impl ResolvedFilter {
+    /// A blur that is the same along both axes.
+    pub fn blur(sigma: f32) -> Self {
+        ResolvedFilter::Blur { x: sigma, y: sigma }
+    }
+
+    /// The filter as it is on screen once the space it is specified in (the local space of the
+    /// element) is put through `matrix`, which is how Chrome applies a filter: it filters in the
+    /// element's own space and then transforms the result. A blur is scaled by the matrix along
+    /// each axis of the window when the matrix keeps the axes apart, which is a scale (or a
+    /// quarter turn of one). Otherwise a blur can't follow the matrix, as a separable one is
+    /// always along the window's axes, and it is scaled by the square root of the area scale,
+    /// which is what Chrome measures for a rotation, a uniform scale and a skew alike.
+    pub(crate) fn through(&self, matrix: &TransformationMatrix) -> ResolvedFilter {
+        let [[a, b], [c, d]] = matrix.rotation_scale;
+        let area_scale = (a * d - b * c).abs().sqrt();
+        let keeps_axes = b.abs() + c.abs() <= 1e-4 * (a.abs() + d.abs());
+        let swaps_axes = a.abs() + d.abs() <= 1e-4 * (b.abs() + c.abs());
+        match *self {
+            ResolvedFilter::Color(_) => *self,
+            ResolvedFilter::Blur { x, y } => {
+                let (x, y) = if keeps_axes {
+                    (x * a.abs(), y * d.abs())
+                } else if swaps_axes {
+                    (y * b.abs(), x * c.abs())
+                } else {
+                    let sigma = (x * y).sqrt() * area_scale;
+                    (sigma, sigma)
+                };
+                ResolvedFilter::Blur {
+                    x: x.min(MAX_BLUR_SIGMA),
+                    y: y.min(MAX_BLUR_SIGMA),
+                }
+            }
+            ResolvedFilter::DropShadow { dx, dy, sigma, color } => ResolvedFilter::DropShadow {
+                dx: a * dx + b * dy,
+                dy: c * dx + d * dy,
+                sigma: (sigma * area_scale).min(MAX_BLUR_SIGMA),
+                color,
+            },
+        }
+    }
+}
+
 impl FilterFunction {
     /// The filter in device pixels, with amounts clamped to what CSS allows.
     pub fn resolve(&self, scale_factor: f32) -> ResolvedFilter {
         let unit = |amount: f32| amount.clamp(0., 1.);
         match *self {
             FilterFunction::Blur(sigma) => {
-                ResolvedFilter::Blur((sigma.0 * scale_factor).clamp(0., MAX_BLUR_SIGMA))
+                ResolvedFilter::blur((sigma.0 * scale_factor).clamp(0., MAX_BLUR_SIGMA))
             }
             FilterFunction::Brightness(amount) => {
                 let amount = amount.max(0.);
@@ -235,12 +285,12 @@ pub fn filter_margin(filters: &[ResolvedFilter]) -> Edges<f32> {
     let mut margin = Edges::<f32>::default();
     for filter in filters {
         match *filter {
-            ResolvedFilter::Blur(sigma) => {
-                let reach = blur_reach(sigma);
-                margin.left += reach;
-                margin.right += reach;
-                margin.top += reach;
-                margin.bottom += reach;
+            ResolvedFilter::Blur { x, y } => {
+                let (reach_x, reach_y) = (blur_reach(x), blur_reach(y));
+                margin.left += reach_x;
+                margin.right += reach_x;
+                margin.top += reach_y;
+                margin.bottom += reach_y;
             }
             ResolvedFilter::DropShadow { dx, dy, sigma, .. } => {
                 let reach = blur_reach(sigma);
@@ -845,6 +895,10 @@ pub struct GroupEffect {
     pub reference: Bounds<ScaledPixels>,
     /// The border box's corner radii.
     pub reference_radii: CornerRadii<ScaledPixels>,
+    /// Where the space of `reference` is in the window: the unit matrix when the reference is in
+    /// the window already. Inside a transform the reference stays the border box in the
+    /// element's own space, so the backdrop is cut to its exact shape, rotated.
+    pub reference_transformation: TransformationMatrix,
     /// Multiply the group by the alpha of the glyphs painted after it, as `background-clip: text`.
     pub text_mask: bool,
     /// The group exists only for the content mask it composites under, which clips the whole group
@@ -865,6 +919,7 @@ impl Default for GroupEffect {
             clip_path: None,
             reference: Bounds::default(),
             reference_radii: CornerRadii::default(),
+            reference_transformation: TransformationMatrix::unit(),
             text_mask: false,
             exact_clip: false,
         }
@@ -887,8 +942,24 @@ impl GroupEffect {
         self.is_opacity_only() && self.opacity >= 1.
     }
 
+    /// The area of the window the reference covers: its bounds, or the bounding box of its
+    /// bounds through `reference_transformation`.
+    pub fn reference_window_bounds(&self) -> Bounds<ScaledPixels> {
+        if self.reference_transformation == TransformationMatrix::unit() {
+            return self.reference;
+        }
+        self.reference_transformation
+            .bounding_box_scaled(self.reference)
+            .dilate(ScaledPixels(1.))
+    }
+
     pub(crate) fn translate(&mut self, delta: Point<ScaledPixels>) {
-        self.reference.origin = self.reference.origin + delta;
+        if self.reference_transformation == TransformationMatrix::unit() {
+            self.reference.origin = self.reference.origin + delta;
+        } else {
+            self.reference_transformation.translation[0] += delta.x.0;
+            self.reference_transformation.translation[1] += delta.y.0;
+        }
         if let Some(clip_path) = &mut self.clip_path {
             clip_path.translate(Point::new(delta.x.0, delta.y.0));
         }
@@ -965,7 +1036,7 @@ mod tests {
     #[test]
     fn blur_and_drop_shadow_grow_the_painted_area() {
         let blur = FilterFunction::Blur(px(2.)).resolve(2.);
-        assert_eq!(blur, ResolvedFilter::Blur(4.));
+        assert_eq!(blur, ResolvedFilter::blur(4.));
         let margin = filter_margin(&[blur]);
         assert_eq!((margin.left, margin.top), (12., 12.));
 
@@ -985,9 +1056,9 @@ mod tests {
     fn a_huge_blur_is_capped_and_so_is_its_margin() {
         assert_eq!(
             FilterFunction::Blur(px(1.0e9)).resolve(2.),
-            ResolvedFilter::Blur(MAX_BLUR_SIGMA)
+            ResolvedFilter::blur(MAX_BLUR_SIGMA)
         );
-        let chain = vec![ResolvedFilter::Blur(MAX_BLUR_SIGMA); 40];
+        let chain = vec![ResolvedFilter::blur(MAX_BLUR_SIGMA); 40];
         let margin = filter_margin(&chain);
         assert_eq!(
             (margin.left, margin.right, margin.top, margin.bottom),
@@ -1008,7 +1079,7 @@ mod tests {
             point(ScaledPixels(10.4), ScaledPixels(20.6)),
             size(ScaledPixels(5.), ScaledPixels(5.)),
         );
-        let visual = visual_bounds(content, &[ResolvedFilter::Blur(1.)]);
+        let visual = visual_bounds(content, &[ResolvedFilter::blur(1.)]);
         assert_eq!(visual.origin, point(ScaledPixels(7.), ScaledPixels(17.)));
         assert_eq!(visual.size, size(ScaledPixels(12.), ScaledPixels(12.)));
     }
@@ -1306,7 +1377,7 @@ mod tests {
         };
         assert!(effect.is_opacity_only());
         assert!(!effect.is_noop());
-        effect.filters.push(ResolvedFilter::Blur(1.));
+        effect.filters.push(ResolvedFilter::blur(1.));
         assert!(!effect.is_opacity_only());
         assert!(GroupEffect::default().is_noop());
         // A group kept for its content mask does more than fade, and is not left out.

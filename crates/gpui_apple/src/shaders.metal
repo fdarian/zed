@@ -1228,6 +1228,8 @@ struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
   uint surface_id [[flat]];
+  float2 local_position;
+  float local_scale;
   float clip_distance [[clip_distance]][4];
 };
 
@@ -1235,6 +1237,8 @@ struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
   uint surface_id [[flat]];
+  float2 local_position;
+  float local_scale;
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -1247,17 +1251,19 @@ vertex SurfaceVertexOutput surface_vertex(
     [[buffer(SurfaceInputIndex_TextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   SurfaceBounds surface = surfaces[surface_id];
-  float4 device_position =
-      to_device_position(unit_vertex, surface.bounds, viewport_size);
-  float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
-                                                 surface.content_mask.bounds);
+  TransformedVertex vertex_data =
+      transformed_vertex(unit_vertex, surface.bounds, surface.transformation,
+                         surface.content_mask.bounds, viewport_size);
+  float4 clip_distance = vertex_data.clip_distance;
   // We are going to copy the whole texture, so the texture position corresponds
-  // to the current vertex of the unit triangle.
-  float2 texture_position = unit_vertex;
+  // to the position across the bounds (a little beyond them for the padding of a
+  // transformed surface, which the fragment clamps).
   return SurfaceVertexOutput{
-      device_position,
-      texture_position,
+      vertex_data.device_position,
+      vertex_data.unit_position,
       surface_id,
+      vertex_data.local_position,
+      vertex_data.local_scale,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -1274,12 +1280,21 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
                float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
                float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
+  SurfaceBounds surface = surfaces[input.surface_id];
+  bool transformed = input.local_scale > 0.0;
+  float2 texture_position = transformed ? saturate(input.texture_position) : input.texture_position;
   float4 ycbcr = float4(
-      y_texture.sample(texture_sampler, input.texture_position).r,
-      cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+      y_texture.sample(texture_sampler, texture_position).r,
+      cb_cr_texture.sample(texture_sampler, texture_position).rg, 1.0);
 
   float4 color = ycbcrToRGBTransform * ycbcr;
-  color.a = content_mask_coverage(input.position.xy, surfaces[input.surface_id].content_mask);
+  float coverage = content_mask_coverage(input.position.xy, surface.content_mask);
+  if (transformed) {
+    // The padding past the bounds is where the antialiased edge is drawn.
+    coverage *= rect_coverage(input.local_position, surface.bounds, input.local_scale) *
+                local_clip_coverage(input.local_position, surface.local_clip, input.local_scale);
+  }
+  color.a = coverage;
   return color;
 }
 
@@ -1903,6 +1918,11 @@ struct CompositeParams {
   float4 reference;
   float4 reference_radii;
   float4 reference_radii_y;
+  // When the reference is in the element's own space (offset.w is 1): the matrix from the
+  // target to that space (a, b, c, d of its rows) and its translation (offset.xy), and the
+  // device pixels one unit of that space covers (offset.z).
+  float4 reference_matrix;
+  float4 reference_offset;
 };
 
 float rounded_rect_sdf(float2 position, float4 rect, float4 radii, float4 radii_y) {
@@ -2001,7 +2021,14 @@ fragment float4 composite_fragment(
   float coverage = saturate(0.5 - rounded_rect_sdf(position, params.content_mask, params.content_radii, params.content_radii_y));
 
   if (params.reference.z > 0.0) {
-    coverage *= saturate(0.5 - rounded_rect_sdf(position, params.reference, params.reference_radii, params.reference_radii_y));
+    if (params.reference_offset.w > 0.5) {
+      float2 local_reference = float2(
+          params.reference_matrix.x * position.x + params.reference_matrix.y * position.y + params.reference_offset.x,
+          params.reference_matrix.z * position.x + params.reference_matrix.w * position.y + params.reference_offset.y);
+      coverage *= saturate(0.5 - rounded_rect_sdf(local_reference, params.reference, params.reference_radii, params.reference_radii_y) * params.reference_offset.z);
+    } else {
+      coverage *= saturate(0.5 - rounded_rect_sdf(position, params.reference, params.reference_radii, params.reference_radii_y));
+    }
   }
 
   float2 local = position - params.group.xy;
