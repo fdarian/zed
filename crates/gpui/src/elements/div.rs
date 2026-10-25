@@ -8568,6 +8568,71 @@ mod tests {
             assert_eq!(chain_at(&window, cx, 50., 50.), ["list", "root"]);
         }
 
+        /// A 100 x 100 list at the origin, rounded by 40, over a red row that fills it.
+        fn rounded_list_with_a_red_row(border: f32) -> AnyElement {
+            root()
+                .child(node("under", 0., 0., 300., 300.))
+                .child(
+                    list(ListState::new(1, ListAlignment::Top, px(0.)), |_, _, _| {
+                        div()
+                            .id("row")
+                            .h(px(100.))
+                            .w_full()
+                            .always_hitbox()
+                            .bg(crate::hsla(0., 1., 0.5, 1.))
+                            .into_any_element()
+                    })
+                    .id("list")
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w(px(100.))
+                    .h(px(100.))
+                    .border(px(border))
+                    .rounded(px(40.)),
+                )
+                .into_any_element()
+        }
+
+        /// The corner radius of the clip the red row is painted through, in layout pixels.
+        fn red_row_clip_radius(window: &AnyWindowHandle, cx: &mut TestAppContext) -> f32 {
+            cx.update_window(*window, |_, window, _| {
+                let quads = window.painted_quads();
+                let row = quads
+                    .iter()
+                    .find(|quad| quad.background.as_solid() == Some(crate::hsla(0., 1., 0.5, 1.)))
+                    .expect("the row is painted");
+                row.content_mask.corner_radii.top_left.0 / window.scale_factor()
+            })
+            .unwrap()
+        }
+
+        #[gpui::test]
+        fn a_list_clips_and_hits_its_rows_through_its_rounded_corners(cx: &mut TestAppContext) {
+            let window = open_scene(cx, true, || rounded_list_with_a_red_row(0.));
+            assert_eq!(red_row_clip_radius(&window, cx), 40.);
+            // The corner is rounded away: the row is neither hit nor painted there.
+            assert_eq!(chain_at(&window, cx, 4., 4.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 96., 96.), ["under", "root"]);
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["row", "list", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 2.), ["row", "list", "root"]);
+        }
+
+        #[gpui::test]
+        fn a_bordered_list_rounds_the_clip_of_its_rows_by_the_radius_less_the_border(
+            cx: &mut TestAppContext,
+        ) {
+            let window = open_scene(cx, true, || rounded_list_with_a_red_row(10.));
+            assert_eq!(red_row_clip_radius(&window, cx), 30.);
+            // The padding box starts at 10 and its corner circle is centred on (40, 40) with radius 30:
+            // (12, 12) is 39.6 from the centre, (20, 20) is 28.3. (12, 12) is still in the border,
+            // inside the outer arc of radius 40.
+            assert_eq!(chain_at(&window, cx, 12., 12.), ["list", "root"]);
+            assert_eq!(chain_at(&window, cx, 88., 88.), ["list", "root"]);
+            assert_eq!(chain_at(&window, cx, 20., 20.), ["row", "list", "root"]);
+            assert_eq!(chain_at(&window, cx, 50., 12.), ["row", "list", "root"]);
+        }
+
         #[gpui::test]
         fn a_rounded_overflow_clip_cuts_the_hit_area_of_its_children_at_the_corners(
             cx: &mut TestAppContext,

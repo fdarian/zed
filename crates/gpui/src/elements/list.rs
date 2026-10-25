@@ -297,6 +297,8 @@ pub struct ListPrepaintState {
     layout: LayoutItemsResponse,
     /// The padding box, where the rows are clipped and hit.
     viewport: Bounds<Pixels>,
+    /// The clip of the rows: the padding box with the corners rounded as a scroller's are.
+    clip: ContentMask<Pixels>,
     /// Whether a row escapes the list's clip, which keeps the clip from being painted exactly.
     escape_inside: bool,
 }
@@ -1471,10 +1473,12 @@ impl StateInner {
         }
     }
 
-    /// `bounds` is the padding box, `unsnapped` the same box as layout sized it.
+    /// `bounds` is the padding box, `unsnapped` the same box as layout sized it, `clip` the
+    /// padding box with its rounded corners, which the rows are hit through.
     fn prepaint_items(
         &mut self,
         bounds: Bounds<Pixels>,
+        clip: ContentMask<Pixels>,
         unsnapped: Bounds<Pixels>,
         padding: Edges<Pixels>,
         autoscroll: bool,
@@ -1514,7 +1518,7 @@ impl StateInner {
                 let mut item_origin = unsnapped.origin + Point::new(padding.left, padding.top);
                 item_origin.y += scroll_snap - layout_response.first_row_offset;
                 for item in &mut layout_response.item_layouts {
-                    window.with_exact_hit_mask(Some(ContentMask::from_bounds(bounds)), |window| {
+                    window.with_exact_hit_mask(Some(clip), |window| {
                         item.element.prepaint_at_fractional(item_origin, window, cx);
                     });
 
@@ -1827,6 +1831,7 @@ impl Element for List {
         // A scroller's client box is its padding box, as the rows' clip and range are.
         let unsnapped = padding_box(window.layout_unsnapped_bounds(layout_id), &insets.border);
         let viewport = padding_box(bounds, &insets.border);
+        let clip = style.padding_box_mask(bounds, rem_size);
         let content_width = padded_width(unsnapped.size.width, &padding);
 
         // A change in the width rows get, from the list's own width or its
@@ -1857,12 +1862,12 @@ impl Element for List {
         let escapes_before = window.escapes_prepainted();
         let layout = window.with_element_space(space.clone(), |window| {
             window.with_hitbox_parent(&hitbox, |window| {
-                match state.prepaint_items(viewport, unsnapped, padding, true, &mut self.render_item, window, cx) {
+                match state.prepaint_items(viewport, clip, unsnapped, padding, true, &mut self.render_item, window, cx) {
                     Ok(layout) => layout,
                     Err(autoscroll_request) => {
                         state.logical_scroll_top = Some(autoscroll_request);
                         state
-                            .prepaint_items(viewport, unsnapped, padding, false, &mut self.render_item, window, cx)
+                            .prepaint_items(viewport, clip, unsnapped, padding, false, &mut self.render_item, window, cx)
                             .unwrap()
                     }
                 }
@@ -1899,6 +1904,7 @@ impl Element for List {
             transform_box,
             layout,
             viewport,
+            clip,
             escape_inside: window.escapes_prepainted() != escapes_before,
         }
     }
@@ -1924,6 +1930,7 @@ impl Element for List {
             // div-based scroll containers.
             let list_state = self.state.clone();
             let viewport = prepaint.viewport;
+            let clip = prepaint.clip;
             let height = viewport.size.height;
             let scroll_top = prepaint.layout.scroll_top;
             let hitbox = prepaint.hitbox.clone();
@@ -1987,7 +1994,7 @@ impl Element for List {
                 .style
                 .paint_with_effects(bounds, window, cx, |window, cx| {
                     window.with_overflow_clip(
-                        Some(ContentMask::from_bounds(viewport)),
+                        Some(clip),
                         escape_inside,
                         |window| {
                             for item in &mut layout.item_layouts {

@@ -1096,13 +1096,27 @@ impl Style {
             _ if self.overflow.x == Overflow::Visible && self.overflow.y == Overflow::Visible => {
                 return None;
             }
-            _ => (
-                Bounds::from_corners(min, max),
-                self.border_box_radii(bounds, rem_size).inset(border_widths),
-            ),
+            _ => return Some(self.padding_box_mask(bounds, rem_size)),
         };
 
         Some(ContentMask::rounded(mask_bounds, corner_radii))
+    }
+
+    /// The clip of an element that hides its overflow on both axes: the padding box, with the
+    /// corners rounded by the border radius minus the adjacent border width. A scroller that
+    /// clips its own children, as a list does, takes this mask.
+    pub(crate) fn padding_box_mask(
+        &self,
+        bounds: Bounds<Pixels>,
+        rem_size: Pixels,
+    ) -> ContentMask<Pixels> {
+        let border_widths = self.border_widths.to_pixels(rem_size);
+        let min = bounds.origin + point(border_widths.left, border_widths.top);
+        let max = bounds.bottom_right() - point(border_widths.right, border_widths.bottom);
+        ContentMask::rounded(
+            Bounds::from_corners(min, max),
+            self.border_box_radii(bounds, rem_size).inset(border_widths),
+        )
     }
 
     /// Paints the element like [`Style::paint`], as one offscreen group when it has an effect
