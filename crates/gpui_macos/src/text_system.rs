@@ -50,8 +50,8 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
 
 use crate::open_type::{
-    VariationAxis, apply_features_and_fallbacks, apply_variations, current_variations,
-    variation_axes,
+    VariationAxis, apply_features_and_fallbacks, apply_variations, copy_for_advances,
+    current_variations, font_table_tags, variation_axes,
 };
 
 #[allow(non_upper_case_globals)]
@@ -92,6 +92,64 @@ struct MacTextSystemState {
     /// than a lookup. A CTFont is also what CoreText keeps its per-font caches on (the ASCII
     /// glyph and advance tables), so a copy made for every line has them filled for every line.
     sized_fonts: Mutex<HashMap<(FontId, u32), CTFont>>,
+    /// Where Chrome takes the advances of each of `fonts` from, by the same index.
+    advance_sources: Vec<AdvanceSource>,
+    /// The copies of a face that give its advances, by face, size and scale factor
+    /// (see [`MacTextSystemState::advance_font`]).
+    advance_fonts: Mutex<HashMap<(FontId, u32, u32), CTFont>>,
+}
+
+/// Where Chrome gets the advances of a font from. CoreText has its own, and they are the same as
+/// Chrome's for a font without a `trak` table. A font with one is advanced differently by Blink
+/// (`HarfBuzzFace`, `harfbuzz_face.cc`) and by Skia (`SkScalerContext_mac_ct.cpp`), which CoreText
+/// only does when the font is made as they make it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdvanceSource {
+    /// The advances CoreText gives.
+    CoreText,
+    /// A `trak` table and no `sbix` (PingFang): HarfBuzz tracks the advances itself, at the CSS size.
+    Tracked,
+    /// A `trak` table and an `sbix` (Apple Color Emoji): Skia's advances, which have no tracking,
+    /// at the device size.
+    Untracked,
+}
+
+impl AdvanceSource {
+    fn of(font: &CTFont) -> Self {
+        let tables = font_table_tags(font);
+        let has = |tag: &[u8; 4]| tables.contains(&u32::from_be_bytes(*tag));
+        match (has(b"trak"), has(b"sbix")) {
+            (false, _) => Self::CoreText,
+            (true, false) => Self::Tracked,
+            (true, true) => Self::Untracked,
+        }
+    }
+}
+
+/// The advances of a face as Chrome measures them: from `font`, in units of which a pixel is
+/// `per_pixel`.
+struct AdvanceFont {
+    font: CTFont,
+    per_pixel: f64,
+}
+
+impl AdvanceFont {
+    fn advances(&self, glyphs: &[CGGlyph]) -> Vec<f64> {
+        let mut advances = vec![CGSize::new(0., 0.); glyphs.len()];
+        // SAFETY: one advance out for each glyph in.
+        unsafe {
+            self.font.get_advances_for_glyphs(
+                kCTFontOrientationDefault,
+                glyphs.as_ptr(),
+                advances.as_mut_ptr(),
+                glyphs.len() as CFIndex,
+            );
+        }
+        advances
+            .iter()
+            .map(|advance| advance.width / self.per_pixel)
+            .collect()
+    }
 }
 
 struct VariedFace {
@@ -119,6 +177,8 @@ impl MacTextSystem {
             varied_fonts: HashMap::default(),
             varied_faces: HashMap::default(),
             sized_fonts: Mutex::new(HashMap::default()),
+            advance_sources: Vec::new(),
+            advance_fonts: Mutex::new(HashMap::default()),
         }))
     }
 }
@@ -223,8 +283,16 @@ impl PlatformTextSystem for MacTextSystem {
         self.0.read().advance(font_id, glyph_id)
     }
 
-    fn glyph_advance(&self, font_id: FontId, glyph_id: GlyphId, font_size: Pixels) -> Result<f64> {
-        self.0.read().glyph_advance(font_id, glyph_id, font_size)
+    fn glyph_advance(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        scale_factor: f32,
+    ) -> Result<f64> {
+        self.0
+            .read()
+            .glyph_advance(font_id, glyph_id, font_size, scale_factor)
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
@@ -519,6 +587,8 @@ impl MacTextSystemState {
     fn push_font(&mut self, font: FontKitFont) -> FontId {
         let font_id = FontId(self.fonts.len());
         self.font_metrics.push(font_kit_metrics_to_metrics(&font));
+        self.advance_sources
+            .push(AdvanceSource::of(&font.native_font()));
         self.fonts.push(font);
         font_id
     }
@@ -616,13 +686,56 @@ impl MacTextSystemState {
         copy
     }
 
+    /// The font that gives the advances of `font_id` at `size` logical pixels, as Chrome measures
+    /// them on a display of `scale_factor` device pixels to a pixel, and `None` for a face whose
+    /// advances are CoreText's own (see [`AdvanceSource`]).
+    ///
+    /// HarfBuzz tracks a font with a `trak` table by the size it is told, which is the CSS size, and
+    /// CoreText only does so for a copy that has the optical size set. Skia measures a copy at the
+    /// device size with its tracking turned off.
+    fn advance_font(&self, font_id: FontId, size: f32, scale_factor: f32) -> Option<AdvanceFont> {
+        let (copy_size, tracking, per_pixel) = match self.advance_sources[font_id.0] {
+            AdvanceSource::CoreText => return None,
+            AdvanceSource::Tracked => (f64::from(size), true, 1.),
+            AdvanceSource::Untracked => (
+                f64::from(size) * f64::from(scale_factor),
+                false,
+                f64::from(scale_factor),
+            ),
+        };
+        let key = (font_id, size.to_bits(), scale_factor.to_bits());
+        let mut fonts = self.advance_fonts.lock();
+        let font = match fonts.get(&key) {
+            Some(font) => font.clone(),
+            None => {
+                let font =
+                    copy_for_advances(&self.sized_font(font_id, size), copy_size, copy_size, tracking);
+                if fonts.len() >= SIZED_FONTS_LIMIT {
+                    fonts.clear();
+                }
+                fonts.insert(key, font.clone());
+                font
+            }
+        };
+        Some(AdvanceFont { font, per_pixel })
+    }
+
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
         Ok(size_from_vector2f(
             self.fonts[font_id.0].advance(glyph_id.0)?,
         ))
     }
 
-    fn glyph_advance(&self, font_id: FontId, glyph_id: GlyphId, font_size: Pixels) -> Result<f64> {
+    fn glyph_advance(
+        &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        scale_factor: f32,
+    ) -> Result<f64> {
+        if let Some(advance_font) = self.advance_font(font_id, f32::from(font_size), scale_factor) {
+            return Ok(advance_font.advances(&[glyph_id.0 as CGGlyph])[0]);
+        }
         let font = self.sized_font(font_id, f32::from(font_size));
         let mut advance = CGSize::new(0., 0.);
         // SAFETY: one glyph in, one advance out.
@@ -665,13 +778,26 @@ impl MacTextSystemState {
             })
     }
 
+    /// Whether `params` is a glyph of an emoji font that Chrome sets at the device size, with the
+    /// advance of that size: it is drawn at that size too, which is not the logical size scaled. Apple
+    /// Color Emoji draws a glyph larger for its em at a small size than at a large one (an emoji
+    /// is 16 wide at 13 px and 24 at 26 px), so a glyph drawn at 13 px scaled by 2 is wider than its
+    /// advance at 26 px.
+    fn draws_at_device_size(&self, params: &RenderGlyphParams) -> bool {
+        params.is_emoji && self.advance_sources[params.font_id.0] == AdvanceSource::Untracked
+    }
+
     fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let font = &self.fonts[params.font_id.0];
+        let (size, factor) = if self.draws_at_device_size(params) {
+            (f32::from(params.font_size) * params.scale_factor, 1.)
+        } else {
+            (f32::from(params.font_size), params.scale_factor)
+        };
         let scale = if params.transform.is_identity() {
-            Transform2F::from_scale(params.scale_factor)
+            Transform2F::from_scale(factor)
         } else {
             let linear = params.transform.linear();
-            let factor = params.scale_factor;
             Transform2F {
                 matrix: Matrix2x2F::row_major(
                     linear[0][0] * factor,
@@ -684,7 +810,7 @@ impl MacTextSystemState {
         };
         let bounds: Bounds<DevicePixels> = bounds_from_rect_i(font.raster_bounds(
             params.glyph_id.0,
-            params.font_size.into(),
+            size,
             scale,
             HintingOptions::None,
             font_kit::canvas::RasterizationOptions::GrayscaleAa,
@@ -755,6 +881,18 @@ impl MacTextSystemState {
                 );
             }
 
+            let device_font = self
+                .draws_at_device_size(params)
+                .then(|| {
+                    self.advance_font(
+                        params.font_id,
+                        f32::from(params.font_size),
+                        params.scale_factor,
+                    )
+                })
+                .flatten();
+            // A glyph drawn at the device size is in device pixels, with no scale.
+            let scale = if device_font.is_some() { 1. } else { params.scale_factor };
             let subpixel_shift = params
                 .subpixel_variant
                 .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
@@ -765,13 +903,10 @@ impl MacTextSystemState {
                     -glyph_bounds.origin.x.0 as CGFloat,
                     (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
                 );
-                cx.scale(
-                    params.scale_factor as CGFloat,
-                    params.scale_factor as CGFloat,
-                );
+                cx.scale(scale as CGFloat, scale as CGFloat);
                 CGPoint::new(
-                    (subpixel_shift.x / params.scale_factor) as CGFloat,
-                    (subpixel_shift.y / params.scale_factor) as CGFloat,
+                    (subpixel_shift.x / scale) as CGFloat,
+                    (subpixel_shift.y / scale) as CGFloat,
                 )
             } else {
                 // The glyph is drawn through the transform around its origin, which is where
@@ -783,7 +918,7 @@ impl MacTextSystemState {
                     (glyph_bounds.origin.y.0 as f32 + bitmap_size.height.0 as f32 - subpixel_shift.y) as CGFloat,
                 );
                 let linear = params.transform.linear();
-                let factor = params.scale_factor;
+                let factor = scale;
                 cx.concat_ctm(CGAffineTransform::new(
                     (linear[0][0] * factor) as CGFloat,
                     (-linear[1][0] * factor) as CGFloat,
@@ -810,12 +945,11 @@ impl MacTextSystemState {
             } else if smoothed {
                 cx.set_should_smooth_fonts(true);
             }
-            self.sized_font(params.font_id, f32::from(params.font_size))
-                .draw_glyphs(
-                    &[params.glyph_id.0 as CGGlyph],
-                    &[draw_at],
-                    cx,
-                );
+            let font = match device_font {
+                Some(device_font) => device_font.font,
+                None => self.sized_font(params.font_id, f32::from(params.font_size)),
+            };
+            font.draw_glyphs(&[params.glyph_id.0 as CGGlyph], &[draw_at], cx);
 
             if params.is_emoji {
                 // Convert from RGBA with premultiplied alpha to BGRA with straight alpha.
@@ -892,6 +1026,8 @@ impl MacTextSystemState {
         let glyph_runs = line.glyph_runs();
         let mut runs = <Vec<ShapedRun>>::with_capacity(glyph_runs.len() as usize);
         let mut ix_converter = StringIndexConverter::new(text);
+        // How far Chrome's advances have moved the glyphs so far, in logical pixels.
+        let mut shift = 0.;
         for run in glyph_runs.into_iter() {
             let attributes = run.attributes().unwrap();
             let font = unsafe {
@@ -916,9 +1052,32 @@ impl MacTextSystemState {
             let font_id = if input_run.postscript_name == font.postscript_name() {
                 input_run.font_id
             } else {
-                self.id_for_native_font(font)
+                self.id_for_native_font(font.clone())
             };
 
+            // The glyphs CoreText advanced are moved to where Chrome's advances put them. The
+            // kerning CoreText applied to a pair stays.
+            let glyph_ids = run.glyphs();
+            let moves = self
+                .advance_font(font_id, f32::from(input_run.font_size), scale_factor)
+                .map(|advance_font| {
+                    let mut coretext = vec![CGSize::new(0., 0.); glyph_ids.len()];
+                    // SAFETY: one advance out for each glyph in.
+                    unsafe {
+                        font.get_advances_for_glyphs(
+                            kCTFontOrientationDefault,
+                            glyph_ids.as_ptr(),
+                            coretext.as_mut_ptr(),
+                            glyph_ids.len() as CFIndex,
+                        );
+                    }
+                    advance_font
+                        .advances(&glyph_ids)
+                        .into_iter()
+                        .zip(coretext)
+                        .map(|(chrome, coretext)| chrome - coretext.width)
+                        .collect::<Vec<f64>>()
+                });
             let glyphs = match runs.last_mut() {
                 Some(run)
                     if run.font_id == font_id
@@ -940,11 +1099,11 @@ impl MacTextSystemState {
                     &mut runs.last_mut().unwrap().glyphs
                 }
             };
-            for ((&glyph_id, position), &glyph_utf16_ix) in run
-                .glyphs()
+            for (glyph_ix, ((&glyph_id, position), &glyph_utf16_ix)) in glyph_ids
                 .iter()
                 .zip(run.positions().iter())
                 .zip(run.string_indices().iter())
+                .enumerate()
             {
                 let glyph_utf16_ix = usize::try_from(glyph_utf16_ix).unwrap();
                 if ix_converter.utf16_ix > glyph_utf16_ix {
@@ -954,10 +1113,13 @@ impl MacTextSystemState {
                 ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
-                    position: point(position.x as f32, position.y as f32).map(px),
+                    position: point((position.x + shift) as f32, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
                     is_emoji: self.is_emoji(font_id),
                 });
+                if let Some(moves) = &moves {
+                    shift += moves[glyph_ix];
+                }
             }
         }
         let typographic_bounds = line.get_typographic_bounds();
@@ -969,7 +1131,7 @@ impl MacTextSystemState {
         LineLayout {
             runs,
             font_size,
-            width: typographic_bounds.width.into(),
+            width: (typographic_bounds.width + shift).into(),
             ascent: strut.map_or(Pixels::ZERO, |strut| strut.ascent),
             descent: strut.map_or(Pixels::ZERO, |strut| strut.descent),
             scale_factor,
@@ -2498,6 +2660,93 @@ mod tests {
                 .min_content_width(text.to_string().into(), px(16.), &[run], cut, &[])
                 .unwrap();
             assert_eq!(measured, px(chrome), "{text}");
+        }
+    }
+
+    /// The advances Chrome sets a font with a `trak` table with: HarfBuzz tracks PingFang at the CSS size, and Skia
+    /// advances Apple Color Emoji at the device size with its tracking off, where CoreText advances both its own way
+    /// (13 and 17 at 13px). The numbers are Chrome's own (`fallback-advance-oracle.json`, 1/64 apart).
+    #[test]
+    fn test_a_font_with_a_trak_table_is_advanced_as_chrome_advances_it() {
+        use super::AdvanceSource;
+
+        let fonts = MacTextSystem::new();
+        let id = |family: &str| fonts.font_id(&font(family)).unwrap();
+        let source = |family: &str| {
+            let font_id = id(family);
+            fonts.0.read().advance_sources[font_id.0]
+        };
+        assert_eq!(source("PingFang SC"), AdvanceSource::Tracked);
+        // Apple Color Emoji cannot be asked for by name, only fallen back to.
+        let emoji = fonts
+            .layout_line(
+                "😀",
+                px(13.),
+                &[FontRun { len: 4, font_id: id("Helvetica Neue"), font_size: None, line_height: None }],
+                1.,
+            )
+            .runs[0]
+            .font_id;
+        assert_eq!(fonts.0.read().advance_sources[emoji.0], AdvanceSource::Untracked);
+        for family in ["Helvetica Neue", "Menlo", "Hiragino Sans", "Apple SD Gothic Neo"] {
+            assert_eq!(source(family), AdvanceSource::CoreText, "{family}");
+        }
+
+        let width = |family: &str, text: &str, size: f32, scale_factor: f32| {
+            let run = FontRun { len: text.len(), font_id: id(family), font_size: None, line_height: None };
+            f32::from(fonts.layout_line(text, px(size), &[run], scale_factor).width)
+        };
+        let close = |actual: f32, expected: f32, what: &str| {
+            assert!((actual - expected).abs() <= 1. / 64., "{what}: {actual}, Chrome {expected}");
+        };
+        for scale_factor in [1., 2.] {
+            // PingFang's tracking is by the CSS size, whatever the device size is, in the font asked for
+            // and in the one CoreText falls back to.
+            for family in ["Helvetica Neue", "Menlo", "PingFang SC"] {
+                close(width(family, "中文测试", 13., scale_factor), 4. * 13.26, family);
+                close(width(family, "中", 16., scale_factor), 16.32, family);
+                close(width(family, "中", 24., scale_factor), 24.32, family);
+            }
+            // Hangul and kana are not tracked.
+            close(width("Helvetica Neue", "한국어", 13., scale_factor), 3. * 11.245, "Hangul");
+            close(width("Helvetica Neue", "こんにちは", 13., scale_factor), 5. * 13., "kana");
+        }
+        // An emoji is 17 wide at 13px to CoreText and 16 to Chrome, 13 at a device size of 26 (an em).
+        for (family, size, scale_factor, expected) in [
+            ("Helvetica Neue", 13., 1., 16.),
+            ("Helvetica Neue", 13., 2., 13.),
+            ("Menlo", 16., 1., 20.),
+            ("Menlo", 16., 2., 16.),
+            ("Helvetica Neue", 24., 1., 24.),
+            ("Helvetica Neue", 10., 1., 13.),
+        ] {
+            close(width(family, "😀", size, scale_factor), expected, &format!("{family} {size} x{scale_factor}"));
+        }
+    }
+
+    /// The glyphs after a glyph of a font that is advanced as Chrome does stand after its advance, the width is the sum,
+    /// and `glyph_advance`, which the line's measure is made from, agrees with both.
+    #[test]
+    fn test_the_glyphs_after_a_fallback_glyph_move_with_its_advance() {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica Neue")).unwrap();
+        for scale_factor in [1., 2.] {
+            let text = "a中b😀c";
+            let run = FontRun { len: text.len(), font_id, font_size: None, line_height: None };
+            let layout = fonts.layout_line(text, px(13.), &[run], scale_factor);
+            let glyphs: Vec<_> = layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(move |glyph| (run.font_id, glyph)))
+                .collect();
+            let mut x = 0.;
+            for (ix, (run_font, glyph)) in glyphs.iter().enumerate() {
+                let at = f32::from(glyph.position.x);
+                assert!((at - x).abs() < 1e-3, "glyph {ix}: {at} at {x}");
+                x += fonts.glyph_advance(*run_font, glyph.id, px(13.), scale_factor).unwrap() as f32;
+            }
+            let width = f32::from(layout.width);
+            assert!((width - x).abs() < 1e-3, "{width} and {x}");
         }
     }
 }

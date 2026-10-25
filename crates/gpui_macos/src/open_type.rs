@@ -205,6 +205,53 @@ pub fn variation_axes(font: &FontKitFont) -> Vec<VariationAxis> {
         .collect()
 }
 
+/// The tags of the tables `font` has.
+pub fn font_table_tags(font: &CTFont) -> Vec<u32> {
+    unsafe {
+        let tags = CTFontCopyAvailableTables(font.as_concrete_TypeRef(), 0);
+        if tags.is_null() {
+            return Vec::new();
+        }
+        // The array holds the tags themselves, as bare integers, not objects.
+        let list = (0..CFArrayGetCount(tags))
+            .map(|ix| CFArrayGetValueAtIndex(tags, ix) as usize as u32)
+            .collect();
+        CFRelease(tags as _);
+        list
+    }
+}
+
+/// A copy of `font` at `size` with the optical size `optical_size`, set the way Skia
+/// (`SkCTFontCreateExactCopy`) and HarfBuzz hand CoreText a font to measure with. Without the
+/// optical size CoreText gives a fallback font no tracking, and `tracking` false turns the
+/// font's own tracking (its `trak` table) off.
+pub fn copy_for_advances(font: &CTFont, size: f64, optical_size: f64, tracking: bool) -> CTFont {
+    let optical = CFNumber::from(optical_size);
+    let unscaled_tracking = CFNumber::from(0i32);
+    let mut attributes = vec![(
+        CFString::new("NSCTFontOpticalSizeAttribute"),
+        optical.as_CFType(),
+    )];
+    if !tracking {
+        attributes.push((
+            CFString::new("NSCTFontUnscaledTrackingAttribute"),
+            unscaled_tracking.as_CFType(),
+        ));
+    }
+    let attributes = CFDictionary::from_CFType_pairs(&attributes);
+    unsafe {
+        let descriptor = CTFontDescriptor::wrap_under_create_rule(
+            CTFontDescriptorCreateWithAttributes(attributes.as_concrete_TypeRef()),
+        );
+        CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
+            font.as_concrete_TypeRef(),
+            size,
+            std::ptr::null(),
+            descriptor.as_concrete_TypeRef(),
+        ))
+    }
+}
+
 /// What `font` has set on each of its `axes`.
 pub fn current_variations(font: &FontKitFont, axes: &[VariationAxis]) -> Vec<(u32, f32)> {
     let dictionary = unsafe {
@@ -286,6 +333,7 @@ unsafe extern "C" {
     static kCTFontVariationAxisDefaultValueKey: CFStringRef;
 
     fn CTFontCopyVariation(font: CTFontRef) -> core_foundation::dictionary::CFDictionaryRef;
+    fn CTFontCopyAvailableTables(font: CTFontRef, options: u32) -> CFArrayRef;
 
     fn CTFontCreateCopyWithAttributes(
         font: CTFontRef,

@@ -510,7 +510,7 @@ impl LineLayoutCache {
                 }
                 let Some(nominal) = *advances.entry((run.font_id, before.id, size)).or_insert_with(|| {
                     self.platform_text_system
-                        .glyph_advance(run.font_id, before.id, run.font_size)
+                        .glyph_advance(run.font_id, before.id, run.font_size, scale_factor)
                         .log_err()
                         .map(|advance| advance * scale)
                 }) else {
@@ -572,7 +572,7 @@ impl LineLayoutCache {
                 let key = (run.font_id, glyph.id, run.font_size.0.to_bits());
                 let nominal = *advances.entry(key).or_insert_with(|| {
                     self.platform_text_system
-                        .glyph_advance(run.font_id, glyph.id, run.font_size)
+                        .glyph_advance(run.font_id, glyph.id, run.font_size, shaped.scale_factor)
                         .log_err()
                 });
                 glyphs.push(DeviceAdvance {
@@ -647,7 +647,7 @@ impl LineLayoutCache {
                 for (pair_ix, pair) in run.glyphs.windows(2).enumerate() {
                     let Some(nominal) = self
                         .platform_text_system
-                        .glyph_advance(run.font_id, pair[0].id, run.font_size)
+                        .glyph_advance(run.font_id, pair[0].id, run.font_size, scale_factor)
                         .log_err()
                     else {
                         continue;
