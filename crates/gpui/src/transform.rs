@@ -14,13 +14,14 @@ const IDENTITY_TOLERANCE: f32 = 1e-6;
 /// A translation shorter than this, in pixels, is none.
 const TRANSLATION_TOLERANCE: f32 = 1e-4;
 
+/// The smallest `W` a point still counts as in front of the eye: a point of the plane with a
+/// smaller one is at the horizon or behind it, where the plane is not seen.
+pub const MIN_W: f32 = 1e-3;
+
 impl TransformationMatrix {
     /// A matrix with the entries of CSS `matrix(a, b, c, d, e, f)`.
     pub fn from_css(values: [f32; 6]) -> Self {
-        Self {
-            rotation_scale: [[values[0], values[2]], [values[1], values[3]]],
-            translation: [values[4], values[5]],
-        }
+        Self::affine([[values[0], values[2]], [values[1], values[3]]], [values[4], values[5]])
     }
 
     /// The matrix that does `self` first and `next` after it. [`TransformationMatrix::compose`]
@@ -30,11 +31,50 @@ impl TransformationMatrix {
         next.compose(self)
     }
 
-    /// The determinant of the linear part.
+    /// The matrix with every point of the window moved by `delta` after it: the same primitive
+    /// drawn `delta` further along.
+    pub fn moved_by(&self, delta: [f32; 2]) -> TransformationMatrix {
+        let mut moved = *self;
+        if self.is_affine() {
+            moved.rows[0][2] += delta[0];
+            moved.rows[1][2] += delta[1];
+            return moved;
+        }
+        // The window point is (X, Y) / W, so moving it by delta adds delta * W to (X, Y).
+        for column in 0..3 {
+            moved.rows[0][column] += delta[0] * self.rows[2][column];
+            moved.rows[1][column] += delta[1] * self.rows[2][column];
+        }
+        moved
+    }
+
+    /// The matrix for points that `delta` further along: the one of a primitive that was moved
+    /// by `delta`, read back at the place it was.
+    pub fn with_input_moved_by(&self, delta: [f32; 2]) -> TransformationMatrix {
+        if self.is_affine() {
+            let [[a, b], [c, d]] = self.linear();
+            let mut moved = *self;
+            moved.rows[0][2] -= a * delta[0] + b * delta[1];
+            moved.rows[1][2] -= c * delta[0] + d * delta[1];
+            return moved;
+        }
+        self.compose(TransformationMatrix::affine(
+            [[1., 0.], [0., 1.]],
+            [-delta[0], -delta[1]],
+        ))
+    }
+
+    /// The determinant of the 3x3 matrix, which for an affine one is the one of its linear part.
     #[inline]
     pub fn determinant(&self) -> f32 {
-        self.rotation_scale[0][0] * self.rotation_scale[1][1]
-            - self.rotation_scale[0][1] * self.rotation_scale[1][0]
+        let [[a, b], [c, d]] = self.linear();
+        if self.is_affine() {
+            return a * d - b * c;
+        }
+        let rows = &self.rows;
+        rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
+            - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
+            + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0])
     }
 
     /// The matrix that undoes this one, or `None` when it flattens the plane (a scale by zero).
@@ -43,115 +83,271 @@ impl TransformationMatrix {
         if !determinant.is_finite() || determinant.abs() < 1e-12 {
             return None;
         }
-        let [[a, b], [c, d]] = self.rotation_scale;
-        let inverse = [[d / determinant, -b / determinant], [-c / determinant, a / determinant]];
-        let translation = [
-            -(inverse[0][0] * self.translation[0] + inverse[0][1] * self.translation[1]),
-            -(inverse[1][0] * self.translation[0] + inverse[1][1] * self.translation[1]),
+        if self.is_affine() {
+            let [[a, b], [c, d]] = self.linear();
+            let translation = self.translation();
+            let inverse = [[d / determinant, -b / determinant], [-c / determinant, a / determinant]];
+            return Some(TransformationMatrix::affine(
+                inverse,
+                [
+                    -(inverse[0][0] * translation[0] + inverse[0][1] * translation[1]),
+                    -(inverse[1][0] * translation[0] + inverse[1][1] * translation[1]),
+                ],
+            ));
+        }
+        let m = &self.rows;
+        let cofactor = |row_a: usize, column_a: usize, row_b: usize, column_b: usize| {
+            m[row_a][column_a] * m[row_b][column_b] - m[row_a][column_b] * m[row_b][column_a]
+        };
+        // The adjugate: the transposed matrix of cofactors, over the determinant.
+        let inverse = [
+            [
+                cofactor(1, 1, 2, 2),
+                -cofactor(0, 1, 2, 2),
+                cofactor(0, 1, 1, 2),
+            ],
+            [
+                -cofactor(1, 0, 2, 2),
+                cofactor(0, 0, 2, 2),
+                -cofactor(0, 0, 1, 2),
+            ],
+            [
+                cofactor(1, 0, 2, 1),
+                -cofactor(0, 0, 2, 1),
+                cofactor(0, 0, 1, 1),
+            ],
         ];
-        Some(TransformationMatrix {
-            rotation_scale: inverse,
-            translation,
-        })
+        let rows = inverse.map(|row| row.map(|entry| entry / determinant));
+        rows.iter()
+            .flatten()
+            .all(|entry| entry.is_finite())
+            .then_some(TransformationMatrix { rows })
     }
 
     /// Whether the matrix moves nothing.
     pub fn is_identity(&self) -> bool {
         self.is_translation()
-            && self.translation[0].abs() < TRANSLATION_TOLERANCE
-            && self.translation[1].abs() < TRANSLATION_TOLERANCE
+            && self.rows[0][2].abs() < TRANSLATION_TOLERANCE
+            && self.rows[1][2].abs() < TRANSLATION_TOLERANCE
     }
 
-    /// Whether the matrix only moves, by whatever amount: no rotation, scale or skew.
+    /// Whether the matrix only moves, by whatever amount: no rotation, scale, skew or perspective.
     pub fn is_translation(&self) -> bool {
-        let [[a, b], [c, d]] = self.rotation_scale;
-        (a - 1.).abs() < IDENTITY_TOLERANCE
+        let [[a, b], [c, d]] = self.linear();
+        self.is_affine()
+            && (a - 1.).abs() < IDENTITY_TOLERANCE
             && b.abs() < IDENTITY_TOLERANCE
             && c.abs() < IDENTITY_TOLERANCE
             && (d - 1.).abs() < IDENTITY_TOLERANCE
     }
 
     /// Whether the matrix maps rectangles to rectangles with the same sides parallel to the
-    /// axes: scales (flips included) and translations, no rotation or skew.
+    /// axes: scales (flips included) and translations, no rotation, skew or perspective.
     pub fn is_axis_aligned(&self) -> bool {
-        self.rotation_scale[0][1].abs() < IDENTITY_TOLERANCE
-            && self.rotation_scale[1][0].abs() < IDENTITY_TOLERANCE
+        self.is_affine()
+            && self.rows[0][1].abs() < IDENTITY_TOLERANCE
+            && self.rows[1][0].abs() < IDENTITY_TOLERANCE
     }
 
     /// How many pixels a unit of length covers after the matrix: the square root of the area
     /// scale. It is the one number that says how thick an antialiased edge is in local units.
+    /// A projective matrix has a different one at every point, see
+    /// [`TransformationMatrix::scale_factor_at`]; this is the one at the origin.
     pub fn scale_factor(&self) -> f32 {
-        self.determinant().abs().sqrt()
+        self.scale_factor_at(0., 0.)
+    }
+
+    /// [`TransformationMatrix::scale_factor`] at the local point `(x, y)`: the area scale of a
+    /// homography there is `det / W^3`. Zero for a point at the horizon or behind it.
+    pub fn scale_factor_at(&self, x: f32, y: f32) -> f32 {
+        if self.is_affine() {
+            return self.determinant().abs().sqrt();
+        }
+        let w = self.homogeneous(x, y)[2];
+        if w < MIN_W {
+            return 0.;
+        }
+        (self.determinant().abs() / (w * w * w)).sqrt()
+    }
+
+    /// The affine matrix that does what this one does around the local point `(x, y)`: the same
+    /// image of the point and the same first derivative. An affine matrix is its own.
+    pub fn linearized_at(&self, x: f32, y: f32) -> TransformationMatrix {
+        if self.is_affine() {
+            return *self;
+        }
+        let [numerator_x, numerator_y, w] = self.homogeneous(x, y);
+        let w = w.max(MIN_W);
+        let derivative = |row: usize, numerator: f32, column: usize| {
+            (self.rows[row][column] * w - self.rows[2][column] * numerator) / (w * w)
+        };
+        let linear = [
+            [derivative(0, numerator_x, 0), derivative(0, numerator_x, 1)],
+            [derivative(1, numerator_y, 0), derivative(1, numerator_y, 1)],
+        ];
+        let image = [numerator_x / w, numerator_y / w];
+        TransformationMatrix::affine(
+            linear,
+            [
+                image[0] - linear[0][0] * x - linear[0][1] * y,
+                image[1] - linear[1][0] * x - linear[1][1] * y,
+            ],
+        )
     }
 
     /// A number no vector is lengthened by more than: the Frobenius norm of the linear part, which
     /// is at least the largest singular value. For padding that is in a space the matrix maps.
+    /// Only meaningful for an affine matrix.
     pub fn stretch_bound(&self) -> f32 {
-        let [[a, b], [c, d]] = self.rotation_scale;
+        let [[a, b], [c, d]] = self.linear();
         (a * a + b * b + c * c + d * d).sqrt()
     }
 
-    /// The point after the matrix, in the units of the matrix.
+    /// `(X, Y, W)` of the local point `(x, y)`.
+    #[inline]
+    pub fn homogeneous(&self, x: f32, y: f32) -> [f32; 3] {
+        [
+            self.rows[0][0] * x + self.rows[0][1] * y + self.rows[0][2],
+            self.rows[1][0] * x + self.rows[1][1] * y + self.rows[1][2],
+            self.rows[2][0] * x + self.rows[2][1] * y + self.rows[2][2],
+        ]
+    }
+
+    /// The point after the matrix, in the units of the matrix. A projective matrix divides by
+    /// `W`, which is not finite at the horizon and flips sign behind the eye: use
+    /// [`TransformationMatrix::project`] where the point may be there.
     #[inline]
     pub fn apply_xy(&self, x: f32, y: f32) -> [f32; 2] {
-        [
-            self.rotation_scale[0][0] * x + self.rotation_scale[0][1] * y + self.translation[0],
-            self.rotation_scale[1][0] * x + self.rotation_scale[1][1] * y + self.translation[1],
-        ]
+        if self.is_affine() {
+            return [
+                self.rows[0][0] * x + self.rows[0][1] * y + self.rows[0][2],
+                self.rows[1][0] * x + self.rows[1][1] * y + self.rows[1][2],
+            ];
+        }
+        let [x, y, w] = self.homogeneous(x, y);
+        [x / w, y / w]
+    }
+
+    /// [`TransformationMatrix::apply_xy`], or `None` for a point at the horizon or behind the
+    /// eye, which the plane does not show.
+    #[inline]
+    pub fn project(&self, x: f32, y: f32) -> Option<[f32; 2]> {
+        if self.is_affine() {
+            return Some(self.apply_xy(x, y));
+        }
+        let [x, y, w] = self.homogeneous(x, y);
+        (w >= MIN_W).then(|| [x / w, y / w])
     }
 
     /// The same matrix for coordinates `factor` times as large: logical pixels to device
     /// pixels, given the scale factor.
     pub fn scaled(&self, factor: f32) -> TransformationMatrix {
-        TransformationMatrix {
-            rotation_scale: self.rotation_scale,
-            translation: [self.translation[0] * factor, self.translation[1] * factor],
+        let mut scaled = *self;
+        if self.is_affine() {
+            scaled.rows[0][2] *= factor;
+            scaled.rows[1][2] *= factor;
+            return scaled;
         }
+        // The matrix conjugated by the scale: the output is `factor` times as large and the input
+        // `factor` times as large, so the translation column grows and the perspective row shrinks.
+        for row in 0..2 {
+            scaled.rows[row][2] *= factor;
+        }
+        for column in 0..2 {
+            scaled.rows[2][column] /= factor;
+        }
+        scaled
     }
 
     /// The smallest rectangle with its sides parallel to the axes that holds the four corners
-    /// of `bounds` after the matrix.
+    /// of `bounds` after the matrix. For a projective matrix, what of the box is behind the eye is
+    /// cut off first, and a box that is all behind it gives the empty bounds.
     pub fn bounding_box(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        self.try_bounding_box(bounds).unwrap_or_default()
+    }
+
+    /// [`TransformationMatrix::bounding_box`], or `None` for a box that is all behind the eye.
+    pub fn try_bounding_box(&self, bounds: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
         let (origin, extent) = self.bounding_corners(
             bounds.origin.x.0,
             bounds.origin.y.0,
             bounds.size.width.0,
             bounds.size.height.0,
-        );
-        Bounds {
+        )?;
+        Some(Bounds {
             origin: point(px(origin[0]), px(origin[1])),
             size: size(px(extent[0]), px(extent[1])),
-        }
+        })
     }
 
     /// [`TransformationMatrix::bounding_box`] for device pixels.
     pub fn bounding_box_scaled(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        self.try_bounding_box_scaled(bounds).unwrap_or_default()
+    }
+
+    /// [`TransformationMatrix::try_bounding_box`] for device pixels.
+    pub fn try_bounding_box_scaled(&self, bounds: Bounds<ScaledPixels>) -> Option<Bounds<ScaledPixels>> {
         let (origin, extent) = self.bounding_corners(
             bounds.origin.x.0,
             bounds.origin.y.0,
             bounds.size.width.0,
             bounds.size.height.0,
-        );
-        Bounds {
+        )?;
+        Some(Bounds {
             origin: point(ScaledPixels(origin[0]), ScaledPixels(origin[1])),
             size: size(ScaledPixels(extent[0]), ScaledPixels(extent[1])),
-        }
+        })
     }
 
-    fn bounding_corners(&self, x: f32, y: f32, width: f32, height: f32) -> ([f32; 2], [f32; 2]) {
-        let corners = [
-            self.apply_xy(x, y),
-            self.apply_xy(x + width, y),
-            self.apply_xy(x, y + height),
-            self.apply_xy(x + width, y + height),
-        ];
-        let mut low = corners[0];
-        let mut high = corners[0];
-        for corner in &corners[1..] {
+    fn bounding_corners(&self, x: f32, y: f32, width: f32, height: f32) -> Option<([f32; 2], [f32; 2])> {
+        let corners = if self.is_affine() {
+            [
+                self.apply_xy(x, y),
+                self.apply_xy(x + width, y),
+                self.apply_xy(x, y + height),
+                self.apply_xy(x + width, y + height),
+            ]
+            .to_vec()
+        } else {
+            self.clipped_outline(&[
+                self.homogeneous(x, y),
+                self.homogeneous(x + width, y),
+                self.homogeneous(x + width, y + height),
+                self.homogeneous(x, y + height),
+            ])
+        };
+        let (first, rest) = corners.split_first()?;
+        let mut low = *first;
+        let mut high = *first;
+        for corner in rest {
             low = [low[0].min(corner[0]), low[1].min(corner[1])];
             high = [high[0].max(corner[0]), high[1].max(corner[1])];
         }
-        (low, [high[0] - low[0], high[1] - low[1]])
+        Some((low, [high[0] - low[0], high[1] - low[1]]))
+    }
+
+    /// The window points of the outline of a polygon given as homogeneous points in order,
+    /// cut to the half space `W >= MIN_W` (Sutherland-Hodgman against a single plane). Empty
+    /// when the polygon is all behind it.
+    pub(crate) fn clipped_outline(&self, polygon: &[[f32; 3]]) -> Vec<[f32; 2]> {
+        let mut kept: Vec<[f32; 3]> = Vec::with_capacity(polygon.len() + 1);
+        for (index, current) in polygon.iter().enumerate() {
+            let previous = &polygon[(index + polygon.len() - 1) % polygon.len()];
+            let current_in_front = current[2] >= MIN_W;
+            let previous_in_front = previous[2] >= MIN_W;
+            if current_in_front != previous_in_front {
+                let along = (MIN_W - previous[2]) / (current[2] - previous[2]);
+                kept.push([
+                    previous[0] + (current[0] - previous[0]) * along,
+                    previous[1] + (current[1] - previous[1]) * along,
+                    MIN_W,
+                ]);
+            }
+            if current_in_front {
+                kept.push(*current);
+            }
+        }
+        kept.iter().map(|point| [point[0] / point[2], point[1] / point[2]]).collect()
     }
 }
 
@@ -162,8 +358,8 @@ impl ContentMask<Pixels> {
         if !matrix.is_axis_aligned() {
             return None;
         }
-        let scale_x = matrix.rotation_scale[0][0];
-        let scale_y = matrix.rotation_scale[1][1];
+        let scale_x = matrix.rows[0][0];
+        let scale_y = matrix.rows[1][1];
         let bounds = matrix.bounding_box(self.bounds);
         let map = |radii: &Corners<Pixels>, radii_y: &Corners<Pixels>| {
             let vertical = |horizontal: Pixels, vertical: Pixels| {
@@ -306,30 +502,26 @@ impl TransformFunction {
     /// The matrix of the function for a border box of `size`.
     pub fn matrix(&self, size: Size<Pixels>) -> TransformationMatrix {
         match self {
-            TransformFunction::Translate(x, y) => TransformationMatrix {
-                translation: [x.resolve(size.width.0), y.resolve(size.height.0)],
-                ..TransformationMatrix::unit()
-            },
-            TransformFunction::Scale(x, y) => TransformationMatrix {
-                rotation_scale: [[*x, 0.], [0., *y]],
-                translation: [0., 0.],
-            },
-            TransformFunction::Rotate(angle) => TransformationMatrix {
-                rotation_scale: [[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]],
-                translation: [0., 0.],
-            },
-            TransformFunction::Skew(x, y) => TransformationMatrix {
-                rotation_scale: [[1., x.tan()], [y.tan(), 1.]],
-                translation: [0., 0.],
-            },
-            TransformFunction::SkewX(x) => TransformationMatrix {
-                rotation_scale: [[1., x.tan()], [0., 1.]],
-                translation: [0., 0.],
-            },
-            TransformFunction::SkewY(y) => TransformationMatrix {
-                rotation_scale: [[1., 0.], [y.tan(), 1.]],
-                translation: [0., 0.],
-            },
+            TransformFunction::Translate(x, y) => TransformationMatrix::affine(
+                [[1., 0.], [0., 1.]],
+                [x.resolve(size.width.0), y.resolve(size.height.0)],
+            ),
+            TransformFunction::Scale(x, y) => {
+                TransformationMatrix::affine([[*x, 0.], [0., *y]], [0., 0.])
+            }
+            TransformFunction::Rotate(angle) => TransformationMatrix::affine(
+                [[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]],
+                [0., 0.],
+            ),
+            TransformFunction::Skew(x, y) => {
+                TransformationMatrix::affine([[1., x.tan()], [y.tan(), 1.]], [0., 0.])
+            }
+            TransformFunction::SkewX(x) => {
+                TransformationMatrix::affine([[1., x.tan()], [0., 1.]], [0., 0.])
+            }
+            TransformFunction::SkewY(y) => {
+                TransformationMatrix::affine([[1., 0.], [y.tan(), 1.]], [0., 0.])
+            }
             TransformFunction::Matrix(values) => TransformationMatrix::from_css(*values),
             TransformFunction::Interpolated { from, to, progress } => interpolate_matrices(
                 &list_matrix(from, size),
@@ -373,14 +565,8 @@ impl ElementTransform {
             border_box.origin.y.0 + self.origin.1.resolve(border_box.size.height.0),
         );
         let functions = list_matrix(&self.functions, border_box.size);
-        let to_origin = TransformationMatrix {
-            translation: [origin.x, origin.y],
-            ..TransformationMatrix::unit()
-        };
-        let from_origin = TransformationMatrix {
-            translation: [-origin.x, -origin.y],
-            ..TransformationMatrix::unit()
-        };
+        let to_origin = TransformationMatrix::affine([[1., 0.], [0., 1.]], [origin.x, origin.y]);
+        let from_origin = TransformationMatrix::affine([[1., 0.], [0., 1.]], [-origin.x, -origin.y]);
         to_origin.compose(functions).compose(from_origin)
     }
 }
@@ -401,8 +587,8 @@ fn decompose(matrix: &TransformationMatrix) -> Option<Decomposed> {
     if matrix.determinant().abs() < 1e-12 || !matrix.determinant().is_finite() {
         return None;
     }
-    let mut column_x = [matrix.rotation_scale[0][0], matrix.rotation_scale[1][0]];
-    let mut column_y = [matrix.rotation_scale[0][1], matrix.rotation_scale[1][1]];
+    let mut column_x = [matrix.rows[0][0], matrix.rows[1][0]];
+    let mut column_y = [matrix.rows[0][1], matrix.rows[1][1]];
     let mut scale_x = column_x[0].hypot(column_x[1]);
     column_x = [column_x[0] / scale_x, column_x[1] / scale_x];
     let mut skew = column_x[0] * column_y[0] + column_x[1] * column_y[1];
@@ -421,7 +607,7 @@ fn decompose(matrix: &TransformationMatrix) -> Option<Decomposed> {
         }
     }
     Some(Decomposed {
-        translate: matrix.translation,
+        translate: matrix.translation(),
         scale: [scale_x, scale_y],
         skew,
         angle: column_x[1].atan2(column_x[0]),
@@ -429,25 +615,16 @@ fn decompose(matrix: &TransformationMatrix) -> Option<Decomposed> {
 }
 
 fn recompose(parts: &Decomposed) -> TransformationMatrix {
-    let translate = TransformationMatrix {
-        translation: parts.translate,
-        ..TransformationMatrix::unit()
-    };
-    let rotate = TransformationMatrix {
-        rotation_scale: [
+    let translate = TransformationMatrix::affine([[1., 0.], [0., 1.]], parts.translate);
+    let rotate = TransformationMatrix::affine(
+        [
             [parts.angle.cos(), -parts.angle.sin()],
             [parts.angle.sin(), parts.angle.cos()],
         ],
-        translation: [0., 0.],
-    };
-    let skew = TransformationMatrix {
-        rotation_scale: [[1., parts.skew], [0., 1.]],
-        translation: [0., 0.],
-    };
-    let scale = TransformationMatrix {
-        rotation_scale: [[parts.scale[0], 0.], [0., parts.scale[1]]],
-        translation: [0., 0.],
-    };
+        [0., 0.],
+    );
+    let skew = TransformationMatrix::affine([[1., parts.skew], [0., 1.]], [0., 0.]);
+    let scale = TransformationMatrix::affine([[parts.scale[0], 0.], [0., parts.scale[1]]], [0., 0.]);
     translate.compose(rotate).compose(skew).compose(scale)
 }
 
@@ -496,11 +673,10 @@ mod tests {
 
     fn assert_matrix(actual: TransformationMatrix, expected: [f32; 6]) {
         let expected = TransformationMatrix::from_css(expected);
-        for row in 0..2 {
-            for column in 0..2 {
-                assert_near(actual.rotation_scale[row][column], expected.rotation_scale[row][column]);
+        for row in 0..3 {
+            for column in 0..3 {
+                assert_near(actual.rows[row][column], expected.rows[row][column]);
             }
-            assert_near(actual.translation[row], expected.translation[row]);
         }
     }
 
@@ -683,7 +859,7 @@ mod tests {
         let from = rotation(170f32.to_radians());
         let to = rotation(-170f32.to_radians());
         let middle = interpolate_matrices(&from, &to, 0.5);
-        assert_near(middle.rotation_scale[0][0], -1.);
+        assert_near(middle.rows[0][0], -1.);
     }
 
     #[test]
@@ -696,8 +872,8 @@ mod tests {
             )],
             progress: 0.25,
         };
-        assert_near(blended.matrix(box_of(80., 10.)).translation[0], 20.);
-        assert_near(blended.matrix(box_of(200., 10.)).translation[0], 50.);
+        assert_near(blended.matrix(box_of(80., 10.)).translation()[0], 20.);
+        assert_near(blended.matrix(box_of(200., 10.)).translation()[0], 50.);
     }
 
     #[test]
@@ -706,5 +882,166 @@ mod tests {
         let other = TransformationMatrix::from_css([1., 0., 0., 1., 8., 0.]);
         assert_eq!(interpolate_matrices(&flat, &other, 0.25), flat);
         assert_eq!(interpolate_matrices(&flat, &other, 0.75), other);
+    }
+
+    /// The homography a plane turned about its vertical axis shows to an eye 200 pixels away,
+    /// in the form of the 4x4 matrix's z = 0 plane: `W = 1 - x / 200`, so the plane is behind the
+    /// eye from `x = 200` on.
+    fn looking_down_the_plane() -> TransformationMatrix {
+        TransformationMatrix { rows: [[1., 0., 0.], [0., 1., 0.], [-1. / 200., 0., 1.]] }
+    }
+
+    #[test]
+    fn a_projective_matrix_divides_by_w_and_is_not_affine() {
+        let matrix = looking_down_the_plane();
+        assert!(!matrix.is_affine() && !matrix.is_translation() && !matrix.is_axis_aligned());
+        assert!(!matrix.is_identity());
+        // W = 0.5 at x = 100.
+        assert_eq!(matrix.apply_xy(100., 30.), [200., 60.]);
+        assert_eq!(matrix.project(100., 30.), Some([200., 60.]));
+        assert_eq!(matrix.project(250., 30.), None);
+        assert_eq!(matrix.project(200., 30.), None);
+        assert!(TransformationMatrix::from_css([1., 2., 3., 4., 5., 6.]).is_affine());
+    }
+
+    #[test]
+    fn the_inverse_of_a_homography_undoes_it() {
+        let matrix = TransformationMatrix {
+            rows: [[1.2, 0.1, 30.], [-0.2, 0.9, 12.], [0.001, -0.0005, 1.]],
+        };
+        let inverse = matrix.inverse().unwrap();
+        for (x, y) in [(0., 0.), (50., 20.), (-30., 80.), (120., 10.)] {
+            let [mapped_x, mapped_y] = matrix.apply_xy(x, y);
+            let back = inverse.apply_xy(mapped_x, mapped_y);
+            assert!((back[0] - x).abs() < 1e-2 && (back[1] - y).abs() < 1e-2, "{back:?} for ({x}, {y})");
+        }
+        let product = matrix.compose(inverse);
+        // A homography is its matrix up to a factor, so the product is the identity scaled.
+        let factor = product.rows[2][2];
+        for row in 0..3 {
+            for column in 0..3 {
+                let expected = if row == column { factor } else { 0. };
+                assert!((product.rows[row][column] - expected).abs() < 1e-3, "{product:?}");
+            }
+        }
+        let flat = TransformationMatrix { rows: [[1., 2., 0.], [2., 4., 0.], [0., 0., 1.]] };
+        assert!(flat.inverse().is_none());
+    }
+
+    #[test]
+    fn composing_affine_matrices_gives_an_affine_one_and_a_homography_does_not() {
+        let turn = rotation(0.4);
+        assert!(turn.compose(TransformationMatrix::from_css([2., 0., 0., 3., 5., 6.])).is_affine());
+        let perspective = looking_down_the_plane();
+        let both = perspective.compose(turn);
+        assert!(!both.is_affine());
+        let point = both.apply_xy(40., 10.);
+        let [turned_x, turned_y] = turn.apply_xy(40., 10.);
+        let expected = perspective.apply_xy(turned_x, turned_y);
+        assert_near(point[0], expected[0]);
+        assert_near(point[1], expected[1]);
+    }
+
+    #[test]
+    fn a_scaled_homography_maps_scaled_points() {
+        let matrix = looking_down_the_plane();
+        let scaled = matrix.scaled(2.);
+        let [x, y] = matrix.apply_xy(60., 25.);
+        let [scaled_x, scaled_y] = scaled.apply_xy(120., 50.);
+        assert_near(scaled_x, 2. * x);
+        assert_near(scaled_y, 2. * y);
+        assert!(scaled.is_affine() == matrix.is_affine());
+    }
+
+    #[test]
+    fn the_bounding_box_of_a_box_with_a_corner_behind_the_eye_is_cut_at_the_horizon() {
+        let matrix = looking_down_the_plane();
+        // The right edge, x = 300, is behind the eye; the plane at x = 200 is the horizon.
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(300.), px(100.)));
+        let box_in_front = matrix.try_bounding_box(bounds).unwrap();
+        assert!(box_in_front.origin.x.0.abs() < 1e-3 && box_in_front.origin.y.0.abs() < 1e-3);
+        for value in [box_in_front.size.width.0, box_in_front.size.height.0] {
+            assert!(value.is_finite() && value > 0., "{box_in_front:?}");
+        }
+        // The cut is at W = MIN_W, so what stays reaches about 1 / MIN_W times what it was.
+        assert!(box_in_front.size.width.0 < 200. / MIN_W * 1.01, "{box_in_front:?}");
+        // A box wholly in front is the box of its mapped corners.
+        let near = matrix.bounding_box(Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.))));
+        assert_near(near.size.width.0, 200.);
+        assert_near(near.size.height.0, 200.);
+        // One that is wholly behind it is empty, not a box at the mapped corners.
+        let behind = Bounds::new(point(px(250.), px(0.)), size(px(50.), px(50.)));
+        assert!(matrix.try_bounding_box(behind).is_none());
+        assert_eq!(matrix.bounding_box(behind), Bounds::default());
+    }
+
+    #[test]
+    fn the_area_scale_of_a_homography_is_its_determinant_over_w_cubed() {
+        let matrix = looking_down_the_plane();
+        // At x = 100, W is 0.5: a unit of x covers 4 pixels (the derivative of x / W) and a unit
+        // of y covers 2, an area of 8, which is the determinant 1 over W cubed.
+        let at = matrix.scale_factor_at(100., 0.);
+        assert_near(at * at, matrix.determinant() / 0.125);
+        assert_eq!(matrix.scale_factor_at(250., 0.), 0.);
+        let numeric = {
+            let step = 1e-2;
+            let origin = matrix.apply_xy(100., 0.);
+            let along_x = matrix.apply_xy(100. + step, 0.);
+            let along_y = matrix.apply_xy(100., step);
+            let area = ((along_x[0] - origin[0]) * (along_y[1] - origin[1])
+                - (along_x[1] - origin[1]) * (along_y[0] - origin[0]))
+                .abs()
+                / (step * step);
+            area.sqrt()
+        };
+        assert!((at - numeric).abs() / at < 2e-2, "{at} against {numeric}");
+    }
+
+    #[test]
+    fn a_homography_linearized_at_a_point_agrees_with_it_there() {
+        let matrix = looking_down_the_plane();
+        let linear = matrix.linearized_at(80., 20.);
+        assert!(linear.is_affine());
+        let exact = matrix.apply_xy(80., 20.);
+        let approximate = linear.apply_xy(80., 20.);
+        assert_near(approximate[0], exact[0]);
+        assert_near(approximate[1], exact[1]);
+        let exact = matrix.apply_xy(80.5, 20.5);
+        let approximate = linear.apply_xy(80.5, 20.5);
+        assert!((approximate[0] - exact[0]).abs() < 0.05 && (approximate[1] - exact[1]).abs() < 0.05);
+    }
+
+    #[test]
+    fn moving_what_a_homography_draws_moves_its_image_in_the_window() {
+        let matrix = looking_down_the_plane();
+        let moved = matrix.moved_by([7., -3.]);
+        let [x, y] = matrix.apply_xy(60., 25.);
+        let [moved_x, moved_y] = moved.apply_xy(60., 25.);
+        assert_near(moved_x, x + 7.);
+        assert_near(moved_y, y - 3.);
+        let read_back = matrix.with_input_moved_by([7., -3.]);
+        let [x, y] = matrix.apply_xy(60., 25.);
+        let [back_x, back_y] = read_back.apply_xy(67., 22.);
+        assert_near(back_x, x);
+        assert_near(back_y, y);
+    }
+
+    #[test]
+    fn a_polygon_clip_path_through_a_homography_is_cut_in_front_of_the_eye() {
+        use crate::ResolvedClipPath;
+        let polygon = ResolvedClipPath::Polygon {
+            contours: vec![vec![
+                crate::Point::new(0., 0.),
+                crate::Point::new(300., 0.),
+                crate::Point::new(300., 100.),
+                crate::Point::new(0., 100.),
+            ]],
+            even_odd: false,
+        };
+        let ResolvedClipPath::Polygon { contours, .. } = polygon.transformed(&looking_down_the_plane()) else {
+            panic!("a homography maps a polygon to a polygon");
+        };
+        assert!(contours[0].len() >= 4);
+        assert!(contours[0].iter().all(|point| point.x.is_finite() && point.y.is_finite() && point.x >= 0.));
     }
 }

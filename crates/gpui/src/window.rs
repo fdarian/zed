@@ -945,7 +945,7 @@ impl HitChainEntry<'_> {
     pub fn to_local(&self, position: Point<Pixels>) -> Option<Point<Pixels>> {
         match self.space {
             None => Some(position),
-            Some(space) => space.to_local.as_ref().map(|to_local| map_point(to_local, position)),
+            Some(space) => space.to_local.as_ref().and_then(|to_local| map_point(to_local, position)),
         }
     }
 }
@@ -1183,12 +1183,13 @@ impl Hitbox {
 
     /// Where the window point `position` is in the space of the hitbox, the one `bounds` is in:
     /// `position` itself outside any transform. `None` when a transform that flattens the plane
-    /// is around the hitbox, where nothing can be hit. This is the offset of the pointer in the
+    /// is around the hitbox, where nothing can be hit, or when `position` is where a perspective
+    /// puts the horizon or what is behind the eye. This is the offset of the pointer in the
     /// element, as `offsetX` and `offsetY` are in the DOM, once `bounds.origin` is taken off.
     pub fn to_local(&self, position: Point<Pixels>) -> Option<Point<Pixels>> {
         match &self.space {
             None => Some(position),
-            Some(space) => space.to_local.as_ref().map(|to_local| map_point(to_local, position)),
+            Some(space) => space.to_local.as_ref().and_then(|to_local| map_point(to_local, position)),
         }
     }
 
@@ -2962,16 +2963,15 @@ impl HitSpace {
 
     /// The space after everything in it was moved by `delta` in the window.
     fn moved(&self, delta: Point<Pixels>) -> HitSpace {
-        let mut to_window = self.to_window;
-        to_window.translation[0] += delta.x.0;
-        to_window.translation[1] += delta.y.0;
-        HitSpace::new(to_window)
+        HitSpace::new(self.to_window.moved_by([delta.x.0, delta.y.0]))
     }
 }
 
-fn map_point(matrix: &TransformationMatrix, position: Point<Pixels>) -> Point<Pixels> {
-    let mapped = matrix.apply_xy(position.x.0, position.y.0);
-    point(px(mapped[0]), px(mapped[1]))
+/// `position` after `matrix`, or `None` when the matrix puts it at the horizon or behind the
+/// eye: a point there is on nothing the plane shows.
+fn map_point(matrix: &TransformationMatrix, position: Point<Pixels>) -> Option<Point<Pixels>> {
+    let mapped = matrix.project(position.x.0, position.y.0)?;
+    Some(point(px(mapped[0]), px(mapped[1])))
 }
 
 /// What a recording reads of the transform around it: what the primitives and hitboxes of the
@@ -3032,13 +3032,7 @@ impl Placement {
     /// The matrix from the local space to the window with the rounded translation in it, for a
     /// primitive that can't just have its bounds moved.
     fn matrix(&self) -> TransformationMatrix {
-        TransformationMatrix {
-            rotation_scale: self.transformation.rotation_scale,
-            translation: [
-                self.transformation.translation[0] + self.offset.x.0,
-                self.transformation.translation[1] + self.offset.y.0,
-            ],
-        }
+        self.transformation.moved_by([self.offset.x.0, self.offset.y.0])
     }
 
     /// The local clip of a primitive whose own space is `own` inside the space the clip is in.
@@ -4824,6 +4818,10 @@ impl Window {
             Some(own) => self.transform().compose(*own),
             None => self.transform(),
         };
+        if !composed.is_affine() {
+            // How far the outset reaches in the window is not bounded by one number under perspective.
+            return false;
+        }
         let stretch = if composed.is_translation() { 1. } else { composed.stretch_bound() };
         let inflate = |bounds: Bounds<Pixels>| {
             let origin = point(
@@ -6247,6 +6245,12 @@ impl Window {
     /// bounding box of the ancestor's clip.
     ///
     /// A matrix that flattens the plane paints nothing.
+    ///
+    /// The matrix may be a homography (a bottom row other than `0 0 1`): primitives carry it, the
+    /// shaders draw them through it with perspective-correct interpolation and what is behind the
+    /// eye is not drawn, and a pointer is mapped back through its inverse with the divide by `W`,
+    /// missing where that is at the horizon or behind the eye. The text inside is rasterized at a
+    /// scale and drawn through the matrix, never rasterized through its linear part.
     pub fn with_transform<R>(
         &mut self,
         matrix: TransformationMatrix,
@@ -6277,8 +6281,8 @@ impl Window {
         let scale_factor = self.scale_factor();
         let (kind, offset, device_offset) = if composed.is_translation() {
             let device = point(
-                ScaledPixels((composed.translation[0] * scale_factor).round()),
-                ScaledPixels((composed.translation[1] * scale_factor).round()),
+                ScaledPixels((composed.translation()[0] * scale_factor).round()),
+                ScaledPixels((composed.translation()[1] * scale_factor).round()),
             );
             let offset = point(Pixels(device.x.0 / scale_factor), Pixels(device.y.0 / scale_factor));
             (TransformKind::Translation, offset, device)
@@ -6309,7 +6313,8 @@ impl Window {
         let space = match kind {
             TransformKind::Translation => {
                 let mut to_window = TransformationMatrix::unit();
-                to_window.translation = [offset.x.0, offset.y.0];
+                to_window.rows[0][2] = offset.x.0;
+                to_window.rows[1][2] = offset.y.0;
                 HitSpace::new(to_window)
             }
             TransformKind::General => HitSpace::new(composed),
@@ -7058,8 +7063,10 @@ impl Window {
     fn place_group_effect(&self, placement: &Placement, effect: &mut GroupEffect) {
         if placement.general {
             effect.reference_transformation = placement.transformation;
+            let centre = effect.reference.center();
+            let filter_matrix = placement.transformation.linearized_at(centre.x.0, centre.y.0);
             for filter in effect.filters.iter_mut().chain(&mut effect.backdrop_filters) {
-                *filter = filter.through(&placement.transformation);
+                *filter = filter.through(&filter_matrix);
             }
             if let Some(clip_path) = &mut effect.clip_path {
                 *clip_path = clip_path.transformed(&placement.transformation);
@@ -7958,11 +7965,12 @@ impl Window {
             });
         }
 
-        let linear = placement.logical.rotation_scale;
-        let transform = GlyphTransform::quantize(linear);
-        let stretch = placement.logical.stretch_bound();
-        let glyph_reach = font_size.0 * scale_factor * stretch;
-        let exact = !placement.animating && glyph_reach <= MAX_TRANSFORMED_GLYPH;
+        // A projective matrix has no one linear part to rasterize the glyph through, so glyphs
+        // under it take the bucketed raster drawn through the matrix, as an animating one does.
+        let affine = placement.logical.is_affine();
+        let transform = GlyphTransform::quantize(placement.logical.linear());
+        let glyph_reach = font_size.0 * scale_factor * placement.logical.stretch_bound();
+        let exact = affine && !placement.animating && glyph_reach <= MAX_TRANSFORMED_GLYPH;
         if exact {
             let inverse = placement.transformation.inverse()?;
             let window_origin = placement.logical.apply(origin).scale(scale_factor);
@@ -7986,7 +7994,11 @@ impl Window {
             });
         }
 
-        let mut raster = animating_raster_scale(placement.logical.scale_factor());
+        let local_scale = placement.logical.scale_factor_at(origin.x.0, origin.y.0);
+        if local_scale == 0. {
+            return None;
+        }
+        let mut raster = animating_raster_scale(local_scale);
         while raster > 1. && font_size.0 * scale_factor * raster > MAX_TRANSFORMED_GLYPH {
             raster /= std::f32::consts::SQRT_2;
         }
@@ -9289,8 +9301,16 @@ impl Window {
                     match to_local {
                         None => listener(event, phase, window, cx),
                         Some(to_local) => {
-                            let local = event.with_position_mapped(&|position| map_point(to_local, position));
-                            listener(&local, phase, window, cx)
+                            let on_the_plane = Cell::new(true);
+                            let local = event.with_position_mapped(&|position| {
+                                map_point(to_local, position).unwrap_or_else(|| {
+                                    on_the_plane.set(false);
+                                    position
+                                })
+                            });
+                            if on_the_plane.get() {
+                                listener(&local, phase, window, cx)
+                            }
                         }
                     }
                 },

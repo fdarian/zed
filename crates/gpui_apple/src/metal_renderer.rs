@@ -1812,24 +1812,36 @@ impl MetalRenderer {
             } else {
                 // The reference stays in the element's own space; the fragment maps its window
                 // position back into it.
-                let mut placed = effect.reference_transformation;
-                placed.translation[0] += origin.x.0;
-                placed.translation[1] += origin.y.0;
+                let placed = effect
+                    .reference_transformation
+                    .moved_by([origin.x.0, origin.y.0]);
                 let inverse = placed
                     .inverse()
                     .expect("draw_backdrop leaves a matrix that can't be inverted out");
-                let [[a, b], [c, d]] = inverse.rotation_scale;
+                let [[a, b], [c, d]] = inverse.linear();
+                let translation = inverse.translation();
                 params.reference = rect_array(&effect.reference);
                 params.reference_matrix = [a, b, c, d];
-                params.reference_offset = [
-                    inverse.translation[0],
-                    inverse.translation[1],
-                    (placed.rotation_scale[0][0] * placed.rotation_scale[1][1]
-                        - placed.rotation_scale[0][1] * placed.rotation_scale[1][0])
-                        .abs()
-                        .sqrt(),
-                    1.,
-                ];
+                if inverse.is_affine() {
+                    params.reference_offset = [
+                        translation[0],
+                        translation[1],
+                        (placed.rows[0][0] * placed.rows[1][1] - placed.rows[0][1] * placed.rows[1][0])
+                            .abs()
+                            .sqrt(),
+                        1.,
+                    ];
+                } else {
+                    // A homography: the fragment divides by the third row's W, and the pixel
+                    // scale follows from the determinant of the inverse there.
+                    params.reference_offset = [translation[0], translation[1], 0., 2.];
+                    params.reference_row = [
+                        inverse.rows[2][0],
+                        inverse.rows[2][1],
+                        inverse.rows[2][2],
+                        inverse.determinant().abs(),
+                    ];
+                }
             }
         }
 
@@ -2502,6 +2514,7 @@ struct CompositeParams {
     reference_radii_y: [f32; 4],
     reference_matrix: [f32; 4],
     reference_offset: [f32; 4],
+    reference_row: [f32; 4],
 }
 
 /// Mirrors `BlurParams` in the shaders.
@@ -5887,5 +5900,224 @@ mod tests {
         let value = along_y.get_pixel(20, 20).0[0] as i32;
         let neighbour = along_y.get_pixel(22, 20).0[0] as i32;
         assert!((value - neighbour).abs() > 200, "{value} {neighbour}");
+    }
+
+    /// A plane seen with perspective, in device pixels: `W = 1 + g (x - cx) + h (y - cy)`, the
+    /// point `(cx, cy)` staying where it is.
+    fn perspective_about(center: (f32, f32), g: f32, h: f32) -> gpui::TransformationMatrix {
+        let shift = |sign: f32| matrix([1., 0., 0., 1., sign * center.0, sign * center.1]);
+        shift(1.)
+            .compose(gpui::TransformationMatrix { rows: [[1., 0., 0.], [0., 1., 0.], [g, h, 1.]] })
+            .compose(shift(-1.))
+    }
+
+    /// What a CPU makes of a scene drawn through `matrix`: each pixel is the average of 8 by 8 samples,
+    /// each taken by mapping the sample back through the matrix's inverse into the primitive's own space
+    /// and asking `shade` for the color there (`None` outside the primitive, black on screen).
+    fn reference_through(
+        matrix: &gpui::TransformationMatrix,
+        shade: impl Fn(f32, f32) -> Option<[f32; 3]>,
+    ) -> image::RgbaImage {
+        const SUBSAMPLES: u32 = 8;
+        let inverse = matrix.inverse().expect("the matrix can be inverted");
+        let mut image = image::RgbaImage::new(SIZE as u32, SIZE as u32);
+        for y in 0..SIZE as u32 {
+            for x in 0..SIZE as u32 {
+                let mut total = [0f32; 3];
+                for sub_y in 0..SUBSAMPLES {
+                    for sub_x in 0..SUBSAMPLES {
+                        let window_x = x as f32 + (sub_x as f32 + 0.5) / SUBSAMPLES as f32;
+                        let window_y = y as f32 + (sub_y as f32 + 0.5) / SUBSAMPLES as f32;
+                        let Some([local_x, local_y]) = inverse.project(window_x, window_y) else {
+                            continue;
+                        };
+                        if let Some(color) = shade(local_x, local_y) {
+                            for channel in 0..3 {
+                                total[channel] += color[channel];
+                            }
+                        }
+                    }
+                }
+                let samples = (SUBSAMPLES * SUBSAMPLES) as f32;
+                image.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([
+                        (total[0] / samples * 255.).round() as u8,
+                        (total[1] / samples * 255.).round() as u8,
+                        (total[2] / samples * 255.).round() as u8,
+                        255,
+                    ]),
+                );
+            }
+        }
+        image
+    }
+
+    /// The antialiasing of a transformed primitive is a distance from the edge with a step at the
+    /// edge for the pixels centred inside, and the reference is an area: along an edge the two differ
+    /// by up to half, more at a corner. Anywhere a pixel is wholly in or out, they agree, so a seam or a gap shows.
+    fn assert_matches_reference(actual: &image::RgbaImage, reference: &image::RgbaImage) {
+        let (mut difference, mut area_actual, mut area_reference) = (0u64, 0u64, 0u64);
+        for (x, y, pixel) in actual.enumerate_pixels() {
+            let expected = reference.get_pixel(x, y);
+            for channel in 0..3 {
+                let (value, wanted) = (pixel.0[channel], expected.0[channel]);
+                let edge = (3..253).contains(&wanted);
+                let allowed = if edge { 170 } else { 40 };
+                assert!(
+                    value.abs_diff(wanted) <= allowed,
+                    "pixel ({x}, {y}) is {:?}, the reference has {:?}",
+                    pixel.0,
+                    expected.0
+                );
+                difference += u64::from(value.abs_diff(wanted));
+                area_actual += u64::from(value);
+                area_reference += u64::from(wanted);
+            }
+        }
+        let pixels = u64::from(SIZE as u32 * SIZE as u32 * 3);
+        assert!(difference / pixels <= 5, "the mean error is {} of 255", difference / pixels);
+        assert!(
+            area_actual.abs_diff(area_reference) * 100 <= area_reference * 8,
+            "the lit area is {area_actual} and the reference's {area_reference}"
+        );
+    }
+
+    fn inside_rounded_rect(x: f32, y: f32, rect: (f32, f32, f32, f32), radius: f32) -> bool {
+        let (left, top, width, height) = rect;
+        let from_center = ((x - (left + width / 2.)).abs(), (y - (top + height / 2.)).abs());
+        let corner = (from_center.0 - (width / 2. - radius), from_center.1 - (height / 2. - radius));
+        if corner.0 > radius || corner.1 > radius {
+            return false;
+        }
+        corner.0 <= 0. || corner.1 <= 0. || corner.0.hypot(corner.1) <= radius
+    }
+
+    #[test]
+    fn a_quad_under_perspective_matches_the_cpu_reference() {
+        let matrix = perspective_about((20., 20.), 0.04, 0.012);
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            transformation: matrix,
+            ..solid(10., 10., 20., 20., 0xff0000)
+        });
+        let reference = reference_through(&matrix, |x, y| {
+            ((10. ..30.).contains(&x) && (10. ..30.).contains(&y)).then_some([1., 0., 0.])
+        });
+        let image = render(&mut scene);
+        assert_matches_reference(&image, &reference);
+        // The near side, where the plane is larger, covers more than the far one does.
+        assert!(image.get_pixel(4, 20).0[0] > 200 && image.get_pixel(26, 20).0[0] > 200);
+        assert!(is_cleared(&image, 2, 20) && is_cleared(&image, 33, 20));
+    }
+
+    #[test]
+    fn a_rounded_bordered_quad_under_perspective_matches_the_cpu_reference() {
+        let matrix = perspective_about((20., 20.), -0.03, 0.025);
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            transformation: matrix,
+            border_widths: Edges::all(ScaledPixels(3.)),
+            border_colors: Edges::all(hex(0x0000ff)),
+            ..rounded_box(8., 9., 24., 8., 0xff0000)
+        });
+        let reference = reference_through(&matrix, |x, y| {
+            if !inside_rounded_rect(x, y, (8., 9., 24., 24.), 8.) {
+                return None;
+            }
+            // The inner edge of the border: the box shrunk by its width, its radius by the same.
+            Some(if inside_rounded_rect(x, y, (11., 12., 18., 18.), 5.) { [1., 0., 0.] } else { [0., 0., 1.] })
+        });
+        assert_matches_reference(&render(&mut scene), &reference);
+    }
+
+    #[test]
+    fn an_image_under_perspective_is_mapped_as_the_plane_is_not_as_the_screen_is() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        // Black left half, white right half: where the middle falls tells the two mappings apart.
+        let tile = atlas_image(
+            &renderer,
+            1,
+            2,
+            1,
+            pixels(&[OPAQUE_BLACK, OPAQUE_WHITE]),
+        );
+        let matrix = perspective_about((20., 20.), 0.04, 0.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::PolychromeSprite {
+            transformation: matrix,
+            ..image_sprite(tile, (10., 10., 20., 20.), window_mask())
+        });
+        let reference = reference_through(&matrix, |x, y| {
+            ((10. ..30.).contains(&x) && (10. ..30.).contains(&y)).then(|| {
+                let level = if x < 20. { 0. } else { 1. };
+                [level; 3]
+            })
+        });
+        let image = render_in(&mut renderer, &mut scene);
+        assert_matches_reference(&image, &reference);
+        // The middle of the plane is at window x = 20, but the middle of the screen
+        // footprint is at about 15 (the plane is larger on the left): that is where a
+        // texture mapped in the screen would put it.
+        assert!(image.get_pixel(18, 20).0[0] < 60, "{:?}", image.get_pixel(18, 20));
+        assert!(image.get_pixel(22, 20).0[0] > 200, "{:?}", image.get_pixel(22, 20));
+    }
+
+    #[test]
+    fn a_glyph_sprite_under_perspective_matches_the_cpu_reference() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let tile = ramp_tile(&renderer, "perspective-ramp");
+        let matrix = perspective_about((20., 20.), 0.025, -0.02);
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::MonochromeSprite {
+            bounds: Bounds::new(
+                point(ScaledPixels(12.), ScaledPixels(12.)),
+                size(ScaledPixels(16.), ScaledPixels(16.)),
+            ),
+            transformation: matrix,
+            ..glyph_sprite(tile, (12., 12.), gpui::TransformationMatrix::unit())
+        });
+        // The ramp's alpha steps by 4 per texel in row-major order of 8 by 8, which the linear sampler
+        // blends: texel centres sit at (i + 0.5) / 8 of the sprite.
+        let alpha = |u: f32, v: f32| {
+            let at = |x: i32, y: i32| (x.clamp(0, 7) + 8 * y.clamp(0, 7)) as f32 * 4. + 3.;
+            let (x, y) = (u * 8. - 0.5, v * 8. - 0.5);
+            let (x0, y0) = (x.floor(), y.floor());
+            let (fx, fy) = (x - x0, y - y0);
+            let (x0, y0) = (x0 as i32, y0 as i32);
+            (at(x0, y0) * (1. - fx) * (1. - fy)
+                + at(x0 + 1, y0) * fx * (1. - fy)
+                + at(x0, y0 + 1) * (1. - fx) * fy
+                + at(x0 + 1, y0 + 1) * fx * fy)
+                / 255.
+        };
+        let reference = reference_through(&matrix, |x, y| {
+            ((12. ..28.).contains(&x) && (12. ..28.).contains(&y))
+                .then(|| [alpha((x - 12.) / 16., (y - 12.) / 16.), 0., 0.])
+        });
+        assert_matches_reference(&render_in(&mut renderer, &mut scene), &reference);
+    }
+
+    #[test]
+    fn a_quad_half_behind_the_eye_draws_only_the_part_in_front() {
+        // W = 1 - (x - 10) / 30: the plane is at the horizon at x = 40 and behind the eye after it.
+        let matrix = perspective_about((10., 20.), -1. / 30., 0.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            content_mask: window_mask(),
+            transformation: matrix,
+            ..solid(10., 10., 60., 20., 0xff0000)
+        });
+        let reference = reference_through(&matrix, |x, y| {
+            ((10. ..70.).contains(&x) && (10. ..30.).contains(&y)).then_some([1., 0., 0.])
+        });
+        let image = render_in(&mut MetalHeadlessRenderer::new(), &mut scene);
+        // The part behind the eye is not mirrored onto the screen, and the part in front is
+        // stretched towards the horizon, to the right edge.
+        assert_matches_reference(&image, &reference);
+        assert!(image.get_pixel(38, 20).0[0] > 200);
     }
 }

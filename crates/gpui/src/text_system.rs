@@ -1548,7 +1548,7 @@ impl GlyphTransform {
     pub const IDENTITY: GlyphTransform = GlyphTransform([Self::UNIT, 0, 0, Self::UNIT]);
 
     /// The nearest quantized transform to `linear`, row-major as in
-    /// [`TransformationMatrix::rotation_scale`].
+    /// [`TransformationMatrix::linear`].
     pub fn quantize(linear: [[f32; 2]; 2]) -> Self {
         let step = |value: f32| (value * Self::UNIT as f32).round() as i32;
         GlyphTransform([step(linear[0][0]), step(linear[0][1]), step(linear[1][0]), step(linear[1][1])])

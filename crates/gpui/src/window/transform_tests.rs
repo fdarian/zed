@@ -442,9 +442,10 @@ fn a_group_in_a_rotation_keeps_its_reference_box_in_local_space() {
     // window is in the group's own coordinates.
     assert_eq!(effect.reference, square(0., 0., 20.).scale(2.));
     assert_eq!(effect.reference_radii, radii);
-    let mut placed = css([1., 0., 0., 1., 40., 10.]).compose(rotation(45.)).scaled(2.);
-    placed.translation[0] -= bounds.origin.x.0;
-    placed.translation[1] -= bounds.origin.y.0;
+    let placed = css([1., 0., 0., 1., 40., 10.])
+        .compose(rotation(45.))
+        .scaled(2.)
+        .moved_by([-bounds.origin.x.0, -bounds.origin.y.0]);
     assert_eq!(effect.reference_transformation, placed);
     // The matrix turns without scaling, so the blur of the element is the one on screen.
     let sigma = crate::ResolvedFilter::blur(1.);
@@ -597,6 +598,95 @@ fn a_path_in_a_rotation_has_its_vertices_placed_and_a_loose_clip() {
     });
 }
 
+/// A plane seen from 200 logical pixels away along its x axis: `W = 1 - x / 200`, so the plane is
+/// at the horizon at x = 200 and behind the eye after it.
+fn homography() -> TransformationMatrix {
+    TransformationMatrix { rows: [[1., 0., 0.], [0., 1., 0.], [-1. / 200., 0., 1.]] }
+}
+
+#[test]
+fn a_hitbox_under_a_homography_is_hit_by_the_divided_point_and_missed_behind_the_eye() {
+    let mut app = TestApp::new();
+    let mut window = app.open_window(|_, _| HitboxPainter(Rc::new(|window| {
+        window.with_transform(homography(), |window| {
+            window.insert_hitbox(
+                Bounds::new(point(px(0.), px(0.)), size(px(800.), px(100.))),
+                crate::HitboxBehavior::Normal,
+            );
+        });
+    })));
+    window.draw();
+    window.update(|_, window, _| {
+        let hitbox = window.rendered_frame.hitboxes[0].clone();
+        // The point at x = 100 is half as far (W = 0.5) and shows at x = 200, y = 2 * 30 = 60.
+        let local = hitbox.to_local(point(px(200.), px(60.))).expect("in front of the eye");
+        assert!((local.x.0 - 100.).abs() < 1e-2 && (local.y.0 - 30.).abs() < 1e-2, "{local:?}");
+        assert!(hitbox.contains_window_point(point(px(200.), px(60.))));
+        assert_eq!(window.rendered_frame.hit_test(point(px(200.), px(60.)), true).ids.len(), 1);
+        // x = 600 of the plane is behind the eye and shows at window x = -300 (600 / -2), where
+        // the plain mapping back would find it inside the box.
+        assert!(hitbox.to_local(point(px(-300.), px(60.))).is_none());
+        assert!(!hitbox.contains_window_point(point(px(-300.), px(60.))));
+        assert!(window.rendered_frame.hit_test(point(px(-300.), px(60.)), true).ids.is_empty());
+        // The window-space box is cut at the horizon, and starts at the plane's origin.
+        let window_bounds = hitbox.window_bounds();
+        assert!(window_bounds.origin.x.0.abs() < 1e-3 && window_bounds.size.width.0.is_finite());
+    });
+}
+
+struct HitboxPainter(Rc<dyn Fn(&mut Window)>);
+
+impl Render for HitboxPainter {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let prepaint = self.0.clone();
+        canvas(move |_, window, _| prepaint(window), |_, (): (), _, _| ()).size_full()
+    }
+}
+
+#[test]
+fn a_primitive_under_a_homography_carries_the_3x3_in_device_pixels() {
+    let quads = painted(|window| {
+        window.with_transform(homography(), |window| {
+            window.paint_quad(fill(square(10., 10., 20.), red()));
+        });
+    });
+    // The window of these tests has a scale factor of 2: the matrix is conjugated by it.
+    let scale = 2.;
+    let quad = quad_with_width(&quads, 20., scale);
+    assert_eq!(quad.transformation, homography().scaled(scale));
+    assert!(!quad.transformation.is_affine());
+    assert_eq!(quad.transformation.rows[2], [-1. / 200. / scale, 0., 1.]);
+    // The same point of the primitive reaches the same device pixel as the logical point does.
+    let logical = homography().apply_xy(40., 12.);
+    let device = quad.transformation.apply_xy(40. * scale, 12. * scale);
+    assert!((device[0] - logical[0] * scale).abs() < 1e-3 && (device[1] - logical[1] * scale).abs() < 1e-3);
+}
+
+#[test]
+fn a_path_under_a_homography_is_cut_in_front_of_the_eye_and_mapped_with_the_divide() {
+    let mut app = TestApp::new();
+    let mut window = app.open_window(|_, _| {
+        Painter(Rc::new(|window| {
+            window.with_transform(homography(), |window| {
+                // x from 20 to 100 (W 0.9 to 0.5) and a point far past the horizon at x = 400.
+                let mut path = crate::Path::new(point(px(20.), px(0.)));
+                path.line_to(point(px(100.), px(0.)));
+                path.line_to(point(px(100.), px(40.)));
+                window.paint_path(path, red());
+            });
+        }))
+    });
+    window.draw();
+    window.update(|_, window, _| {
+        let path = &window.rendered_frame.scene.paths[0];
+        // Device pixels at scale 2: x = 20 -> 20 / 0.9 and x = 100 -> 100 / 0.5 = 200, times 2.
+        assert!((path.bounds.origin.x.0 - 2. * 20. / 0.9).abs() < 0.05, "{:?}", path.bounds);
+        assert!((path.bounds.right().0 - 400.).abs() < 0.05, "{:?}", path.bounds);
+        // y = 40 at x = 100 is 40 / 0.5 = 80, times 2.
+        assert!((path.bounds.bottom().0 - 160.).abs() < 0.05, "{:?}", path.bounds);
+    });
+}
+
 #[test]
 fn a_surface_is_placed_as_a_quad_is_exactly_under_a_translation_and_a_rotation() {
     let mut app = TestApp::new();
@@ -707,11 +797,7 @@ mod elements {
     fn assert_matrix(actual: TransformationMatrix, expected: TransformationMatrix) {
         let close = |left: f32, right: f32| (left - right).abs() < 1e-3;
         assert!(
-            (0..2).all(|row| (0..2).all(|column| close(
-                actual.rotation_scale[row][column],
-                expected.rotation_scale[row][column]
-            ))) && close(actual.translation[0], expected.translation[0])
-                && close(actual.translation[1], expected.translation[1]),
+            (0..3).all(|row| (0..3).all(|column| close(actual.rows[row][column], expected.rows[row][column]))),
             "{actual:?} is not {expected:?}"
         );
     }
@@ -783,10 +869,7 @@ mod elements {
         // (110 - y, x + 10) in logical and (220 - y, x + 20) in device pixels.
         assert_matrix(
             parent.transformation,
-            TransformationMatrix {
-                rotation_scale: [[0., -1.], [1., 0.]],
-                translation: [220., 20.],
-            },
+            TransformationMatrix::affine([[0., -1.], [1., 0.]], [220., 20.]),
         );
     }
 
@@ -1636,7 +1719,7 @@ mod glyphs {
     }
 
     fn linear(matrix: TransformationMatrix) -> GlyphTransform {
-        GlyphTransform::quantize(matrix.rotation_scale)
+        GlyphTransform::quantize(matrix.linear())
     }
 
     #[test]

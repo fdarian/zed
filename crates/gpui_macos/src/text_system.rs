@@ -2257,10 +2257,7 @@ mod tests {
             (ink, squares / ink, edge / ink, (centroid.0 / ink, centroid.1 / ink))
         };
 
-        let turn = TransformationMatrix {
-            rotation_scale: linear,
-            translation: [SIDE as f32 / 2., SIDE as f32 / 2.],
-        };
+        let turn = TransformationMatrix::affine(linear, [SIDE as f32 / 2., SIDE as f32 / 2.]);
         // The scale factor is in the raster of either; the matrix works on device pixels.
         let (exact_ink, exact_solid, exact_edge, exact_centroid) =
             coverage(GlyphTransform::quantize(linear), None);

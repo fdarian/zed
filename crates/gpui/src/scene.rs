@@ -1561,8 +1561,7 @@ fn move_through(transformation: &mut TransformationMatrix, delta: Point<ScaledPi
     if *transformation == TransformationMatrix::unit() {
         return false;
     }
-    transformation.translation[0] += delta.x.0;
-    transformation.translation[1] += delta.y.0;
+    *transformation = transformation.moved_by([delta.x.0, delta.y.0]);
     true
 }
 
@@ -1573,9 +1572,7 @@ fn move_clip_through(clip_transformation: &mut TransformationMatrix, delta: Poin
     if *clip_transformation == TransformationMatrix::unit() {
         return;
     }
-    let [[a, b], [c, d]] = clip_transformation.rotation_scale;
-    clip_transformation.translation[0] -= a * delta.x.0 + b * delta.y.0;
-    clip_transformation.translation[1] -= c * delta.x.0 + d * delta.y.0;
+    *clip_transformation = clip_transformation.with_input_moved_by([delta.x.0, delta.y.0]);
 }
 
 fn translate_bounds(bounds: &mut Bounds<ScaledPixels>, delta: Point<ScaledPixels>) {
@@ -1686,11 +1683,67 @@ impl PaintSurface {
     }
 }
 
+/// The triangles of a path (three vertices each), cut to where `matrix` puts a point in front of the
+/// eye. The cut is made in the path's own space, where the coordinates the rasterizer interpolates
+/// are linear, so a vertex it adds takes the exact ones.
+fn triangles_in_front(
+    vertices: &[PathVertex<ScaledPixels>],
+    matrix: &TransformationMatrix,
+) -> Vec<PathVertex<ScaledPixels>> {
+    debug_assert_eq!(vertices.len() % 3, 0, "a path is a list of triangles");
+    let w_of = |vertex: &PathVertex<ScaledPixels>| {
+        matrix.homogeneous(vertex.xy_position.x.0, vertex.xy_position.y.0)[2]
+    };
+    let mut kept = Vec::with_capacity(vertices.len());
+    for triangle in vertices.chunks_exact(3) {
+        let mut polygon: Vec<PathVertex<ScaledPixels>> = Vec::with_capacity(4);
+        for (index, current) in triangle.iter().enumerate() {
+            let previous = &triangle[(index + 2) % 3];
+            let (current_w, previous_w) = (w_of(current), w_of(previous));
+            let current_in_front = current_w >= crate::transform::MIN_W;
+            if current_in_front != (previous_w >= crate::transform::MIN_W) {
+                let along = (crate::transform::MIN_W - previous_w) / (current_w - previous_w);
+                let lerp = |from: f32, to: f32| from + (to - from) * along;
+                polygon.push(PathVertex {
+                    xy_position: point(
+                        ScaledPixels(lerp(previous.xy_position.x.0, current.xy_position.x.0)),
+                        ScaledPixels(lerp(previous.xy_position.y.0, current.xy_position.y.0)),
+                    ),
+                    st_position: Point::new(
+                        lerp(previous.st_position.x, current.st_position.x),
+                        lerp(previous.st_position.y, current.st_position.y),
+                    ),
+                    content_mask: current.content_mask.clone(),
+                });
+            }
+            if current_in_front {
+                polygon.push(current.clone());
+            }
+        }
+        for corner in 2..polygon.len() {
+            kept.extend([polygon[0].clone(), polygon[corner - 1].clone(), polygon[corner].clone()]);
+        }
+    }
+    kept
+}
+
 impl Path<ScaledPixels> {
     /// Places the path where a transform puts it, in the vertices: the rasterizer draws triangles,
     /// which take any affine matrix, and the antialiasing of the curves follows the screen-space
     /// gradient of their coordinates. The bounds become those of the placed vertices.
+    ///
+    /// A matrix with perspective maps the vertices, so the edges of the triangles stay straight
+    /// and exact; the curve of a Bezier triangle is not exact, as the rasterizer interpolates the
+    /// coordinates its antialiasing uses linearly on the screen and not in perspective. What of a
+    /// triangle is behind the eye is cut off first.
     pub(crate) fn place(&mut self, offset: Point<ScaledPixels>, matrix: &TransformationMatrix) {
+        if !matrix.is_affine() && !self.vertices.is_empty() {
+            self.vertices = triangles_in_front(&self.vertices, matrix);
+            if self.vertices.is_empty() {
+                self.bounds = Bounds::default();
+                return;
+            }
+        }
         if self.vertices.is_empty() {
             self.bounds = matrix.bounding_box_scaled(self.bounds);
             translate_bounds(&mut self.bounds, offset);
@@ -2094,9 +2147,10 @@ fn transformed_bounds(
     if *transformation == TransformationMatrix::unit() {
         return bounds;
     }
+    // A primitive all behind the eye shows nowhere: its bounds stay empty, not grown by the pixel.
     transformation
-        .bounding_box_scaled(bounds)
-        .dilate(ScaledPixels(1.))
+        .try_bounding_box_scaled(bounds)
+        .map_or_else(Bounds::default, |window| window.dilate(ScaledPixels(1.)))
 }
 
 impl From<Quad> for Primitive {
@@ -2191,15 +2245,15 @@ pub enum BorderStyle {
     Outset = 7,
 }
 
-/// A data type representing a 2 dimensional transformation that can be applied to an element.
+/// A projective transformation of the plane, the z = 0 plane of a 4x4 transform: it takes a point
+/// `(x, y)` of a primitive's own space to the window point `(X / W, Y / W)`, where `(X, Y, W)` is
+/// the matrix applied to `(x, y, 1)`. An affine matrix has the bottom row `(0, 0, 1)`; every
+/// transform that does not look at perspective is one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct TransformationMatrix {
-    /// 2x2 matrix containing rotation and scale,
-    /// stored row-major
-    pub rotation_scale: [[f32; 2]; 2],
-    /// translation vector
-    pub translation: [f32; 2],
+    /// The 3x3 matrix, stored row-major and applied to the column `(x, y, 1)`.
+    pub rows: [[f32; 3]; 3],
 }
 
 impl Eq for TransformationMatrix {}
@@ -2207,37 +2261,64 @@ impl Eq for TransformationMatrix {}
 impl TransformationMatrix {
     /// The unit matrix, has no effect.
     pub fn unit() -> Self {
+        Self::affine([[1.0, 0.0], [0.0, 1.0]], [0.0, 0.0])
+    }
+
+    /// The affine matrix of a 2x2 linear part (row-major) and a translation.
+    pub fn affine(linear: [[f32; 2]; 2], translation: [f32; 2]) -> Self {
         Self {
-            rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
-            translation: [0.0, 0.0],
+            rows: [
+                [linear[0][0], linear[0][1], translation[0]],
+                [linear[1][0], linear[1][1], translation[1]],
+                [0.0, 0.0, 1.0],
+            ],
         }
     }
 
+    /// The 2x2 linear part, row-major. For a projective matrix it is the one of the first
+    /// derivative at the origin only up to the bottom row, so read it of affine matrices.
+    #[inline]
+    pub fn linear(&self) -> [[f32; 2]; 2] {
+        [
+            [self.rows[0][0], self.rows[0][1]],
+            [self.rows[1][0], self.rows[1][1]],
+        ]
+    }
+
+    /// The translation column of the first two rows: where the origin goes for an affine matrix.
+    #[inline]
+    pub fn translation(&self) -> [f32; 2] {
+        [self.rows[0][2], self.rows[1][2]]
+    }
+
+    /// Whether the bottom row is `(0, 0, 1)`: the matrix keeps parallel lines parallel and `W` is 1.
+    #[inline]
+    pub fn is_affine(&self) -> bool {
+        self.rows[2] == [0.0, 0.0, 1.0]
+    }
+
     /// Move the origin by a given point
-    pub fn translate(mut self, point: Point<ScaledPixels>) -> Self {
-        self.compose(Self {
-            rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
-            translation: [point.x.0, point.y.0],
-        })
+    pub fn translate(self, point: Point<ScaledPixels>) -> Self {
+        self.compose(Self::affine([[1.0, 0.0], [0.0, 1.0]], [point.x.0, point.y.0]))
     }
 
     /// Clockwise rotation in radians around the origin
     pub fn rotate(self, angle: Radians) -> Self {
-        self.compose(Self {
-            rotation_scale: [
+        self.compose(Self::affine(
+            [
                 [angle.0.cos(), -angle.0.sin()],
                 [angle.0.sin(), angle.0.cos()],
             ],
-            translation: [0.0, 0.0],
-        })
+            [0.0, 0.0],
+        ))
     }
 
     /// Scale around the origin
     pub fn scale(self, size: Size<f32>) -> Self {
-        self.compose(Self {
-            rotation_scale: [[size.width, 0.0], [0.0, size.height]],
-            translation: [0.0, 0.0],
-        })
+        self.compose(Self::affine(
+            [[size.width, 0.0], [0.0, size.height]],
+            [0.0, 0.0],
+        ))
     }
 
     /// Perform matrix multiplication with another transformation
@@ -2248,42 +2329,36 @@ impl TransformationMatrix {
         if other == Self::unit() {
             return self;
         }
-        // Perform matrix multiplication
-        TransformationMatrix {
-            rotation_scale: [
+        if self.is_affine() && other.is_affine() {
+            let [[a0, a1], [a2, a3]] = self.linear();
+            let [[b0, b1], [b2, b3]] = other.linear();
+            let own = self.translation();
+            let next = other.translation();
+            return Self::affine(
                 [
-                    self.rotation_scale[0][0] * other.rotation_scale[0][0]
-                        + self.rotation_scale[0][1] * other.rotation_scale[1][0],
-                    self.rotation_scale[0][0] * other.rotation_scale[0][1]
-                        + self.rotation_scale[0][1] * other.rotation_scale[1][1],
+                    [a0 * b0 + a1 * b2, a0 * b1 + a1 * b3],
+                    [a2 * b0 + a3 * b2, a2 * b1 + a3 * b3],
                 ],
                 [
-                    self.rotation_scale[1][0] * other.rotation_scale[0][0]
-                        + self.rotation_scale[1][1] * other.rotation_scale[1][0],
-                    self.rotation_scale[1][0] * other.rotation_scale[0][1]
-                        + self.rotation_scale[1][1] * other.rotation_scale[1][1],
+                    own[0] + a0 * next[0] + a1 * next[1],
+                    own[1] + a2 * next[0] + a3 * next[1],
                 ],
-            ],
-            translation: [
-                self.translation[0]
-                    + self.rotation_scale[0][0] * other.translation[0]
-                    + self.rotation_scale[0][1] * other.translation[1],
-                self.translation[1]
-                    + self.rotation_scale[1][0] * other.translation[0]
-                    + self.rotation_scale[1][1] * other.translation[1],
-            ],
+            );
         }
+        let mut rows = [[0.0; 3]; 3];
+        for (row, output_row) in rows.iter_mut().enumerate() {
+            for (column, output_cell) in output_row.iter_mut().enumerate() {
+                for k in 0..3 {
+                    *output_cell += self.rows[row][k] * other.rows[k][column];
+                }
+            }
+        }
+        TransformationMatrix { rows }
     }
 
     /// Apply transformation to a point, mainly useful for debugging
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
-        let input = [point.x.0, point.y.0];
-        let mut output = self.translation;
-        for (i, output_cell) in output.iter_mut().enumerate() {
-            for (k, input_cell) in input.iter().enumerate() {
-                *output_cell += self.rotation_scale[i][k] * *input_cell;
-            }
-        }
+        let output = self.apply_xy(point.x.0, point.y.0);
         Point::new(output[0].into(), output[1].into())
     }
 }

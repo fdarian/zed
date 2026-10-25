@@ -137,9 +137,10 @@ impl ResolvedFilter {
     /// each axis of the window when the matrix keeps the axes apart, which is a scale (or a
     /// quarter turn of one). Otherwise a blur can't follow the matrix, as a separable one is
     /// always along the window's axes, and it is scaled by the square root of the area scale,
-    /// which is what Chrome measures for a rotation, a uniform scale and a skew alike.
+    /// which is what Chrome measures for a rotation, a uniform scale and a skew alike. The matrix
+    /// is affine: a projective one is put through [`TransformationMatrix::linearized_at`] first.
     pub(crate) fn through(&self, matrix: &TransformationMatrix) -> ResolvedFilter {
-        let [[a, b], [c, d]] = matrix.rotation_scale;
+        let [[a, b], [c, d]] = matrix.linear();
         let area_scale = (a * d - b * c).abs().sqrt();
         let keeps_axes = b.abs() + c.abs() <= 1e-4 * (a.abs() + d.abs());
         let swaps_axes = a.abs() + d.abs() <= 1e-4 * (b.abs() + c.abs());
@@ -657,6 +658,22 @@ impl ResolvedClipPath {
             let mapped = matrix.apply_xy(point.x, point.y);
             Point::new(mapped[0], mapped[1])
         };
+        // A homography maps a polygon's edges to straight edges, but the part of it behind the
+        // eye has to be cut off before the points are divided by W.
+        let map_contour = |contour: &[Point<f32>]| -> Vec<Point<f32>> {
+            if matrix.is_affine() {
+                return contour.iter().map(map).collect();
+            }
+            let homogeneous: Vec<[f32; 3]> = contour
+                .iter()
+                .map(|point| matrix.homogeneous(point.x, point.y))
+                .collect();
+            matrix
+                .clipped_outline(&homogeneous)
+                .into_iter()
+                .map(|mapped| Point::new(mapped[0], mapped[1]))
+                .collect()
+        };
         if matrix.is_axis_aligned() {
             match self {
                 ResolvedClipPath::RoundedRect {
@@ -683,8 +700,8 @@ impl ResolvedClipPath {
                     return ResolvedClipPath::Ellipse {
                         center: map(center),
                         radii: Size::new(
-                            radii.width * matrix.rotation_scale[0][0].abs(),
-                            radii.height * matrix.rotation_scale[1][1].abs(),
+                            radii.width * matrix.rows[0][0].abs(),
+                            radii.height * matrix.rows[1][1].abs(),
                         ),
                     };
                 }
@@ -696,33 +713,25 @@ impl ResolvedClipPath {
                 bounds,
                 corner_radii,
             } => ResolvedClipPath::Polygon {
-                contours: vec![
-                    rounded_rect_outline(bounds, corner_radii)
-                        .iter()
-                        .map(map)
-                        .collect(),
-                ],
+                contours: vec![map_contour(&rounded_rect_outline(bounds, corner_radii))],
                 even_odd: false,
             },
             ResolvedClipPath::Ellipse { center, radii } => ResolvedClipPath::Polygon {
-                contours: vec![
-                    (0..OUTLINE_SAMPLES * 4)
+                contours: vec![map_contour(
+                    &(0..OUTLINE_SAMPLES * 4)
                         .map(|step| {
                             let angle = step as f32 / (OUTLINE_SAMPLES * 4) as f32 * std::f32::consts::TAU;
-                            map(&Point::new(
+                            Point::new(
                                 center.x + radii.width * angle.cos(),
                                 center.y + radii.height * angle.sin(),
-                            ))
+                            )
                         })
-                        .collect(),
-                ],
+                        .collect::<Vec<_>>(),
+                )],
                 even_odd: false,
             },
             ResolvedClipPath::Polygon { contours, even_odd } => ResolvedClipPath::Polygon {
-                contours: contours
-                    .iter()
-                    .map(|contour| contour.iter().map(map).collect())
-                    .collect(),
+                contours: contours.iter().map(|contour| map_contour(contour)).collect(),
                 even_odd: *even_odd,
             },
         }
@@ -949,16 +958,15 @@ impl GroupEffect {
             return self.reference;
         }
         self.reference_transformation
-            .bounding_box_scaled(self.reference)
-            .dilate(ScaledPixels(1.))
+            .try_bounding_box_scaled(self.reference)
+            .map_or_else(Bounds::default, |window| window.dilate(ScaledPixels(1.)))
     }
 
     pub(crate) fn translate(&mut self, delta: Point<ScaledPixels>) {
         if self.reference_transformation == TransformationMatrix::unit() {
             self.reference.origin = self.reference.origin + delta;
         } else {
-            self.reference_transformation.translation[0] += delta.x.0;
-            self.reference_transformation.translation[1] += delta.y.0;
+            self.reference_transformation = self.reference_transformation.moved_by([delta.x.0, delta.y.0]);
         }
         if let Some(clip_path) = &mut self.clip_path {
             clip_path.translate(Point::new(delta.x.0, delta.y.0));

@@ -10,16 +10,11 @@ float4 srgb_to_oklab(float4 color);
 float4 oklab_to_srgb(float4 color);
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           constant Size_DevicePixels *viewport_size);
-float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          TransformationMatrix transformation,
-                          constant Size_DevicePixels *input_viewport_size);
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
 float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
-float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                               Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation);
 float corner_dash_velocity(float dv1, float dv2);
 float dash_alpha(float t, float period, float length, float dash_velocity,
                  float antialias_threshold, float pixel);
@@ -37,10 +32,15 @@ float quad_sdf_impl(float2 center_to_point, float2 corner_radius);
 float content_mask_coverage(float2 position, ContentMask_ScaledPixels content_mask);
 float border_vertical_weight(float2 corner_to_point, float2 border, float pixel);
 bool is_identity_transform(TransformationMatrix transformation);
+bool is_affine_transform(TransformationMatrix transformation);
 float transform_pixel_scale(TransformationMatrix transformation);
 float2 apply_transform(TransformationMatrix transformation, float2 position);
+float3 apply_homography(TransformationMatrix transformation, float2 position);
 float4 device_position_of(float2 position, constant Size_DevicePixels *viewport_size);
+float4 device_position_of_homogeneous(float3 position, constant Size_DevicePixels *viewport_size);
 float4 distance_from_clip(float2 position, Bounds_ScaledPixels clip_bounds);
+float4 distance_from_clip_homogeneous(float3 position, Bounds_ScaledPixels clip_bounds);
+float fragment_pixel_scale(float local_scale, float2 local_position);
 float local_clip_coverage(float2 local_position, ContentMask_ScaledPixels local_clip, float pixel);
 float rect_coverage(float2 local_position, Bounds_ScaledPixels bounds, float pixel);
 float4 select_border_color(bool is_left, bool is_top, float vertical_weight,
@@ -66,7 +66,9 @@ struct TransformedVertex {
   // Where the vertex is in the primitive's own space; unused when `local_scale` is 0.
   float2 local_position;
   // The device pixels one unit of the primitive's own space covers, or 0 when no
-  // matrix applies and the fragment works in window pixels.
+  // matrix applies and the fragment works in window pixels. A matrix with perspective covers a
+  // different number at every point: it is -1 then, and the fragment finds it from the
+  // derivatives of the local position (`fragment_pixel_scale`).
   float local_scale;
 };
 
@@ -134,14 +136,13 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
   } else {
     // One device pixel of padding around the quad is where its antialiased
     // edges are drawn, whichever way the matrix turns them.
-    local_scale = transform_pixel_scale(quad.transformation);
-    float pad = 1.0 / local_scale;
-    float2 origin = float2(quad.bounds.origin.x, quad.bounds.origin.y) - pad;
-    float2 extent = float2(quad.bounds.size.width, quad.bounds.size.height) + 2.0 * pad;
-    local_position = origin + unit_vertex * extent;
-    float2 window_position = apply_transform(quad.transformation, local_position);
-    device_position = device_position_of(window_position, viewport_size);
-    clip_distance = distance_from_clip(window_position, quad.content_mask.bounds);
+    TransformedVertex vertex_data =
+        transformed_vertex(unit_vertex, quad.bounds, quad.transformation,
+                           quad.content_mask.bounds, viewport_size);
+    device_position = vertex_data.device_position;
+    clip_distance = vertex_data.clip_distance;
+    local_position = vertex_data.local_position;
+    local_scale = vertex_data.local_scale;
   }
 
   GradientColor gradient = prepare_fill_color(
@@ -173,8 +174,8 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   Quad quad = quads[input.quad_id];
   // Everything below is in the quad's own space, which is the window's when
   // nothing transforms the quad. `pixel` is the device pixels one unit of it covers.
-  bool transformed = input.local_scale > 0.0;
-  float pixel = transformed ? input.local_scale : 1.0;
+  bool transformed = input.local_scale != 0.0;
+  float pixel = transformed ? fragment_pixel_scale(input.local_scale, input.local_position) : 1.0;
   float2 local_position = transformed ? input.local_position : input.position.xy;
   float2 fill_position = local_position;
   Bounds_ScaledPixels fill_bounds = quad.bounds;
@@ -752,14 +753,13 @@ vertex ShadowVertexOutput shadow_vertex(
     clip_distance =
         distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
   } else {
-    local_scale = transform_pixel_scale(shadow.transformation);
-    float pad = 1.0 / local_scale;
-    float2 origin = float2(bounds.origin.x, bounds.origin.y) - pad;
-    float2 extent = float2(bounds.size.width, bounds.size.height) + 2.0 * pad;
-    local_position = origin + unit_vertex * extent;
-    float2 window_position = apply_transform(shadow.transformation, local_position);
-    device_position = device_position_of(window_position, viewport_size);
-    clip_distance = distance_from_clip(window_position, shadow.content_mask.bounds);
+    TransformedVertex vertex_data =
+        transformed_vertex(unit_vertex, bounds, shadow.transformation,
+                           shadow.content_mask.bounds, viewport_size);
+    device_position = vertex_data.device_position;
+    clip_distance = vertex_data.clip_distance;
+    local_position = vertex_data.local_position;
+    local_scale = vertex_data.local_scale;
   }
   float4 color = hsla_to_rgba(shadow.color);
 
@@ -776,8 +776,8 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                 constant Shadow *shadows
                                 [[buffer(ShadowInputIndex_Shadows)]]) {
   Shadow shadow = shadows[input.shadow_id];
-  bool transformed = input.local_scale > 0.0;
-  float pixel = transformed ? input.local_scale : 1.0;
+  bool transformed = input.local_scale != 0.0;
+  float pixel = transformed ? fragment_pixel_scale(input.local_scale, input.local_position) : 1.0;
   float2 local_position = transformed ? input.local_position : input.position.xy;
 
   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
@@ -884,8 +884,8 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
   Underline underline = underlines[input.underline_id];
   // Everything below is in the underline's own space, which is the window's when nothing
   // transforms it. `pixel` is the device pixels one unit of it covers.
-  bool transformed = input.local_scale > 0.0;
-  float pixel = transformed ? input.local_scale : 1.0;
+  bool transformed = input.local_scale != 0.0;
+  float pixel = transformed ? fragment_pixel_scale(input.local_scale, input.local_position) : 1.0;
   float2 local_position = transformed ? input.local_position : input.position.xy;
   float mask_alpha = content_mask_coverage(input.position.xy, underline.content_mask);
   if (transformed) {
@@ -980,6 +980,10 @@ fragment float4 monochrome_sprite_fragment(
     MonochromeSpriteFragmentInput input [[stage_in]],
     constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
+  // Before anything returns: the derivatives of a perspective sprite are taken by every fragment.
+  float pixel = input.local_scale != 0.0
+                    ? fragment_pixel_scale(input.local_scale, input.local_position)
+                    : 1.0;
   if (any(input.clip_distance < float4(0.0))) {
     return float4(0.0);
   }
@@ -989,7 +993,7 @@ fragment float4 monochrome_sprite_fragment(
                                           min_filter::linear);
   float2 tile_position = input.tile_position;
   float coverage = 1.0;
-  if (input.local_scale > 0.0) {
+  if (input.local_scale != 0.0) {
     // The padding around a transformed sprite reads the tile's edge texels, not its
     // neighbours in the atlas, and is cut to the sprite's antialiased bounds.
     float2 atlas_size = float2(atlas_texture.get_width(), atlas_texture.get_height());
@@ -998,8 +1002,8 @@ fragment float4 monochrome_sprite_fragment(
     float2 tile_low = (tile_origin + 0.5) / atlas_size;
     float2 tile_high = max((tile_origin + tile_size - 0.5) / atlas_size, tile_low);
     tile_position = clamp(tile_position, tile_low, tile_high);
-    coverage = rect_coverage(input.local_position, sprite.bounds, input.local_scale) *
-               local_clip_coverage(input.local_position, sprite.local_clip, input.local_scale);
+    coverage = rect_coverage(input.local_position, sprite.bounds, pixel) *
+               local_clip_coverage(input.local_position, sprite.local_clip, pixel);
   } else if (!is_identity_transform(sprite.clip_transformation)) {
     // A sprite drawn upright inside a transform that clips: the clip is in the transform's
     // local space, found from the window position of the fragment.
@@ -1064,8 +1068,8 @@ fragment float4 polychrome_sprite_fragment(
   PolychromeSprite sprite = sprites[input.sprite_id];
   // Everything below is in the sprite's own space, which is the window's when nothing
   // transforms it. `pixel` is the device pixels one unit of it covers.
-  bool transformed = input.local_scale > 0.0;
-  float pixel = transformed ? input.local_scale : 1.0;
+  bool transformed = input.local_scale != 0.0;
+  float pixel = transformed ? fragment_pixel_scale(input.local_scale, input.local_position) : 1.0;
   float2 local_position = transformed ? input.local_position : input.position.xy;
   constexpr sampler linear_sampler(mag_filter::linear, min_filter::linear);
   constexpr sampler nearest_neighbor_sampler(mag_filter::nearest,
@@ -1281,7 +1285,8 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
                float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
   SurfaceBounds surface = surfaces[input.surface_id];
-  bool transformed = input.local_scale > 0.0;
+  bool transformed = input.local_scale != 0.0;
+  float pixel = transformed ? fragment_pixel_scale(input.local_scale, input.local_position) : 1.0;
   float2 texture_position = transformed ? saturate(input.texture_position) : input.texture_position;
   float4 ycbcr = float4(
       y_texture.sample(texture_sampler, texture_position).r,
@@ -1291,8 +1296,8 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   float coverage = content_mask_coverage(input.position.xy, surface.content_mask);
   if (transformed) {
     // The padding past the bounds is where the antialiased edge is drawn.
-    coverage *= rect_coverage(input.local_position, surface.bounds, input.local_scale) *
-                local_clip_coverage(input.local_position, surface.local_clip, input.local_scale);
+    coverage *= rect_coverage(input.local_position, surface.bounds, pixel) *
+                local_clip_coverage(input.local_position, surface.local_clip, pixel);
   }
   color.a = coverage;
   return color;
@@ -1416,30 +1421,6 @@ float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
   return float4(device_position, 0., 1.);
 }
 
-float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          TransformationMatrix transformation,
-                          constant Size_DevicePixels *input_viewport_size) {
-  float2 position =
-      unit_vertex * float2(bounds.size.width, bounds.size.height) +
-      float2(bounds.origin.x, bounds.origin.y);
-
-  // Apply the transformation matrix to the position via matrix multiplication.
-  float2 transformed_position = float2(0, 0);
-  transformed_position[0] = position[0] * transformation.rotation_scale[0][0] + position[1] * transformation.rotation_scale[0][1];
-  transformed_position[1] = position[0] * transformation.rotation_scale[1][0] + position[1] * transformation.rotation_scale[1][1];
-
-  // Add in the translation component of the transformation matrix.
-  transformed_position[0] += transformation.translation[0];
-  transformed_position[1] += transformation.translation[1];
-
-  float2 viewport_size = float2((float)input_viewport_size->width,
-                                (float)input_viewport_size->height);
-  float2 device_position =
-      transformed_position / viewport_size * float2(2., -2.) + float2(-1., 1.);
-  return float4(device_position, 0., 1.);
-}
-
-
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size) {
   float2 tile_origin = float2(tile.bounds.origin.x, tile.bounds.origin.y);
@@ -1550,49 +1531,53 @@ float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                 clip_bounds.origin.y + clip_bounds.size.height - position.y);
 }
 
-float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                               Bounds_ScaledPixels clip_bounds, TransformationMatrix transformation) {
-  float2 position =
-      unit_vertex * float2(bounds.size.width, bounds.size.height) +
-      float2(bounds.origin.x, bounds.origin.y);
-  float2 transformed_position = float2(0, 0);
-  transformed_position[0] = position[0] * transformation.rotation_scale[0][0] + position[1] * transformation.rotation_scale[0][1];
-  transformed_position[1] = position[0] * transformation.rotation_scale[1][0] + position[1] * transformation.rotation_scale[1][1];
-  transformed_position[0] += transformation.translation[0];
-  transformed_position[1] += transformation.translation[1];
-
-  return float4(transformed_position.x - clip_bounds.origin.x,
-                clip_bounds.origin.x + clip_bounds.size.width - transformed_position.x,
-                transformed_position.y - clip_bounds.origin.y,
-                clip_bounds.origin.y + clip_bounds.size.height - transformed_position.y);
+bool is_identity_transform(TransformationMatrix transformation) {
+  return transformation.rows[0][0] == 1.0 &&
+         transformation.rows[0][1] == 0.0 &&
+         transformation.rows[0][2] == 0.0 &&
+         transformation.rows[1][0] == 0.0 &&
+         transformation.rows[1][1] == 1.0 &&
+         transformation.rows[1][2] == 0.0 &&
+         transformation.rows[2][0] == 0.0 &&
+         transformation.rows[2][1] == 0.0 &&
+         transformation.rows[2][2] == 1.0;
 }
 
-bool is_identity_transform(TransformationMatrix transformation) {
-  return transformation.rotation_scale[0][0] == 1.0 &&
-         transformation.rotation_scale[0][1] == 0.0 &&
-         transformation.rotation_scale[1][0] == 0.0 &&
-         transformation.rotation_scale[1][1] == 1.0 &&
-         transformation.translation[0] == 0.0 &&
-         transformation.translation[1] == 0.0;
+bool is_affine_transform(TransformationMatrix transformation) {
+  return transformation.rows[2][0] == 0.0 && transformation.rows[2][1] == 0.0 &&
+         transformation.rows[2][2] == 1.0;
 }
 
 // The device pixels a unit of the primitive's own space covers once the matrix
 // is applied, as the square root of the area scale.
 float transform_pixel_scale(TransformationMatrix transformation) {
   float determinant =
-      transformation.rotation_scale[0][0] * transformation.rotation_scale[1][1] -
-      transformation.rotation_scale[0][1] * transformation.rotation_scale[1][0];
+      transformation.rows[0][0] * transformation.rows[1][1] -
+      transformation.rows[0][1] * transformation.rows[1][0];
   return sqrt(fabs(determinant));
 }
 
+// The window position of an affine matrix; a matrix with perspective goes through
+// `apply_homography`.
 float2 apply_transform(TransformationMatrix transformation, float2 position) {
   return float2(
-      position.x * transformation.rotation_scale[0][0] +
-          position.y * transformation.rotation_scale[0][1] +
-          transformation.translation[0],
-      position.x * transformation.rotation_scale[1][0] +
-          position.y * transformation.rotation_scale[1][1] +
-          transformation.translation[1]);
+      position.x * transformation.rows[0][0] +
+          position.y * transformation.rows[0][1] +
+          transformation.rows[0][2],
+      position.x * transformation.rows[1][0] +
+          position.y * transformation.rows[1][1] +
+          transformation.rows[1][2]);
+}
+
+// (X, Y, W) of a point: the window position is (X, Y) / W.
+float3 apply_homography(TransformationMatrix transformation, float2 position) {
+  return float3(
+      position.x * transformation.rows[0][0] + position.y * transformation.rows[0][1] +
+          transformation.rows[0][2],
+      position.x * transformation.rows[1][0] + position.y * transformation.rows[1][1] +
+          transformation.rows[1][2],
+      position.x * transformation.rows[2][0] + position.y * transformation.rows[2][1] +
+          transformation.rows[2][2]);
 }
 
 float4 device_position_of(float2 position,
@@ -1600,6 +1585,41 @@ float4 device_position_of(float2 position,
   float2 viewport_size = float2((float)input_viewport_size->width,
                                 (float)input_viewport_size->height);
   return float4(position / viewport_size * float2(2., -2.) + float2(-1., 1.), 0., 1.);
+}
+
+// The clip space position of a homogeneous window position: the same as
+// `device_position_of` of (X, Y) / W with W as the clip w, so the hardware divides, interpolates
+// the varyings correctly in perspective and clips what is at or behind W = 0 (z is 0).
+float4 device_position_of_homogeneous(float3 position,
+                                      constant Size_DevicePixels *input_viewport_size) {
+  float2 viewport_size = float2((float)input_viewport_size->width,
+                                (float)input_viewport_size->height);
+  return float4(position.xy / viewport_size * float2(2., -2.) + float2(-1., 1.) * position.z, 0.,
+                position.z);
+}
+
+// The clip distances of a homogeneous window position: each is the distance of the window
+// position from a side of the clip times W, so it is linear in clip space as the hardware
+// clips and interpolates it, and has the sign of the distance where W > 0.
+float4 distance_from_clip_homogeneous(float3 position, Bounds_ScaledPixels clip_bounds) {
+  return float4(position.x - clip_bounds.origin.x * position.z,
+                (clip_bounds.origin.x + clip_bounds.size.width) * position.z - position.x,
+                position.y - clip_bounds.origin.y * position.z,
+                (clip_bounds.origin.y + clip_bounds.size.height) * position.z - position.y);
+}
+
+// Device pixels per unit of the primitive's own space at a fragment: the flat scale of a
+// primitive drawn through an affine matrix, else, for a matrix with perspective, the side of
+// the square a pixel covers in the local space found from the derivatives of the local position.
+// Must be called by every fragment of the primitive: it takes derivatives.
+float fragment_pixel_scale(float local_scale, float2 local_position) {
+  if (local_scale > 0.0) {
+    return local_scale;
+  }
+  float2 across = dfdx(local_position);
+  float2 down = dfdy(local_position);
+  float area = fabs(across.x * down.y - across.y * down.x);
+  return 1.0 / max(sqrt(area), 1e-6);
 }
 
 float4 distance_from_clip(float2 position, Bounds_ScaledPixels clip_bounds) {
@@ -1643,8 +1663,31 @@ TransformedVertex transformed_vertex(float2 unit_vertex, Bounds_ScaledPixels bou
     result.local_scale = 0.0;
     return result;
   }
-  float local_scale = transform_pixel_scale(transformation);
-  if (local_scale < 1e-6) {
+  bool affine = is_affine_transform(transformation);
+  float2 size = float2(bounds.size.width, bounds.size.height);
+  float2 bounds_origin = float2(bounds.origin.x, bounds.origin.y);
+  float local_scale;
+  float pad;
+  if (affine) {
+    local_scale = transform_pixel_scale(transformation);
+    pad = 1.0 / local_scale;
+  } else {
+    // The pixel is a different size in the local space at every vertex: the area scale of a
+    // homography is det / W^3, and a point at the horizon covers none. The pad is larger than
+    // the pixel the edges are antialiased across, as it varies along an edge between vertices.
+    float3 corner = apply_homography(transformation, bounds_origin + unit_vertex * size);
+    float determinant =
+        transformation.rows[0][0] * (transformation.rows[1][1] * transformation.rows[2][2] -
+                                     transformation.rows[1][2] * transformation.rows[2][1]) -
+        transformation.rows[0][1] * (transformation.rows[1][0] * transformation.rows[2][2] -
+                                     transformation.rows[1][2] * transformation.rows[2][0]) +
+        transformation.rows[0][2] * (transformation.rows[1][0] * transformation.rows[2][1] -
+                                     transformation.rows[1][1] * transformation.rows[2][0]);
+    float w = max(fabs(corner.z), 1e-3);
+    local_scale = sqrt(fabs(determinant) / (w * w * w));
+    pad = 1.5 / max(local_scale, 1e-6);
+  }
+  if (local_scale < 1e-6 && affine) {
     // A matrix that flattens the plane draws nothing: put the quad off the screen.
     result.device_position = float4(2.0, 2.0, 0.0, 1.0);
     result.clip_distance = float4(-1.0);
@@ -1653,15 +1696,20 @@ TransformedVertex transformed_vertex(float2 unit_vertex, Bounds_ScaledPixels bou
     result.local_scale = 1.0;
     return result;
   }
-  float pad = 1.0 / local_scale;
-  float2 size = float2(bounds.size.width, bounds.size.height);
-  float2 origin = float2(bounds.origin.x, bounds.origin.y) - pad;
+  float2 origin = bounds_origin - pad;
   float2 extent = size + 2.0 * pad;
   float2 local_position = origin + unit_vertex * extent;
-  float2 window_position = apply_transform(transformation, local_position);
-  result.device_position = device_position_of(window_position, viewport_size);
-  result.clip_distance = distance_from_clip(window_position, clip_bounds);
-  result.unit_position = (local_position - float2(bounds.origin.x, bounds.origin.y)) / max(size, float2(1e-6));
+  if (affine) {
+    float2 window_position = apply_transform(transformation, local_position);
+    result.device_position = device_position_of(window_position, viewport_size);
+    result.clip_distance = distance_from_clip(window_position, clip_bounds);
+  } else {
+    float3 homogeneous = apply_homography(transformation, local_position);
+    result.device_position = device_position_of_homogeneous(homogeneous, viewport_size);
+    result.clip_distance = distance_from_clip_homogeneous(homogeneous, clip_bounds);
+    local_scale = -1.0;
+  }
+  result.unit_position = (local_position - bounds_origin) / max(size, float2(1e-6));
   result.local_position = local_position;
   result.local_scale = local_scale;
   return result;
@@ -1918,11 +1966,14 @@ struct CompositeParams {
   float4 reference;
   float4 reference_radii;
   float4 reference_radii_y;
-  // When the reference is in the element's own space (offset.w is 1): the matrix from the
-  // target to that space (a, b, c, d of its rows) and its translation (offset.xy), and the
-  // device pixels one unit of that space covers (offset.z).
+  // When the reference is in the element's own space (offset.w is 1, or 2 for a homography): the
+  // matrix from the target to that space (a, b, c, d of its rows) and its translation (offset.xy),
+  // and the device pixels one unit of that space covers (offset.z). A homography divides what the
+  // two rows give by the third row (reference_row.xyz) at the position, and its pixel scale is
+  // found from the determinant of that matrix (reference_row.w).
   float4 reference_matrix;
   float4 reference_offset;
+  float4 reference_row;
 };
 
 float rounded_rect_sdf(float2 position, float4 rect, float4 radii, float4 radii_y) {
@@ -2021,7 +2072,20 @@ fragment float4 composite_fragment(
   float coverage = saturate(0.5 - rounded_rect_sdf(position, params.content_mask, params.content_radii, params.content_radii_y));
 
   if (params.reference.z > 0.0) {
-    if (params.reference_offset.w > 0.5) {
+    if (params.reference_offset.w > 1.5) {
+      float w = params.reference_row.x * position.x + params.reference_row.y * position.y + params.reference_row.z;
+      if (w < 1e-3) {
+        // The position is at the horizon or behind the eye: not on the box.
+        coverage = 0.0;
+      } else {
+        float2 local_reference = float2(
+            params.reference_matrix.x * position.x + params.reference_matrix.y * position.y + params.reference_offset.x,
+            params.reference_matrix.z * position.x + params.reference_matrix.w * position.y + params.reference_offset.y) / w;
+        // Device pixels per unit of the box's space: the inverse's area scale is det / w^3.
+        float pixel = sqrt(w * w * w / max(params.reference_row.w, 1e-12));
+        coverage *= saturate(0.5 - rounded_rect_sdf(local_reference, params.reference, params.reference_radii, params.reference_radii_y) * pixel);
+      }
+    } else if (params.reference_offset.w > 0.5) {
       float2 local_reference = float2(
           params.reference_matrix.x * position.x + params.reference_matrix.y * position.y + params.reference_offset.x,
           params.reference_matrix.z * position.x + params.reference_matrix.w * position.y + params.reference_offset.y);
