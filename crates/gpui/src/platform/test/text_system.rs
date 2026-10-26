@@ -1,5 +1,5 @@
 use crate::{
-    Bounds, DevicePixels, Font, FontId, FontMetrics, FontRun, GlyphId, LineLayout, NoopTextSystem,
+    Bounds, DevicePixels, Font, FontId, FontMetrics, FontRun, GlyphId, Halt, LineLayout, NoopTextSystem,
     Pixels, PlatformTextSystem, RenderGlyphParams, ShapedGlyph, ShapedRun, Size, px,
 };
 use parking_lot::Mutex;
@@ -278,6 +278,7 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
                     position: crate::point(x, px(0.)),
                     index: ix,
                     is_emoji: false,
+                    halt: Halt::default(),
                 });
             x += run_size * self.advance;
         }

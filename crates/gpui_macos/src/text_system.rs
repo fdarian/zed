@@ -36,7 +36,7 @@ use font_kit::{
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontSmoothing, FontStyle, FontVariations, FontWeight, GlyphId, Hsla, LineLayout, Pixels, PlatformTextSystem,
+    FontSmoothing, FontStyle, FontVariations, FontWeight, GlyphId, Halt, Hsla, LineLayout, Pixels, PlatformTextSystem,
     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
     Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
 };
@@ -1116,6 +1116,7 @@ impl MacTextSystemState {
                     position: point((position.x + shift) as f32, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
                     is_emoji: self.is_emoji(font_id),
+                    halt: Halt::None,
                 });
                 if let Some(moves) = &moves {
                     shift += moves[glyph_ix];

@@ -804,7 +804,12 @@ fn paint_line(
                     }
                 }
 
-                let painted_origin = point(glyph_origin.x + leading, glyph_origin.y);
+                // A trimmed opening bracket is drawn in the half of its box that was kept, which
+                // is before where it starts: the caret and the selection stay at its start.
+                let painted_origin = point(
+                    glyph_origin.x + leading + glyph.halt.paint_offset(),
+                    glyph_origin.y,
+                );
                 let max_glyph_bounds = Bounds {
                     origin: painted_origin,
                     size: max_glyph_size,
@@ -1293,7 +1298,7 @@ fn aligned_origin_x(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FontId, GlyphId, ShapedGlyph, ShapedRun};
+    use crate::{FontId, GlyphId, Halt, ShapedGlyph, ShapedRun};
 
     #[test]
     fn an_auto_underline_offset_is_half_the_thickness_rounded_up_and_at_least_a_pixel() {
@@ -1331,6 +1336,7 @@ mod tests {
                 position: point(px(x), px(0.0)),
                 index,
                 is_emoji: false,
+                halt: Halt::default(),
             })
             .collect();
 
@@ -1436,18 +1442,21 @@ mod tests {
                                 position: point(px(0.0), px(0.0)),
                                 index: 0,
                                 is_emoji: false,
+                                halt: Halt::default(),
                             },
                             ShapedGlyph {
                                 id: GlyphId(0),
                                 position: point(px(10.0), px(0.0)),
                                 index: 1,
                                 is_emoji: false,
+                                halt: Halt::default(),
                             },
                             ShapedGlyph {
                                 id: GlyphId(0),
                                 position: point(px(20.0), px(0.0)),
                                 index: 2,
                                 is_emoji: false,
+                                halt: Halt::default(),
                             },
                         ],
                         inline: Default::default(),
@@ -1464,18 +1473,21 @@ mod tests {
                                 position: point(px(30.0), px(0.0)),
                                 index: 3,
                                 is_emoji: false,
+                                halt: Halt::default(),
                             },
                             ShapedGlyph {
                                 id: GlyphId(0),
                                 position: point(px(40.0), px(0.0)),
                                 index: 4,
                                 is_emoji: false,
+                                halt: Halt::default(),
                             },
                             ShapedGlyph {
                                 id: GlyphId(0),
                                 position: point(px(50.0), px(0.0)),
                                 index: 5,
                                 is_emoji: false,
+                                halt: Halt::default(),
                             },
                         ],
                         inline: Default::default(),

@@ -27,7 +27,7 @@
 
 use super::{LineLayout, LineLayoutCache};
 use super::ShapedRun;
-use crate::{FontId, FontRun, GlyphId, Pixels, px, util::{LAYOUT_UNIT, ceil_layout_units}};
+use crate::{FontId, FontRun, GlyphId, Halt, Pixels, px, util::{LAYOUT_UNIT, ceil_layout_units}};
 use collections::FxHashMap;
 use gpui_util::ResultExt as _;
 use smallvec::SmallVec;
@@ -496,6 +496,26 @@ impl LineLayoutCache {
                 let cluster = &text[before.index..next.index];
                 if cluster.chars().count() != 1 {
                     continue;
+                }
+                // Blink does not break between two punctuation marks that `halt` trims (they are
+                // unsafe to break between). A closing bracket that is trimmed because of what follows
+                // is whole on a line that ends there, and the opening one that is trimmed because of
+                // what comes before it is whole on the line it starts, which no width is lost to.
+                // The trim is not a kern: the advance of a trimmed glyph is not compared with its own.
+                match (before.halt, next.halt) {
+                    (Halt::Close { at_line_end, .. }, _) => {
+                        reshapes.push((after, EndReshape { loss: -fixed_point(at_line_end, scale_factor) }));
+                        continue;
+                    }
+                    (_, Halt::Open { at_line_end_before, .. }) => {
+                        reshapes.push((
+                            after,
+                            EndReshape { loss: -fixed_point(at_line_end_before, scale_factor) },
+                        ));
+                        continue;
+                    }
+                    (Halt::Open { .. }, _) => continue,
+                    _ => {}
                 }
                 let letter = cluster.chars().next().expect("the cluster has a character");
                 let follows = text[next.index..].chars().next();
@@ -973,5 +993,70 @@ mod tests {
         let positions = vec![px(0.), px(0.5 + 0.9 / 65536.)];
         let sums = measure_sums(&positions, [DeviceAdvance { nominal: None, font_unit: 1. / 64. }], 1.);
         assert_eq!(sums, [0, 32768]);
+    }
+
+    fn halted_layout(halts: &[Halt]) -> LineLayout {
+        let mut x = 0.;
+        let glyphs = halts
+            .iter()
+            .enumerate()
+            .map(|(ix, halt)| {
+                let glyph = crate::ShapedGlyph {
+                    id: GlyphId(0),
+                    position: crate::point(px(x), px(0.)),
+                    index: ix * 3,
+                    is_emoji: false,
+                    halt: *halt,
+                };
+                x += 10. - match halt {
+                    Halt::Open { trim, .. } | Halt::Close { trim, .. } => trim.0,
+                    _ => 0.,
+                };
+                glyph
+            })
+            .collect();
+        LineLayout {
+            width: px(x),
+            len: halts.len() * 3,
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                font_size: px(10.),
+                ascent: px(8.),
+                descent: px(2.),
+                line_height: None,
+                glyphs,
+                inline: Default::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_a_line_cannot_end_between_two_marks_that_are_trimmed_and_widens_by_the_trim() {
+        // 。」「 after an あ: the full stop is trimmed on its right because a closing bracket follows,
+        // the opening bracket on its left because the closing one is before it.
+        let text = "あ。」「あ";
+        let layout = halted_layout(&[
+            Halt::None,
+            Halt::Close { trim: px(5.), at_line_end: px(5.) },
+            Halt::None,
+            Halt::Open { trim: px(5.), at_line_start: px(5.), at_line_end_before: px(2.) },
+            Halt::None,
+        ]);
+        let cache = LineLayoutCache::new(
+            std::sync::Arc::new(crate::NoopTextSystem::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        let x = glyph_positions(&layout);
+        let reshapes = cache.end_reshapes(&layout, text, &[], &x);
+        // Before the closing bracket the full stop is whole: the line is 5 wider. Before the opening
+        // one the glyph before it is shaped again, and is 2 wider.
+        assert_eq!(
+            reshapes,
+            vec![
+                (2, EndReshape { loss: -5 * 65536 }),
+                (3, EndReshape { loss: -2 * 65536 }),
+            ]
+        );
     }
 }

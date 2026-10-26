@@ -322,6 +322,52 @@ pub struct ShapedGlyph {
 
     /// Whether this glyph is an emoji
     pub is_emoji: bool,
+
+    /// What `text-spacing-trim` does to this glyph.
+    pub halt: Halt,
+}
+
+/// What the OpenType feature `halt` does to a glyph of fullwidth CJK punctuation, which
+/// `text-spacing-trim: normal` asks for where two of them meet: the half of the em that the glyph
+/// leaves empty is cut off. The layout of the line has the narrower glyph in it already.
+///
+/// Chrome shapes the glyph again where a line breaks next to it, and shapes it alone: the glyph is
+/// whole, and it may be in another font than it is in the text (a script run of its own falls to the
+/// font the system picks for that character, where in the text it is in the font of the kana around it).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Halt {
+    /// Not trimmed, and not a glyph that is trimmed at the end of a line either.
+    #[default]
+    None,
+    /// An opening bracket after punctuation, trimmed on the left by `trim`: its advance is that much
+    /// narrower and its ink is drawn that much to the left of where the glyph starts, in the half
+    /// of its box that was left. It stays at its start for the caret, the hit test and the
+    /// selection. A wrapped line that starts with it does not trim it, and it is `at_line_start`
+    /// wider there than it is in the text.
+    ///
+    /// A line that ends right before it is `at_line_end_before` wider than the text is up to there:
+    /// the glyphs before it are shaped again.
+    Open {
+        trim: Pixels,
+        at_line_start: Pixels,
+        at_line_end_before: Pixels,
+    },
+    /// A closing bracket or full stop before more closing punctuation, trimmed on the right by `trim`.
+    /// A line that ends with it is `at_line_end` wider than the text is up to there.
+    Close { trim: Pixels, at_line_end: Pixels },
+    /// A closing bracket that is not trimmed, which Chrome trims by this much when it is the last
+    /// glyph of a line and that makes the line fit.
+    CloseAtLineEnd(Pixels),
+}
+
+impl Halt {
+    /// How far the ink of the glyph is drawn from where the glyph starts.
+    pub fn paint_offset(self) -> Pixels {
+        match self {
+            Self::Open { trim, .. } => -trim,
+            _ => Pixels::ZERO,
+        }
+    }
 }
 
 /// The height of a wrapped row and where its baseline is.
@@ -644,6 +690,7 @@ impl LineLayout {
                         position: point(g.position.x - x_offset, g.position.y),
                         index: g.index - byte_index,
                         is_emoji: g.is_emoji,
+                        halt: g.halt,
                     })
                     .collect();
                 right_runs.push(ShapedRun {
@@ -728,9 +775,12 @@ impl LineLayout {
         let mut positions = GlyphPositions::new(self, text, tab_stop, options, insets);
         let glyph_count = positions.glyphs.len();
         let mut placed = 0;
+        // The closing bracket the line was found to fit with when it is trimmed, by the glyph after it.
+        let mut trimmed_to_fit: Option<(usize, Pixels)> = None;
+        let mut end_trims: SmallVec<[(usize, Pixels); 1]> = SmallVec::new();
 
         for ix in 0..glyph_count {
-            positions.place(ix + 1, last_boundary_x);
+            positions.place(ix + 1, line_starts[line_starts.len() - 1], last_boundary_x);
             placed = ix + 1;
             let boundary = positions.glyphs[ix].boundary;
             let ch = positions.glyphs[ix].wrap_char;
@@ -809,7 +859,24 @@ impl LineLayout {
                             fit,
                         )
                     };
-                    if units(ix + 1) > fit {
+                    // Chrome keeps a closing bracket on the line that it trims to make it fit, if a line
+                    // may end after it (`ShapingLineBreaker::ShapeLine`).
+                    let overflow = units(ix + 1);
+                    let trims_to_fit = match positions.glyphs[ix].halt {
+                        Halt::CloseAtLineEnd(trim)
+                            if overflow > fit
+                                && overflow - trim_units(trim, self.scale_factor) <= fit
+                                && (ix + 1 == glyph_count
+                                    || may_end_before_non_space(&positions.glyphs, &line_breaks, ix + 1)) =>
+                        {
+                            Some(trim)
+                        }
+                        _ => None,
+                    };
+                    if let Some(trim) = trims_to_fit {
+                        trimmed_to_fit = Some((ix + 1, trim));
+                        None
+                    } else if overflow > fit {
                         match Self::break_candidate(
                             &candidates,
                             line_start,
@@ -857,6 +924,11 @@ impl LineLayout {
                 }
 
                 broke_word |= cut;
+                if let Some((glyph, trim)) = trimmed_to_fit.take()
+                    && glyph == line_start_ix
+                {
+                    end_trims.push((glyph, trim));
+                }
                 candidates.retain(|candidate| {
                     *candidate > line_start_ix
                         && !(keeps_minus_before_digit
@@ -868,7 +940,7 @@ impl LineLayout {
                 line_starts.push(line_start_ix);
                 // The tab stops of what moved to the new line count from its start.
                 for moved_ix in line_start_ix + 1..=ix + 1 {
-                    positions.place(moved_ix, last_boundary_x);
+                    positions.place(moved_ix, line_start_ix, last_boundary_x);
                 }
             }
             // After a space the line may break, and a space that does not fit then
@@ -885,7 +957,13 @@ impl LineLayout {
         }
 
         for ix in placed + 1..=positions.glyphs.len() {
-            positions.place(ix, last_boundary_x);
+            positions.place(ix, line_starts[line_starts.len() - 1], last_boundary_x);
+        }
+
+        if let Some((glyph, trim)) = trimmed_to_fit
+            && glyph == glyph_count
+        {
+            end_trims.push((glyph, trim));
         }
 
         let hanging_widths = if hang {
@@ -907,6 +985,7 @@ impl LineLayout {
             broke_word,
             line_starts,
             line_ends,
+            end_trims,
         }
     }
 
@@ -999,7 +1078,11 @@ impl LineLayout {
         let hang = options.spaces_hang();
         let mut positions = GlyphPositions::new(self, text, None, options, insets);
         for ix in 1..=positions.glyphs.len() {
-            positions.place(ix, px(0.));
+            let line_start = breaks[..breaks.partition_point(|line_start| *line_start < ix)]
+                .last()
+                .copied()
+                .unwrap_or(0);
+            positions.place(ix, line_start, px(0.));
         }
         let boundaries = breaks
             .iter()
@@ -1027,13 +1110,16 @@ impl LineLayout {
             broke_word: false,
             line_starts,
             line_ends,
+            end_trims: SmallVec::new(),
         }
     }
 
     /// This layout with the glyphs at `x` and the line `x`'s last entry wide, as
-    /// computed by [`Self::compute_wrap_boundaries`].
-    fn with_x_positions(&self, x: &[Pixels]) -> LineLayout {
+    /// computed by [`Self::compute_wrap_boundaries`] for lines that start at the glyphs `line_starts`.
+    /// A trimmed opening bracket at the start of a line is whole there.
+    fn with_x_positions(&self, x: &[Pixels], line_starts: &[usize]) -> LineLayout {
         let mut x_iter = x.iter();
+        let mut glyph_ix = 0;
         let runs = self
             .runs
             .iter()
@@ -1046,9 +1132,17 @@ impl LineLayout {
                 glyphs: run
                     .glyphs
                     .iter()
-                    .map(|glyph| ShapedGlyph {
-                        position: point(*x_iter.next().expect("one x per glyph"), glyph.position.y),
-                        ..glyph.clone()
+                    .map(|glyph| {
+                        let starts_a_line = glyph_ix > 0 && line_starts.binary_search(&glyph_ix).is_ok();
+                        glyph_ix += 1;
+                        ShapedGlyph {
+                            position: point(*x_iter.next().expect("one x per glyph"), glyph.position.y),
+                            halt: match glyph.halt {
+                                Halt::Open { .. } if starts_a_line => Halt::None,
+                                halt => halt,
+                            },
+                            ..glyph.clone()
+                        }
                     })
                     .collect(),
                 inline: run.inline,
@@ -1086,6 +1180,9 @@ pub(super) struct WrapComputation {
     pub(super) line_starts: SmallVec<[usize; 2]>,
     /// The glyph each line ends at, before the spaces that hang at its end.
     pub(super) line_ends: SmallVec<[usize; 1]>,
+    /// The lines whose last glyph is a closing bracket that is trimmed to make the line fit, by
+    /// the glyph the line ends at, with how much narrower the line is for it.
+    pub(super) end_trims: SmallVec<[(usize, Pixels); 1]>,
 }
 
 impl WrapComputation {
@@ -1101,6 +1198,7 @@ impl WrapComputation {
             broke_word: false,
             line_starts: smallvec![0],
             line_ends: smallvec![glyph_count],
+            end_trims: SmallVec::new(),
         }
     }
 }
@@ -1129,6 +1227,7 @@ struct WrapGlyph {
     font_id: FontId,
     shaped_x: Pixels,
     wrap: RunWrap,
+    halt: Halt,
 }
 
 /// Whether a line that starts at glyph `line_start` may not break before glyph `at` because the
@@ -1162,6 +1261,21 @@ impl SpaceRun {
     fn may_break(&self) -> bool {
         self.space_wraps || (self.word_wraps && !self.opens_nowrap)
     }
+}
+
+/// Whether a line may end before glyph `after`, which is not a space and follows a glyph that is
+/// not a space either.
+fn may_end_before_non_space(glyphs: &[WrapGlyph], line_breaks: &LineBreaks, after: usize) -> bool {
+    let glyph = &glyphs[after];
+    glyph.wrap_char != ' '
+        && !glyph.is_object
+        && may_break_apart(&glyphs[after - 1], glyph)
+        && line_breaks.contains(glyph.index)
+}
+
+/// `trim` in layout units, 1/64 of a device pixel.
+fn trim_units(trim: Pixels, scale_factor: f32) -> i64 {
+    (trim.0 * scale_factor / crate::util::LAYOUT_UNIT).round() as i64
 }
 
 /// The x of each glyph of a line and then of its end. They are the shaped
@@ -1274,12 +1388,18 @@ impl<'a> GlyphPositions<'a> {
                         hangs: hangs(character),
                         font_id: run.font_id,
                         shaped_x: glyph.position.x,
+                        halt: glyph.halt,
                     }
                 })
             })
             .collect();
         let insets = glyph_insets(layout, insets);
-        let tabbed = (tab_stop.is_some() || !insets.is_empty()).then(|| {
+        // A line that starts with a trimmed opening bracket starts it whole, which moves the glyphs
+        // after it as an inset does.
+        // Blink measures the min-content of a text from the positions of its glyphs, as shaped.
+        let trimmed_opens = !options.min_content
+            && glyphs.iter().any(|glyph| matches!(glyph.halt, Halt::Open { .. }));
+        let tabbed = (tab_stop.is_some() || !insets.is_empty() || trimmed_opens).then(|| {
             let mut x: Vec<Pixels> = glyphs.iter().map(|glyph| glyph.shaped_x).collect();
             x.push(layout.width);
             TabbedPositions {
@@ -1310,9 +1430,9 @@ impl<'a> GlyphPositions<'a> {
     }
 
     /// Positions glyph `ix`, or the end of the line when it is past the last
-    /// glyph, on a line that starts at `line_start_x`. The glyph before it must
-    /// be placed already.
-    fn place(&mut self, ix: usize, line_start_x: Pixels) {
+    /// glyph, on a line that starts at the glyph `line_start`, which is at `line_start_x`.
+    /// The glyph before it must be placed already.
+    fn place(&mut self, ix: usize, line_start: usize, line_start_x: Pixels) {
         let Some(tabbed) = self.tabbed.as_mut() else {
             return;
         };
@@ -1341,7 +1461,13 @@ impl<'a> GlyphPositions<'a> {
             tabbed.x[ix] = pen + advance_to_tab_stop(pen - line_start_x, stop) + trailing;
             tabbed.shift[ix] = tabbed.x[ix] - shaped_x;
         } else {
-            tabbed.shift[ix] = tabbed.shift[ix - 1] + leading + trailing;
+            // A trimmed opening bracket that starts a line is not trimmed (`text-spacing-trim:
+            // normal` does not trim at the start of a wrapped line).
+            let whole = match previous.halt {
+                Halt::Open { at_line_start, .. } if ix - 1 == line_start => at_line_start,
+                _ => Pixels::ZERO,
+            };
+            tabbed.shift[ix] = tabbed.shift[ix - 1] + leading + trailing + whole;
             tabbed.x[ix] = shaped_x + tabbed.shift[ix];
         }
     }
@@ -1510,7 +1636,14 @@ impl WrappedLineLayout {
                     .iter()
                     .find(|(hyphenated, _)| *hyphenated == row_ix)
                     .map_or(Pixels::ZERO, |(_, hyphen)| hyphen.snapped_width(scale_factor));
-                marks.width(&x, scale_factor, *start, *end) + hyphen
+                let trimmed = computation
+                    .end_trims
+                    .iter()
+                    .find(|(glyph, _)| glyph == end)
+                    .map_or(Pixels::ZERO, |(_, trim)| {
+                        Pixels(trim_units(*trim, scale_factor) as f32 * crate::util::LAYOUT_UNIT / scale_factor)
+                    });
+                marks.width(&x, scale_factor, *start, *end) + hyphen - trimmed
             })
             .collect();
         let snapped_width = marks.width(&x, scale_factor, 0, x.len() - 1);
@@ -2268,7 +2401,7 @@ impl LineLayoutCache {
                     &marks,
                 );
                 let unwrapped_layout = match &computation.tabbed_x {
-                    Some(x) => Arc::new(shaped_layout.with_x_positions(x)),
+                    Some(x) => Arc::new(shaped_layout.with_x_positions(x, &computation.line_starts)),
                     None => shaped_layout,
                 };
                 (unwrapped_layout, computation)
@@ -2494,6 +2627,7 @@ impl LineLayoutCache {
                             position: point(x, Pixels::ZERO),
                             index: position,
                             is_emoji: false,
+                            halt: Halt::default(),
                         }],
                         inline: InlineRun::default(),
                     });
@@ -3034,6 +3168,7 @@ mod tests {
             position: point(px(x), px(0.)),
             index,
             is_emoji: false,
+            halt: Halt::default(),
         }
     }
 
@@ -3178,7 +3313,7 @@ mod tests {
             &SnapMarks::default(),
         );
         WrappedLineLayout::new(
-            Arc::new(shaped.with_x_positions(&computation.tabbed_x.clone().unwrap())),
+            Arc::new(shaped.with_x_positions(&computation.tabbed_x.clone().unwrap(), &computation.line_starts)),
             wrap_width.map(px),
             computation,
             &SnapMarks::default(),
@@ -4095,7 +4230,7 @@ mod tests {
         );
         WrappedLineLayout::new(
             Arc::new(match &computation.tabbed_x {
-                Some(x) => shaped.with_x_positions(x),
+                Some(x) => shaped.with_x_positions(x, &computation.line_starts),
                 None => shaped,
             }),
             wrap_width.map(px),
@@ -4113,6 +4248,118 @@ mod tests {
         let mut x = glyph_x_positions(&layout.unwrapped_layout);
         x.push(f32::from(layout.unwrapped_layout.width));
         x
+    }
+
+    fn open(trim: f32, at_line_start: f32) -> Halt {
+        Halt::Open {
+            trim: px(trim),
+            at_line_start: px(at_line_start),
+            at_line_end_before: px(0.),
+        }
+    }
+
+    /// `text` as ten pixel wide characters laid out as a text that `text-spacing-trim` has trimmed: a
+    /// glyph in `halts` is that much narrower and the glyphs after it nearer.
+    fn trimmed_line(text: &str, wrap_width: Option<f32>, halts: &[(usize, Halt)]) -> WrappedLineLayout {
+        let mut shaped = monospace_layout(text, 10.);
+        let mut moved = 0.;
+        for (ix, glyph) in shaped.runs[0].glyphs.iter_mut().enumerate() {
+            glyph.position.x = px(f32::from(glyph.position.x) - moved);
+            if let Some((_, halt)) = halts.iter().find(|(halted, _)| *halted == ix) {
+                glyph.halt = *halt;
+                if let Halt::Open { trim, .. } | Halt::Close { trim, .. } = halt {
+                    moved += f32::from(*trim);
+                }
+            }
+        }
+        shaped.width = px(f32::from(shaped.width) - moved);
+        let computation = shaped.compute_wrap_boundaries(
+            text,
+            wrap_width.map(px),
+            None,
+            TextLayoutOptions::default(),
+            None,
+            &[],
+            &SnapMarks::default(),
+        );
+        let unwrapped = match &computation.tabbed_x {
+            Some(x) => shaped.with_x_positions(x, &computation.line_starts),
+            None => shaped,
+        };
+        WrappedLineLayout::new(
+            Arc::new(unwrapped),
+            wrap_width.map(px),
+            computation,
+            &SnapMarks::default(),
+        )
+    }
+
+    #[test]
+    fn test_a_trimmed_opening_bracket_stays_trimmed_inside_a_line() {
+        let layout = trimmed_line("ああ。「ああ", None, &[(3, open(5., 5.))]);
+        assert_eq!(x_and_width(&layout), vec![0., 10., 20., 30., 35., 45., 55.]);
+        let bracket = &layout.unwrapped_layout.runs[0].glyphs[3];
+        assert_eq!(bracket.halt, open(5., 5.));
+        // It is drawn in the half of its box that was kept, which is before the start of the box.
+        assert_eq!(bracket.halt.paint_offset(), px(-5.));
+        // The caret and the hit test stay at the start of the box.
+        assert_eq!(layout.unwrapped_layout.x_for_index(bracket.index), px(30.));
+        assert_eq!(layout.unwrapped_layout.index_for_x(px(32.)), Some(bracket.index));
+        assert_eq!(layout.unwrapped_layout.closest_index_for_x(px(32.)), bracket.index);
+        assert_eq!(
+            layout.unwrapped_layout.closest_index_for_x(px(34.)),
+            bracket.index + '「'.len_utf8()
+        );
+    }
+
+    #[test]
+    fn test_a_line_that_starts_with_a_trimmed_opening_bracket_starts_it_whole() {
+        // "ああ。" is 30 wide and fits; with the bracket trimmed it would be 35, which does not.
+        let layout = trimmed_line("ああ。「ああ", Some(30.), &[(3, open(5., 5.))]);
+        assert_eq!(boundary_indices(&layout), vec!["ああ。".len()]);
+        // The bracket is whole on the second line, and the glyphs after it that much further.
+        assert_eq!(x_and_width(&layout), vec![0., 10., 20., 30., 40., 50., 60.]);
+        assert_eq!(layout.unwrapped_layout.runs[0].glyphs[3].halt, Halt::None);
+        assert_eq!(layout.line_widths().collect::<Vec<_>>(), pixels(&[30., 30.]));
+        // Shaped alone, the bracket can be another font than it is in the text, and as wide as that font says.
+        let layout = trimmed_line("ああ。「ああ", Some(31.), &[(3, open(5., 6.))]);
+        assert_eq!(x_and_width(&layout), vec![0., 10., 20., 30., 41., 51., 61.]);
+        assert_eq!(layout.line_widths().collect::<Vec<_>>(), pixels(&[30., 31.]));
+    }
+
+    #[test]
+    fn test_a_trimmed_opening_bracket_in_the_middle_of_a_wrapped_line_stays_trimmed() {
+        let layout = trimmed_line("あ。「ああああ", Some(40.), &[(2, open(5., 5.))]);
+        // "あ。「あ" is 35 wide trimmed; the next あ makes 45.
+        assert_eq!(boundary_indices(&layout), vec!["あ。「あ".len()]);
+        assert_eq!(layout.unwrapped_layout.runs[0].glyphs[2].halt, open(5., 5.));
+    }
+
+    #[test]
+    fn test_a_closing_bracket_that_overflows_is_trimmed_when_that_makes_the_line_fit() {
+        let halts = [(2, Halt::CloseAtLineEnd(px(5.)))];
+        // "ああ」" is 30 wide in 25: trimmed it is 25, and a line may end after it.
+        let layout = trimmed_line("ああ」ああ", Some(25.), &halts);
+        assert_eq!(boundary_indices(&layout), vec!["ああ」".len()]);
+        assert_eq!(layout.line_widths().collect::<Vec<_>>(), pixels(&[25., 20.]));
+        // Not trimmed, the bracket cannot start a line and the third あ is too much for the second: the
+        // lines break before the second あ and before the last.
+        let layout = trimmed_line("ああ」ああ", Some(25.), &[]);
+        assert_eq!(boundary_indices(&layout), vec!["あ".len(), "ああ」".len()]);
+    }
+
+    #[test]
+    fn test_a_closing_bracket_is_not_trimmed_for_a_line_it_does_not_make_fit() {
+        let halts = [(2, Halt::CloseAtLineEnd(px(5.)))];
+        let layout = trimmed_line("ああ」ああ", Some(20.), &halts);
+        assert_eq!(boundary_indices(&layout), vec!["あ".len(), "ああ」".len()]);
+    }
+
+    #[test]
+    fn test_a_trimmed_closing_bracket_at_the_end_of_the_text_makes_the_line_narrower() {
+        let layout = trimmed_line("ああ」", Some(25.), &[(2, Halt::CloseAtLineEnd(px(5.)))]);
+        assert!(layout.wrap_boundaries.is_empty());
+        assert_eq!(layout.line_widths().collect::<Vec<_>>(), pixels(&[25.]));
     }
 
     #[test]
@@ -4555,7 +4802,7 @@ mod tests {
                 &SnapMarks::default(),
             );
             let layout = WrappedLineLayout::new(
-                Arc::new(shaped.with_x_positions(&computation.tabbed_x.clone().unwrap())),
+                Arc::new(shaped.with_x_positions(&computation.tabbed_x.clone().unwrap(), &computation.line_starts)),
                 Some(px(200.)),
                 computation,
                 &SnapMarks::default(),
@@ -5509,6 +5756,7 @@ mod line_box_tests {
                 position: point(px(0.), px(0.)),
                 index: 0,
                 is_emoji: false,
+                halt: Halt::default(),
             }],
             inline: InlineRun::default(),
         }
