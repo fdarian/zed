@@ -50,9 +50,11 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, char, convert::TryFrom, ops::Range, sync::Arc, sync::OnceLock};
 
 use crate::font_fallback;
+use crate::han_kerning::{self, FONT_PROBE_CHARACTERS, FontClasses, GlyphShape, Side};
 use crate::open_type::{
     VariationAxis, apply_features_and_fallbacks, apply_variations, copy_for_advances,
-    current_variations, font_for_string, font_table_tags, variation_axes,
+    copy_with_feature, current_variations, font_for_string, font_table_tags, has_feature,
+    variation_axes,
 };
 
 #[allow(non_upper_case_globals)]
@@ -102,6 +104,12 @@ struct MacTextSystemState {
     /// character (see [`MacTextSystemState::fallback_assignments`]). `None` when it picks none that is
     /// of use.
     fallback_fonts: Mutex<HashMap<(FontId, u32, char), Option<CTFont>>>,
+    /// What `text-spacing-trim` needs of a face at a size, `None` for one it does not apply to.
+    han_fonts: Mutex<HashMap<(FontId, u32), Option<Arc<HanFont>>>>,
+    /// How much `halt` shortens each character in a face at a size.
+    halt_probes: Mutex<HashMap<(FontId, u32, char), Option<HaltProbe>>>,
+    /// How a character is set alone in the font a run asks for, by that font, size and the character.
+    lone_characters: Mutex<HashMap<(FontId, u32, char), Option<LoneCharacter>>>,
 }
 
 /// Where Chrome gets the advances of a font from. CoreText has its own, and they are the same as
@@ -157,6 +165,44 @@ impl AdvanceFont {
     }
 }
 
+/// What `text-spacing-trim` does to a glyph, with the amount `halt` takes off it.
+#[derive(Clone, Copy, Debug)]
+enum Mark {
+    Open(f64),
+    Close(f64),
+    AtLineEnd(f64),
+}
+
+/// A character shaped by itself, as Chrome shapes the part of a text it shapes again where a line breaks
+/// next to it: with no text around it to give it the font of the script run it is in, so that the
+/// font is the one asked for if that has the character and the one the system picks for it if not.
+#[derive(Clone, Debug)]
+struct LoneCharacter {
+    postscript_name: String,
+    /// How far it advances, as Chrome advances that font.
+    advance: f64,
+}
+
+/// A face that `text-spacing-trim` applies to: one with a `halt` feature whose glyphs for the
+/// characters Blink checks are the ones it can work with (`HanKerning::FontData`).
+struct HanFont {
+    classes: FontClasses,
+    /// The face with `halt` turned on, to find out what the feature does to a glyph.
+    halt: CTFont,
+}
+
+/// What the feature `halt` does to a character, in logical pixels, as the glyph of the character
+/// alone is set by CoreText with and without it.
+#[derive(Clone, Copy, Debug)]
+struct HaltProbe {
+    /// How far it advances without the feature.
+    plain: f64,
+    /// How much narrower it advances.
+    narrower: f64,
+    /// How far from the start of the glyph its origin is.
+    placement: f64,
+}
+
 struct VariedFace {
     source: FontId,
     requested: Vec<(u32, f32)>,
@@ -185,6 +231,9 @@ impl MacTextSystem {
             advance_sources: Vec::new(),
             advance_fonts: Mutex::new(HashMap::default()),
             fallback_fonts: Mutex::new(HashMap::default()),
+            han_fonts: Mutex::new(HashMap::default()),
+            halt_probes: Mutex::new(HashMap::default()),
+            lone_characters: Mutex::new(HashMap::default()),
         }))
     }
 }
@@ -790,6 +839,300 @@ impl MacTextSystemState {
         fallback
     }
 
+    /// What `text-spacing-trim` needs of `font_id` at `size`, or `None` if it does not apply to it.
+    fn han_font(&self, font_id: FontId, size: f32) -> Option<Arc<HanFont>> {
+        let key = (font_id, size.to_bits());
+        if let Some(cached) = self.han_fonts.lock().get(&key) {
+            return cached.clone();
+        }
+        let han = self.read_han_font(font_id, size).map(Arc::new);
+        let mut cache = self.han_fonts.lock();
+        if cache.len() >= SIZED_FONTS_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, han.clone());
+        han
+    }
+
+    fn read_han_font(&self, font_id: FontId, size: f32) -> Option<HanFont> {
+        let font = self.sized_font(font_id, size);
+        if !has_feature(&font, *b"halt") {
+            return None;
+        }
+        // The font has to have one glyph for each of the characters Blink looks at.
+        let units: Vec<u16> = FONT_PROBE_CHARACTERS
+            .iter()
+            .map(|character| *character as u16)
+            .collect();
+        let mut glyphs = [0 as CGGlyph; FONT_PROBE_CHARACTERS.len()];
+        // SAFETY: one glyph out for each character in.
+        let all = unsafe {
+            font.get_glyphs_for_characters(units.as_ptr(), glyphs.as_mut_ptr(), units.len() as CFIndex)
+        };
+        if !all || glyphs.contains(&0) {
+            return None;
+        }
+        let mut advances = [CGSize::new(0., 0.); FONT_PROBE_CHARACTERS.len()];
+        // SAFETY: one advance out for each glyph in.
+        unsafe {
+            font.get_advances_for_glyphs(
+                kCTFontOrientationDefault,
+                glyphs.as_ptr(),
+                advances.as_mut_ptr(),
+                glyphs.len() as CFIndex,
+            );
+        }
+        let shapes: [GlyphShape; FONT_PROBE_CHARACTERS.len()] = std::array::from_fn(|ix| {
+            let bounds = font.get_bounding_rects_for_glyphs(kCTFontOrientationDefault, &glyphs[ix..=ix]);
+            GlyphShape {
+                advance: advances[ix].width,
+                left: bounds.origin.x,
+                right: bounds.origin.x + bounds.size.width,
+            }
+        });
+        Some(HanFont {
+            classes: FontClasses::from_glyphs(&shapes),
+            halt: copy_with_feature(&font, "halt"),
+        })
+    }
+
+    /// How `halt` changes `character` in `font_id` at `size`, or `None` if it does not change it.
+    fn halt_probe(&self, han: &HanFont, font_id: FontId, size: f32, character: char) -> Option<HaltProbe> {
+        let key = (font_id, size.to_bits(), character);
+        if let Some(cached) = self.halt_probes.lock().get(&key) {
+            return *cached;
+        }
+        let probe = set_alone(&self.sized_font(font_id, size), character)
+            .zip(set_alone(&han.halt, character))
+            .and_then(|((plain, _), (halted, placement))| {
+                ((plain - halted).abs() > 1e-6).then_some(HaltProbe {
+                    plain,
+                    narrower: plain - halted,
+                    placement,
+                })
+            });
+        let mut cache = self.halt_probes.lock();
+        if cache.len() >= SIZED_FONTS_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, probe);
+        probe
+    }
+
+    /// `character` set by itself in the font `input` asks for.
+    fn lone_character(&self, input: &InputRun, character: char) -> Option<LoneCharacter> {
+        let size = f32::from(input.font_size);
+        let key = (input.font_id, size.to_bits(), character);
+        if let Some(cached) = self.lone_characters.lock().get(&key) {
+            return cached.clone();
+        }
+        let primary = self.sized_font(input.font_id, size);
+        let font = if font_covers(&primary, character) {
+            primary
+        } else {
+            self.fallback_font(input.font_id, &primary, size, character)
+                .unwrap_or(primary)
+        };
+        // PingFang is advanced at the CSS size with its tracking, as HarfBuzz does.
+        let measured = match AdvanceSource::of(&font) {
+            AdvanceSource::Tracked => copy_for_advances(&font, f64::from(size), f64::from(size), true),
+            _ => font.clone(),
+        };
+        let lone = set_alone(&measured, character).map(|(advance, _)| LoneCharacter {
+            postscript_name: font.postscript_name(),
+            advance,
+        });
+        let mut cache = self.lone_characters.lock();
+        if cache.len() >= SIZED_FONTS_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, lone.clone());
+        lone
+    }
+
+    /// `text-spacing-trim: normal` on the glyphs of `runs`: the opening and closing punctuation that
+    /// Blink applies `halt` to is made as narrow as the feature makes it, and the glyphs after it
+    /// move up. Returns how much narrower the line is.
+    fn trim_text_spacing(&self, text: &str, runs: &mut [ShapedRun], input_runs: &[InputRun]) -> f64 {
+        if !text.chars().any(han_kerning::may_apply) {
+            return 0.;
+        }
+        let glyph_refs: Vec<(usize, usize)> = runs
+            .iter()
+            .enumerate()
+            .flat_map(|(run_ix, run)| (0..run.glyphs.len()).map(move |glyph_ix| (run_ix, glyph_ix)))
+            .collect();
+        let glyph_start = |glyph: usize| runs[glyph_refs[glyph].0].glyphs[glyph_refs[glyph].1].index;
+        // Only a text in the order of its glyphs is worked out here.
+        if !(1..glyph_refs.len()).all(|glyph| glyph_start(glyph - 1) < glyph_start(glyph)) {
+            return 0.;
+        }
+
+        let characters: Vec<char> = text.chars().collect();
+        let mut character_starts = Vec::with_capacity(characters.len());
+        let mut byte = 0;
+        for character in &characters {
+            character_starts.push(byte);
+            byte += character.len_utf8();
+        }
+        // The face of each character, and the glyph that is the character alone.
+        let mut faces: Vec<Option<(FontId, f32)>> = vec![None; characters.len()];
+        let mut glyph_of: Vec<Option<usize>> = vec![None; characters.len()];
+        let mut character = 0;
+        for glyph in 0..glyph_refs.len() {
+            let end = if glyph + 1 < glyph_refs.len() { glyph_start(glyph + 1) } else { text.len() };
+            let run = &runs[glyph_refs[glyph].0];
+            while character < characters.len() && character_starts[character] < end {
+                faces[character] = Some((run.font_id, f32::from(run.font_size)));
+                if character_starts[character] == glyph_start(glyph)
+                    && character_starts[character] + characters[character].len_utf8() == end
+                {
+                    glyph_of[character] = Some(glyph);
+                }
+                character += 1;
+            }
+        }
+
+        // How the character is set alone, where the font it is asked for is the one of its run.
+        let alone = |ix: usize| {
+            let input = &input_runs
+                [input_runs.partition_point(|input| input.byte_start <= character_starts[ix]) - 1];
+            self.lone_character(input, characters[ix])
+        };
+        let mut marks: Vec<Option<Mark>> = vec![None; glyph_refs.len()];
+        let mut start = 0;
+        while start < characters.len() {
+            let Some(face) = faces[start] else {
+                start += 1;
+                continue;
+            };
+            let mut end = start + 1;
+            while end < characters.len() && faces[end] == Some(face) {
+                end += 1;
+            }
+            if let Some(han) = self.han_font(face.0, face.1) {
+                let face_name = self.sized_font(face.0, face.1).postscript_name();
+                for (ix, side) in han_kerning::halted(&characters, start..end, &han.classes) {
+                    let (Some(glyph), Some(probe)) = (
+                        glyph_of[ix],
+                        self.halt_probe(&han, face.0, face.1, characters[ix]),
+                    ) else {
+                        continue;
+                    };
+                    // The opening glyph is moved to the left by what it is narrowed by, and a closing
+                    // one is not moved: any other font makes it a different trim.
+                    marks[glyph] = match side {
+                        Side::Open if (probe.placement + probe.narrower).abs() < 1e-3 => {
+                            Some(Mark::Open(probe.narrower))
+                        }
+                        Side::Close if probe.placement.abs() < 1e-3 => Some(Mark::Close(probe.narrower)),
+                        _ => None,
+                    };
+                }
+                // A closing bracket that is not trimmed in the text is trimmed at the end of a line
+                // when that makes the line fit, if it is shaped alone in this font: a bracket alone
+                // is in the font the system picks for it, which is not always one with `halt`.
+                for ix in start..end {
+                    let Some(glyph) = glyph_of[ix] else { continue };
+                    if marks[glyph].is_some() || !han_kerning::may_trim_at_line_end(characters[ix]) {
+                        continue;
+                    }
+                    if let Some(probe) = self.halt_probe(&han, face.0, face.1, characters[ix])
+                        && probe.placement.abs() < 1e-3
+                        && alone(ix).is_some_and(|alone| alone.postscript_name == face_name)
+                    {
+                        marks[glyph] = Some(Mark::AtLineEnd(probe.narrower));
+                    }
+                }
+            }
+            start = end;
+        }
+        if marks.iter().all(Option::is_none) {
+            return 0.;
+        }
+
+        // Where a line breaks at a boundary that is unsafe to break at (next to a glyph that is
+        // trimmed because of its neighbour), Chrome shapes the glyphs between the nearest safe
+        // boundaries again, with nothing around them to give them the font of their script run: each
+        // is in the font that is asked for if it has the character, and in the one the system picks
+        // for it if not, where it is not trimmed if that font has no `halt`. A glyph is that much
+        // wider alone than it is in the text.
+        let glyph_count = glyph_refs.len();
+        let position = |glyph: usize| {
+            let (run_ix, glyph_ix) = glyph_refs[glyph];
+            f64::from(f32::from(runs[run_ix].glyphs[glyph_ix].position.x))
+        };
+        let mut character_of: Vec<Option<usize>> = vec![None; glyph_count];
+        for (character, glyph) in glyph_of.iter().enumerate() {
+            if let Some(glyph) = glyph {
+                character_of[*glyph] = Some(character);
+            }
+        }
+        let trimmed_by = |glyph: usize| match marks[glyph] {
+            Some(Mark::Open(narrower) | Mark::Close(narrower)) => narrower,
+            _ => 0.,
+        };
+        let unsafe_before = |glyph: usize| {
+            glyph > 0
+                && (matches!(marks[glyph], Some(Mark::Open(_)))
+                    || matches!(marks[glyph - 1], Some(Mark::Close(_))))
+        };
+        // How much wider `glyph` is shaped alone than it is in the text; `None` if it is in the font it
+        // is in in the text, or is not one character.
+        let widened = |glyph: usize| -> Option<f64> {
+            let character = character_of[glyph]?;
+            let face = faces[character]?;
+            let lone = alone(character)?;
+            (lone.postscript_name != self.sized_font(face.0, face.1).postscript_name())
+                .then(|| lone.advance - (position(glyph + 1) - position(glyph) - trimmed_by(glyph)))
+        };
+        let mut halts = vec![Halt::None; glyph_count];
+        for glyph in 0..glyph_count {
+            let Some(mark) = marks[glyph] else { continue };
+            // The glyphs from the last safe boundary up to the one that breaks before `before`.
+            let widening_before = |before: usize| {
+                let mut first = before - 1;
+                while unsafe_before(first) {
+                    first -= 1;
+                }
+                (first..before).filter_map(&widened).sum::<f64>()
+            };
+            let pixels = |value: f64| px(value as f32);
+            halts[glyph] = match mark {
+                Mark::Open(narrower) => {
+                    // A line that starts with it shapes it, and the glyphs that follow while the
+                    // boundaries are unsafe, alone. In its own font it is whole there: the other
+                    // glyphs stay as they are with the pairs between them.
+                    let mut end = glyph + 1;
+                    while end < glyph_count && unsafe_before(end) {
+                        end += 1;
+                    }
+                    let start = widened(glyph).unwrap_or(narrower)
+                        + (glyph + 1..end).filter_map(&widened).sum::<f64>();
+                    Halt::Open {
+                        trim: pixels(narrower),
+                        at_line_start: pixels(start),
+                        at_line_end_before: pixels(widening_before(glyph)),
+                    }
+                }
+                Mark::Close(narrower) => Halt::Close {
+                    trim: pixels(narrower),
+                    at_line_end: pixels(widening_before(glyph + 1)),
+                },
+                Mark::AtLineEnd(narrower) => Halt::CloseAtLineEnd(pixels(narrower)),
+            };
+        }
+
+        let mut moved = 0.;
+        for (glyph, (run_ix, glyph_ix)) in glyph_refs.iter().enumerate() {
+            let shaped = &mut runs[*run_ix].glyphs[*glyph_ix];
+            shaped.position.x = px((f64::from(f32::from(shaped.position.x)) - moved) as f32);
+            shaped.halt = halts[glyph];
+            moved += trimmed_by(glyph);
+        }
+        moved
+    }
+
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
         Ok(size_from_vector2f(
             self.fonts[font_id.0].advance(glyph_id.0)?,
@@ -1055,6 +1398,7 @@ impl MacTextSystemState {
 
         {
             let mut text = text;
+            let mut byte_start = 0;
             let mut break_ligature = true;
             for run in font_runs {
                 let text_run;
@@ -1078,6 +1422,7 @@ impl MacTextSystemState {
                 let ct_font = self.sized_font(run.font_id, f32::from(ct_font_size));
                 input_runs.push(InputRun {
                     font_id: run.font_id,
+                    byte_start,
                     postscript_name: ct_font.postscript_name(),
                     utf16_start,
                     font_size: run_font_size,
@@ -1100,6 +1445,7 @@ impl MacTextSystemState {
                     }
                 }
                 break_ligature = !break_ligature;
+                byte_start += run.len;
             }
         }
         // Retrieve the glyphs from the shaped line, converting UTF16 offsets to UTF8 offsets.
@@ -1205,6 +1551,7 @@ impl MacTextSystemState {
             }
         }
         let typographic_bounds = line.get_typographic_bounds();
+        let trimmed = self.trim_text_spacing(text, &mut runs, &input_runs);
         // The strut is the font of the element the text is in, which the caller sets when
         // it knows it. Without it the font of the first run stands for it.
         let strut = font_runs
@@ -1213,7 +1560,7 @@ impl MacTextSystemState {
         LineLayout {
             runs,
             font_size,
-            width: (typographic_bounds.width + shift).into(),
+            width: (typographic_bounds.width + shift - trimmed).into(),
             ascent: strut.map_or(Pixels::ZERO, |strut| strut.ascent),
             descent: strut.map_or(Pixels::ZERO, |strut| strut.descent),
             scale_factor,
@@ -1235,9 +1582,25 @@ fn font_covers(font: &CTFont, character: char) -> bool {
     glyphs[0] != 0
 }
 
+/// How wide CoreText sets `character` in `font` alone, and how far from the start its glyph's origin
+/// is; `None` if it makes no glyph of it.
+fn set_alone(font: &CTFont, character: char) -> Option<(f64, f64)> {
+    let mut string = CFMutableAttributedString::new();
+    string.replace_str(&CFString::new(character.encode_utf8(&mut [0; 4])), CFRange::init(0, 0));
+    let range = CFRange::init(0, string.char_len());
+    unsafe {
+        string.set_attribute(range, kCTFontAttributeName, font);
+    }
+    let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
+    let placement = line.glyph_runs().get(0)?.positions().first()?.x;
+    Some((line.get_typographic_bounds().width, placement))
+}
+
 /// What the shaper needs to know about an input `FontRun` once the glyphs come back.
 struct InputRun {
     font_id: FontId,
+    /// The byte of the text the run starts at.
+    byte_start: usize,
     /// The name CoreText gives the font the run is asked to be shaped in.
     postscript_name: String,
     utf16_start: CFIndex,
@@ -2891,5 +3254,86 @@ mod tests {
         close(advance(9), 12.6, "す");
         // The full stop is not trimmed: no punctuation follows it.
         assert_eq!(glyphs[10].2.halt, gpui::Halt::None);
+    }
+
+    /// Chrome trims the empty half of an opening bracket after a full stop (`text-spacing-trim: normal`): 「 is 6.5
+    /// wide at 13px, and is drawn in the half of its box that was kept, where the caret stays at the start of the box.
+    /// Where a line starts with it, it is shaped alone, which puts it in PingFang (13.26 wide), as in Chrome.
+    #[test]
+    fn test_an_opening_bracket_after_a_full_stop_is_trimmed() {
+        use gpui::Halt;
+        let fonts = MacTextSystem::new();
+        let text = "す。「え";
+        let layout = line(&fonts, "Helvetica Neue", text, 13.);
+        let glyphs = glyphs_of(&fonts, text, &layout);
+        let x = |ix: usize| f32::from(glyphs[ix].2.position.x);
+        let Halt::Open { trim, at_line_start, at_line_end_before } = glyphs[2].2.halt else {
+            panic!("not trimmed: {:?}", glyphs[2].2.halt);
+        };
+        assert_eq!(trim, px(6.5));
+        assert!((f32::from(at_line_start) - (13.26 - 6.5)).abs() < 0.02, "{at_line_start:?}");
+        // A line that ends before it shapes the full stop again, alone, in PingFang.
+        assert!((f32::from(at_line_end_before) - 0.26).abs() < 0.02, "{at_line_end_before:?}");
+        assert_eq!(glyphs[2].2.halt.paint_offset(), px(-6.5));
+        assert_eq!(glyphs[1].2.halt, Halt::None);
+        // The bracket starts where the full stop ends, and the glyph after it is 6.5 on.
+        assert!((x(3) - x(2) - 6.5).abs() < 1e-3, "{} {}", x(2), x(3));
+        assert!((x(2) - x(1) - 13.).abs() < 1e-3, "{} {}", x(1), x(2));
+        assert!((f32::from(layout.width) - x(3) - 13.).abs() < 1e-3);
+        assert_eq!(layout.x_for_index(text.find('「').unwrap()), px(x(2)));
+        // In a font that has the bracket itself, nothing changes it alone.
+        let layout = line(&fonts, "Hiragino Sans", text, 13.);
+        let glyphs = glyphs_of(&fonts, text, &layout);
+        assert_eq!(
+            glyphs[2].2.halt,
+            Halt::Open { trim: px(6.5), at_line_start: px(6.5), at_line_end_before: px(0.) }
+        );
+    }
+
+    /// A closing bracket or a full stop before another closing bracket loses its empty right half, and a closing
+    /// bracket that stands alone is whole but may be trimmed at the end of a line when it is in a font that has `halt`
+    /// where it is shaped alone too: not in the PingFang that the system picks for a bracket alone.
+    #[test]
+    fn test_a_closing_bracket_before_another_is_trimmed() {
+        use gpui::Halt;
+        let fonts = MacTextSystem::new();
+        let text = "す。」え」";
+        let layout = line(&fonts, "Hiragino Sans", text, 13.);
+        let glyphs = glyphs_of(&fonts, text, &layout);
+        assert_eq!(
+            glyphs[1].2.halt,
+            Halt::Close { trim: px(6.5), at_line_end: px(0.) }
+        );
+        // 」 follows a trimmed full stop and nothing closes after it: whole, and trimmed at a line end.
+        assert_eq!(glyphs[2].2.halt, Halt::CloseAtLineEnd(px(6.5)));
+        assert_eq!(glyphs[4].2.halt, Halt::CloseAtLineEnd(px(6.5)));
+        let x = |ix: usize| f32::from(glyphs[ix].2.position.x);
+        assert!((x(2) - x(1) - 6.5).abs() < 1e-3);
+        assert!((x(3) - x(2) - 13.).abs() < 1e-3);
+        // Behind Helvetica Neue the full stop alone is PingFang's, and wider: a line that ends with it is 6.76 wider.
+        let layout = line(&fonts, "Helvetica Neue", text, 13.);
+        let glyphs = glyphs_of(&fonts, text, &layout);
+        let Halt::Close { trim, at_line_end } = glyphs[1].2.halt else {
+            panic!("not trimmed: {:?}", glyphs[1].2.halt);
+        };
+        assert_eq!(trim, px(6.5));
+        assert!((f32::from(at_line_end) - (13.26 - 6.5)).abs() < 0.02, "{at_line_end:?}");
+        assert_eq!(glyphs[2].2.halt, Halt::None);
+    }
+
+    /// With no `halt` in the font (PingFang) or when the punctuation is the first of the script run that the system
+    /// gives PingFang (a full stop after a Latin letter), nothing is trimmed, as in Chrome.
+    #[test]
+    fn test_nothing_is_trimmed_in_a_font_without_halt() {
+        let fonts = MacTextSystem::new();
+        for (family, text) in [("Helvetica Neue", "。「"), ("PingFang SC", "す。「"), ("Menlo", "a。「b")] {
+            let layout = line(&fonts, family, text, 13.);
+            let glyphs = glyphs_of(&fonts, text, &layout);
+            for (name, character, glyph) in glyphs {
+                if matches!(character, '。' | '「') {
+                    assert_eq!(glyph.halt, gpui::Halt::None, "{family} {text} {character} in {name}");
+                }
+            }
+        }
     }
 }

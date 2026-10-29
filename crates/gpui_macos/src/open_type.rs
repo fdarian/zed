@@ -252,6 +252,63 @@ pub fn copy_for_advances(font: &CTFont, size: f64, optical_size: f64, tracking: 
     }
 }
 
+/// A copy of `font`, at its size, with the OpenType feature `tag` turned on.
+pub fn copy_with_feature(font: &CTFont, tag: &str) -> CTFont {
+    let feature = CFDictionary::from_CFType_pairs(&[
+        (
+            unsafe { CFString::wrap_under_get_rule(kCTFontOpenTypeFeatureTag) },
+            CFString::new(tag).as_CFType(),
+        ),
+        (
+            unsafe { CFString::wrap_under_get_rule(kCTFontOpenTypeFeatureValue) },
+            CFNumber::from(1i32).as_CFType(),
+        ),
+    ]);
+    let features = core_foundation::array::CFArray::from_CFTypes(&[feature]);
+    let attributes = CFDictionary::from_CFType_pairs(&[(
+        unsafe { CFString::wrap_under_get_rule(kCTFontFeatureSettingsAttribute) },
+        features.as_CFType(),
+    )]);
+    unsafe {
+        let descriptor = CTFontDescriptor::wrap_under_create_rule(
+            CTFontDescriptorCreateWithAttributes(attributes.as_concrete_TypeRef()),
+        );
+        CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
+            font.as_concrete_TypeRef(),
+            0.0,
+            std::ptr::null(),
+            descriptor.as_concrete_TypeRef(),
+        ))
+    }
+}
+
+/// Whether the GSUB or the GPOS table of `font` lists the feature `tag`.
+pub fn has_feature(font: &CTFont, tag: [u8; 4]) -> bool {
+    [*b"GPOS", *b"GSUB"].into_iter().any(|table| {
+        font.get_font_table(u32::from_be_bytes(table))
+            .is_some_and(|data| layout_table_has_feature(data.bytes(), tag))
+    })
+}
+
+/// Whether the feature list of a GSUB or GPOS `table` has `tag`.
+fn layout_table_has_feature(table: &[u8], tag: [u8; 4]) -> bool {
+    let read_u16 = |offset: usize| -> Option<usize> {
+        let bytes = table.get(offset..offset + 2)?;
+        Some(u16::from_be_bytes([bytes[0], bytes[1]]) as usize)
+    };
+    // The header is the version (two u16), then the offsets of the script, feature and lookup lists.
+    let Some(list) = read_u16(6) else {
+        return false;
+    };
+    let Some(count) = read_u16(list) else {
+        return false;
+    };
+    (0..count).any(|ix| {
+        let record = list + 2 + ix * 6;
+        table.get(record..record + 4) == Some(&tag[..])
+    })
+}
+
 /// A font that can show `string`, as CoreText picks it when the font `font` has not the glyphs: the
 /// first of the cascade of `font` that has them, at the size of `font`.
 pub fn font_for_string(font: &CTFont, string: &str) -> CTFont {

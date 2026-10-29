@@ -33,6 +33,9 @@ mod open_type;
 mod font_fallback;
 
 #[cfg(feature = "font-kit")]
+mod han_kerning;
+
+#[cfg(feature = "font-kit")]
 mod script_runs;
 
 #[cfg(feature = "font-kit")]
