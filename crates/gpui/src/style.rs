@@ -1015,6 +1015,7 @@ impl TextStyle {
             strikethrough: self.strikethrough,
             font_size: None,
             line_height: None,
+            normal_line_height: self.line_height == LineHeight::Normal,
             overline: self.overline,
             extra_decorations: self.extra_decorations.clone(),
             group: 0,

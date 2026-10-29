@@ -263,6 +263,7 @@ impl TextSystem {
                     font_id,
                     font_size: None,
                     line_height: None,
+                    normal_line_height: false,
                 }],
                 1.,
             )
@@ -719,6 +720,7 @@ impl WindowTextSystem {
                     && font_id == font_run.font_id
                     && run.font_size == font_run.font_size
                     && run.line_height == font_run.line_height
+                    && run.normal_line_height == font_run.normal_line_height
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -728,6 +730,7 @@ impl WindowTextSystem {
                         font_id,
                         font_size: run.font_size,
                         line_height: run.line_height,
+                        normal_line_height: run.normal_line_height,
                     });
                 }
 
@@ -950,6 +953,7 @@ impl WindowTextSystem {
                 && font_id == font_run.font_id
                 && run.font_size == font_run.font_size
                 && run.line_height == font_run.line_height
+                && run.normal_line_height == font_run.normal_line_height
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -959,6 +963,7 @@ impl WindowTextSystem {
                     font_id,
                     font_size: run.font_size,
                     line_height: run.line_height,
+                    normal_line_height: run.normal_line_height,
                 });
             }
         }
@@ -989,6 +994,7 @@ impl WindowTextSystem {
                     font_id,
                     font_size: None,
                     line_height: None,
+                    normal_line_height: false,
                 }],
                 None,
                 None,
@@ -1043,6 +1049,7 @@ impl WindowTextSystem {
                 && font_id == font_run.font_id
                 && run.font_size == font_run.font_size
                 && run.line_height == font_run.line_height
+                && run.normal_line_height == font_run.normal_line_height
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -1052,6 +1059,7 @@ impl WindowTextSystem {
                     font_id,
                     font_size: run.font_size,
                     line_height: run.line_height,
+                    normal_line_height: run.normal_line_height,
                 });
             }
         }
@@ -1112,6 +1120,7 @@ impl WindowTextSystem {
                 && font_id == font_run.font_id
                 && run.font_size == font_run.font_size
                 && run.line_height == font_run.line_height
+                && run.normal_line_height == font_run.normal_line_height
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -1121,6 +1130,7 @@ impl WindowTextSystem {
                     font_id,
                     font_size: run.font_size,
                     line_height: run.line_height,
+                    normal_line_height: run.normal_line_height,
                 });
             }
         }
@@ -1188,6 +1198,7 @@ fn split_font_run_at(font_runs: &mut Vec<FontRun>, at: usize) {
                     font_id: run.font_id,
                     font_size: run.font_size,
                     line_height: run.line_height,
+                    normal_line_height: run.normal_line_height,
                 },
             );
             return;
@@ -1372,6 +1383,10 @@ pub struct TextRun {
     /// How much this run contributes to the height of its line box.
     /// `None` is the line height the line is painted with.
     pub line_height: Option<Pixels>,
+    /// Whether the line height of this run is `normal`, which makes the line box as tall as
+    /// every font the line falls back to needs (see [`ShapedRun::used_font`]). Not set for a
+    /// number or a length, which is the same line height for every font.
+    pub normal_line_height: bool,
     /// The overline style (if any)
     pub overline: Option<OverlineStyle>,
     /// The lines drawn besides `underline`, `strikethrough` and `overline`.
@@ -1408,6 +1423,7 @@ impl TextRun {
             run.font.hash(hasher);
             run.font_size.hash(hasher);
             run.line_height.hash(hasher);
+            run.normal_line_height.hash(hasher);
             previous
                 .is_none_or(|previous| !previous.same_decoration(run))
                 .hash(hasher);
@@ -1874,6 +1890,7 @@ mod tests {
                 font_id: FontId(0),
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             })
             .collect()
     }
@@ -1953,6 +1970,7 @@ mod tests {
             font_id: FontId(0),
             font_size: Some(px(32.)),
             line_height: Some(px(40.)),
+            normal_line_height: false,
         }];
         split_font_run_at(&mut runs, 1);
         assert_eq!(runs.len(), 2);

@@ -36,9 +36,9 @@ use font_kit::{
 };
 use gpui::{
     Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
-    FontSmoothing, FontStyle, FontVariations, FontWeight, GlyphId, Halt, Hsla, LineLayout, Pixels, PlatformTextSystem,
+    FontSmoothing, FontStyle, FontVariations, FontWeight, GlyphId, Halt, Hsla, LineBox, LineLayout, Pixels, PlatformTextSystem,
     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
-    Size, TextRenderingMode, point, px, size, swap_rgba_pa_to_bgra,
+    Size, TextRenderingMode, UsedFont, point, px, size, swap_rgba_pa_to_bgra,
 };
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use pathfinder_geometry::{
@@ -1183,6 +1183,23 @@ impl MacTextSystemState {
         }
     }
 
+    /// The content area and line gap of a font Chrome falls back to, at `size`. An emoji font
+    /// answers by the strike it draws the size from, so its ascent and descent are those of the
+    /// font at the device size and not its units scaled (Apple Color Emoji: 29 px of ascent,
+    /// descent and gap at 20, 32 at 24, where the units scale to 32 and 39).
+    fn used_line_box(&self, font_id: FontId, size: Pixels, scale_factor: f32) -> LineBox {
+        if !self.is_emoji(font_id) {
+            return self.font_metrics[font_id.0].line_box(size, scale_factor);
+        }
+        let font = self.sized_font(font_id, f32::from(size * scale_factor));
+        let round = |length: CGFloat| px((length as f32 + 0.5).floor() / scale_factor);
+        LineBox {
+            ascent: round(font.ascent()),
+            descent: round(font.descent()),
+            line_gap: round(font.leading()),
+        }
+    }
+
     fn is_emoji(&self, font_id: FontId) -> bool {
         self.postscript_names_by_font_id
             .get(&font_id)
@@ -1429,6 +1446,7 @@ impl MacTextSystemState {
                     ascent: line_box.ascent,
                     descent: line_box.descent,
                     line_height: run.line_height,
+                    normal_line_height: run.normal_line_height,
                 });
                 unsafe {
                     string.set_attribute(cf_range, kCTFontAttributeName, &ct_font);
@@ -1505,11 +1523,20 @@ impl MacTextSystemState {
                         .map(|(chrome, coretext)| chrome - coretext.width)
                         .collect::<Vec<f64>>()
                 });
+            // Chrome's line box under `line-height: normal` takes in the line box of every
+            // font that has a glyph on the line, so a font other than the one asked for gets its
+            // own. The ascent and descent of the run stay those of the font asked for.
+            let used_font = (input_run.normal_line_height && font_id != input_run.font_id).then(|| {
+                let line_box = self.used_line_box(font_id, input_run.font_size, scale_factor);
+                let (above, below) = line_box.extent(line_box.normal_line_height(), scale_factor);
+                UsedFont { above, below }
+            });
             let glyphs = match runs.last_mut() {
                 Some(run)
                     if run.font_id == font_id
                         && run.font_size == input_run.font_size
-                        && run.line_height == input_run.line_height =>
+                        && run.line_height == input_run.line_height
+                        && run.used_font == used_font =>
                 {
                     &mut run.glyphs
                 }
@@ -1520,6 +1547,7 @@ impl MacTextSystemState {
                         ascent: input_run.ascent,
                         descent: input_run.descent,
                         line_height: input_run.line_height,
+                        used_font,
                         glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
                         inline: Default::default(),
                     });
@@ -1608,6 +1636,7 @@ struct InputRun {
     ascent: Pixels,
     descent: Pixels,
     line_height: Option<Pixels>,
+    normal_line_height: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1790,7 +1819,7 @@ mod tests {
     use crate::MacTextSystem;
     use gpui::{
         Font, FontFeatures, FontRun, FontSmoothing, FontVariations, FontWeight, GlyphId,
-        PlatformTextSystem, RenderGlyphParams, font, px,
+        PlatformTextSystem, RenderGlyphParams, UsedFont, font, px,
     };
     use std::sync::Arc;
 
@@ -1852,6 +1881,7 @@ mod tests {
             len: line.len(),
             font_size: None,
             line_height: None,
+            normal_line_height: false,
         };
 
         let layout = fonts.layout_line(line, px(16.), &[style], 1.);
@@ -1875,12 +1905,14 @@ mod tests {
                 font_id,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             },
             FontRun {
                 len: "ab".len(),
                 font_id,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             },
         ];
         let layout = fonts.layout_line(line, px(16.), font_runs, 1.);
@@ -1904,12 +1936,14 @@ mod tests {
                 len: 5,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             }, // "hello"
             FontRun {
                 font_id,
                 len: 6,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             }, // " world"
         ];
 
@@ -1935,6 +1969,7 @@ mod tests {
                 len: 5,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             }, // "hello"
             // " world"
             FontRun {
@@ -1942,6 +1977,7 @@ mod tests {
                 len: 6,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             },
         ];
 
@@ -1971,6 +2007,7 @@ mod tests {
             len: 5,
             font_size: None,
             line_height: None,
+            normal_line_height: false,
         }];
         let layout = fonts.layout_line(text, px(16.), font_runs, 1.);
         assert_eq!(layout.len, text.len());
@@ -1982,18 +2019,21 @@ mod tests {
                 len: 1,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             }, // "a"
             FontRun {
                 font_id,
                 len: 1,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             }, // "b"
             FontRun {
                 font_id,
                 len: 1,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             }, // "c"
         ];
         let layout = fonts.layout_line(text, px(16.), font_runs, 1.);
@@ -2029,6 +2069,7 @@ mod tests {
             len,
             font_size,
             line_height,
+            normal_line_height: false,
         }
     }
 
@@ -2275,6 +2316,7 @@ mod tests {
             len: text.len(),
             font_size: None,
             line_height: None,
+            normal_line_height: false,
         };
         f32::from(fonts.layout_line(text, px(40.), &[run], 1.).width)
     }
@@ -2375,12 +2417,14 @@ mod tests {
                     len: 1,
                     font_size: None,
                     line_height: None,
+                    normal_line_height: false,
                 },
                 FontRun {
                     font_id: heavy,
                     len: 1,
                     font_size: None,
                     line_height: None,
+                    normal_line_height: false,
                 },
             ],
             1.,
@@ -2407,6 +2451,7 @@ mod tests {
                 len: 1,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             }],
             1.,
         );
@@ -2455,12 +2500,14 @@ mod tests {
                     len: 1,
                     font_size: None,
                     line_height: None,
+                    normal_line_height: false,
                 },
                 FontRun {
                     font_id: plain_id,
                     len: 1,
                     font_size: None,
                     line_height: None,
+                    normal_line_height: false,
                 },
             ],
             1.,
@@ -2568,6 +2615,7 @@ mod tests {
             len,
             font_size,
             line_height: None,
+            normal_line_height: false,
         };
         let layout = fonts.layout_line(
             "aabb",
@@ -2582,6 +2630,47 @@ mod tests {
         // Bold Helvetica Neue at 20px is 24px of content in Chrome.
         assert_eq!((layout.runs[1].ascent, layout.runs[1].descent), (px(20.), px(4.)));
         assert_eq!(layout.scale_factor, 1.);
+    }
+
+    /// Under `line-height: normal` the glyphs set in a font other than the one asked for have the
+    /// line box of that font, which Chrome unites with the box of the font of the element
+    /// (`fixtures/line-height-normal-oracle.json`, Helvetica Neue 13px: a line of Han is 14 above the
+    /// baseline and 4 below it, a line of emoji 16 and 5, where Latin is 12 and 3). A number or a
+    /// length is the same for every font, and the ascent and descent of the run stay the primary font's.
+    #[test]
+    fn test_a_fallback_font_under_line_height_normal_has_a_line_box_of_its_own() {
+        let fonts = MacTextSystem::new();
+        let helvetica = fonts.font_id(&font("Helvetica Neue")).unwrap();
+        let shape = |text: &str, normal_line_height: bool, scale_factor: f32| {
+            fonts.layout_line(
+                text,
+                px(13.),
+                &[FontRun {
+                    font_id: helvetica,
+                    len: text.len(),
+                    font_size: None,
+                    line_height: None,
+                    normal_line_height,
+                }],
+                scale_factor,
+            )
+        };
+        let used = |above: f32, below: f32| Some(UsedFont { above: px(above), below: px(below) });
+
+        let han = shape("中文", true, 1.);
+        assert_eq!(han.runs.len(), 1);
+        assert_eq!(han.runs[0].used_font, used(14., 4.));
+        assert_eq!((han.runs[0].ascent, han.runs[0].descent), (han.ascent, han.descent));
+        assert_eq!(shape("😀", true, 1.).runs[0].used_font, used(16., 5.));
+        // At scale 2 a line of Han is 14 above and 4.5 below in Chrome, the font's own box in device pixels.
+        assert_eq!(shape("中文", true, 2.).runs[0].used_font, used(14., 4.5));
+
+        assert_eq!(shape("Hxg", true, 1.).runs[0].used_font, None);
+        assert_eq!(shape("中文", false, 1.).runs[0].used_font, None);
+
+        let mixed = shape("Hxg 中文 Hxg", true, 1.);
+        let used_fonts: Vec<_> = mixed.runs.iter().map(|run| run.used_font).collect();
+        assert_eq!(used_fonts, [None, used(14., 4.), None]);
     }
 
     /// The same runs shaped for a display of scale 2 are measured in device pixels, as Chrome does
@@ -2602,6 +2691,7 @@ mod tests {
             len,
             font_size: None,
             line_height: None,
+            normal_line_height: false,
         };
         let layout = fonts.layout_line("aabb", px(20.), &[run(helvetica, 2), run(bold, 2)], 2.);
         assert_eq!(layout.scale_factor, 2.);
@@ -2733,6 +2823,7 @@ mod tests {
                 len: "Hamburgefonstiv 0123".len(),
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             };
             let advance =
                 f32::from(fonts.layout_line("Hamburgefonstiv 0123", px(size), &[run], 1.).width);
@@ -3139,7 +3230,7 @@ mod tests {
             .layout_line(
                 "😀",
                 px(13.),
-                &[FontRun { len: 4, font_id: id("Helvetica Neue"), font_size: None, line_height: None }],
+                &[FontRun { len: 4, font_id: id("Helvetica Neue"), font_size: None, line_height: None, normal_line_height: false }],
                 1.,
             )
             .runs[0]
@@ -3150,7 +3241,7 @@ mod tests {
         }
 
         let width = |family: &str, text: &str, size: f32, scale_factor: f32| {
-            let run = FontRun { len: text.len(), font_id: id(family), font_size: None, line_height: None };
+            let run = FontRun { len: text.len(), font_id: id(family), font_size: None, line_height: None, normal_line_height: false };
             f32::from(fonts.layout_line(text, px(size), &[run], scale_factor).width)
         };
         let close = |actual: f32, expected: f32, what: &str| {
@@ -3189,7 +3280,7 @@ mod tests {
         let font_id = fonts.font_id(&font("Helvetica Neue")).unwrap();
         for scale_factor in [1., 2.] {
             let text = "a中b😀c";
-            let run = FontRun { len: text.len(), font_id, font_size: None, line_height: None };
+            let run = FontRun { len: text.len(), font_id, font_size: None, line_height: None, normal_line_height: false };
             let layout = fonts.layout_line(text, px(13.), &[run], scale_factor);
             let glyphs: Vec<_> = layout
                 .runs
@@ -3229,7 +3320,7 @@ mod tests {
 
     fn line(fonts: &MacTextSystem, family: &str, text: &str, size: f32) -> gpui::LineLayout {
         let font_id = fonts.font_id(&font(family)).unwrap();
-        let run = FontRun { len: text.len(), font_id, font_size: None, line_height: None };
+        let run = FontRun { len: text.len(), font_id, font_size: None, line_height: None, normal_line_height: false };
         fonts.layout_line(text, px(size), &[run], 1.)
     }
 

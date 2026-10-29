@@ -759,6 +759,7 @@ impl CosmicTextSystemState {
                     ascent: layout.max_ascent.into(),
                     descent: layout.max_descent.into(),
                     line_height,
+                    used_font: None,
                     glyphs: vec![shaped_glyph],
                     inline: Default::default(),
                 });
@@ -814,6 +815,7 @@ fn clip_font_runs(font_runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontR
                 font_id: run.font_id,
                 font_size: run.font_size,
                 line_height: run.line_height,
+                normal_line_height: run.normal_line_height,
             });
         }
     }
@@ -1106,6 +1108,7 @@ mod tests {
             font_id,
             font_size: None,
             line_height: None,
+            normal_line_height: false,
         }];
         Ok(text_system.layout_line(text, gpui::px(14.0), &runs, 1.))
     }
@@ -1124,6 +1127,7 @@ mod tests {
             font: gpui::font("IBM Plex Sans"),
             font_size: None,
             line_height: None,
+            normal_line_height: false,
             ..Default::default()
         }];
 
@@ -1219,12 +1223,14 @@ mod tests {
                 font_id,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             },
             FontRun {
                 len: "\u{05d1}".len(),
                 font_id,
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             },
         ];
         let layout = text_system.layout_line(text, gpui::px(14.0), &runs, 1.);
@@ -1280,12 +1286,14 @@ mod tests {
                 font_id: fid(1),
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             },
             FontRun {
                 len: 4,
                 font_id: fid(2),
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             },
         ];
 
@@ -1298,12 +1306,14 @@ mod tests {
                     font_id: fid(1),
                     font_size: None,
                     line_height: None,
+                    normal_line_height: false,
                 },
                 FontRun {
                     len: 2,
                     font_id: fid(2),
                     font_size: None,
                     line_height: None,
+                    normal_line_height: false,
                 },
             ]
         );
@@ -1314,6 +1324,7 @@ mod tests {
                 font_id: fid(2),
                 font_size: None,
                 line_height: None,
+                normal_line_height: false,
             }]
         );
         assert!(clip_font_runs(&runs, 5..5).is_empty());

@@ -549,7 +549,7 @@ impl LineLayoutCache {
             return nominal;
         }
         let text = letter.to_string();
-        let runs = [FontRun { len: text.len(), font_id: run.font_id, font_size: None, line_height: None }];
+        let runs = [FontRun { len: text.len(), font_id: run.font_id, font_size: None, line_height: None, normal_line_height: false }];
         let alone = self
             .platform_text_system
             .layout_line(&text, run.font_size, &runs, scale_factor);
@@ -1002,6 +1002,7 @@ mod tests {
                 ascent: px(8.),
                 descent: px(2.),
                 line_height: None,
+                used_font: None,
                 glyphs,
                 inline: Default::default(),
             }],

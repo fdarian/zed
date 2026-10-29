@@ -271,11 +271,28 @@ pub struct ShapedRun {
     pub descent: Pixels,
     /// The line height of this run, if it has one of its own
     pub line_height: Option<Pixels>,
+    /// How far the line box of this run's font reaches around the baseline, when the run is
+    /// set in a font the line falls back to (not the one it asked for) under `line-height:
+    /// normal`. A row that holds the run is at least that tall, as Chrome unites the content
+    /// area of every font used on a line. `ascent` and `descent` stay those of the font asked
+    /// for, which a decoration and the box of an inline element are measured from.
+    pub used_font: Option<UsedFont>,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
     /// How the run sits on its line besides its font. A platform shaper leaves it at its
     /// default: it is set when the line is laid out with [`InlineBox`]es.
     pub inline: InlineRun,
+}
+
+/// The line box of a font used on a line with `line-height: normal`: its content area with its
+/// line gap split in half around it and floored to a device pixel above, as it is for the font
+/// of the box (see [`extent_in_line`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct UsedFont {
+    /// The distance from the baseline up to the top of the line box of the font.
+    pub above: Pixels,
+    /// The distance from the baseline down to the bottom of the line box of the font.
+    pub below: Pixels,
 }
 
 impl ShapedRun {
@@ -426,11 +443,13 @@ impl LineLayout {
     }
 
     /// Whether the run is an inline box of its own in the line: it differs from the
-    /// strut in the size or the line height it was set with, or in the content area its
-    /// font has at that size, so the line is as tall as both together need.
+    /// strut in the size or the line height it was set with, in the content area its
+    /// font has at that size, or in having glyphs of a font the line falls back to, so the
+    /// line is as tall as both together need.
     pub(crate) fn is_styled(&self, run: &ShapedRun) -> bool {
         run.font_size != self.font_size
             || run.line_height.is_some()
+            || run.used_font.is_some()
             || run.ascent != self.ascent
             || run.descent != self.descent
             || !run.inline.is_default()
@@ -496,6 +515,10 @@ impl LineLayout {
             let run_line_height = run.line_height.unwrap_or(line_height);
             let (run_above, run_below) =
                 extent_in_line(run.ascent, run.descent, run_line_height, self.scale_factor);
+            let (run_above, run_below) = match run.used_font {
+                Some(used) => (run_above.max(used.above), run_below.max(used.below)),
+                None => (run_above, run_below),
+            };
             // The boxes of its aligned group around an atomic inline are one with it.
             let (run_above, run_below) = match run.inline.aligned_strut {
                 Some(strut) => (run_above.max(strut.above), run_below.max(strut.below)),
@@ -677,6 +700,7 @@ impl LineLayout {
                     ascent: run.ascent,
                     descent: run.descent,
                     line_height: run.line_height,
+                    used_font: run.used_font,
                     glyphs: run.glyphs[..split_pos].to_vec(),
                     inline: run.inline,
                 });
@@ -699,6 +723,7 @@ impl LineLayout {
                     ascent: run.ascent,
                     descent: run.descent,
                     line_height: run.line_height,
+                    used_font: run.used_font,
                     glyphs: right_glyphs,
                     inline: run.inline,
                 });
@@ -1129,6 +1154,7 @@ impl LineLayout {
                 ascent: run.ascent,
                 descent: run.descent,
                 line_height: run.line_height,
+                used_font: run.used_font,
                 glyphs: run
                     .glyphs
                     .iter()
@@ -2622,6 +2648,7 @@ impl LineLayoutCache {
                         ascent: extent.ascent,
                         descent: extent.descent,
                         line_height: Some(extent.ascent + extent.descent),
+                        used_font: None,
                         glyphs: vec![ShapedGlyph {
                             id: GlyphId(0),
                             position: point(x, Pixels::ZERO),
@@ -2970,6 +2997,9 @@ pub struct FontRun {
     pub font_size: Option<Pixels>,
     /// The line height of the run, carried through to [`ShapedRun::line_height`].
     pub line_height: Option<Pixels>,
+    /// Whether the line height of the run is `normal`: the shaper gives the glyphs it sets in
+    /// a font other than `font_id` a [`ShapedRun::used_font`].
+    pub normal_line_height: bool,
 }
 
 impl FontRun {
@@ -3186,6 +3216,7 @@ mod tests {
                 ascent: px(12.),
                 descent: px(4.),
                 line_height: None,
+                used_font: None,
                 glyphs,
                 inline: InlineRun::default(),
             }],
@@ -5751,6 +5782,7 @@ mod line_box_tests {
             ascent: px(ascent),
             descent: px(descent),
             line_height: line_height.map(px),
+            used_font: None,
             glyphs: vec![ShapedGlyph {
                 id: crate::GlyphId(0),
                 position: point(px(0.), px(0.)),
@@ -5804,6 +5836,49 @@ mod line_box_tests {
                 baseline: px(20.)
             }]
         );
+    }
+
+    /// With `line-height: normal` a row holds the line box of every font that has a glyph in it, each
+    /// with its line gap split in half around its content area (Helvetica Neue 13px, 12 above and
+    /// 3 below, with a Han run that reaches 14 above and 4 below: Chrome's line is 18 tall with the
+    /// baseline at 14, `Helvetica Neue|13|han|normal`), and only the rows that hold it.
+    #[test]
+    fn test_a_row_is_as_tall_as_the_line_box_of_every_font_used_in_it() {
+        let mut fallback = run(12., 3., None);
+        fallback.used_font = Some(UsedFont { above: px(14.), below: px(4.) });
+        let mut layout = layout(vec![run(12., 3., None), fallback.clone()]);
+        layout.ascent = px(12.);
+        layout.descent = px(3.);
+        layout.runs[1].glyphs[0].index = 1;
+        assert!(layout.is_styled(&layout.runs[1]));
+
+        let one_row = layout.rows(&[], px(15.));
+        assert_eq!(one_row.as_slice(), [RowMetrics { height: px(18.), baseline: px(14.) }]);
+
+        // Wrapped before the fallback run's glyph, the first row is the strut's alone.
+        let wrapped = layout.rows(&[WrapBoundary { run_ix: 1, glyph_ix: 0 }], px(15.));
+        assert_eq!(
+            wrapped.as_slice(),
+            [
+                RowMetrics { height: px(15.), baseline: px(12.) },
+                RowMetrics { height: px(18.), baseline: px(14.) },
+            ]
+        );
+    }
+
+    /// The box of the font a line falls back to is united with the box the run's own line height
+    /// gives, and it leaves the ascent and descent that decorations are measured from alone.
+    #[test]
+    fn test_the_line_box_of_a_used_font_leaves_the_content_area_of_its_run_alone() {
+        let mut fallback = run(19., 4., Some(40.));
+        fallback.used_font = Some(UsedFont { above: px(30.), below: px(6.) });
+        let layout = layout(vec![fallback]);
+        // A line height of 40 around 23 puts 8.5 (floored to 8) above: 27 above, 13 below.
+        assert_eq!(
+            layout.rows(&[], px(24.)).as_slice(),
+            [RowMetrics { height: px(43.), baseline: px(30.) }]
+        );
+        assert_eq!((layout.runs[0].ascent, layout.runs[0].descent), (px(19.), px(4.)));
     }
 
     #[test]

@@ -265,6 +265,7 @@ impl PlatformTextSystem for FixedMetricsTextSystem {
                         .line_box(run_size, scale_factor)
                         .descent,
                     line_height: font_run.line_height,
+                    used_font: None,
                     glyphs: Vec::new(),
                     inline: Default::default(),
                 });

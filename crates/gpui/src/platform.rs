@@ -1314,6 +1314,7 @@ impl PlatformTextSystem for NoopTextSystem {
                         ascent: metrics.line_box(run_size, scale_factor).ascent,
                         descent: metrics.line_box(run_size, scale_factor).descent,
                         line_height: font_run.line_height,
+                        used_font: None,
                         glyphs: Vec::new(),
                         inline: Default::default(),
                     });

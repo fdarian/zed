@@ -1354,6 +1354,7 @@ mod tests {
                     ascent: px(12.0),
                     descent: px(4.0),
                     line_height: None,
+                    used_font: None,
                     glyphs: shaped_glyphs,
                     inline: Default::default(),
                 }],
@@ -1436,6 +1437,7 @@ mod tests {
                         ascent: px(12.0),
                         descent: px(4.0),
                         line_height: None,
+                        used_font: None,
                         glyphs: vec![
                             ShapedGlyph {
                                 id: GlyphId(0),
@@ -1467,6 +1469,7 @@ mod tests {
                         ascent: px(12.0),
                         descent: px(4.0),
                         line_height: None,
+                        used_font: None,
                         glyphs: vec![
                             ShapedGlyph {
                                 id: GlyphId(0),
