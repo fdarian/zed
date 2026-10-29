@@ -797,8 +797,10 @@ impl WindowTextSystem {
                 line_start,
                 line_start + second_line.len(),
             );
+            let mut previous_len = second_line.len();
             for line_text in split_lines {
-                line_start += line_text.len() + '\n'.len_utf8();
+                line_start += previous_len + '\n'.len_utf8();
+                previous_len = line_text.len();
                 process_line(
                     SharedString::new(line_text),
                     line_start,
@@ -2045,6 +2047,50 @@ mod insets_tests {
             ..colored(3, red)
         };
         assert_ne!(measured, measured_hash(&[small, colored(4, blue)]));
+    }
+
+    /// The third line of a text and the lines after it start where their text does, whatever the
+    /// lengths of the lines before: an atomic inline at the start of each is on its line.
+    #[crate::test]
+    fn test_the_inline_boxes_of_the_third_line_are_found_whatever_the_second_is_long(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let text: SharedString = "\u{FFFC}a\n\u{FFFC}bbbb\n\u{FFFC}c\n\u{FFFC}".into();
+            let starts = [0, 5, 13, 18];
+            let atomic = |start: usize| InlineBox {
+                range: start..start + 3,
+                parent: None,
+                align: VerticalAlign::Baseline,
+                line_height: None,
+                wraps: None,
+                key: None,
+                content: InlineContent::Atomic(AtomicExtent {
+                    advance: px(10.),
+                    ascent: px(10.),
+                    descent: px(0.),
+                }),
+            };
+            let boxes: Vec<InlineBox> = starts.iter().map(|start| atomic(*start)).collect();
+            let lines = text_system
+                .shape_text_inline(
+                    text.clone(),
+                    px(16.),
+                    &[run(text.len())],
+                    None,
+                    None,
+                    TextLayoutOptions::default(),
+                    &[],
+                    &boxes,
+                    px(20.),
+                )
+                .unwrap();
+            assert_eq!(lines.len(), 4);
+            for (ix, line) in lines.iter().enumerate() {
+                assert_eq!(line.layout.objects(px(20.)).len(), 1, "line {ix}");
+            }
+        });
     }
 
     #[crate::test]
