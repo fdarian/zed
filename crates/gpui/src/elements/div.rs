@@ -10192,6 +10192,115 @@ mod tests {
                     assert_eq!(bounds_of(&window, cx, "box").origin, point(px(114.), px(114.)));
                 }
             }
+
+            /// An element that reports what its child escapes to and, if `forwards`, leaves
+            /// applying it to the child, as a wrapper that only a parent reads the escape of does.
+            struct Wrapper {
+                child: AnyElement,
+                forwards: bool,
+            }
+
+            impl IntoElement for Wrapper {
+                type Element = Self;
+
+                fn into_element(self) -> Self::Element {
+                    self
+                }
+            }
+
+            impl Element for Wrapper {
+                type RequestLayoutState = ();
+                type PrepaintState = ();
+
+                fn id(&self) -> Option<ElementId> {
+                    None
+                }
+
+                fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+                    None
+                }
+
+                fn escapes_to(&self) -> Option<Escape> {
+                    self.child.escapes_to()
+                }
+
+                fn forwards_escape(&self) -> bool {
+                    self.forwards
+                }
+
+                fn request_layout(
+                    &mut self,
+                    _: Option<&GlobalElementId>,
+                    _: Option<&InspectorElementId>,
+                    window: &mut Window,
+                    cx: &mut App,
+                ) -> (LayoutId, ()) {
+                    (self.child.request_layout(window, cx), ())
+                }
+
+                fn prepaint(
+                    &mut self,
+                    _: Option<&GlobalElementId>,
+                    _: Option<&InspectorElementId>,
+                    _: Bounds<Pixels>,
+                    _: &mut (),
+                    window: &mut Window,
+                    cx: &mut App,
+                ) {
+                    self.child.prepaint(window, cx);
+                }
+
+                fn paint(
+                    &mut self,
+                    _: Option<&GlobalElementId>,
+                    _: Option<&InspectorElementId>,
+                    _: Bounds<Pixels>,
+                    _: &mut (),
+                    _: &mut (),
+                    window: &mut Window,
+                    cx: &mut App,
+                ) {
+                    self.child.paint(window, cx);
+                }
+            }
+
+            fn widenings(window: &AnyWindowHandle, cx: &mut TestAppContext) -> usize {
+                cx.update_window(*window, |_, window, _| {
+                    let scene = &window.rendered_frame.scene;
+                    scene
+                        .describe_operations(0..scene.paint_operations.len(), true)
+                        .matches("widen ")
+                        .count()
+                })
+                .unwrap()
+            }
+
+            #[gpui::test]
+            fn a_wrapper_that_forwards_the_escape_of_its_child_does_not_apply_it_twice(
+                cx: &mut TestAppContext,
+            ) {
+                let scene = |wrapped: Option<bool>| {
+                    move || {
+                        let target = escaping("a", 10., 20., 50.);
+                        let target = match wrapped {
+                            Some(forwards) => Wrapper { child: target.into_any_element(), forwards }.into_any_element(),
+                            None => target.into_any_element(),
+                        };
+                        root().child(static_box("b", 0., 100.).overflow_hidden().child(target)).into_any_element()
+                    }
+                };
+
+                let bare = open_scene(cx, true, scene(None));
+                let forwarding = open_scene(cx, true, scene(Some(true)));
+                assert_eq!(widenings(&bare, cx), 1);
+                assert_eq!(widenings(&forwarding, cx), 1, "a build of the child alone is as deep");
+                assert_eq!(bounds_of(&forwarding, cx, "a"), bounds_of(&bare, cx, "a"));
+                assert_eq!(visible_area(&forwarding, cx), visible_area(&bare, cx));
+
+                // An element that reads its own bounds is placed by its escape, and applies it.
+                let placed = open_scene(cx, true, scene(Some(false)));
+                assert_eq!(widenings(&placed, cx), 2);
+            }
         }
 
         /// Positioned elements are lifted into the nearest stacking context and painted, and hit

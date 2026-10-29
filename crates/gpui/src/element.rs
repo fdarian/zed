@@ -117,6 +117,15 @@ pub trait Element: 'static + IntoElement {
         None
     }
 
+    /// Whether this element only reports the [`Element::escapes_to`] of the element it wraps, for
+    /// a parent that places or records it by that (a retained root), and does not apply it: the
+    /// wrapped element does when it prepaints and paints. An element that reads its own bounds
+    /// is placed by its escape and does not say so. Without it the escape would be applied twice,
+    /// which draws the same and records a frame deeper than a build of the wrapped element alone.
+    fn forwards_escape(&self) -> bool {
+        false
+    }
+
     /// The `z-index` of this element if it is drawn in the stacking order of the nearest
     /// stacking context (see [`crate::Div::stacking_context`]) instead of in its tree position, as
     /// a CSS positioned element is: its parent hands it over to that context once it is
@@ -571,7 +580,7 @@ impl<E: Element> Drawable<E> {
 
                 // Inside a culled subtree nothing draws or is hit, so only the offset an
                 // escaping box is placed by matters: its bounds are read.
-                let escaped = self.element.escapes_to().map(|escape| {
+                let escaped = self.element.escapes_to().filter(|_| !self.element.forwards_escape()).map(|escape| {
                     let derived = window.escape_frame_is_in_recording(escape);
                     let (mask, offset) = window.escape_frame(escape);
                     (mask, offset, derived)
