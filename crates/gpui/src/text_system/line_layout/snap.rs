@@ -376,22 +376,6 @@ fn measure_sums(x: &[Pixels], glyphs: impl IntoIterator<Item = DeviceAdvance>, s
     sums
 }
 
-/// Whether `character` is set in a CJK font: kana, bopomofo, Han ideographs, Hangul and the
-/// punctuation and forms that go with them.
-fn is_east_asian(character: char) -> bool {
-    matches!(
-        character,
-        '\u{1100}'..='\u{11FF}'
-            | '\u{2E80}'..='\u{9FFF}'
-            | '\u{A960}'..='\u{A97F}'
-            | '\u{AC00}'..='\u{D7FF}'
-            | '\u{F900}'..='\u{FAFF}'
-            | '\u{FE30}'..='\u{FE4F}'
-            | '\u{FF00}'..='\u{FFEF}'
-            | '\u{20000}'..='\u{3FFFF}'
-    )
-}
-
 /// The x of every glyph of `layout`, and then of its end.
 pub(super) fn glyph_positions(layout: &LineLayout) -> Vec<Pixels> {
     layout
@@ -520,12 +504,6 @@ impl LineLayoutCache {
                 let letter = cluster.chars().next().expect("the cluster has a character");
                 let follows = text[next.index..].chars().next();
                 if letter.is_whitespace() || follows.is_none_or(char::is_whitespace) {
-                    continue;
-                }
-                // CoreText kerns kana, ideographs and fullwidth forms with the GPOS table of a
-                // fallback font that Chrome's text does not take: the widths do not agree
-                // whether the line is shaped again or not, so they are left as shaped.
-                if is_east_asian(letter) || follows.is_some_and(is_east_asian) {
                     continue;
                 }
                 let Some(nominal) = *advances.entry((run.font_id, before.id, size)).or_insert_with(|| {
@@ -1048,7 +1026,12 @@ mod tests {
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
         let x = glyph_positions(&layout);
-        let reshapes = cache.end_reshapes(&layout, text, &[], &x);
+        // The test system has no advances, which the pairs of kerned letters (boundary 1) are made from.
+        let reshapes: Vec<_> = cache
+            .end_reshapes(&layout, text, &[], &x)
+            .into_iter()
+            .filter(|(after, _)| *after >= 2)
+            .collect();
         // Before the closing bracket the full stop is whole: the line is 5 wider. Before the opening
         // one the glyph before it is shaped again, and is 2 wider.
         assert_eq!(
