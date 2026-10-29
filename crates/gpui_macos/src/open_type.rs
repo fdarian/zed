@@ -252,6 +252,19 @@ pub fn copy_for_advances(font: &CTFont, size: f64, optical_size: f64, tracking: 
     }
 }
 
+/// A font that can show `string`, as CoreText picks it when the font `font` has not the glyphs: the
+/// first of the cascade of `font` that has them, at the size of `font`.
+pub fn font_for_string(font: &CTFont, string: &str) -> CTFont {
+    let string = CFString::new(string);
+    unsafe {
+        CTFont::wrap_under_create_rule(CTFontCreateForString(
+            font.as_concrete_TypeRef(),
+            string.as_concrete_TypeRef(),
+            core_foundation::base::CFRange::init(0, string.char_len()),
+        ))
+    }
+}
+
 /// What `font` has set on each of its `axes`.
 pub fn current_variations(font: &FontKitFont, axes: &[VariationAxis]) -> Vec<(u32, f32)> {
     let dictionary = unsafe {
@@ -334,6 +347,11 @@ unsafe extern "C" {
 
     fn CTFontCopyVariation(font: CTFontRef) -> core_foundation::dictionary::CFDictionaryRef;
     fn CTFontCopyAvailableTables(font: CTFontRef, options: u32) -> CFArrayRef;
+    fn CTFontCreateForString(
+        font: CTFontRef,
+        string: CFStringRef,
+        range: core_foundation::base::CFRange,
+    ) -> CTFontRef;
 
     fn CTFontCreateCopyWithAttributes(
         font: CTFontRef,

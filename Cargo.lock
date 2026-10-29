@@ -7661,6 +7661,7 @@ dependencies = [
  "gpui_apple",
  "gpui_macos",
  "gpui_util",
+ "icu_properties",
  "image",
  "itertools 0.14.0",
  "libc",

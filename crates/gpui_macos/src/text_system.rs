@@ -47,11 +47,12 @@ use pathfinder_geometry::{
     vector::Vector2F,
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, char, convert::TryFrom, sync::Arc, sync::OnceLock};
+use std::{borrow::Cow, char, convert::TryFrom, ops::Range, sync::Arc, sync::OnceLock};
 
+use crate::font_fallback;
 use crate::open_type::{
     VariationAxis, apply_features_and_fallbacks, apply_variations, copy_for_advances,
-    current_variations, font_table_tags, variation_axes,
+    current_variations, font_for_string, font_table_tags, variation_axes,
 };
 
 #[allow(non_upper_case_globals)]
@@ -97,6 +98,10 @@ struct MacTextSystemState {
     /// The copies of a face that give its advances, by face, size and scale factor
     /// (see [`MacTextSystemState::advance_font`]).
     advance_fonts: Mutex<HashMap<(FontId, u32, u32), CTFont>>,
+    /// The font the system picks for a character that a face has no glyph for, by face, size and
+    /// character (see [`MacTextSystemState::fallback_assignments`]). `None` when it picks none that is
+    /// of use.
+    fallback_fonts: Mutex<HashMap<(FontId, u32, char), Option<CTFont>>>,
 }
 
 /// Where Chrome gets the advances of a font from. CoreText has its own, and they are the same as
@@ -179,6 +184,7 @@ impl MacTextSystem {
             sized_fonts: Mutex::new(HashMap::default()),
             advance_sources: Vec::new(),
             advance_fonts: Mutex::new(HashMap::default()),
+            fallback_fonts: Mutex::new(HashMap::default()),
         }))
     }
 }
@@ -720,6 +726,70 @@ impl MacTextSystemState {
         Some(AdvanceFont { font, per_pixel })
     }
 
+    /// The font Chrome sets each character of `text` in, for the characters `font` has no glyph for
+    /// that the system finds a font for ([`font_fallback`]): the UTF-16 ranges of `text` and the font of
+    /// each. CoreText would find a font for those on its own, and for a full stop that follows kana it
+    /// finds another than Chrome does.
+    fn fallback_assignments(&self, font_id: FontId, font: &CTFont, size: f32, text: &str) -> Vec<(Range<usize>, CTFont)> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut glyphs = vec![0 as CGGlyph; units.len()];
+        // SAFETY: one glyph out for each character in.
+        let all = unsafe {
+            font.get_glyphs_for_characters(units.as_ptr(), glyphs.as_mut_ptr(), units.len() as CFIndex)
+        };
+        if all {
+            return Vec::new();
+        }
+        let mut unit = 0;
+        let primary_covers: Vec<bool> = text
+            .chars()
+            .map(|character| {
+                let covered = glyphs[unit] != 0;
+                unit += character.len_utf16();
+                covered
+            })
+            .collect();
+        let assignment = font_fallback::assign(
+            text,
+            &primary_covers,
+            |hint| self.fallback_font(font_id, font, size, hint),
+            font_covers,
+        );
+        let mut ranges: Vec<(Range<usize>, CTFont)> = Vec::new();
+        let mut start = 0;
+        let mut last: Option<usize> = None;
+        for (character, font_ix) in text.chars().zip(&assignment.per_character) {
+            let end = start + character.len_utf16();
+            if let Some(font_ix) = font_ix {
+                match ranges.last_mut() {
+                    Some((range, _)) if last == Some(*font_ix) && range.end == start => range.end = end,
+                    _ => ranges.push((start..end, assignment.fonts[*font_ix].clone())),
+                }
+            }
+            last = *font_ix;
+            start = end;
+        }
+        ranges
+    }
+
+    /// The font CoreText cascades `font` to for `character`, `None` when that is `font` itself or
+    /// the font of last resort, which draws a box.
+    fn fallback_font(&self, font_id: FontId, font: &CTFont, size: f32, character: char) -> Option<CTFont> {
+        let key = (font_id, size.to_bits(), character);
+        let mut cache = self.fallback_fonts.lock();
+        if let Some(cached) = cache.get(&key) {
+            return cached.clone();
+        }
+        let found = font_for_string(font, character.encode_utf8(&mut [0; 4]));
+        let name = found.postscript_name();
+        let fallback = (name != font.postscript_name() && !name.contains("LastResort")).then_some(found);
+        if cache.len() >= SIZED_FONTS_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, fallback.clone());
+        fallback
+    }
+
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
         Ok(size_from_vector2f(
             self.fonts[font_id.0].advance(glyph_id.0)?,
@@ -1018,6 +1088,17 @@ impl MacTextSystemState {
                 unsafe {
                     string.set_attribute(cf_range, kCTFontAttributeName, &ct_font);
                 }
+                for (range, fallback) in
+                    self.fallback_assignments(run.font_id, &ct_font, f32::from(ct_font_size), text_run)
+                {
+                    let range = CFRange::init(
+                        utf16_start + range.start as CFIndex,
+                        (range.end - range.start) as CFIndex,
+                    );
+                    unsafe {
+                        string.set_attribute(range, kCTFontAttributeName, &fallback);
+                    }
+                }
                 break_ligature = !break_ligature;
             }
         }
@@ -1140,6 +1221,18 @@ impl MacTextSystemState {
             boxes: Vec::new(),
         }
     }
+}
+
+/// Whether `font` has a glyph for `character`.
+fn font_covers(font: &CTFont, character: char) -> bool {
+    let mut units = [0u16; 2];
+    let units = character.encode_utf16(&mut units);
+    let mut glyphs = [0 as CGGlyph; 2];
+    // SAFETY: one glyph out for each character in.
+    unsafe {
+        font.get_glyphs_for_characters(units.as_ptr(), glyphs.as_mut_ptr(), units.len() as CFIndex);
+    }
+    glyphs[0] != 0
 }
 
 /// What the shaper needs to know about an input `FontRun` once the glyphs come back.
@@ -2749,5 +2842,54 @@ mod tests {
             let width = f32::from(layout.width);
             assert!((width - x).abs() < 1e-3, "{width} and {x}");
         }
+    }
+
+    /// The glyphs of a line, with the name of the font of each and the character it is for.
+    fn glyphs_of(
+        fonts: &MacTextSystem,
+        text: &str,
+        layout: &gpui::LineLayout,
+    ) -> Vec<(String, char, gpui::ShapedGlyph)> {
+        let state = fonts.0.read();
+        layout
+            .runs
+            .iter()
+            .flat_map(|run| {
+                let name = state.postscript_names_by_font_id[&run.font_id].clone();
+                run.glyphs.iter().map(move |glyph| {
+                    let character = text[glyph.index..].chars().next().unwrap();
+                    (name.clone(), character, glyph.clone())
+                })
+            })
+            .collect()
+    }
+
+    fn line(fonts: &MacTextSystem, family: &str, text: &str, size: f32) -> gpui::LineLayout {
+        let font_id = fonts.font_id(&font(family)).unwrap();
+        let run = FontRun { len: text.len(), font_id, font_size: None, line_height: None };
+        fonts.layout_line(text, px(size), &[run], 1.)
+    }
+
+    /// CJK punctuation is set in the font of the script run it is in, as Chrome does: the full stop after kana is
+    /// Hiragino's, where CoreText cascades to PingFang's for it when the text starts with Han. Hiragino kerns the kana
+    /// before it (テス is 50 font units closer and す。 100), as Chrome measures 13.31 for テ and 12.61 for す at 14px.
+    #[test]
+    fn test_punctuation_after_kana_is_in_the_font_of_the_kana() {
+        let fonts = MacTextSystem::new();
+        let text = "日本語のテスト、です。";
+        let layout = line(&fonts, "Helvetica Neue", text, 14.);
+        let glyphs = glyphs_of(&fonts, text, &layout);
+        for (name, character, _) in &glyphs {
+            let expected = if matches!(character, '日' | '本' | '語') { "PingFang" } else { "Hiragino" };
+            assert!(name.contains(expected), "{character}: {name}");
+        }
+        let advance = |ix: usize| f32::from(glyphs[ix + 1].2.position.x - glyphs[ix].2.position.x);
+        let close = |actual: f32, expected: f32, what: &str| {
+            assert!((actual - expected).abs() < 0.02, "{what}: {actual}, Chrome {expected}");
+        };
+        close(advance(4), 13.3, "テ");
+        close(advance(9), 12.6, "す");
+        // The full stop is not trimmed: no punctuation follows it.
+        assert_eq!(glyphs[10].2.halt, gpui::Halt::None);
     }
 }

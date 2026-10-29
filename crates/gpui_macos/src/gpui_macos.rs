@@ -30,6 +30,12 @@ pub mod metal_renderer {
 mod open_type;
 
 #[cfg(feature = "font-kit")]
+mod font_fallback;
+
+#[cfg(feature = "font-kit")]
+mod script_runs;
+
+#[cfg(feature = "font-kit")]
 mod text_system;
 
 mod platform;
