@@ -101,6 +101,39 @@ pub struct CompositionFrame {
 }
 
 impl CompositionFrame {
+    /// What `composed` puts on the screen, as a platform window records it for a test.
+    /// `attachment` of a native layer is what the surface's `platform_handle` answers as a
+    /// `usize`: the index of the attachment on the test platform, the content view's address on
+    /// AppKit.
+    pub fn record(composed: &ComposedScene<'_>) -> Self {
+        let layers = composed
+            .layers()
+            .iter()
+            .enumerate()
+            .map(|(z, layer)| match layer {
+                ComposedLayer::Gpui(layer) => RecordedLayer::Gpui {
+                    surface: layer.surface,
+                    orders: layer.orders,
+                    is_base: layer.is_base,
+                    primitives: composed.scene().len_in(layer.orders),
+                    hitboxes: layer.hitboxes.clone(),
+                },
+                ComposedLayer::Native(layer) => RecordedLayer::Native {
+                    surface: layer.surface,
+                    attachment: *layer
+                        .attachment
+                        .platform_handle()
+                        .expect("a native attachment has a handle")
+                        .downcast::<usize>()
+                        .expect("a native attachment's handle is a usize"),
+                    placement: layer.placement,
+                    z,
+                },
+            })
+            .collect();
+        Self { layers }
+    }
+
     /// The native layers, bottom to top.
     pub fn natives(&self) -> impl Iterator<Item = &RecordedLayer> {
         self.layers
@@ -570,32 +603,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn draw_composed(&self, composed: ComposedScene<'_>) {
-        let layers = composed
-            .layers()
-            .iter()
-            .enumerate()
-            .map(|(z, layer)| match layer {
-                ComposedLayer::Gpui(layer) => RecordedLayer::Gpui {
-                    surface: layer.surface,
-                    orders: layer.orders,
-                    is_base: layer.is_base,
-                    primitives: composed.scene().len_in(layer.orders),
-                    hitboxes: layer.hitboxes.clone(),
-                },
-                ComposedLayer::Native(layer) => RecordedLayer::Native {
-                    surface: layer.surface,
-                    attachment: *layer
-                        .attachment
-                        .platform_handle()
-                        .expect("a test attachment has a handle")
-                        .downcast::<usize>()
-                        .expect("a test attachment's handle is its index"),
-                    placement: layer.placement,
-                    z,
-                },
-            })
-            .collect();
-        self.0.lock().composition_frames.push(CompositionFrame { layers });
+        self.0.lock().composition_frames.push(CompositionFrame::record(&composed));
         self.draw_scene(composed.scene());
     }
 
@@ -629,6 +637,14 @@ impl PlatformWindow for TestWindow {
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         Some(self)
+    }
+
+    fn composition_frame(&self) -> Option<CompositionFrame> {
+        TestWindow::composition_frame(self)
+    }
+
+    fn composition_frames(&self) -> Vec<CompositionFrame> {
+        TestWindow::composition_frames(self)
     }
 
     #[cfg(target_os = "windows")]

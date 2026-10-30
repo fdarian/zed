@@ -1051,6 +1051,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// The last frame the window drew composed (`draw_composed`), for tests. `None` for a
+    /// platform that does not record, and while the window only drew plain frames.
+    #[cfg(any(test, feature = "test-support"))]
+    fn composition_frame(&self) -> Option<CompositionFrame> {
+        None
+    }
+
+    /// Every frame the window drew composed, oldest first, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    fn composition_frames(&self) -> Vec<CompositionFrame> {
+        Vec::new()
+    }
+
     /// Makes the window report `scale_factor` from now on, whatever display it is on or
     /// moves to: the analogue of Chrome's `--force-device-scale-factor`. The drawable follows
     /// it, so a capture is the window's size times the factor. It does not run the resize

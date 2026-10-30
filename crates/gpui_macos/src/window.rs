@@ -2120,6 +2120,16 @@ impl PlatformWindow for MacWindow {
         composition::create_native_surface(&self.0)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn composition_frame(&self) -> Option<gpui::CompositionFrame> {
+        composition::recorded_frame(&self.0)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn composition_frames(&self) -> Vec<gpui::CompositionFrame> {
+        composition::recorded_frames(&self.0)
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }

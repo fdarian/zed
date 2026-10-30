@@ -67,6 +67,9 @@ pub(super) struct MacComposition {
     native_buttons: u64,
     gpui_buttons: u64,
     withheld_buttons: u64,
+    /// The frames drawn composed, for tests (`PlatformWindow::composition_frames`).
+    #[cfg(any(test, feature = "test-support"))]
+    recorded: Vec<gpui::CompositionFrame>,
 }
 
 impl MacComposition {
@@ -80,6 +83,8 @@ impl MacComposition {
             native_buttons: 0,
             gpui_buttons: 0,
             withheld_buttons: 0,
+            #[cfg(any(test, feature = "test-support"))]
+            recorded: Vec::new(),
         }
     }
 
@@ -587,6 +592,8 @@ pub(super) fn draw_composed(window_state: &Arc<Mutex<MacWindowState>>, scene: Co
     let root = state.native_view.as_ptr() as id;
     let window_height = f64::from(state.content_size().height.as_f32());
     let mut changed = false;
+    #[cfg(any(test, feature = "test-support"))]
+    state.composition.recorded.push(gpui::CompositionFrame::record(&scene));
 
     let live: FxHashSet<CompositionSurfaceId> = scene
         .layers()
@@ -702,6 +709,18 @@ extern "C" fn compare_subviews(a: id, b: id, context: *mut c_void) -> isize {
             .map_or(-1, |position| position as isize)
     };
     rank(a).cmp(&rank(b)) as isize
+}
+
+/// The frames `draw_composed` recorded, oldest first.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn recorded_frames(window_state: &Arc<Mutex<MacWindowState>>) -> Vec<gpui::CompositionFrame> {
+    window_state.lock().composition.recorded.clone()
+}
+
+/// The last frame `draw_composed` recorded.
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn recorded_frame(window_state: &Arc<Mutex<MacWindowState>>) -> Option<gpui::CompositionFrame> {
+    window_state.lock().composition.recorded.last().cloned()
 }
 
 /// The view and renderer of an overlay, the size of the window's view.

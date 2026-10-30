@@ -303,12 +303,12 @@ impl Window {
 impl Window {
     /// The last frame the window drew composed, `None` while it only drew plain frames.
     pub fn composition_frame(&mut self) -> Option<crate::CompositionFrame> {
-        self.test_window().composition_frame()
+        self.platform_window.composition_frame()
     }
 
     /// Every frame the window drew composed, oldest first.
     pub fn composition_frames(&mut self) -> Vec<crate::CompositionFrame> {
-        self.test_window().composition_frames()
+        self.platform_window.composition_frames()
     }
 
     /// How many frames the window drew with the platform's plain `draw`.
