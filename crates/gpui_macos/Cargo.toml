@@ -17,6 +17,11 @@ path = "tests/run_loop_wake.rs"
 harness = false
 
 [[test]]
+name = "native_surface"
+path = "tests/native_surface.rs"
+harness = false
+
+[[test]]
 name = "window_resize"
 path = "tests/window_resize.rs"
 harness = false

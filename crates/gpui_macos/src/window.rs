@@ -75,6 +75,8 @@ use std::{
     time::Duration,
 };
 
+mod composition;
+
 const WINDOW_STATE_IVAR: &str = "windowState";
 /// A plain flag rather than a field of the state behind `WINDOW_STATE_IVAR`: AppKit asks for the
 /// constrained frame from inside calls that already hold that state's lock.
@@ -142,6 +144,7 @@ unsafe extern "C" {
 #[ctor(unsafe)]
 unsafe fn build_classes() {
     unsafe {
+        composition::build_classes();
         WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
         PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
         VIEW_CLASS = {
@@ -389,6 +392,7 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
         let mut decl = ClassDecl::new(name, superclass).unwrap();
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
         decl.add_ivar::<BOOL>(KEEPS_FRAME_IVAR);
+        composition::register_window_input(&mut decl, superclass);
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
         decl.add_method(
             sel!(constrainFrameRect:toScreen:),
@@ -630,6 +634,7 @@ struct MacWindowState {
     /// Consecutive `step`s in which nobody asked for another frame.
     idle_steps: u32,
     renderer: renderer::Renderer,
+    composition: composition::MacComposition,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -1133,6 +1138,7 @@ impl MacWindow {
                 frame_source: None,
                 frame_requested: false,
                 idle_steps: 0,
+                composition: composition::MacComposition::new(renderer_context.clone()),
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1577,6 +1583,7 @@ impl PlatformWindow for MacWindow {
             }
         }
         lock.renderer.update_drawable_size(drawable_size);
+        composition::scale_factor_changed(&mut lock, scale_factor, drawable_size);
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -2103,6 +2110,14 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+    }
+
+    fn draw_composed(&self, scene: gpui::ComposedScene<'_>) {
+        composition::report(composition::draw_composed(&self.0, scene));
+    }
+
+    fn create_native_surface(&self) -> anyhow::Result<Rc<dyn gpui::PlatformSurfaceAttachment>> {
+        composition::create_native_surface(&self.0)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -2800,9 +2815,18 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 }
 
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
+    dispatch_view_event(this, native_event);
+}
+
+/// Runs `native_event` through the window's input callback, which tells whether GPUI handled it.
+/// `None` when there was nothing to dispatch to, or the event had already been shown to GPUI.
+fn dispatch_view_event(this: &Object, native_event: id) -> Option<gpui::DispatchEventResult> {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
+    if lock.composition.is_pre_dispatched(native_event) {
+        return None;
+    }
     let window_height = lock.content_size().height;
     let native_event_type = unsafe { native_event.eventType() };
     match native_event_type {
@@ -2961,7 +2985,7 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                     && prev_modifiers == modifiers
                     && prev_capslock == capslock
                 {
-                    return;
+                    return None;
                 }
 
                 lock.previous_modifiers_changed_event = Some(event.clone());
@@ -2972,10 +2996,12 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 
         if let Some(mut callback) = lock.event_callback.take() {
             drop(lock);
-            callback(event);
+            let result = callback(event);
             window_state.lock().event_callback = Some(callback);
+            return Some(result);
         }
     }
+    None
 }
 
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
@@ -3065,6 +3091,7 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     }
 
     lock.renderer.update_drawable_size(drawable_size);
+    composition::scale_factor_changed(&mut lock, scale_factor, drawable_size);
 
     if let Some(mut callback) = lock.resize_callback.take() {
         let content_size = lock.content_size();
@@ -3137,14 +3164,14 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
-                lock.renderer.set_presents_with_transaction(true);
+                composition::set_presents_with_transaction(&mut lock, true);
                 let was_running = lock.stop_display_link();
                 drop(lock);
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
-                lock.renderer.set_presents_with_transaction(false);
+                composition::set_presents_with_transaction(&mut lock, false);
                 lock.restart_display_link(was_running);
             }
         } else {
@@ -3187,6 +3214,7 @@ extern "C" fn close_window(this: &Object, _: Sel) {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
             lock.closed.store(true, Ordering::Release);
+            composition::window_closed(&mut lock);
             lock.release_cursor();
             (
                 lock.close_callback.take(),
@@ -3245,6 +3273,7 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     let scale_factor = lock.scale_factor();
     let drawable_size = new_size.to_device_pixels(scale_factor);
     lock.renderer.update_drawable_size(drawable_size);
+    composition::drawable_size_changed(&mut lock, drawable_size);
 
     if let Some(mut callback) = lock.resize_callback.take() {
         let content_size = lock.content_size();
@@ -3259,14 +3288,14 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.renderer.set_presents_with_transaction(true);
+        composition::set_presents_with_transaction(&mut lock, true);
         let was_running = lock.stop_display_link();
         drop(lock);
         callback(Default::default());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
-        lock.renderer.set_presents_with_transaction(false);
+        composition::set_presents_with_transaction(&mut lock, false);
         lock.restart_display_link(was_running);
     }
 }
