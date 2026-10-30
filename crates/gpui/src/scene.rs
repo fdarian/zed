@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Anchor, AtlasTextureId, AtlasTile, Background, BackgroundTile, Bounds, ContentMask, CornerRadii, Corners, Edges,
     GroupEffect, Hsla, MAX_GROUP_EXTENT, Pixels, Point, Radians, RenderGlyphParams, ResolvedFilter, ScaledPixels, Size,
-    bounds_tree::BoundsTree, filter_margin, point, visual_bounds,
+    bounds_tree::BoundsTree, composition::{NativeSurfacePlaceholder, OrderRange}, filter_margin, point, visual_bounds,
 };
 use std::{
     fmt::Debug,
@@ -56,6 +56,11 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
     /// Offscreen effect groups, each a scene of its own composited into this one.
     pub groups: Vec<EffectGroup>,
+    /// What the visible native surfaces painted, by order. See [`NativeSurfacePlaceholder`].
+    pub native_surfaces: Vec<NativeSurfacePlaceholder>,
+    /// Placeholders painted inside an effect group, which take their order once the outermost
+    /// group is in the scene.
+    pending_native_surfaces: Vec<NativeSurfacePlaceholder>,
     effect_groups_enabled: bool,
     /// A scene nested in a group has no paint operations of its own: the root records them all.
     is_sub_scene: bool,
@@ -156,6 +161,8 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.groups.clear();
+        self.native_surfaces.clear();
+        self.pending_native_surfaces.clear();
         self.group_stack.clear();
         self.flat_opacities.clear();
         self.text_clips.clear();
@@ -448,6 +455,52 @@ impl Scene {
         }
     }
 
+    /// Records what an element painted for a native surface. The surface is drawn by the platform,
+    /// so nothing is routed to a typed vector: the placeholder gets an order like a primitive,
+    /// which tells what is below and above it.
+    pub(crate) fn insert_native_surface(&mut self, placeholder: NativeSurfacePlaceholder) {
+        if self.hidden {
+            return;
+        }
+        self.record(PaintOperation::NativeSurface(placeholder.clone()));
+        if placeholder.is_clipped_away() {
+            return;
+        }
+        let mut placeholder = placeholder;
+        if self.effect_groups_enabled {
+            let mut opacity = 1.;
+            for group in &self.group_stack {
+                if group.effect.opacity <= 0. {
+                    return;
+                }
+                if group.effect.is_opacity_only() {
+                    opacity *= group.effect.opacity;
+                }
+            }
+            placeholder.opacity *= opacity;
+            if !self.group_stack.is_empty() {
+                self.pending_native_surfaces.push(placeholder);
+                return;
+            }
+        } else {
+            let opacity: f32 = self.flat_opacities.iter().product();
+            if opacity <= 0. {
+                return;
+            }
+            placeholder.opacity *= opacity;
+        }
+        self.place_native_surface(placeholder);
+    }
+
+    fn place_native_surface(&mut self, mut placeholder: NativeSurfacePlaceholder) {
+        placeholder.order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.insert_bounds(placeholder.visible_bounds()));
+        self.native_surfaces.push(placeholder);
+    }
+
     /// Stores the primitive in this scene with an order, without recording or routing it.
     fn insert_primitive_local(&mut self, mut primitive: Primitive) {
         let clipped_bounds = primitive
@@ -680,6 +733,16 @@ impl Scene {
     }
 
     pub fn end_group(&mut self) {
+        self.close_group();
+        if self.group_stack.is_empty() {
+            // After the group, so that a surface that overlaps what the group painted is above it.
+            for placeholder in mem::take(&mut self.pending_native_surfaces) {
+                self.place_native_surface(placeholder);
+            }
+        }
+    }
+
+    fn close_group(&mut self) {
         self.record(PaintOperation::EndGroup);
         if !self.effect_groups_enabled {
             self.flat_opacities.pop();
@@ -926,6 +989,16 @@ impl Scene {
                 }
                 PaintOperation::Primitive(Primitive::Surface(surface)) => write!(out, "{surface:?}"),
                 PaintOperation::PendingGlyph(glyph) => write!(out, "{glyph:?}"),
+                // Not the hitbox: a build of the same subtree inserts the hitbox again, with a new id.
+                PaintOperation::NativeSurface(placeholder) => write!(
+                    out,
+                    "native surface {:?} {:?} {:?} {} {:?}",
+                    placeholder.surface,
+                    placeholder.bounds,
+                    placeholder.content_mask,
+                    placeholder.opacity,
+                    placeholder.corner_radius,
+                ),
                 PaintOperation::StartLayer(bounds) => write!(out, "layer {bounds:?}"),
                 PaintOperation::EndLayer => write!(out, "end layer"),
                 PaintOperation::StartGroup { content_mask, reserved, .. } => {
@@ -1007,6 +1080,7 @@ impl Scene {
                 PaintOperation::Quad(quad) => self.insert_quad(*quad),
                 PaintOperation::Image(sprite) => self.insert_image(*sprite),
                 PaintOperation::PendingGlyph(glyph) => self.insert_pending_glyph(glyph.clone()),
+                PaintOperation::NativeSurface(placeholder) => self.insert_native_surface(placeholder.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::StartGroup {
@@ -1083,6 +1157,14 @@ impl Scene {
                     }
                     self.insert_pending_glyph(glyph);
                 }
+                PaintOperation::NativeSurface(placeholder) => {
+                    let mut placeholder = placeholder.clone();
+                    placeholder.translate(delta);
+                    if clipped {
+                        clip_mask(&mut placeholder.content_mask, &clip.snapped);
+                    }
+                    self.insert_native_surface(placeholder);
+                }
                 PaintOperation::StartLayer(bounds) => {
                     let mut bounds = *bounds;
                     translate_bounds(&mut bounds, delta);
@@ -1151,6 +1233,7 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.groups.sort_by_key(|group| group.order);
+        self.native_surfaces.sort_by_key(|placeholder| placeholder.order);
     }
 
     #[cfg_attr(
@@ -1161,26 +1244,64 @@ impl Scene {
         allow(dead_code)
     )]
     pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
-        BatchIterator {
-            shadows_start: 0,
-            shadows_iter: self.shadows.iter().peekable(),
-            quads_start: 0,
-            quads_iter: self.quads.iter().peekable(),
-            paths_start: 0,
-            paths_iter: self.paths.iter().peekable(),
-            underlines_start: 0,
-            underlines_iter: self.underlines.iter().peekable(),
-            monochrome_sprites_start: 0,
-            monochrome_sprites_iter: self.monochrome_sprites.iter().peekable(),
-            subpixel_sprites_start: 0,
-            subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
-            polychrome_sprites_start: 0,
-            polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
-            surfaces_start: 0,
-            surfaces_iter: self.surfaces.iter().peekable(),
-            groups_start: 0,
-            groups_iter: self.groups.iter().peekable(),
+        self.batches_in(OrderRange::ALL)
+    }
+
+    /// [`Scene::batches`] of the primitives and groups whose order is in `orders`. The ranges of
+    /// the batches index the scene's vectors, not a slice of them, so a renderer draws them as it
+    /// would those of `batches`.
+    pub fn batches_in(&self, orders: OrderRange) -> impl Iterator<Item = PrimitiveBatch> + '_ {
+        fn within<T>(items: &[T], orders: OrderRange, order: impl Fn(&T) -> DrawOrder) -> (usize, &[T]) {
+            let start = items.partition_point(|item| order(item) <= orders.after);
+            let end = start + items[start..].partition_point(|item| order(item) <= orders.through);
+            (start, &items[start..end])
         }
+        let (shadows_start, shadows) = within(&self.shadows, orders, |item| item.order);
+        let (quads_start, quads) = within(&self.quads, orders, |item| item.order);
+        let (paths_start, paths) = within(&self.paths, orders, |item| item.order);
+        let (underlines_start, underlines) = within(&self.underlines, orders, |item| item.order);
+        let (monochrome_sprites_start, monochrome_sprites) =
+            within(&self.monochrome_sprites, orders, |item| item.order);
+        let (subpixel_sprites_start, subpixel_sprites) =
+            within(&self.subpixel_sprites, orders, |item| item.order);
+        let (polychrome_sprites_start, polychrome_sprites) =
+            within(&self.polychrome_sprites, orders, |item| item.order);
+        let (surfaces_start, surfaces) = within(&self.surfaces, orders, |item| item.order);
+        let (groups_start, groups) = within(&self.groups, orders, |item| item.order);
+        BatchIterator {
+            shadows_start,
+            shadows_iter: shadows.iter().peekable(),
+            quads_start,
+            quads_iter: quads.iter().peekable(),
+            paths_start,
+            paths_iter: paths.iter().peekable(),
+            underlines_start,
+            underlines_iter: underlines.iter().peekable(),
+            monochrome_sprites_start,
+            monochrome_sprites_iter: monochrome_sprites.iter().peekable(),
+            subpixel_sprites_start,
+            subpixel_sprites_iter: subpixel_sprites.iter().peekable(),
+            polychrome_sprites_start,
+            polychrome_sprites_iter: polychrome_sprites.iter().peekable(),
+            surfaces_start,
+            surfaces_iter: surfaces.iter().peekable(),
+            groups_start,
+            groups_iter: groups.iter().peekable(),
+        }
+    }
+
+    /// How many primitives and groups have an order in `orders`.
+    pub fn len_in(&self, orders: OrderRange) -> usize {
+        self.batches_in(orders)
+            .map(|batch| match batch {
+                PrimitiveBatch::Shadows(range) | PrimitiveBatch::Quads(range) | PrimitiveBatch::Paths(range)
+                | PrimitiveBatch::Underlines(range) | PrimitiveBatch::Surfaces(range)
+                | PrimitiveBatch::EffectGroups(range) => range.len(),
+                PrimitiveBatch::MonochromeSprites { range, .. }
+                | PrimitiveBatch::SubpixelSprites { range, .. }
+                | PrimitiveBatch::PolychromeSprites { range, .. } => range.len(),
+            })
+            .sum()
     }
 }
 
@@ -1215,6 +1336,8 @@ pub(crate) enum PaintOperation {
     /// A glyph of a patchable root that the content mask clips away: it holds what the sprite
     /// would, without the atlas tile, which painting it would have rasterized.
     PendingGlyph(PendingGlyph),
+    /// What a native surface painted: see [`Scene::insert_native_surface`].
+    NativeSurface(NativeSurfacePlaceholder),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
     StartGroup {
@@ -1247,6 +1370,7 @@ impl PaintOperation {
             PaintOperation::Quad(quad) => quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty(),
             PaintOperation::Image(sprite) => sprite.window_bounds().intersect(&sprite.content_mask.bounds).is_empty(),
             PaintOperation::PendingGlyph(glyph) => glyph.is_clipped_away(),
+            PaintOperation::NativeSurface(placeholder) => placeholder.is_clipped_away(),
             _ => false,
         }
     }

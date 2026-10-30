@@ -1115,6 +1115,11 @@ impl ExactClips {
 }
 
 impl Hitbox {
+    /// The hitbox this one was inserted inside of.
+    pub(crate) fn parent_id(&self) -> Option<HitboxId> {
+        self.parent
+    }
+
     /// The hitbox of a subtree that was recorded in a region and is put `delta` away from where it
     /// was recorded, inside `surroundings`: moved, and cut by the content mask around it, which
     /// the region stood in for when it was recorded.
@@ -2019,6 +2024,7 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    pub(crate) composition: crate::composition::WindowComposition,
     /// The state of the elements, by the id of the element and the type of the state. It outlives
     /// the frames: a state is dropped when a frame that is presented has neither accessed it nor
     /// kept it through the retained subtree it belongs to, see [`StateOwner`].
@@ -2795,6 +2801,7 @@ impl Window {
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            composition: Default::default(),
             element_states: FxHashMap::default(),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
@@ -4455,7 +4462,7 @@ impl Window {
     }
 
     #[inline]
-    fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+    pub(crate) fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
         let left = round_to_device_pixel_down(bounds.left().0, scale_factor);
         let top = round_to_device_pixel_down(bounds.top().0, scale_factor);
@@ -4553,7 +4560,7 @@ impl Window {
     }
 
     #[inline]
-    fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+    pub(crate) fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         self.snapped_mask(self.content_mask())
     }
 
@@ -5376,7 +5383,7 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
-        self.platform_window.draw(&self.rendered_frame.scene);
+        crate::composition::present(self);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -9576,7 +9583,8 @@ impl Window {
 
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
-        if self.is_window_hovered() {
+        // Over a native surface the cursor is the native view's.
+        if self.is_window_hovered() && !crate::composition::pointer_over_native_surface(self) {
             cx.platform.set_cursor_style(self.pointer_cursor_style());
         }
     }

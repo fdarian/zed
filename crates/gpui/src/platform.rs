@@ -44,6 +44,7 @@ use crate::{
     LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
     Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+    ComposedScene, PlatformSurfaceAttachment,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -85,7 +86,9 @@ pub use keystroke::*;
 pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+pub use test::{
+    CompositionFrame, NativeSurfaceEvent, RecordedLayer, TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use threaded_dispatcher::ThreadedDispatcher;
@@ -889,6 +892,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Draws a frame that has native surfaces (see [`NativeSurface`](crate::NativeSurface)): the GPUI layers each
+    /// draw the primitives of `scene` in their order range, the native layers are placed between
+    /// them, bottom to top. Every frame lists every layer: a layer missing from a frame no longer
+    /// exists, and an overlay layer's range can be empty, which draws it clear. The default draws
+    /// the whole scene and none of the surfaces, for a platform that cannot compose.
+    fn draw_composed(&self, scene: ComposedScene<'_>) {
+        self.draw(scene.scene());
+    }
+    /// Makes the container for a native surface, hidden until a frame places it. The platform
+    /// removes it when the returned attachment is dropped.
+    fn create_native_surface(&self) -> Result<Rc<dyn PlatformSurfaceAttachment>> {
+        anyhow::bail!("native surfaces are not supported on this platform")
+    }
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

@@ -1,5 +1,6 @@
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
+    AnyWindowHandle, AtlasKey, ComposedLayer, ComposedScene, CompositionSurfaceId, NativePlacement, OrderRange,
+    OverlayHitbox, PlatformSurfaceAttachment, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TileId, WindowAppearance,
@@ -11,7 +12,8 @@ use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
-    cell::Cell,
+    any::Any,
+    cell::{Cell, RefCell},
     path::PathBuf,
     rc::{Rc, Weak},
     sync::{self, Arc},
@@ -49,6 +51,92 @@ pub(crate) struct TestWindowState {
     pointer_locked: bool,
     last_mouse_movement: Point<Pixels>,
     scale_factor: f32,
+    plain_draws: usize,
+    composition_frames: Vec<CompositionFrame>,
+    native_surface_events: Rc<RefCell<Vec<NativeSurfaceEvent>>>,
+    next_native_surface: usize,
+}
+
+/// A layer of a frame the window drew composed, bottom to top.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecordedLayer {
+    /// A GPUI layer.
+    Gpui {
+        /// The surface of the layer.
+        surface: CompositionSurfaceId,
+        /// The orders of the scene it draws.
+        orders: OrderRange,
+        /// Whether it is the window's own layer.
+        is_base: bool,
+        /// The primitives and groups of the scene in `orders`.
+        primitives: usize,
+        /// What the layer claims of the pointer.
+        hitboxes: Vec<OverlayHitbox>,
+    },
+    /// A native layer.
+    Native {
+        /// The surface of the layer.
+        surface: CompositionSurfaceId,
+        /// What `platform_handle` of the surface answers: the index of its attachment, from 0.
+        attachment: usize,
+        /// Where it is, `None` when it is not visible.
+        placement: Option<NativePlacement>,
+        /// The position in the frame's layers, bottom to top.
+        z: usize,
+    },
+}
+
+impl RecordedLayer {
+    /// Whether the layer is a native one that shows.
+    pub fn is_visible_native(&self) -> bool {
+        matches!(self, RecordedLayer::Native { placement: Some(_), .. })
+    }
+}
+
+/// A frame drawn with `draw_composed`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositionFrame {
+    /// The layers, bottom to top.
+    pub layers: Vec<RecordedLayer>,
+}
+
+impl CompositionFrame {
+    /// The native layers, bottom to top.
+    pub fn natives(&self) -> impl Iterator<Item = &RecordedLayer> {
+        self.layers
+            .iter()
+            .filter(|layer| matches!(layer, RecordedLayer::Native { .. }))
+    }
+}
+
+/// What happened to the native surfaces of a test window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeSurfaceEvent {
+    /// The attachment with this index was made.
+    Created(usize),
+    /// The attachment with this index was dropped, which removes its view.
+    Removed(usize),
+}
+
+struct TestSurfaceAttachment {
+    index: usize,
+    events: Rc<RefCell<Vec<NativeSurfaceEvent>>>,
+}
+
+impl PlatformSurfaceAttachment for TestSurfaceAttachment {
+    fn platform_handle(&self) -> anyhow::Result<Box<dyn Any>> {
+        Ok(Box::new(self.index))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl Drop for TestSurfaceAttachment {
+    fn drop(&mut self) {
+        self.events.borrow_mut().push(NativeSurfaceEvent::Removed(self.index));
+    }
 }
 
 #[derive(Clone)]
@@ -117,8 +205,43 @@ impl TestWindow {
             start_external_drag_result: false,
             pointer_locked: false,
             last_mouse_movement: Point::default(),
+            plain_draws: 0,
+            composition_frames: Vec::new(),
+            native_surface_events: Rc::new(RefCell::new(Vec::new())),
+            next_native_surface: 0,
         })))
     }
+    /// How many frames were drawn with `draw`, which a window without native surfaces does.
+    pub fn plain_draw_count(&self) -> usize {
+        self.0.lock().plain_draws
+    }
+
+    /// The frames drawn with `draw_composed`, oldest first.
+    pub fn composition_frames(&self) -> Vec<CompositionFrame> {
+        self.0.lock().composition_frames.clone()
+    }
+
+    /// The last frame drawn with `draw_composed`.
+    pub fn composition_frame(&self) -> Option<CompositionFrame> {
+        self.0.lock().composition_frames.last().cloned()
+    }
+
+    /// The native surfaces made and removed, in order.
+    pub fn native_surface_events(&self) -> Vec<NativeSurfaceEvent> {
+        self.0.lock().native_surface_events.borrow().clone()
+    }
+
+    fn draw_scene(&self, scene: &Scene) {
+        let scale_factor = self.scale_factor();
+        let mut state = self.0.lock();
+        state.frame_callback_pending = true;
+        state.frame_scheduled = true;
+        let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
+        if let Some(renderer) = &mut state.renderer {
+            renderer.render_scene(scene, device_size).warn_on_err();
+        }
+    }
+
     pub fn simulate_scheduled_frame(&self) -> bool {
         let callback = {
             let mut state = self.0.lock();
@@ -442,14 +565,49 @@ impl PlatformWindow for TestWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        let scale_factor = self.scale_factor();
+        self.0.lock().plain_draws += 1;
+        self.draw_scene(scene);
+    }
+
+    fn draw_composed(&self, composed: ComposedScene<'_>) {
+        let layers = composed
+            .layers()
+            .iter()
+            .enumerate()
+            .map(|(z, layer)| match layer {
+                ComposedLayer::Gpui(layer) => RecordedLayer::Gpui {
+                    surface: layer.surface,
+                    orders: layer.orders,
+                    is_base: layer.is_base,
+                    primitives: composed.scene().len_in(layer.orders),
+                    hitboxes: layer.hitboxes.clone(),
+                },
+                ComposedLayer::Native(layer) => RecordedLayer::Native {
+                    surface: layer.surface,
+                    attachment: *layer
+                        .attachment
+                        .platform_handle()
+                        .expect("a test attachment has a handle")
+                        .downcast::<usize>()
+                        .expect("a test attachment's handle is its index"),
+                    placement: layer.placement,
+                    z,
+                },
+            })
+            .collect();
+        self.0.lock().composition_frames.push(CompositionFrame { layers });
+        self.draw_scene(composed.scene());
+    }
+
+    fn create_native_surface(&self) -> anyhow::Result<Rc<dyn PlatformSurfaceAttachment>> {
         let mut state = self.0.lock();
-        state.frame_callback_pending = true;
-        state.frame_scheduled = true;
-        let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
-        if let Some(renderer) = &mut state.renderer {
-            renderer.render_scene(scene, device_size).warn_on_err();
-        }
+        let index = state.next_native_surface;
+        state.next_native_surface += 1;
+        state.native_surface_events.borrow_mut().push(NativeSurfaceEvent::Created(index));
+        Ok(Rc::new(TestSurfaceAttachment {
+            index,
+            events: state.native_surface_events.clone(),
+        }))
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
