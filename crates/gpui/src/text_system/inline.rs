@@ -93,6 +93,18 @@ pub enum InlineContent {
     /// An atomic inline, such as an `inline-block`: one character of the text, which
     /// must be U+FFFC, whose advance and extent are those given.
     Atomic(AtomicExtent),
+    /// An inline box that holds nothing but takes space along the line (an empty `<span>` with
+    /// inline margin, border or padding, whose [`TextInset`](crate::TextInset) is on the range). It
+    /// is one U+FFFC of the text with no advance and no ink, so that the insets and the box's
+    /// fragment have a glyph to sit at, and it is not a place to break: a line breaks where it
+    /// would without it. The box has its strut, so the line it is on is as tall as the strut of the
+    /// text around it and of the box, whatever else is on it.
+    Empty {
+        /// The font of the box.
+        font: Font,
+        /// The font size of the box.
+        font_size: Pixels,
+    },
 }
 
 /// An inline box of a text, in a list next to the text like its insets: a box that
@@ -190,6 +202,10 @@ pub struct InlineRun {
     /// Whether the run is an atomic inline: one glyph that is never painted, with the
     /// ascent and descent of the box.
     pub object: bool,
+    /// For the placeholder of an empty inline box ([`InlineContent::Empty`]), which is an
+    /// `object` that a line may break around as if it were not there: the ascent and descent of
+    /// the content area of the box's font.
+    pub empty: Option<(Pixels, Pixels)>,
     /// For an atomic inline: the struts of the boxes around it that sit on the baseline of
     /// its row (raised or lowered with their vertical alignment), which are in the row
     /// whatever is in them, since every inline box has its strut.
@@ -242,12 +258,20 @@ pub(crate) struct InlineSpec {
 pub(crate) enum SpecContent {
     Text { font_id: FontId, font_size: Pixels },
     Atomic(AtomicExtent),
+    Empty { font_id: FontId, font_size: Pixels },
 }
 
 impl InlineSpec {
+    /// The extent of the box when it takes the place of a U+FFFC: an atomic inline, or the
+    /// placeholder of an empty box, which has none.
     pub(crate) fn atomic(&self) -> Option<AtomicExtent> {
         match self.content {
             SpecContent::Atomic(extent) => Some(extent),
+            SpecContent::Empty { .. } => Some(AtomicExtent {
+                advance: px(0.),
+                ascent: px(0.),
+                descent: px(0.),
+            }),
             SpecContent::Text { .. } => None,
         }
     }
@@ -279,6 +303,7 @@ pub(crate) struct ResolvedBox {
     pub above: Pixels,
     pub below: Pixels,
     pub ascent: Pixels,
+    pub descent: Pixels,
 }
 
 /// Where each box of `specs` sits on its line, as the baseline shift that CSS 2.1
@@ -298,7 +323,7 @@ pub(crate) fn resolve_placements(
         placement: RunPlacement::Baseline,
     };
     let mut frames: Vec<Frame> = Vec::with_capacity(specs.len());
-    let mut extents: Vec<(Pixels, Pixels, Pixels)> = Vec::with_capacity(specs.len());
+    let mut extents: Vec<(Pixels, Pixels, Pixels, Pixels)> = Vec::with_capacity(specs.len());
     for (ix, spec) in specs.iter().enumerate() {
         let parent = spec
             .parent
@@ -307,7 +332,7 @@ pub(crate) fn resolve_placements(
         let parent_frame = parent.unwrap_or(&root);
 
         let (font_size, ascent, descent, x_height) = match spec.content {
-            SpecContent::Text { font_id, font_size } => {
+            SpecContent::Text { font_id, font_size } | SpecContent::Empty { font_id, font_size } => {
                 let metrics = font_metrics(font_id);
                 let line_box = metrics.line_box(font_size, line.scale_factor);
                 (
@@ -322,7 +347,7 @@ pub(crate) fn resolve_placements(
         let own_line_height = spec.line_height.unwrap_or(line_height);
         // The extent of the inline box around the baseline of the box itself.
         let (above, below) = match spec.content {
-            SpecContent::Text { .. } => {
+            SpecContent::Text { .. } | SpecContent::Empty { .. } => {
                 extent_in_line(ascent, descent, own_line_height, line.scale_factor)
             }
             SpecContent::Atomic(extent) => (extent.ascent, extent.descent),
@@ -359,7 +384,7 @@ pub(crate) fn resolve_placements(
             }
         };
 
-        extents.push((above, below, ascent));
+        extents.push((above, below, ascent, descent));
         frames.push(Frame {
             font_size,
             ascent,
@@ -371,11 +396,12 @@ pub(crate) fn resolve_placements(
     frames
         .into_iter()
         .zip(extents)
-        .map(|(frame, (above, below, ascent))| ResolvedBox {
+        .map(|(frame, (above, below, ascent, descent))| ResolvedBox {
             placement: frame.placement,
             above,
             below,
             ascent,
+            descent,
         })
         .collect()
 }
@@ -389,10 +415,14 @@ fn struts_around(
     atomic: usize,
 ) -> (Option<InlineStrut>, Option<InlineStrut>) {
     let (mut on_baseline, mut aligned) = (None, None);
-    let mut ancestor = specs[atomic].parent;
+    // An empty box is its own strut, and its own placeholder.
+    let mut ancestor = match specs[atomic].content {
+        SpecContent::Empty { .. } => Some(atomic),
+        SpecContent::Text { .. } | SpecContent::Atomic(_) => specs[atomic].parent,
+    };
     while let Some(ix) = ancestor {
         let Some(spec) = specs.get(ix) else { break };
-        if matches!(spec.content, SpecContent::Text { .. }) {
+        if matches!(spec.content, SpecContent::Text { .. } | SpecContent::Empty { .. }) {
             let resolved = boxes[ix];
             match resolved.placement {
                 RunPlacement::Baseline => {
@@ -490,9 +520,12 @@ pub(crate) fn apply_inline(
                         } else {
                             (None, None)
                         };
+                        let empty = matches!(specs[ix].content, SpecContent::Empty { .. })
+                            .then(|| (boxes[ix].ascent, boxes[ix].descent));
                         InlineRun {
                             placement: boxes[ix].placement,
                             object,
+                            empty,
                             strut,
                             aligned_strut,
                             wrap: Some(wrap),

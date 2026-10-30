@@ -25,7 +25,7 @@ pub(super) use self::snap::SnapMarks;
 use self::snap::glyph_positions;
 use super::line_break::LineBreaks;
 use super::{
-    InlineRun, InlineSpec, PlacedBox, RunWrap, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
+    InlineRun, InlineSpec, PlacedBox, RunWrap, SpecContent, extent_in_line, LineMetrics, LineWrapper, RunPlacement, TextWrapStyle,
     apply_inline,
     resolve_placements,
 };
@@ -307,19 +307,22 @@ impl ShapedRun {
     ) -> Option<(Pixels, Pixels)> {
         let mut first: Option<&ShapedRun> = None;
         let mut own: Option<(Pixels, Pixels)> = None;
+        let extent = |run: &ShapedRun| run.inline.empty.unwrap_or((run.ascent, run.descent));
         for run in runs {
             first.get_or_insert(run);
+            let (ascent, descent) = extent(run);
             if (run.font_size - font_size).abs() < px(1e-3) {
                 own = Some(match own {
-                    Some(own) => (own.0.max(run.ascent), own.1.max(run.descent)),
-                    None => (run.ascent, run.descent),
+                    Some(own) => (own.0.max(ascent), own.1.max(descent)),
+                    None => (ascent, descent),
                 });
             }
         }
         own.or_else(|| {
             first.map(|run| {
                 let scale = font_size / run.font_size;
-                (run.ascent * scale, run.descent * scale)
+                let (ascent, descent) = extent(run);
+                (ascent * scale, descent * scale)
             })
         })
     }
@@ -771,7 +774,13 @@ impl LineLayout {
         marks: &SnapMarks,
     ) -> WrapComputation {
         let hang = options.spaces_hang();
-        let line_breaks = LineBreaks::new(text, options.word_break);
+        let placeholders: Vec<usize> = self
+            .runs
+            .iter()
+            .filter(|run| run.inline.empty.is_some())
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+            .collect();
+        let line_breaks = LineBreaks::new_skipping(text, options.word_break, &placeholders);
         let fit = wrap_width
             .map(|wrap_width| crate::util::fit_layout_units(wrap_width, self.scale_factor));
         let breaks_words = options.overflow_wrap != OverflowWrap::Normal;
@@ -1247,7 +1256,8 @@ struct WrapGlyph {
     /// The character at the glyph's index, as the wrapping rules see it.
     wrap_char: char,
     is_tab: bool,
-    /// The placeholder of an atomic inline, which a line may break on either side of.
+    /// The placeholder of an atomic inline, which a line may break on either side of. Not that
+    /// of an empty inline box, which is no place to break and is skipped by the breaking rules.
     is_object: bool,
     hangs: bool,
     font_id: FontId,
@@ -1410,7 +1420,7 @@ impl<'a> GlyphPositions<'a> {
                             character
                         },
                         is_tab: character == '\t',
-                        is_object: run.inline.object,
+                        is_object: run.inline.object && run.inline.empty.is_none(),
                         hangs: hangs(character),
                         font_id: run.font_id,
                         shaped_x: glyph.position.x,
@@ -1757,10 +1767,12 @@ impl WrappedLineLayout {
     }
 
     /// The runs of text that have a glyph in `bytes`. The placeholder of an atomic inline
-    /// is not one: it is not part of the content area of the inline box around it.
+    /// is not one: it is not part of the content area of the inline box around it. The
+    /// placeholder of an empty inline box is, with the content area of the box.
     pub fn runs_in(&self, bytes: Range<usize>) -> impl Iterator<Item = &ShapedRun> {
         self.unwrapped_layout.runs.iter().filter(move |run| {
-            !run.inline.object && run.glyphs.iter().any(|glyph| bytes.contains(&glyph.index))
+            (!run.inline.object || run.inline.empty.is_some())
+                && run.glyphs.iter().any(|glyph| bytes.contains(&glyph.index))
         })
     }
 
@@ -2623,9 +2635,10 @@ impl LineLayoutCache {
             let atomic = inline.iter().find_map(|spec| {
                 spec.atomic()
                     .filter(|_| spec.range == (position..end))
+                    .map(|extent| (spec, extent))
             });
             match atomic {
-                Some(extent) => {
+                Some((spec, extent)) => {
                     shape_segment(
                         &mut segment,
                         segment_start,
@@ -2635,7 +2648,12 @@ impl LineLayoutCache {
                         &mut ascent,
                         &mut descent,
                     );
-                    let run_size = run.font_size.unwrap_or(font_size);
+                    let run_size = match spec.content {
+                        SpecContent::Empty { font_size, .. } => font_size,
+                        SpecContent::Text { .. } | SpecContent::Atomic(_) => {
+                            run.font_size.unwrap_or(font_size)
+                        }
+                    };
                     let strut = self
                         .platform_text_system
                         .font_metrics(strut_font.unwrap_or(run.font_id))
@@ -5443,6 +5461,92 @@ mod tests {
         )
     }
 
+    /// `text` as ten pixel wide characters, with the placeholder of an empty inline box (U+FFFC)
+    /// no wide at all, and a line from `wrap_width`: the byte each row after the first starts at.
+    fn empty_box_row_starts(text: &str, wrap_width: f32) -> Vec<usize> {
+        let object = crate::OBJECT_REPLACEMENT_CHARACTER;
+        let mut x = 0.;
+        let mut specs = Vec::new();
+        let glyphs = text
+            .char_indices()
+            .map(|(index, character)| {
+                let glyph = glyph_at(x, index);
+                if character == object {
+                    specs.push(InlineSpec {
+                        range: index..index + object.len_utf8(),
+                        parent: None,
+                        align: crate::VerticalAlign::Baseline,
+                        line_height: None,
+                        wraps: None,
+                        key: None,
+                        content: SpecContent::Empty {
+                            font_id: FontId(0),
+                            font_size: px(16.),
+                        },
+                    });
+                } else {
+                    x += 10.;
+                }
+                glyph
+            })
+            .collect();
+        let shaped = LineLayout {
+            width: px(x),
+            len: text.len(),
+            ..make_layout(glyphs)
+        };
+        let boxes: Vec<_> = specs
+            .iter()
+            .map(|_| crate::text_system::ResolvedBox {
+                placement: RunPlacement::Baseline,
+                above: px(12.),
+                below: px(4.),
+                ascent: px(12.),
+                descent: px(4.),
+            })
+            .collect();
+        let shaped = apply_inline(&shaped, &specs, &boxes, true);
+        let options = TextLayoutOptions {
+            overflow_wrap: OverflowWrap::Normal,
+            ..Default::default()
+        };
+        let computation = shaped.compute_wrap_boundaries(
+            text,
+            Some(px(wrap_width)),
+            None,
+            options,
+            None,
+            &[],
+            &SnapMarks::default(),
+        );
+        boundary_indices(&WrappedLineLayout::new(
+            Arc::new(shaped),
+            Some(px(wrap_width)),
+            computation,
+            &SnapMarks::default(),
+        ))
+    }
+
+    #[test]
+    fn test_a_line_breaks_around_an_empty_box_where_it_would_without_it() {
+        let object = crate::OBJECT_REPLACEMENT_CHARACTER;
+        // No place to break between two letters, whatever sits between them: one row.
+        assert_eq!(
+            empty_box_row_starts(&format!("aaaa{object}bbbb"), 45.),
+            Vec::<usize>::new()
+        );
+        // A line that breaks at the space starts with the box that follows it, as Blink's
+        // open tag after the break is on the next line, and a box before the space stays.
+        // "aaaa " is 50 wide, so with 45 the line breaks after the space and "bbbb" starts the row.
+        assert_eq!(empty_box_row_starts(&format!("aaaa {object}bbbb"), 45.), vec![5]);
+        assert_eq!(empty_box_row_starts(&format!("aaaa{object} bbbb"), 45.), vec![8]);
+        // Two boxes in a row move together.
+        assert_eq!(
+            empty_box_row_starts(&format!("aaaa {object}{object}bbbb"), 45.),
+            vec![5]
+        );
+    }
+
     #[test]
     fn test_a_line_breaks_before_and_after_an_atomic_inline() {
         let normal = TextLayoutOptions {
@@ -5585,6 +5689,7 @@ mod tests {
                 above: px(0.),
                 below: px(0.),
                 ascent: px(0.),
+                descent: px(0.),
             })
             .collect();
         let options = TextLayoutOptions {

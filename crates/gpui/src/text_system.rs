@@ -897,6 +897,17 @@ impl WindowTextSystem {
                     );
                     SpecContent::Atomic(*extent)
                 }
+                InlineContent::Empty { font, font_size } => {
+                    debug_assert_eq!(
+                        end - start,
+                        OBJECT_REPLACEMENT_CHARACTER.len_utf8(),
+                        "an empty box takes the place of one U+FFFC"
+                    );
+                    SpecContent::Empty {
+                        font_id: self.resolve_font(font),
+                        font_size: *font_size,
+                    }
+                }
             };
             spec_ix.push(Some(specs.len()));
             specs.push(InlineSpec {

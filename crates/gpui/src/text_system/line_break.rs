@@ -75,6 +75,33 @@ impl LineBreaks {
         Self { offsets }
     }
 
+    /// The places `text` may break as if the characters at the byte indices `skipped`, which are
+    /// U+FFFC placeholders of empty inline boxes, were not there. A line that breaks where they
+    /// would sit starts at the first of them: a box between two characters belongs with the
+    /// character after it.
+    pub(super) fn new_skipping(text: &str, word_break: WordBreak, skipped: &[usize]) -> Self {
+        if skipped.is_empty() {
+            return Self::new(text, word_break);
+        }
+        let width = crate::OBJECT_REPLACEMENT_CHARACTER.len_utf8();
+        let mut without = String::with_capacity(text.len());
+        let mut at = 0;
+        // Where in `without` each skipped character was.
+        let mut gaps = Vec::with_capacity(skipped.len());
+        for index in skipped {
+            without.push_str(&text[at..*index]);
+            gaps.push(without.len());
+            at = index + width;
+        }
+        without.push_str(&text[at..]);
+        let offsets = Self::new(&without, word_break)
+            .offsets
+            .into_iter()
+            .map(|offset| offset + width * gaps.partition_point(|gap| *gap < offset))
+            .collect();
+        Self { offsets }
+    }
+
     /// Whether a line may start at the character at `offset`.
     pub(super) fn contains(&self, offset: usize) -> bool {
         self.offsets.binary_search(&offset).is_ok()
