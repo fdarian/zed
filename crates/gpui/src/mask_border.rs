@@ -247,7 +247,6 @@ impl MaskBorder {
             composite: MaskComposite::Add,
         };
         let area = self.area(border_box, border_widths);
-        let visible = window.content_mask().bounds;
         match &self.source {
             BackgroundImage::Image(key) => {
                 let Some(image) = BackgroundImages::get(cx, *key) else {
@@ -256,7 +255,7 @@ impl MaskBorder {
                 let image_size = image.render_size(0);
                 for piece in self.pieces(area, border_widths, image_size) {
                     let clip = window.snapped_mask(ContentMask::rounded(piece.area, CornerRadii::default()));
-                    for tile in piece.tiles.iter().filter(|tile| tile.intersects(&visible)) {
+                    for tile in piece.tiles.iter().filter(|tile| window.reaches_content_mask(tile.intersect(&piece.area))) {
                         let placed = placed_image(piece.source, *tile, image_size);
                         let sprite = window
                             .image_sprite(
@@ -283,7 +282,7 @@ impl MaskBorder {
                     };
                     let placed_size = placed_image(piece.source, *first, area.size).size;
                     let chunks = gradient.resolve(placed_size);
-                    for tile in piece.tiles.iter().filter(|tile| tile.intersects(&visible)) {
+                    for tile in piece.tiles.iter().filter(|tile| window.reaches_content_mask(tile.intersect(&piece.area))) {
                         let placed = placed_image(piece.source, *tile, area.size);
                         let background_tile = BackgroundTile {
                             origin_x: placed.origin.x.0,
@@ -401,6 +400,7 @@ mod tests {
     use crate::{
         AppContext as _, BackgroundImages, ColorSpace, Gradient, GradientItem, GradientShape,
         GradientStop, ImageKey, LinearDirection, ParentElement, RenderImage, Styled,
+        style::style_transform_tests,
     };
     use std::sync::Arc;
 
@@ -729,6 +729,91 @@ mod tests {
         for sprite in sprites {
             assert_eq!(sprite.opacity, 1.);
             assert_eq!(sprite.corner_radii, Default::default());
+        }
+    }
+
+    /// The tiles of every piece of `border` in a box of [`style_transform_tests::BOX`] laid out at
+    /// `left`, with the number of quads each one draws.
+    fn laid_out_tiles(border: &MaskBorder, left: f32, image: Size<Pixels>) -> Vec<(Bounds<Pixels>, usize)> {
+        let (width, height) = style_transform_tests::BOX;
+        let widths = Edges::all(px(2.));
+        let area = border.area(style_transform_tests::rect(left, 0., width, height), widths);
+        let mut tiles = Vec::new();
+        for piece in border.pieces(area, widths, image) {
+            let Some(first) = piece.tiles.first() else {
+                continue;
+            };
+            let chunks = match &border.source {
+                BackgroundImage::Gradient(gradient) => {
+                    gradient.resolve(placed_image(piece.source, *first, area.size).size).len()
+                }
+                BackgroundImage::Image(_) => 1,
+            };
+            tiles.extend(piece.tiles.into_iter().map(|tile| (tile.intersect(&piece.area), chunks)));
+        }
+        tiles
+    }
+
+    fn transformed_border(source: BackgroundImage) -> MaskBorder {
+        let mut border = border(1., 10.);
+        border.source = source;
+        border.repeat_x = BorderImageRepeat::Repeat;
+        border.repeat_y = BorderImageRepeat::Repeat;
+        border
+    }
+
+    #[crate::test]
+    fn the_image_pieces_of_a_mask_border_are_the_ones_the_transform_puts_in_the_window(
+        cx: &mut crate::TestAppContext,
+    ) {
+        for (index, case) in style_transform_tests::cases().iter().enumerate() {
+            let border = transformed_border(BackgroundImage::Image(style_transform_tests::KEY));
+            let expected = laid_out_tiles(&border, case.left, size(px(4.), px(4.)))
+                .into_iter()
+                .filter(|(tile, _)| case.reaches_window(*tile))
+                .count();
+            let window = style_transform_tests::draw(
+                cx,
+                style_transform_tests::Tiled {
+                    case: index,
+                    background: Vec::new(),
+                    mask: Vec::new(),
+                    border: Some(border),
+                },
+            );
+            let effects = cx.update_window(window, |_, window, _| window.painted_group_effects()).unwrap();
+            assert!(expected > 0, "{}: the case shows nothing", case.name);
+            assert_eq!(effects.len(), 1, "{}", case.name);
+            let layers = effects[0].mask.as_ref().expect("a mask");
+            assert_eq!(layers[0].sprites.len(), expected, "{}", case.name);
+        }
+    }
+
+    #[crate::test]
+    fn the_gradient_pieces_of_a_mask_border_are_the_ones_the_transform_puts_in_the_window(
+        cx: &mut crate::TestAppContext,
+    ) {
+        for (index, case) in style_transform_tests::cases().iter().enumerate() {
+            let border = transformed_border(gradient_source());
+            let expected: usize = laid_out_tiles(&border, case.left, size(px(600.), px(50.)))
+                .into_iter()
+                .filter(|(tile, _)| case.reaches_window(*tile))
+                .map(|(_, chunks)| chunks)
+                .sum();
+            let window = style_transform_tests::draw(
+                cx,
+                style_transform_tests::Tiled {
+                    case: index,
+                    background: Vec::new(),
+                    mask: Vec::new(),
+                    border: Some(border),
+                },
+            );
+            let effects = cx.update_window(window, |_, window, _| window.painted_group_effects()).unwrap();
+            assert!(expected > 0, "{}: the case shows nothing", case.name);
+            assert_eq!(effects.len(), 1, "{}", case.name);
+            let layers = effects[0].mask.as_ref().expect("a mask");
+            assert_eq!(layers[0].quads.len(), expected, "{}", case.name);
         }
     }
 }

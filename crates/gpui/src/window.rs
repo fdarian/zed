@@ -6492,7 +6492,7 @@ impl Window {
     /// around it. The content mask is in window space, so a box that a transform moved is
     /// tested where the window has it, and not where it was laid out: a glyph in a box moved
     /// by -80 inside an `overflow: hidden` is under a mask that moved with it.
-    pub(crate) fn reaches_content_mask(&self, bounds: Bounds<Pixels>) -> bool {
+    pub fn reaches_content_mask(&self, bounds: Bounds<Pixels>) -> bool {
         let Some(ambient) = self.transform_stack.last() else {
             return bounds.intersects(&self.content_mask().bounds);
         };
@@ -6507,6 +6507,15 @@ impl Window {
             (TransformKind::General, Some(clip)) => bounds.intersects(&clip.bounds),
             _ => true,
         }
+    }
+
+    /// The clip a general transform in effect keeps in its local space, as the window has it: the
+    /// bounding box of its corners. `None` outside a general transform, and when it has no clip
+    /// (a translation moves its masks into the window mask).
+    pub fn local_clip_in_window(&self) -> Option<Bounds<Pixels>> {
+        let ambient = self.transform_stack.last()?;
+        let clip = ambient.local_clip.as_ref()?;
+        Some(ambient.bounds_in_window(clip.bounds))
     }
 
     /// `bounds`, in the local space of what is being painted, as the window has them: moved by

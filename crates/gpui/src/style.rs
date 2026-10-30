@@ -1357,6 +1357,19 @@ impl Style {
         masked
     }
 
+    /// The part of the window that shows anything, as a box in the local space of what is being
+    /// painted, which a transform may have moved from where the content mask has it. `None` when
+    /// the transform flattens the plane. The box is a bound, not exact: tiles are still tested
+    /// with [`Window::reaches_content_mask`]. Under perspective it is unbounded, because the
+    /// bound of a projected box is not one box.
+    fn visible_in_local_space(window: &Window) -> Option<Bounds<Pixels>> {
+        if window.transform().is_affine() {
+            return window.window_bounds_in_local(window.content_mask().bounds);
+        }
+        let far = px(1e9);
+        Some(Bounds::from_corners(point(-far, -far), point(far, far)))
+    }
+
     /// The tiles of an image mask layer. Mask alpha is not scaled by the element's opacity.
     fn mask_image_sprites(
         layer: &BackgroundLayer,
@@ -1368,10 +1381,13 @@ impl Style {
         let Some(image) = BackgroundImages::get(cx, key) else {
             return Vec::new();
         };
-        let visible = window.content_mask().bounds;
-        let Some(resolved) = layer.resolve_image(boxes, image.render_size(0), visible) else {
+        let Some(visible) = Self::visible_in_local_space(window) else {
             return Vec::new();
         };
+        let Some(mut resolved) = layer.resolve_image(boxes, image.render_size(0), visible) else {
+            return Vec::new();
+        };
+        resolved.tiles.retain(|tile| window.reaches_content_mask(tile.intersect(&resolved.bounds)));
         // The sprites keep the rounded clip as their content mask, so each one stays
         // square-cornered and only has its atlas tile cropped to the clip box.
         let clip = window.snapped_mask(ContentMask::rounded(resolved.bounds, resolved.corner_radii));
@@ -1669,10 +1685,13 @@ impl Style {
         let Some(image) = BackgroundImages::get(cx, key) else {
             return;
         };
-        let visible = window.content_mask().bounds;
-        let Some(resolved) = layer.resolve_image(boxes, image.render_size(0), visible) else {
+        let Some(visible) = Self::visible_in_local_space(window) else {
             return;
         };
+        let Some(mut resolved) = layer.resolve_image(boxes, image.render_size(0), visible) else {
+            return;
+        };
+        resolved.tiles.retain(|tile| window.reaches_content_mask(tile.intersect(&resolved.bounds)));
         // The rounded clip is the content mask, so each sprite stays square-cornered and only
         // needs its atlas tile cropped to the clip box.
         let clip = ContentMask::rounded(resolved.bounds, resolved.corner_radii);
@@ -2593,6 +2612,10 @@ impl From<Position> for taffy::style::Position {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "style_transform_tests.rs"]
+pub(crate) mod style_transform_tests;
 
 #[cfg(test)]
 mod tests {
