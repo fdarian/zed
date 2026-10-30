@@ -21,6 +21,7 @@ mod natural;
 #[cfg(test)]
 mod table_tests;
 use calc::CalcArena;
+use crate::shrink::{clear_shrinking, kept_capacity, shrink_oversized};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -458,15 +459,22 @@ const GARBAGE_SLACK: usize = 4096;
 /// is its own whatever its children requested before it.
 const PARKING_SCOPE: u64 = 0x5041_524b_4544_4c4b;
 
+/// The node store of the layout engine is looked at once it has room for this many nodes.
+const NODE_SHRINK_FLOOR: usize = 4096;
+
+fn next_engine_id() -> u64 {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
 
 impl TaffyLayoutEngine {
     pub fn new() -> Self {
         let mut taffy = TaffyTree::new();
         taffy.disable_rounding();
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         TaffyLayoutEngine {
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: next_engine_id(),
             taffy,
             meta: FxHashMap::default(),
             absolute_layout_bounds: FxHashMap::default(),
@@ -694,15 +702,15 @@ impl TaffyLayoutEngine {
             self.collect_garbage();
         }
         self.give_back_stretched_widths(false);
-        self.absolute_layout_bounds.clear();
-        self.absolute_outer_origins.clear();
-        self.origin_seeds.clear();
-        self.computed_layouts.clear();
-        self.intrinsic_pending.clear();
-        self.natural_pending.clear();
-        self.natural_widths.clear();
-        self.escapable_nodes.clear();
-        self.ordinals.clear();
+        clear_shrinking(&mut self.absolute_layout_bounds);
+        clear_shrinking(&mut self.absolute_outer_origins);
+        clear_shrinking(&mut self.origin_seeds);
+        clear_shrinking(&mut self.computed_layouts);
+        clear_shrinking(&mut self.intrinsic_pending);
+        clear_shrinking(&mut self.natural_pending);
+        clear_shrinking(&mut self.natural_widths);
+        clear_shrinking(&mut self.escapable_nodes);
+        clear_shrinking(&mut self.ordinals);
         for id in std::mem::take(&mut self.anchor_restyled_nodes) {
             if let Some(meta) = self.meta.get_mut(&id) {
                 meta.anchor_restyled = false;
@@ -721,6 +729,68 @@ impl TaffyLayoutEngine {
         if self.calcs.len() > self.calcs_after_sweep {
             self.sweep_calcs();
         }
+        self.shrink_node_store();
+    }
+
+    /// Gives back the room that nodes the collections freed left behind, once the nodes alive are
+    /// a small part of it. A tree keeps the slots of the nodes it removed, so the nodes are moved
+    /// to a tree of their own size: they get other ids, and the engine another [`Self::id`], so
+    /// that what holds the ids of one (the retained recordings and the scroll anchors) takes them
+    /// for stale. The new tree has room for twice the nodes alive, so the next move waits for
+    /// more than four times what is alive then.
+    fn shrink_node_store(&mut self) {
+        let alive = self.meta.len();
+        let capacity = self.taffy.node_capacity();
+        if capacity <= NODE_SHRINK_FLOOR || capacity <= alive * 4 {
+            shrink_oversized(&mut self.meta);
+            shrink_oversized(&mut self.keys);
+            shrink_oversized(&mut self.parked);
+            shrink_oversized(&mut self.painted_extents);
+            shrink_oversized(&mut self.scroll_reaches);
+            shrink_oversized(&mut self.unsnapped_scroll_reaches);
+            return;
+        }
+        debug_assert!(
+            self.computed_layouts.is_empty()
+                && self.escapable_nodes.is_empty()
+                && self.probed.is_empty()
+                && self.scratch_stack.is_empty()
+        );
+        let moved: FxHashMap<LayoutId, LayoutId> = self
+            .taffy
+            .compact(kept_capacity(alive))
+            .into_iter()
+            .map(|(old, new)| (LayoutId(old), LayoutId(new)))
+            .collect();
+        let new_id = |old: &LayoutId| *moved.get(old).expect("a node of the tree has a new id");
+
+        self.meta = std::mem::take(&mut self.meta).into_iter().map(|(id, meta)| (new_id(&id), meta)).collect();
+        self.keys = std::mem::take(&mut self.keys).into_iter().map(|(key, id)| (key, new_id(&id))).collect();
+        self.parked = std::mem::take(&mut self.parked)
+            .into_iter()
+            .map(|(id, children)| (new_id(&id), children.iter().map(new_id).collect()))
+            .collect();
+        self.painted_extents =
+            std::mem::take(&mut self.painted_extents).into_iter().map(|(id, memo)| (new_id(&id), memo)).collect();
+        self.scroll_reaches =
+            std::mem::take(&mut self.scroll_reaches).into_iter().map(|(id, memo)| (new_id(&id), memo)).collect();
+        self.unsnapped_scroll_reaches = std::mem::take(&mut self.unsnapped_scroll_reaches)
+            .into_iter()
+            .map(|(id, memo)| (new_id(&id), memo))
+            .collect();
+        self.roots_at_collection = std::mem::take(&mut self.roots_at_collection).iter().map(new_id).collect();
+        for id in &mut self.stretched {
+            *id = new_id(id);
+        }
+        // A node a collection freed since its request has no new id, and its recheck is moot.
+        self.detach_rechecks.retain_mut(|id| match moved.get(id) {
+            Some(new) => {
+                *id = *new;
+                true
+            }
+            None => false,
+        });
+        self.id = next_engine_id();
     }
 
     /// How many escapable nodes the pass has requested so far. Pair with
@@ -4822,6 +4892,80 @@ mod tests {
                 engine.compute_layout(r3, space(), window, cx);
                 engine.end_frame();
                 assert_eq!(engine.taffy.total_node_count(), 1);
+            });
+        }
+
+        /// A page of `count` keyed leaves under one root, laid out and ended as a frame.
+        fn frame_of(
+            engine: &mut TaffyLayoutEngine,
+            count: usize,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Vec<LayoutId>) {
+            let leaves: Vec<LayoutId> = (0..count)
+                .map(|index| engine.request_keyed_layout(1000 + index as u64, flex(), REM, 1., &[]))
+                .collect();
+            let root = engine.request_keyed_layout(1, flex(), REM, 1., &leaves);
+            engine.compute_layout(root, space(), window, cx);
+            engine.end_frame();
+            (root, leaves)
+        }
+
+        #[gpui::test]
+        fn the_node_store_shrinks_once_a_small_page_follows_a_big_one(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                frame_of(&mut engine, 20_000, window, cx);
+                let peak = engine.taffy.node_capacity();
+                let id = engine.id();
+                assert!(peak > 20_000);
+
+                frame_of(&mut engine, 100, window, cx);
+                let shrunk = engine.taffy.node_capacity();
+                assert!(shrunk < peak / 50, "{shrunk} of {peak}");
+                assert_ne!(engine.id(), id, "ids from before the move are stale");
+                assert_eq!(engine.meta.len(), 101);
+                assert_eq!(engine.taffy.total_node_count(), 101);
+                assert!(engine.meta.capacity() < 1024 && engine.keys.capacity() < 1024);
+
+                // The next frame finds the nodes by their keys, and they stay where they are from then on.
+                let (root, leaves) = frame_of(&mut engine, 100, window, cx);
+                assert!(engine.contains(root) && leaves.iter().all(|leaf| engine.contains(*leaf)));
+                assert_eq!(engine.taffy.total_node_count(), 101);
+                assert_eq!(frame_of(&mut engine, 100, window, cx), (root, leaves));
+                assert_eq!(engine.taffy.node_capacity(), shrunk);
+            });
+        }
+
+        #[gpui::test]
+        fn a_steady_page_keeps_its_node_store(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                frame_of(&mut engine, 20_000, window, cx);
+                frame_of(&mut engine, 6_000, window, cx);
+                let (capacity, id) = (engine.taffy.node_capacity(), engine.id());
+                assert!(capacity > NODE_SHRINK_FLOOR);
+                assert_eq!(engine.taffy.total_node_count(), 6_001);
+
+                for _ in 0..3 {
+                    frame_of(&mut engine, 6_000, window, cx);
+                    assert_eq!((engine.taffy.node_capacity(), engine.id()), (capacity, id));
+                }
+            });
+        }
+
+        #[gpui::test]
+        fn a_small_window_never_moves_its_node_store(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                frame_of(&mut engine, 1_500, window, cx);
+                let (capacity, id) = (engine.taffy.node_capacity(), engine.id());
+                assert!(capacity <= NODE_SHRINK_FLOOR);
+                frame_of(&mut engine, 10, window, cx);
+                assert_eq!((engine.taffy.node_capacity(), engine.id()), (capacity, id));
             });
         }
 

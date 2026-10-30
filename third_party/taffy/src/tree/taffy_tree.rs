@@ -1065,6 +1065,65 @@ impl<NodeContext> TaffyTree<NodeContext> {
         self.node_context_data.clear();
     }
 
+    /// How many nodes the tree can hold without growing. A slot map keeps the slots of the nodes
+    /// it removed, so this stays at the most the tree ever held until [`Self::compact`].
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn node_capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    /// Moves the nodes into storage with room for `capacity` of them, which frees the slots that the
+    /// removed ones left. A node has another id there: the result lists `(old, new)` for each, sorted
+    /// by `old`, and an id from before is not good for the tree anymore (it can be the id of another
+    /// node).
+    ///
+    /// fdarian fork patch.
+    pub fn compact(&mut self, capacity: usize) -> Vec<(NodeId, NodeId)> {
+        let mut old_nodes = std::mem::replace(&mut self.nodes, SlotMap::with_capacity(capacity));
+        let mut old_children = std::mem::replace(&mut self.children, SlotMap::with_capacity(capacity));
+        let mut old_parents = std::mem::replace(&mut self.parents, SlotMap::with_capacity(capacity));
+        let mut old_contexts = std::mem::replace(&mut self.node_context_data, SecondaryMap::with_capacity(capacity));
+
+        let mut moved: Vec<(NodeId, NodeId)> = Vec::with_capacity(old_nodes.len());
+        // The three slot maps hand out the same keys only while they are filled in the same order.
+        for (key, data) in old_nodes.drain() {
+            let new_key = self.nodes.insert(data);
+            let children = old_children.remove(key).expect("every node has a children list");
+            let new_children_key = self.children.insert(children);
+            let parent = old_parents.remove(key).expect("every node has a parent entry");
+            let new_parents_key = self.parents.insert(parent);
+            debug_assert!(new_key == new_children_key && new_key == new_parents_key);
+            if let Some(context) = old_contexts.remove(key) {
+                self.node_context_data.insert(new_key, context);
+            }
+            moved.push((NodeId::from(key), NodeId::from(new_key)));
+        }
+        moved.sort_unstable_by_key(|(old, _)| u64::from(*old));
+
+        let new_id = |old: NodeId| {
+            let index = moved
+                .binary_search_by_key(&u64::from(old), |(old, _)| u64::from(*old))
+                .expect("a node that another lists is in the tree");
+            moved[index].1
+        };
+        for (_, children) in self.children.iter_mut() {
+            for child in children.iter_mut() {
+                *child = new_id(*child);
+            }
+        }
+        for (_, parent) in self.parents.iter_mut() {
+            if let Some(parent) = parent {
+                *parent = new_id(*parent);
+            }
+        }
+        for node in self.pending_boundaries.iter_mut() {
+            *node = new_id(*node);
+        }
+        moved
+    }
+
     /// Remove a specific node from the tree and drop it
     ///
     /// Returns the id of the node removed.
