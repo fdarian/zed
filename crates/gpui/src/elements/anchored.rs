@@ -168,11 +168,19 @@ impl Element for Anchored {
             .map(|child| child.request_layout(window, cx))
             .collect::<SmallVec<_>>();
 
-        let anchored_style = Style {
+        let mut anchored_style = Style {
             position: Position::Absolute,
             display: Display::Flex,
             ..Style::default()
         };
+        if self.reference_in_deferral_site {
+            // A portal's containing block is the viewport, not the trigger's box that taffy
+            // sizes an absolute child against: in a trigger 60px wide a popup would otherwise
+            // be shrunk to its min-content width.
+            anchored_style.intrinsic_widths.width = Some(Some(crate::IntrinsicSize::FitContentLimit(
+                window.viewport_size().width.into(),
+            )));
+        }
 
         let layout_id = window.request_layout(anchored_style, child_layout_ids.iter().copied(), cx);
         window.mark_layout_detached(layout_id);
@@ -632,6 +640,54 @@ mod tests {
 
         assert_eq!(menu_bounds.origin, point(px(100.), px(100.)));
         assert_eq!(menu_bounds.size, size(px(200.), px(300.)));
+    }
+
+    struct PortalTestView {
+        portal: bool,
+    }
+
+    impl Render for PortalTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let anchored = if self.portal {
+                super::anchored().reference_in_deferral_site()
+            } else {
+                super::anchored()
+            };
+            div().size_full().child(
+                div().relative().w(px(60.)).h(px(36.)).child(
+                    deferred(
+                        anchored
+                            .snap_to_window()
+                            .position(point(px(0.), px(40.)))
+                            .child(div().debug_selector(|| "LAYER".into()).child("aa aa aa aa aa aa aa aa aa aa")),
+                    )
+                    .with_priority(1),
+                ),
+            )
+        }
+    }
+
+    fn layer_width(cx: &mut TestAppContext, portal: bool) -> Pixels {
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| PortalTestView { portal });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| {
+                window.rendered_frame.debug_bounds.get("LAYER").copied()
+            })
+            .unwrap()
+            .expect("LAYER debug bounds not found")
+            .size
+            .width
+    }
+
+    #[gpui::test]
+    fn a_portal_is_sized_in_the_viewport_not_in_the_box_of_its_trigger(cx: &mut TestAppContext) {
+        assert!(layer_width(cx, true) > px(60.));
+    }
+
+    #[gpui::test]
+    fn a_layer_that_is_not_a_portal_is_sized_in_the_box_of_its_trigger(cx: &mut TestAppContext) {
+        assert!(layer_width(cx, false) <= px(60.));
     }
 
     fn placement(side: super::PlacementSide, align: super::PlacementAlign) -> super::AnchoredPlacement {
