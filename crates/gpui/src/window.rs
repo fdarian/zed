@@ -1987,6 +1987,9 @@ pub struct Window {
     /// the layout root it is: taken by the first element prepainted, see
     /// [`Window::with_fractional_element_origin`].
     root_seed: Option<Point<Pixels>>,
+    /// How far the element about to be prepainted or painted is stretched by the layout animation
+    /// around it, taken by the first element that reaches it: see [`Window::with_projection_scale`].
+    projection_scale: Option<[f32; 2]>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     /// The transforms [`Window::with_transform`] is inside, innermost last. Empty for none.
@@ -2783,6 +2786,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             origin_phase_stack: Vec::new(),
             root_seed: None,
+            projection_scale: None,
             content_mask_stack: Vec::new(),
             transform_stack: Vec::new(),
             deferral_site: None,
@@ -7153,6 +7157,24 @@ impl Window {
         self.origin_phase_stack.pop();
         self.root_seed = None;
         result
+    }
+
+    /// Runs `f`, in which the first element to be prepainted or painted is told that the transform
+    /// around it stretches it by `scale` (x and y). It paints its own corner radii and box shadows
+    /// divided by that, so that they come out the size it asked for on the screen, as Motion's
+    /// scale correctors do for a layout animation. The boxes inside it are stretched along with
+    /// it. This method should only be called during the prepaint and paint phases of element
+    /// drawing.
+    pub fn with_projection_scale<R>(&mut self, scale: [f32; 2], f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        self.projection_scale = Some(scale);
+        let result = f(self);
+        self.projection_scale = None;
+        result
+    }
+
+    pub(crate) fn take_projection_scale(&mut self) -> Option<[f32; 2]> {
+        self.projection_scale.take()
     }
 
     /// Hands the layout root being prepainted the fraction of its origin that

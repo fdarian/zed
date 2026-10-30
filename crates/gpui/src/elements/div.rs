@@ -2956,6 +2956,9 @@ pub struct Interactivity {
     /// the clip from being painted exactly (see [`Window::with_exact_content_mask`]).
     pub(crate) escape_inside: bool,
     pub(crate) hitbox_behavior: HitboxBehavior,
+    /// How far a layout animation stretches the element, taken from the window when it is
+    /// prepainted and painted. Its radii and shadows are corrected by it.
+    pub(crate) projection_scale: Option<[f32; 2]>,
     pub(crate) capture_pointer: bool,
     /// A listener reads the bounds of the element's hitbox when it runs, which a retained subtree
     /// replayed elsewhere would leave where they were.
@@ -3151,6 +3154,7 @@ impl Interactivity {
         f: impl FnOnce(&Style, Point<Pixels>, Option<Hitbox>, &mut Window, &mut App) -> R,
     ) -> R {
         self.content_size = content_size;
+        self.projection_scale = window.take_projection_scale();
 
         let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
         if let Some(layout_id) = self.layout_id {
@@ -3575,6 +3579,7 @@ impl Interactivity {
         cx: &mut App,
         f: impl FnOnce(&Style, &mut Window, &mut App),
     ) {
+        self.projection_scale = window.take_projection_scale();
         self.hovered = hitbox.map(|hitbox| hitbox.is_hovered(window));
         window.with_optional_element_state::<InteractiveElementState, _>(
             global_id,
@@ -4693,6 +4698,9 @@ impl Interactivity {
             }
         }
 
+        if let Some(scale) = self.projection_scale {
+            style.correct_for_projection(scale);
+        }
         style
     }
 

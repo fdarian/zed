@@ -12,7 +12,7 @@ use crate::{
     FontFallbacks, FontFeatures, FontSmoothing, FontStyle, FontVariations, FontWeight, GridAutoFlow, GridLocation, ImageKey,
     GridTemplateAreas, GridTemplateTracks, GridTrack, Hsla, Length, Pixels, Point, PointRefinement, PolychromeSprite,
     Rgba, SharedString, Size, SizeRefinement, Styled, TabSize, DecorationThickness, TextDecorationStyle, TextLayoutOptions, TextWrapStyle,
-    TextRun, TextSystem, Window, OverflowWrap, ElementTransform, ElementSpace, Perspective, TransformLength, TransformationMatrix, TextBoxEdge, WordBreak, black, point, px, quad, rems, size,
+    TextRun, TextSystem, Window, OverflowWrap, IsZero, ElementTransform, ElementSpace, Perspective, TransformLength, TransformationMatrix, TextBoxEdge, WordBreak, black, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use gpui_util::ResultExt;
@@ -1190,6 +1190,40 @@ impl Style {
             None => window.with_element_opacity(self.opacity, |window| {
                 self.paint(box_bounds, window, cx, continuation)
             }),
+        }
+    }
+
+    /// The style of an element that a layout animation stretches by `scale` (x, y), as Motion's
+    /// scale correctors write it: a length radius is divided by the scale of its axis, so it
+    /// is the length asked for once stretched (a fraction of the box needs nothing), and the
+    /// offsets of a shadow by the scale of their axis and its blur and spread by the mean of
+    /// the two.
+    pub(crate) fn correct_for_projection(&mut self, scale: [f32; 2]) {
+        let [x, y] = scale;
+        if !(x > 0. && y > 0.) || (x == 1. && y == 1.) {
+            return;
+        }
+        let corners = [
+            &mut self.corner_radii.top_left,
+            &mut self.corner_radii.top_right,
+            &mut self.corner_radii.bottom_right,
+            &mut self.corner_radii.bottom_left,
+        ];
+        for corner in corners {
+            let vertical_is_horizontal = corner.y.is_zero();
+            let horizontal = corner.x;
+            corner.x = divide_length(corner.x, x);
+            corner.y = if vertical_is_horizontal {
+                divide_length(horizontal, y)
+            } else {
+                divide_length(corner.y, y)
+            };
+        }
+        let mean = (x + y) / 2.;
+        for shadow in &mut self.box_shadow {
+            shadow.offset = point(px(shadow.offset.x.0 / x), px(shadow.offset.y.0 / y));
+            shadow.blur_radius = px(shadow.blur_radius.0 / mean);
+            shadow.spread_radius = px(shadow.spread_radius.0 / mean);
         }
     }
 
@@ -2573,6 +2607,47 @@ mod tests {
     }
 
     #[test]
+    fn a_stretched_box_paints_its_radii_and_shadows_at_the_size_asked_for() {
+        let mut style = Style::default();
+        style.corner_radii.top_left = CornerRadius {
+            x: DefiniteLength::Absolute(AbsoluteLength::Pixels(px(12.))),
+            y: DefiniteLength::Absolute(AbsoluteLength::Pixels(px(0.))),
+        };
+        style.corner_radii.top_right = CornerRadius {
+            x: DefiniteLength::Fraction(0.5),
+            y: DefiniteLength::Absolute(AbsoluteLength::Pixels(px(8.))),
+        };
+        style.box_shadow = vec![BoxShadow {
+            color: black(),
+            offset: point(px(4.), px(6.)),
+            blur_radius: px(10.),
+            spread_radius: px(2.),
+            inset: false,
+        }];
+
+        style.correct_for_projection([2., 0.5]);
+
+        // A radius of 12 stretched twice across and by a half down is 6 by 24 before it is stretched.
+        let top_left = style.corner_radii.top_left;
+        assert_eq!(top_left.x, DefiniteLength::Absolute(AbsoluteLength::Pixels(px(6.))));
+        assert_eq!(top_left.y, DefiniteLength::Absolute(AbsoluteLength::Pixels(px(24.))));
+        // A fraction of the box stretches with it.
+        let top_right = style.corner_radii.top_right;
+        assert_eq!(top_right.x, DefiniteLength::Fraction(0.5));
+        assert_eq!(top_right.y, DefiniteLength::Absolute(AbsoluteLength::Pixels(px(16.))));
+        // Offsets by the scale of their axis, blur and spread by the mean of the two.
+        let shadow = &style.box_shadow[0];
+        assert_eq!(shadow.offset, point(px(2.), px(12.)));
+        assert_eq!(shadow.blur_radius, px(8.));
+        assert_eq!(shadow.spread_radius, px(1.6));
+
+        let mut unstretched = Style::default();
+        unstretched.corner_radii.top_left = top_left;
+        unstretched.correct_for_projection([1., 1.]);
+        assert_eq!(unstretched.corner_radii.top_left, top_left);
+    }
+
+    #[test]
     fn a_refinement_can_clear_the_clip_path() {
         use crate::{ClipPath, ClipShape, InsetRadii, LengthPercentage};
         let clip = ClipPath {
@@ -3042,5 +3117,24 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+}
+
+fn divide_length(length: DefiniteLength, by: f32) -> DefiniteLength {
+    match length {
+        DefiniteLength::Absolute(AbsoluteLength::Pixels(pixels)) => {
+            DefiniteLength::Absolute(AbsoluteLength::Pixels(px(pixels.0 / by)))
+        }
+        DefiniteLength::Absolute(AbsoluteLength::Rems(amount)) => {
+            DefiniteLength::Absolute(AbsoluteLength::Rems(rems(amount.0 / by)))
+        }
+        DefiniteLength::Calc { length, fraction } => DefiniteLength::Calc {
+            length: match length {
+                AbsoluteLength::Pixels(pixels) => AbsoluteLength::Pixels(px(pixels.0 / by)),
+                AbsoluteLength::Rems(amount) => AbsoluteLength::Rems(rems(amount.0 / by)),
+            },
+            fraction,
+        },
+        DefiniteLength::Fraction(_) => length,
     }
 }
