@@ -61,6 +61,7 @@ pub mod profiler;
 pub mod queue;
 mod scene;
 mod shared_uri;
+mod shrink;
 mod spring;
 mod style;
 mod styled;
