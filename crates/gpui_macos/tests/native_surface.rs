@@ -36,6 +36,8 @@ static GPUI_FIRST_DOWNS: AtomicUsize = AtomicUsize::new(0);
 static GPUI_FIRST_MOVES: AtomicUsize = AtomicUsize::new(0);
 static GPUI_BADGE_DOWNS: AtomicUsize = AtomicUsize::new(0);
 static GPUI_POPOVER_DOWNS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_KEYS: AtomicUsize = AtomicUsize::new(0);
+static GPUI_KEYS: AtomicUsize = AtomicUsize::new(0);
 
 /// The window is 600x500 and the content is laid out in logical pixels, the same at any scale.
 const WINDOW: (f64, f64) = (600., 500.);
@@ -134,6 +136,12 @@ fn probe_class() -> &'static Class {
     extern "C" fn accepts_first_mouse(_: &Object, _: Sel, _: id) -> BOOL {
         YES
     }
+    extern "C" fn accepts_first_responder(_: &Object, _: Sel) -> BOOL {
+        YES
+    }
+    extern "C" fn key_down(_: &Object, _: Sel, _: id) {
+        NATIVE_KEYS.fetch_add(1, SeqCst);
+    }
     if let Some(class) = Class::get("TestProbeView") {
         return class;
     }
@@ -141,6 +149,8 @@ fn probe_class() -> &'static Class {
     unsafe {
         decl.add_method(sel!(mouseDown:), mouse_down as extern "C" fn(&Object, Sel, id));
         decl.add_method(sel!(acceptsFirstMouse:), accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL);
+        decl.add_method(sel!(acceptsFirstResponder), accepts_first_responder as extern "C" fn(&Object, Sel) -> BOOL);
+        decl.add_method(sel!(keyDown:), key_down as extern "C" fn(&Object, Sel, id));
     }
     decl.register()
 }
@@ -230,6 +240,32 @@ fn send(ns_window: id, pointer: Pointer, x: f64, y: f64) {
     }
 }
 
+
+/// A key press, through the application as a typed key goes: key equivalents first, then the
+/// first responder.
+fn send_key(ns_window: id, key_code: u16, characters: &str) {
+    use cocoa::{base::NO, foundation::NSString as _};
+    unsafe {
+        let number: i64 = msg_send![ns_window, windowNumber];
+        let text = cocoa::foundation::NSString::alloc(nil).init_str(characters);
+        let event: id = msg_send![
+            class!(NSEvent),
+            keyEventWithType: 10u64
+            location: NSPoint::new(0., 0.)
+            modifierFlags: 0u64
+            timestamp: 0f64
+            windowNumber: number
+            context: nil
+            characters: text
+            charactersIgnoringModifiers: text
+            isARepeat: NO
+            keyCode: key_code
+        ];
+        assert_ne!(event, nil);
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, sendEvent: event];
+    }
+}
 
 // -- Capturing the window's own composited pixels. A process can capture its own window without the
 // screen recording permission. The symbol is looked up at run time: the SDK marks it unavailable.
@@ -455,6 +491,11 @@ fn main() {
             )
             .unwrap();
 
+        cx.observe_keystrokes(|_, _, _| {
+            GPUI_KEYS.fetch_add(1, SeqCst);
+        })
+        .detach();
+
         cx.spawn(async move |cx| {
             settle(cx).await;
             let (root, ns_window) = cx.update(|cx| {
@@ -589,6 +630,31 @@ fn main() {
             );
 
 
+            // Keys go to the first responder: GPUI's while its view has the keyboard, and a native view's,
+            // which GPUI does not see, while that has it.
+            let probe = subviews(subviews(views[0])[0])[0];
+            let first_responder = |expected: id| unsafe {
+                let current: id = msg_send![ns_window, firstResponder];
+                current == expected
+            };
+            send_key(ns_window, 0, "a");
+            let (gpui_keys, native_keys) = (GPUI_KEYS.load(SeqCst), NATIVE_KEYS.load(SeqCst));
+            assert_eq!(native_keys, 0, "a key goes to GPUI's view first");
+            unsafe {
+                let accepted: BOOL = msg_send![ns_window, makeFirstResponder: probe];
+                assert_eq!(accepted, YES);
+            }
+            assert!(first_responder(probe));
+            send_key(ns_window, 0, "a");
+            assert_eq!(NATIVE_KEYS.load(SeqCst), native_keys + 1, "a key goes to the native view that has the keyboard");
+            assert_eq!(GPUI_KEYS.load(SeqCst), gpui_keys, "and GPUI does not see it");
+            unsafe {
+                let accepted: BOOL = msg_send![ns_window, makeFirstResponder: root];
+                assert_eq!(accepted, YES);
+            }
+            send_key(ns_window, 0, "a");
+            assert_eq!(NATIVE_KEYS.load(SeqCst), native_keys + 1, "back to GPUI's view: the native view hears no more");
+
             // The cursor rects of the window view leave out what is under the native views.
             {
                 use std::sync::Mutex;
@@ -674,11 +740,10 @@ fn main() {
                 aligned(&Capture::of(ns_window)).unwrap_or_else(|error| panic!("settled at {offset}: {error}"));
             }
             println!("captures during the scroll: {total}, out of step: {inconsistent}");
-            // A capture can land between the two halves of a frame while the machine is busy: GPUI's
-            // layers are Metal drawables the window server takes up on its own schedule. Quiet, none
-            // does (0 of ~29 over five runs); under a heavy build a handful do, with or without the
-            // transaction. A frame behind for good fails the aligned checks above.
-            assert!(inconsistent * 2 <= total, "the native view was out of step in {inconsistent} of {total} captures");
+            // A frame's transaction is flushed as the frame ends, so a capture lands between the two halves of a
+            // frame only when the machine is busy (about 1% of captures under heavy CPU load, none on a quiet
+            // one). A frame behind for good fails the aligned checks above.
+            assert!(inconsistent * 10 <= total, "the native view was out of step in {inconsistent} of {total} captures");
 
             // The window loses its second surface: the container goes with it.
             cx.update(|cx| {

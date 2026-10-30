@@ -396,7 +396,9 @@ fn send_event(this: &Object, event: id, superclass: &Class) {
         default_prevented: false,
         drag_operation: None,
     });
-    let handled = !result.propagate || result.default_prevented;
+    // A press that focuses the native surface's element prevents the default, as GPUI's focus
+    // transfer does; only a handler that stops the event keeps it from the native view.
+    let handled = !result.propagate;
     let deliver = {
         let mut state = window_state.lock();
         let composition = &mut state.composition;
@@ -425,6 +427,32 @@ fn send_event(this: &Object, event: id, superclass: &Class) {
     window_state.lock().composition.pre_dispatched_event = event as usize;
     super_send();
     window_state.lock().composition.pre_dispatched_event = 0;
+}
+
+/// Whether the first responder of the window is a view inside a native surface (a web view
+/// holding the keyboard), which GPUI's keystrokes must leave alone.
+pub(super) fn keyboard_is_native(view: &Object) -> bool {
+    unsafe {
+        let window: id = msg_send![view, window];
+        if window == nil {
+            return false;
+        }
+        let active: BOOL = *(*window).get_ivar::<BOOL>(COMPOSITION_INPUT_IVAR);
+        if active == NO {
+            return false;
+        }
+        let responder: id = msg_send![window, firstResponder];
+        let is_view: BOOL = msg_send![responder, isKindOfClass: class!(NSView)];
+        let mut view = if is_view == YES { responder } else { nil };
+        while view != nil {
+            let is_native: BOOL = msg_send![view, isKindOfClass: native_surface_class()];
+            if is_native == YES {
+                return true;
+            }
+            view = msg_send![view, superview];
+        }
+        false
+    }
 }
 
 /// The native container the pointer of `event` is over, if AppKit's hit test lands in one.

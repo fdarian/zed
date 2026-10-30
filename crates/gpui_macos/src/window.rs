@@ -2596,6 +2596,11 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
 }
 
 extern "C" fn handle_key_equivalent(this: &Object, _: Sel, native_event: id) -> BOOL {
+    if composition::keyboard_is_native(this) {
+        // A native view of the window has the keyboard: its keys are its own, and AppKit asks
+        // it (and the menus) for the key equivalent as it would without GPUI.
+        return unsafe { msg_send![super(this, class!(NSView)), performKeyEquivalent: native_event] };
+    }
     handle_key_event(this, native_event, true)
 }
 
