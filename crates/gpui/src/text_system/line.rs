@@ -679,7 +679,7 @@ fn paint_line(
                             size: hyphen_size,
                         };
                         if window.paints_glyphs_outside_the_mask()
-                            || hyphen_bounds.dilate(reach).intersects(&window.content_mask().bounds)
+                            || window.reaches_content_mask(hyphen_bounds.dilate(reach))
                         {
                             window.paint_glyph(
                                 hyphen_origin,
@@ -815,7 +815,6 @@ fn paint_line(
                     size: max_glyph_size,
                 };
 
-                let content_mask = window.content_mask();
                 // The box of the font starts at the top of the row, and a line taller than the font
                 // puts the glyphs lower in it: a descender can show under the mask that the box is
                 // over. A glyph that shows is painted, whatever mask a recording of it was made
@@ -826,7 +825,7 @@ fn paint_line(
                 if !run.inline.object
                     && scope.admits(group)
                     && (window.paints_glyphs_outside_the_mask()
-                        || max_glyph_bounds.dilate(reach).intersects(&content_mask.bounds))
+                        || window.reaches_content_mask(max_glyph_bounds.dilate(reach)))
                 {
                     let baseline_offset = point(px(0.0), run_baseline);
                     let vertical_offset = point(px(0.0), glyph.position.y);

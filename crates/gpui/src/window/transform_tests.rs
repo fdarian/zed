@@ -131,6 +131,29 @@ fn a_mask_pushed_before_a_transform_is_cut_into_window_space_once() {
     assert_eq!(translated.content_mask, plain.content_mask);
 }
 
+/// What a glyph is tested against when the text is painted (gpuix #110): a clip pushed inside a transform is in window
+/// space, and the glyph is in the local space, so it is moved by the transform before the test.
+#[test]
+fn a_box_in_a_transformed_clip_reaches_the_mask_where_the_transform_puts_it() {
+    painted(|window| {
+        window.with_transform(css([1., 0., 0., 1., 0., -104.]), |window| {
+            window.with_content_mask(Some(ContentMask::from_bounds(square(0., 120., 50.))), |window| {
+                assert!(window.reaches_content_mask(square(10., 125., 10.)), "a glyph inside the clip");
+                assert!(!window.reaches_content_mask(square(10., 20., 10.)), "a glyph above it");
+                assert!(!window.reaches_content_mask(square(10., 200., 10.)), "a glyph below it");
+                assert!(!window.reaches_content_mask(square(60., 125., 10.)), "a glyph beside it");
+            });
+        });
+        // Under a general transform the clip is a local one, and the window mask is not moved.
+        window.with_transform(rotation(30.), |window| {
+            window.with_content_mask(Some(ContentMask::from_bounds(square(0., 0., 50.))), |window| {
+                assert!(window.reaches_content_mask(square(10., 10., 10.)), "a glyph inside the clip");
+                assert!(!window.reaches_content_mask(square(100., 100., 10.)), "a glyph outside the clip");
+            });
+        });
+    });
+}
+
 #[test]
 fn a_clip_entering_a_scale_is_mapped_into_the_new_space_exactly() {
     let quads = painted(|window| {

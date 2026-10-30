@@ -6484,6 +6484,27 @@ impl Window {
             .map_or_else(TransformationMatrix::unit, |ambient| ambient.matrix)
     }
 
+    /// Whether `bounds`, in the local space of what is being painted, can show under the clips
+    /// around it. The content mask is in window space, so a box that a transform moved is
+    /// tested where the window has it, and not where it was laid out: a glyph in a box moved
+    /// by -80 inside an `overflow: hidden` is under a mask that moved with it.
+    pub(crate) fn reaches_content_mask(&self, bounds: Bounds<Pixels>) -> bool {
+        let Some(ambient) = self.transform_stack.last() else {
+            return bounds.intersects(&self.content_mask().bounds);
+        };
+        // How far a box reaches under perspective is not one number; it is not culled.
+        if ambient.kind == TransformKind::General && !ambient.matrix.is_affine() {
+            return true;
+        }
+        if !ambient.bounds_in_window(bounds).intersects(&self.content_mask().bounds) {
+            return false;
+        }
+        match (ambient.kind, &ambient.local_clip) {
+            (TransformKind::General, Some(clip)) => bounds.intersects(&clip.bounds),
+            _ => true,
+        }
+    }
+
     /// `bounds`, in the local space of what is being painted, as the window has them: moved by
     /// the rounded translation, or the bounding box of the transformed corners.
     pub(crate) fn bounds_in_window(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
