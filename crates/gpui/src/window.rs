@@ -2903,14 +2903,22 @@ pub struct DispatchEventResult {
 /// [`ContentMask::intersection_is_exact`] tests whether one mask's corner fits inside another.
 const EXACT_TOLERANCE: f32 = 0.01;
 
+/// How far, in device pixels, a translation may be from a whole number of them and still be one
+/// that only moves what is painted: the matrices that make it are `f32` products, whose noise
+/// grows with the position of the element.
+const WHOLE_DEVICE_PIXEL_TOLERANCE: f32 = 0.01;
+
 /// The points between the two ends of a corner's arc that [`ContentMask::intersection_is_exact`]
 /// tests.
 const EXACT_ARC_SAMPLES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransformKind {
-    /// Only moves, by whatever amount: painted content is placed, not transformed.
+    /// Only moves, by a whole number of device pixels: painted content is placed, not transformed.
     Translation,
+    /// Everything else, a translation by a fraction of a device pixel included: Chrome draws a box
+    /// moved by one with antialiased edges and text on a subpixel position, which the primitives
+    /// do through the matrix.
     General,
 }
 
@@ -2921,7 +2929,7 @@ struct AmbientTransform {
     /// multiplied out.
     matrix: TransformationMatrix,
     kind: TransformKind,
-    /// The translation of a `Translation` rounded to whole device pixels, in logical pixels.
+    /// The translation of a `Translation`, whole device pixels, in logical pixels.
     offset: Point<Pixels>,
     /// `offset` in device pixels.
     device_offset: Point<ScaledPixels>,
@@ -6278,11 +6286,13 @@ impl Window {
     /// the local space of the elements inside to the space they are in now, in logical pixels,
     /// and composes onto the transform already in effect.
     ///
-    /// Inside a transform that only translates, nothing is drawn transformed: the translation
-    /// rounded to whole device pixels moves the logical bounds before they are snapped, so the
-    /// output is the same pixels as the content placed there, and masks pushed inside are moved
-    /// into window space. Inside any other transform, primitives carry the matrix and the
-    /// shaders draw them through it.
+    /// Inside a transform that only translates by whole device pixels, nothing is drawn
+    /// transformed: the translation moves the bounds after they are snapped, so the output is the
+    /// same pixels as the content placed there, and masks pushed inside are moved into window
+    /// space. Inside any other transform, a translation by a fraction of a device pixel included,
+    /// primitives carry the matrix and the shaders draw them through it: a box is where layout
+    /// snaps it, moved by exactly the translation, as Chrome draws the paint offset of a
+    /// transformed element and its transform.
     ///
     /// The clips follow one model. [`Window::content_mask`] is always in window space and is not
     /// changed by a general transform, so what is painted is still cut by the hardware clip and
@@ -6353,7 +6363,6 @@ impl Window {
         if space.matrix.is_identity() && !space.preserve_3d && !space.backface_hidden && space.child_perspective.is_none() && !parent_shapes_children {
             return f(self);
         }
-        let animating = space.animating || parent.is_some_and(|parent| parent.animating);
         let parent_matrix = self.transform();
         let carried_clip = parent.and_then(|parent| parent.local_clip);
         let entered = self.enter_space(&space);
@@ -6361,7 +6370,13 @@ impl Window {
             (entered.accumulated, entered.matrix, entered.step, entered.hidden, entered.outer);
 
         let scale_factor = self.scale_factor();
-        let (kind, offset, device_offset) = if composed.is_translation() {
+        let whole_device_pixels = composed.is_translation()
+            && composed.translation().iter().all(|axis| {
+                let device = axis * scale_factor;
+                (device - device.round()).abs() < WHOLE_DEVICE_PIXEL_TOLERANCE
+            });
+        let animating = space.animating || parent.is_some_and(|parent| parent.animating);
+        let (kind, offset, device_offset) = if whole_device_pixels {
             let device = point(
                 ScaledPixels((composed.translation()[0] * scale_factor).round()),
                 ScaledPixels((composed.translation()[1] * scale_factor).round()),
@@ -8078,6 +8093,33 @@ impl Window {
                 tile_scale: 1.,
                 transformation: placement.transformation,
                 clip_transformation: TransformationMatrix::unit(),
+            });
+        }
+
+        // A translation that moves has no raster scale to hold, and a glyph on a new subpixel
+        // position at every tick is a raster at every tick: its text moves by whole device pixels
+        // while it does, and is on the exact position when it stops.
+        if placement.animating && placement.logical.is_translation() {
+            let translation = placement.logical.translation();
+            let moved = point(
+                ScaledPixels((translation[0] * scale_factor).round()),
+                ScaledPixels((translation[1] * scale_factor).round()),
+            );
+            let (integer_origin, subpixel_variant) = split(origin.scale(scale_factor) + moved, (steps_x, steps_y));
+            let clipped = placement.local_clip != ContentMask::unbounded();
+            return Some(GlyphDrawing {
+                transform: GlyphTransform::IDENTITY,
+                raster_scale: scale_factor,
+                bucket: 1.,
+                integer_origin,
+                subpixel_variant,
+                tile_scale: 1.,
+                transformation: TransformationMatrix::unit(),
+                clip_transformation: if clipped {
+                    TransformationMatrix::unit().moved_by([-moved.x.0, -moved.y.0])
+                } else {
+                    TransformationMatrix::unit()
+                },
             });
         }
 

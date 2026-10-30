@@ -33,6 +33,7 @@ float content_mask_coverage(float2 position, ContentMask_ScaledPixels content_ma
 float border_vertical_weight(float2 corner_to_point, float2 border, float pixel);
 bool is_identity_transform(TransformationMatrix transformation);
 bool is_affine_transform(TransformationMatrix transformation);
+bool is_translation_transform(TransformationMatrix transformation);
 float transform_pixel_scale(TransformationMatrix transformation);
 float2 apply_transform(TransformationMatrix transformation, float2 position);
 float3 apply_homography(TransformationMatrix transformation, float2 position);
@@ -297,8 +298,17 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     straight_border_inner_corner_to_point.x < -antialias_threshold &&
     straight_border_inner_corner_to_point.y < -antialias_threshold;
 
+  // A quad that is only moved, by a fraction of a pixel, has straight edges that cross the
+  // pixels along them: they are covered in part, which is not what the fast path draws. Its
+  // edges are on pixel boundaries otherwise, so the pixels whose centre is half a pixel inside
+  // are whole (the slack keeps those that sit exactly there on the fast path).
+  bool moved = transformed && is_translation_transform(quad.transformation);
+  bool clear_of_outer_edge = !moved ||
+    (corner_to_point.x < -antialias_threshold + 0.001 &&
+     corner_to_point.y < -antialias_threshold + 0.001);
+
   // Fast path for points that must be part of the background
-  if (is_within_inner_straight_border && !is_near_rounded_corner) {
+  if (is_within_inner_straight_border && !is_near_rounded_corner && clear_of_outer_edge) {
     return background_color * float4(1.0, 1.0, 1.0, mask_alpha);
   }
 
@@ -1540,6 +1550,13 @@ bool is_identity_transform(TransformationMatrix transformation) {
          transformation.rows[1][2] == 0.0 &&
          transformation.rows[2][0] == 0.0 &&
          transformation.rows[2][1] == 0.0 &&
+         transformation.rows[2][2] == 1.0;
+}
+
+bool is_translation_transform(TransformationMatrix transformation) {
+  return transformation.rows[0][0] == 1.0 && transformation.rows[0][1] == 0.0 &&
+         transformation.rows[1][0] == 0.0 && transformation.rows[1][1] == 1.0 &&
+         transformation.rows[2][0] == 0.0 && transformation.rows[2][1] == 0.0 &&
          transformation.rows[2][2] == 1.0;
 }
 

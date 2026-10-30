@@ -51,10 +51,9 @@ fn without_order(mut quad: Quad) -> String {
 
 #[test]
 fn a_translated_quad_is_the_quad_painted_at_the_offset() {
-    // At scale 2, a shift of (10.25, 5.1) is 20.5 and 10.2 device pixels, which round to 21
-    // and 10: (10.5, 5) logical.
+    // At scale 2, a shift of (10.5, 5) is 21 and 10 whole device pixels.
     let moved = painted(|window| {
-        window.with_transform(css([1., 0., 0., 1., 10.25, 5.1]), |window| {
+        window.with_transform(css([1., 0., 0., 1., 10.5, 5.]), |window| {
             window.paint_quad(fill(square(3., 4., 20.), red()));
             window.with_content_mask(Some(ContentMask::from_bounds(square(0., 0., 10.))), |window| {
                 window.paint_quad(fill(square(3.25, 4., 21.), red()));
@@ -321,9 +320,9 @@ fn paint_run(window: &mut Window, cx: &mut crate::App, at: crate::Point<Pixels>)
 
 #[test]
 fn translated_glyphs_emoji_lines_and_icons_are_those_painted_at_the_offset() {
-    // 10.25 by 5.1 logical pixels, rounded to 21 and 10 device pixels at scale 2.
+    // 10.5 by 5 logical pixels, 21 and 10 whole device pixels at scale 2.
     let moved = painted_primitives(|window, cx| {
-        window.with_transform(css([1., 0., 0., 1., 10.25, 5.1]), |window| {
+        window.with_transform(css([1., 0., 0., 1., 10.5, 5.]), |window| {
             window.with_content_mask(Some(ContentMask::from_bounds(square(0., 0., 80.))), |window| {
                 paint_run(window, cx, point(px(3.3), px(12.)))
             });
@@ -336,6 +335,88 @@ fn translated_glyphs_emoji_lines_and_icons_are_those_painted_at_the_offset() {
     });
     assert!(moved.len() >= 4 * 6, "{} primitives", moved.len());
     assert_eq!(moved, placed);
+}
+
+#[test]
+fn a_translation_by_a_fraction_of_a_device_pixel_moves_the_snapped_quad_through_the_matrix() {
+    // 10.25 by 5.1 logical pixels are 20.5 and 10.2 device pixels at scale 2. Chrome puts the
+    // translation of an element on its snapped paint offset exactly and antialiases the edges: the
+    // quad keeps the bounds layout snapped it to, and the matrix is the translation as it is.
+    let quads = painted(|window| {
+        window.paint_quad(fill(square(3.3, 4., 20.), blue()));
+        window.with_transform(css([1., 0., 0., 1., 10.25, 5.1]), |window| {
+            window.paint_quad(fill(square(3.3, 4., 21.), red()));
+        });
+    });
+    let plain = quad_with_width(&quads, 20., 2.);
+    let moved = quad_with_width(&quads, 21., 2.);
+    assert_eq!(moved.bounds.origin, plain.bounds.origin);
+    assert_eq!(moved.transformation, css([1., 0., 0., 1., 20.5, 10.2]));
+}
+
+#[test]
+fn a_translation_that_is_whole_device_pixels_up_to_noise_places_the_quad() {
+    // The matrices that put an element's translation together are `f32` products: a 20.0004
+    // device pixel shift is the whole 20.
+    let quads = painted(|window| {
+        window.with_transform(css([1., 0., 0., 1., 10.0002, 5.]), |window| {
+            window.paint_quad(fill(square(3., 4., 20.), red()));
+        });
+    });
+    let quad = quad_with_width(&quads, 20., 2.);
+    assert_eq!(quad.transformation, TransformationMatrix::unit());
+    assert_eq!(quad.bounds.origin, point(ScaledPixels(26.), ScaledPixels(18.)));
+}
+
+#[test]
+fn text_translated_by_a_fraction_is_where_the_same_text_at_that_position_is() {
+    use crate::{FontId, FontSmoothing, GlyphId};
+    // Chrome puts text moved by a fractional translation on a subpixel position, as it does text
+    // at a fractional `left`: the glyph is upright, on the position the sum gives.
+    let glyphs = |translation: [f32; 2], at: crate::Point<Pixels>| {
+        painted_primitives(move |window, _| {
+            let paint = |window: &mut Window| {
+                for column in 0..6 {
+                    let at = at + point(px(column as f32 * 0.3125 + 0.0625), px(0.));
+                    window.paint_glyph(at, FontId(0), GlyphId(1), px(16.), blue(), FontSmoothing::Auto).unwrap();
+                }
+            };
+            if translation == [0., 0.] {
+                paint(window)
+            } else {
+                window.with_transform(css([1., 0., 0., 1., translation[0], translation[1]]), paint)
+            }
+        })
+    };
+    let moved = glyphs([10.25, 5.], point(px(3.3), px(12.)));
+    let placed = glyphs([0., 0.], point(px(13.55), px(17.)));
+    assert_eq!(moved.len(), 6);
+    assert_eq!(moved, placed);
+}
+
+#[test]
+fn text_under_a_translation_that_animates_moves_by_whole_device_pixels() {
+    use crate::{FontId, FontSmoothing, GlyphId};
+    // A glyph on a new subpixel position at every tick is a raster at every tick, so while a
+    // translation moves its text is on the whole device pixel it rounds to (20.5 is 21 at scale 2),
+    // and the box beside it is on the exact translation.
+    let glyphs = |animating: bool, translation: f32, at: crate::Point<Pixels>| {
+        painted_primitives(move |window, _| {
+            let paint = |window: &mut Window| {
+                for column in 0..6 {
+                    let at = at + point(px(column as f32 * 0.3125 + 0.0625), px(0.));
+                    window.paint_glyph(at, FontId(0), GlyphId(1), px(16.), blue(), FontSmoothing::Auto).unwrap();
+                }
+            };
+            window.with_transform_animating(css([1., 0., 0., 1., translation, 0.]), animating, paint)
+        })
+    };
+    let moving = glyphs(true, 10.25, point(px(3.3), px(12.)));
+    let placed = glyphs(false, 10.5, point(px(3.3), px(12.)));
+    assert_eq!(moving.len(), 6);
+    assert_eq!(moving, placed);
+    let at_rest = glyphs(false, 10.25, point(px(3.3), px(12.)));
+    assert_ne!(at_rest, moving);
 }
 
 #[test]
@@ -722,10 +803,9 @@ fn a_surface_is_placed_as_a_quad_is_exactly_under_a_translation_and_a_rotation()
     }
     assert_eq!(plain.0, square(3., 4., 20.).scale(2.));
     assert_eq!(plain.1, TransformationMatrix::unit());
-    // A translation moves the bounds by the rounded offset and leaves the matrix alone.
-    assert_eq!(moved.0.origin, plain.0.origin + point(ScaledPixels(21.), ScaledPixels(10.)));
-    assert_eq!(moved.0.size, plain.0.size);
-    assert_eq!(moved.1, TransformationMatrix::unit());
+    // A translation by a fraction of a device pixel (20.5 and 10.2 here) keeps the bounds and is the matrix.
+    assert_eq!(moved.0, plain.0);
+    assert_eq!(moved.1, css([1., 0., 0., 1., 20.5, 10.2]));
     // A rotation keeps the surface's own bounds and carries the matrix: (x, y) goes to (40 - y, x).
     assert_eq!(turned.0, plain.0);
     assert_ne!(turned.1, TransformationMatrix::unit());
