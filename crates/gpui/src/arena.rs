@@ -1,3 +1,4 @@
+use crate::shrink::{clear_shrinking, is_oversized, kept_capacity};
 use std::{
     alloc::{self, handle_alloc_error},
     cell::Cell,
@@ -150,11 +151,15 @@ impl Arena {
     fn force_clear(&mut self) {
         self.valid.set(false);
         self.valid = Rc::new(Cell::new(true));
-        self.elements.clear();
-        for chunk_index in 0..=self.current_chunk_index {
+        clear_shrinking(&mut self.elements);
+        let used_chunks = self.current_chunk_index + 1;
+        for chunk_index in 0..used_chunks {
             self.chunks[chunk_index].reset();
         }
         self.current_chunk_index = 0;
+        if is_oversized(self.chunks.len(), used_chunks, self.chunk_size.get()) {
+            self.chunks.truncate(kept_capacity(used_chunks));
+        }
     }
 
     #[inline(always)]
@@ -304,6 +309,53 @@ mod tests {
         arena.alloc(|| 4u32);
 
         assert_eq!(arena.capacity(), 24);
+    }
+
+    const CHUNK: usize = 64 * 1024;
+
+    /// Allocates `count` values that each need a chunk of their own, then clears.
+    fn frame_of_chunks(arena: &mut Arena, count: usize) {
+        for _ in 0..count {
+            arena.alloc(|| [0u8; CHUNK - 16]);
+        }
+        arena.clear();
+    }
+
+    #[test]
+    fn test_arena_gives_back_the_chunks_a_big_frame_needed() {
+        let mut arena = Arena::new(CHUNK);
+        frame_of_chunks(&mut arena, 20);
+        assert_eq!(arena.capacity(), 20 * CHUNK, "the frame that needed them keeps them");
+
+        frame_of_chunks(&mut arena, 1);
+        assert_eq!(arena.capacity(), 2 * CHUNK);
+
+        // Still usable, and it grows again when a big frame comes back.
+        frame_of_chunks(&mut arena, 6);
+        assert_eq!(arena.capacity(), 6 * CHUNK);
+    }
+
+    #[test]
+    fn test_arena_keeps_its_chunks_for_a_frame_that_stays_the_size_it_is() {
+        let mut arena = Arena::new(CHUNK);
+        frame_of_chunks(&mut arena, 8);
+        for _ in 0..3 {
+            frame_of_chunks(&mut arena, 2);
+            assert_eq!(arena.capacity(), 8 * CHUNK);
+        }
+    }
+
+    #[test]
+    fn test_small_arena_never_gives_back_a_chunk() {
+        let mut arena = Arena::new(1024);
+        for _ in 0..40 {
+            arena.alloc(|| [0u8; 1008]);
+        }
+        arena.clear();
+        assert_eq!(arena.capacity(), 40 * 1024);
+        arena.alloc(|| 1u8);
+        arena.clear();
+        assert_eq!(arena.capacity(), 40 * 1024);
     }
 
     #[test]
