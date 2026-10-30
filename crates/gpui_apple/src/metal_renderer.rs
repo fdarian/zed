@@ -8,7 +8,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, MAX_GROUP_EXTENT,
-    MaskComposite, MaskLayer, PaintSurface, Path, Point, PrimitiveBatch, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
+    MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point, PrimitiveBatch, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
     TransformationMatrix, filter_margin, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -123,8 +123,8 @@ impl InstanceBufferPool {
 }
 
 pub struct MetalRenderer {
-    device: metal::Device,
-    layer: Option<metal::MetalLayer>,
+    pub(crate) device: metal::Device,
+    pub(crate) layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -150,7 +150,7 @@ pub struct MetalRenderer {
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
-    sprite_atlas: Arc<MetalAtlas>,
+    pub(crate) sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
@@ -175,8 +175,14 @@ impl MetalRenderer {
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
         let device = Self::create_device();
 
+        let layer = Self::new_layer(&device, transparent);
+
+        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+    }
+
+    pub(crate) fn new_layer(device: &metal::Device, transparent: bool) -> metal::MetalLayer {
         let layer = metal::MetalLayer::new();
-        layer.set_device(&device);
+        layer.set_device(device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
@@ -194,8 +200,7 @@ impl MetalRenderer {
                     | AutoresizingMask::HEIGHT_SIZABLE
             ];
         }
-
-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
+        layer
     }
 
     /// Creates a new headless MetalRenderer for offscreen rendering without a window.
@@ -230,7 +235,7 @@ impl MetalRenderer {
         }
     }
 
-    fn new_internal(
+    pub(crate) fn new_internal(
         device: metal::Device,
         layer: Option<metal::MetalLayer>,
         opaque: bool,
@@ -342,6 +347,10 @@ impl MetalRenderer {
         &self.sprite_atlas
     }
 
+    pub fn presents_with_transaction(&self) -> bool {
+        self.presents_with_transaction
+    }
+
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         self.presents_with_transaction = presents_with_transaction;
         if let Some(layer) = &self.layer {
@@ -405,6 +414,11 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        self.draw_orders(scene, OrderRange::ALL);
+    }
+
+    /// Draws the primitives and groups of `scene` whose order is in `orders`, clearing the rest.
+    pub fn draw_orders(&mut self, scene: &Scene, orders: OrderRange) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -430,7 +444,7 @@ impl MetalRenderer {
         };
 
         let stats = render_stats_enabled().then(|| (encoders_opened(), std::time::Instant::now()));
-        let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
+        let command_buffer = match self.render_frame_in(scene, orders, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
@@ -457,9 +471,20 @@ impl MetalRenderer {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn render_frame(
         &mut self,
         scene: &Scene,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<metal::CommandBuffer> {
+        self.render_frame_in(scene, OrderRange::ALL, texture, viewport_size)
+    }
+
+    fn render_frame_in(
+        &mut self,
+        scene: &Scene,
+        orders: OrderRange,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
@@ -470,6 +495,7 @@ impl MetalRenderer {
         );
         let command_buffer = self.draw_primitives_to_texture(
             scene,
+            orders,
             &mut writer,
             texture,
             viewport_size,
@@ -530,6 +556,18 @@ impl MetalRenderer {
         scene: &Scene,
         size: Size<DevicePixels>,
     ) -> Result<RgbaImage> {
+        self.render_scene_to_image_in(scene, OrderRange::ALL, size)
+    }
+
+    /// [`MetalRenderer::render_scene_to_image`] of the primitives and groups whose order is in
+    /// `orders`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_scene_to_image_in(
+        &mut self,
+        scene: &Scene,
+        orders: OrderRange,
+        size: Size<DevicePixels>,
+    ) -> Result<RgbaImage> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             anyhow::bail!("Invalid size for render_scene_to_image: {:?}", size);
         }
@@ -547,7 +585,7 @@ impl MetalRenderer {
         texture_descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
         let target_texture = self.device.new_texture(&texture_descriptor);
 
-        let command_buffer = self.render_frame(scene, &target_texture, size)?;
+        let command_buffer = self.render_frame_in(scene, orders, &target_texture, size)?;
 
         // On discrete GPUs (non-unified memory), Managed textures require an
         // explicit blit synchronize before the CPU can read back the rendered
@@ -610,6 +648,7 @@ impl MetalRenderer {
     fn draw_primitives_to_texture(
         &mut self,
         scene: &Scene,
+        orders: OrderRange,
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
@@ -622,8 +661,7 @@ impl MetalRenderer {
 
         // A backdrop filter reads what is already drawn, which a drawable that is only a render
         // target can't be asked for. Draw into a texture first, then copy it over.
-        let reads_target = scene
-            .groups
+        let reads_target = scene.groups[group_indices(scene, orders)]
             .iter()
             .any(|group| !group.effect.backdrop_filters.is_empty());
         let readable = texture
@@ -636,6 +674,7 @@ impl MetalRenderer {
             );
             self.encode_scene(
                 scene,
+                orders,
                 command_buffer,
                 &frame,
                 viewport_size,
@@ -649,6 +688,7 @@ impl MetalRenderer {
         } else {
             self.encode_scene(
                 scene,
+                orders,
                 command_buffer,
                 texture,
                 viewport_size,
@@ -671,6 +711,7 @@ impl MetalRenderer {
     fn encode_scene(
         &mut self,
         scene: &Scene,
+        orders: OrderRange,
         command_buffer: &metal::CommandBufferRef,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
@@ -683,6 +724,7 @@ impl MetalRenderer {
         self.group_depth.set(usize::from(in_group));
         let result = self.encode_batches(
             scene,
+            orders,
             command_buffer,
             texture,
             viewport_size,
@@ -698,6 +740,7 @@ impl MetalRenderer {
     fn encode_batches(
         &mut self,
         scene: &Scene,
+        orders: OrderRange,
         command_buffer: &metal::CommandBufferRef,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
@@ -705,6 +748,12 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         path_intermediate: Option<PathIntermediate>,
     ) -> Result<()> {
+        // Nothing to draw, which an overlay above a native surface often is: clear and be done.
+        if scene.batches_in(orders).next().is_none() {
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color)
+                .end_encoding();
+            return Ok(());
+        }
         let instance_bindings = write_instances(scene, writer).with_context(|| {
             format!(
                 "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
@@ -720,13 +769,13 @@ impl MetalRenderer {
 
         // Group textures are drawn before the target's encoder opens, so that compositing a group
         // does not end the encoder: a new one would Load and Store the whole target again.
-        let mut groups = GroupQueue::new(scene.groups.len());
+        let mut groups = GroupQueue::new(scene.groups.len(), group_indices(scene, orders));
         self.prepare_groups(scene, &mut groups, command_buffer, writer)?;
 
         let mut command_encoder =
             new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color);
 
-        for batch in scene.batches() {
+        for batch in scene.batches_in(orders) {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
                     range,
@@ -1943,7 +1992,7 @@ impl MetalRenderer {
     ) -> Result<()> {
         let first = groups.next;
         let mut bytes = 0;
-        while groups.next < scene.groups.len() {
+        while groups.next < groups.end {
             let group = &scene.groups[groups.next];
             bytes += group_texture_bytes(group);
             if bytes > self.group_texture_budget && groups.next > first {
@@ -1975,6 +2024,7 @@ impl MetalRenderer {
             .then(|| self.group_path_intermediate(texture_width, texture_height));
         self.encode_scene(
             &group.scene,
+            OrderRange::ALL,
             command_buffer,
             &content,
             texture_size,
@@ -1994,6 +2044,7 @@ impl MetalRenderer {
                 let texture = self.acquire_texture(texture_width, texture_height);
                 self.encode_scene(
                     glyphs,
+                    OrderRange::ALL,
                     command_buffer,
                     &texture,
                     texture_size,
@@ -2298,13 +2349,17 @@ struct GroupQueue {
     prepared: Vec<Option<PreparedGroup>>,
     /// The first group that is not prepared.
     next: usize,
+    /// One past the last group of the queue: a scene drawn in a range of orders queues only the
+    /// groups in it.
+    end: usize,
 }
 
 impl GroupQueue {
-    fn new(len: usize) -> Self {
+    fn new(len: usize, queued: Range<usize>) -> Self {
         Self {
             prepared: (0..len).map(|_| None).collect(),
-            next: 0,
+            next: queued.start,
+            end: queued.end,
         }
     }
 
@@ -2317,6 +2372,13 @@ impl GroupQueue {
             .take()
             .expect("a group is prepared before it is composited, and composited once")
     }
+}
+
+/// The groups of `scene`, sorted by order, that `orders` holds.
+fn group_indices(scene: &Scene, orders: OrderRange) -> Range<usize> {
+    let start = scene.groups.partition_point(|group| group.order <= orders.after);
+    let end = start + scene.groups[start..].partition_point(|group| group.order <= orders.through);
+    start..end
 }
 
 /// Where paths are rasterized before being copied into a target of the same size.
@@ -6217,5 +6279,67 @@ mod tests {
         let other = matrix.project(31., 31., 0.).unwrap();
         let apart = flattened_first.project(31., 31., 0.).unwrap();
         assert!((other[1] - apart[1]).abs() > 0.5, "{other:?} {apart:?}");
+    }
+
+    fn render_orders(scene: &mut Scene, orders: gpui::OrderRange) -> image::RgbaImage {
+        scene.finish();
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer
+            .renderer
+            .render_scene_to_image_in(
+                scene,
+                orders,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
+            .expect("scene should render")
+    }
+
+    #[test]
+    fn a_range_of_orders_draws_only_the_primitives_in_it() {
+        // Orders: the red quad 1, the green one 2 (it overlaps the red), the blue one 1.
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid(0., 0., 24., 24., 0xff0000));
+        scene.insert_primitive(solid(12., 12., 24., 24., 0x00ff00));
+        scene.insert_primitive(solid(30., 0., 8., 8., 0x0000ff));
+        let below = gpui::OrderRange { after: 0, through: 1 };
+        let above = gpui::OrderRange { after: 1, through: gpui::DrawOrder::MAX };
+        let past = gpui::OrderRange { after: 2, through: gpui::DrawOrder::MAX };
+
+        let image = render_orders(&mut scene, below);
+        assert_color(&image, 4, 4, [255, 0, 0]);
+        assert_color(&image, 34, 4, [0, 0, 255]);
+        assert_color(&image, 18, 18, [255, 0, 0]);
+        assert!(is_cleared(&image, 30, 30));
+
+        let image = render_orders(&mut scene, above);
+        assert_color(&image, 30, 30, [0, 255, 0]);
+        assert_color(&image, 18, 18, [0, 255, 0]);
+        assert!(is_cleared(&image, 4, 4));
+        assert!(is_cleared(&image, 34, 4));
+
+        let image = render_orders(&mut scene, past);
+        assert!(is_cleared(&image, 30, 30));
+        assert!(is_cleared(&image, 4, 4));
+        let image = render_orders(&mut scene, gpui::OrderRange::ALL);
+        assert_color(&image, 4, 4, [255, 0, 0]);
+        assert_color(&image, 30, 30, [0, 255, 0]);
+    }
+
+    #[test]
+    fn a_range_of_orders_draws_the_effect_groups_in_it_and_not_the_others() {
+        // Orders: the red quad 1, the group over it 2, the blue quad over the group 3.
+        let mut scene = groups_scene();
+        scene.insert_primitive(solid(0., 0., 24., 24., 0xff0000));
+        group(&mut scene, GroupEffect { opacity: 1., ..GroupEffect::default() }, &[solid(8., 8., 24., 24., 0x00ff00)]);
+        scene.insert_primitive(solid(16., 16., 24., 24., 0x0000ff));
+        let only_the_group = gpui::OrderRange { after: 1, through: 2 };
+
+        let image = render_orders(&mut scene, only_the_group);
+        assert_color(&image, 12, 12, [0, 255, 0]);
+        assert!(is_cleared(&image, 2, 2));
+        assert!(is_cleared(&image, 36, 36));
+        let image = render_orders(&mut scene, gpui::OrderRange { after: 2, through: gpui::DrawOrder::MAX });
+        assert_color(&image, 36, 36, [0, 0, 255]);
+        assert!(is_cleared(&image, 12, 12));
     }
 }
