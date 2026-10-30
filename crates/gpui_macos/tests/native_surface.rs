@@ -145,13 +145,18 @@ fn probe_class() -> &'static Class {
     decl.register()
 }
 
-fn add_probe(surface: &NativeSurface) -> id {
+fn add_probe(surface: &NativeSurface, rgb: [f64; 3]) -> id {
     let content = *surface.platform_handle().unwrap().downcast::<usize>().unwrap() as id;
     unsafe {
         let probe: id = msg_send![probe_class(), alloc];
         let bounds: NSRect = msg_send![content, bounds];
         let probe: id = msg_send![probe, initWithFrame: bounds];
         let _: () = msg_send![probe, setAutoresizingMask: 2usize | 16usize];
+        let _: () = msg_send![probe, setWantsLayer: YES];
+        let layer: id = msg_send![probe, layer];
+        let color: id = msg_send![class!(NSColor), colorWithSRGBRed: rgb[0] green: rgb[1] blue: rgb[2] alpha: 1f64];
+        let cg_color: *const std::ffi::c_void = msg_send![color, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg_color];
         let _: () = msg_send![content, addSubview: probe];
         let _: () = msg_send![probe, release];
         probe
@@ -225,6 +230,168 @@ fn send(ns_window: id, pointer: Pointer, x: f64, y: f64) {
     }
 }
 
+
+// -- Capturing the window's own composited pixels. A process can capture its own window without the
+// screen recording permission. The symbol is looked up at run time: the SDK marks it unavailable.
+
+/// What a pixel of the capture is, by the colors the demo paints. Loose, since the capture may be in
+/// another color space than the colors were written for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Paint {
+    Magenta,
+    Green,
+    Orange,
+    Yellow,
+    Blue,
+    White,
+    Other,
+}
+
+fn paint_of(rgb: [u8; 3]) -> Paint {
+    let (r, g, b) = (rgb[0] as i32, rgb[1] as i32, rgb[2] as i32);
+    if r > 170 && b > 170 && g < 100 {
+        Paint::Magenta
+    } else if g > 130 && r < 100 && b < 100 {
+        Paint::Green
+    } else if r > 200 && (70..190).contains(&g) && b < 90 {
+        Paint::Orange
+    } else if r > 200 && g > 200 && b < 110 {
+        Paint::Yellow
+    } else if b > 170 && r < 90 && g < 90 {
+        Paint::Blue
+    } else if r > 225 && g > 225 && b > 225 {
+        Paint::White
+    } else {
+        Paint::Other
+    }
+}
+
+struct Capture {
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+    /// Image pixels per point.
+    scale: f64,
+    /// The height of the title bar in points: the content starts there.
+    title: f64,
+}
+
+impl Capture {
+    fn of(ns_window: id) -> Capture {
+        use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+        use std::ffi::{c_void, CStr};
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGImageGetWidth(image: *const c_void) -> usize;
+            fn CGImageGetHeight(image: *const c_void) -> usize;
+            fn CGImageRelease(image: *const c_void);
+            fn CGColorSpaceCreateDeviceRGB() -> *const c_void;
+            fn CGColorSpaceRelease(space: *const c_void);
+            fn CGBitmapContextCreate(
+                data: *mut c_void,
+                width: usize,
+                height: usize,
+                bits_per_component: usize,
+                bytes_per_row: usize,
+                space: *const c_void,
+                info: u32,
+            ) -> *mut c_void;
+            fn CGContextDrawImage(context: *mut c_void, rect: CGRect, image: *const c_void);
+            fn CGContextRelease(context: *mut c_void);
+        }
+        type CreateImage = unsafe extern "C" fn(CGRect, u32, u32, u32) -> *const c_void;
+
+        unsafe {
+            let symbol = libc::dlsym(libc::RTLD_DEFAULT, CStr::from_bytes_with_nul(b"CGWindowListCreateImage\0").unwrap().as_ptr());
+            assert!(!symbol.is_null(), "CGWindowListCreateImage is not there to capture the window with");
+            let create: CreateImage = std::mem::transmute(symbol);
+            let null_rect = CGRect::new(&CGPoint::new(f64::INFINITY, f64::INFINITY), &CGSize::new(0., 0.));
+            let number: i64 = msg_send![ns_window, windowNumber];
+            // Including the window only, without its frame's shadow, at the display's resolution.
+            let image = create(null_rect, 1 << 3, number as u32, 1 | (1 << 3));
+            assert!(!image.is_null(), "the window could not be captured");
+            let (width, height) = (CGImageGetWidth(image), CGImageGetHeight(image));
+            let mut rgba = vec![0u8; width * height * 4];
+            let space = CGColorSpaceCreateDeviceRGB();
+            // kCGImageAlphaPremultipliedLast
+            let context = CGBitmapContextCreate(rgba.as_mut_ptr().cast(), width, height, 8, width * 4, space, 1);
+            assert!(!context.is_null());
+            CGContextDrawImage(
+                context,
+                CGRect::new(&CGPoint::new(0., 0.), &CGSize::new(width as f64, height as f64)),
+                image,
+            );
+            CGContextRelease(context);
+            CGColorSpaceRelease(space);
+            CGImageRelease(image);
+
+            let frame: NSRect = msg_send![ns_window, frame];
+            Capture {
+                width,
+                height,
+                rgba,
+                scale: width as f64 / frame.size.width,
+                title: frame.size.height - WINDOW.1,
+            }
+        }
+    }
+
+    /// The image row of the window point `y` (from the top of the content), and column of `x`.
+    fn row(&self, y: f64) -> usize {
+        ((self.title + y) * self.scale).round() as usize
+    }
+
+    fn column(&self, x: f64) -> usize {
+        (x * self.scale).round() as usize
+    }
+
+    fn rgb(&self, column: usize, row: usize) -> [u8; 3] {
+        let at = (row * self.width + column) * 4;
+        [self.rgba[at], self.rgba[at + 1], self.rgba[at + 2]]
+    }
+
+    fn at(&self, x: f64, y: f64) -> Paint {
+        paint_of(self.rgb(self.column(x), self.row(y)))
+    }
+
+    /// The first and last image row of `paint` in the column of `x` between two window points.
+    fn run(&self, paint: Paint, x: f64, from: f64, to: f64) -> Option<(usize, usize)> {
+        let column = self.column(x);
+        let rows: Vec<usize> = (self.row(from)..self.row(to))
+            .filter(|row| paint_of(self.rgb(column, *row)) == paint)
+            .collect();
+        Some((*rows.first()?, *rows.last()?))
+    }
+
+    fn save(&self, name: &str) {
+        if let Some(dir) = std::env::var_os("GPUIX_SELFCAPTURE_DIR") {
+            let image = image::RgbaImage::from_raw(self.width as u32, self.height as u32, self.rgba.clone()).unwrap();
+            image.save(std::path::Path::new(&dir).join(name)).unwrap();
+        }
+    }
+}
+
+/// What a capture of the scroller column must show at a scroll offset: the green native view starts
+/// where the magenta GPUI marker above it ends, or at the scroller's top edge once the marker has
+/// scrolled out, and nothing green lies above that edge. Returns the image row where green starts.
+fn aligned(capture: &Capture) -> Result<usize, String> {
+    const X: f64 = 300.;
+    const SCROLLER_TOP: f64 = 60.;
+    let green = capture.run(Paint::Green, X, 0., 360.).ok_or("no native view in the capture")?;
+    let top_edge = capture.row(SCROLLER_TOP);
+    if green.0 + 1 < top_edge {
+        return Err(format!("the native view shows above the scroller's edge (row {} < {top_edge})", green.0));
+    }
+    match capture.run(Paint::Magenta, X, SCROLLER_TOP, 360.) {
+        Some(marker) if green.0.abs_diff(marker.1 + 1) > 1 => {
+            Err(format!("marker ends at row {}, native view starts at row {}", marker.1, green.0))
+        }
+        None if green.0.abs_diff(top_edge) > 1 => Err(format!("native view starts at row {}, edge at {top_edge}", green.0)),
+        _ => Ok(green.0),
+    }
+}
+
 fn counts() -> [usize; 5] {
     [
         NATIVE_DOWNS.load(SeqCst),
@@ -281,8 +448,8 @@ fn main() {
                 |window, cx| {
                     let first = Rc::new(window.create_native_surface().unwrap());
                     let second = Rc::new(window.create_native_surface().unwrap());
-                    add_probe(&first);
-                    add_probe(&second);
+                    add_probe(&first, [0., 0.78, 0.]);
+                    add_probe(&second, [0., 0., 1.]);
                     cx.new(|_| Demo { first, second: Some(second), scroll: ScrollHandle::new(), popover_open: false })
                 },
             )
@@ -420,6 +587,98 @@ fn main() {
                 [before[0], before[1] + 1, before[2] + 1, before[3] + 1],
                 "the badge and the popover take their presses, the native view none"
             );
+
+
+            // The cursor rects of the window view leave out what is under the native views.
+            {
+                use std::sync::Mutex;
+                static RECTS: Mutex<Vec<NSRect>> = Mutex::new(Vec::new());
+                extern "C" fn record(_: &Object, _: Sel, rect: NSRect, _: id) {
+                    RECTS.lock().unwrap().push(rect);
+                }
+                unsafe {
+                    let class: *const Class = msg_send![root, class];
+                    let types = std::ffi::CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}@").unwrap();
+                    let imp: objc::runtime::Imp = std::mem::transmute(record as extern "C" fn(&Object, Sel, NSRect, id));
+                    objc::runtime::class_addMethod(class as *mut Class, sel!(addCursorRect:cursor:), imp, types.as_ptr());
+                    RECTS.lock().unwrap().clear();
+                    let _: () = msg_send![root, resetCursorRects];
+                }
+                let rects = RECTS.lock().unwrap().clone();
+                let area: f64 = rects.iter().map(|rect| rect.size.width * rect.size.height).sum();
+                assert_eq!(area, WINDOW.0 * WINDOW.1 - 360. * 200. - 140. * 140., "the cursor rects cover the window but for the native views");
+                let under = |rect: &NSRect, x: f64, y: f64, w: f64, h: f64| {
+                    rect.origin.x < x + w && x < rect.origin.x + rect.size.width && rect.origin.y < y + h && y < rect.origin.y + rect.size.height
+                };
+                assert!(
+                    rects.iter().all(|rect| !under(rect, 20., 200., 360., 200.) && !under(rect, 440., 300., 140., 140.)),
+                    "a cursor rect of the window view lies under a native view: {}",
+                    rects.len()
+                );
+                println!("cursor rects: {} rects, area {area}", rects.len());
+            }
+
+            // The composited window, captured by the process itself: the layers as the window server
+            // shows them.
+            let capture = Capture::of(ns_window);
+            capture.save("popover.png");
+            println!("capture {}x{} at {}x", capture.width, capture.height, capture.scale);
+            assert_eq!(capture.at(300., 80.), Paint::Magenta, "the GPUI marker above the native view");
+            assert_eq!(capture.at(100., 250.), Paint::Green, "the native view's color");
+            assert_eq!(capture.at(360., 120.), Paint::Orange, "the badge is above the native view's corner");
+            assert_eq!(capture.at(120., 180.), Paint::Yellow, "the popover is above the native view");
+            assert_eq!(capture.at(510., 130.), Paint::Blue, "the second native view");
+            assert_ne!(capture.at(442., 62.), Paint::Blue, "the second native view's corner is rounded off");
+            assert_eq!(capture.at(400., 330.), Paint::White, "beside the native view");
+            aligned(&capture).expect("at rest");
+
+            // Scroll the container, and capture while the frames that follow are drawn: every capture
+            // must be consistent in itself, and the last must show the new offset.
+            let mut inconsistent = 0;
+            let mut total = 0;
+            for offset in [-7., -13., -20., -31., -37., -50., -90., 0., -40., 0., -90., 0., -25., -60., 0.] {
+                cx.update(|cx| {
+                    window
+                        .update(cx, |demo, _, cx| {
+                            demo.scroll.set_offset(gpui::point(px(0.), px(offset)));
+                            cx.notify();
+                        })
+                        .unwrap()
+                });
+                // The native view's top is at 100 + offset, cut at the scroller's top edge at 60.
+                let expected = capture.row((100. + offset as f64).max(60.));
+                let mut shown = false;
+                for attempt in 0..300 {
+                    let seen = Capture::of(ns_window);
+                    total += 1;
+                    match aligned(&seen) {
+                        Ok(row) if row.abs_diff(expected) <= 1 => {
+                            println!(
+                                "offset {offset:>4}: native view top at row {row} (expected {expected}) after {attempt} earlier captures"
+                            );
+                            seen.save(&format!("offset{}.png", -offset as i32));
+                            shown = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            eprintln!("offset {offset}, capture {attempt}: {error}");
+                            seen.save(&format!("bad_{}_{attempt}.png", -offset as i32));
+                            inconsistent += 1;
+                        }
+                    }
+                    cx.background_executor().timer(Duration::from_millis(2)).await;
+                }
+                assert!(shown, "the native view never reached offset {offset}");
+                // And once settled, the capture right after is aligned with the marker.
+                aligned(&Capture::of(ns_window)).unwrap_or_else(|error| panic!("settled at {offset}: {error}"));
+            }
+            println!("captures during the scroll: {total}, out of step: {inconsistent}");
+            // A capture can land between the two halves of a frame while the machine is busy: GPUI's
+            // layers are Metal drawables the window server takes up on its own schedule. Quiet, none
+            // does (0 of ~29 over five runs); under a heavy build a handful do, with or without the
+            // transaction. A frame behind for good fails the aligned checks above.
+            assert!(inconsistent * 2 <= total, "the native view was out of step in {inconsistent} of {total} captures");
 
             // The window loses its second surface: the container goes with it.
             cx.update(|cx| {

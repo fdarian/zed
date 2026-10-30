@@ -2587,8 +2587,11 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::None => msg_send![class!(NSCursor), arrowCursor],
         };
 
+        // Not under the native views, whose cursor is their own.
         let bounds = NSView::bounds(this as *const Object as id);
-        let _: () = msg_send![this, addCursorRect: bounds cursor: cursor];
+        for region in composition::cursor_regions(&window_state, bounds) {
+            let _: () = msg_send![this, addCursorRect: region cursor: cursor];
+        }
     }
 }
 

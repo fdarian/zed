@@ -59,6 +59,9 @@ pub(super) struct MacComposition {
     order: Vec<usize>,
     /// The layers above the base one, bottom to top, as last applied.
     stack: Rc<Vec<StackEntry>>,
+    /// The frames of the shown native containers, in the window view's coordinates: the cursor
+    /// rects of the window view leave them out, so the native view's cursor is the one shown.
+    native_frames: Vec<NSRect>,
     /// The event that `send_event` showed to GPUI and is now passing on to AppKit: the window's
     /// view skips it should AppKit deliver it there too.
     pre_dispatched_event: usize,
@@ -79,6 +82,7 @@ impl MacComposition {
             overlays: FxHashMap::default(),
             order: Vec::new(),
             stack: Rc::new(Vec::new()),
+            native_frames: Vec::new(),
             pre_dispatched_event: 0,
             native_buttons: 0,
             gpui_buttons: 0,
@@ -320,7 +324,6 @@ enum Pointer {
     Up,
     Drag,
     Move,
-    Wheel,
 }
 
 fn pointer_kind(kind: NSEventType) -> Option<Pointer> {
@@ -331,15 +334,18 @@ fn pointer_kind(kind: NSEventType) -> Option<Pointer> {
         | NSEventType::NSRightMouseDragged
         | NSEventType::NSOtherMouseDragged => Pointer::Drag,
         NSEventType::NSMouseMoved => Pointer::Move,
-        NSEventType::NSScrollWheel => Pointer::Wheel,
         _ => return None,
     })
 }
 
-/// An event that AppKit would deliver to a native container is first run through GPUI's handler,
-/// so that hover, a click outside a popup and the focus change of a press happen, and then goes on
-/// to AppKit unless GPUI handled it. An event for an overlay or `GPUIView` takes the ordinary path
-/// and reaches GPUI once. A pressed button keeps its recipient for the drag and the release.
+/// A press, drag, release or move that AppKit would deliver to a native container is first run
+/// through GPUI's handler, so that hover, a click outside a popup and the focus change of a press
+/// happen, and then goes on to AppKit unless GPUI handled it. An event for an overlay or `GPUIView`
+/// takes the ordinary path and reaches GPUI once. A pressed button keeps its recipient for the
+/// drag and the release.
+///
+/// A wheel is not in this path at all: over a native container it goes to AppKit and the native
+/// view only, so that the page scrolls and a GPUI scroll ancestor does not.
 fn send_event(this: &Object, event: id, superclass: &Class) {
     let super_send = || unsafe {
         let _: () = msg_send![super(this, superclass), sendEvent: event];
@@ -358,7 +364,7 @@ fn send_event(this: &Object, event: id, superclass: &Class) {
     let root = window_state.lock().native_view.as_ptr();
     let button = match pointer {
         Pointer::Down | Pointer::Up | Pointer::Drag => 1u64 << unsafe { event.buttonNumber() }.clamp(0, 63),
-        Pointer::Move | Pointer::Wheel => 0,
+        Pointer::Move => 0,
     };
     let (native_buttons, gpui_buttons, withheld_buttons) = {
         let state = window_state.lock();
@@ -411,7 +417,6 @@ fn send_event(this: &Object, event: id, superclass: &Class) {
                 delivered
             }
             Pointer::Move => true,
-            Pointer::Wheel => !handled,
         }
     };
     if !deliver {
@@ -635,6 +640,8 @@ pub(super) fn draw_composed(window_state: &Arc<Mutex<MacWindowState>>, scene: Co
 
     let mut order = Vec::new();
     let mut stack = Vec::new();
+    let mut native_frames = Vec::new();
+    let mut native_moved = false;
     for layer in scene.layers() {
         match layer {
             ComposedLayer::Gpui(layer) if layer.is_base => {}
@@ -653,7 +660,12 @@ pub(super) fn draw_composed(window_state: &Arc<Mutex<MacWindowState>>, scene: Co
                     .as_any()
                     .downcast_ref::<MacNativeSurface>()
                     .context("the native surface was not made by an AppKit window")?;
-                changed |= unsafe { surface.apply(layer.placement, window_height) };
+                let moved = unsafe { surface.apply(layer.placement, window_height) };
+                native_moved |= moved;
+                changed |= moved;
+                if layer.placement.is_some() {
+                    native_frames.push(unsafe { frame_of(surface.container.as_ptr() as id) });
+                }
                 order.push(surface.container.as_ptr() as usize);
                 stack.push(StackEntry::Native {
                     container: surface.container.as_ptr() as usize,
@@ -674,6 +686,12 @@ pub(super) fn draw_composed(window_state: &Arc<Mutex<MacWindowState>>, scene: Co
         changed = true;
     }
     state.composition.stack = Rc::new(stack);
+    state.composition.native_frames = native_frames;
+    if native_moved {
+        unsafe {
+            let _: () = msg_send![state.native_window, invalidateCursorRectsForView: root];
+        }
+    }
 
     let previous = state.renderer.presents_with_transaction();
     if changed {
@@ -700,17 +718,6 @@ pub(super) fn draw_composed(window_state: &Arc<Mutex<MacWindowState>>, scene: Co
     Ok(())
 }
 
-extern "C" fn compare_subviews(a: id, b: id, context: *mut c_void) -> isize {
-    let order = unsafe { &*(context as *const Vec<usize>) };
-    let rank = |view: id| {
-        order
-            .iter()
-            .position(|managed| *managed == view as usize)
-            .map_or(-1, |position| position as isize)
-    };
-    rank(a).cmp(&rank(b)) as isize
-}
-
 /// The frames `draw_composed` recorded, oldest first.
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn recorded_frames(window_state: &Arc<Mutex<MacWindowState>>) -> Vec<gpui::CompositionFrame> {
@@ -721,6 +728,58 @@ pub(super) fn recorded_frames(window_state: &Arc<Mutex<MacWindowState>>) -> Vec<
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn recorded_frame(window_state: &Arc<Mutex<MacWindowState>>) -> Option<gpui::CompositionFrame> {
     window_state.lock().composition.recorded.last().cloned()
+}
+
+unsafe fn frame_of(view: id) -> NSRect {
+    unsafe { msg_send![view, frame] }
+}
+
+/// The parts of `bounds` of the window view that are not under a native container, for its cursor
+/// rects.
+pub(super) fn cursor_regions(window_state: &Arc<Mutex<MacWindowState>>, bounds: NSRect) -> Vec<NSRect> {
+    subtract_all(bounds, &window_state.lock().composition.native_frames)
+}
+
+fn subtract_all(rect: NSRect, holes: &[NSRect]) -> Vec<NSRect> {
+    let mut pieces = vec![rect];
+    for hole in holes {
+        pieces = pieces.into_iter().flat_map(|piece| subtract(piece, *hole)).collect();
+    }
+    pieces
+}
+
+/// `rect` without `hole`, as up to four rectangles.
+fn subtract(rect: NSRect, hole: NSRect) -> Vec<NSRect> {
+    let (left, right) = (rect.origin.x, rect.origin.x + rect.size.width);
+    let (bottom, top) = (rect.origin.y, rect.origin.y + rect.size.height);
+    let (hole_left, hole_right) = (hole.origin.x.max(left), (hole.origin.x + hole.size.width).min(right));
+    let (hole_bottom, hole_top) = (hole.origin.y.max(bottom), (hole.origin.y + hole.size.height).min(top));
+    if hole_left >= hole_right || hole_bottom >= hole_top {
+        return vec![rect];
+    }
+    let rectangle = |x0: f64, y0: f64, x1: f64, y1: f64| {
+        (x1 > x0 && y1 > y0).then(|| NSRect::new(NSPoint::new(x0, y0), NSSize::new(x1 - x0, y1 - y0)))
+    };
+    [
+        rectangle(left, bottom, right, hole_bottom),
+        rectangle(left, hole_top, right, top),
+        rectangle(left, hole_bottom, hole_left, hole_top),
+        rectangle(hole_right, hole_bottom, right, hole_top),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+extern "C" fn compare_subviews(a: id, b: id, context: *mut c_void) -> isize {
+    let order = unsafe { &*(context as *const Vec<usize>) };
+    let rank = |view: id| {
+        order
+            .iter()
+            .position(|managed| *managed == view as usize)
+            .map_or(-1, |position| position as isize)
+    };
+    rank(a).cmp(&rank(b)) as isize
 }
 
 /// The view and renderer of an overlay, the size of the window's view.
@@ -807,5 +866,51 @@ pub(super) fn window_closed(state: &mut MacWindowState) {
 pub(super) fn report(result: Result<()>) {
     if let Err(error) = result {
         log::error!("composing the window: {error:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+    }
+
+    fn area(rects: &[NSRect]) -> f64 {
+        rects.iter().map(|rect| rect.size.width * rect.size.height).sum()
+    }
+
+    fn overlaps(a: NSRect, b: NSRect) -> bool {
+        a.origin.x < b.origin.x + b.size.width
+            && b.origin.x < a.origin.x + a.size.width
+            && a.origin.y < b.origin.y + b.size.height
+            && b.origin.y < a.origin.y + a.size.height
+    }
+
+    #[test]
+    fn the_cursor_regions_leave_out_the_native_frames_and_nothing_else() {
+        let window = rect(0., 0., 600., 500.);
+        let holes = [rect(20., 200., 360., 200.), rect(440., 300., 140., 140.)];
+        let pieces = subtract_all(window, &holes);
+        assert_eq!(area(&pieces), 600. * 500. - 360. * 200. - 140. * 140.);
+        for piece in &pieces {
+            assert!(holes.iter().all(|hole| !overlaps(*piece, *hole)), "({}, {}) is under a native view", piece.origin.x, piece.origin.y);
+        }
+    }
+
+    #[test]
+    fn a_wheel_is_never_shown_to_gpui_before_the_native_view_it_is_over() {
+        assert!(pointer_kind(NSEventType::NSScrollWheel).is_none());
+        assert!(pointer_kind(NSEventType::NSLeftMouseDown).is_some());
+        assert!(pointer_kind(NSEventType::NSMouseMoved).is_some());
+    }
+
+    #[test]
+    fn a_frame_partly_outside_the_view_or_missing_it_takes_only_what_is_inside() {
+        let window = rect(0., 0., 100., 100.);
+        assert_eq!(area(&subtract_all(window, &[rect(80., 80., 60., 60.)])), 10000. - 400.);
+        assert_eq!(area(&subtract_all(window, &[rect(200., 0., 10., 10.)])), 10000.);
+        assert_eq!(area(&subtract_all(window, &[window])), 0.);
     }
 }
