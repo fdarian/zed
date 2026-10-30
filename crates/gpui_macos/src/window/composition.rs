@@ -620,13 +620,30 @@ pub(super) fn create_native_surface(
 /// A frame that moves a native view presents its drawables with the transaction the views change
 /// in, so a page and the GPUI content around it appear together.
 pub(super) fn draw_composed(window_state: &Arc<Mutex<MacWindowState>>, scene: ComposedScene<'_>) -> Result<()> {
+    let has_native = scene.layers().iter().any(|layer| matches!(layer, ComposedLayer::Native(_)));
+    draw_composed_locked(window_state, &scene)?;
+    if has_native {
+        // The transaction the frame's views and drawables are in goes to the window server now, not
+        // when this turn of the run loop ends (a turn that may be a long one, with JS in it).
+        // After a scroll, with eight busy processes, a capture found the page a frame ahead of the GPUI
+        // content beside it in 28 of 160 captures without this, and in 2 with it (on an idle machine
+        // 0 and 1). It takes AppKit into the views, which take the lock of the window: it cannot be
+        // flushed under it.
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), flush];
+        }
+    }
+    Ok(())
+}
+
+fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &ComposedScene<'_>) -> Result<()> {
     let mut guard = window_state.lock();
     let state = &mut *guard;
     let root = state.native_view.as_ptr() as id;
     let window_height = f64::from(state.content_size().height.as_f32());
     let mut changed = false;
     #[cfg(any(test, feature = "test-support"))]
-    state.composition.recorded.push(gpui::CompositionFrame::record(&scene));
+    state.composition.recorded.push(gpui::CompositionFrame::record(scene));
 
     let live: FxHashSet<CompositionSurfaceId> = scene
         .layers()
