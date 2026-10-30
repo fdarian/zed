@@ -3412,6 +3412,528 @@ mod tests {
         assert_eq!(glyphs[2].2.halt, Halt::None);
     }
 
+    /// The glyph of `character` in Apple Color Emoji, which cannot be asked for by name, only fallen back to.
+    fn emoji_glyph(fonts: &MacTextSystem, character: char) -> (gpui::FontId, GlyphId) {
+        let text = character.to_string();
+        let font_id = fonts.font_id(&font("Helvetica Neue")).unwrap();
+        let run = FontRun { len: text.len(), font_id, font_size: None, line_height: None, normal_line_height: false };
+        let layout = fonts.layout_line(&text, px(13.), &[run], 1.);
+        let emoji = &layout.runs[0];
+        assert!(fonts.0.read().is_emoji(emoji.font_id), "{character} is not set in Apple Color Emoji");
+        (emoji.font_id, emoji.glyphs[0].id)
+    }
+
+    fn emoji_params(
+        (font_id, glyph_id): (gpui::FontId, GlyphId),
+        font_size: f32,
+        scale_factor: f32,
+        transform: gpui::GlyphTransform,
+    ) -> RenderGlyphParams {
+        RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: px(font_size),
+            subpixel_variant: Default::default(),
+            scale_factor,
+            is_emoji: true,
+            subpixel_rendering: false,
+            luminance_bucket: 0,
+            font_smoothing: FontSmoothing::Auto,
+            transform,
+        }
+    }
+
+    fn rotation_matrix(degrees: f32) -> [[f32; 2]; 2] {
+        let radians = degrees.to_radians();
+        [[radians.cos(), -radians.sin()], [radians.sin(), radians.cos()]]
+    }
+
+    /// Where the opaque part of a rasterized emoji is, in device pixels from the glyph's origin
+    /// (y down): the box of the pixels at least half covered, and the centroid of the coverage.
+    #[derive(Debug, Clone, Copy)]
+    struct Ink {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        centroid: (f32, f32),
+    }
+
+    impl Ink {
+        fn width(&self) -> f32 {
+            self.right - self.left
+        }
+
+        fn height(&self) -> f32 {
+            self.bottom - self.top
+        }
+    }
+
+    fn emoji_ink(fonts: &MacTextSystem, params: &RenderGlyphParams) -> (gpui::Bounds<gpui::DevicePixels>, Ink) {
+        let bounds = fonts.glyph_raster_bounds(params).unwrap();
+        let (size, bytes) = fonts.rasterize_glyph(params, bounds).unwrap();
+        let (width, height) = (size.width.0 as usize, size.height.0 as usize);
+        let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        let (mut weight, mut sum_x, mut sum_y) = (0f32, 0f32, 0f32);
+        for y in 0..height {
+            for x in 0..width {
+                let alpha = bytes[(y * width + x) * 4 + 3];
+                let (px_x, px_y) = (bounds.origin.x.0 as f32 + x as f32, bounds.origin.y.0 as f32 + y as f32);
+                if alpha >= 128 {
+                    left = left.min(px_x);
+                    top = top.min(px_y);
+                    right = right.max(px_x + 1.);
+                    bottom = bottom.max(px_y + 1.);
+                }
+                let coverage = alpha as f32 / 255.;
+                weight += coverage;
+                sum_x += coverage * (px_x + 0.5);
+                sum_y += coverage * (px_y + 0.5);
+            }
+        }
+        assert!(weight > 1., "the emoji is drawn: {params:?}");
+        (bounds, Ink { left, top, right, bottom, centroid: (sum_x / weight, sum_y / weight) })
+    }
+
+    /// An emoji is drawn at the device size, which Chrome sets and which Apple Color Emoji draws larger than a plain
+    /// scale of the logical size would give: 16 wide at 13 px, 20 at 16 and 24 at 24, and at a scale factor of 2 the
+    /// emoji of the device size 26 (26 wide, not 16 scaled by 2). The ink is as wide as the advance of the layout, and
+    /// the same at one device size however it is made up. This pins the raster of an upright emoji, which holds no
+    /// transform.
+    #[test]
+    fn test_an_upright_emoji_is_drawn_at_the_device_size() {
+        let fonts = MacTextSystem::new();
+        let glyph = emoji_glyph(&fonts, '\u{1F534}');
+        for (font_size, scale_factor, device_size, width) in
+            [(13., 1., 13., 16.), (13., 2., 26., 26.), (26., 1., 26., 26.), (16., 1., 16., 20.), (24., 1., 24., 24.)]
+        {
+            let params = emoji_params(glyph, font_size, scale_factor, gpui::GlyphTransform::IDENTITY);
+            let (bounds, ink) = emoji_ink(&fonts, &params);
+            let advance = fonts.glyph_advance(glyph.0, glyph.1, px(font_size), scale_factor).unwrap() as f32 * scale_factor;
+            let what = format!("{font_size} x{scale_factor} (device size {device_size})");
+            assert_eq!((ink.width(), ink.height()), (width, width), "{what}");
+            assert_eq!(advance, width, "{what}");
+            // The bounds hold the ink.
+            assert!(bounds.origin.x.0 as f32 <= ink.left && ink.right <= (bounds.origin.x.0 + bounds.size.width.0) as f32, "{what}");
+            assert!(bounds.origin.y.0 as f32 <= ink.top && ink.bottom <= (bounds.origin.y.0 + bounds.size.height.0) as f32, "{what}");
+        }
+        let at = |font_size, scale_factor| {
+            let params = emoji_params(glyph, font_size, scale_factor, gpui::GlyphTransform::IDENTITY);
+            (fonts.glyph_raster_bounds(&params).unwrap(), fonts.rasterize_glyph(&params, fonts.glyph_raster_bounds(&params).unwrap()).unwrap().1)
+        };
+        assert!(at(13., 2.) == at(26., 1.), "the same device size is the same raster");
+    }
+
+    /// An emoji under a 2D transform is rasterized through the matrix at the device size and lands where the upright
+    /// one, turned or scaled around the glyph's origin, would: the box and centroid of its ink are the upright ones
+    /// moved by the matrix (a disc stays a disc turned, and an ellipse scaled).
+    #[test]
+    fn test_an_emoji_rasterized_through_a_2d_transform_is_the_upright_one_transformed() {
+        let fonts = MacTextSystem::new();
+        let glyph = emoji_glyph(&fonts, '\u{1F534}');
+        let matrices: [(&str, [[f32; 2]; 2]); 7] = [
+            ("rotate 30", rotation_matrix(30.)),
+            ("rotate 90", rotation_matrix(90.)),
+            ("rotate 180", rotation_matrix(180.)),
+            ("rotate -45", rotation_matrix(-45.)),
+            ("scale 1.5", [[1.5, 0.], [0., 1.5]]),
+            ("scale 0.5", [[0.5, 0.], [0., 0.5]]),
+            ("scale 2 by 0.75", [[2., 0.], [0., 0.75]]),
+        ];
+        let tolerance = 1.25;
+        for scale_factor in [1., 2.] {
+            let upright = emoji_params(glyph, 16., scale_factor, gpui::GlyphTransform::IDENTITY);
+            let (upright_bounds, ink) = emoji_ink(&fonts, &upright);
+            let (a, b) = (ink.width() / 2., ink.height() / 2.);
+            let center = ((ink.left + ink.right) / 2., (ink.top + ink.bottom) / 2.);
+            for (name, linear) in matrices {
+                let params = emoji_params(glyph, 16., scale_factor, gpui::GlyphTransform::quantize(linear));
+                let (bounds, got) = emoji_ink(&fonts, &params);
+                let moved = |(x, y): (f32, f32)| {
+                    (linear[0][0] * x + linear[0][1] * y, linear[1][0] * x + linear[1][1] * y)
+                };
+                let center = moved(center);
+                let half_width = ((linear[0][0] * a).powi(2) + (linear[0][1] * b).powi(2)).sqrt();
+                let half_height = ((linear[1][0] * a).powi(2) + (linear[1][1] * b).powi(2)).sqrt();
+                let expected = [center.0 - half_width, center.1 - half_height, center.0 + half_width, center.1 + half_height];
+                let measured = [got.left, got.top, got.right, got.bottom];
+                let expected_centroid = moved(ink.centroid);
+                println!("x{scale_factor} {name}: expected {expected:?} ink {measured:?}; centroid {expected_centroid:?} against {:?}; bounds {bounds:?}", got.centroid);
+                for (side, (measured, expected)) in ["left", "top", "right", "bottom"].iter().zip(measured.iter().zip(expected)) {
+                    assert!(
+                        (measured - expected).abs() <= tolerance,
+                        "x{scale_factor} {name}: {side} of the ink {measured}, expected {expected}"
+                    );
+                }
+                assert!(
+                    (got.centroid.0 - expected_centroid.0).abs() <= tolerance && (got.centroid.1 - expected_centroid.1).abs() <= tolerance,
+                    "x{scale_factor} {name}: centroid {:?}, expected {expected_centroid:?}",
+                    got.centroid
+                );
+                // The bounds of the raster are those of the upright emoji moved by the matrix, to a pixel or two:
+                // they hold all the ink.
+                let corners = [
+                    (upright_bounds.origin.x.0, upright_bounds.origin.y.0),
+                    (upright_bounds.origin.x.0 + upright_bounds.size.width.0, upright_bounds.origin.y.0),
+                    (upright_bounds.origin.x.0, upright_bounds.origin.y.0 + upright_bounds.size.height.0),
+                    (upright_bounds.origin.x.0 + upright_bounds.size.width.0, upright_bounds.origin.y.0 + upright_bounds.size.height.0),
+                ]
+                .map(|(x, y)| moved((x as f32, y as f32)));
+                let hull = [
+                    corners.iter().map(|corner| corner.0).fold(f32::MAX, f32::min),
+                    corners.iter().map(|corner| corner.1).fold(f32::MAX, f32::min),
+                    corners.iter().map(|corner| corner.0).fold(f32::MIN, f32::max),
+                    corners.iter().map(|corner| corner.1).fold(f32::MIN, f32::max),
+                ];
+                let raster = [
+                    bounds.origin.x.0 as f32,
+                    bounds.origin.y.0 as f32,
+                    (bounds.origin.x.0 + bounds.size.width.0) as f32,
+                    (bounds.origin.y.0 + bounds.size.height.0) as f32,
+                ];
+                for (side, (raster, hull)) in ["left", "top", "right", "bottom"].iter().zip(raster.iter().zip(hull)) {
+                    assert!(
+                        (raster - hull).abs() <= 2.5,
+                        "x{scale_factor} {name}: {side} of the raster bounds {raster}, the upright bounds moved give {hull}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A grid of how much of each pixel an emoji covers, as the headless Metal renderer draws its sprite of the
+    /// tile of `params`: `origin` is where the sprite's corner is in its own space, `tile_scale` how big a pixel of
+    /// the tile is there, and `transformation` the matrix the sprite is drawn through, in a window of `SIDE` pixels.
+    const SIDE: i32 = 160;
+
+    fn drawn_emoji(
+        fonts: &MacTextSystem,
+        params: &RenderGlyphParams,
+        side: i32,
+        tile_scale: f32,
+        transformation: gpui::TransformationMatrix,
+        at: (f32, f32),
+    ) -> Vec<Vec<f32>> {
+        use gpui::{
+            AtlasKey, ContentMask, DevicePixels, PlatformHeadlessRenderer, PolychromeSprite, ScaledPixels, Scene,
+            point,
+        };
+        use gpui_apple::metal_renderer::MetalHeadlessRenderer;
+
+        let mut renderer = MetalHeadlessRenderer::new();
+        let bounds = fonts.glyph_raster_bounds(params).unwrap();
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(&AtlasKey::Glyph(params.clone()), &mut || {
+                let (size, bytes) = fonts.rasterize_glyph(params, bounds)?;
+                Ok(Some((size, bytes.into())))
+            })
+            .unwrap()
+            .unwrap();
+        let scaled = |pixels: f32| ScaledPixels(pixels * tile_scale);
+        let mut scene = Scene::default();
+        scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            nearest_neighbor: false.into(),
+            grayscale: false.into(),
+            opacity: 1.,
+            bounds: gpui::Bounds {
+                origin: point(scaled(bounds.origin.x.0 as f32) + ScaledPixels(at.0), scaled(bounds.origin.y.0 as f32) + ScaledPixels(at.1)),
+                size: gpui::size(scaled(tile.bounds.size.width.0 as f32), scaled(tile.bounds.size.height.0 as f32)),
+            },
+            content_mask: ContentMask {
+                bounds: gpui::Bounds {
+                    origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size: gpui::size(ScaledPixels(side as f32), ScaledPixels(side as f32)),
+                },
+                ..Default::default()
+            },
+            corner_radii: Default::default(),
+            corner_radii_y: Default::default(),
+            tile,
+            transformation,
+            local_clip: ContentMask::unbounded(),
+            clip_transformation: gpui::TransformationMatrix::unit(),
+        });
+        scene.finish();
+        let image = renderer
+            .render_scene_to_image(&scene, gpui::size(DevicePixels(side), DevicePixels(side)))
+            .unwrap();
+        // The sprite is drawn over black: the brightest channel of a pixel against the brightest there is.
+        let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[..3].iter().copied().max().unwrap() as f32;
+        let pixels: Vec<(u32, u32)> = (0..side as u32).flat_map(|y| (0..side as u32).map(move |x| (x, y))).collect();
+        let solid = pixels.iter().map(|(x, y)| brightness(*x, *y)).fold(0., f32::max);
+        assert!(solid > 100., "the emoji is drawn: {solid}");
+        (0..side as u32)
+            .map(|y| (0..side as u32).map(|x| brightness(x, y) / solid).collect())
+            .collect()
+    }
+
+    /// The box of the pixels at least half covered, the centroid and the sharpness of the edge (the squared steps of
+    /// coverage between neighbours over the ink) of a grid from [`drawn_emoji`], in the pixels of the window.
+    fn measure(grid: &[Vec<f32>]) -> (Ink, f32) {
+        let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        let (mut ink, mut edge, mut sum_x, mut sum_y) = (0f32, 0f32, 0f32, 0f32);
+        for (y, row) in grid.iter().enumerate() {
+            for (x, coverage) in row.iter().enumerate() {
+                if *coverage >= 0.5 {
+                    left = left.min(x as f32);
+                    top = top.min(y as f32);
+                    right = right.max(x as f32 + 1.);
+                    bottom = bottom.max(y as f32 + 1.);
+                }
+                ink += coverage;
+                sum_x += coverage * (x as f32 + 0.5);
+                sum_y += coverage * (y as f32 + 0.5);
+                if let Some(next) = row.get(x + 1) {
+                    edge += (next - coverage).powi(2);
+                }
+                if let Some(below) = grid.get(y + 1) {
+                    edge += (below[x] - coverage).powi(2);
+                }
+            }
+        }
+        (Ink { left, top, right, bottom, centroid: (sum_x / ink, sum_y / ink) }, edge / ink)
+    }
+
+    /// The emoji that the checks of how a raster is drawn run over: a disc, a face, a square and an apple. The box of
+    /// the ink of the apple is not held to, its stem being too thin to be half covered at every size.
+    const EMOJI: [char; 4] = ['\u{1F534}', '\u{1F600}', '\u{1F7E5}', '\u{1F34E}'];
+    const APPLE: char = '\u{1F34E}';
+
+    fn at_the_middle() -> (f32, f32) {
+        (SIDE as f32 / 2., SIDE as f32 / 2.)
+    }
+
+    /// Rasterized through the matrix and drawn upright, an emoji is where and as large as the upright one drawn through
+    /// the same matrix, and it holds more detail when the matrix enlarges it. The upright emoji is the reference
+    /// that a draw through the matrix of the tile it resampled gives. The edges of an emoji turned are not measurably
+    /// sharper than the resampled ones (CoreGraphics draws the bitmap of the strike through the turn at its own
+    /// quality), so a turn is held to being no blurrier.
+    #[test]
+    fn test_an_emoji_rasterized_through_a_matrix_is_as_placed_and_as_sharp_as_one_resampled_through_it() {
+        use gpui::{GlyphTransform, TransformationMatrix};
+
+        let fonts = MacTextSystem::new();
+        let at = at_the_middle();
+        for character in EMOJI {
+            let glyph = emoji_glyph(&fonts, character);
+            for scale_factor in [1., 2.] {
+                for (name, linear, sharper) in [
+                    ("rotate 30", rotation_matrix(30.), 0.6),
+                    ("rotate 45", rotation_matrix(45.), 0.6),
+                    ("scale 1.5", [[1.5, 0.], [0., 1.5]], 1.2),
+                    ("scale 2", [[2., 0.], [0., 2.]], 1.4),
+                ] {
+                    let what = format!("{character} {name} x{scale_factor}");
+                    let upright = emoji_params(glyph, 16., scale_factor, GlyphTransform::IDENTITY);
+                    let exact = emoji_params(glyph, 16., scale_factor, GlyphTransform::quantize(linear));
+                    let (resampled, resampled_edge) = measure(&drawn_emoji(
+                        &fonts,
+                        &upright,
+                        SIDE,
+                        1.,
+                        TransformationMatrix::affine(linear, [at.0, at.1]),
+                        (0., 0.),
+                    ));
+                    let (through, through_edge) =
+                        measure(&drawn_emoji(&fonts, &exact, SIDE, 1., TransformationMatrix::unit(), at));
+                    for (side, (through, resampled)) in [
+                        ("left", (through.left, resampled.left)),
+                        ("top", (through.top, resampled.top)),
+                        ("right", (through.right, resampled.right)),
+                        ("bottom", (through.bottom, resampled.bottom)),
+                    ] {
+                        assert!((through - resampled).abs() <= 1., "{what}: {side} {through} against {resampled}");
+                    }
+                    assert!(
+                        (through.centroid.0 - resampled.centroid.0).abs() <= 0.5
+                            && (through.centroid.1 - resampled.centroid.1).abs() <= 0.5,
+                        "{what}: centroid {:?} against {:?}",
+                        through.centroid,
+                        resampled.centroid
+                    );
+                    assert!(
+                        through_edge > resampled_edge * sharper,
+                        "{what}: edges {through_edge} against {resampled_edge}, {sharper} times at least"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A glyph that is rasterized at a bucketed scale is drawn smaller or larger by it (an animating matrix, or one with
+    /// perspective). An emoji is not in proportion to its size, so the raster is the one of the device size scaled by
+    /// the bucket through the transform, which `Window::paint_emoji` asks for: its ink is the bucket times that of the
+    /// upright one, wherever the bucket is (a raster of the larger size would be 20% smaller at 2 and 25% larger at
+    /// a half).
+    #[test]
+    fn test_an_emoji_at_a_bucketed_scale_is_the_device_size_scaled_by_the_bucket() {
+        use gpui::GlyphTransform;
+
+        let fonts = MacTextSystem::new();
+        let root_two = std::f32::consts::SQRT_2;
+        for character in EMOJI {
+            let glyph = emoji_glyph(&fonts, character);
+            for scale_factor in [1., 2.] {
+                let upright = emoji_ink(&fonts, &emoji_params(glyph, 16., scale_factor, GlyphTransform::IDENTITY)).1;
+                for bucket in [0.25, 0.5, 1. / root_two, root_two, 2., 2. * root_two, 4., 8.] {
+                    let what = format!("{character} x{scale_factor} bucket {bucket}");
+                    let transform = GlyphTransform::quantize([[bucket, 0.], [0., bucket]]);
+                    let ink = emoji_ink(&fonts, &emoji_params(glyph, 16., scale_factor, transform)).1;
+                    // A pixel of the raster is 1 / bucket of a pixel drawn.
+                    let box_tolerance = (1.25 / bucket).max(1.);
+                    for (side, (got, expected)) in [
+                        ("left", (ink.left, upright.left)),
+                        ("top", (ink.top, upright.top)),
+                        ("right", (ink.right, upright.right)),
+                        ("bottom", (ink.bottom, upright.bottom)),
+                    ] {
+                        if character == APPLE {
+                            continue;
+                        }
+                        assert!(
+                            (got / bucket - expected).abs() <= box_tolerance,
+                            "{what}: {side} of the ink {}, upright {expected}",
+                            got / bucket
+                        );
+                    }
+                    let centroid_tolerance = (1. / bucket).max(0.5);
+                    assert!(
+                        (ink.centroid.0 / bucket - upright.centroid.0).abs() <= centroid_tolerance
+                            && (ink.centroid.1 / bucket - upright.centroid.1).abs() <= centroid_tolerance,
+                        "{what}: centroid {:?}, upright {:?}",
+                        (ink.centroid.0 / bucket, ink.centroid.1 / bucket),
+                        upright.centroid
+                    );
+                }
+            }
+        }
+    }
+
+    /// The reason for [`test_an_emoji_at_a_bucketed_scale_is_the_device_size_scaled_by_the_bucket`]: the emoji of a
+    /// scale factor of the bucket's times the window's is not the bucket times the emoji of the window's.
+    #[test]
+    fn test_an_emoji_of_a_larger_size_is_not_a_larger_emoji() {
+        use gpui::GlyphTransform;
+
+        let fonts = MacTextSystem::new();
+        let glyph = emoji_glyph(&fonts, '\u{1F534}');
+        let width = |scale_factor| emoji_ink(&fonts, &emoji_params(glyph, 16., scale_factor, GlyphTransform::IDENTITY)).1.width();
+        assert_eq!((width(1.), width(2.)), (20., 32.));
+        assert_eq!((width(2.), width(4.)), (32., 64.));
+        assert_eq!(width(0.5), 10.);
+    }
+
+    /// A glyph under a 3D transform is drawn as the tile of a bucketed raster through a matrix with perspective,
+    /// where the emoji of the bucket is `tile_scale` = 1 / bucket the size in the space of the sprite. Its ink is where
+    /// and as large as that of the upright emoji drawn through the same matrix at no bucket.
+    #[test]
+    fn test_an_emoji_under_a_3d_transform_is_where_and_as_large_as_the_upright_one_projected() {
+        use gpui::{GlyphTransform, TransformationMatrix};
+
+        let fonts = MacTextSystem::new();
+        let at = at_the_middle();
+        // A turn about the vertical (`axis` 0) or horizontal (1) axis in a perspective of `distance`, around `at`.
+        let turned = |axis: usize, degrees: f32, distance: f32| {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            let rows = if axis == 0 {
+                [[cos, 0., 0.], [0., 1., 0.], [sin / distance, 0., 1.]]
+            } else {
+                [[1., 0., 0.], [0., cos, 0.], [0., sin / distance, 1.]]
+            };
+            let mut moved = rows;
+            for (row, centre) in [at.0, at.1].iter().enumerate() {
+                for column in 0..3 {
+                    moved[row][column] += centre * rows[2][column];
+                }
+            }
+            TransformationMatrix { rows: moved }
+        };
+        for character in EMOJI {
+            let glyph = emoji_glyph(&fonts, character);
+            for scale_factor in [1., 2.] {
+                for (name, matrix) in [
+                    ("rotateY 40", turned(0, 40., 400.)),
+                    ("rotateY -60", turned(0, -60., 400.)),
+                    ("rotateX 50", turned(1, 50., 400.)),
+                ] {
+                    let upright = emoji_params(glyph, 16., scale_factor, GlyphTransform::IDENTITY);
+                    let (reference, _) = measure(&drawn_emoji(&fonts, &upright, SIDE, 1., matrix, (0., 0.)));
+                    for bucket in [0.5, 2., 4.] {
+                        let what = format!("{character} {name} x{scale_factor} bucket {bucket}");
+                        let bucketed =
+                            emoji_params(glyph, 16., scale_factor, GlyphTransform::quantize([[bucket, 0.], [0., bucket]]));
+                        let (drawn, _) = measure(&drawn_emoji(&fonts, &bucketed, SIDE, 1. / bucket, matrix, (0., 0.)));
+                        for (side, (drawn, reference)) in [
+                            ("left", (drawn.left, reference.left)),
+                            ("top", (drawn.top, reference.top)),
+                            ("right", (drawn.right, reference.right)),
+                            ("bottom", (drawn.bottom, reference.bottom)),
+                        ] {
+                            if character != APPLE {
+                                assert!((drawn - reference).abs() <= 1.25, "{what}: {side} {drawn} against {reference}");
+                            }
+                        }
+                        assert!(
+                            (drawn.centroid.0 - reference.centroid.0).abs() <= 0.5
+                                && (drawn.centroid.1 - reference.centroid.1).abs() <= 0.5,
+                            "{what}: centroid {:?} against {:?}",
+                            drawn.centroid,
+                            reference.centroid
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The matrix path leaves a matrix of the identity alone: a transform one step of the quantization off the identity
+    /// takes the branch of the raster through a matrix, and its emoji has the ink of the upright one, which the identity
+    /// branch draws and which [`test_an_upright_emoji_is_drawn_at_the_device_size`] pins. Its bounds are those of the
+    /// upright one to a pixel, as a step in the matrix can carry the rectangle CoreText gives over a whole pixel.
+    #[test]
+    fn test_an_emoji_through_a_matrix_of_the_identity_is_the_upright_one() {
+        use gpui::GlyphTransform;
+
+        let fonts = MacTextSystem::new();
+        let almost = GlyphTransform::quantize([[1., 0.], [0., 1. + 1. / GlyphTransform::UNIT as f32]]);
+        assert!(!almost.is_identity());
+        for character in EMOJI {
+            let glyph = emoji_glyph(&fonts, character);
+            for (font_size, scale_factor) in [(13., 1.), (13., 2.), (16., 1.), (24., 2.)] {
+                let what = format!("{character} {font_size} x{scale_factor}");
+                let (upright_bounds, upright) =
+                    emoji_ink(&fonts, &emoji_params(glyph, font_size, scale_factor, GlyphTransform::IDENTITY));
+                let (bounds, through) = emoji_ink(&fonts, &emoji_params(glyph, font_size, scale_factor, almost));
+                let edges = |bounds: gpui::Bounds<gpui::DevicePixels>| {
+                    [
+                        bounds.origin.x.0,
+                        bounds.origin.y.0,
+                        bounds.origin.x.0 + bounds.size.width.0,
+                        bounds.origin.y.0 + bounds.size.height.0,
+                    ]
+                };
+                for (got, expected) in edges(bounds).into_iter().zip(edges(upright_bounds)) {
+                    assert!((got - expected).abs() <= 1, "{what}: bounds {bounds:?} against {upright_bounds:?}");
+                }
+                if character != APPLE {
+                    assert_eq!(
+                        (through.left, through.top, through.right, through.bottom),
+                        (upright.left, upright.top, upright.right, upright.bottom),
+                        "{what}"
+                    );
+                }
+                assert!(
+                    (through.centroid.0 - upright.centroid.0).abs() < 0.05 && (through.centroid.1 - upright.centroid.1).abs() < 0.05,
+                    "{what}: centroid {:?} against {:?}",
+                    through.centroid,
+                    upright.centroid
+                );
+            }
+        }
+    }
+
     /// With no `halt` in the font (PingFang) or when the punctuation is the first of the script run that the system
     /// gives PingFang (a full stop after a Latin letter), nothing is trimmed, as in Chrome.
     #[test]
