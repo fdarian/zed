@@ -626,9 +626,10 @@ pub(super) fn draw_composed(window_state: &Arc<Mutex<MacWindowState>>, scene: Co
         // The transaction the frame's views and drawables are in goes to the window server now, not
         // when this turn of the run loop ends (a turn that may be a long one, with JS in it).
         // After a scroll, with eight busy processes, a capture found the page a frame ahead of the GPUI
-        // content beside it in 28 of 160 captures without this, and in 2 with it (on an idle machine
-        // 0 and 1). It takes AppKit into the views, which take the lock of the window: it cannot be
-        // flushed under it.
+        // content beside it in 12 to 20% of captures without this, and in 0.8% with it (18 of 2160; none
+        // on an idle machine). It takes AppKit into the views, which take the lock of the window: it
+        // cannot be flushed under it. An explicit begin and commit, waiting for the GPU before the
+        // present, and drawing before the views move measured no better.
         unsafe {
             let _: () = msg_send![class!(CATransaction), flush];
         }
