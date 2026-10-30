@@ -149,6 +149,10 @@ http_client = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 reqwest_client = { workspace = true, features = ["test-support"] }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen = { workspace = true }
 
@@ -184,6 +188,10 @@ path = "examples/image/image.rs"
 [[example]]
 name = "input"
 path = "examples/input.rs"
+
+[[example]]
+name = "native_surface"
+path = "examples/native_surface.rs"
 
 [[example]]
 name = "on_window_close_quit"
