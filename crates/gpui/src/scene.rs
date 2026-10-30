@@ -4,6 +4,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::shrink::clear_shrinking;
 use crate::{
     Anchor, AtlasTextureId, AtlasTile, Background, BackgroundTile, Bounds, ContentMask, CornerRadii, Corners, Edges,
     GroupEffect, Hsla, MAX_GROUP_EXTENT, Pixels, Point, Radians, RenderGlyphParams, ResolvedFilter, ScaledPixels, Size,
@@ -148,25 +149,25 @@ pub struct EffectGroup {
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
-        self.paint_operations.clear();
+        clear_shrinking(&mut self.paint_operations);
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.layer_opened.clear();
-        self.paths.clear();
-        self.shadows.clear();
-        self.quads.clear();
-        self.underlines.clear();
-        self.monochrome_sprites.clear();
-        self.subpixel_sprites.clear();
-        self.polychrome_sprites.clear();
-        self.surfaces.clear();
+        clear_shrinking(&mut self.paths);
+        clear_shrinking(&mut self.shadows);
+        clear_shrinking(&mut self.quads);
+        clear_shrinking(&mut self.underlines);
+        clear_shrinking(&mut self.monochrome_sprites);
+        clear_shrinking(&mut self.subpixel_sprites);
+        clear_shrinking(&mut self.polychrome_sprites);
+        clear_shrinking(&mut self.surfaces);
         self.groups.clear();
         self.native_surfaces.clear();
         self.pending_native_surfaces.clear();
         self.group_stack.clear();
         self.flat_opacities.clear();
         self.text_clips.clear();
-        self.order_log.clear();
+        clear_shrinking(&mut self.order_log);
         self.order_reuse = None;
         self.order_reuse_failed = false;
         self.tree_stale = false;
@@ -2950,6 +2951,67 @@ mod tests {
             filters: vec![ResolvedFilter::blur(2.)],
             ..GroupEffect::default()
         }
+    }
+
+    /// A page of `count` quads and as many glyphs.
+    fn paint_page(scene: &mut Scene, count: usize) {
+        for index in 0..count {
+            let x = (index % 40) as f32 * 10.;
+            scene.insert_primitive(quad(x, 0., 8., 8.));
+            scene.insert_primitive(glyph(x, 20.));
+        }
+        scene.finish();
+    }
+
+    fn capacities(scene: &Scene) -> [usize; 3] {
+        [scene.paint_operations.capacity(), scene.quads.capacity(), scene.monochrome_sprites.capacity()]
+    }
+
+    #[test]
+    fn a_scene_gives_back_the_room_of_a_big_page_when_a_small_one_clears_it() {
+        let mut scene = scene();
+        paint_page(&mut scene, 20_000);
+        let peak = capacities(&scene);
+        scene.clear();
+        assert_eq!(capacities(&scene), peak, "the page just cleared was as big as the room");
+
+        paint_page(&mut scene, 100);
+        scene.clear();
+        let [operations, quads, glyphs] = capacities(&scene);
+        assert!(operations < peak[0] / 20 && quads < peak[1] / 20 && glyphs < peak[2] / 20, "{operations} {quads} {glyphs}");
+        assert!(quads >= 200 && glyphs >= 200, "room for twice the page is kept");
+    }
+
+    #[test]
+    fn a_scene_keeps_its_room_for_a_page_that_stays_the_size_it_is() {
+        let mut scene = scene();
+        paint_page(&mut scene, 20_000);
+        scene.clear();
+        paint_page(&mut scene, 6_000);
+        scene.clear();
+        let capacity = capacities(&scene);
+        assert!(capacity[1] > 6_000);
+
+        for _ in 0..3 {
+            paint_page(&mut scene, 6_000);
+            scene.clear();
+            assert_eq!(capacities(&scene), capacity);
+        }
+        // A page not 4x smaller than the room does not move it.
+        paint_page(&mut scene, 3_500);
+        scene.clear();
+        assert_eq!(capacities(&scene), capacity);
+    }
+
+    #[test]
+    fn a_small_scene_never_reallocates() {
+        let mut scene = scene();
+        paint_page(&mut scene, 50);
+        scene.clear();
+        let capacity = capacities(&scene);
+        paint_page(&mut scene, 2);
+        scene.clear();
+        assert_eq!(capacities(&scene), capacity);
     }
 
     #[test]

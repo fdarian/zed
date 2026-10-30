@@ -1,4 +1,4 @@
-use crate::{Bounds, Half};
+use crate::{Bounds, Half, shrink::clear_shrinking};
 use std::{
     cmp,
     fmt::Debug,
@@ -106,7 +106,7 @@ where
 {
     /// Clears all nodes from the tree.
     pub fn clear(&mut self) {
-        self.nodes.clear();
+        clear_shrinking(&mut self.nodes);
         self.root = None;
         self.max_leaf = None;
         self.insert_path.clear();
