@@ -5,6 +5,7 @@ use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::element::Culled;
+use crate::shrink::clear_shrinking;
 use crate::{
     Action, Anchor, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
@@ -1748,19 +1749,19 @@ impl Frame {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.accessed_element_states.clear();
-        self.mouse_listeners.clear();
+        clear_shrinking(&mut self.accessed_element_states);
+        clear_shrinking(&mut self.mouse_listeners);
         self.root_key_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
-        self.cursor_styles.clear();
+        clear_shrinking(&mut self.cursor_styles);
         self.layout_publications.clear();
         self.scrollers.clear();
-        self.retained_recordings.clear();
-        self.patchable.clear();
-        self.hitboxes.clear();
+        clear_shrinking(&mut self.retained_recordings);
+        clear_shrinking(&mut self.patchable);
+        clear_shrinking(&mut self.hitboxes);
         self.hitboxes_changed();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
@@ -13460,6 +13461,36 @@ mod tests {
             });
         }
         frame
+    }
+
+    #[test]
+    fn a_frame_gives_back_the_room_of_a_big_page_when_a_small_one_clears_it() {
+        let page = |count: u64| frame_of(&(0..count).map(|id| hitbox(id, None)).collect::<Vec<_>>()).hitboxes;
+        let mut frame = Frame::new(DispatchTree::new(
+            Rc::new(RefCell::new(Keymap::new(Vec::new()))),
+            Rc::new(ActionRegistry::default()),
+        ));
+        frame.hitboxes.extend(page(10_000));
+        let peak = frame.hitboxes.capacity();
+        frame.clear();
+        assert_eq!(frame.hitboxes.capacity(), peak, "the page just cleared was as big as the room");
+
+        // Less than 4x smaller than the room: it stays, frame after frame.
+        for _ in 0..3 {
+            frame.hitboxes.extend(page(5_000));
+            frame.clear();
+            assert_eq!(frame.hitboxes.capacity(), peak);
+        }
+
+        frame.hitboxes.extend(page(500));
+        frame.clear();
+        let shrunk = frame.hitboxes.capacity();
+        assert!((1_000..peak / 8).contains(&shrunk), "{shrunk} of {peak}");
+        for _ in 0..3 {
+            frame.hitboxes.extend(page(500));
+            frame.clear();
+            assert_eq!(frame.hitboxes.capacity(), shrunk);
+        }
     }
 
     fn hit_ids(frame: &Frame, x: f32, y: f32, dom: bool) -> Vec<u64> {
