@@ -3117,6 +3117,10 @@ struct GlyphDrawing {
     /// The scale factor the glyph is rasterized at: the window's, or more when the glyph is drawn
     /// through a matrix that animates.
     raster_scale: f32,
+    /// How many times larger than the window's pixels the raster of a glyph drawn through a matrix
+    /// that animates (or has perspective) is: `raster_scale` is the window's times this, which is
+    /// 1 for every other glyph.
+    bucket: f32,
     /// The whole pixel of the raster the glyph's origin is in, and the subpixel variant it is at.
     integer_origin: Point<ScaledPixels>,
     subpixel_variant: Point<u8>,
@@ -8061,6 +8065,7 @@ impl Window {
             return Some(GlyphDrawing {
                 transform: GlyphTransform::IDENTITY,
                 raster_scale: scale_factor,
+                bucket: 1.,
                 integer_origin,
                 subpixel_variant,
                 tile_scale: 1.,
@@ -8090,6 +8095,7 @@ impl Window {
             return Some(GlyphDrawing {
                 transform,
                 raster_scale: scale_factor,
+                bucket: 1.,
                 integer_origin,
                 subpixel_variant,
                 tile_scale: 1.,
@@ -8111,6 +8117,7 @@ impl Window {
         Some(GlyphDrawing {
             transform: GlyphTransform::IDENTITY,
             raster_scale,
+            bucket: raster,
             integer_origin,
             subpixel_variant,
             tile_scale: 1. / raster,
@@ -8192,17 +8199,28 @@ impl Window {
         let Some(drawing) = self.glyph_drawing(&placement, origin, font_size, false) else {
             return Ok(());
         };
+        // An emoji is drawn at the device size of the window, which does not grow in proportion to
+        // the size (an emoji is 20 wide at 16 px and 24 at 24), so a bucketed raster is that glyph
+        // scaled through the transform and not the glyph of a larger size.
+        let (scale_factor, transform) = if drawing.bucket == 1. {
+            (drawing.raster_scale, drawing.transform)
+        } else {
+            (
+                self.scale_factor(),
+                GlyphTransform::quantize([[drawing.bucket, 0.], [0., drawing.bucket]]),
+            )
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
             font_size,
             subpixel_variant: Default::default(),
-            scale_factor: drawing.raster_scale,
+            scale_factor,
             is_emoji: true,
             subpixel_rendering: false,
             luminance_bucket: 0,
             font_smoothing: FontSmoothing::Auto,
-            transform: drawing.transform,
+            transform,
         };
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;

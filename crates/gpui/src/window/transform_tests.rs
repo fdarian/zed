@@ -1995,6 +1995,34 @@ mod glyphs {
         assert!(painted.asked[0].transform.is_identity());
     }
 
+    /// An emoji is drawn at the device size of the window, which is not in proportion to the size, so an emoji of a
+    /// bucketed raster is rasterized at the size of the window and scaled by the bucket through the transform. A
+    /// text system that rasterized it at the size of the bucket would draw it 20% too small or 25% too large.
+    #[test]
+    fn an_emoji_in_an_animating_or_projective_transform_is_rasterized_at_the_window_size_scaled_by_the_bucket() {
+        // The glyph is at x = 20, where the divisor of this perspective is 1.4: it is drawn about half as large.
+        let perspective = TransformationMatrix { rows: [[1., 0., 0.], [0., 1., 0.], [0.02, 0., 1.]] };
+        let perspective_bucket = animating_raster_scale(perspective.scale_factor_at(20., 30.));
+        assert!(perspective_bucket < 1., "{perspective_bucket}");
+        for (name, matrix, animating, bucket) in [
+            ("animating scale 1.5", css([1.5, 0., 0., 1.5, 0., 0.]).compose(rotation(10.)), true, 2.),
+            ("animating scale 0.5", css([0.5, 0., 0., 0.5, 0., 0.]), true, 0.5),
+            ("perspective", perspective, false, perspective_bucket),
+        ] {
+            let painted = painted_text(2., move |window, _| {
+                window.with_transform_animating(matrix, animating, |window| {
+                    window.paint_emoji(point(px(20.), px(30.)), FontId(0), GlyphId(2), px(16.)).unwrap()
+                });
+            });
+            assert_eq!(painted.polychrome.len(), 1, "{name}");
+            let params = &painted.asked[0];
+            assert!(params.is_emoji, "{name}");
+            assert_eq!(params.scale_factor, 2., "{name}: the size of the window, not of the bucket");
+            assert_eq!(params.transform, GlyphTransform::quantize([[bucket, 0.], [0., bucket]]), "{name}");
+            assert_eq!(painted.polychrome[0].transformation, matrix.scaled(2.), "{name}");
+        }
+    }
+
     #[test]
     fn the_matrices_of_a_static_run_share_a_raster_only_when_they_quantize_alike() {
         let at = |degrees: f32| {
