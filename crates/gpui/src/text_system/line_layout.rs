@@ -1000,6 +1000,9 @@ impl LineLayout {
             end_trims.push((glyph, trim));
         }
 
+        if hang {
+            positions.collapse_spaces_before_boxes(&line_starts);
+        }
         let hanging_widths = if hang {
             positions.hanging_widths(&line_starts)
         } else {
@@ -1125,6 +1128,9 @@ impl LineLayout {
         let mut line_starts: SmallVec<[usize; 2]> = SmallVec::new();
         line_starts.push(0);
         line_starts.extend(breaks.iter().copied());
+        if hang {
+            positions.collapse_spaces_before_boxes(&line_starts);
+        }
         let hanging_widths = if hang {
             positions.hanging_widths(&line_starts)
         } else {
@@ -1259,6 +1265,8 @@ struct WrapGlyph {
     /// The placeholder of an atomic inline, which a line may break on either side of. Not that
     /// of an empty inline box, which is no place to break and is skipped by the breaking rules.
     is_object: bool,
+    /// The placeholder of an empty inline box.
+    is_placeholder: bool,
     hangs: bool,
     font_id: FontId,
     shaped_x: Pixels,
@@ -1421,6 +1429,7 @@ impl<'a> GlyphPositions<'a> {
                         },
                         is_tab: character == '\t',
                         is_object: run.inline.object && run.inline.empty.is_none(),
+                        is_placeholder: run.inline.empty.is_some(),
                         hangs: hangs(character),
                         font_id: run.font_id,
                         shaped_x: glyph.position.x,
@@ -1449,6 +1458,38 @@ impl<'a> GlyphPositions<'a> {
             shaped_width: layout.width,
             tabbed,
             insets,
+        }
+    }
+
+    /// Takes the width off the spaces that end a line before the placeholders of empty inline boxes
+    /// that end it too, for lines that start at the glyphs `line_starts`. The spaces are trailing
+    /// white space, which Blink removes whatever sits after them that is not text, so the boxes
+    /// start where the spaces did.
+    fn collapse_spaces_before_boxes(&mut self, line_starts: &[usize]) {
+        let Some(tabbed) = self.tabbed.as_mut() else {
+            return;
+        };
+        for (line_ix, line_start) in line_starts.iter().enumerate() {
+            let line_end = line_starts
+                .get(line_ix + 1)
+                .copied()
+                .unwrap_or(self.glyphs.len());
+            let mut boxes = line_end;
+            while boxes > *line_start && self.glyphs[boxes - 1].is_placeholder {
+                boxes -= 1;
+            }
+            let mut spaces = boxes;
+            while boxes < line_end && spaces > *line_start && self.glyphs[spaces - 1].hangs {
+                spaces -= 1;
+            }
+            if spaces == boxes {
+                continue;
+            }
+            let width = tabbed.x[boxes] - tabbed.x[spaces];
+            for ix in boxes..tabbed.x.len() {
+                tabbed.x[ix] -= width;
+                tabbed.shift[ix] -= width;
+            }
         }
     }
 
@@ -1976,12 +2017,15 @@ impl WrappedLineLayout {
     pub fn objects(&self, line_height: Pixels) -> SmallVec<[ObjectPlacement; 2]> {
         let layout = &self.unwrapped_layout;
         let mut objects = SmallVec::new();
-        if !layout.runs.iter().any(|run| run.inline.object) {
+        // The placeholder of an empty box has no element to place, and its position is that of
+        // any glyph: before its leading inset.
+        let is_atomic = |run: &ShapedRun| run.inline.object && run.inline.empty.is_none();
+        if !layout.runs.iter().any(is_atomic) {
             return objects;
         }
         let line_rows = layout.line_rows(&self.wrap_boundaries, line_height);
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            if !run.inline.object {
+            if !is_atomic(run) {
                 continue;
             }
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
@@ -4584,6 +4628,13 @@ mod tests {
     }
 
     #[test]
+    fn test_a_negative_inset_pulls_the_glyphs_after_it() {
+        // b has 10 of leading inset and -4 of trailing inset: c starts 6 later than it would.
+        let layout = inset_line("abcd", None, &[inset(1..2, 10., -4.)]);
+        assert_eq!(x_and_width(&layout), vec![0., 10., 26., 36., 46.]);
+    }
+
+    #[test]
     fn test_an_inset_with_no_glyph_adds_nothing() {
         let layout = inset_line("abc", None, &[inset(1..1, 6., 4.), inset(5..9, 6., 4.)]);
         assert_eq!(x_and_width(&layout), vec![0., 10., 20., 30.]);
@@ -5462,11 +5513,12 @@ mod tests {
     }
 
     /// `text` as ten pixel wide characters, with the placeholder of an empty inline box (U+FFFC)
-    /// no wide at all, and a line from `wrap_width`: the byte each row after the first starts at.
-    fn empty_box_row_starts(text: &str, wrap_width: f32) -> Vec<usize> {
+    /// no wide at all and `inset` of space on each side of it, wrapped at `wrap_width`.
+    fn empty_box_line(text: &str, wrap_width: f32, inset: f32) -> WrappedLineLayout {
         let object = crate::OBJECT_REPLACEMENT_CHARACTER;
         let mut x = 0.;
         let mut specs = Vec::new();
+        let mut insets = Vec::new();
         let glyphs = text
             .char_indices()
             .map(|(index, character)| {
@@ -5483,6 +5535,11 @@ mod tests {
                             font_id: FontId(0),
                             font_size: px(16.),
                         },
+                    });
+                    insets.push(TextInset {
+                        range: index..index + object.len_utf8(),
+                        leading: px(inset),
+                        trailing: px(inset),
                     });
                 } else {
                     x += 10.;
@@ -5508,6 +5565,7 @@ mod tests {
         let shaped = apply_inline(&shaped, &specs, &boxes, true);
         let options = TextLayoutOptions {
             overflow_wrap: OverflowWrap::Normal,
+            hang_trailing_spaces: true,
             ..Default::default()
         };
         let computation = shaped.compute_wrap_boundaries(
@@ -5516,15 +5574,24 @@ mod tests {
             None,
             options,
             None,
-            &[],
+            &insets,
             &SnapMarks::default(),
         );
-        boundary_indices(&WrappedLineLayout::new(
+        let shaped = match &computation.tabbed_x {
+            Some(x) => shaped.with_x_positions(x, &computation.line_starts),
+            None => shaped,
+        };
+        WrappedLineLayout::new(
             Arc::new(shaped),
             Some(px(wrap_width)),
             computation,
             &SnapMarks::default(),
-        ))
+        )
+    }
+
+    /// The byte each row after the first of [`empty_box_line`] starts at.
+    fn empty_box_row_starts(text: &str, wrap_width: f32) -> Vec<usize> {
+        boundary_indices(&empty_box_line(text, wrap_width, 0.))
     }
 
     #[test]
@@ -5535,16 +5602,34 @@ mod tests {
             empty_box_row_starts(&format!("aaaa{object}bbbb"), 45.),
             Vec::<usize>::new()
         );
-        // A line that breaks at the space starts with the box that follows it, as Blink's
-        // open tag after the break is on the next line, and a box before the space stays.
-        // "aaaa " is 50 wide, so with 45 the line breaks after the space and "bbbb" starts the row.
-        assert_eq!(empty_box_row_starts(&format!("aaaa {object}bbbb"), 45.), vec![5]);
+        // A line that breaks at the space ends with the box that follows it: Blink moves the break
+        // past the open and close tag of a box that holds nothing, so the line starts at "bbbb".
+        assert_eq!(empty_box_row_starts(&format!("aaaa {object}bbbb"), 45.), vec![8]);
         assert_eq!(empty_box_row_starts(&format!("aaaa{object} bbbb"), 45.), vec![8]);
         // Two boxes in a row move together.
         assert_eq!(
             empty_box_row_starts(&format!("aaaa {object}{object}bbbb"), 45.),
-            vec![5]
+            vec![11]
         );
+    }
+
+    #[test]
+    fn test_the_space_before_a_box_that_ends_a_line_is_removed() {
+        let object = crate::OBJECT_REPLACEMENT_CHARACTER;
+        // "aaaa " and a box of 20 (insets of 10): the line breaks before "bbbb", the box
+        // starts where the space did, at 40, and the next row starts with "bbbb".
+        let layout = empty_box_line(&format!("aaaa {object}bbbb"), 45., 10.);
+        assert_eq!(boundary_indices(&layout), vec![8]);
+        let x = |index: usize| f32::from(layout.unwrapped_layout.x_for_index(index));
+        assert_eq!(x(4), 40.);
+        assert_eq!(x(5), 40.);
+        // The box is on its row, so the row after it starts at its end.
+        assert_eq!(x(8), 60.);
+        // A box in the middle of a row leaves the space where it is.
+        let layout = empty_box_line(&format!("aa {object}bb"), 200., 10.);
+        assert!(layout.wrap_boundaries.is_empty());
+        assert_eq!(f32::from(layout.unwrapped_layout.x_for_index(3)), 30.);
+        assert_eq!(f32::from(layout.unwrapped_layout.x_for_index(6)), 30. + 20.);
     }
 
     #[test]

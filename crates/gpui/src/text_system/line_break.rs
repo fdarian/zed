@@ -77,8 +77,9 @@ impl LineBreaks {
 
     /// The places `text` may break as if the characters at the byte indices `skipped`, which are
     /// U+FFFC placeholders of empty inline boxes, were not there. A line that breaks where they
-    /// would sit starts at the first of them: a box between two characters belongs with the
-    /// character after it.
+    /// would sit starts after them: the break opportunity before a box that holds nothing moves
+    /// to after it, as Blink moves it past the open and close tag (`line_breaker.cc`), so a box
+    /// after a space stays on the line the space ends.
     pub(super) fn new_skipping(text: &str, word_break: WordBreak, skipped: &[usize]) -> Self {
         if skipped.is_empty() {
             return Self::new(text, word_break);
@@ -97,7 +98,7 @@ impl LineBreaks {
         let offsets = Self::new(&without, word_break)
             .offsets
             .into_iter()
-            .map(|offset| offset + width * gaps.partition_point(|gap| *gap < offset))
+            .map(|offset| offset + width * gaps.partition_point(|gap| *gap <= offset))
             .collect();
         Self { offsets }
     }
