@@ -2092,6 +2092,9 @@ pub struct Window {
     /// The invalidator's update count after the last layout pass, and whether it painted, so
     /// that a window nothing invalidated since is not laid out again. Reset by every draw.
     measured_at: Option<(usize, bool)>,
+    /// Asked at the start of a draw whether the frame is to be preceded by a layout pass: see
+    /// [`Window::set_commit_survey`].
+    commit_survey: Option<Rc<dyn Fn(&Window) -> bool>>,
     /// A layout pass is running, so a view must not read or write the frame caches.
     pub(crate) measuring: bool,
     /// The pass running is one that does not paint: see [`Window::draw_if_dirty`].
@@ -2847,6 +2850,7 @@ impl Window {
             dispatch_depth: Rc::new(Cell::new(0)),
             dispatch_serial: 0,
             measured_at: None,
+            commit_survey: None,
             measuring: false,
             layout_only: false,
             layout_passes: 0,
@@ -5085,10 +5089,27 @@ impl Window {
         true
     }
 
+    /// Lets the owner of the window ask for a layout pass before a draw. `wants` runs at the start of
+    /// every draw (a patched tick has no commit to ask about); when it answers yes, the tree the draw is about to
+    /// build is laid out once without painting first, unless a pass already did for these invalidations.
+    /// A pass samples time at the instant of the last draw, so the owner reads where a commit put the
+    /// boxes before the frame's own animation ticks moved them, as a browser measures a render apart
+    /// from the animation frame that follows.
+    pub fn set_commit_survey(&mut self, wants: Option<Rc<dyn Fn(&Window) -> bool>>) {
+        self.commit_survey = wants;
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        if !draw_in_progress()
+            && self.invalidator.is_dirty()
+            && self.commit_survey.clone().is_some_and(|wants| wants(self))
+        {
+            self.layout_pass(cx, false, false);
+        }
+
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
