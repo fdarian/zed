@@ -1616,7 +1616,11 @@ impl Window {
             .expect("the layout engine is out of the window only while it computes layout")
     }
 
-    pub(crate) fn layout_engine_id(&self) -> u64 {
+    /// Names the layout ids of the window's engine as they stand: it changes whenever the engine gives
+    /// its nodes other ids (it moves them to a store of the size of the page once a big page left room
+    /// behind), after which an id kept from before may be another node's. A reading that keeps an id
+    /// across frames keeps this beside it and takes the id for stale once it differs.
+    pub fn layout_engine_id(&self) -> u64 {
         self.layout_engine().id()
     }
 
