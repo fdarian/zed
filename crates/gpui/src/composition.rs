@@ -20,7 +20,7 @@ use std::{any::Any, rc::Rc};
 pub(crate) use hit::pointer_over_native_surface;
 pub(crate) use present::{WindowComposition, present};
 pub(crate) use tree::CompositionTree;
-pub use present::{NativeSurface, NativeSurfaceStyle};
+pub use present::{NativeSurface, NativeSurfaceOverflow, NativeSurfaceStyle};
 
 /// Identity of a surface in a window's composition tree. Never reused within a window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -83,6 +83,10 @@ pub struct NativeSurfacePlaceholder {
     pub opacity: f32,
     /// The radius of all four corners, in device pixels.
     pub corner_radius: ScaledPixels,
+    /// Whether the surface is cut to `bounds`.
+    pub overflow: NativeSurfaceOverflow,
+    /// Whether the native view takes the pointer events over the surface.
+    pub captures_pointer: bool,
     /// The hitbox the element inserted for the surface: the GPUI hitboxes above it are the ones
     /// the layers above the surface claim.
     pub hitbox: HitboxId,
@@ -91,13 +95,23 @@ pub struct NativeSurfacePlaceholder {
 }
 
 impl NativeSurfacePlaceholder {
-    /// The part of the surface the content mask lets through.
-    pub fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+    /// The part of the box the content mask lets through: where the pointer can be over the
+    /// surface, and what has to be left of it for the surface to show at all.
+    pub fn hit_bounds(&self) -> Bounds<ScaledPixels> {
         self.bounds.intersect(&self.content_mask.bounds)
     }
 
+    /// Where the surface's view can draw: the part of the box the content mask lets through, or
+    /// for [`NativeSurfaceOverflow::Visible`] the content mask itself.
+    pub fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        match self.overflow {
+            NativeSurfaceOverflow::Clip => self.hit_bounds(),
+            NativeSurfaceOverflow::Visible => self.content_mask.bounds,
+        }
+    }
+
     pub(crate) fn is_clipped_away(&self) -> bool {
-        self.visible_bounds().is_empty()
+        self.hit_bounds().is_empty()
     }
 
     pub(crate) fn translate(&mut self, delta: crate::Point<ScaledPixels>) {
@@ -111,12 +125,18 @@ impl NativeSurfacePlaceholder {
 pub struct NativePlacement {
     /// The whole surface, uncut. The embedder's content is laid out to this.
     pub bounds: Bounds<Pixels>,
-    /// The part of `bounds` that shows: `bounds` cut by the content mask, a rectangle.
+    /// The part of the window where the surface shows, a rectangle: `bounds` cut by the content
+    /// mask, or for [`NativeSurfaceOverflow::Visible`] the content mask alone (cut to the window),
+    /// which may be larger than `bounds`.
     pub clip: Bounds<Pixels>,
     /// 0 to 1.
     pub opacity: f32,
-    /// The radius of all four corners of `bounds`.
+    /// The radius of all four corners of `bounds`. The corners are cut in the whole of `bounds`,
+    /// so with a radius nothing shows outside it.
     pub corner_radius: Pixels,
+    /// Whether the native view takes the pointer events over `bounds` cut by `clip`. When it does
+    /// not, the pointer events over the surface go to what is below it, GPUI's content.
+    pub captures_pointer: bool,
 }
 
 /// A GPUI hitbox that a layer above a native surface claims: the pointer over it goes to GPUI

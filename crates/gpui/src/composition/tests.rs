@@ -107,6 +107,8 @@ mod scene {
             content_mask: open_mask(),
             opacity: 1.,
             corner_radius: ScaledPixels(0.),
+            overflow: NativeSurfaceOverflow::Clip,
+            captures_pointer: false,
             hitbox: HitboxId::placeholder(),
             order: 0,
         }
@@ -321,6 +323,34 @@ mod scene {
     }
 
     #[test]
+    fn a_translated_replay_keeps_the_overflow_and_the_pointer_and_cuts_the_mask_by_the_clip() {
+        let mut recorded = scene(true);
+        let mut overflowing = placeholder(1, 10., 100., 80., 100.);
+        overflowing.overflow = NativeSurfaceOverflow::Visible;
+        overflowing.captures_pointer = true;
+        overflowing.content_mask.bounds = bounds(0., 80., 200., 200.);
+        recorded.insert_native_surface(overflowing);
+
+        // The viewport slid down by 50 px and ends at 150: the mask, now at 30 to 230, is cut at 150.
+        let mut replayed = scene(true);
+        replayed.replay_translated(
+            &recorded.paint_operations,
+            point(ScaledPixels(0.), ScaledPixels(-50.)),
+            &clip(0., 0., 300., 150.),
+            PrimitiveCount::Replayed,
+        );
+        replayed.finish();
+
+        let native = &replayed.native_surfaces[..];
+        assert_eq!(native.len(), 1);
+        assert_eq!(native[0].overflow, NativeSurfaceOverflow::Visible);
+        assert!(native[0].captures_pointer);
+        assert_eq!(native[0].bounds, bounds(10., 50., 80., 100.));
+        assert_eq!(native[0].visible_bounds(), bounds(0., 30., 200., 120.), "the mask, not the box");
+        assert_eq!(native[0].hit_bounds(), bounds(10., 50., 80., 100.));
+    }
+
+    #[test]
     fn a_placeholder_differs_when_any_field_differs() {
         let base = placeholder(1, 0., 0., 10., 10.);
         let same = PaintOperation::NativeSurface(base.clone());
@@ -338,6 +368,8 @@ mod scene {
         assert!(differs(&|native| native.content_mask.bounds.size.width.0 -= 1.));
         assert!(differs(&|native| native.opacity = 0.5));
         assert!(differs(&|native| native.corner_radius = ScaledPixels(4.)));
+        assert!(differs(&|native| native.overflow = NativeSurfaceOverflow::Visible));
+        assert!(differs(&|native| native.captures_pointer = true));
     }
 
     #[test]
@@ -449,18 +481,40 @@ mod window {
     }
 
     fn native(surface: &Surface, x: f32, y: f32, width: f32, height: f32) -> crate::Canvas<crate::Hitbox> {
+        native_styled(surface, x, y, width, height, NativeSurfaceStyle::default())
+    }
+
+    fn native_styled(
+        surface: &Surface,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        style: NativeSurfaceStyle,
+    ) -> crate::Canvas<crate::Hitbox> {
         let surface = surface.clone();
         canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
-            move |bounds, hitbox, window, _| {
-                window.paint_native_surface(&surface, &hitbox, bounds, NativeSurfaceStyle::default())
-            },
+            move |bounds, hitbox, window, _| window.paint_native_surface(&surface, &hitbox, bounds, style),
         )
         .absolute()
         .left(px(x))
         .top(px(y))
         .w(px(width))
         .h(px(height))
+    }
+
+    fn overflowing(captures_pointer: bool) -> NativeSurfaceStyle {
+        NativeSurfaceStyle {
+            overflow: NativeSurfaceOverflow::Visible,
+            captures_pointer,
+            ..NativeSurfaceStyle::default()
+        }
+    }
+
+    /// An `overflow: hidden` box at (50, 50), 200x100, to paint a surface in.
+    fn clipping_box() -> crate::Div {
+        div().absolute().left(px(50.)).top(px(50.)).w(px(200.)).h(px(100.)).overflow_hidden()
     }
 
     fn root() -> crate::Div {
@@ -911,7 +965,7 @@ mod window {
         set_page(&mut window, move |_| {
             root()
                 .child(block(0., 0., 400., 400.))
-                .child(native(&page_surface, 100., 100., 100., 100.))
+                .child(native_styled(&page_surface, 100., 100., 100., 100., overflowing(true)))
                 .child(block(150., 150., 100., 100.))
                 .into_any_element()
         });
@@ -921,6 +975,246 @@ mod window {
             assert_eq!(window.native_surface_at(point(px(110.), px(110.))), Some(surface.id()));
             assert_eq!(window.native_surface_at(point(px(50.), px(50.))), None, "not over the surface");
             assert_eq!(window.native_surface_at(point(px(160.), px(160.))), None, "covered by the popover");
+        });
+    }
+
+    #[test]
+    fn a_surface_cut_to_its_box_is_unchanged_by_the_options_it_does_not_use() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        let page_surface = surface.clone();
+        set_page(&mut window, move |_| {
+            root()
+                .child(clipping_box().child(native_styled(&page_surface, 100., 20., 300., 300., NativeSurfaceStyle::default())))
+                .into_any_element()
+        });
+
+        let placement = native_layer(&frame(&mut window), &surface).0.expect("the surface shows");
+
+        assert_eq!(placement.bounds, rect(150., 70., 300., 300.));
+        assert_eq!(placement.clip, rect(150., 70., 100., 80.), "the box cut by the mask");
+        assert!(!placement.captures_pointer, "the pointer is GPUI's unless asked for");
+    }
+
+    #[test]
+    fn an_overflowing_surface_is_cut_by_the_mask_around_it_and_not_by_its_box() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        let page_surface = surface.clone();
+        set_page(&mut window, move |_| {
+            root()
+                .child(clipping_box().child(native_styled(&page_surface, 30., 20., 40., 30., overflowing(false))))
+                .into_any_element()
+        });
+
+        let placement = native_layer(&frame(&mut window), &surface).0.expect("the surface shows");
+
+        assert_eq!(placement.bounds, rect(80., 70., 40., 30.), "the view keeps the box");
+        assert_eq!(placement.clip, rect(50., 50., 200., 100.), "and shows in the box that clips");
+        assert_eq!(placement.corner_radius, px(0.));
+    }
+
+    #[test]
+    fn an_overflowing_surface_larger_than_the_mask_around_it_shows_in_the_mask() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        let page_surface = surface.clone();
+        set_page(&mut window, move |_| {
+            root()
+                .child(clipping_box().child(native_styled(&page_surface, 30., 20., 300., 300., overflowing(false))))
+                .into_any_element()
+        });
+
+        let placement = native_layer(&frame(&mut window), &surface).0.expect("the surface shows");
+
+        assert_eq!(placement.bounds, rect(80., 70., 300., 300.));
+        assert_eq!(placement.clip, rect(50., 50., 200., 100.));
+    }
+
+    #[test]
+    fn an_overflowing_surface_with_no_clip_around_it_shows_in_the_window() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        let page_surface = surface.clone();
+        set_page(&mut window, move |_| {
+            root()
+                .child(native_styled(&page_surface, 100., 100., 50., 50., overflowing(false)))
+                .into_any_element()
+        });
+
+        let placement = native_layer(&frame(&mut window), &surface).0.expect("the surface shows");
+
+        let viewport = window.update(|_, window, _| window.viewport_size());
+        assert_eq!(placement.clip, Bounds::new(point(px(0.), px(0.)), viewport));
+        assert_eq!(placement.bounds, rect(100., 100., 50., 50.));
+    }
+
+    #[test]
+    fn an_overflowing_surface_is_cut_by_the_scroller_that_moves_it() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        let scroll = ScrollHandle::new();
+        let (page_surface, page_scroll) = (surface.clone(), scroll.clone());
+        set_page(&mut window, move |_| {
+            root()
+                .child(
+                    div()
+                        .id("scroller")
+                        .absolute()
+                        .left(px(10.))
+                        .top(px(20.))
+                        .w(px(100.))
+                        .h(px(80.))
+                        .overflow_y_scroll()
+                        .track_scroll(&page_scroll)
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(100.))
+                                .h(px(400.))
+                                .child(native_styled(&page_surface, 20., 100., 60., 50., overflowing(false))),
+                        ),
+                )
+                .into_any_element()
+        });
+
+        let at_rest = frame(&mut window);
+        assert_eq!(native_layer(&at_rest, &surface).0, None, "the box is below the scroller: clipped away");
+
+        scroll.set_offset(point(px(0.), px(-60.)));
+        let scrolled = frame(&mut window);
+        let placement = native_layer(&scrolled, &surface).0.expect("the box scrolled into view");
+        assert_eq!(placement.bounds, rect(30., 60., 60., 50.));
+        assert_eq!(placement.clip, rect(10., 20., 100., 80.), "the scroller, wherever the box is in it");
+
+        scroll.set_offset(point(px(0.), px(-200.)));
+        let past = frame(&mut window);
+        assert_eq!(native_layer(&past, &surface).0, None, "scrolled out again");
+    }
+
+    #[test]
+    fn an_overflowing_surface_whose_box_is_wholly_outside_the_mask_is_clipped_away_and_takes_no_order() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        let page_surface = surface.clone();
+        set_page(&mut window, move |_| {
+            root()
+                .child(block(0., 0., 20., 20.))
+                .child(clipping_box().child(native_styled(&page_surface, 250., 20., 40., 30., overflowing(true))))
+                .into_any_element()
+        });
+
+        let frame = frame(&mut window);
+
+        assert_eq!(layer_kinds(&frame), "base hidden");
+        assert_eq!(native_layer(&frame, &surface).0, None);
+        window.update(|_, window, _| {
+            assert!(window.rendered_frame.scene.native_surfaces.is_empty());
+            assert_eq!(window.native_surface_at(point(px(310.), px(80.))), None);
+        });
+    }
+
+    #[test]
+    fn what_an_overflowing_surface_can_draw_over_is_below_what_is_painted_after_it() {
+        let paint = |style: NativeSurfaceStyle| {
+            let (_app, mut window) = open(|_| root().into_any_element());
+            let surface = make_surface(&mut window);
+            let page_surface = surface.clone();
+            set_page(&mut window, move |_| {
+                root()
+                    .child(native_styled(&page_surface, 100., 100., 50., 50., style))
+                    .child(block(400., 400., 10., 10.))
+                    .into_any_element()
+            });
+            frame(&mut window);
+            let surface_order = window.update(|_, window, _| window.rendered_frame.scene.native_surfaces[0].order);
+            (surface_order, quad_orders(&mut window))
+        };
+
+        let (surface_order, quads) = paint(NativeSurfaceStyle::default());
+        assert_eq!(quads, [(400. , 1)], "outside the box, nothing of the surface is under it");
+        assert_eq!(surface_order, 1);
+
+        let (surface_order, quads) = paint(overflowing(false));
+        assert!(quads[0].1 > surface_order, "the view can draw over (400, 400): the quad is above it: {quads:?}");
+    }
+
+    #[test]
+    fn the_pointer_is_native_only_where_the_surface_captures_it() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let captures = make_surface(&mut window);
+        let lets_through = make_surface(&mut window);
+        let (page_captures, page_lets_through) = (captures.clone(), lets_through.clone());
+        set_page(&mut window, move |_| {
+            root()
+                .child(native_styled(
+                    &page_captures,
+                    100.,
+                    100.,
+                    100.,
+                    100.,
+                    NativeSurfaceStyle { captures_pointer: true, ..NativeSurfaceStyle::default() },
+                ))
+                .child(native(&page_lets_through, 300., 100., 100., 100.))
+                .into_any_element()
+        });
+
+        let frame = frame(&mut window);
+
+        assert!(native_layer(&frame, &captures).0.expect("shows").captures_pointer);
+        assert!(!native_layer(&frame, &lets_through).0.expect("shows").captures_pointer);
+        window.update(|_, window, _| {
+            assert_eq!(window.native_surface_at(point(px(150.), px(150.))), Some(captures.id()));
+            assert_eq!(window.native_surface_at(point(px(350.), px(150.))), None, "it shows, and the pointer is GPUI's");
+        });
+    }
+
+    #[test]
+    fn a_surface_that_lets_the_pointer_through_gives_it_to_gpui_and_not_to_the_one_below_it() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let below = make_surface(&mut window);
+        let above = make_surface(&mut window);
+        let (page_below, page_above) = (below.clone(), above.clone());
+        set_page(&mut window, move |_| {
+            root()
+                .child(native_styled(
+                    &page_below,
+                    100.,
+                    100.,
+                    100.,
+                    100.,
+                    NativeSurfaceStyle { captures_pointer: true, ..NativeSurfaceStyle::default() },
+                ))
+                .child(native(&page_above, 120., 120., 100., 100.))
+                .into_any_element()
+        });
+        frame(&mut window);
+
+        window.update(|_, window, _| {
+            assert_eq!(window.native_surface_at(point(px(110.), px(110.))), Some(below.id()));
+            // Its element is GPUI's, and above the surface below: the hitbox it inserted after
+            // that surface's claims the pointer, as any element's would.
+            assert_eq!(window.native_surface_at(point(px(150.), px(150.))), None);
+            assert_eq!(window.native_surface_at(point(px(210.), px(210.))), None);
+        });
+    }
+
+    #[test]
+    fn an_overflowing_surface_that_captures_the_pointer_takes_it_in_its_box_only() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        let page_surface = surface.clone();
+        set_page(&mut window, move |_| {
+            root()
+                .child(clipping_box().child(native_styled(&page_surface, 30., 20., 40., 30., overflowing(true))))
+                .into_any_element()
+        });
+        frame(&mut window);
+
+        window.update(|_, window, _| {
+            assert_eq!(window.native_surface_at(point(px(100.), px(80.))), Some(surface.id()), "in the box");
+            assert_eq!(window.native_surface_at(point(px(60.), px(60.))), None, "in the clip, beside the box");
+            assert_eq!(window.native_surface_at(point(px(300.), px(300.))), None);
         });
     }
 

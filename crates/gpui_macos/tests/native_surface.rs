@@ -1,7 +1,7 @@
 //! `harness = false`: AppKit creates windows and delivers events on the main thread, which
 //! libtest never runs a test on.
 //!
-//! Opens a real window with two native surfaces and checks, on the AppKit side, what composition
+//! Opens a real window with five native surfaces and checks, on the AppKit side, what composition
 //! promises: the view tree and its order, where each container and content view is, what AppKit
 //! hit-tests to, and that a pointer event reaches GPUI and the native view once each. Events are
 //! built here and handed to the window's own `sendEvent:`; nothing is posted to the system.
@@ -18,8 +18,8 @@ use cocoa::{
     foundation::{NSPoint, NSRect, NSSize},
 };
 use gpui::{
-    App, AsyncApp, Bounds, Context, HitboxBehavior, MouseButton, NativeSurface, NativeSurfaceStyle,
-    Render, ScrollHandle, Window, WindowBounds, WindowOptions, canvas, div, prelude::*, px, rgb, size,
+    App, AsyncApp, Bounds, Context, HitboxBehavior, MouseButton, NativeSurface, NativeSurfaceOverflow,
+    NativeSurfaceStyle, Render, ScrollHandle, Window, WindowBounds, WindowOptions, canvas, div, prelude::*, px, rgb, size,
 };
 use gpui_macos::MacPlatform;
 use objc::{
@@ -36,6 +36,8 @@ static GPUI_FIRST_DOWNS: AtomicUsize = AtomicUsize::new(0);
 static GPUI_FIRST_MOVES: AtomicUsize = AtomicUsize::new(0);
 static GPUI_BADGE_DOWNS: AtomicUsize = AtomicUsize::new(0);
 static GPUI_POPOVER_DOWNS: AtomicUsize = AtomicUsize::new(0);
+static GPUI_LETS_THROUGH_DOWNS: AtomicUsize = AtomicUsize::new(0);
+static GPUI_HOLE_DOWNS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_KEYS: AtomicUsize = AtomicUsize::new(0);
 static GPUI_KEYS: AtomicUsize = AtomicUsize::new(0);
 
@@ -45,6 +47,12 @@ const WINDOW: (f64, f64) = (600., 500.);
 struct Demo {
     first: Rc<NativeSurface>,
     second: Option<Rc<NativeSurface>>,
+    /// A surface that lets the pointer through (the default).
+    lets_through: Rc<NativeSurface>,
+    /// A capturing surface overflowing its box, inside an `overflow: hidden` box.
+    overflowing: Rc<NativeSurface>,
+    /// A capturing surface whose native view leaves every point to GPUI.
+    hole: Rc<NativeSurface>,
     scroll: ScrollHandle,
     popover_open: bool,
 }
@@ -82,7 +90,7 @@ impl Render for Demo {
                             .child(div().h(px(40.)).bg(rgb(0xff00ff)))
                             .child(div().w(px(360.)).h(px(200.)).child(native(
                                 &self.first,
-                                NativeSurfaceStyle::default(),
+                                NativeSurfaceStyle { captures_pointer: true, ..Default::default() },
                                 div()
                                     .on_mouse_down(MouseButton::Left, |_, _, _| {
                                         GPUI_FIRST_DOWNS.fetch_add(1, SeqCst);
@@ -108,10 +116,47 @@ impl Render for Demo {
             .children(self.second.as_ref().map(|second| {
                 div().absolute().left(px(440.)).top(px(60.)).w(px(140.)).h(px(140.)).child(native(
                     second,
-                    NativeSurfaceStyle { corner_radius: px(24.) },
+                    NativeSurfaceStyle { corner_radius: px(24.), captures_pointer: true, ..Default::default() },
                     div(),
                 ))
             }))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(20.))
+                    .top(px(380.))
+                    .w(px(120.))
+                    .h(px(80.))
+                    .child(native(
+                        &self.lets_through,
+                        NativeSurfaceStyle::default(),
+                        div().on_mouse_down(MouseButton::Left, |_, _, _| {
+                            GPUI_LETS_THROUGH_DOWNS.fetch_add(1, SeqCst);
+                        }),
+                    )),
+            )
+            .child(
+                div().absolute().left(px(160.)).top(px(380.)).w(px(120.)).h(px(80.)).overflow_hidden().child(
+                    div().absolute().left(px(30.)).top(px(20.)).w(px(60.)).h(px(40.)).child(native(
+                        &self.overflowing,
+                        NativeSurfaceStyle {
+                            overflow: NativeSurfaceOverflow::Visible,
+                            captures_pointer: true,
+                            ..Default::default()
+                        },
+                        div(),
+                    )),
+                ),
+            )
+            .child(
+                div().absolute().left(px(300.)).top(px(380.)).w(px(120.)).h(px(80.)).child(native(
+                    &self.hole,
+                    NativeSurfaceStyle { captures_pointer: true, ..Default::default() },
+                    div().on_mouse_down(MouseButton::Left, |_, _, _| {
+                        GPUI_HOLE_DOWNS.fetch_add(1, SeqCst);
+                    }),
+                )),
+            )
             .children(self.popover_open.then(|| {
                 div()
                     .absolute()
@@ -155,10 +200,30 @@ fn probe_class() -> &'static Class {
     decl.register()
 }
 
+/// A native view that leaves every point to whatever is below it, as a library's view can.
+fn hole_class() -> &'static Class {
+    extern "C" fn hit_test(_: &Object, _: Sel, _: NSPoint) -> id {
+        nil
+    }
+    if let Some(class) = Class::get("TestHoleView") {
+        return class;
+    }
+    let mut decl = ClassDecl::new("TestHoleView", class!(NSView)).unwrap();
+    unsafe {
+        decl.add_method(sel!(hitTest:), hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id);
+    }
+    decl.register()
+}
+
 fn add_probe(surface: &NativeSurface, rgb: [f64; 3]) -> id {
+    add_view(surface, probe_class(), rgb)
+}
+
+/// A view of `class` that fills the content view of `surface`, in a color.
+fn add_view(surface: &NativeSurface, class: &Class, rgb: [f64; 3]) -> id {
     let content = *surface.platform_handle().unwrap().downcast::<usize>().unwrap() as id;
     unsafe {
-        let probe: id = msg_send![probe_class(), alloc];
+        let probe: id = msg_send![class, alloc];
         let bounds: NSRect = msg_send![content, bounds];
         let probe: id = msg_send![probe, initWithFrame: bounds];
         let _: () = msg_send![probe, setAutoresizingMask: 2usize | 16usize];
@@ -208,6 +273,13 @@ fn hit(root: id, x: f64, y: f64) -> String {
     }
 }
 
+/// Asserts that AppKit hit-tests to a view of GPUI's at a point, the window's own or the overlay
+/// of a layer that claims the point with a hitbox: either way the event is GPUI's.
+fn assert_gpui_hit(root: id, x: f64, y: f64, what: &str) {
+    let class = hit(root, x, y);
+    assert!(class == "GPUIView" || class == "GPUIOverlayView", "{what}: hit a {class}");
+}
+
 #[derive(Clone, Copy)]
 enum Pointer {
     Down,
@@ -216,6 +288,7 @@ enum Pointer {
 }
 
 fn send(ns_window: id, pointer: Pointer, x: f64, y: f64) {
+
     let (kind, clicks): (u64, i64) = match pointer {
         Pointer::Down => (1, 1),
         Pointer::Up => (2, 1),
@@ -486,7 +559,21 @@ fn main() {
                     let second = Rc::new(window.create_native_surface().unwrap());
                     add_probe(&first, [0., 0.78, 0.]);
                     add_probe(&second, [0., 0., 1.]);
-                    cx.new(|_| Demo { first, second: Some(second), scroll: ScrollHandle::new(), popover_open: false })
+                    let lets_through = Rc::new(window.create_native_surface().unwrap());
+                    let overflowing = Rc::new(window.create_native_surface().unwrap());
+                    let hole = Rc::new(window.create_native_surface().unwrap());
+                    add_probe(&lets_through, [0.5, 0.5, 0.5]);
+                    add_probe(&overflowing, [0.4, 0.2, 0.6]);
+                    add_view(&hole, hole_class(), [0.2, 0.6, 0.6]);
+                    cx.new(|_| Demo {
+                        first,
+                        second: Some(second),
+                        lets_through,
+                        overflowing,
+                        hole,
+                        scroll: ScrollHandle::new(),
+                        popover_open: false,
+                    })
                 },
             )
             .unwrap();
@@ -524,14 +611,10 @@ fn main() {
             };
             assert_eq!((content.width, content.height), WINDOW, "the content view is the window size");
 
-            // Base, first native, its overlay, second native, its overlay.
+            // Base, then each of the five natives with its overlay.
             let views = subviews(root);
             let names: Vec<String> = views.iter().map(|view| class_name(*view)).collect();
-            assert_eq!(
-                names,
-                ["GPUINativeSurfaceView", "GPUIOverlayView", "GPUINativeSurfaceView", "GPUIOverlayView"],
-                "view order"
-            );
+            assert_eq!(names, ["GPUINativeSurfaceView", "GPUIOverlayView"].repeat(5), "view order");
             assert_frame(frame(views[1]), (0., 0., WINDOW.0, WINDOW.1), "overlay covers the window");
 
             // First surface: x 20, from y 100 for 360x200 in the window; AppKit's y goes up.
@@ -542,6 +625,14 @@ fn main() {
             // Second: x 440, y 60, 140x140.
             assert_frame(frame(views[2]), (440., 300., 140., 140.), "second container");
 
+            // The surface that overflows its box: its container is the box that clips, at (160, 380)
+            // for 120x80, and the content view keeps the surface's own 60x40 at (190, 400).
+            let (lets_through, overflowing, hole) = (views[4], views[6], views[8]);
+            assert_frame(frame(lets_through), (20., 40., 120., 80.), "container of the surface that lets the pointer through");
+            assert_frame(frame(overflowing), (160., 40., 120., 80.), "container of the surface that overflows: the clip");
+            assert_frame(frame(subviews(overflowing)[0]), (30., 20., 60., 40.), "content of the surface that overflows: the box");
+            assert_frame(frame(hole), (300., 40., 120., 80.), "container of the surface with a hole");
+
             // Where AppKit sends the pointer.
             assert_eq!(hit(root, 200., 200.), "TestProbeView", "over the first native view");
             assert_eq!(hit(root, 360., 120.), "GPUIOverlayView", "over the badge");
@@ -550,6 +641,15 @@ fn main() {
             assert_eq!(hit(root, 590., 450.), "GPUIView", "over nothing");
             // A corner of the rounded surface is still in the container, which is square.
             assert_eq!(hit(root, 441., 61.), "TestProbeView");
+            // A surface that does not capture the pointer is not hit, whatever is in it: the views below
+            // are, and here that is the window's view.
+            assert_gpui_hit(root, 80., 420., "over the surface that lets the pointer through");
+            // One that does, but only where its box is: the clip around the box is GPUI's.
+            assert_eq!(hit(root, 220., 420.), "TestProbeView", "in the box of the overflowing surface");
+            assert_gpui_hit(root, 170., 385., "in the clip of the overflowing surface, beside its box");
+            assert_gpui_hit(root, 270., 470., "beyond the clip of the overflowing surface");
+            // And not where its own view leaves the point to GPUI.
+            assert_gpui_hit(root, 360., 420., "over a native view that claims nothing");
 
             // A press on a native view reaches GPUI once and the view once.
             send(ns_window, Pointer::Move, 200., 200.);
@@ -662,6 +762,58 @@ fn main() {
             send_key(ns_window, 0, "a");
             assert_eq!(NATIVE_KEYS.load(SeqCst), native_keys + 1, "back to GPUI's view: the native view hears no more");
 
+            // A press over a surface that lets the pointer through, or over a hole in one that does not,
+            // is GPUI's alone; one in the box of the overflowing surface is the native view's.
+            let before = (NATIVE_DOWNS.load(SeqCst), GPUI_LETS_THROUGH_DOWNS.load(SeqCst), GPUI_HOLE_DOWNS.load(SeqCst));
+            send(ns_window, Pointer::Down, 80., 420.);
+            send(ns_window, Pointer::Up, 80., 420.);
+            send(ns_window, Pointer::Down, 360., 420.);
+            send(ns_window, Pointer::Up, 360., 420.);
+            let after = (NATIVE_DOWNS.load(SeqCst), GPUI_LETS_THROUGH_DOWNS.load(SeqCst), GPUI_HOLE_DOWNS.load(SeqCst));
+            assert_eq!(after, (before.0, before.1 + 1, before.2 + 1), "GPUI got both presses, the native views none");
+            send(ns_window, Pointer::Down, 220., 420.);
+            send(ns_window, Pointer::Up, 220., 420.);
+            assert_eq!(NATIVE_DOWNS.load(SeqCst), before.0 + 1, "the box of the overflowing surface is its native view's");
+            let (lets_through_at, overflowing_at, beside_at, overflowing_id) = cx.update(|cx| {
+                window
+                    .update(cx, |demo, window, _| {
+                        (
+                            window.native_surface_at(gpui::point(px(80.), px(420.))),
+                            window.native_surface_at(gpui::point(px(220.), px(420.))),
+                            window.native_surface_at(gpui::point(px(170.), px(385.))),
+                            demo.overflowing.id(),
+                        )
+                    })
+                    .unwrap()
+            });
+            assert_eq!(lets_through_at, None, "the pointer over a surface that does not capture it is GPUI's");
+            assert_eq!(overflowing_at, Some(overflowing_id));
+            assert_eq!(beside_at, None, "beside the box of an overflowing surface");
+
+            // A press on GPUI's content takes the keyboard back from a native view that had it.
+            let overflowing_probe = subviews(subviews(overflowing)[0])[0];
+            unsafe {
+                let accepted: BOOL = msg_send![ns_window, makeFirstResponder: overflowing_probe];
+                assert_eq!(accepted, YES);
+            }
+            assert!(first_responder(overflowing_probe));
+            send(ns_window, Pointer::Down, 590., 450.);
+            send(ns_window, Pointer::Up, 590., 450.);
+            assert!(first_responder(root), "a press over nothing is GPUI's, and so is the keyboard");
+            unsafe {
+                let accepted: BOOL = msg_send![ns_window, makeFirstResponder: overflowing_probe];
+                assert_eq!(accepted, YES);
+            }
+            send(ns_window, Pointer::Down, 80., 420.);
+            send(ns_window, Pointer::Up, 80., 420.);
+            assert!(first_responder(root), "and over a surface that lets the pointer through");
+            send(ns_window, Pointer::Down, 590., 450.);
+            send(ns_window, Pointer::Up, 590., 450.);
+            assert!(first_responder(root), "a press with GPUI's view having the keyboard changes nothing");
+            let native_keys = NATIVE_KEYS.load(SeqCst);
+            send_key(ns_window, 0, "a");
+            assert_eq!(NATIVE_KEYS.load(SeqCst), native_keys, "the native view hears no more");
+
             // The cursor rects of the window view leave out what is under the native views.
             {
                 use std::sync::Mutex;
@@ -679,15 +831,25 @@ fn main() {
                 }
                 let rects = RECTS.lock().unwrap().clone();
                 let area: f64 = rects.iter().map(|rect| rect.size.width * rect.size.height).sum();
-                assert_eq!(area, WINDOW.0 * WINDOW.1 - 360. * 200. - 140. * 140., "the cursor rects cover the window but for the native views");
+                assert_eq!(
+                    area,
+                    WINDOW.0 * WINDOW.1 - 360. * 200. - 140. * 140. - 60. * 40. - 120. * 80.,
+                    "the cursor rects cover the window but for the native views' pointer areas: the box of the overflowing surface, not its clip, and nothing for the one that lets the pointer through"
+                );
                 let under = |rect: &NSRect, x: f64, y: f64, w: f64, h: f64| {
                     rect.origin.x < x + w && x < rect.origin.x + rect.size.width && rect.origin.y < y + h && y < rect.origin.y + rect.size.height
                 };
                 assert!(
-                    rects.iter().all(|rect| !under(rect, 20., 200., 360., 200.) && !under(rect, 440., 300., 140., 140.)),
+                    rects.iter().all(|rect| !under(rect, 20., 200., 360., 200.)
+                        && !under(rect, 440., 300., 140., 140.)
+                        && !under(rect, 190., 60., 60., 40.)
+                        && !under(rect, 300., 40., 120., 80.)),
                     "a cursor rect of the window view lies under a native view: {}",
                     rects.len()
                 );
+                // AppKit's y goes up: the surface that lets the pointer through is at (20, 40) for 120x80.
+                assert!(rects.iter().any(|rect| under(rect, 21., 41., 1., 1.)), "the cursor over a surface that does not capture it is GPUI's");
+                assert!(rects.iter().any(|rect| under(rect, 165., 45., 1., 1.)), "and so beside the box of an overflowing one");
                 println!("cursor rects: {} rects, area {area}", rects.len());
             }
 
@@ -763,7 +925,11 @@ fn main() {
             });
             settle(cx).await;
             let names: Vec<String> = subviews(root).iter().map(|view| class_name(*view)).collect();
-            assert_eq!(names, ["GPUINativeSurfaceView", "GPUIOverlayView"], "the second surface and its overlay are gone");
+            assert_eq!(
+                names,
+                ["GPUINativeSurfaceView", "GPUIOverlayView"].repeat(4),
+                "the second surface and its overlay are gone"
+            );
 
             println!("native_surface: ok");
             cx.update(|cx| cx.quit());

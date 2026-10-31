@@ -8,7 +8,10 @@
 //! An overlay covers the whole window, so it claims the pointer only inside the hitboxes GPUI
 //! gave its layer; elsewhere AppKit's hit test reaches the container below, or `GPUIView`.
 //! A pointer event bound for a native container is shown to GPUI first (see `send_event`), since
-//! AppKit would deliver it to the embedder's view and GPUI would never learn of it.
+//! AppKit would deliver it to the embedder's view and GPUI would never learn of it. A container
+//! whose surface does not capture the pointer, or a point that the embedder's views leave
+//! unclaimed, is no hit at all: AppKit goes on to the views below and GPUI gets the event as it
+//! does over any of its elements.
 
 use super::{
     MacWindowState, WINDOW_STATE_IVAR, dispatch_view_event, drop_window_state, get_window_state,
@@ -47,6 +50,10 @@ use std::{
 const COMPOSITION_INPUT_IVAR: &str = "compositionInput";
 const OVERLAY_INPUT_IVAR: &str = "overlayInput";
 const OVERLAY_LAYER_IVAR: &str = "overlayLayer";
+/// Flags and views of a native container: whether its surface takes the pointer, and the content
+/// view the container made, which the embedder fills.
+const CAPTURES_POINTER_IVAR: &str = "capturesPointer";
+const CONTENT_VIEW_IVAR: &str = "contentView";
 
 static mut OVERLAY_VIEW_CLASS: *const Class = ptr::null();
 static mut NATIVE_SURFACE_CLASS: *const Class = ptr::null();
@@ -168,9 +175,16 @@ pub(super) unsafe fn build_classes() {
             );
             decl.register()
         };
-        NATIVE_SURFACE_CLASS = ClassDecl::new("GPUINativeSurfaceView", class!(NSView))
-            .unwrap()
-            .register();
+        NATIVE_SURFACE_CLASS = {
+            let mut decl = ClassDecl::new("GPUINativeSurfaceView", class!(NSView)).unwrap();
+            decl.add_ivar::<BOOL>(CAPTURES_POINTER_IVAR);
+            decl.add_ivar::<*mut c_void>(CONTENT_VIEW_IVAR);
+            decl.add_method(
+                sel!(hitTest:),
+                native_surface_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
+            decl.register()
+        };
     }
 }
 
@@ -240,6 +254,21 @@ extern "C" fn overlay_hit_test(this: &Object, _: Sel, point: NSPoint) -> id {
             .iter()
             .any(|hitbox| hitbox.bounds.contains(&point));
         if claimed { this as *const Object as id } else { nil }
+    }
+}
+
+/// A container claims a point only where the embedder's own views do. A plain `NSView` answers
+/// itself for a point in it that no subview claims, as the content view does, and neither is the
+/// embedder's: those points are GPUI's.
+extern "C" fn native_surface_hit_test(this: &Object, _: Sel, point: NSPoint) -> id {
+    unsafe {
+        let captures: BOOL = *this.get_ivar(CAPTURES_POINTER_IVAR);
+        if captures == NO {
+            return nil;
+        }
+        let hit: id = msg_send![super(this, class!(NSView)), hitTest: point];
+        let content = *this.get_ivar::<*mut c_void>(CONTENT_VIEW_IVAR) as id;
+        if hit == this as *const Object as id || hit == content { nil } else { hit }
     }
 }
 
@@ -388,6 +417,10 @@ fn send_event(this: &Object, event: id, superclass: &Class) {
             _ => {}
         }
         drop(state);
+        // A press on GPUI's content takes the keyboard back from a native view that had it.
+        if pointer == Pointer::Down && keyboard_is_native(unsafe { &*root }) {
+            let _: BOOL = unsafe { msg_send![this, makeFirstResponder: root] };
+        }
         return super_send();
     }
 
@@ -528,11 +561,14 @@ impl MacNativeSurface {
             };
             let clip = placement.clip.map(|value| f64::from(value.as_f32()));
             let bounds = placement.bounds.map(|value| f64::from(value.as_f32()));
+            let captures = if placement.captures_pointer { YES } else { NO };
+            (*container).set_ivar(CAPTURES_POINTER_IVAR, captures);
             let container_frame = NSRect::new(
                 NSPoint::new(clip.origin.x, window_height - (clip.origin.y + clip.size.height)),
                 NSSize::new(clip.size.width, clip.size.height),
             );
-            // The content keeps its whole size, so that a clip cuts the page and does not squeeze it.
+            // The content keeps its whole size, so that a clip cuts the page and does not squeeze it,
+            // and it can be smaller than the clip: a surface that overflows its box.
             let content_frame = NSRect::new(
                 NSPoint::new(
                     bounds.origin.x - clip.origin.x,
@@ -603,6 +639,7 @@ pub(super) fn create_native_surface(
         let content: id = msg_send![content, initWithFrame: zero];
         let _: () = msg_send![container, addSubview: content];
         let _: () = msg_send![content, release];
+        (*container).set_ivar(CONTENT_VIEW_IVAR, content as *mut c_void);
 
         let _: () = msg_send![root, addSubview: container];
         (*native_window).set_ivar(COMPOSITION_INPUT_IVAR, YES);
@@ -709,8 +746,8 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
                 let moved = unsafe { surface.apply(layer.placement, window_height) };
                 native_moved |= moved;
                 changed |= moved;
-                if layer.placement.is_some() {
-                    native_frames.push(unsafe { frame_of(surface.container.as_ptr() as id) });
+                if let Some(area) = layer.placement.and_then(|placement| pointer_area(&placement, window_height)) {
+                    native_frames.push(area);
                 }
                 order.push(surface.container.as_ptr() as usize);
                 stack.push(StackEntry::Native {
@@ -776,8 +813,20 @@ pub(super) fn recorded_frame(window_state: &Arc<Mutex<MacWindowState>>) -> Optio
     window_state.lock().composition.recorded.last().cloned()
 }
 
-unsafe fn frame_of(view: id) -> NSRect {
-    unsafe { msg_send![view, frame] }
+/// Where in the window view (whose y goes up) the pointer is the native view's, for the cursor
+/// rects: the box cut by the clip, which a surface that overflows its box does not fill. `None`
+/// for a surface that lets the pointer through, or whose box the clip cuts away.
+fn pointer_area(placement: &NativePlacement, window_height: f64) -> Option<NSRect> {
+    if !placement.captures_pointer {
+        return None;
+    }
+    let area = placement.bounds.intersect(&placement.clip).map(|value| f64::from(value.as_f32()));
+    (area.size.width > 0. && area.size.height > 0.).then(|| {
+        NSRect::new(
+            NSPoint::new(area.origin.x, window_height - (area.origin.y + area.size.height)),
+            NSSize::new(area.size.width, area.size.height),
+        )
+    })
 }
 
 /// The parts of `bounds` of the window view that are not under a native container, for its cursor
@@ -943,6 +992,44 @@ mod tests {
         for piece in &pieces {
             assert!(holes.iter().all(|hole| !overlaps(*piece, *hole)), "({}, {}) is under a native view", piece.origin.x, piece.origin.y);
         }
+    }
+
+    fn placement(bounds: gpui::Bounds<gpui::Pixels>, clip: gpui::Bounds<gpui::Pixels>, captures_pointer: bool) -> NativePlacement {
+        NativePlacement {
+            bounds,
+            clip,
+            opacity: 1.,
+            corner_radius: px(0.),
+            captures_pointer,
+        }
+    }
+
+    fn logical(x: f32, y: f32, width: f32, height: f32) -> gpui::Bounds<gpui::Pixels> {
+        gpui::Bounds::new(gpui::point(px(x), px(y)), gpui::size(px(width), px(height)))
+    }
+
+    #[test]
+    fn the_pointer_area_of_a_surface_cut_to_its_box_is_the_clip_flipped_to_the_window_view() {
+        let clip = logical(20., 100., 360., 200.);
+        let area = pointer_area(&placement(logical(20., 100., 360., 400.), clip, true), 500.).unwrap();
+        assert_eq!((area.origin.x, area.origin.y, area.size.width, area.size.height), (20., 200., 360., 200.));
+    }
+
+    #[test]
+    fn the_pointer_area_of_an_overflowing_surface_is_its_box_and_not_the_clip() {
+        let box_ = logical(80., 70., 40., 30.);
+        let area = pointer_area(&placement(box_, logical(50., 50., 200., 100.), true), 500.).unwrap();
+        assert_eq!((area.origin.x, area.origin.y, area.size.width, area.size.height), (80., 400., 40., 30.));
+        // The box cut by the clip on one side only.
+        let area = pointer_area(&placement(logical(30., 120., 100., 100.), logical(50., 50., 200., 100.), true), 500.).unwrap();
+        assert_eq!((area.origin.x, area.origin.y, area.size.width, area.size.height), (50., 350., 80., 30.));
+    }
+
+    #[test]
+    fn a_surface_that_lets_the_pointer_through_or_whose_box_the_clip_cuts_away_has_no_pointer_area() {
+        let (box_, clip) = (logical(80., 70., 40., 30.), logical(50., 50., 200., 100.));
+        assert!(pointer_area(&placement(box_, clip, false), 500.).is_none());
+        assert!(pointer_area(&placement(logical(300., 70., 40., 30.), clip, true), 500.).is_none());
     }
 
     #[test]

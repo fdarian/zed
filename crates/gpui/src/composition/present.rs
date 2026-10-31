@@ -8,11 +8,33 @@ use anyhow::Result;
 use collections::FxHashMap;
 use std::{any::Any, cell::RefCell, rc::Rc};
 
-/// How a native surface looks, beyond where it is.
+/// Whether a native surface is cut to its box, as CSS `overflow` cuts a child.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeSurfaceOverflow {
+    /// The surface is cut to its box and the content mask around it.
+    #[default]
+    Clip,
+    /// The surface is cut to the content mask around it only, so that its view can draw outside
+    /// its box (the outer shadow of a glass view). The element paints the surface inside its own
+    /// overflow clip, so the mask already holds the clip of an `overflow: hidden` element and of
+    /// every ancestor.
+    ///
+    /// The mask is a rectangle, and the surface shows only while its box touches the mask: the
+    /// overflow of a box wholly outside the mask is not shown. A corner radius still cuts the whole
+    /// of the box, and so the overflow with it.
+    Visible,
+}
+
+/// How a native surface looks and behaves, beyond where it is.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NativeSurfaceStyle {
     /// The radius of all four corners; the surface is cut to it. Clamped to half the shorter side.
     pub corner_radius: Pixels,
+    /// Whether the surface is cut to its box.
+    pub overflow: NativeSurfaceOverflow,
+    /// Whether the native view takes the pointer events (and the cursor) over its box, as a web
+    /// page does. When it does not, they are GPUI's, as over any element.
+    pub captures_pointer: bool,
 }
 
 /// A native surface of a window, made by [`Window::create_native_surface`]. It lives while the
@@ -150,12 +172,19 @@ pub(super) fn visible_natives<'a>(scene: &'a Scene, state: &CompositionState) ->
     natives
 }
 
-fn placement(placeholder: &NativeSurfacePlaceholder, scale_factor: f32) -> NativePlacement {
+fn placement(placeholder: &NativeSurfacePlaceholder, scale_factor: f32, window: Bounds<Pixels>) -> NativePlacement {
+    let mut clip = to_logical(placeholder.visible_bounds(), scale_factor);
+    // A mask is the window's or cut from it, but a view must not be asked to be as large as a mask
+    // that is not.
+    if placeholder.overflow == NativeSurfaceOverflow::Visible {
+        clip = clip.intersect(&window);
+    }
     NativePlacement {
         bounds: to_logical(placeholder.bounds, scale_factor),
-        clip: to_logical(placeholder.visible_bounds(), scale_factor),
+        clip,
         opacity: placeholder.opacity,
         corner_radius: px(placeholder.corner_radius.0 / scale_factor),
+        captures_pointer: placeholder.captures_pointer,
     }
 }
 
@@ -167,6 +196,7 @@ pub(crate) fn present(window: &mut Window) {
         return;
     };
     let scale_factor = window.scale_factor();
+    let window_bounds = Bounds::new(Point::default(), window.viewport_size);
     let scene = &window.rendered_frame.scene;
 
     let (layers, retired) = {
@@ -211,7 +241,7 @@ pub(crate) fn present(window: &mut Window) {
                         placement: visible
                             .iter()
                             .find(|native| native.surface == surface)
-                            .map(|native| placement(native, scale_factor)),
+                            .map(|native| placement(native, scale_factor, window_bounds)),
                     }));
                 }
             }
@@ -250,7 +280,8 @@ impl Window {
     ///
     /// The surface takes the element's opacity and the content mask around it, as a rectangle.
     /// Rounded clips, transforms (but for the place they put it) and filters around the element
-    /// do not apply to it.
+    /// do not apply to it. With [`NativeSurfaceOverflow::Visible`] the box does not cut it, only
+    /// the mask does: an element paints it inside its own overflow clip.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_native_surface(
@@ -285,14 +316,16 @@ impl Window {
             content_mask: self.snapped_content_mask(),
             opacity: self.element_opacity(),
             corner_radius,
+            overflow: style.overflow,
+            captures_pointer: style.captures_pointer,
             hitbox: hitbox.id,
             order: 0,
         };
         self.next_frame.scene.insert_native_surface(placeholder);
     }
 
-    /// The native surface that shows at `position` (a window point) and that no GPUI hitbox
-    /// covers: the pointer there belongs to the native view, as the cursor does.
+    /// The native surface that captures the pointer at `position` (a window point) and that no
+    /// GPUI hitbox covers: the pointer there belongs to the native view, as the cursor does.
     pub fn native_surface_at(&self, position: Point<Pixels>) -> Option<CompositionSurfaceId> {
         native_surface_at(self, position)
     }

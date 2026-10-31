@@ -992,12 +992,14 @@ impl Scene {
                 // Not the hitbox: a build of the same subtree inserts the hitbox again, with a new id.
                 PaintOperation::NativeSurface(placeholder) => write!(
                     out,
-                    "native surface {:?} {:?} {:?} {} {:?}",
+                    "native surface {:?} {:?} {:?} {} {:?} {:?} {}",
                     placeholder.surface,
                     placeholder.bounds,
                     placeholder.content_mask,
                     placeholder.opacity,
                     placeholder.corner_radius,
+                    placeholder.overflow,
+                    placeholder.captures_pointer,
                 ),
                 PaintOperation::StartLayer(bounds) => write!(out, "layer {bounds:?}"),
                 PaintOperation::EndLayer => write!(out, "end layer"),

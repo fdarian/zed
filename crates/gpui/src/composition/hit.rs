@@ -70,8 +70,9 @@ pub(super) fn overlay_hitboxes(hitboxes: &[Hitbox], natives: &[&NativeSurfacePla
     layers
 }
 
-/// The topmost native surface that shows at `position` and that no GPUI hitbox above it covers:
-/// where the pointer belongs to the native view.
+/// The topmost native surface that captures the pointer at `position` and that no GPUI hitbox
+/// above it covers: where the pointer belongs to the native view. The pointer area of a surface
+/// is its box cut by the content mask, whatever it draws outside it.
 pub(crate) fn native_surface_at(window: &Window, position: Point<Pixels>) -> Option<CompositionSurfaceId> {
     let state = window.composition.state()?;
     let scene = &window.rendered_frame.scene;
@@ -82,7 +83,7 @@ pub(crate) fn native_surface_at(window: &Window, position: Point<Pixels>) -> Opt
     let natives = visible_natives(scene, &state.borrow());
     let top = natives
         .iter()
-        .rposition(|native| to_logical(native.visible_bounds(), scale_factor).contains(&position))?;
+        .rposition(|native| native.captures_pointer && to_logical(native.hit_bounds(), scale_factor).contains(&position))?;
     let layers = overlay_hitboxes(&window.rendered_frame.hitboxes, &natives);
     let covered = layers[top..]
         .iter()

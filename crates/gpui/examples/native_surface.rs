@@ -145,7 +145,7 @@ mod demo {
                             div()
                                 .relative()
                                 .child(div().h(px(40.)).bg(rgb(0xff00ff)))
-                                .child(div().w(px(360.)).h(px(200.)).child(native(&self.first, NativeSurfaceStyle::default(), "first")))
+                                .child(div().w(px(360.)).h(px(200.)).child(native(&self.first, NativeSurfaceStyle { captures_pointer: true, ..Default::default() }, "first")))
                                 .child(
                                     div()
                                         .absolute()
@@ -165,7 +165,7 @@ mod demo {
                         .top(px(60.))
                         .w(px(140.))
                         .h(px(140.))
-                        .child(native(&self.second, NativeSurfaceStyle { corner_radius: px(24.) }, "second")),
+                        .child(native(&self.second, NativeSurfaceStyle { corner_radius: px(24.), captures_pointer: true, ..Default::default() }, "second")),
                 )
                 .children(popover)
         }
