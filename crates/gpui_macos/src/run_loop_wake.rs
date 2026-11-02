@@ -362,10 +362,15 @@ extern "C" fn ignore_message(
 
 /// The mach port set that the main run loop receives from while it waits in
 /// `kCFRunLoopDefaultMode`.
+pub(crate) unsafe fn default_mode_port_set() -> mach_port_t {
+    unsafe { default_mode_port_set_of(CFRunLoopGetMain()) }
+}
+
+/// The mach port set that `run_loop` receives from while it waits in `kCFRunLoopDefaultMode`.
 ///
 /// CoreFoundation does not expose it, so a sentinel port is added to that mode alone and the
 /// set that contains the sentinel is the one. The sentinel is removed again.
-pub(crate) unsafe fn default_mode_port_set() -> mach_port_t {
+pub(crate) unsafe fn default_mode_port_set_of(run_loop: CFRunLoopRef) -> mach_port_t {
     unsafe {
         let port = CFMachPortCreate(
             ptr::null(),
@@ -379,7 +384,6 @@ pub(crate) unsafe fn default_mode_port_set() -> mach_port_t {
             !source.is_null(),
             "could not create the sentinel run loop source"
         );
-        let run_loop = CFRunLoopGetMain();
         CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode);
 
         let sentinel = CFMachPortGetPort(port);
@@ -393,7 +397,7 @@ pub(crate) unsafe fn default_mode_port_set() -> mach_port_t {
         match sets.as_slice() {
             [set] => *set,
             sets => panic!(
-                "expected one mach port set to contain the main run loop's default-mode \
+                "expected one mach port set to contain the run loop's default-mode \
                  sentinel port {sentinel}, found {}: {sets:?}",
                 sets.len()
             ),
@@ -445,7 +449,7 @@ unsafe fn port_sets_containing(member: mach_port_t) -> Vec<mach_port_t> {
 }
 
 /// Frees an array that a mach call returned in out-of-line memory.
-unsafe fn deallocate<T>(array: *mut T, count: u32) {
+pub(crate) unsafe fn deallocate<T>(array: *mut T, count: u32) {
     if count == 0 {
         return;
     }

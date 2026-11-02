@@ -10,6 +10,7 @@ mod display;
 mod display_link;
 mod events;
 mod keyboard;
+pub mod main_run_loop_wakeups;
 mod pasteboard;
 mod run_loop_wake;
 mod system_notifications;
