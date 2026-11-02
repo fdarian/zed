@@ -2071,6 +2071,7 @@ pub struct Window {
     pointer_lock_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
+    focus_emulation: bool,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Whether the draw that is running answers the platform's frame request, which presents it.
@@ -2839,6 +2840,7 @@ impl Window {
             pointer_lock_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
             active,
+            focus_emulation: false,
             hovered,
             needs_present,
             drawing_for_frame_request: false,
@@ -3472,7 +3474,7 @@ impl Window {
     pub fn observe_window_appearance(
         &self,
         mut callback: impl FnMut(&mut Window, &mut App) + 'static,
-    ) -> Subscription {
+    ) -> crate::Subscription {
         let (subscription, activate) = self.appearance_observers.insert(
             (),
             Box::new(move |window, cx| {
@@ -3488,7 +3490,7 @@ impl Window {
     pub fn observe_button_layout_changed(
         &self,
         mut callback: impl FnMut(&mut Window, &mut App) + 'static,
-    ) -> Subscription {
+    ) -> crate::Subscription {
         let (subscription, activate) = self.button_layout_observers.insert(
             (),
             Box::new(move |window, cx| {
@@ -3889,7 +3891,7 @@ impl Window {
         observed: &Entity<T>,
         cx: &mut App,
         mut on_notify: impl FnMut(Entity<T>, &mut Window, &mut App) + 'static,
-    ) -> Subscription {
+    ) -> crate::Subscription {
         let entity_id = observed.entity_id();
         let observed = observed.downgrade();
         let window_handle = self.handle;
@@ -4181,7 +4183,7 @@ impl Window {
     pub fn observe_pointer_lock(
         &self,
         mut callback: impl FnMut(&mut Window, &mut App) + 'static,
-    ) -> Subscription {
+    ) -> crate::Subscription {
         let (subscription, activate) = self.pointer_lock_observers.insert(
             (),
             Box::new(move |window, cx| {
@@ -4230,14 +4232,44 @@ impl Window {
         self.viewport_size
     }
 
-    /// Returns whether this window is focused by the operating system (receiving key events).
+    /// Returns whether this window is focused by the operating system (receiving key events),
+    /// or reports itself so under [`Window::set_focus_emulation`]. This is what the focus path
+    /// of a frame, and so `on_focus` and `on_blur`, follow. The platform's own value, which
+    /// frame throttling and the cursor use, is not affected by emulation.
     pub fn is_window_active(&self) -> bool {
-        self.active.get()
+        self.active.get() || self.focus_emulation
+    }
+
+    /// Makes the window behave as active for focus (see [`Window::is_window_active`]) without
+    /// asking the platform to activate it: the window does not become key, the application is
+    /// not activated, and everything that reads the platform's state (frame throttling, the
+    /// cursor, `is_window_hovered`) keeps the real value. It is Chrome's
+    /// `Emulation.setFocusEmulationEnabled`, for a window that runs behind the user's work.
+    ///
+    /// A real activation change while emulating notifies nothing, as the window was already
+    /// active for focus, and turning emulation off while the window is not active blurs it.
+    pub fn set_focus_emulation(&mut self, enabled: bool, cx: &mut App) {
+        if self.focus_emulation == enabled {
+            return;
+        }
+        let was_active = self.is_window_active();
+        self.focus_emulation = enabled;
+        if was_active != self.is_window_active() {
+            self.activation_observers
+                .clone()
+                .retain(&(), |callback| callback(self, cx));
+        }
+        self.refresh();
+    }
+
+    /// Whether [`Window::set_focus_emulation`] is on.
+    pub fn focus_emulation(&self) -> bool {
+        self.focus_emulation
     }
 
     /// Returns whether this window is considered to be the window
     /// that currently owns the mouse cursor.
-    /// On mac, this is equivalent to `is_window_active`.
+    /// On mac, this is whether the window is key, which focus emulation does not change.
     pub fn is_window_hovered(&self) -> bool {
         if cfg!(any(
             target_os = "windows",
@@ -4246,7 +4278,7 @@ impl Window {
         )) {
             self.hovered.get()
         } else {
-            self.is_window_active()
+            self.active.get()
         }
     }
 
@@ -5174,7 +5206,7 @@ impl Window {
             self.retained.reference = false;
         }
         self.dirty_views.clear();
-        self.next_frame.window_active = self.active.get();
+        self.next_frame.window_active = self.is_window_active();
 
         // Register requested input handler with the platform window.
         // Use .take() instead of .pop() to preserve Vec length, so that cached
@@ -9656,7 +9688,7 @@ impl Window {
         handle: &FocusHandle,
         cx: &mut App,
         mut listener: impl FnMut(&mut Window, &mut App) + 'static,
-    ) -> Subscription {
+    ) -> crate::Subscription {
         let focus_id = handle.id;
         let (subscription, activate) =
             self.new_focus_listener(Box::new(move |event, window, cx| {
@@ -9676,7 +9708,7 @@ impl Window {
         handle: &FocusHandle,
         cx: &mut App,
         mut listener: impl FnMut(FocusOutEvent, &mut Window, &mut App) + 'static,
-    ) -> Subscription {
+    ) -> crate::Subscription {
         let focus_id = handle.id;
         let (subscription, activate) =
             self.new_focus_listener(Box::new(move |event, window, cx| {
@@ -10633,7 +10665,7 @@ impl Window {
         &mut self,
         cx: &mut App,
         f: impl Fn(&mut Window, &mut App) + 'static,
-    ) -> Subscription {
+    ) -> crate::Subscription {
         let window_handle = self.handle;
         let (subscription, activate) = cx.global_observers.insert(
             TypeId::of::<G>(),
@@ -11070,9 +11102,11 @@ impl Window {
         self.active.set(active);
         self.modifiers = self.platform_window.modifiers();
         self.capslock = self.platform_window.capslock();
-        self.activation_observers
-            .clone()
-            .retain(&(), |callback| callback(self, cx));
+        if !self.focus_emulation {
+            self.activation_observers
+                .clone()
+                .retain(&(), |callback| callback(self, cx));
+        }
 
         self.sync_pointer_lock(cx);
         self.bounds_changed(cx);
@@ -12826,6 +12860,179 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    struct FocusLog {
+        handle: FocusHandle,
+    }
+
+    impl Render for FocusLog {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(div().w(px(50.)).h(px(50.)).track_focus(&self.handle))
+        }
+    }
+
+    fn count_activations(window: &mut Window, count: Rc<Cell<usize>>) -> crate::Subscription {
+        let (subscription, activate) = window.activation_observers.insert(
+            (),
+            Box::new(move |_, _| {
+                count.set(count.get() + 1);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    fn add_focus_log_window(
+        cx: &mut TestAppContext,
+        focused: &Rc<Cell<usize>>,
+        blurred: &Rc<Cell<usize>>,
+    ) -> crate::WindowHandle<FocusLog> {
+        cx.add_window({
+            let focused = focused.clone();
+            let blurred = blurred.clone();
+            move |window, cx| {
+                let handle = cx.focus_handle();
+                let on_focus = focused.clone();
+                cx.on_focus(&handle, window, move |_, _, _| {
+                    on_focus.set(on_focus.get() + 1)
+                })
+                .detach();
+                let on_blur = blurred.clone();
+                cx.on_blur(&handle, window, move |_, _, _| {
+                    on_blur.set(on_blur.get() + 1)
+                })
+                .detach();
+                FocusLog { handle }
+            }
+        })
+    }
+
+    #[gpui::test]
+    fn focus_emulation_makes_an_inactive_window_active_for_focus(cx: &mut TestAppContext) {
+        let focused = Rc::new(Cell::new(0));
+        let blurred = Rc::new(Cell::new(0));
+        let window = add_focus_log_window(cx, &focused, &blurred);
+        let any: AnyWindowHandle = window.into();
+        let handle = window.update(cx, |view, _, _| view.handle.clone()).unwrap();
+
+        cx.update_window(any, |_, window, cx| {
+            window.focus(&handle, cx);
+            window.draw(cx).clear(cx);
+            assert!(!window.is_window_active());
+            assert!(!window.rendered_frame.window_active);
+        })
+        .unwrap();
+        assert_eq!((focused.get(), blurred.get()), (0, 0));
+
+        cx.update_window(any, |_, window, cx| {
+            window.set_focus_emulation(true, cx);
+            assert!(window.focus_emulation());
+            assert!(window.is_window_active());
+            window.draw(cx).clear(cx);
+            assert!(window.rendered_frame.window_active);
+        })
+        .unwrap();
+        assert_eq!((focused.get(), blurred.get()), (1, 0));
+    }
+
+    #[gpui::test]
+    fn a_real_activation_change_does_not_clobber_focus_emulation(cx: &mut TestAppContext) {
+        let focused = Rc::new(Cell::new(0));
+        let blurred = Rc::new(Cell::new(0));
+        let window = add_focus_log_window(cx, &focused, &blurred);
+        let any: AnyWindowHandle = window.into();
+        let handle = window.update(cx, |view, _, _| view.handle.clone()).unwrap();
+        let activations = Rc::new(Cell::new(0));
+        let _subscription = cx
+            .update_window(any, |_, window, _| {
+                count_activations(window, activations.clone())
+            })
+            .unwrap();
+
+        cx.update_window(any, |_, window, cx| {
+            window.set_focus_emulation(true, cx);
+            window.focus(&handle, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!((focused.get(), blurred.get()), (1, 0));
+        let observed = activations.get();
+
+        cx.update_window(any, |_, window, cx| {
+            window.set_active_for_tests(true, cx);
+            window.draw(cx).clear(cx);
+            window.set_active_for_tests(false, cx);
+            assert!(window.is_window_active());
+            window.draw(cx).clear(cx);
+            assert!(window.rendered_frame.window_active);
+        })
+        .unwrap();
+        assert_eq!(
+            (focused.get(), blurred.get()),
+            (1, 0),
+            "activating a window that already emulates focus is not a second focus"
+        );
+        assert_eq!(activations.get(), observed, "activation observers stay quiet");
+    }
+
+    #[gpui::test]
+    fn turning_focus_emulation_off_restores_the_real_state(cx: &mut TestAppContext) {
+        let focused = Rc::new(Cell::new(0));
+        let blurred = Rc::new(Cell::new(0));
+        let window = add_focus_log_window(cx, &focused, &blurred);
+        let any: AnyWindowHandle = window.into();
+        let handle = window.update(cx, |view, _, _| view.handle.clone()).unwrap();
+        let activations = Rc::new(Cell::new(0));
+        let _subscription = cx
+            .update_window(any, |_, window, _| {
+                count_activations(window, activations.clone())
+            })
+            .unwrap();
+        let initial = activations.get();
+
+        cx.update_window(any, |_, window, cx| {
+            window.set_focus_emulation(true, cx);
+            window.focus(&handle, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(activations.get(), initial + 1);
+
+        cx.update_window(any, |_, window, cx| {
+            window.set_focus_emulation(false, cx);
+            assert!(!window.is_window_active());
+            window.draw(cx).clear(cx);
+            assert!(!window.rendered_frame.window_active);
+        })
+        .unwrap();
+        assert_eq!((focused.get(), blurred.get()), (1, 1));
+        assert_eq!(activations.get(), initial + 2);
+
+        cx.update_window(any, |_, window, cx| {
+            window.set_active_for_tests(true, cx);
+            window.set_focus_emulation(true, cx);
+            window.set_focus_emulation(false, cx);
+            assert!(window.is_window_active(), "a window that is really active stays so");
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn focus_emulation_leaves_the_platform_state_alone(cx: &mut TestAppContext) {
+        let focused = Rc::new(Cell::new(0));
+        let blurred = Rc::new(Cell::new(0));
+        let window = add_focus_log_window(cx, &focused, &blurred);
+        let any: AnyWindowHandle = window.into();
+
+        cx.update_window(any, |_, window, cx| {
+            window.set_focus_emulation(true, cx);
+            assert!(window.is_window_active());
+            assert!(!window.active.get());
+            assert!(!window.is_window_hovered(), "the cursor follows the real state");
+        })
+        .unwrap();
     }
 
     struct DialogAndNeighbour {
