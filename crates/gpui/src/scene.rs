@@ -10,6 +10,8 @@ use crate::{
     GroupEffect, Hsla, MAX_GROUP_EXTENT, Pixels, Point, Radians, RenderGlyphParams, ResolvedFilter, ScaledPixels, Size,
     bounds_tree::BoundsTree, composition::{NativeSurfacePlaceholder, OrderRange}, filter_margin, point, visual_bounds,
 };
+mod split;
+
 use std::{
     fmt::Debug,
     iter::Peekable,
@@ -45,8 +47,8 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
-    /// For each layer pushed and not popped, whether it opened one in `layer_stack`.
-    layer_opened: Vec<bool>,
+    /// For each layer pushed and not popped, its bounds if it opened one in `layer_stack`.
+    open_layers: Vec<Option<Bounds<ScaledPixels>>>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -120,6 +122,7 @@ struct GroupBuilder {
     id: u64,
     effect: GroupEffect,
     content_mask: ContentMask<ScaledPixels>,
+    reserved: Option<Bounds<ScaledPixels>>,
     reserved_order: Option<DrawOrder>,
     scene: Scene,
 }
@@ -152,7 +155,7 @@ impl Scene {
         clear_shrinking(&mut self.paint_operations);
         self.primitive_bounds.clear();
         self.layer_stack.clear();
-        self.layer_opened.clear();
+        self.open_layers.clear();
         clear_shrinking(&mut self.paths);
         clear_shrinking(&mut self.shadows);
         clear_shrinking(&mut self.quads);
@@ -263,7 +266,7 @@ impl Scene {
         let bounds = if opened { bounds } else { Bounds::default() };
         self.record(PaintOperation::StartLayer(bounds));
         let current = self.current_mut();
-        current.layer_opened.push(opened);
+        current.open_layers.push(opened.then_some(bounds));
         if opened {
             let order = current.insert_bounds(bounds);
             current.layer_stack.push(order);
@@ -273,7 +276,7 @@ impl Scene {
     pub fn pop_layer(&mut self) {
         self.record(PaintOperation::EndLayer);
         let current = self.current_mut();
-        if current.layer_opened.pop() == Some(true) {
+        if current.open_layers.pop().flatten().is_some() {
             current.layer_stack.pop();
         }
     }
@@ -474,13 +477,15 @@ impl Scene {
                 if group.effect.opacity <= 0. {
                     return;
                 }
-                if group.effect.is_opacity_only() {
-                    opacity *= group.effect.opacity;
-                }
+                opacity *= group.effect.opacity;
             }
             placeholder.opacity *= opacity;
             if !self.group_stack.is_empty() {
-                self.pending_native_surfaces.push(placeholder);
+                if self.splits_at_native_surface() {
+                    self.split_groups_at_native_surface(placeholder);
+                } else {
+                    self.pending_native_surfaces.push(placeholder);
+                }
                 return;
             }
         } else {
@@ -692,6 +697,16 @@ impl Scene {
             self.flat_opacities.push(effect.opacity);
             return;
         }
+        self.open_group(effect, content_mask, reserved);
+    }
+
+    /// [`Scene::start_group`] without recording it.
+    fn open_group(
+        &mut self,
+        effect: GroupEffect,
+        content_mask: ContentMask<ScaledPixels>,
+        reserved: Option<Bounds<ScaledPixels>>,
+    ) {
         let reserved_order = reserved.map(|bounds| {
             let current = self.current_mut();
             current
@@ -714,6 +729,7 @@ impl Scene {
             id,
             effect,
             content_mask,
+            reserved,
             reserved_order,
             scene,
         });
@@ -753,6 +769,11 @@ impl Scene {
             self.flat_opacities.pop();
             return;
         }
+        self.finish_group();
+    }
+
+    /// [`Scene::end_group`]'s closing of the innermost open group, without recording it.
+    fn finish_group(&mut self) {
         let Some(builder) = self.group_stack.pop() else {
             return;
         };
@@ -760,6 +781,7 @@ impl Scene {
             id,
             mut effect,
             content_mask,
+            reserved: _,
             reserved_order,
             mut scene,
         } = builder;
@@ -2902,6 +2924,9 @@ impl PathVertex<Pixels> {
         }
     }
 }
+
+#[cfg(test)]
+mod split_tests;
 
 #[cfg(test)]
 mod tests {

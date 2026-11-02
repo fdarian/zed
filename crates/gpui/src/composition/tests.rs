@@ -900,6 +900,64 @@ mod window {
     }
 
     #[test]
+    fn what_a_fading_group_paints_after_a_surface_is_in_the_layer_above_it() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        window.update(|_, window, _| window.force_effect_groups());
+        let surface = make_surface(&mut window);
+        let page_surface = surface.clone();
+        set_page(&mut window, move |_| {
+            root()
+                .child(
+                    div()
+                        .opacity(0.5)
+                        .child(block(0., 0., 100., 100.))
+                        .child(native(&page_surface, 10., 10., 50., 50.))
+                        .child(block(20., 20., 60., 60.))
+                        .child(block(30., 30., 20., 20.)),
+                )
+                .into_any_element()
+        });
+
+        let frame = frame(&mut window);
+
+        assert_eq!(layer_kinds(&frame), "base native gpui");
+        let layers = gpui_layers(&frame);
+        assert_eq!(layers[0].1, 1, "the block painted before is under the surface");
+        assert_eq!(layers[1].1, 1, "and the group of the two painted after is above it");
+        assert_eq!(native_layer(&frame, &surface).0.expect("the surface shows").opacity, 0.5);
+    }
+
+    #[test]
+    fn nested_fades_multiply_and_both_split_at_the_surface() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        window.update(|_, window, _| window.force_effect_groups());
+        let surface = make_surface(&mut window);
+        let page_surface = surface.clone();
+        set_page(&mut window, move |_| {
+            root()
+                .child(
+                    div()
+                        .opacity(0.5)
+                        .child(
+                            div()
+                                .opacity(0.5)
+                                .child(block(0., 0., 100., 100.))
+                                .child(native(&page_surface, 10., 10., 50., 50.))
+                                .child(block(20., 20., 60., 60.))
+                                .child(block(30., 30., 20., 20.)),
+                        ),
+                )
+                .into_any_element()
+        });
+
+        let frame = frame(&mut window);
+
+        assert_eq!(layer_kinds(&frame), "base native gpui");
+        assert_eq!(gpui_layers(&frame)[1].1, 1);
+        assert_eq!(native_layer(&frame, &surface).0.expect("the surface shows").opacity, 0.25);
+    }
+
+    #[test]
     fn the_hitboxes_over_a_surface_are_the_overlay_layer_s_and_never_its_ancestors() {
         let (_app, mut window) = open(|_| root().into_any_element());
         let surface = make_surface(&mut window);
