@@ -14,7 +14,7 @@ mod tree;
 #[cfg(test)]
 mod tests;
 
-use crate::{Bounds, ContentMask, DrawOrder, HitboxBehavior, HitboxId, Pixels, ScaledPixels};
+use crate::{Bounds, ContentMask, DrawOrder, HitboxBehavior, HitboxId, Pixels, ScaledPixels, Size};
 use std::{any::Any, rc::Rc};
 
 pub(crate) use hit::pointer_over_native_surface;
@@ -45,6 +45,17 @@ pub trait PlatformSurfaceAttachment {
 
     /// The platform's own type, for its `draw_composed` to apply a [`NativePlacement`] to.
     fn as_any(&self) -> &dyn Any;
+
+    /// Gives the native view of a surface that no frame has placed yet the size it will have, so
+    /// that an embedder who adds its view to it before the first frame (`autoresizing` follows the
+    /// content view from then on) finds a content view that is not empty. A surface that was
+    /// placed already keeps its placement.
+    fn size_before_placement(&self, _size: Size<Pixels>) {}
+
+    /// The size of the content view, for a platform that has one to measure.
+    fn content_size(&self) -> Option<Size<Pixels>> {
+        None
+    }
 }
 
 /// A range of draw orders: `after < order <= through`.

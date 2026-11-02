@@ -588,6 +588,43 @@ mod window {
     }
 
     #[test]
+    fn a_surface_is_sized_in_the_prepaint_that_precedes_its_first_frame() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        assert_eq!(surface.content_size(), None);
+        let sized_in_prepaint = Rc::new(std::cell::RefCell::new(None));
+        let (page_surface, seen) = (surface.clone(), sized_in_prepaint.clone());
+        set_page(&mut window, move |_| {
+            let (prepainted, painted) = (page_surface.clone(), page_surface.clone());
+            let seen = seen.clone();
+            root()
+                .child(
+                    canvas(
+                        move |bounds, window, _| {
+                            window.size_native_surface(&prepainted, bounds);
+                            *seen.borrow_mut() = prepainted.content_size();
+                            window.insert_hitbox(bounds, HitboxBehavior::Normal)
+                        },
+                        move |bounds, hitbox, window, _| {
+                            window.paint_native_surface(&painted, &hitbox, bounds, NativeSurfaceStyle::default())
+                        },
+                    )
+                    .absolute()
+                    .left(px(20.))
+                    .top(px(20.))
+                    .w(px(120.))
+                    .h(px(80.)),
+                )
+                .into_any_element()
+        });
+
+        let frame = frame(&mut window);
+
+        assert_eq!(*sized_in_prepaint.borrow(), Some(size(px(120.), px(80.))));
+        assert_eq!(native_layer(&frame, &surface).0.expect("placed").bounds, rect(20., 20., 120., 80.));
+    }
+
+    #[test]
     fn a_surface_that_is_not_painted_is_hidden_and_the_frame_is_composed() {
         let (_app, mut window) = open(|_| root().into_any_element());
         let surface = make_surface(&mut window);

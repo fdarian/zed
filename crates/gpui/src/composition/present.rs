@@ -3,7 +3,7 @@ use super::{
     NativeLayer, NativePlacement, NativeSurfacePlaceholder, OrderRange, PlatformSurfaceAttachment,
     hit::{native_surface_at, overlay_hitboxes, to_logical},
 };
-use crate::{Bounds, Hitbox, Pixels, Point, Scene, ScaledPixels, Window, px};
+use crate::{Bounds, Hitbox, Pixels, Point, Scene, ScaledPixels, Size, Window, px};
 use anyhow::Result;
 use collections::FxHashMap;
 use std::{any::Any, cell::RefCell, rc::Rc};
@@ -54,6 +54,11 @@ impl NativeSurface {
     /// as `usize` on macOS).
     pub fn platform_handle(&self) -> Result<Box<dyn Any>> {
         self.state.borrow().attachment(self.id).platform_handle()
+    }
+
+    /// The size of the content view, `None` where the platform has no view to measure.
+    pub fn content_size(&self) -> Option<Size<Pixels>> {
+        self.state.borrow().attachment(self.id).content_size()
     }
 }
 
@@ -271,6 +276,17 @@ impl Window {
             .clone();
         let id = state.borrow_mut().add_native(attachment);
         Ok(NativeSurface { id, state })
+    }
+
+    /// Sizes the native view of `surface` to `bounds` (in the local space of what is being
+    /// prepainted or painted), the size [`Window::paint_native_surface`] will place it at, before
+    /// any frame has: an embedder that adds its own view to a new surface finds a content view of
+    /// the size the page gives it. It does nothing for a surface that a frame placed already.
+    pub fn size_native_surface(&mut self, surface: &NativeSurface, bounds: Bounds<Pixels>) {
+        let scale_factor = self.scale_factor();
+        let snapped = self.snap_bounds(self.bounds_in_window(bounds));
+        let size = to_logical(snapped, scale_factor).size;
+        surface.state.borrow().attachment(surface.id).size_before_placement(size);
     }
 
     /// Paints `surface` at `bounds`: the GPUI primitives painted before it and overlapping it are

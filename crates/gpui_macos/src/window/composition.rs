@@ -531,6 +531,23 @@ impl PlatformSurfaceAttachment for MacNativeSurface {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn size_before_placement(&self, size: gpui::Size<gpui::Pixels>) {
+        if self.applied.get().is_some() {
+            return;
+        }
+        let size = NSSize::new(f64::from(size.width.as_f32()), f64::from(size.height.as_f32()));
+        let frame = NSRect::new(NSPoint::new(0., 0.), size);
+        unsafe {
+            let _: () = msg_send![self.container.as_ptr(), setFrame: frame];
+            let _: () = msg_send![self.content.as_ptr(), setFrame: frame];
+        }
+    }
+
+    fn content_size(&self) -> Option<gpui::Size<gpui::Pixels>> {
+        let bounds: NSRect = unsafe { msg_send![self.content.as_ptr(), bounds] };
+        Some(gpui::size(gpui::px(bounds.size.width as f32), gpui::px(bounds.size.height as f32)))
+    }
 }
 
 impl Drop for MacNativeSurface {
@@ -777,6 +794,11 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
     }
 
     let previous = state.renderer.presents_with_transaction();
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        let frame = state.composition.recorded.last_mut().expect("this frame was recorded above");
+        frame.presented_with_transaction = changed;
+    }
     if changed {
         set_presents_with_transaction(state, true);
     }

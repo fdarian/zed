@@ -27,6 +27,11 @@ path = "tests/native_surface.rs"
 harness = false
 
 [[test]]
+name = "native_surface_present"
+path = "tests/native_surface_present.rs"
+harness = false
+
+[[test]]
 name = "window_resize"
 path = "tests/window_resize.rs"
 harness = false

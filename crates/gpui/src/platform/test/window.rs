@@ -98,6 +98,9 @@ impl RecordedLayer {
 pub struct CompositionFrame {
     /// The layers, bottom to top.
     pub layers: Vec<RecordedLayer>,
+    /// Whether the platform presented the frame with the transaction its views changed in, which
+    /// it does for a frame that adds, removes, moves or reorders a view. The test platform never does.
+    pub presented_with_transaction: bool,
 }
 
 impl CompositionFrame {
@@ -131,7 +134,7 @@ impl CompositionFrame {
                 },
             })
             .collect();
-        Self { layers }
+        Self { layers, presented_with_transaction: false }
     }
 
     /// The native layers, bottom to top.
@@ -154,6 +157,8 @@ pub enum NativeSurfaceEvent {
 struct TestSurfaceAttachment {
     index: usize,
     events: Rc<RefCell<Vec<NativeSurfaceEvent>>>,
+    /// What `size_before_placement` last gave.
+    size: Cell<Option<Size<Pixels>>>,
 }
 
 impl PlatformSurfaceAttachment for TestSurfaceAttachment {
@@ -163,6 +168,14 @@ impl PlatformSurfaceAttachment for TestSurfaceAttachment {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn size_before_placement(&self, size: Size<Pixels>) {
+        self.size.set(Some(size));
+    }
+
+    fn content_size(&self) -> Option<Size<Pixels>> {
+        self.size.get()
     }
 }
 
@@ -615,6 +628,7 @@ impl PlatformWindow for TestWindow {
         Ok(Rc::new(TestSurfaceAttachment {
             index,
             events: state.native_surface_events.clone(),
+            size: Cell::new(None),
         }))
     }
 
