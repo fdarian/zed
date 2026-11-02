@@ -507,8 +507,12 @@ impl Scene {
         let clipped_bounds = primitive
             .window_bounds()
             .intersect(&primitive.content_mask().bounds);
+        // What a primitive draws beyond its bounds is ordered against what it overlaps there.
+        let drawn_bounds = primitive
+            .drawn_bounds()
+            .intersect(&primitive.content_mask().bounds);
 
-        if clipped_bounds.is_empty() {
+        if clipped_bounds.is_empty() || drawn_bounds.is_empty() {
             return;
         }
 
@@ -516,7 +520,7 @@ impl Scene {
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.insert_bounds(clipped_bounds));
+            .unwrap_or_else(|| self.insert_bounds(drawn_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -577,7 +581,7 @@ impl Scene {
             }
         };
         for shadow in &self.shadows {
-            add(shadow.window_bounds(), &shadow.content_mask);
+            add(shadow.drawn_bounds(), &shadow.content_mask);
         }
         for quad in &self.quads {
             add(quad.window_bounds(), &quad.content_mask);
@@ -1548,6 +1552,15 @@ impl Primitive {
         }
     }
 
+    /// The area the primitive draws in the window: [`Primitive::window_bounds`], and for a shadow
+    /// the blur around it.
+    pub fn drawn_bounds(&self) -> Bounds<ScaledPixels> {
+        match self {
+            Primitive::Shadow(shadow) => shadow.drawn_bounds(),
+            _ => self.window_bounds(),
+        }
+    }
+
     /// Scales the primitive's alpha, as a group's opacity does when it is drawn flat.
     pub fn apply_opacity(&mut self, opacity: f32) {
         match self {
@@ -1737,11 +1750,28 @@ impl Shadow {
         translate_bounds(&mut self.element_bounds, delta);
     }
 
-    /// The area of the shadow's rectangle in the window; the blur beyond it is not counted.
+    /// The area of the shadow's rectangle in the window; the blur beyond it is not counted, see
+    /// [`Shadow::drawn_bounds`] for that.
     pub fn window_bounds(&self) -> Bounds<ScaledPixels> {
         transformed_bounds(&self.transformation, self.bounds)
     }
+
+    /// The area the shader draws in the window. An outer shadow is drawn over its rectangle grown
+    /// by the gaussian tail on every side, and an inset one over the box of its element, which
+    /// the hole it is the complement of need not cover.
+    pub fn drawn_bounds(&self) -> Bounds<ScaledPixels> {
+        if self.inset != 0 {
+            return transformed_bounds(&self.transformation, self.element_bounds);
+        }
+        // `shadow_vertex` in the shaders leaves this much room around the rectangle.
+        let tail = ScaledPixels(SHADOW_TAIL_SIGMAS * self.blur_radius.0);
+        transformed_bounds(&self.transformation, self.bounds.dilate(tail))
+    }
 }
+
+/// How many times the blur radius a shadow is drawn beyond its rectangle, which is as far as the
+/// fragment shader integrates the gaussian. The shadow vertex shaders repeat it, so change them together.
+const SHADOW_TAIL_SIGMAS: f32 = 3.;
 
 impl Underline {
     fn translate(&mut self, delta: Point<ScaledPixels>) {
@@ -3052,6 +3082,105 @@ mod tests {
             scene.groups[0].scene.quads[0].bounds.origin,
             point(ScaledPixels(6.), ScaledPixels(6.))
         );
+    }
+
+    fn shadow(rect: Bounds<ScaledPixels>, blur: f32) -> Shadow {
+        Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(blur),
+            bounds: rect,
+            corner_radii: Corners::default(),
+            corner_radii_y: Corners::default(),
+            content_mask: mask(),
+            color: red(),
+            element_bounds: rect,
+            element_corner_radii: Corners::default(),
+            element_corner_radii_y: Corners::default(),
+            inset: 0,
+            pad: 0,
+            transformation: TransformationMatrix::unit(),
+            local_clip: ContentMask::unbounded(),
+        }
+    }
+
+    #[test]
+    fn a_group_holds_the_whole_blur_of_a_shadow() {
+        let mut scene = scene();
+        scene.start_group(fade(0.5), mask(), None);
+        // A box of 50 by 50 at (100, 100), shadowed with offset (10, 5) and spread 4: the rectangle
+        // is the box moved and grown, and the blur adds three times its radius around it.
+        scene.insert_primitive(shadow(bounds(106., 101., 58., 58.), 8.));
+        scene.insert_primitive(quad(100., 100., 50., 50.));
+        scene.end_group();
+        assert_eq!(scene.groups[0].bounds, bounds(82., 77., 106., 106.));
+        assert_eq!(
+            scene.groups[0].scene.shadows[0].bounds,
+            bounds(24., 24., 58., 58.),
+            "the shadow keeps its place in the group's texture"
+        );
+    }
+
+    #[test]
+    fn a_group_holds_the_whole_blur_of_a_transformed_shadow() {
+        let mut scene = scene();
+        scene.start_group(fade(0.5), mask(), None);
+        let mut scaled = shadow(bounds(100., 100., 50., 50.), 5.);
+        scaled.transformation = TransformationMatrix::from_css([2., 0., 0., 2., 0., 0.]);
+        scene.insert_primitive(scaled);
+        scene.insert_primitive(quad(20., 20., 4., 4.));
+        scene.end_group();
+        // The blur is added in the shadow's own space (15 each way), then the matrix doubles it,
+        // and the pixel the shader adds around a transformed primitive is on top of that.
+        let group = scene.groups[0].bounds;
+        assert_eq!(group.origin, point(ScaledPixels(20.), ScaledPixels(20.)));
+        assert_eq!(group.bottom_right(), point(ScaledPixels(331.), ScaledPixels(331.)));
+    }
+
+    #[test]
+    fn a_group_holds_the_ring_of_an_inset_shadow() {
+        let mut scene = scene();
+        scene.start_group(fade(0.5), mask(), None);
+        let mut inset = shadow(bounds(110., 110., 30., 30.), 4.);
+        inset.element_bounds = bounds(100., 100., 50., 50.);
+        inset.inset = 1;
+        scene.insert_primitive(inset);
+        // Inside the hole, which the shadow is not drawn in.
+        scene.insert_primitive(quad(120., 120., 10., 10.));
+        scene.end_group();
+        assert_eq!(scene.groups[0].bounds, bounds(100., 100., 50., 50.));
+    }
+
+    #[test]
+    fn a_group_without_a_shadow_is_as_big_as_its_content() {
+        let mut scene = scene();
+        scene.start_group(fade(0.5), mask(), None);
+        scene.insert_primitive(quad(100., 100., 50., 50.));
+        scene.insert_primitive(quad(120., 130., 60., 10.));
+        scene.end_group();
+        assert_eq!(scene.groups[0].bounds, bounds(100., 100., 80., 50.));
+    }
+
+    #[test]
+    fn a_shadow_is_above_what_its_blur_reaches_that_was_painted_before_it() {
+        let mut scene = scene();
+        scene.insert_primitive(quad(0., 0., 100., 100.));
+        // The rectangle is clear of the quad, the tail of 60 is not.
+        scene.insert_primitive(shadow(bounds(140., 0., 60., 100.), 20.));
+        scene.finish();
+        assert!(scene.shadows[0].order > scene.quads[0].order);
+    }
+
+    #[test]
+    fn a_shadow_is_below_what_is_painted_after_it_over_its_blur() {
+        let mut scene = scene();
+        scene.insert_primitive(quad(140., 0., 60., 100.));
+        scene.insert_primitive(shadow(bounds(140., 0., 60., 100.), 20.));
+        // Over the tail of the shadow but clear of its rectangle.
+        scene.insert_primitive(quad(60., 0., 60., 100.));
+        scene.finish();
+        assert!(scene.quads.iter().all(|quad| quad.order > 0));
+        let later = scene.quads.iter().find(|quad| quad.bounds.origin.x.0 == 60.).unwrap();
+        assert!(later.order > scene.shadows[0].order);
     }
 
     #[test]

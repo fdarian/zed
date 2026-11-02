@@ -4600,6 +4600,52 @@ mod tests {
     }
 
     #[test]
+    fn a_faded_group_keeps_the_blur_of_its_shadow_beyond_the_rectangle() {
+        let rectangle = Bounds::new(
+            point(ScaledPixels(14.), ScaledPixels(14.)),
+            size(ScaledPixels(12.), ScaledPixels(12.)),
+        );
+        let paint = |scene: &mut Scene, opacity: f32, faded: bool| {
+            let mut halo = shadow(4., CornerRadii::default());
+            halo.bounds = rectangle;
+            halo.element_bounds = rectangle;
+            halo.color = gpui::red().opacity(if faded { 1. } else { opacity });
+            let mut fill = solid(14., 14., 12., 12., 0xff0000);
+            if !faded {
+                fill.background = gpui::red().opacity(opacity).into();
+            }
+            scene.insert_primitive(halo);
+            scene.insert_primitive(fill);
+        };
+        let mut grouped = groups_scene();
+        grouped.start_group(
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        paint(&mut grouped, 0.5, true);
+        grouped.end_group();
+        let mut flat = Scene::default();
+        paint(&mut flat, 0.5, false);
+
+        let grouped = render(&mut grouped);
+        let flat = render(&mut flat);
+        // The tail of the shadow reaches 12 pixels out; these are 2, 6 and 10 pixels from the
+        // rectangle, beside it and off its corner.
+        for (x, y) in [(12, 20), (8, 20), (4, 20), (20, 12), (20, 8), (20, 4), (28, 20), (20, 28), (10, 10), (30, 30)] {
+            let (grouped, flat) = (grouped.get_pixel(x, y).0, flat.get_pixel(x, y).0);
+            assert!(
+                grouped.iter().zip(flat).all(|(grouped, flat)| grouped.abs_diff(flat) <= 8),
+                "pixel ({x}, {y}) is {grouped:?} in the group, {flat:?} with no group"
+            );
+        }
+        assert!(flat.get_pixel(8, 20).0[3] > 20, "the shadow is there to compare");
+    }
+
+    #[test]
     fn a_hard_shadow_with_elliptical_corners_has_the_shape_of_the_hit_test() {
         let mut scene = Scene::default();
         scene.insert_primitive(shadow(0., elliptical_radii()));
