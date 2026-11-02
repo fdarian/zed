@@ -632,6 +632,20 @@ unsafe fn set_corner_radius(layer: id, container_frame: NSRect, content_frame: N
     }
 }
 
+/// With `GPUIX_RENDER_STATS` set, the time of the composition steps is printed next to the renderer's
+/// per-layer lines, to tell where the frame of a window with many native views spends it.
+fn stats_timer() -> Option<std::time::Instant> {
+    renderer::render_stats_enabled().then(std::time::Instant::now)
+}
+
+struct ReportOnDrop(&'static str, std::time::Instant);
+
+impl Drop for ReportOnDrop {
+    fn drop(&mut self) {
+        eprintln!("[gpuix-compose] {} ms={:.3}", self.0, self.1.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
 /// `PlatformWindow::create_native_surface`.
 pub(super) fn create_native_surface(
     window_state: &Arc<Mutex<MacWindowState>>,
@@ -641,6 +655,7 @@ pub(super) fn create_native_surface(
         let state = window_state.lock();
         (state.native_view.as_ptr() as id, state.native_window)
     };
+    let _report = stats_timer().map(|started| ReportOnDrop("create_native_surface", started));
     unsafe {
         let zero = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
         let container: id = msg_send![native_surface_class(), alloc];
@@ -674,6 +689,7 @@ pub(super) fn create_native_surface(
 /// A frame that moves a native view presents its drawables with the transaction the views change
 /// in, so a page and the GPUI content around it appear together.
 pub(super) fn draw_composed(window_state: &Arc<Mutex<MacWindowState>>, scene: ComposedScene<'_>) -> Result<()> {
+    let _report = stats_timer().map(|started| ReportOnDrop("draw_composed", started));
     let has_native = scene.layers().iter().any(|layer| matches!(layer, ComposedLayer::Native(_)));
     draw_composed_locked(window_state, &scene)?;
     if has_native {
@@ -732,6 +748,7 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
             && !layer.is_base
             && !state.composition.overlays.contains_key(&layer.surface)
         {
+            let _report = stats_timer().map(|started| ReportOnDrop("create_overlay", started));
             let overlay = unsafe { create_overlay(window_state, state)? };
             state.composition.overlays.insert(layer.surface, overlay);
             changed = true;
@@ -802,6 +819,8 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
     if changed {
         set_presents_with_transaction(state, true);
     }
+    let _report = stats_timer()
+        .map(|started| ReportOnDrop(if changed { "draw_layers_in_transaction" } else { "draw_layers" }, started));
     for layer in scene.layers() {
         if let ComposedLayer::Gpui(layer) = layer {
             if layer.is_base {

@@ -433,6 +433,7 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let stats = render_stats_enabled().then(std::time::Instant::now);
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -442,8 +443,8 @@ impl MetalRenderer {
             );
             return;
         };
+        let stats = stats.map(|started| (encoders_opened(), started.elapsed(), std::time::Instant::now()));
 
-        let stats = render_stats_enabled().then(|| (encoders_opened(), std::time::Instant::now()));
         let command_buffer = match self.render_frame_in(scene, orders, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
@@ -451,14 +452,9 @@ impl MetalRenderer {
                 return;
             }
         };
-        if let Some((encoders_before, started)) = stats {
-            eprintln!(
-                "[gpuix-render] encoders={} encode_ms={:.3} pool_mb={:.1}",
-                encoders_opened() - encoders_before,
-                started.elapsed().as_secs_f64() * 1e3,
-                self.texture_pool.bytes() as f64 / 1e6,
-            );
-        }
+        let encoded = stats.map(|(encoders_before, drawable_time, started)| {
+            (encoders_opened() - encoders_before, drawable_time, started.elapsed(), std::time::Instant::now())
+        });
 
         log_presented_time(&drawable);
         if self.presents_with_transaction {
@@ -468,6 +464,16 @@ impl MetalRenderer {
         } else {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
+        }
+        if let Some((encoders, drawable_time, encode_time, presenting)) = encoded {
+            eprintln!(
+                "[gpuix-render] encoders={} drawable_ms={:.3} encode_ms={:.3} present_ms={:.3} pool_mb={:.1}",
+                encoders,
+                drawable_time.as_secs_f64() * 1e3,
+                encode_time.as_secs_f64() * 1e3,
+                presenting.elapsed().as_secs_f64() * 1e3,
+                self.texture_pool.bytes() as f64 / 1e6,
+            );
         }
     }
 
@@ -3125,9 +3131,10 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
     }
 }
 
-/// Debug only: with `GPUIX_RENDER_STATS` set, `draw` prints the encoders it opened, the time it
-/// took to encode the frame and the bytes the texture pool holds, one line per frame.
-fn render_stats_enabled() -> bool {
+/// Debug only: with `GPUIX_RENDER_STATS` set, `draw` and `draw_orders` print the encoders they opened,
+/// the time to get the drawable, to encode the frame and to commit and present it, and the bytes the
+/// texture pool holds, one line per layer drawn.
+pub fn render_stats_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GPUIX_RENDER_STATS").is_some())
 }
