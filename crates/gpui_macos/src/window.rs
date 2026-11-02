@@ -76,11 +76,16 @@ use std::{
 };
 
 mod composition;
+mod kind;
 
 const WINDOW_STATE_IVAR: &str = "windowState";
 /// A plain flag rather than a field of the state behind `WINDOW_STATE_IVAR`: AppKit asks for the
 /// constrained frame from inside calls that already hold that state's lock.
 const KEEPS_FRAME_IVAR: &str = "keepsFrame";
+/// Set only while a panel is ordered front without `focus`: AppKit makes an ordered-front
+/// non-activating panel the key window of an inactive app by itself, and only `canBecomeKeyWindow`
+/// can refuse that. Zero (can become key) for every other window.
+const REFUSES_KEY_IVAR: &str = "refusesKey";
 
 /// How many display-link steps in a row may find nothing to do before the link stops. Every step
 /// is a wake of the embedder, so a window that asked for one frame (a caret toggle) costs this
@@ -112,6 +117,8 @@ const NSTrackingActiveInKeyWindow: NSUInteger = 0x20;
 const NSTrackingActiveAlways: NSUInteger = 0x80;
 #[allow(non_upper_case_globals)]
 const NSTrackingInVisibleRect: NSUInteger = 0x200;
+#[allow(non_upper_case_globals)]
+const NSWindowTabbingModeDisallowed: NSInteger = 2;
 #[allow(non_upper_case_globals)]
 const NSWindowAnimationBehaviorUtilityWindow: NSInteger = 4;
 #[allow(non_upper_case_globals)]
@@ -392,6 +399,7 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
         let mut decl = ClassDecl::new(name, superclass).unwrap();
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
         decl.add_ivar::<BOOL>(KEEPS_FRAME_IVAR);
+        decl.add_ivar::<BOOL>(REFUSES_KEY_IVAR);
         composition::register_window_input(&mut decl, superclass);
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
         decl.add_method(
@@ -405,7 +413,7 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
         );
         decl.add_method(
             sel!(canBecomeKeyWindow),
-            yes as extern "C" fn(&Object, Sel) -> BOOL,
+            can_become_key_window as extern "C" fn(&Object, Sel) -> BOOL,
         );
         decl.add_method(
             sel!(windowDidResize:),
@@ -1046,19 +1054,13 @@ impl MacWindow {
                     | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
             }
 
-            let native_window: id = match kind {
-                WindowKind::Normal => {
-                    msg_send![WINDOW_CLASS, alloc]
-                }
-                // `AnchoredPopup` is rejected in `MacPlatform::open_window`, grouped here only
-                // for exhaustiveness.
-                WindowKind::PopUp | WindowKind::AnchoredPopup(_) => {
-                    style_mask |= NSWindowStyleMaskNonactivatingPanel;
-                    msg_send![PANEL_CLASS, alloc]
-                }
-                WindowKind::Floating | WindowKind::Dialog => {
-                    msg_send![PANEL_CLASS, alloc]
-                }
+            let kind_traits = kind::traits(&kind);
+            if kind_traits.non_activating {
+                style_mask |= NSWindowStyleMaskNonactivatingPanel;
+            }
+            let native_window: id = match kind_traits.class {
+                kind::NativeClass::Window => msg_send![WINDOW_CLASS, alloc],
+                kind::NativeClass::Panel => msg_send![PANEL_CLASS, alloc],
             };
 
             let display = display_id
@@ -1241,12 +1243,9 @@ impl MacWindow {
             let mut sheet_parent = None;
 
             match kind {
-                WindowKind::Normal | WindowKind::Floating => {
-                    if kind == WindowKind::Floating {
-                        // Let the window float keep above normal windows.
-                        native_window.setLevel_(NSFloatingWindowLevel);
-                    } else {
-                        native_window.setLevel_(NSNormalWindowLevel);
+                WindowKind::Normal | WindowKind::Floating | WindowKind::Panel => {
+                    if let Some(level) = kind_traits.level {
+                        native_window.setLevel_(level);
                     }
                     native_window.setAcceptsMouseMovedEvents_(YES);
 
@@ -1263,7 +1262,16 @@ impl MacWindow {
                     let _: () =
                         msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
 
-                    if let Some(tabbing_identifier) = tabbing_identifier {
+                    if kind == WindowKind::Panel {
+                        // NSPanel hides itself whenever its application is not active, and a
+                        // panel exists to be shown while another application is. A panel is
+                        // never a tab.
+                        let _: () = msg_send![native_window, setHidesOnDeactivate: NO];
+                        let _: () = msg_send![
+                            native_window,
+                            setTabbingMode: NSWindowTabbingModeDisallowed
+                        ];
+                    } else if let Some(tabbing_identifier) = tabbing_identifier {
                         let tabbing_id = ns_string(tabbing_identifier.as_str());
                         let _: () = msg_send![native_window, setTabbingIdentifier: tabbing_id];
                     } else {
@@ -1315,6 +1323,7 @@ impl MacWindow {
             }
 
             if allows_automatic_window_tabbing
+                && kind != WindowKind::Panel
                 && !main_window.is_null()
                 && main_window != native_window
             {
@@ -1347,7 +1356,14 @@ impl MacWindow {
             if focus && show {
                 native_window.makeKeyAndOrderFront_(nil);
             } else if show {
+                let is_panel = kind == WindowKind::Panel;
+                if is_panel {
+                    (*native_window).set_ivar(REFUSES_KEY_IVAR, YES);
+                }
                 native_window.orderFront_(nil);
+                if is_panel {
+                    (*native_window).set_ivar(REFUSES_KEY_IVAR, NO);
+                }
             }
 
             // Set the initial position of the window to the specified origin.
@@ -2509,6 +2525,17 @@ unsafe fn drop_window_state(object: &Object) {
 
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
     YES
+}
+
+extern "C" fn can_become_key_window(this: &Object, _: Sel) -> BOOL {
+    unsafe {
+        let refuses: BOOL = *this.get_ivar(REFUSES_KEY_IVAR);
+        if refuses == YES {
+            NO
+        } else {
+            YES
+        }
+    }
 }
 
 /// AppKit pulls a window that is shown onto a screen, which also caps it to the screen's visible

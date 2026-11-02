@@ -2226,6 +2226,17 @@ pub enum WindowKind {
     /// A normal application window
     Normal,
 
+    /// A normal window that can become the key window without activating its application.
+    ///
+    /// On macOS it is an `NSPanel` with `NSWindowStyleMaskNonactivatingPanel`, at the normal
+    /// window level, with the titlebar, resizing, closing and miniaturizing of [`WindowKind::Normal`]
+    /// and mouse tracking while key. Opening it with `focus: true` makes it key and leaves the
+    /// frontmost application frontmost, so a window can show its key look (glass tints, accent
+    /// colours) while another app keeps the user's keyboard focus. It is not an overlay: unlike
+    /// [`WindowKind::PopUp`] it is not raised above other windows. On other platforms it is a
+    /// [`WindowKind::Normal`] window.
+    Panel,
+
     /// A window that appears above all other windows, usually used for alerts or popups
     /// use sparingly!
     PopUp,

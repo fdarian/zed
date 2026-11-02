@@ -335,7 +335,7 @@ impl Platform for WebPlatform {
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         match &params.kind {
-            WindowKind::Normal => {}
+            WindowKind::Normal | WindowKind::Panel => {}
             WindowKind::AnchoredPopup(_) => return Err(PopupNotSupportedError.into()),
             WindowKind::PopUp => {
                 return Err(WebWindowError::UnsupportedWindowKind("popup windows").into());
