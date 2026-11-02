@@ -723,7 +723,7 @@ fn replay_recorded_paint(
         let mut state = state.expect("a replayed subtree has its state");
         // What the subtree read while it painted is read again by its replay: the layout of a
         // wrapper that holds it as a hole is skipped, and its entities are not observed otherwise.
-        cx.entities.extend_accessed(&state.accessed_entities);
+        cx.entities.extend_accessed(state.accessed_entities.iter().copied());
         let recorded = state
             .recorded
             .as_mut()
@@ -933,7 +933,7 @@ impl Retained {
                 window.retained.counters.hits += 1;
                 state.layout = None;
                 state.owner.keep(window.retained.state_pass, window.current_state_owner());
-                cx.entities.extend_accessed(&state.accessed_entities);
+                cx.entities.extend_accessed(state.accessed_entities.iter().copied());
                 return ((state.root, RetainedLayout::Skipped), state);
             }
 

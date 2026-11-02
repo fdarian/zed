@@ -2169,7 +2169,7 @@ impl Window {
         // Taken out so that nothing borrows the cell while its paint is put into the frame.
         let mut paint = {
             let mut recorded = cell.recorded.borrow_mut();
-            cx.entities.extend_accessed(&recorded.entities);
+            cx.entities.extend_accessed(recorded.entities.iter().copied());
             recorded.paint.take().expect("a cell is replayed with its paint recorded")
         };
         paint.range = self.replay_paint(&paint, Point::default(), Some(ordinal + 1), false);

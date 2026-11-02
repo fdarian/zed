@@ -1141,14 +1141,9 @@ impl App {
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
     ) -> (R, FxHashSet<EntityId>) {
-        let accessed_before = std::mem::take(self.entities.accessed_entities.get_mut());
+        self.entities.push_access_scope();
         let result = callback(self);
-        let accessed_in_callback = std::mem::replace(
-            self.entities.accessed_entities.get_mut(),
-            accessed_before,
-        );
-        self.entities.extend_accessed(&accessed_in_callback);
-        (result, accessed_in_callback)
+        (result, self.entities.pop_access_scope())
     }
 
     pub(crate) fn record_entities_accessed(

@@ -295,6 +295,8 @@ struct ViewElementState {
     prepaint_serial: u64,
     paint_serial: u64,
     cache_key: ViewElementCacheKey,
+    /// The entities the view accessed while it was last drawn, in any phase,
+    /// restored when its prepaint is reused so the window stays subscribed.
     accessed_entities: FxHashSet<EntityId>,
 }
 
@@ -418,7 +420,7 @@ impl<V: View> Element for ViewElement<V> {
                             window.retained.cached_view_hits =
                                 window.retained.cached_view_hits.wrapping_add(1);
                             cx.entities
-                                .extend_accessed(&element_state.accessed_entities);
+                                .extend_accessed(element_state.accessed_entities.iter().copied());
                             let prepaint_end = window.prepaint_index();
                             element_state.prepaint_range = prepaint_start..prepaint_end;
                             element_state.prepaint_serial = window.building_serial();
@@ -512,7 +514,9 @@ impl<V: View> Element for ViewElement<V> {
                             // redrawn on the next frame.
                             if let Some(element) = element {
                                 let refreshing = mem::replace(&mut window.refreshing, true);
-                                element.paint(window, cx);
+                                let ((), accessed_entities) =
+                                    cx.detect_accessed_entities(|cx| element.paint(window, cx));
+                                element_state.accessed_entities.extend(accessed_entities);
                                 window.refreshing = refreshing;
                                 element_state.cache_key.opacity = opacity;
                             } else {
