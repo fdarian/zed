@@ -24,7 +24,9 @@ use core_foundation::{
     boolean::CFBoolean,
     data::CFData,
     dictionary::{CFDictionary, CFDictionaryRef, CFMutableDictionary},
-    runloop::{CFRunLoopRun, CFRunLoopRunInMode, kCFRunLoopDefaultMode},
+    runloop::{
+        CFRunLoopRun, CFRunLoopRunInMode, kCFRunLoopDefaultMode, kCFRunLoopRunHandledSource,
+    },
     string::{CFString, CFStringRef},
 };
 use ctor::ctor;
@@ -651,7 +653,16 @@ unsafe fn pump_app_nonblocking() {
             let _: () = msg_send![app, sendEvent: event];
         }
         let _: () = msg_send![app, updateWindows];
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1);
+
+        // A run that returns after one source also receives the run loop's wake message, so the
+        // sources that are still signalled would wait for a message that is gone.
+        for _ in 0..256 {
+            if CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1) != kCFRunLoopRunHandledSource {
+                return;
+            }
+        }
+        // Still finding sources to handle: have the embedder pump again.
+        DispatchQueue::main().exec_async(|| {});
     }
 }
 
