@@ -1016,18 +1016,7 @@ impl Scene {
                 }
                 PaintOperation::Primitive(Primitive::Surface(surface)) => write!(out, "{surface:?}"),
                 PaintOperation::PendingGlyph(glyph) => write!(out, "{glyph:?}"),
-                // Not the hitbox: a build of the same subtree inserts the hitbox again, with a new id.
-                PaintOperation::NativeSurface(placeholder) => write!(
-                    out,
-                    "native surface {:?} {:?} {:?} {} {:?} {:?} {}",
-                    placeholder.surface,
-                    placeholder.bounds,
-                    placeholder.content_mask,
-                    placeholder.opacity,
-                    placeholder.corner_radius,
-                    placeholder.overflow,
-                    placeholder.captures_pointer,
-                ),
+                PaintOperation::NativeSurface(placeholder) => write!(out, "{:?}", PaintedSurface(placeholder)),
                 PaintOperation::StartLayer(bounds) => write!(out, "layer {bounds:?}"),
                 PaintOperation::EndLayer => write!(out, "end layer"),
                 PaintOperation::StartGroup { content_mask, reserved, .. } => {
@@ -1425,7 +1414,36 @@ impl PaintOperation {
     /// Whether the operations paint differently, compared field by field through their debug
     /// form: most of what they hold has no equality, and an effect that fades is not a box.
     pub(crate) fn differs_from(&self, other: &PaintOperation) -> bool {
-        !self.same_kind(other) || !same_debug_form(self, other)
+        if !self.same_kind(other) {
+            return true;
+        }
+        match (self, other) {
+            (PaintOperation::NativeSurface(left), PaintOperation::NativeSurface(right)) => {
+                !same_debug_form(&PaintedSurface(left), &PaintedSurface(right))
+            }
+            _ => !same_debug_form(self, other),
+        }
+    }
+}
+
+/// What a native surface placeholder paints, which is all of it but the hitbox: a build of the same
+/// subtree inserts the hitbox again, with a new id, and a patched frame keeps the old one.
+struct PaintedSurface<'a>(&'a NativeSurfacePlaceholder);
+
+impl Debug for PaintedSurface<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let placeholder = self.0;
+        write!(
+            f,
+            "native surface {:?} {:?} {:?} {} {:?} {:?} {}",
+            placeholder.surface,
+            placeholder.bounds,
+            placeholder.content_mask,
+            placeholder.opacity,
+            placeholder.corner_radius,
+            placeholder.overflow,
+            placeholder.captures_pointer,
+        )
     }
 }
 
@@ -3848,6 +3866,26 @@ mod tests {
         assert!(same.differs_from(&PaintOperation::Quad(quad(0., 0., 10., 11.))));
         assert!(same.differs_from(&PaintOperation::Quad(Quad { background: crate::blue().into(), ..quad(0., 0., 10., 10.) })));
         assert!(same.differs_from(&PaintOperation::EndLayer));
+    }
+
+    #[test]
+    fn a_native_surface_painted_again_with_a_new_hitbox_paints_the_same() {
+        let surface = |hitbox: crate::HitboxId, opacity: f32| {
+            PaintOperation::NativeSurface(NativeSurfacePlaceholder {
+                surface: crate::CompositionSurfaceId(3),
+                bounds: bounds(10., 10., 100., 50.),
+                content_mask: ContentMask { bounds: bounds(0., 0., WINDOW, WINDOW), ..ContentMask::default() },
+                opacity,
+                corner_radius: ScaledPixels(0.),
+                overflow: crate::NativeSurfaceOverflow::Clip,
+                captures_pointer: false,
+                hitbox,
+                order: 0,
+            })
+        };
+        let kept = crate::HitboxId::placeholder();
+        assert!(!surface(kept, 1.).differs_from(&surface(kept.next(), 1.)), "only the hitbox id differs");
+        assert!(surface(kept, 1.).differs_from(&surface(kept, 0.5)), "an opacity that differs is a difference");
     }
 
     fn pending_glyph(x: f32, y: f32, content_mask: ContentMask<ScaledPixels>) -> PendingGlyph {
