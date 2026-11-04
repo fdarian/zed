@@ -37,6 +37,7 @@ pub(crate) struct TestPlatform {
     pub text_system: Arc<dyn PlatformTextSystem>,
     /// The scale factor of the windows opened from now on.
     pub(crate) window_scale_factor: Cell<f32>,
+    pub(crate) atlas_read_back: Cell<bool>,
     pub expect_restart:
         RefCell<Option<oneshot::Sender<(Option<PathBuf>, Vec<std::ffi::OsString>)>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
@@ -150,6 +151,7 @@ impl TestPlatform {
             system_notifications: Default::default(),
             text_system,
             window_scale_factor: Cell::new(2.0),
+            atlas_read_back: Cell::new(false),
             headless_renderer_factory,
         })
     }

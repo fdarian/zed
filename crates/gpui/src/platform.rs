@@ -1498,10 +1498,23 @@ pub trait PlatformAtlas {
 
     fn remove(&self, key: &AtlasKey);
 
+    /// A reader of this atlas's tiles, for an atlas whose tiles the CPU can read back. An image
+    /// uploaded to such an atlas drops its CPU copy of the pixels. `None` (the default) keeps
+    /// the copy.
+    fn tile_reader(self: Arc<Self>) -> Option<Arc<dyn TileReader>> {
+        None
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
     }
+}
+
+/// Read access to the tiles of an atlas, see [`PlatformAtlas::tile_reader`].
+pub trait TileReader: Send + Sync {
+    /// The pixels of the tile stored under `key`, tightly packed in the format they were uploaded in.
+    fn read_tile(&self, key: &AtlasKey) -> Result<Vec<u8>>;
 }
 
 #[doc(hidden)]

@@ -266,6 +266,12 @@ impl TestAppContext {
         .unwrap()
     }
 
+    /// Makes the sprite atlases of the windows opened after this call able to read tiles back, as
+    /// the Metal atlas on an Apple GPU does.
+    pub fn set_atlas_read_back(&mut self, read_back: bool) {
+        self.test_platform.atlas_read_back.set(read_back);
+    }
+
     /// Adds a new window with no content.
     pub fn add_empty_window(&mut self) -> &mut VisualTestContext {
         let mut cx = self.app.borrow_mut();
