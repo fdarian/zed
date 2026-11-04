@@ -2851,14 +2851,19 @@ impl App {
     /// If the current window is being updated, it will be removed from `App.windows`, you can use `current_window` to specify the current window.
     /// This is a no-op if the image is not in the sprite atlas.
     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
+        let id = image.id;
         // remove the texture from all other windows
         for window in self.windows.values_mut().flatten() {
-            _ = window.drop_image(image.clone());
+            if let Err(error) = window.drop_image(image.clone()) {
+                log::error!("failed to drop image {id:?} from a window's atlas: {error:#}");
+            }
         }
 
         // remove the texture from the current window
         if let Some(window) = current_window {
-            _ = window.drop_image(image);
+            if let Err(error) = window.drop_image(image) {
+                log::error!("failed to drop image {id:?} from the current window's atlas: {error:#}");
+            }
         }
     }
 

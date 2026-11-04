@@ -184,11 +184,19 @@ impl AtlasImages {
         images.insert(image.id, Arc::downgrade(image));
     }
 
+    #[cfg(test)]
+    pub(crate) fn tracks(&self, image: &RenderImage) -> bool {
+        self.images.borrow().contains_key(&image.id)
+    }
+
     /// Call before removing `image`'s tile from this window's atlas.
     pub(crate) fn release(&self, image: &RenderImage) -> Result<()> {
-        if self.images.borrow_mut().remove(&image.id).is_some() {
-            image.restore_pixels_from(&self.holder)?;
+        if !self.images.borrow().contains_key(&image.id) {
+            return Ok(());
         }
+        // The entry stays on a failed read, so the window closing still tries again.
+        image.restore_pixels_from(&self.holder)?;
+        self.images.borrow_mut().remove(&image.id);
         Ok(())
     }
 }
@@ -391,6 +399,62 @@ mod tests {
         drop_image(cx, window, &image);
         close(cx, window);
         assert_eq!(bytes_of(&image, 0), before);
+    }
+
+    #[crate::test]
+    fn a_failed_read_on_drop_image_keeps_the_image_restorable(cx: &mut TestAppContext) {
+        cx.set_atlas_read_back(true);
+        let window = open(cx);
+        let image = patterned(3, 2, 1);
+        paint(cx, window, &image, 0);
+        window
+            .update(cx, |_, window, _| window.lose_image_atlas_entry(&image))
+            .unwrap();
+
+        let result = window
+            .update(cx, |_, window, _| window.drop_image(image.clone()))
+            .unwrap();
+
+        assert!(result.is_err());
+        assert!(image.pixels_are_in_atlas());
+        assert!(image.read_pixels(0).is_err());
+        assert!(
+            window
+                .update(cx, |_, window, _| window.tracks_atlas_image(&image))
+                .unwrap()
+        );
+    }
+
+    #[crate::test]
+    fn app_drop_image_survives_a_failed_read(cx: &mut TestAppContext) {
+        cx.set_atlas_read_back(true);
+        let window = open(cx);
+        let image = patterned(3, 2, 1);
+        paint(cx, window, &image, 0);
+        window
+            .update(cx, |_, window, _| window.lose_image_atlas_entry(&image))
+            .unwrap();
+
+        cx.update(|cx| cx.drop_image(image.clone(), None));
+
+        assert!(image.pixels_are_in_atlas());
+    }
+
+    #[crate::test]
+    fn closing_the_holding_window_after_a_lost_tile_does_not_panic(cx: &mut TestAppContext) {
+        cx.set_atlas_read_back(true);
+        let window = open(cx);
+        let image = patterned(3, 2, 1);
+        paint(cx, window, &image, 0);
+        window
+            .update(cx, |_, window, _| window.lose_image_atlas_entry(&image))
+            .unwrap();
+
+        close(cx, window);
+
+        // Nothing to restore the pixels from: the failure is logged and reads keep failing.
+        assert!(image.pixels_are_in_atlas());
+        assert!(image.read_pixels(0).is_err());
     }
 
     #[crate::test]
