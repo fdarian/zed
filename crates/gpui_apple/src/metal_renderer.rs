@@ -1933,10 +1933,12 @@ impl MetalRenderer {
         (params, polygon)
     }
 
-    /// Draws `source` over the part of the target that `encoder` is drawing into.
+    /// Draws `source` into the part of the target that `encoder` is drawing into, blended as
+    /// `pipeline` says.
     #[allow(clippy::too_many_arguments)]
     fn encode_composite(
         &self,
+        pipeline: &metal::RenderPipelineStateRef,
         encoder: &metal::RenderCommandEncoderRef,
         viewport_size: Size<DevicePixels>,
         params: &CompositeParams,
@@ -1945,7 +1947,7 @@ impl MetalRenderer {
         mask_a: Option<&metal::TextureRef>,
         mask_b: Option<&metal::TextureRef>,
     ) {
-        encoder.set_render_pipeline_state(&self.effect_pipelines.composite);
+        encoder.set_render_pipeline_state(pipeline);
         encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
         let params_size = mem::size_of::<CompositeParams>() as u64;
         let params_pointer = params as *const CompositeParams as *const _;
@@ -1968,8 +1970,9 @@ impl MetalRenderer {
         encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
     }
 
+    /// Replaces the part of the target the filtered backdrop `source` covers with it.
     #[allow(clippy::too_many_arguments)]
-    fn draw_composite(
+    fn draw_backdrop_composite(
         &self,
         command_buffer: &metal::CommandBufferRef,
         target: &metal::TextureRef,
@@ -1981,7 +1984,16 @@ impl MetalRenderer {
         mask_b: Option<&metal::TextureRef>,
     ) {
         let encoder = new_command_encoder_for_texture(command_buffer, target, viewport_size, None);
-        self.encode_composite(encoder, viewport_size, params, polygon, source, mask_a, mask_b);
+        self.encode_composite(
+            &self.effect_pipelines.composite_backdrop,
+            encoder,
+            viewport_size,
+            params,
+            polygon,
+            source,
+            mask_a,
+            mask_b,
+        );
         encoder.end_encoding();
     }
 
@@ -2109,6 +2121,7 @@ impl MetalRenderer {
             _ => None,
         };
         self.encode_composite(
+            &self.effect_pipelines.composite,
             encoder,
             viewport_size,
             &params,
@@ -2120,9 +2133,12 @@ impl MetalRenderer {
         Ok(())
     }
 
-    /// Filters the part of the target behind the group and draws it back clipped to the group's
-    /// border box, before the group itself goes over it. The target is whatever has been painted
-    /// into it so far, which makes the target the group's backdrop root.
+    /// Filters the part of the target behind the group and puts it back in place of the target,
+    /// clipped to the group's border box, before the group itself goes over it. The target is
+    /// whatever has been painted into it so far, which makes the target the group's backdrop root.
+    /// It replaces the target rather than going over it: a target that is not opaque (the layer
+    /// above a native surface starts out transparent) would otherwise show its own unfiltered
+    /// content through the translucent filtered copy.
     #[allow(clippy::too_many_arguments)]
     fn draw_backdrop(
         &mut self,
@@ -2238,7 +2254,7 @@ impl MetalRenderer {
             Some(points) if !points.is_empty() => Some(writer.write(&points)?),
             _ => None,
         };
-        self.draw_composite(
+        self.draw_backdrop_composite(
             command_buffer,
             target,
             viewport_size,
@@ -2489,6 +2505,7 @@ impl Pipelines {
 /// The passes that put effect groups together.
 struct EffectPipelines {
     composite: metal::RenderPipelineState,
+    composite_backdrop: metal::RenderPipelineState,
     filter_color: metal::RenderPipelineState,
     blur: metal::RenderPipelineState,
     resample: metal::RenderPipelineState,
@@ -2500,7 +2517,7 @@ impl EffectPipelines {
     fn new(device: &metal::DeviceRef, library: &metal::LibraryRef) -> Self {
         let format = MTLPixelFormat::BGRA8Unorm;
         let overwrite = |label, vertex, fragment| {
-            build_effect_pipeline_state(device, library, label, vertex, fragment, format, false)
+            build_effect_pipeline_state(device, library, label, vertex, fragment, format, Blend::Overwrite)
         };
         Self {
             // A premultiplied source drawn over the target.
@@ -2511,7 +2528,17 @@ impl EffectPipelines {
                 "composite_vertex",
                 "composite_fragment",
                 format,
-                true,
+                Blend::PremultipliedOver,
+            ),
+            // A filtered backdrop takes the place of the target under it.
+            composite_backdrop: build_effect_pipeline_state(
+                device,
+                library,
+                "effect_composite_backdrop",
+                "composite_vertex",
+                "composite_backdrop_fragment",
+                format,
+                Blend::Replace,
             ),
             filter_color: overwrite("effect_filter_color", "fullscreen_vertex", "filter_color_fragment"),
             blur: overwrite("effect_blur", "fullscreen_vertex", "blur_fragment"),
@@ -2522,6 +2549,17 @@ impl EffectPipelines {
     }
 }
 
+/// How an effect pass writes into its target.
+#[derive(Clone, Copy)]
+enum Blend {
+    Overwrite,
+    /// `source + target * (1 - source.a)`, for a premultiplied source.
+    PremultipliedOver,
+    /// `source + target * (1 - share)`, `share` being the second output of the fragment function: a
+    /// premultiplied source that has already been multiplied by the share of the target it replaces.
+    Replace,
+}
+
 fn build_effect_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -2529,7 +2567,7 @@ fn build_effect_pipeline_state(
     vertex_fn_name: &str,
     fragment_fn_name: &str,
     pixel_format: metal::MTLPixelFormat,
-    blend_premultiplied_over: bool,
+    blend: Blend,
 ) -> metal::RenderPipelineState {
     let vertex_fn = library
         .get_function(vertex_fn_name, None)
@@ -2544,16 +2582,19 @@ fn build_effect_pipeline_state(
     descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
     let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
     color_attachment.set_pixel_format(pixel_format);
-    if blend_premultiplied_over {
+    let target_factor = match blend {
+        Blend::Overwrite => None,
+        Blend::PremultipliedOver => Some(metal::MTLBlendFactor::OneMinusSourceAlpha),
+        Blend::Replace => Some(metal::MTLBlendFactor::OneMinusSource1Alpha),
+    };
+    if let Some(target_factor) = target_factor {
         color_attachment.set_blending_enabled(true);
         color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
         color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
         color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
         color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
-        color_attachment
-            .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-        color_attachment
-            .set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        color_attachment.set_destination_rgb_blend_factor(target_factor);
+        color_attachment.set_destination_alpha_blend_factor(target_factor);
     }
 
     device
@@ -3177,7 +3218,9 @@ fn log_presented_time(drawable: &metal::MetalDrawableRef) {
 
 #[cfg(test)]
 mod tests {
-    use super::MetalHeadlessRenderer;
+    use super::{InstanceBufferPool, MetalHeadlessRenderer, MetalRenderer};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use gpui::{
         Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundLayer,
         BackgroundPosition, BackgroundRepeat, BackgroundSize, Bounds, ColorSpace, ContentMask,
@@ -3934,6 +3977,43 @@ mod tests {
         }
         // The blur doesn't leak out of the element's box.
         assert!(brightness(8, 20) > 250 || brightness(8, 20) < 5);
+    }
+
+    #[test]
+    fn a_backdrop_blur_replaces_a_translucent_backdrop_instead_of_going_over_it() {
+        // A layer above a native surface starts out transparent, so what is blurred is mostly empty.
+        // Order 1 stands for what is below the surface; the black stripes and the blur are above it.
+        let mut scene = groups_scene();
+        scene.insert_primitive(solid(0., 0., SIZE, SIZE, 0x808080));
+        for column in (1..20).step_by(2) {
+            scene.insert_primitive(solid(column as f32 * 2., 0., 2., SIZE, 0x000000));
+        }
+        let region = Bounds::new(
+            point(ScaledPixels(10.), ScaledPixels(10.)),
+            size(ScaledPixels(20.), ScaledPixels(20.)),
+        );
+        scene.start_group(
+            GroupEffect {
+                backdrop_filters: vec![gpui::FilterFunction::Blur(px(4.)).resolve(1.)],
+                reference: region,
+                ..GroupEffect::default()
+            },
+            window_mask(),
+            None,
+        );
+        scene.end_group();
+        let image = render_orders_over_transparent(
+            &mut scene,
+            gpui::OrderRange { after: 1, through: gpui::DrawOrder::MAX },
+        );
+        let alpha = |x: u32, y: u32| image.get_pixel(x, y).0[3] as i32;
+        // Outside the element the stripes are as sharp as they were.
+        assert_eq!((alpha(2, 20), alpha(4, 20)), (255, 0));
+        // Inside it the blur is all there is: no stripe stays crisp under it.
+        for x in 14..26 {
+            let value = alpha(x, 20);
+            assert!((100..155).contains(&value), "x = {x} has alpha {value}");
+        }
     }
 
     #[test]
@@ -6339,6 +6419,24 @@ mod tests {
         let mut renderer = MetalHeadlessRenderer::new();
         renderer
             .renderer
+            .render_scene_to_image_in(
+                scene,
+                orders,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
+            .expect("scene should render")
+    }
+
+    /// [`render_orders`] on a target that starts out transparent, as a layer above a native surface does.
+    fn render_orders_over_transparent(scene: &mut Scene, orders: gpui::OrderRange) -> image::RgbaImage {
+        scene.finish();
+        let mut renderer = MetalRenderer::new_internal(
+            MetalRenderer::create_device(),
+            None,
+            false,
+            Arc::new(Mutex::new(InstanceBufferPool::default())),
+        );
+        renderer
             .render_scene_to_image_in(
                 scene,
                 orders,

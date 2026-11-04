@@ -2073,19 +2073,15 @@ vertex EffectVertexOutput composite_vertex(
   return EffectVertexOutput{float4(device_position, 0., 1.)};
 }
 
-fragment float4 composite_fragment(
-    EffectVertexOutput input [[stage_in]],
-    constant CompositeParams &params [[buffer(1)]],
-    constant float2 *polygon [[buffer(3)]],
-    texture2d<float> source [[texture(0)]],
-    texture2d<float> mask_a [[texture(1)]],
-    texture2d<float> mask_b [[texture(2)]]) {
+// How much of the source shows at `position`: the content mask, the reference box, the clip path
+// and the masks, antialiased.
+float composite_coverage(
+    float2 position,
+    constant CompositeParams &params,
+    constant float2 *polygon,
+    texture2d<float> mask_a,
+    texture2d<float> mask_b) {
   constexpr sampler linear(mag_filter::linear, min_filter::linear, address::clamp_to_zero);
-  float2 position = input.position.xy;
-
-  // Premultiplied.
-  float4 color = source.sample(linear, (position - params.source.xy) * params.source.zw);
-
   float coverage = saturate(0.5 - rounded_rect_sdf(position, params.content_mask, params.content_radii, params.content_radii_y));
 
   if (params.reference.z > 0.0) {
@@ -2129,7 +2125,48 @@ fragment float4 composite_fragment(
     coverage *= mask_b.sample(linear, (position - params.mask_b.xy) * params.mask_b.zw).a;
   }
 
+  return coverage;
+}
+
+fragment float4 composite_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant CompositeParams &params [[buffer(1)]],
+    constant float2 *polygon [[buffer(3)]],
+    texture2d<float> source [[texture(0)]],
+    texture2d<float> mask_a [[texture(1)]],
+    texture2d<float> mask_b [[texture(2)]]) {
+  constexpr sampler linear(mag_filter::linear, min_filter::linear, address::clamp_to_zero);
+  float2 position = input.position.xy;
+
+  // Premultiplied.
+  float4 color = source.sample(linear, (position - params.source.xy) * params.source.zw);
+  float coverage = composite_coverage(position, params, polygon, mask_a, mask_b);
   return color * (coverage * params.misc.x);
+}
+
+// A filtered backdrop goes over the target as a replacement of what is under it, not as another layer
+// on top: the target - a layer above a native surface, or a transparent window - is not opaque, and the
+// backdrop copy already holds what the target had there, so drawing it over would leave the unfiltered
+// content showing through the translucent filtered one. The blend is `source + target * (1 - share)`,
+// `share` being how much of the source shows (second output); the first is the source premultiplied by it.
+struct BackdropCompositeOutput {
+  float4 color [[color(0), index(0)]];
+  float4 share [[color(0), index(1)]];
+};
+
+fragment BackdropCompositeOutput composite_backdrop_fragment(
+    EffectVertexOutput input [[stage_in]],
+    constant CompositeParams &params [[buffer(1)]],
+    constant float2 *polygon [[buffer(3)]],
+    texture2d<float> source [[texture(0)]],
+    texture2d<float> mask_a [[texture(1)]],
+    texture2d<float> mask_b [[texture(2)]]) {
+  constexpr sampler linear(mag_filter::linear, min_filter::linear, address::clamp_to_zero);
+  float2 position = input.position.xy;
+
+  float4 color = source.sample(linear, (position - params.source.xy) * params.source.zw);
+  float share = composite_coverage(position, params, polygon, mask_a, mask_b) * params.misc.x;
+  return BackdropCompositeOutput{color * share, float4(share)};
 }
 
 // A pass over the whole target.
