@@ -76,6 +76,8 @@ use std::{
 };
 
 mod composition;
+#[cfg(any(test, feature = "test-support"))]
+pub use composition::overlay_drawn_frames;
 mod kind;
 
 const WINDOW_STATE_IVAR: &str = "windowState";

@@ -6,17 +6,33 @@
 //! or resizes a native view is presented with the Core Animation transaction the views change in,
 //! while one that changes nothing is not. A window without native views never reaches
 //! `draw_composed` at all.
+//!
+//! And what an overlay (a GPUI layer above a native surface) draws: nothing, and no frame, while
+//! its range of the scene holds no primitive, however many hitboxes it claims. Its layer is hidden
+//! then, and shown again with the frame that has something for it.
 #![cfg(target_os = "macos")]
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
-use cocoa::{base::id, foundation::NSRect};
+use cocoa::{base::id, foundation::{NSPoint, NSRect}};
 use gpui::{
     App, Bounds, Context, HitboxBehavior, NativeSurface, NativeSurfaceStyle, Render, Size, Window, WindowBounds,
-    WindowOptions, canvas, div, prelude::*, px, size,
+    WindowOptions, canvas, div, fill, prelude::*, px, red, size,
 };
 use gpui_macos::MacPlatform;
-use objc::{class, msg_send, runtime::{BOOL, YES}, sel, sel_impl};
+use objc::{class, msg_send, runtime::{BOOL, Class, YES}, sel, sel_impl};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+const WINDOW_HEIGHT: f64 = 300.;
+
+/// What the page puts above the native surface.
+#[derive(Clone, Copy, PartialEq)]
+enum Above {
+    Nothing,
+    /// An element with a hitbox that paints nothing.
+    Hitbox,
+    Painted,
+}
 
 #[derive(Default)]
 struct Page {
@@ -30,12 +46,14 @@ struct Page {
 struct Demo {
     shown: bool,
     width: f32,
+    above: Above,
     page: Rc<RefCell<Page>>,
 }
 
 impl Render for Demo {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let page = self.page.clone();
+        let above = self.above;
         div().size_full().children(self.shown.then(|| {
             let painted = page.clone();
             canvas(
@@ -62,6 +80,21 @@ impl Render for Demo {
             .w(px(self.width))
             .h(px(80.))
         }))
+        .children((self.shown && above != Above::Nothing).then(|| {
+            canvas(
+                |bounds: Bounds<gpui::Pixels>, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                move |bounds, _, window, _| {
+                    if above == Above::Painted {
+                        window.paint_quad(fill(bounds, red()));
+                    }
+                },
+            )
+            .absolute()
+            .left(px(20.))
+            .top(px(30.))
+            .w(px(100.))
+            .h(px(40.))
+        }))
     }
 }
 
@@ -82,6 +115,36 @@ fn embed(surface: &NativeSurface) -> id {
 fn size_of_view(view: id) -> (f64, f64) {
     let frame: NSRect = unsafe { msg_send![view, frame] };
     (frame.size.width, frame.size.height)
+}
+
+fn class_name(view: id) -> String {
+    unsafe {
+        let class: *const Class = msg_send![view, class];
+        (*class).name().to_string()
+    }
+}
+
+fn overlays(root: id) -> Vec<id> {
+    unsafe {
+        let array: id = msg_send![root, subviews];
+        let count: usize = msg_send![array, count];
+        (0..count)
+            .map(|index| msg_send![array, objectAtIndex: index])
+            .filter(|view: &id| class_name(*view) == "GPUIOverlayView")
+            .collect()
+    }
+}
+
+/// Whether the overlay's own hit test claims a point of the window (y down), as AppKit's would on
+/// the way from the window's view.
+fn claims(overlay: id, x: f64, y: f64) -> bool {
+    let hit: id = unsafe { msg_send![overlay, hitTest: NSPoint::new(x, WINDOW_HEIGHT - y)] };
+    hit == overlay
+}
+
+fn layer_is_hidden(overlay: id) -> bool {
+    let layer: id = unsafe { msg_send![overlay, layer] };
+    is_hidden(layer)
 }
 
 fn is_hidden(view: id) -> bool {
@@ -123,7 +186,7 @@ fn main() {
                     show: false,
                     ..Default::default()
                 },
-                move |_, cx| cx.new(|_| Demo { shown: false, width: 300., page: shared }),
+                move |_, cx| cx.new(|_| Demo { shown: false, width: 300., above: Above::Nothing, page: shared }),
             )
             .unwrap();
 
@@ -156,6 +219,70 @@ fn main() {
 
             let (_, transacted) = frame(cx, window, |_| {});
             assert!(!transacted);
+
+            let root: id = cx.update(|cx| {
+                window
+                    .update(cx, |_, window, _| {
+                        let RawWindowHandle::AppKit(handle) = HasWindowHandle::window_handle(window).unwrap().as_raw() else {
+                            panic!("not an AppKit window");
+                        };
+                        handle.ns_view.as_ptr().cast()
+                    })
+                    .unwrap()
+            });
+            let views = overlays(root);
+            assert_eq!(views.len(), 1, "the surface has an overlay above it, empty as it is");
+            let overlay = views[0];
+            assert_eq!(gpui_macos::overlay_drawn_frames(overlay), 0, "the empty overlay has never drawn");
+            assert!(layer_is_hidden(overlay), "and its layer shows nothing");
+            assert!(!is_hidden(overlay), "the view is not hidden: AppKit's hit test skips a hidden one");
+            assert!(!claims(overlay, 30., 40.));
+
+            // Something that claims the pointer and paints nothing.
+            let (_, transacted) = frame(cx, window, |demo| demo.above = Above::Hitbox);
+            assert!(!transacted, "an overlay that stays empty changes no view");
+            assert_eq!(overlays(root), views);
+            assert!(claims(overlay, 30., 40.), "the empty overlay claims the hitbox");
+            assert!(!claims(overlay, 200., 40.), "and only that");
+            assert!(!is_hidden(overlay));
+            frame(cx, window, |_| {});
+            assert_eq!(gpui_macos::overlay_drawn_frames(overlay), 0, "it has not drawn since");
+            assert!(layer_is_hidden(overlay));
+
+            // Something that paints.
+            let (_, transacted) = frame(cx, window, |demo| demo.above = Above::Painted);
+            assert!(transacted, "a frame that shows the layer of an overlay is presented with the transaction");
+            assert_eq!(gpui_macos::overlay_drawn_frames(overlay), 1, "the overlay draws the frame that has something for it");
+            assert!(!layer_is_hidden(overlay), "and its layer shows it");
+            assert!(claims(overlay, 30., 40.));
+            let (_, transacted) = frame(cx, window, |_| {});
+            assert!(!transacted);
+            assert_eq!(gpui_macos::overlay_drawn_frames(overlay), 2, "it goes on drawing every frame");
+
+            // The paint goes, the hitbox stays.
+            let (_, transacted) = frame(cx, window, |demo| demo.above = Above::Hitbox);
+            assert!(transacted, "a frame that hides the layer of an overlay is presented with the transaction");
+            assert!(layer_is_hidden(overlay), "the layer stops showing its last frame");
+            assert_eq!(gpui_macos::overlay_drawn_frames(overlay), 2, "and the frame that hid it drew nothing into it");
+            for _ in 0..3 {
+                let (_, transacted) = frame(cx, window, |_| {});
+                assert!(!transacted);
+            }
+            assert_eq!(gpui_macos::overlay_drawn_frames(overlay), 2, "later frames draw nothing into it either");
+            assert!(claims(overlay, 30., 40.), "it still claims the hitbox");
+            assert!(!is_hidden(overlay));
+
+            // The element goes: the overlay stays, as the surface does, and claims nothing.
+            frame(cx, window, |demo| demo.above = Above::Nothing);
+            assert_eq!(overlays(root), views);
+            assert!(!claims(overlay, 30., 40.));
+            assert_eq!(gpui_macos::overlay_drawn_frames(overlay), 2);
+
+            // And back.
+            frame(cx, window, |demo| demo.above = Above::Painted);
+            assert_eq!(gpui_macos::overlay_drawn_frames(overlay), 3);
+            assert!(!layer_is_hidden(overlay));
+            assert!(claims(overlay, 30., 40.));
 
             println!("native_surface_present: ok");
             cx.update(|cx| cx.quit());

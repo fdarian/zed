@@ -120,6 +120,35 @@ struct Overlay {
     view: NonNull<Object>,
     renderer: renderer::Renderer,
     input: Rc<OverlayInput>,
+    /// Whether the layer shows a frame. A layer with nothing to draw is hidden and holds no
+    /// drawables; the view stays, for the hitboxes of its layer.
+    showing: bool,
+}
+
+impl Overlay {
+    /// Shows the layer for a frame that draws into it, or hides it and gives its drawables back
+    /// for one that has nothing to draw; whether that flipped it.
+    fn set_showing(&mut self, showing: bool, drawable_size: gpui::Size<gpui::DevicePixels>) -> bool {
+        let layer = self.renderer.layer_ptr() as id;
+        // AppKit sets the layer's flag from the view's (shown) once, when it first lays the view
+        // out, so it is set on every frame and not only on a change.
+        let hidden: BOOL = unsafe { msg_send![layer, isHidden] };
+        if (hidden == YES) == showing {
+            unsafe {
+                let _: () = msg_send![layer, setHidden: if showing { NO } else { YES }];
+            }
+        }
+        if self.showing == showing {
+            return false;
+        }
+        self.showing = showing;
+        if showing {
+            self.renderer.update_drawable_size(drawable_size);
+        } else {
+            self.renderer.release_drawables();
+        }
+        true
+    }
 }
 
 /// What the view of an overlay claims, shared with it on the main thread.
@@ -764,6 +793,7 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
         }
     }
 
+    let drawable_size = state.content_size().to_device_pixels(state.scale_factor());
     let mut order = Vec::new();
     let mut stack = Vec::new();
     let mut native_frames = Vec::new();
@@ -772,7 +802,12 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
         match layer {
             ComposedLayer::Gpui(layer) if layer.is_base => {}
             ComposedLayer::Gpui(layer) => {
-                let overlay = &state.composition.overlays[&layer.surface];
+                let overlay = state
+                    .composition
+                    .overlays
+                    .get_mut(&layer.surface)
+                    .expect("the overlay was just made");
+                changed |= overlay.set_showing(!scene.scene().is_empty_in(layer.orders), drawable_size);
                 *overlay.input.hitboxes.borrow_mut() = layer.hitboxes.clone();
                 order.push(overlay.view.as_ptr() as usize);
                 stack.push(StackEntry::Overlay {
@@ -835,13 +870,14 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
             if layer.is_base {
                 state.renderer.draw_orders(scene.scene(), layer.orders);
             } else {
-                state
+                let overlay = state
                     .composition
                     .overlays
                     .get_mut(&layer.surface)
-                    .expect("the overlay was just made")
-                    .renderer
-                    .draw_orders(scene.scene(), layer.orders);
+                    .expect("the overlay was just made");
+                if overlay.showing {
+                    overlay.renderer.draw_orders(scene.scene(), layer.orders);
+                }
             }
         }
     }
@@ -861,6 +897,21 @@ pub(super) fn composed_frame_count(window_state: &Arc<Mutex<MacWindowState>>) ->
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn recorded_frame(window_state: &Arc<Mutex<MacWindowState>>) -> Option<gpui::CompositionFrame> {
     window_state.lock().composition.recorded.clone()
+}
+
+/// How many frames the layer of the overlay `view` took a drawable for.
+#[cfg(any(test, feature = "test-support"))]
+pub fn overlay_drawn_frames(view: id) -> usize {
+    let window_state = unsafe { get_window_state(&*view) };
+    let state = window_state.lock();
+    state
+        .composition
+        .overlays
+        .values()
+        .find(|overlay| overlay.view.as_ptr() == view)
+        .expect("the view is an overlay of its window")
+        .renderer
+        .drawn_frames()
 }
 
 /// Where in the window view (whose y goes up) the pointer is the native view's, for the cursor
@@ -956,6 +1007,7 @@ unsafe fn create_overlay(window_state: &Arc<Mutex<MacWindowState>>, state: &mut 
             view: object,
             renderer,
             input,
+            showing: false,
         })
     }
 }

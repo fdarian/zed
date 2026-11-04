@@ -1269,11 +1269,6 @@ impl Scene {
     /// the batches index the scene's vectors, not a slice of them, so a renderer draws them as it
     /// would those of `batches`.
     pub fn batches_in(&self, orders: OrderRange) -> impl Iterator<Item = PrimitiveBatch> + '_ {
-        fn within<T>(items: &[T], orders: OrderRange, order: impl Fn(&T) -> DrawOrder) -> (usize, &[T]) {
-            let start = items.partition_point(|item| order(item) <= orders.after);
-            let end = start + items[start..].partition_point(|item| order(item) <= orders.through);
-            (start, &items[start..end])
-        }
         let (shadows_start, shadows) = within(&self.shadows, orders, |item| item.order);
         let (quads_start, quads) = within(&self.quads, orders, |item| item.order);
         let (paths_start, paths) = within(&self.paths, orders, |item| item.order);
@@ -1308,6 +1303,23 @@ impl Scene {
         }
     }
 
+    /// Whether `orders` holds no primitive or group: [`Scene::batches_in`] yields nothing, so a
+    /// renderer draws nothing for it. A binary search per kind, not a walk of the scene.
+    pub fn is_empty_in(&self, orders: OrderRange) -> bool {
+        fn none<T>(items: &[T], orders: OrderRange, order: impl Fn(&T) -> DrawOrder) -> bool {
+            within(items, orders, order).1.is_empty()
+        }
+        none(&self.shadows, orders, |item| item.order)
+            && none(&self.quads, orders, |item| item.order)
+            && none(&self.paths, orders, |item| item.order)
+            && none(&self.underlines, orders, |item| item.order)
+            && none(&self.monochrome_sprites, orders, |item| item.order)
+            && none(&self.subpixel_sprites, orders, |item| item.order)
+            && none(&self.polychrome_sprites, orders, |item| item.order)
+            && none(&self.surfaces, orders, |item| item.order)
+            && none(&self.groups, orders, |item| item.order)
+    }
+
     /// How many primitives and groups have an order in `orders`.
     pub fn len_in(&self, orders: OrderRange) -> usize {
         self.batches_in(orders)
@@ -1321,6 +1333,13 @@ impl Scene {
             })
             .sum()
     }
+}
+
+/// The items of `items`, sorted by order, whose order is in `orders`, and the index of the first.
+fn within<T>(items: &[T], orders: OrderRange, order: impl Fn(&T) -> DrawOrder) -> (usize, &[T]) {
+    let start = items.partition_point(|item| order(item) <= orders.after);
+    let end = start + items[start..].partition_point(|item| order(item) <= orders.through);
+    (start, &items[start..end])
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]

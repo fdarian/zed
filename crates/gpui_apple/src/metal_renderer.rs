@@ -147,6 +147,9 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+    /// How many frames `draw_orders` took a drawable for, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    drawn_frames: usize,
 }
 
 #[repr(C)]
@@ -262,6 +265,8 @@ impl MetalRenderer {
             instance_buffer_pool,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
+            #[cfg(any(test, feature = "test-support"))]
+            drawn_frames: 0,
         }
     }
 
@@ -305,6 +310,33 @@ impl MetalRenderer {
             }
         }
         self.update_path_intermediate_textures(size);
+    }
+
+    /// Gives back the drawables the layer holds, for a layer that is hidden until its next frame.
+    /// Shrinking it is not enough: the drawable on screen stays until another is presented, and the
+    /// idle one in the layer's pool until another is asked for. Not the path intermediate, which
+    /// the other layers share; `update_drawable_size` grows the layer back.
+    pub fn release_drawables(&mut self) {
+        let Some(layer) = &self.layer else {
+            return;
+        };
+        let ns_size = NSSize {
+            width: 1.,
+            height: 1.,
+        };
+        unsafe {
+            let _: () = msg_send![layer.as_ref(), setDrawableSize: ns_size];
+        }
+        if let Some(drawable) = layer.next_drawable() {
+            drawable.present();
+        }
+        drop(layer.next_drawable());
+    }
+
+    /// How many frames `draw_orders` took a drawable of the layer for.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn drawn_frames(&self) -> usize {
+        self.drawn_frames
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -352,6 +384,10 @@ impl MetalRenderer {
             );
             return;
         };
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.drawn_frames += 1;
+        }
         let stats = stats.map(|started| {
             (
                 encoders_opened(),

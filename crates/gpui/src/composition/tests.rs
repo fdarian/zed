@@ -420,10 +420,27 @@ mod scene {
                 assert!(range.contains(order), "{kind}{index} has order {order}, outside {range:?}");
             }
             assert_eq!(scene.len_in(range), items.len());
+            assert_eq!(scene.is_empty_in(range), items.is_empty());
             joined.extend(items);
         }
         assert_eq!(joined, whole);
         assert_eq!(flatten(scene.batches_in(OrderRange::ALL).collect()), whole);
+    }
+
+    #[test]
+    fn a_range_is_empty_when_no_order_of_any_kind_is_in_it() {
+        let mut scene = scene(true);
+        assert!(scene.is_empty_in(OrderRange::ALL));
+        scene.insert_quad(quad(0., 0., 10., 10.));
+        scene.insert_quad(quad(0., 0., 10., 10.));
+        scene.finish();
+        let orders: Vec<_> = scene.quads.iter().map(|quad| quad.order).collect();
+        let (first, last) = (orders[0], orders[1]);
+        assert!(!scene.is_empty_in(OrderRange::ALL));
+        assert!(!scene.is_empty_in(OrderRange { after: first - 1, through: first }));
+        assert!(scene.is_empty_in(OrderRange { after: first, through: first }), "`after` is not in the range");
+        assert!(!scene.is_empty_in(OrderRange { after: first, through: last }));
+        assert!(scene.is_empty_in(OrderRange { after: last, through: DrawOrder::MAX }));
     }
 }
 
