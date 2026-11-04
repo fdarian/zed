@@ -8,8 +8,9 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, MAX_GROUP_EXTENT,
-    MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point, PrimitiveBatch, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
-    TransformationMatrix, filter_margin, point, size,
+    MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point, PrimitiveBatch,
+    ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size, TransformationMatrix,
+    filter_margin, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -27,13 +28,7 @@ use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
 use std::{
-    cell::Cell,
-    collections::HashMap,
-    ffi::c_void,
-    mem,
-    mem::MaybeUninit,
-    ops::Range,
-    ptr, slice,
+    cell::Cell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice,
     sync::Arc,
 };
 
@@ -295,8 +290,11 @@ impl MetalRenderer {
             PATH_SAMPLE_COUNT,
         );
         let root_pipelines = Pipelines::new(&device, &library, metal::MTLBlendFactor::One);
-        let group_pipelines =
-            Pipelines::new(&device, &library, metal::MTLBlendFactor::OneMinusSourceAlpha);
+        let group_pipelines = Pipelines::new(
+            &device,
+            &library,
+            metal::MTLBlendFactor::OneMinusSourceAlpha,
+        );
         let effect_pipelines = EffectPipelines::new(&device, &library);
 
         let command_queue = device.new_command_queue();
@@ -443,17 +441,29 @@ impl MetalRenderer {
             );
             return;
         };
-        let stats = stats.map(|started| (encoders_opened(), started.elapsed(), std::time::Instant::now()));
+        let stats = stats.map(|started| {
+            (
+                encoders_opened(),
+                started.elapsed(),
+                std::time::Instant::now(),
+            )
+        });
 
-        let command_buffer = match self.render_frame_in(scene, orders, drawable.texture(), viewport_size) {
-            Ok(command_buffer) => command_buffer,
-            Err(error) => {
-                log::error!("failed to render: {error:#}");
-                return;
-            }
-        };
+        let command_buffer =
+            match self.render_frame_in(scene, orders, drawable.texture(), viewport_size) {
+                Ok(command_buffer) => command_buffer,
+                Err(error) => {
+                    log::error!("failed to render: {error:#}");
+                    return;
+                }
+            };
         let encoded = stats.map(|(encoders_before, drawable_time, started)| {
-            (encoders_opened() - encoders_before, drawable_time, started.elapsed(), std::time::Instant::now())
+            (
+                encoders_opened() - encoders_before,
+                drawable_time,
+                started.elapsed(),
+                std::time::Instant::now(),
+            )
         });
 
         log_presented_time(&drawable);
@@ -499,13 +509,8 @@ impl MetalRenderer {
             &self.instance_buffer_pool,
             self.is_unified_memory,
         );
-        let command_buffer = self.draw_primitives_to_texture(
-            scene,
-            orders,
-            &mut writer,
-            texture,
-            viewport_size,
-        );
+        let command_buffer =
+            self.draw_primitives_to_texture(scene, orders, &mut writer, texture, viewport_size);
         self.texture_pool.end_frame();
         let command_buffer = command_buffer?;
 
@@ -670,14 +675,10 @@ impl MetalRenderer {
         let reads_target = scene.groups[group_indices(scene, orders)]
             .iter()
             .any(|group| !group.effect.backdrop_filters.is_empty());
-        let readable = texture
-            .usage()
-            .contains(metal::MTLTextureUsage::ShaderRead);
+        let readable = texture.usage().contains(metal::MTLTextureUsage::ShaderRead);
         if reads_target && !readable {
-            let frame = self.acquire_texture(
-                viewport_size.width.0 as u32,
-                viewport_size.height.0 as u32,
-            );
+            let frame =
+                self.acquire_texture(viewport_size.width.0 as u32, viewport_size.height.0 as u32);
             self.encode_scene(
                 scene,
                 orders,
@@ -783,18 +784,12 @@ impl MetalRenderer {
 
         for batch in scene.batches_in(orders) {
             match batch {
-                PrimitiveBatch::Shadows(range) => self.draw_shadows(
-                    range,
-                    &instance_bindings,
-                    viewport_size,
-                    command_encoder,
-                ),
-                PrimitiveBatch::Quads(range) => self.draw_quads(
-                    range,
-                    &instance_bindings,
-                    viewport_size,
-                    command_encoder,
-                ),
+                PrimitiveBatch::Shadows(range) => {
+                    self.draw_shadows(range, &instance_bindings, viewport_size, command_encoder)
+                }
+                PrimitiveBatch::Quads(range) => {
+                    self.draw_quads(range, &instance_bindings, viewport_size, command_encoder)
+                }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
@@ -830,12 +825,9 @@ impl MetalRenderer {
                         }
                     }
                 }
-                PrimitiveBatch::Underlines(range) => self.draw_underlines(
-                    range,
-                    &instance_bindings,
-                    viewport_size,
-                    command_encoder,
-                ),
+                PrimitiveBatch::Underlines(range) => {
+                    self.draw_underlines(range, &instance_bindings, viewport_size, command_encoder)
+                }
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
                         texture_id,
@@ -1036,7 +1028,12 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
-        self.draw_quad_instances(&instance_bindings.quads, quads, viewport_size, command_encoder);
+        self.draw_quad_instances(
+            &instance_bindings.quads,
+            quads,
+            viewport_size,
+            command_encoder,
+        );
     }
 
     fn draw_quad_instances(
@@ -1411,7 +1408,6 @@ impl MetalRenderer {
     }
 }
 
-
 /// Offscreen effect groups: each is drawn into a texture of its own, run through its filters,
 /// and composited into the target with its opacity, masks and clip path.
 impl MetalRenderer {
@@ -1495,14 +1491,19 @@ impl MetalRenderer {
         target: &metal::TextureRef,
     ) {
         let target_size = [target.width() as f32, target.height() as f32];
-        self.run_pass(command_buffer, target, &self.effect_pipelines.resample, |encoder| {
-            encoder.set_fragment_bytes(
-                0,
-                mem::size_of_val(&target_size) as u64,
-                target_size.as_ptr() as *const _,
-            );
-            encoder.set_fragment_texture(0, Some(source));
-        });
+        self.run_pass(
+            command_buffer,
+            target,
+            &self.effect_pipelines.resample,
+            |encoder| {
+                encoder.set_fragment_bytes(
+                    0,
+                    mem::size_of_val(&target_size) as u64,
+                    target_size.as_ptr() as *const _,
+                );
+                encoder.set_fragment_texture(0, Some(source));
+            },
+        );
     }
 
     fn copy_pass(
@@ -1534,15 +1535,24 @@ impl MetalRenderer {
         }
         let count = matrices.len() as u32;
         let output = self.acquire_texture(input.width() as u32, input.height() as u32);
-        self.run_pass(command_buffer, &output, &self.effect_pipelines.filter_color, |encoder| {
-            encoder.set_fragment_bytes(0, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);
-            encoder.set_fragment_bytes(
-                1,
-                (values.len() * mem::size_of::<[f32; 4]>()) as u64,
-                values.as_ptr() as *const _,
-            );
-            encoder.set_fragment_texture(0, Some(&input));
-        });
+        self.run_pass(
+            command_buffer,
+            &output,
+            &self.effect_pipelines.filter_color,
+            |encoder| {
+                encoder.set_fragment_bytes(
+                    0,
+                    mem::size_of::<u32>() as u64,
+                    &count as *const u32 as *const _,
+                );
+                encoder.set_fragment_bytes(
+                    1,
+                    (values.len() * mem::size_of::<[f32; 4]>()) as u64,
+                    values.as_ptr() as *const _,
+                );
+                encoder.set_fragment_texture(0, Some(&input));
+            },
+        );
         self.release_texture(input);
         output
     }
@@ -1569,14 +1579,19 @@ impl MetalRenderer {
             pad: 0,
             valid: edge.unwrap_or([1., 1.]),
         };
-        self.run_pass(command_buffer, target, &self.effect_pipelines.blur, |encoder| {
-            encoder.set_fragment_bytes(
-                0,
-                mem::size_of::<BlurParams>() as u64,
-                &params as *const BlurParams as *const _,
-            );
-            encoder.set_fragment_texture(0, Some(source));
-        });
+        self.run_pass(
+            command_buffer,
+            target,
+            &self.effect_pipelines.blur,
+            |encoder| {
+                encoder.set_fragment_bytes(
+                    0,
+                    mem::size_of::<BlurParams>() as u64,
+                    &params as *const BlurParams as *const _,
+                );
+                encoder.set_fragment_texture(0, Some(source));
+            },
+        );
     }
 
     /// A Gaussian blur of the texture in a new texture of the same size, by `sigma` along x and
@@ -1597,10 +1612,21 @@ impl MetalRenderer {
             && (sigma[0] / scale[0] > MAX_SIGMA_IN_PASS || sigma[1] / scale[1] > MAX_SIGMA_IN_PASS)
         {
             let (width, height) = *sizes.last().expect("sizes starts with one entry");
-            let halve = [sigma[0] / scale[0] > MAX_SIGMA_IN_PASS, sigma[1] / scale[1] > MAX_SIGMA_IN_PASS];
+            let halve = [
+                sigma[0] / scale[0] > MAX_SIGMA_IN_PASS,
+                sigma[1] / scale[1] > MAX_SIGMA_IN_PASS,
+            ];
             sizes.push((
-                if halve[0] { width.div_ceil(2).max(1) } else { width },
-                if halve[1] { height.div_ceil(2).max(1) } else { height },
+                if halve[0] {
+                    width.div_ceil(2).max(1)
+                } else {
+                    width
+                },
+                if halve[1] {
+                    height.div_ceil(2).max(1)
+                } else {
+                    height
+                },
             ));
             for axis in 0..2 {
                 if halve[axis] {
@@ -1627,7 +1653,14 @@ impl MetalRenderer {
                 continue;
             }
             let blurred = self.acquire_texture(width, height);
-            self.blur_pass(command_buffer, result.as_ref().unwrap_or(input), &blurred, vertical, sigma, edge);
+            self.blur_pass(
+                command_buffer,
+                result.as_ref().unwrap_or(input),
+                &blurred,
+                vertical,
+                sigma,
+                edge,
+            );
             if let Some(previous) = result.replace(blurred) {
                 self.release_texture(previous);
             }
@@ -1667,8 +1700,7 @@ impl MetalRenderer {
                 ResolvedFilter::Blur { x, y } => {
                     index += 1;
                     if x > 0. || y > 0. {
-                        let blurred =
-                            self.blur_texture(&texture, [x, y], edge, command_buffer);
+                        let blurred = self.blur_texture(&texture, [x, y], edge, command_buffer);
                         self.release_texture(mem::replace(&mut texture, blurred));
                     }
                 }
@@ -1687,16 +1719,25 @@ impl MetalRenderer {
                         pad: [0.; 2],
                         color: [rgba.r * rgba.a, rgba.g * rgba.a, rgba.b * rgba.a, rgba.a],
                     };
-                    let output = self.acquire_texture(texture.width() as u32, texture.height() as u32);
-                    self.run_pass(command_buffer, &output, &self.effect_pipelines.drop_shadow, |encoder| {
-                        encoder.set_fragment_bytes(
-                            0,
-                            mem::size_of::<DropShadowParams>() as u64,
-                            &params as *const DropShadowParams as *const _,
-                        );
-                        encoder.set_fragment_texture(0, Some(&texture));
-                        encoder.set_fragment_texture(1, Some(blurred.as_ref().unwrap_or(&texture)));
-                    });
+                    let output =
+                        self.acquire_texture(texture.width() as u32, texture.height() as u32);
+                    self.run_pass(
+                        command_buffer,
+                        &output,
+                        &self.effect_pipelines.drop_shadow,
+                        |encoder| {
+                            encoder.set_fragment_bytes(
+                                0,
+                                mem::size_of::<DropShadowParams>() as u64,
+                                &params as *const DropShadowParams as *const _,
+                            );
+                            encoder.set_fragment_texture(0, Some(&texture));
+                            encoder.set_fragment_texture(
+                                1,
+                                Some(blurred.as_ref().unwrap_or(&texture)),
+                            );
+                        },
+                    );
                     if let Some(blurred) = blurred {
                         self.release_texture(blurred);
                     }
@@ -1723,8 +1764,12 @@ impl MetalRenderer {
 
         let mut mask: Option<metal::Texture> = None;
         for layer in layers {
-            let drawn =
-                self.render_mask_layers(slice::from_ref(layer), texture_size, command_buffer, writer)?;
+            let drawn = self.render_mask_layers(
+                slice::from_ref(layer),
+                texture_size,
+                command_buffer,
+                writer,
+            )?;
             mask = Some(match mask {
                 // An alpha layer on the bottom is the mask so far as it is.
                 None if !layer.is_luminance() => drawn,
@@ -1742,7 +1787,8 @@ impl MetalRenderer {
         command_buffer: &metal::CommandBufferRef,
         writer: &mut InstanceBufferWriter,
     ) -> Result<metal::Texture> {
-        let texture = self.acquire_texture(texture_size.width.0 as u32, texture_size.height.0 as u32);
+        let texture =
+            self.acquire_texture(texture_size.width.0 as u32, texture_size.height.0 as u32);
         let mut bindings = Vec::with_capacity(layers.len());
         for layer in layers {
             bindings.push((writer.write(&layer.quads)?, writer.write(&layer.sprites)?));
@@ -1787,7 +1833,8 @@ impl MetalRenderer {
         layer: &MaskLayer,
         command_buffer: &metal::CommandBufferRef,
     ) -> metal::Texture {
-        let output = self.acquire_texture(layer_texture.width() as u32, layer_texture.height() as u32);
+        let output =
+            self.acquire_texture(layer_texture.width() as u32, layer_texture.height() as u32);
         let params = MaskCombineParams {
             luminance: layer.is_luminance() as u32,
             operator: match (&below, layer.composite) {
@@ -1799,15 +1846,20 @@ impl MetalRenderer {
             has_below: below.is_some() as u32,
             pad: 0,
         };
-        self.run_pass(command_buffer, &output, &self.effect_pipelines.mask_combine, |encoder| {
-            encoder.set_fragment_bytes(
-                0,
-                mem::size_of::<MaskCombineParams>() as u64,
-                &params as *const MaskCombineParams as *const _,
-            );
-            encoder.set_fragment_texture(0, Some(&layer_texture));
-            encoder.set_fragment_texture(1, Some(below.as_deref().unwrap_or(&layer_texture)));
-        });
+        self.run_pass(
+            command_buffer,
+            &output,
+            &self.effect_pipelines.mask_combine,
+            |encoder| {
+                encoder.set_fragment_bytes(
+                    0,
+                    mem::size_of::<MaskCombineParams>() as u64,
+                    &params as *const MaskCombineParams as *const _,
+                );
+                encoder.set_fragment_texture(0, Some(&layer_texture));
+                encoder.set_fragment_texture(1, Some(below.as_deref().unwrap_or(&layer_texture)));
+            },
+        );
         self.release_texture(layer_texture);
         if let Some(below) = below {
             self.release_texture(below);
@@ -1881,7 +1933,8 @@ impl MetalRenderer {
                     params.reference_offset = [
                         translation[0],
                         translation[1],
-                        (placed.rows[0][0] * placed.rows[1][1] - placed.rows[0][1] * placed.rows[1][0])
+                        (placed.rows[0][0] * placed.rows[1][1]
+                            - placed.rows[0][1] * placed.rows[1][0])
                             .abs()
                             .sqrt(),
                         1.,
@@ -1914,7 +1967,12 @@ impl MetalRenderer {
             }
             Some(ResolvedClipPath::Ellipse { center, radii }) => {
                 params.group[2] = 2.;
-                params.clip_a = [center.x, center.y, radii.width.max(1e-3), radii.height.max(1e-3)];
+                params.clip_a = [
+                    center.x,
+                    center.y,
+                    radii.width.max(1e-3),
+                    radii.height.max(1e-3),
+                ];
             }
             Some(ResolvedClipPath::Polygon { contours, even_odd }) => {
                 let mut points: Vec<[f32; 2]> = Vec::new();
@@ -2149,10 +2207,7 @@ impl MetalRenderer {
         target: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<()> {
-        if !target
-            .usage()
-            .contains(metal::MTLTextureUsage::ShaderRead)
-        {
+        if !target.usage().contains(metal::MTLTextureUsage::ShaderRead) {
             log::warn!("backdrop-filter skipped: the target can't be read back");
             return Ok(());
         }
@@ -2207,7 +2262,10 @@ impl MetalRenderer {
             new_command_encoder_for_texture(
                 command_buffer,
                 &backdrop,
-                size(DevicePixels(texture_width as i32), DevicePixels(texture_height as i32)),
+                size(
+                    DevicePixels(texture_width as i32),
+                    DevicePixels(texture_height as i32),
+                ),
                 Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
             )
             .end_encoding();
@@ -2238,8 +2296,12 @@ impl MetalRenderer {
             copy_width as f32 / texture_width as f32,
             copy_height as f32 / texture_height as f32,
         ];
-        let filtered =
-            self.apply_filters(backdrop, &effect.backdrop_filters, Some(valid), command_buffer);
+        let filtered = self.apply_filters(
+            backdrop,
+            &effect.backdrop_filters,
+            Some(valid),
+            command_buffer,
+        );
 
         let (params, polygon) = Self::composite_params(
             group,
@@ -2398,7 +2460,9 @@ impl GroupQueue {
 
 /// The groups of `scene`, sorted by order, that `orders` holds.
 fn group_indices(scene: &Scene, orders: OrderRange) -> Range<usize> {
-    let start = scene.groups.partition_point(|group| group.order <= orders.after);
+    let start = scene
+        .groups
+        .partition_point(|group| group.order <= orders.after);
     let end = start + scene.groups[start..].partition_point(|group| group.order <= orders.through);
     start..end
 }
@@ -2517,7 +2581,15 @@ impl EffectPipelines {
     fn new(device: &metal::DeviceRef, library: &metal::LibraryRef) -> Self {
         let format = MTLPixelFormat::BGRA8Unorm;
         let overwrite = |label, vertex, fragment| {
-            build_effect_pipeline_state(device, library, label, vertex, fragment, format, Blend::Overwrite)
+            build_effect_pipeline_state(
+                device,
+                library,
+                label,
+                vertex,
+                fragment,
+                format,
+                Blend::Overwrite,
+            )
         };
         Self {
             // A premultiplied source drawn over the target.
@@ -2540,11 +2612,23 @@ impl EffectPipelines {
                 format,
                 Blend::Replace,
             ),
-            filter_color: overwrite("effect_filter_color", "fullscreen_vertex", "filter_color_fragment"),
+            filter_color: overwrite(
+                "effect_filter_color",
+                "fullscreen_vertex",
+                "filter_color_fragment",
+            ),
             blur: overwrite("effect_blur", "fullscreen_vertex", "blur_fragment"),
             resample: overwrite("effect_resample", "fullscreen_vertex", "resample_fragment"),
-            drop_shadow: overwrite("effect_drop_shadow", "fullscreen_vertex", "drop_shadow_fragment"),
-            mask_combine: overwrite("effect_mask_combine", "fullscreen_vertex", "mask_combine_fragment"),
+            drop_shadow: overwrite(
+                "effect_drop_shadow",
+                "fullscreen_vertex",
+                "drop_shadow_fragment",
+            ),
+            mask_combine: overwrite(
+                "effect_mask_combine",
+                "fullscreen_vertex",
+                "mask_combine_fragment",
+            ),
         }
     }
 }
@@ -2690,7 +2774,13 @@ fn mask_is_plain(layers: &[MaskLayer]) -> bool {
 
 fn group_texture_extent(group: &EffectGroup) -> (u32, u32) {
     let width = group.bounds.size.width.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
-    let height = group.bounds.size.height.0.ceil().clamp(1., MAX_GROUP_EXTENT) as u32;
+    let height = group
+        .bounds
+        .size
+        .height
+        .0
+        .ceil()
+        .clamp(1., MAX_GROUP_EXTENT) as u32;
     (texture_size_class(width), texture_size_class(height))
 }
 
@@ -3219,16 +3309,17 @@ fn log_presented_time(drawable: &metal::MetalDrawableRef) {
 #[cfg(test)]
 mod tests {
     use super::{InstanceBufferPool, MetalHeadlessRenderer, MetalRenderer};
-    use parking_lot::Mutex;
-    use std::sync::Arc;
     use gpui::{
         Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundLayer,
         BackgroundPosition, BackgroundRepeat, BackgroundSize, Bounds, ColorSpace, ContentMask,
-        CornerRadii, Corners, DevicePixels, Edges, Gradient, GradientItem, GradientShape, GradientStop, GroupEffect, Hsla,
-        LengthPercentage, LinearDirection, PlatformHeadlessRenderer, Quad, RadialShape,
-        RadialSize, RepeatStyle, ScaledPixels, Scene, StopPosition, point, px, size,
+        CornerRadii, Corners, DevicePixels, Edges, Gradient, GradientItem, GradientShape,
+        GradientStop, GroupEffect, Hsla, LengthPercentage, LinearDirection,
+        PlatformHeadlessRenderer, Quad, RadialShape, RadialSize, RepeatStyle, ScaledPixels, Scene,
+        StopPosition, point, px, size,
     };
     use gpui::{MaskComposite, MaskLayer, MaskMode};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     const SIZE: f32 = 40.;
 
@@ -3250,7 +3341,11 @@ mod tests {
         }
     }
 
-    fn quad(background: impl Into<Background>, border_colors: Edges<Hsla>, border_width: f32) -> Quad {
+    fn quad(
+        background: impl Into<Background>,
+        border_colors: Edges<Hsla>,
+        border_width: f32,
+    ) -> Quad {
         Quad {
             bounds: full_bounds(),
             content_mask: ContentMask {
@@ -3328,7 +3423,11 @@ mod tests {
         assert!(is_cleared(&image, 39, 39));
         assert!(is_cleared(&image, 37, 2));
         assert_eq!(dominant_channel(&image, 20, 20), "red");
-        assert_eq!(dominant_channel(&image, 20, 1), "red", "straight edges are untouched");
+        assert_eq!(
+            dominant_channel(&image, 20, 1),
+            "red",
+            "straight edges are untouched"
+        );
         assert_eq!(dominant_channel(&image, 8, 8), "red", "inside the arc");
     }
 
@@ -3368,18 +3467,23 @@ mod tests {
                 bottom_left: px(radii.y.bottom_left.0),
             },
         };
-        let mut sides = (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy))).map(|(dx, dy)| {
-            let at = point(
-                px((x as f32 + 0.5 + dx as f32).clamp(0., SIZE - 0.01)),
-                px((y as f32 + 0.5 + dy as f32).clamp(0., SIZE - 0.01)),
-            );
-            gpui::point_in_rounded_rect(at, bounds, radii)
-        });
+        let mut sides = (-1..=1)
+            .flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
+            .map(|(dx, dy)| {
+                let at = point(
+                    px((x as f32 + 0.5 + dx as f32).clamp(0., SIZE - 0.01)),
+                    px((y as f32 + 0.5 + dy as f32).clamp(0., SIZE - 0.01)),
+                );
+                gpui::point_in_rounded_rect(at, bounds, radii)
+            });
         let first = sides.next().unwrap();
         sides.all(|side| side == first).then_some(first)
     }
 
-    fn assert_the_shader_draws_the_hit_test_shape(image: &image::RgbaImage, radii: CornerRadii<ScaledPixels>) {
+    fn assert_the_shader_draws_the_hit_test_shape(
+        image: &image::RgbaImage,
+        radii: CornerRadii<ScaledPixels>,
+    ) {
         let mut checked_inside = 0;
         let mut checked_outside = 0;
         for y in 0..SIZE as u32 {
@@ -3387,7 +3491,11 @@ mod tests {
                 match clearly_inside(x, y, radii) {
                     Some(true) => {
                         checked_inside += 1;
-                        assert_eq!(dominant_channel(image, x, y), "red", "pixel ({x}, {y}) is inside");
+                        assert_eq!(
+                            dominant_channel(image, x, y),
+                            "red",
+                            "pixel ({x}, {y}) is inside"
+                        );
                     }
                     Some(false) => {
                         checked_outside += 1;
@@ -3432,11 +3540,7 @@ mod tests {
     #[test]
     fn the_inner_edge_of_a_border_on_an_elliptical_corner_is_an_ellipse() {
         let mut scene = Scene::default();
-        let mut ring = quad(
-            gpui::transparent_black(),
-            Edges::all(gpui::red()),
-            4.,
-        );
+        let mut ring = quad(gpui::transparent_black(), Edges::all(gpui::red()), 4.);
         ring.corner_radii = Corners::all(ScaledPixels(16.));
         ring.corner_radii_y = Corners::all(ScaledPixels(8.));
         scene.insert_primitive(ring);
@@ -3482,7 +3586,12 @@ mod tests {
     /// Paints the layer into the whole 40x40 target, one quad per chunk.
     fn render_layer(layer: &BackgroundLayer) -> image::RgbaImage {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
-        let boxes = BackgroundBoxes::new(bounds, CornerRadii::default(), Edges::default(), Edges::default());
+        let boxes = BackgroundBoxes::new(
+            bounds,
+            CornerRadii::default(),
+            Edges::default(),
+            Edges::default(),
+        );
         let resolved = layer.resolve(&boxes).expect("layer has something to paint");
         let mut scene = Scene::default();
         for chunk in resolved.chunks {
@@ -3722,7 +3831,12 @@ mod tests {
     #[test]
     fn dithering_a_gradient_does_not_make_it_translucent() {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE)));
-        let boxes = BackgroundBoxes::new(bounds, CornerRadii::default(), Edges::default(), Edges::default());
+        let boxes = BackgroundBoxes::new(
+            bounds,
+            CornerRadii::default(),
+            Edges::default(),
+            Edges::default(),
+        );
         let resolved = layer(
             GradientShape::Linear(LinearDirection::ToRight),
             vec![stop(0x000000, at(0.)), stop(0x000000, at(1.))],
@@ -3731,7 +3845,11 @@ mod tests {
         .resolve(&boxes)
         .unwrap();
         let mut scene = Scene::default();
-        scene.insert_primitive(quad(gpui::white(), Edges::all(gpui::transparent_black()), 0.));
+        scene.insert_primitive(quad(
+            gpui::white(),
+            Edges::all(gpui::transparent_black()),
+            0.,
+        ));
         for chunk in resolved.chunks {
             let mut quad = quad(chunk, Edges::all(gpui::transparent_black()), 0.);
             quad.background_tile = resolved.tile;
@@ -3740,7 +3858,10 @@ mod tests {
         let image = render(&mut scene);
         // Opaque black over white: anything the white shows through is alpha noise.
         let brightest = image.pixels().map(|pixel| pixel.0[0]).max().unwrap();
-        assert!(brightest <= 2, "white shows through an opaque gradient: {brightest}/255");
+        assert!(
+            brightest <= 2,
+            "white shows through an opaque gradient: {brightest}/255"
+        );
     }
 
     fn groups_scene() -> Scene {
@@ -3847,7 +3968,11 @@ mod tests {
         let centre = brightness(20, 20);
         assert!(centre > 140 && centre < 250, "centre is {centre}");
         // Outside the square, where nothing was drawn, the blur has reached.
-        assert!(brightness(12, 20) > 10, "no bleed at 12: {}", brightness(12, 20));
+        assert!(
+            brightness(12, 20) > 10,
+            "no bleed at 12: {}",
+            brightness(12, 20)
+        );
         assert!(brightness(12, 20) < brightness(14, 20));
         assert!(brightness(27, 20) > 10);
         assert!(brightness(0, 20) < 4);
@@ -3969,7 +4094,10 @@ mod tests {
         let image = render(&mut scene);
         let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0] as i32;
         // Outside the element the stripes are untouched.
-        assert!(brightness(4, 20) > 250 && brightness(2, 20) < 5 || brightness(4, 20) < 5 && brightness(2, 20) > 250);
+        assert!(
+            brightness(4, 20) > 250 && brightness(2, 20) < 5
+                || brightness(4, 20) < 5 && brightness(2, 20) > 250
+        );
         // Inside it they have run together.
         for x in 14..26 {
             let value = brightness(x, 20);
@@ -4004,7 +4132,10 @@ mod tests {
         scene.end_group();
         let image = render_orders_over_transparent(
             &mut scene,
-            gpui::OrderRange { after: 1, through: gpui::DrawOrder::MAX },
+            gpui::OrderRange {
+                after: 1,
+                through: gpui::DrawOrder::MAX,
+            },
         );
         let alpha = |x: u32, y: u32| image.get_pixel(x, y).0[3] as i32;
         // Outside the element the stripes are as sharp as they were.
@@ -4098,7 +4229,12 @@ mod tests {
 
     fn fade_mask(width: f32) -> Vec<Quad> {
         let bounds = Bounds::new(point(px(0.), px(0.)), size(px(width), px(SIZE)));
-        let boxes = BackgroundBoxes::new(bounds, CornerRadii::default(), Edges::default(), Edges::default());
+        let boxes = BackgroundBoxes::new(
+            bounds,
+            CornerRadii::default(),
+            Edges::default(),
+            Edges::default(),
+        );
         let fade = layer(
             GradientShape::Linear(LinearDirection::ToRight),
             vec![
@@ -4118,7 +4254,9 @@ mod tests {
             ],
             false,
         );
-        let resolved = fade.resolve(&boxes).expect("the mask has something to paint");
+        let resolved = fade
+            .resolve(&boxes)
+            .expect("the mask has something to paint");
         resolved
             .chunks
             .into_iter()
@@ -4176,11 +4314,19 @@ mod tests {
     }
 
     fn white(alpha: f32) -> Hsla {
-        Hsla { a: alpha, ..hex(0xffffff) }
+        Hsla {
+            a: alpha,
+            ..hex(0xffffff)
+        }
     }
 
     fn layer_of(quads: Vec<Quad>, mode: MaskMode, composite: MaskComposite) -> MaskLayer {
-        MaskLayer { quads, sprites: Vec::new(), mode, composite }
+        MaskLayer {
+            quads,
+            sprites: Vec::new(),
+            mode,
+            composite,
+        }
     }
 
     fn sprites_of(
@@ -4188,7 +4334,12 @@ mod tests {
         mode: MaskMode,
         composite: MaskComposite,
     ) -> MaskLayer {
-        MaskLayer { quads: Vec::new(), sprites, mode, composite }
+        MaskLayer {
+            quads: Vec::new(),
+            sprites,
+            mode,
+            composite,
+        }
     }
 
     /// A layer whose image has not loaded.
@@ -4231,7 +4382,12 @@ mod tests {
                     image_id: gpui::ImageId(id),
                     frame_index: 0,
                 }),
-                &mut || Ok(Some((size(DevicePixels(width), DevicePixels(height)), bgra.clone().into()))),
+                &mut || {
+                    Ok(Some((
+                        size(DevicePixels(width), DevicePixels(height)),
+                        bgra.clone().into(),
+                    )))
+                },
             )
             .expect("the atlas takes the image")
             .expect("the image exists")
@@ -4261,7 +4417,10 @@ mod tests {
         }
     }
 
-    fn through_image_mask(renderer: &mut MetalHeadlessRenderer, layers: Vec<MaskLayer>) -> image::RgbaImage {
+    fn through_image_mask(
+        renderer: &mut MetalHeadlessRenderer,
+        layers: Vec<MaskLayer>,
+    ) -> image::RgbaImage {
         let mut scene = groups_scene();
         group(
             &mut scene,
@@ -4273,7 +4432,10 @@ mod tests {
         );
         scene.finish();
         renderer
-            .render_scene_to_image(&scene, size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .render_scene_to_image(
+                &scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
             .expect("scene should render")
     }
 
@@ -4346,7 +4508,11 @@ mod tests {
         let image = through_image_mask(
             &mut renderer,
             vec![
-                layer_of(vec![tinted(0., 0., 30., SIZE, white(0.5))], MaskMode::Alpha, MaskComposite::Add),
+                layer_of(
+                    vec![tinted(0., 0., 30., SIZE, white(0.5))],
+                    MaskMode::Alpha,
+                    MaskComposite::Add,
+                ),
                 sprites_of(vec![top], MaskMode::Alpha, MaskComposite::Add),
             ],
         );
@@ -4410,7 +4576,11 @@ mod tests {
     /// the middle 20px both.
     fn two_layers(mode: MaskMode, operator: MaskComposite) -> Vec<MaskLayer> {
         vec![
-            layer_of(vec![tinted(0., 0., 30., SIZE, white(0.25))], mode, MaskComposite::Add),
+            layer_of(
+                vec![tinted(0., 0., 30., SIZE, white(0.25))],
+                mode,
+                MaskComposite::Add,
+            ),
             layer_of(vec![tinted(10., 0., 30., SIZE, white(0.8))], mode, operator),
         ]
     }
@@ -4442,11 +4612,23 @@ mod tests {
     #[test]
     fn a_layer_combines_with_the_union_of_every_layer_below_it() {
         let layer = |x, composite| {
-            layer_of(vec![tinted(x, 0., 20., SIZE, white(1.))], MaskMode::Alpha, composite)
+            layer_of(
+                vec![tinted(x, 0., 20., SIZE, white(1.))],
+                MaskMode::Alpha,
+                composite,
+            )
         };
         // The top layer, everywhere, minus the first two.
-        let everywhere = layer_of(vec![tinted(0., 0., SIZE, SIZE, white(1.))], MaskMode::Alpha, MaskComposite::Subtract);
-        let image = through_mask(vec![layer(0., MaskComposite::Add), layer(10., MaskComposite::Add), everywhere]);
+        let everywhere = layer_of(
+            vec![tinted(0., 0., SIZE, SIZE, white(1.))],
+            MaskMode::Alpha,
+            MaskComposite::Subtract,
+        );
+        let image = through_mask(vec![
+            layer(0., MaskComposite::Add),
+            layer(10., MaskComposite::Add),
+            everywhere,
+        ]);
 
         assert_mask(&image, 5, 20, 0.);
         assert_mask(&image, 15, 20, 0.);
@@ -4456,7 +4638,11 @@ mod tests {
 
     #[test]
     fn the_bottom_layers_operator_is_ignored() {
-        for operator in [MaskComposite::Subtract, MaskComposite::Intersect, MaskComposite::Exclude] {
+        for operator in [
+            MaskComposite::Subtract,
+            MaskComposite::Intersect,
+            MaskComposite::Exclude,
+        ] {
             for mode in [MaskMode::Alpha, MaskMode::Luminance] {
                 let image = through_mask(vec![layer_of(
                     vec![tinted(0., 0., SIZE, SIZE, white(0.8))],
@@ -4476,7 +4662,13 @@ mod tests {
 
     #[test]
     fn an_unloaded_layer_is_transparent_black_for_the_operators() {
-        let shown = || layer_of(vec![tinted(0., 0., SIZE, SIZE, white(1.))], MaskMode::Alpha, MaskComposite::Add);
+        let shown = || {
+            layer_of(
+                vec![tinted(0., 0., SIZE, SIZE, white(1.))],
+                MaskMode::Alpha,
+                MaskComposite::Add,
+            )
+        };
 
         let intersected = through_mask(vec![shown(), nothing(MaskComposite::Intersect)]);
         assert!(is_cleared(&intersected, 20, 20));
@@ -4492,7 +4684,11 @@ mod tests {
         assert_mask(&from_nothing, 20, 20, 1.);
         let intersect_nothing = through_mask(vec![
             nothing(MaskComposite::Add),
-            layer_of(vec![tinted(0., 0., SIZE, SIZE, white(1.))], MaskMode::Alpha, MaskComposite::Intersect),
+            layer_of(
+                vec![tinted(0., 0., SIZE, SIZE, white(1.))],
+                MaskMode::Alpha,
+                MaskComposite::Intersect,
+            ),
         ]);
         assert!(is_cleared(&intersect_nothing, 20, 20));
     }
@@ -4506,7 +4702,13 @@ mod tests {
         };
         let plain = |count: usize| {
             (0..count)
-                .map(|_| layer_of(vec![tinted(0., 0., SIZE, SIZE, white(0.5))], MaskMode::Alpha, MaskComposite::Add))
+                .map(|_| {
+                    layer_of(
+                        vec![tinted(0., 0., SIZE, SIZE, white(0.5))],
+                        MaskMode::Alpha,
+                        MaskComposite::Add,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -4536,7 +4738,11 @@ mod tests {
         let luminance = bytes(two_layers(MaskMode::Luminance, MaskComposite::Add));
         let none = {
             let mut scene = groups_scene();
-            group(&mut scene, filtered(vec![gpui::FilterFunction::Grayscale(1.)]), &[solid(0., 0., SIZE, SIZE, 0xff0000)]);
+            group(
+                &mut scene,
+                filtered(vec![gpui::FilterFunction::Grayscale(1.)]),
+                &[solid(0., 0., SIZE, SIZE, 0xff0000)],
+            );
             super::group_texture_bytes(&scene.groups[0])
         };
         // The content, plus one mask texture or the three a combine holds at once.
@@ -4722,14 +4928,31 @@ mod tests {
         let flat = render(&mut flat);
         // The tail of the shadow reaches 12 pixels out; these are 2, 6 and 10 pixels from the
         // rectangle, beside it and off its corner.
-        for (x, y) in [(12, 20), (8, 20), (4, 20), (20, 12), (20, 8), (20, 4), (28, 20), (20, 28), (10, 10), (30, 30)] {
+        for (x, y) in [
+            (12, 20),
+            (8, 20),
+            (4, 20),
+            (20, 12),
+            (20, 8),
+            (20, 4),
+            (28, 20),
+            (20, 28),
+            (10, 10),
+            (30, 30),
+        ] {
             let (grouped, flat) = (grouped.get_pixel(x, y).0, flat.get_pixel(x, y).0);
             assert!(
-                grouped.iter().zip(flat).all(|(grouped, flat)| grouped.abs_diff(flat) <= 8),
+                grouped
+                    .iter()
+                    .zip(flat)
+                    .all(|(grouped, flat)| grouped.abs_diff(flat) <= 8),
                 "pixel ({x}, {y}) is {grouped:?} in the group, {flat:?} with no group"
             );
         }
-        assert!(flat.get_pixel(8, 20).0[3] > 20, "the shadow is there to compare");
+        assert!(
+            flat.get_pixel(8, 20).0[3] > 20,
+            "the shadow is there to compare"
+        );
     }
 
     #[test]
@@ -4755,7 +4978,10 @@ mod tests {
             x: Corners::all(ScaledPixels(16.)),
             y: Corners::all(ScaledPixels(8.)),
         });
-        assert!(circle + 8 < ellipse && ellipse + 8 < square, "{circle} < {ellipse} < {square}");
+        assert!(
+            circle + 8 < ellipse && ellipse + 8 < square,
+            "{circle} < {ellipse} < {square}"
+        );
     }
 
     #[test]
@@ -4784,7 +5010,10 @@ mod tests {
         let image = render(&mut scene);
         // The backdrop is the stripes averaged over the window, under a faint red.
         let pixel = image.get_pixel(20, 20).0;
-        assert!(pixel[0] > 100 && pixel[1] > 80 && pixel[1] < 160, "{pixel:?}");
+        assert!(
+            pixel[0] > 100 && pixel[1] > 80 && pixel[1] < 160,
+            "{pixel:?}"
+        );
     }
 
     #[test]
@@ -4823,7 +5052,11 @@ mod tests {
             corner_radii: Corners::default(),
             corner_radii_y: Corners::default(),
         };
-        scene.start_group(filtered(vec![gpui::FilterFunction::Blur(px(1.))]), mask, None);
+        scene.start_group(
+            filtered(vec![gpui::FilterFunction::Blur(px(1.))]),
+            mask,
+            None,
+        );
         let mut inside = solid(0., 0., SIZE, SIZE, 0xff0000);
         inside.content_mask = mask;
         scene.insert_primitive(inside);
@@ -4890,9 +5123,18 @@ mod tests {
             for x in 0..SIZE as u32 {
                 let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
                 let here = inside(cx, cy);
-                let steady = [(-1., 0.), (1., 0.), (0., -1.), (0., 1.), (-1., -1.), (1., 1.), (1., -1.), (-1., 1.)]
-                    .iter()
-                    .all(|(dx, dy)| inside(cx + dx, cy + dy) == here);
+                let steady = [
+                    (-1., 0.),
+                    (1., 0.),
+                    (0., -1.),
+                    (0., 1.),
+                    (-1., -1.),
+                    (1., 1.),
+                    (1., -1.),
+                    (-1., 1.),
+                ]
+                .iter()
+                .all(|(dx, dy)| inside(cx + dx, cy + dy) == here);
                 if steady {
                     pixels.push((x, y, here));
                 }
@@ -4970,9 +5212,18 @@ mod tests {
     #[test]
     fn an_exact_pair_paints_the_same_with_or_without_a_group() {
         for (parent, child) in [
-            (clip_mask(0., 0., 40., 40., (16., 16.)), clip_mask(8., 8., 24., 24., (0., 0.))),
-            (clip_mask(0., 0., 40., 40., (16., 16.)), clip_mask(0., 0., 40., 40., (6., 6.))),
-            (clip_mask(0., 0., 40., 40., (0., 0.)), clip_mask(5., 5., 30., 30., (0., 0.))),
+            (
+                clip_mask(0., 0., 40., 40., (16., 16.)),
+                clip_mask(8., 8., 24., 24., (0., 0.)),
+            ),
+            (
+                clip_mask(0., 0., 40., 40., (16., 16.)),
+                clip_mask(0., 0., 40., 40., (6., 6.)),
+            ),
+            (
+                clip_mask(0., 0., 40., 40., (0., 0.)),
+                clip_mask(5., 5., 30., 30., (0., 0.)),
+            ),
         ] {
             assert!(child.intersection_is_exact(&parent));
             let plain = clipped_by_two(&parent, &child, false);
@@ -4986,7 +5237,10 @@ mod tests {
                 .flat_map(|(plain, grouped)| (0..3).map(|i| plain.0[i].abs_diff(grouped.0[i])))
                 .max()
                 .unwrap();
-            assert!(worst <= 24, "the group changed an edge pixel by {worst}/255");
+            assert!(
+                worst <= 24,
+                "the group changed an edge pixel by {worst}/255"
+            );
         }
     }
 
@@ -5000,7 +5254,12 @@ mod tests {
                     path: "solid".into(),
                     size: size(DevicePixels(16), DevicePixels(16)),
                 }),
-                &mut || Ok(Some((size(DevicePixels(16), DevicePixels(16)), vec![255u8; 256].into()))),
+                &mut || {
+                    Ok(Some((
+                        size(DevicePixels(16), DevicePixels(16)),
+                        vec![255u8; 256].into(),
+                    )))
+                },
             )
             .expect("the atlas takes the tile")
             .expect("the tile exists");
@@ -5041,7 +5300,10 @@ mod tests {
         scene.finish();
 
         let image = renderer
-            .render_scene_to_image(&scene, size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .render_scene_to_image(
+                &scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
             .expect("scene should render");
         assert_color(&image, 18, 20, [255, 0, 0]);
         assert!(is_cleared(&image, 4, 4));
@@ -5056,10 +5318,8 @@ mod tests {
         path.line_to(point(px(6.), px(6.)));
         path.line_to(point(px(6.), px(30.)));
         path.color = hex(0xff0000).into();
-        path.content_mask = ContentMask::from_bounds(Bounds::new(
-            point(px(0.), px(0.)),
-            size(px(SIZE), px(SIZE)),
-        ));
+        path.content_mask =
+            ContentMask::from_bounds(Bounds::new(point(px(0.), px(0.)), size(px(SIZE), px(SIZE))));
         let path = path.scale(1.);
 
         let mut scene = groups_scene();
@@ -5317,8 +5577,7 @@ mod tests {
     #[test]
     fn a_resizing_element_goes_through_few_texture_sizes() {
         use super::texture_size_class;
-        let classes: std::collections::BTreeSet<_> =
-            (100..=1500).map(texture_size_class).collect();
+        let classes: std::collections::BTreeSet<_> = (100..=1500).map(texture_size_class).collect();
         assert!(classes.len() <= 56, "{} classes", classes.len());
         for extent in 1..=16384u32 {
             let class = texture_size_class(extent);
@@ -5342,9 +5601,8 @@ mod tests {
         descriptor.set_width(WIDTH as u64);
         descriptor.set_height(HEIGHT as u64);
         descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        descriptor.set_usage(
-            metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
-        );
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
         descriptor.set_storage_mode(metal::MTLStorageMode::Private);
         let target = renderer.device.new_texture(&descriptor);
         let mask = ContentMask {
@@ -5521,10 +5779,12 @@ mod tests {
 
     #[test]
     fn a_translated_shadow_matches_the_shadow_drawn_at_the_offset() {
-        let element = |x: f32| Bounds::new(
-            point(ScaledPixels(x), ScaledPixels(x)),
-            size(ScaledPixels(12.), ScaledPixels(12.)),
-        );
+        let element = |x: f32| {
+            Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(x)),
+                size(ScaledPixels(12.), ScaledPixels(12.)),
+            )
+        };
         let radii = CornerRadii {
             x: Corners::all(ScaledPixels(3.)),
             y: Corners::default(),
@@ -5551,7 +5811,10 @@ mod tests {
     fn render_in(renderer: &mut MetalHeadlessRenderer, scene: &mut Scene) -> image::RgbaImage {
         scene.finish();
         renderer
-            .render_scene_to_image(scene, size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .render_scene_to_image(
+                scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
             .expect("scene should render")
     }
 
@@ -5568,7 +5831,12 @@ mod tests {
                     path: name.to_string().into(),
                     size: size(DevicePixels(8), DevicePixels(8)),
                 }),
-                &mut || Ok(Some((size(DevicePixels(8), DevicePixels(8)), bytes.clone().into()))),
+                &mut || {
+                    Ok(Some((
+                        size(DevicePixels(8), DevicePixels(8)),
+                        bytes.clone().into(),
+                    )))
+                },
             )
             .expect("the atlas takes the tile")
             .expect("the tile exists")
@@ -5596,11 +5864,16 @@ mod tests {
     }
 
     fn lit(image: &image::RgbaImage, x: u32, y: u32) -> bool {
-        image.get_pixel(x, y).0[..3].iter().any(|&channel| channel > 200)
+        image.get_pixel(x, y).0[..3]
+            .iter()
+            .any(|&channel| channel > 200)
     }
 
     fn lit_pixels(image: &image::RgbaImage) -> usize {
-        image.pixels().filter(|pixel| pixel.0[..3].iter().any(|&channel| channel > 127)).count()
+        image
+            .pixels()
+            .filter(|pixel| pixel.0[..3].iter().any(|&channel| channel > 127))
+            .count()
     }
 
     #[test]
@@ -5608,18 +5881,35 @@ mod tests {
         let mut renderer = MetalHeadlessRenderer::new();
         let tile = ramp_tile(&renderer, "ramp");
         let mut moved = Scene::default();
-        moved.insert_primitive(glyph_sprite(tile, (5., 4.), matrix([1., 0., 0., 1., 9., 7.])));
+        moved.insert_primitive(glyph_sprite(
+            tile,
+            (5., 4.),
+            matrix([1., 0., 0., 1., 9., 7.]),
+        ));
         let mut placed = Scene::default();
-        placed.insert_primitive(glyph_sprite(tile, (14., 11.), gpui::TransformationMatrix::unit()));
+        placed.insert_primitive(glyph_sprite(
+            tile,
+            (14., 11.),
+            gpui::TransformationMatrix::unit(),
+        ));
         let moved = render_in(&mut renderer, &mut moved);
         assert_images_match(&moved, &render_in(&mut renderer, &mut placed));
-        assert!(moved.pixels().any(|pixel| pixel.0[0] > 40), "the sprite is drawn");
+        assert!(
+            moved.pixels().any(|pixel| pixel.0[0] > 40),
+            "the sprite is drawn"
+        );
     }
 
     #[test]
     fn a_translated_image_matches_the_one_drawn_at_the_offset() {
         let mut renderer = MetalHeadlessRenderer::new();
-        let tile = atlas_image(&renderer, 1, 2, 2, pixels(&[OPAQUE_WHITE, OPAQUE_BLACK, OPAQUE_BLACK, OPAQUE_WHITE]));
+        let tile = atlas_image(
+            &renderer,
+            1,
+            2,
+            2,
+            pixels(&[OPAQUE_WHITE, OPAQUE_BLACK, OPAQUE_BLACK, OPAQUE_WHITE]),
+        );
         let rounded = |at: (f32, f32), transformation| gpui::PolychromeSprite {
             corner_radii: Corners::all(ScaledPixels(5.)),
             transformation,
@@ -5703,7 +5993,12 @@ mod tests {
                     path: "solid".into(),
                     size: size(DevicePixels(16), DevicePixels(16)),
                 }),
-                &mut || Ok(Some((size(DevicePixels(16), DevicePixels(16)), vec![255u8; 256].into()))),
+                &mut || {
+                    Ok(Some((
+                        size(DevicePixels(16), DevicePixels(16)),
+                        vec![255u8; 256].into(),
+                    )))
+                },
             )
             .expect("the atlas takes the tile")
             .expect("the tile exists");
@@ -5721,11 +6016,18 @@ mod tests {
             assert!(is_cleared(&image, x, y), "pixel ({x}, {y}) should be empty");
         }
         // The slanted edge has partly covered pixels, which a hard-edged quad would not.
-        let partial = image.pixels().filter(|pixel| (40..215).contains(&pixel.0[0])).count();
+        let partial = image
+            .pixels()
+            .filter(|pixel| (40..215).contains(&pixel.0[0]))
+            .count();
         assert!(partial > 10, "{partial} antialiased pixels");
     }
 
-    fn underline(style: u32, bounds: (f32, f32, f32, f32), transformation: gpui::TransformationMatrix) -> gpui::Underline {
+    fn underline(
+        style: u32,
+        bounds: (f32, f32, f32, f32),
+        transformation: gpui::TransformationMatrix,
+    ) -> gpui::Underline {
         gpui::Underline {
             order: 0,
             pad: 0,
@@ -5749,9 +6051,17 @@ mod tests {
         // Solid, dotted, dashed and wavy.
         for style in 0..4 {
             let mut moved = Scene::default();
-            moved.insert_primitive(underline(style, (3., 5., 24., 6.), matrix([1., 0., 0., 1., 7., 9.])));
+            moved.insert_primitive(underline(
+                style,
+                (3., 5., 24., 6.),
+                matrix([1., 0., 0., 1., 7., 9.]),
+            ));
             let mut placed = Scene::default();
-            placed.insert_primitive(underline(style, (10., 14., 24., 6.), gpui::TransformationMatrix::unit()));
+            placed.insert_primitive(underline(
+                style,
+                (10., 14., 24., 6.),
+                gpui::TransformationMatrix::unit(),
+            ));
             assert_images_match(&render(&mut moved), &render(&mut placed));
         }
     }
@@ -5759,7 +6069,11 @@ mod tests {
     #[test]
     fn a_rotated_underline_runs_along_the_turned_axis() {
         let mut scene = Scene::default();
-        scene.insert_primitive(underline(0, (8., 18., 24., 4.), rotation_around(90., (20., 20.))));
+        scene.insert_primitive(underline(
+            0,
+            (8., 18., 24., 4.),
+            rotation_around(90., (20., 20.)),
+        ));
         let image = render(&mut scene);
         assert_eq!(dominant_channel(&image, 20, 10), "red");
         assert_eq!(dominant_channel(&image, 20, 29), "red");
@@ -5804,11 +6118,17 @@ mod tests {
         scene.end_group();
         let image = render(&mut scene);
         let center = image.get_pixel(20, 20).0[0] as i32;
-        assert!((center - 128).abs() <= 4, "half faded once, not twice: {center}");
+        assert!(
+            (center - 128).abs() <= 4,
+            "half faded once, not twice: {center}"
+        );
         for (x, y) in [(11, 11), (28, 11), (11, 28), (28, 28)] {
             assert!(is_cleared(&image, x, y), "pixel ({x}, {y}) should be empty");
         }
-        assert!(image.get_pixel(20, 8).0[0] > 20, "the tip of the diamond is at the top");
+        assert!(
+            image.get_pixel(20, 8).0[0] > 20,
+            "the tip of the diamond is at the top"
+        );
     }
 
     #[test]
@@ -5821,7 +6141,11 @@ mod tests {
         };
         let image = through_image_mask(
             &mut renderer,
-            vec![sprites_of(vec![turned], MaskMode::Alpha, MaskComposite::Add)],
+            vec![sprites_of(
+                vec![turned],
+                MaskMode::Alpha,
+                MaskComposite::Add,
+            )],
         );
         assert_mask(&image, 20, 20, 1.);
         assert_mask(&image, 20, 12, 1.);
@@ -5863,21 +6187,31 @@ mod tests {
 
     /// A 4:2:0 pixel buffer whose luma is `luma(x, y)` and whose chroma is neutral, so the
     /// picture is a gray one that an RGBA image can hold too.
-    fn gray_surface(width: usize, height: usize, luma: impl Fn(usize, usize) -> u8) -> core_video::pixel_buffer::CVPixelBuffer {
+    fn gray_surface(
+        width: usize,
+        height: usize,
+        luma: impl Fn(usize, usize) -> u8,
+    ) -> core_video::pixel_buffer::CVPixelBuffer {
         use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
         use core_video::pixel_buffer::{
             CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
-            CVPixelBufferLockBaseAddress, CVPixelBufferUnlockBaseAddress, CVPixelBufferKeys,
+            CVPixelBufferKeys, CVPixelBufferLockBaseAddress, CVPixelBufferUnlockBaseAddress,
             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         };
         // The texture cache only takes buffers an IOSurface backs.
-        let io_surface: CFDictionary<CFString, core_foundation::base::CFType> = CFDictionary::from_CFType_pairs(&[]);
+        let io_surface: CFDictionary<CFString, core_foundation::base::CFType> =
+            CFDictionary::from_CFType_pairs(&[]);
         let options = CFDictionary::from_CFType_pairs(&[(
             CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
             io_surface.as_CFType(),
         )]);
-        let buffer = CVPixelBuffer::new(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, width, height, Some(&options))
-            .expect("a pixel buffer");
+        let buffer = CVPixelBuffer::new(
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            width,
+            height,
+            Some(&options),
+        )
+        .expect("a pixel buffer");
         unsafe {
             let pointer = buffer.as_concrete_TypeRef();
             assert_eq!(CVPixelBufferLockBaseAddress(pointer, 0), 0);
@@ -5951,7 +6285,10 @@ mod tests {
     fn render_with(renderer: &mut MetalHeadlessRenderer, mut scene: Scene) -> image::RgbaImage {
         scene.finish();
         renderer
-            .render_scene_to_image(&scene, size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .render_scene_to_image(
+                &scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
             .expect("scene should render")
     }
 
@@ -5960,7 +6297,10 @@ mod tests {
             .enumerate_pixels()
             .map(|(x, y, pixel)| {
                 let other = image.get_pixel(x, y);
-                (0..3).map(|channel| pixel.0[channel].abs_diff(other.0[channel])).max().unwrap()
+                (0..3)
+                    .map(|channel| pixel.0[channel].abs_diff(other.0[channel]))
+                    .max()
+                    .unwrap()
             })
             .max()
             .unwrap();
@@ -5983,11 +6323,21 @@ mod tests {
         let from_surface = render_with(&mut renderer, with_surface);
 
         let mut with_image = groups_scene();
-        with_image.insert_primitive(gray_image_sprite(&renderer, 1, bounds, turn, ContentMask::unbounded()));
+        with_image.insert_primitive(gray_image_sprite(
+            &renderer,
+            1,
+            bounds,
+            turn,
+            ContentMask::unbounded(),
+        ));
         let from_image = render_with(&mut renderer, with_image);
 
         // The picture is turned, and not the box around it.
-        assert!(is_cleared(&from_surface, 4, 4), "{:?}", from_surface.get_pixel(4, 4));
+        assert!(
+            is_cleared(&from_surface, 4, 4),
+            "{:?}",
+            from_surface.get_pixel(4, 4)
+        );
         assert!(is_cleared(&from_surface, 35, 35));
         assert!(!is_cleared(&from_surface, 20, 20));
         assert_pictures_agree(&from_surface, &from_image);
@@ -6009,11 +6359,21 @@ mod tests {
         };
 
         let mut with_surface = groups_scene();
-        with_surface.insert_primitive(surface(gray_surface(16, 16, block_luma), bounds, turn, clip));
+        with_surface.insert_primitive(surface(
+            gray_surface(16, 16, block_luma),
+            bounds,
+            turn,
+            clip,
+        ));
         let from_surface = render_with(&mut renderer, with_surface);
 
         let mut whole = groups_scene();
-        whole.insert_primitive(surface(gray_surface(16, 16, block_luma), bounds, turn, ContentMask::unbounded()));
+        whole.insert_primitive(surface(
+            gray_surface(16, 16, block_luma),
+            bounds,
+            turn,
+            ContentMask::unbounded(),
+        ));
         let uncut = render_with(&mut renderer, whole);
 
         let mut with_image = groups_scene();
@@ -6028,7 +6388,11 @@ mod tests {
         let (cut_x, cut_y) = beyond(6.);
         assert!(!is_cleared(&from_surface, kept_x, kept_y));
         assert!(!is_cleared(&uncut, cut_x, cut_y));
-        assert!(is_cleared(&from_surface, cut_x, cut_y), "{:?}", from_surface.get_pixel(cut_x, cut_y));
+        assert!(
+            is_cleared(&from_surface, cut_x, cut_y),
+            "{:?}",
+            from_surface.get_pixel(cut_x, cut_y)
+        );
         assert_pictures_agree(&from_surface, &from_image);
     }
 
@@ -6055,12 +6419,25 @@ mod tests {
         let brightness = |x: u32, y: u32| image.get_pixel(x, y).0[0] as i32;
         let sharp = |x: u32, y: u32| brightness(x, y) > 250 || brightness(x, y) < 5;
         // The centre is blurred.
-        assert!((100..155).contains(&brightness(20, 20)), "{}", brightness(20, 20));
+        assert!(
+            (100..155).contains(&brightness(20, 20)),
+            "{}",
+            brightness(20, 20)
+        );
         // Along the long axis, turned 40 degrees: inside the end of the box and 4 px beyond it.
         let (sin, cos) = 40f32.to_radians().sin_cos();
-        let along = |distance: f32| ((20. + distance * cos).round() as u32, (20. + distance * sin).round() as u32);
+        let along = |distance: f32| {
+            (
+                (20. + distance * cos).round() as u32,
+                (20. + distance * sin).round() as u32,
+            )
+        };
         let (x, y) = along(9.);
-        assert!((100..155).contains(&brightness(x, y)), "{}", brightness(x, y));
+        assert!(
+            (100..155).contains(&brightness(x, y)),
+            "{}",
+            brightness(x, y)
+        );
         let (x, y) = along(15.);
         assert!(sharp(x, y), "{}", brightness(x, y));
         // The corners of the box around the turned one, which a bounding box would have blurred.
@@ -6102,7 +6479,9 @@ mod tests {
     fn perspective_about(center: (f32, f32), g: f32, h: f32) -> gpui::TransformationMatrix {
         let shift = |sign: f32| matrix([1., 0., 0., 1., sign * center.0, sign * center.1]);
         shift(1.)
-            .compose(gpui::TransformationMatrix { rows: [[1., 0., 0.], [0., 1., 0.], [g, h, 1.]] })
+            .compose(gpui::TransformationMatrix {
+                rows: [[1., 0., 0.], [0., 1., 0.], [g, h, 1.]],
+            })
             .compose(shift(-1.))
     }
 
@@ -6172,7 +6551,11 @@ mod tests {
             }
         }
         let pixels = u64::from(SIZE as u32 * SIZE as u32 * 3);
-        assert!(difference / pixels <= 5, "the mean error is {} of 255", difference / pixels);
+        assert!(
+            difference / pixels <= 5,
+            "the mean error is {} of 255",
+            difference / pixels
+        );
         assert!(
             area_actual.abs_diff(area_reference) * 100 <= area_reference * 8,
             "the lit area is {area_actual} and the reference's {area_reference}"
@@ -6181,8 +6564,14 @@ mod tests {
 
     fn inside_rounded_rect(x: f32, y: f32, rect: (f32, f32, f32, f32), radius: f32) -> bool {
         let (left, top, width, height) = rect;
-        let from_center = ((x - (left + width / 2.)).abs(), (y - (top + height / 2.)).abs());
-        let corner = (from_center.0 - (width / 2. - radius), from_center.1 - (height / 2. - radius));
+        let from_center = (
+            (x - (left + width / 2.)).abs(),
+            (y - (top + height / 2.)).abs(),
+        );
+        let corner = (
+            from_center.0 - (width / 2. - radius),
+            from_center.1 - (height / 2. - radius),
+        );
         if corner.0 > radius || corner.1 > radius {
             return false;
         }
@@ -6224,7 +6613,11 @@ mod tests {
                 return None;
             }
             // The inner edge of the border: the box shrunk by its width, its radius by the same.
-            Some(if inside_rounded_rect(x, y, (11., 12., 18., 18.), 5.) { [1., 0., 0.] } else { [0., 0., 1.] })
+            Some(if inside_rounded_rect(x, y, (11., 12., 18., 18.), 5.) {
+                [1., 0., 0.]
+            } else {
+                [0., 0., 1.]
+            })
         });
         assert_matches_reference(&render(&mut scene), &reference);
     }
@@ -6233,13 +6626,7 @@ mod tests {
     fn an_image_under_perspective_is_mapped_as_the_plane_is_not_as_the_screen_is() {
         let mut renderer = MetalHeadlessRenderer::new();
         // Black left half, white right half: where the middle falls tells the two mappings apart.
-        let tile = atlas_image(
-            &renderer,
-            1,
-            2,
-            1,
-            pixels(&[OPAQUE_BLACK, OPAQUE_WHITE]),
-        );
+        let tile = atlas_image(&renderer, 1, 2, 1, pixels(&[OPAQUE_BLACK, OPAQUE_WHITE]));
         let matrix = perspective_about((20., 20.), 0.04, 0.);
         let mut scene = Scene::default();
         scene.insert_primitive(gpui::PolychromeSprite {
@@ -6257,8 +6644,16 @@ mod tests {
         // The middle of the plane is at window x = 20, but the middle of the screen
         // footprint is at about 15 (the plane is larger on the left): that is where a
         // texture mapped in the screen would put it.
-        assert!(image.get_pixel(18, 20).0[0] < 60, "{:?}", image.get_pixel(18, 20));
-        assert!(image.get_pixel(22, 20).0[0] > 200, "{:?}", image.get_pixel(22, 20));
+        assert!(
+            image.get_pixel(18, 20).0[0] < 60,
+            "{:?}",
+            image.get_pixel(18, 20)
+        );
+        assert!(
+            image.get_pixel(22, 20).0[0] > 200,
+            "{:?}",
+            image.get_pixel(22, 20)
+        );
     }
 
     #[test]
@@ -6322,10 +6717,19 @@ mod tests {
     fn reference_of_4x4(matrix: &gpui::Matrix3d, rect: (f32, f32, f32, f32)) -> image::RgbaImage {
         const SUBSAMPLES: u32 = 8;
         let (left, top, width, height) = rect;
-        let corners: Vec<[f32; 2]> = [(left, top), (left + width, top), (left + width, top + height), (left, top + height)]
-            .iter()
-            .map(|(x, y)| matrix.project(*x, *y, 0.).expect("the corners are in front of the eye"))
-            .collect();
+        let corners: Vec<[f32; 2]> = [
+            (left, top),
+            (left + width, top),
+            (left + width, top + height),
+            (left, top + height),
+        ]
+        .iter()
+        .map(|(x, y)| {
+            matrix
+                .project(*x, *y, 0.)
+                .expect("the corners are in front of the eye")
+        })
+        .collect();
         let inside = |x: f32, y: f32| {
             let signs: Vec<f32> = (0..4)
                 .map(|index| {
@@ -6372,14 +6776,25 @@ mod tests {
     #[test]
     fn a_quad_turned_about_y_under_a_perspective_is_where_the_4x4_puts_it() {
         // rotateY(60deg) about the middle of a 20 square, seen from 50 pixels away along its center.
-        let matrix = gpui::Matrix3d::perspective_about(50., 20., 20.)
-            .compose(about_in_3d((20., 20.), gpui::Matrix3d::rotate(0., 1., 0., 60f32.to_radians())));
+        let matrix = gpui::Matrix3d::perspective_about(50., 20., 20.).compose(about_in_3d(
+            (20., 20.),
+            gpui::Matrix3d::rotate(0., 1., 0., 60f32.to_radians()),
+        ));
         let rect = (10., 10., 20., 20.);
         let image = drawn_through_4x4(&matrix, rect);
         assert_matches_reference(&image, &reference_of_4x4(&matrix, rect));
         // The left edge came toward the viewer and is the taller one.
-        let column_height = |x: u32| (0..SIZE as u32).filter(|y| image.get_pixel(x, *y).0[0] > 128).count();
-        assert!(column_height(15) > column_height(23), "{} {}", column_height(15), column_height(23));
+        let column_height = |x: u32| {
+            (0..SIZE as u32)
+                .filter(|y| image.get_pixel(x, *y).0[0] > 128)
+                .count()
+        };
+        assert!(
+            column_height(15) > column_height(23),
+            "{} {}",
+            column_height(15),
+            column_height(23)
+        );
     }
 
     #[test]
@@ -6392,7 +6807,10 @@ mod tests {
             let image = drawn_through_4x4(&matrix, rect);
             assert_matches_reference(&image, &reference_of_4x4(&matrix, rect));
             let left = matrix.project(14., 14., 0.).unwrap();
-            assert!((left[0] - (origin.0 + (14. - origin.0) * 4. / 3.)).abs() < 1e-3, "{left:?}");
+            assert!(
+                (left[0] - (origin.0 + (14. - origin.0) * 4. / 3.)).abs() < 1e-3,
+                "{left:?}"
+            );
         }
     }
 
@@ -6400,9 +6818,17 @@ mod tests {
     fn two_planes_of_a_3d_context_flatten_once() {
         // A plane turned 35 about x inside one turned 40 about y: the 4x4s multiply, then the primitive is
         // flattened; flattening the parent first would put the child somewhere else.
-        let parent = about_in_3d((20., 20.), gpui::Matrix3d::rotate(0., 1., 0., 40f32.to_radians()));
-        let child = about_in_3d((20., 20.), gpui::Matrix3d::rotate(1., 0., 0., 35f32.to_radians()));
-        let matrix = gpui::Matrix3d::perspective_about(70., 20., 20.).compose(parent).compose(child);
+        let parent = about_in_3d(
+            (20., 20.),
+            gpui::Matrix3d::rotate(0., 1., 0., 40f32.to_radians()),
+        );
+        let child = about_in_3d(
+            (20., 20.),
+            gpui::Matrix3d::rotate(1., 0., 0., 35f32.to_radians()),
+        );
+        let matrix = gpui::Matrix3d::perspective_about(70., 20., 20.)
+            .compose(parent)
+            .compose(child);
         let rect = (9., 9., 22., 22.);
         let image = drawn_through_4x4(&matrix, rect);
         assert_matches_reference(&image, &reference_of_4x4(&matrix, rect));
@@ -6428,7 +6854,10 @@ mod tests {
     }
 
     /// [`render_orders`] on a target that starts out transparent, as a layer above a native surface does.
-    fn render_orders_over_transparent(scene: &mut Scene, orders: gpui::OrderRange) -> image::RgbaImage {
+    fn render_orders_over_transparent(
+        scene: &mut Scene,
+        orders: gpui::OrderRange,
+    ) -> image::RgbaImage {
         scene.finish();
         let mut renderer = MetalRenderer::new_internal(
             MetalRenderer::create_device(),
@@ -6452,9 +6881,18 @@ mod tests {
         scene.insert_primitive(solid(0., 0., 24., 24., 0xff0000));
         scene.insert_primitive(solid(12., 12., 24., 24., 0x00ff00));
         scene.insert_primitive(solid(30., 0., 8., 8., 0x0000ff));
-        let below = gpui::OrderRange { after: 0, through: 1 };
-        let above = gpui::OrderRange { after: 1, through: gpui::DrawOrder::MAX };
-        let past = gpui::OrderRange { after: 2, through: gpui::DrawOrder::MAX };
+        let below = gpui::OrderRange {
+            after: 0,
+            through: 1,
+        };
+        let above = gpui::OrderRange {
+            after: 1,
+            through: gpui::DrawOrder::MAX,
+        };
+        let past = gpui::OrderRange {
+            after: 2,
+            through: gpui::DrawOrder::MAX,
+        };
 
         let image = render_orders(&mut scene, below);
         assert_color(&image, 4, 4, [255, 0, 0]);
@@ -6481,15 +6919,31 @@ mod tests {
         // Orders: the red quad 1, the group over it 2, the blue quad over the group 3.
         let mut scene = groups_scene();
         scene.insert_primitive(solid(0., 0., 24., 24., 0xff0000));
-        group(&mut scene, GroupEffect { opacity: 1., ..GroupEffect::default() }, &[solid(8., 8., 24., 24., 0x00ff00)]);
+        group(
+            &mut scene,
+            GroupEffect {
+                opacity: 1.,
+                ..GroupEffect::default()
+            },
+            &[solid(8., 8., 24., 24., 0x00ff00)],
+        );
         scene.insert_primitive(solid(16., 16., 24., 24., 0x0000ff));
-        let only_the_group = gpui::OrderRange { after: 1, through: 2 };
+        let only_the_group = gpui::OrderRange {
+            after: 1,
+            through: 2,
+        };
 
         let image = render_orders(&mut scene, only_the_group);
         assert_color(&image, 12, 12, [0, 255, 0]);
         assert!(is_cleared(&image, 2, 2));
         assert!(is_cleared(&image, 36, 36));
-        let image = render_orders(&mut scene, gpui::OrderRange { after: 2, through: gpui::DrawOrder::MAX });
+        let image = render_orders(
+            &mut scene,
+            gpui::OrderRange {
+                after: 2,
+                through: gpui::DrawOrder::MAX,
+            },
+        );
         assert_color(&image, 36, 36, [0, 0, 255]);
         assert!(is_cleared(&image, 12, 12));
     }

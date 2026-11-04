@@ -10,6 +10,19 @@ use metal::Device;
 use parking_lot::Mutex;
 use std::borrow::Cow;
 
+const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
+    width: DevicePixels(1024),
+    height: DevicePixels(1024),
+};
+// Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
+const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
+    width: DevicePixels(16384),
+    height: DevicePixels(16384),
+};
+// A tile past half the default side can't share a default texture with a second tile of its size,
+// so padding its texture to the default would waste most of it.
+const DEDICATED_TEXTURE_THRESHOLD: DevicePixels = DevicePixels(512);
+
 pub struct MetalAtlas {
     state: Mutex<MetalAtlasState>,
     last_submission: Mutex<Option<AssertSend<metal::CommandBuffer>>>,
@@ -161,16 +174,13 @@ impl MetalAtlasState {
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
     ) -> &mut MetalAtlasTexture {
-        const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
+        let size = if min_size.width > DEDICATED_TEXTURE_THRESHOLD
+            || min_size.height > DEDICATED_TEXTURE_THRESHOLD
+        {
+            min_size.min(&MAX_ATLAS_SIZE)
+        } else {
+            DEFAULT_ATLAS_SIZE
         };
-        // Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
-        const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(16384),
-            height: DevicePixels(16384),
-        };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.into());
         texture_descriptor.set_height(size.height.into());
@@ -443,6 +453,128 @@ mod tests {
         atlas.remove(&big_key_a);
         let tile_b = insert_tile(&atlas, &big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    fn square(side: i32) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(side),
+            height: DevicePixels(side),
+        }
+    }
+
+    fn live_polychrome_textures(atlas: &MetalAtlas) -> usize {
+        let state = atlas.state.lock();
+        state.polychrome_textures.textures.iter().flatten().count()
+    }
+
+    fn texture_extent(atlas: &MetalAtlas, tile: &AtlasTile) -> (u64, u64) {
+        let texture = atlas.metal_texture(tile.texture_id);
+        (texture.width(), texture.height())
+    }
+
+    #[test]
+    fn test_large_tile_gets_a_texture_of_its_own_size() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let tile = insert_tile(&atlas, &make_image_key(1, 0), square(600));
+
+        assert_eq!(texture_extent(&atlas, &tile), (600, 600));
+        assert_eq!(tile.bounds.origin, Point::default());
+        assert_eq!(tile.bounds.size, square(600));
+    }
+
+    #[test]
+    fn test_non_square_large_tile_fits_its_texture_exactly() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let wide = Size {
+            width: DevicePixels(601),
+            height: DevicePixels(37),
+        };
+        let tall = Size {
+            width: DevicePixels(41),
+            height: DevicePixels(2049),
+        };
+        let wide_tile = insert_tile(&atlas, &make_image_key(1, 0), wide);
+        let tall_tile = insert_tile(&atlas, &make_image_key(2, 0), tall);
+
+        assert_eq!(texture_extent(&atlas, &wide_tile), (601, 37));
+        assert_eq!(texture_extent(&atlas, &tall_tile), (41, 2049));
+    }
+
+    #[test]
+    fn test_two_large_tiles_get_two_textures() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let first = insert_tile(&atlas, &make_image_key(1, 0), square(600));
+        let second = insert_tile(&atlas, &make_image_key(2, 0), square(600));
+
+        assert_ne!(first.texture_id, second.texture_id);
+        assert_eq!(texture_extent(&atlas, &second), (600, 600));
+        assert_eq!(live_polychrome_textures(&atlas), 2);
+    }
+
+    #[test]
+    fn test_small_tile_still_uses_the_default_texture() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let tile = insert_tile(&atlas, &make_image_key(1, 0), square(100));
+        let at_threshold = insert_tile(&atlas, &make_image_key(2, 0), square(512));
+
+        assert_eq!(texture_extent(&atlas, &tile), (1024, 1024));
+        assert_eq!(tile.texture_id, at_threshold.texture_id);
+    }
+
+    #[test]
+    fn test_large_tile_reuses_room_in_an_existing_texture() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let small = insert_tile(&atlas, &make_image_key(1, 0), square(100));
+        let large = insert_tile(&atlas, &make_image_key(2, 0), square(600));
+
+        assert_eq!(small.texture_id, large.texture_id);
+        assert_eq!(live_polychrome_textures(&atlas), 1);
+    }
+
+    #[test]
+    fn test_removing_a_large_tile_frees_its_texture() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let key = make_image_key(1, 0);
+        let tile = insert_tile(&atlas, &key, square(600));
+        assert_eq!(live_polychrome_textures(&atlas), 1);
+
+        atlas.remove(&key);
+
+        let state = atlas.state.lock();
+        assert_eq!(
+            state.polychrome_textures.free_list,
+            vec![tile.texture_id.index as usize]
+        );
+        assert!(state.polychrome_textures.textures[tile.texture_id.index as usize].is_none());
+        drop(state);
+        assert_eq!(live_polychrome_textures(&atlas), 0);
+    }
+
+    #[test]
+    fn test_freed_slot_is_reused_for_a_texture_of_the_next_size() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let key = make_image_key(1, 0);
+        let large = insert_tile(&atlas, &key, square(600));
+        atlas.remove(&key);
+
+        let small = insert_tile(&atlas, &make_image_key(2, 0), square(64));
+
+        assert_eq!(small.texture_id, large.texture_id);
+        assert_eq!(texture_extent(&atlas, &small), (1024, 1024));
     }
 
     #[test]
