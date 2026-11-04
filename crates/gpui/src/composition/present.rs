@@ -355,9 +355,9 @@ impl Window {
         self.platform_window.composition_frame()
     }
 
-    /// Every frame the window drew composed, oldest first.
-    pub fn composition_frames(&mut self) -> Vec<crate::CompositionFrame> {
-        self.platform_window.composition_frames()
+    /// How many frames the window drew composed.
+    pub fn composed_frame_count(&mut self) -> usize {
+        self.platform_window.composed_frame_count()
     }
 
     /// How many frames the window drew with the platform's plain `draw`.

@@ -77,9 +77,13 @@ pub(super) struct MacComposition {
     native_buttons: u64,
     gpui_buttons: u64,
     withheld_buttons: u64,
-    /// The frames drawn composed, for tests (`PlatformWindow::composition_frames`).
+    /// The last frame drawn composed and how many were, for tests (`PlatformWindow::composition_frame`,
+    /// `PlatformWindow::composed_frame_count`). Not a history: the published addon builds with
+    /// `test-support`, so every frame kept would be kept for the life of the window.
     #[cfg(any(test, feature = "test-support"))]
-    recorded: Vec<gpui::CompositionFrame>,
+    recorded: Option<gpui::CompositionFrame>,
+    #[cfg(any(test, feature = "test-support"))]
+    composed_frames: usize,
 }
 
 impl MacComposition {
@@ -95,7 +99,9 @@ impl MacComposition {
             gpui_buttons: 0,
             withheld_buttons: 0,
             #[cfg(any(test, feature = "test-support"))]
-            recorded: Vec::new(),
+            recorded: None,
+            #[cfg(any(test, feature = "test-support"))]
+            composed_frames: 0,
         }
     }
 
@@ -714,7 +720,10 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
     let window_height = f64::from(state.content_size().height.as_f32());
     let mut changed = false;
     #[cfg(any(test, feature = "test-support"))]
-    state.composition.recorded.push(gpui::CompositionFrame::record(scene));
+    {
+        state.composition.recorded = Some(gpui::CompositionFrame::record(scene));
+        state.composition.composed_frames += 1;
+    }
 
     let live: FxHashSet<CompositionSurfaceId> = scene
         .layers()
@@ -813,7 +822,7 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
     let previous = state.renderer.presents_with_transaction();
     #[cfg(any(test, feature = "test-support"))]
     {
-        let frame = state.composition.recorded.last_mut().expect("this frame was recorded above");
+        let frame = state.composition.recorded.as_mut().expect("this frame was recorded above");
         frame.presented_with_transaction = changed;
     }
     if changed {
@@ -842,16 +851,16 @@ fn draw_composed_locked(window_state: &Arc<Mutex<MacWindowState>>, scene: &Compo
     Ok(())
 }
 
-/// The frames `draw_composed` recorded, oldest first.
+/// How many frames `draw_composed` drew.
 #[cfg(any(test, feature = "test-support"))]
-pub(super) fn recorded_frames(window_state: &Arc<Mutex<MacWindowState>>) -> Vec<gpui::CompositionFrame> {
-    window_state.lock().composition.recorded.clone()
+pub(super) fn composed_frame_count(window_state: &Arc<Mutex<MacWindowState>>) -> usize {
+    window_state.lock().composition.composed_frames
 }
 
 /// The last frame `draw_composed` recorded.
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn recorded_frame(window_state: &Arc<Mutex<MacWindowState>>) -> Option<gpui::CompositionFrame> {
-    window_state.lock().composition.recorded.last().cloned()
+    window_state.lock().composition.recorded.clone()
 }
 
 /// Where in the window view (whose y goes up) the pointer is the native view's, for the cursor

@@ -102,8 +102,10 @@ fn frame(cx: &mut gpui::AsyncApp, window: gpui::WindowHandle<Demo>, change: impl
         cx.update_window(window.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
             window.present_cached_frame();
-            let frames = window.composition_frames();
-            (frames.len(), frames.last().is_some_and(|frame| frame.presented_with_transaction))
+            (
+                window.composed_frame_count(),
+                window.composition_frame().is_some_and(|frame| frame.presented_with_transaction),
+            )
         })
         .unwrap()
     })

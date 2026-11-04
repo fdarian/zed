@@ -52,7 +52,8 @@ pub(crate) struct TestWindowState {
     last_mouse_movement: Point<Pixels>,
     scale_factor: f32,
     plain_draws: usize,
-    composition_frames: Vec<CompositionFrame>,
+    last_composition_frame: Option<CompositionFrame>,
+    composed_frames: usize,
     native_surface_events: Rc<RefCell<Vec<NativeSurfaceEvent>>>,
     next_native_surface: usize,
 }
@@ -256,7 +257,8 @@ impl TestWindow {
             pointer_locked: false,
             last_mouse_movement: Point::default(),
             plain_draws: 0,
-            composition_frames: Vec::new(),
+            last_composition_frame: None,
+            composed_frames: 0,
             native_surface_events: Rc::new(RefCell::new(Vec::new())),
             next_native_surface: 0,
         })))
@@ -266,14 +268,14 @@ impl TestWindow {
         self.0.lock().plain_draws
     }
 
-    /// The frames drawn with `draw_composed`, oldest first.
-    pub fn composition_frames(&self) -> Vec<CompositionFrame> {
-        self.0.lock().composition_frames.clone()
+    /// How many frames were drawn with `draw_composed`.
+    pub fn composed_frame_count(&self) -> usize {
+        self.0.lock().composed_frames
     }
 
     /// The last frame drawn with `draw_composed`.
     pub fn composition_frame(&self) -> Option<CompositionFrame> {
-        self.0.lock().composition_frames.last().cloned()
+        self.0.lock().last_composition_frame.clone()
     }
 
     /// The native surfaces made and removed, in order.
@@ -620,7 +622,10 @@ impl PlatformWindow for TestWindow {
     }
 
     fn draw_composed(&self, composed: ComposedScene<'_>) {
-        self.0.lock().composition_frames.push(CompositionFrame::record(&composed));
+        let mut state = self.0.lock();
+        state.last_composition_frame = Some(CompositionFrame::record(&composed));
+        state.composed_frames += 1;
+        drop(state);
         self.draw_scene(composed.scene());
     }
 
@@ -661,8 +666,8 @@ impl PlatformWindow for TestWindow {
         TestWindow::composition_frame(self)
     }
 
-    fn composition_frames(&self) -> Vec<CompositionFrame> {
-        TestWindow::composition_frames(self)
+    fn composed_frame_count(&self) -> usize {
+        TestWindow::composed_frame_count(self)
     }
 
     #[cfg(target_os = "windows")]

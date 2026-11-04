@@ -2142,8 +2142,8 @@ impl PlatformWindow for MacWindow {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn composition_frames(&self) -> Vec<gpui::CompositionFrame> {
-        composition::recorded_frames(&self.0)
+    fn composed_frame_count(&self) -> usize {
+        composition::composed_frame_count(&self.0)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

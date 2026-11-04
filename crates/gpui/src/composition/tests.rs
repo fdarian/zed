@@ -1323,6 +1323,23 @@ mod window {
         window.update(|_, window, _| window.present_cached_frame());
         let again = window.update(|_, window, _| window.composition_frame().unwrap());
         assert_eq!(first, again);
-        assert_eq!(window.update(|_, window, _| window.composition_frames().len()), 2);
+        assert_eq!(window.update(|_, window, _| window.composed_frame_count()), 2);
+    }
+
+    #[test]
+    fn the_window_counts_composed_frames_and_holds_only_the_last() {
+        let (_app, mut window) = open(|_| root().into_any_element());
+        let surface = make_surface(&mut window);
+        let mut frames = Vec::new();
+        for step in 0..5 {
+            let page_surface = surface.clone();
+            set_page(&mut window, move |_| {
+                root().child(native(&page_surface, 10. * step as f32, 20., 50., 50.)).into_any_element()
+            });
+            frames.push(frame(&mut window));
+        }
+        assert_eq!(window.update(|_, window, _| window.composed_frame_count()), 5);
+        assert_ne!(frames[0], frames[4], "the frames differ, so the last one tells which is held");
+        assert_eq!(window.update(|_, window, _| window.composition_frame().unwrap()), frames[4]);
     }
 }

@@ -1058,10 +1058,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
-    /// Every frame the window drew composed, oldest first, for tests.
+    /// How many frames the window drew composed, for tests.
     #[cfg(any(test, feature = "test-support"))]
-    fn composition_frames(&self) -> Vec<CompositionFrame> {
-        Vec::new()
+    fn composed_frame_count(&self) -> usize {
+        0
     }
 
     /// Makes the window report `scale_factor` from now on, whatever display it is on or
