@@ -5,13 +5,13 @@
 //! renderer (see `DeviceState`): its pipelines, command queue and sprite atlas, so the tiles a scene
 //! refers to are valid whichever layer draws them.
 
-use crate::metal_renderer::{Context, MetalRenderer, Renderer};
+use crate::metal_renderer::{Context, MetalRenderer, OVERLAY_DRAWABLE_COUNT, Renderer};
 use objc::{msg_send, sel, sel_impl};
 use std::ffi::c_void;
 
 /// A renderer for a layer above `base`: transparent, on its own `CAMetalLayer`.
 pub fn new_overlay_renderer(context: Context, base: &Renderer) -> Renderer {
-    let layer = MetalRenderer::new_layer(&base.device, true);
+    let layer = MetalRenderer::new_layer(&base.device, true, OVERLAY_DRAWABLE_COUNT);
     copy_colorspace(base, &layer);
     MetalRenderer::new_sharing(base.shared.clone(), Some(layer), false, context)
 }
@@ -60,6 +60,22 @@ mod tests {
             overlay.shared.paths_rasterization_pipeline_state.as_ptr()
         );
         assert_ne!(base.layer_ptr(), overlay.layer_ptr());
+    }
+
+    #[test]
+    fn an_overlay_layer_keeps_two_drawables_and_the_window_layer_three() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let base = MetalRenderer::new(pool.clone(), true);
+        let overlay = new_overlay_renderer(pool, &base);
+
+        assert_eq!(maximum_drawable_count(&base), 3);
+        assert_eq!(maximum_drawable_count(&overlay), 2);
+    }
+
+    fn maximum_drawable_count(renderer: &MetalRenderer) -> u64 {
+        let layer = renderer.layer_ptr();
+        // SAFETY: `layer_ptr` is the renderer's own live `CAMetalLayer`.
+        unsafe { msg_send![layer, maximumDrawableCount] }
     }
 
     #[test]

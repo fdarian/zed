@@ -39,6 +39,11 @@ use device_state::DeviceState;
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+/// How many drawables the window's layer cycles through.
+pub(crate) const WINDOW_DRAWABLE_COUNT: u64 = 3;
+/// An overlay layer is window-sized too, so each drawable it holds costs a window of memory; two is
+/// the least that lets it draw while the other is on screen.
+pub(crate) const OVERLAY_DRAWABLE_COUNT: u64 = 2;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -158,19 +163,23 @@ impl MetalRenderer {
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
         let device = Self::create_device();
 
-        let layer = Self::new_layer(&device, transparent);
+        let layer = Self::new_layer(&device, transparent, WINDOW_DRAWABLE_COUNT);
 
         Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
     }
 
-    pub(crate) fn new_layer(device: &metal::Device, transparent: bool) -> metal::MetalLayer {
+    pub(crate) fn new_layer(
+        device: &metal::Device,
+        transparent: bool,
+        maximum_drawable_count: u64,
+    ) -> metal::MetalLayer {
         let layer = metal::MetalLayer::new();
         layer.set_device(device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        layer.set_maximum_drawable_count(maximum_drawable_count);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
