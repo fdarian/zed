@@ -17,28 +17,25 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+    metal_texture::CVMetalTextureGetTexture,
     pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
-use metal::{
-    CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
-};
+use metal::{CAMetalLayer, MTLPixelFormat, MTLResourceOptions, NSRange};
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
 use std::{
-    cell::Cell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice,
-    sync::Arc,
+    cell::Cell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr,
+    rc::Rc, slice, sync::Arc,
 };
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
 
-#[cfg(not(feature = "runtime_shaders"))]
-const SHADERS_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
-#[cfg(feature = "runtime_shaders")]
-const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitched_shaders.metal"));
+mod device_state;
+use device_state::DeviceState;
+
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
@@ -125,19 +122,11 @@ impl InstanceBufferPool {
 pub struct MetalRenderer {
     pub(crate) device: metal::Device,
     pub(crate) layer: Option<metal::MetalLayer>,
-    is_apple_gpu: bool,
-    is_unified_memory: bool,
+    /// What this renderer shares with the others of its window.
+    pub(crate) shared: Rc<DeviceState>,
     presents_with_transaction: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
-    command_queue: CommandQueue,
-    paths_rasterization_pipeline_state: metal::RenderPipelineState,
-    /// Pipelines for drawing into the window.
-    root_pipelines: Pipelines,
-    /// Pipelines for drawing into an effect group's texture, which blend alpha as "over" so the
-    /// texture stays correctly premultiplied.
-    group_pipelines: Pipelines,
-    effect_pipelines: EffectPipelines,
     /// How many effect groups deep the scene being encoded is; the group pipelines draw when it is
     /// not zero.
     group_depth: Cell<usize>,
@@ -147,14 +136,8 @@ pub struct MetalRenderer {
     group_texture_budget: u64,
     /// Path rasterization targets for groups, by texture size.
     group_path_intermediates: HashMap<(u32, u32), PathIntermediate>,
-    unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
-    pub(crate) sprite_atlas: Arc<MetalAtlas>,
-    core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
-    path_intermediate_texture: Option<metal::Texture>,
-    path_intermediate_msaa_texture: Option<metal::Texture>,
-    path_sample_count: u32,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
@@ -241,95 +224,33 @@ impl MetalRenderer {
         opaque: bool,
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     ) -> Self {
-        #[cfg(feature = "runtime_shaders")]
-        let library = device
-            .new_library_with_source(&SHADERS_SOURCE_FILE, &metal::CompileOptions::new())
-            .expect("error building metal library");
-        #[cfg(not(feature = "runtime_shaders"))]
-        let library = device
-            .new_library_with_data(SHADERS_METALLIB)
-            .expect("error building metal library");
-
-        fn to_float2_bits(point: PointF) -> u64 {
-            let mut output = point.y.to_bits() as u64;
-            output <<= 32;
-            output |= point.x.to_bits() as u64;
-            output
-        }
-
-        // Shared memory can be used only if CPU and GPU share the same memory space.
-        // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
-        let is_unified_memory = device.has_unified_memory();
-        // Apple GPU families support memoryless textures, which can significantly reduce
-        // memory usage by keeping render targets in on-chip tile memory instead of
-        // allocating backing store in system memory.
-        // https://developer.apple.com/documentation/metal/mtlgpufamily
-        let is_apple_gpu = device.supports_family(MTLGPUFamily::Apple1);
-
-        let unit_vertices = [
-            to_float2_bits(point(0., 0.)),
-            to_float2_bits(point(1., 0.)),
-            to_float2_bits(point(0., 1.)),
-            to_float2_bits(point(0., 1.)),
-            to_float2_bits(point(1., 0.)),
-            to_float2_bits(point(1., 1.)),
-        ];
-        let unit_vertices = device.new_buffer_with_data(
-            unit_vertices.as_ptr() as *const c_void,
-            mem::size_of_val(&unit_vertices) as u64,
-            if is_unified_memory {
-                MTLResourceOptions::StorageModeShared
-                    | MTLResourceOptions::CPUCacheModeWriteCombined
-            } else {
-                MTLResourceOptions::StorageModeManaged
-            },
-        );
-
-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
-            &device,
-            &library,
-            "paths_rasterization",
-            "path_rasterization_vertex",
-            "path_rasterization_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-            PATH_SAMPLE_COUNT,
-        );
-        let root_pipelines = Pipelines::new(&device, &library, metal::MTLBlendFactor::One);
-        let group_pipelines = Pipelines::new(
-            &device,
-            &library,
-            metal::MTLBlendFactor::OneMinusSourceAlpha,
-        );
-        let effect_pipelines = EffectPipelines::new(&device, &library);
-
-        let command_queue = device.new_command_queue();
-        let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
-        let core_video_texture_cache =
-            CVMetalTextureCache::new(None, device.clone(), None).unwrap();
-
-        Self {
-            device,
+        Self::new_sharing(
+            Rc::new(DeviceState::new(device)),
             layer,
-            presents_with_transaction: false,
-            is_apple_gpu,
-            is_unified_memory,
             opaque,
-            command_queue,
-            paths_rasterization_pipeline_state,
-            root_pipelines,
-            group_pipelines,
-            effect_pipelines,
+            instance_buffer_pool,
+        )
+    }
+
+    /// A renderer on the device, pipelines, command queue and atlas of `shared`, which the
+    /// renderers of one window have in common.
+    pub(crate) fn new_sharing(
+        shared: Rc<DeviceState>,
+        layer: Option<metal::MetalLayer>,
+        opaque: bool,
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+    ) -> Self {
+        Self {
+            device: shared.device.clone(),
+            layer,
+            shared,
+            presents_with_transaction: false,
+            opaque,
             group_depth: Cell::new(0),
             group_texture_budget: GROUP_TEXTURE_BUDGET,
             texture_pool: TexturePool::default(),
             group_path_intermediates: HashMap::new(),
-            unit_vertices,
             instance_buffer_pool,
-            sprite_atlas,
-            core_video_texture_cache,
-            path_intermediate_texture: None,
-            path_intermediate_msaa_texture: None,
-            path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
         }
@@ -347,7 +268,7 @@ impl MetalRenderer {
     }
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
-        &self.sprite_atlas
+        &self.shared.sprite_atlas
     }
 
     pub fn presents_with_transaction(&self) -> bool {
@@ -378,31 +299,7 @@ impl MetalRenderer {
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
-        // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
-        // https://github.com/zed-industries/zed/issues/36229
-        if size.width.0 <= 0 || size.height.0 <= 0 {
-            self.path_intermediate_texture = None;
-            self.path_intermediate_msaa_texture = None;
-            return;
-        }
-
-        let intermediate = make_path_intermediate(
-            &self.device,
-            size.width.0 as u32,
-            size.height.0 as u32,
-            self.path_sample_count,
-            self.is_apple_gpu,
-        );
-        self.path_intermediate_texture = Some(intermediate.texture);
-        self.path_intermediate_msaa_texture = intermediate.msaa;
-    }
-
-    fn path_intermediate(&self) -> Option<PathIntermediate> {
-        Some(PathIntermediate {
-            texture: self.path_intermediate_texture.clone()?,
-            msaa: self.path_intermediate_msaa_texture.clone(),
-        })
+        self.shared.resize_path_intermediate(size);
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -512,7 +409,7 @@ impl MetalRenderer {
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
-            self.is_unified_memory,
+            self.shared.is_unified_memory,
         );
         let command_buffer =
             self.draw_primitives_to_texture(scene, orders, &mut writer, texture, viewport_size);
@@ -606,7 +503,7 @@ impl MetalRenderer {
         // On discrete GPUs (non-unified memory), Managed textures require an
         // explicit blit synchronize before the CPU can read back the rendered
         // data. Without this, get_bytes returns stale zeros.
-        if !self.is_unified_memory {
+        if !self.shared.is_unified_memory {
             let blit = command_buffer.new_blit_command_encoder();
             blit.synchronize_resource(&target_texture);
             blit.end_encoding();
@@ -669,11 +566,12 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
-        let command_queue = self.command_queue.clone();
+        let command_queue = self.shared.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
         let clear_color = metal::MTLClearColor::new(0., 0., 0., alpha);
-        let path_intermediate = self.path_intermediate();
+        self.update_path_intermediate_textures(viewport_size);
+        let path_intermediate = self.shared.path_intermediate();
 
         // A backdrop filter reads what is already drawn, which a drawable that is only a render
         // target can't be asked for. Draw into a texture first, then copy it over.
@@ -713,7 +611,7 @@ impl MetalRenderer {
 
         // Dynamic atlas updates use CPU replacement, so retain the newest
         // submission as a fence until the GPU has finished sampling it.
-        self.sprite_atlas.track_submission(command_buffer);
+        self.shared.sprite_atlas.track_submission(command_buffer);
         Ok(command_buffer.to_owned())
     }
 
@@ -958,7 +856,7 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
-        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        command_encoder.set_render_pipeline_state(&self.shared.paths_rasterization_pipeline_state);
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
             Some(&vertex_instance_bindings.buffer),
@@ -998,7 +896,7 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.pipelines().shadows);
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
+            Some(&self.shared.unit_vertices),
             0,
         );
         command_encoder.set_vertex_buffer(
@@ -1055,7 +953,7 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.pipelines().quads);
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
+            Some(&self.shared.unit_vertices),
             0,
         );
         command_encoder.set_vertex_buffer(
@@ -1099,7 +997,7 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.pipelines().path_sprites);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
+            Some(&self.shared.unit_vertices),
             0,
         );
         command_encoder.set_vertex_bytes(
@@ -1166,7 +1064,7 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.pipelines().underlines);
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
+            Some(&self.shared.unit_vertices),
             0,
         );
         command_encoder.set_vertex_buffer(
@@ -1206,7 +1104,7 @@ impl MetalRenderer {
             return;
         }
 
-        let texture = self.sprite_atlas.metal_texture(texture_id);
+        let texture = self.shared.sprite_atlas.metal_texture(texture_id);
         let texture_size = size(
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
@@ -1214,7 +1112,7 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.pipelines().monochrome_sprites);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
+            Some(&self.shared.unit_vertices),
             0,
         );
         command_encoder.set_vertex_buffer(
@@ -1277,7 +1175,7 @@ impl MetalRenderer {
             return;
         }
 
-        let texture = self.sprite_atlas.metal_texture(texture_id);
+        let texture = self.shared.sprite_atlas.metal_texture(texture_id);
         let texture_size = size(
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
@@ -1285,7 +1183,7 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.pipelines().polychrome_sprites);
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
+            Some(&self.shared.unit_vertices),
             0,
         );
         command_encoder.set_vertex_buffer(
@@ -1334,7 +1232,7 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.pipelines().surfaces);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
+            Some(&self.shared.unit_vertices),
             0,
         );
         command_encoder.set_vertex_buffer(
@@ -1365,6 +1263,7 @@ impl MetalRenderer {
             );
 
             let y_texture = self
+                .shared
                 .core_video_texture_cache
                 .create_texture_from_image(
                     surface.image_buffer.as_concrete_TypeRef(),
@@ -1376,6 +1275,7 @@ impl MetalRenderer {
                 )
                 .unwrap();
             let cb_cr_texture = self
+                .shared
                 .core_video_texture_cache
                 .create_texture_from_image(
                     surface.image_buffer.as_concrete_TypeRef(),
@@ -1418,9 +1318,9 @@ impl MetalRenderer {
 impl MetalRenderer {
     fn pipelines(&self) -> &Pipelines {
         if self.group_depth.get() > 0 {
-            &self.group_pipelines
+            &self.shared.group_pipelines
         } else {
-            &self.root_pipelines
+            &self.shared.root_pipelines
         }
     }
 
@@ -1455,8 +1355,8 @@ impl MetalRenderer {
             &self.device,
             width,
             height,
-            self.path_sample_count,
-            self.is_apple_gpu,
+            PATH_SAMPLE_COUNT,
+            self.shared.is_apple_gpu,
         );
         self.group_path_intermediates
             .insert((width, height), intermediate.clone());
@@ -1482,7 +1382,7 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
         );
         encoder.set_render_pipeline_state(pipeline);
-        encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+        encoder.set_vertex_buffer(0, Some(&self.shared.unit_vertices), 0);
         bind(encoder);
         encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
         encoder.end_encoding();
@@ -1499,7 +1399,7 @@ impl MetalRenderer {
         self.run_pass(
             command_buffer,
             target,
-            &self.effect_pipelines.resample,
+            &self.shared.effect_pipelines.resample,
             |encoder| {
                 encoder.set_fragment_bytes(
                     0,
@@ -1543,7 +1443,7 @@ impl MetalRenderer {
         self.run_pass(
             command_buffer,
             &output,
-            &self.effect_pipelines.filter_color,
+            &self.shared.effect_pipelines.filter_color,
             |encoder| {
                 encoder.set_fragment_bytes(
                     0,
@@ -1587,7 +1487,7 @@ impl MetalRenderer {
         self.run_pass(
             command_buffer,
             target,
-            &self.effect_pipelines.blur,
+            &self.shared.effect_pipelines.blur,
             |encoder| {
                 encoder.set_fragment_bytes(
                     0,
@@ -1729,7 +1629,7 @@ impl MetalRenderer {
                     self.run_pass(
                         command_buffer,
                         &output,
-                        &self.effect_pipelines.drop_shadow,
+                        &self.shared.effect_pipelines.drop_shadow,
                         |encoder| {
                             encoder.set_fragment_bytes(
                                 0,
@@ -1854,7 +1754,7 @@ impl MetalRenderer {
         self.run_pass(
             command_buffer,
             &output,
-            &self.effect_pipelines.mask_combine,
+            &self.shared.effect_pipelines.mask_combine,
             |encoder| {
                 encoder.set_fragment_bytes(
                     0,
@@ -2011,7 +1911,7 @@ impl MetalRenderer {
         mask_b: Option<&metal::TextureRef>,
     ) {
         encoder.set_render_pipeline_state(pipeline);
-        encoder.set_vertex_buffer(0, Some(&self.unit_vertices), 0);
+        encoder.set_vertex_buffer(0, Some(&self.shared.unit_vertices), 0);
         let params_size = mem::size_of::<CompositeParams>() as u64;
         let params_pointer = params as *const CompositeParams as *const _;
         encoder.set_vertex_bytes(1, params_size, params_pointer);
@@ -2025,7 +1925,7 @@ impl MetalRenderer {
             Some(binding) => {
                 encoder.set_fragment_buffer(3, Some(&binding.buffer), binding.offset as u64)
             }
-            None => encoder.set_fragment_buffer(3, Some(&self.unit_vertices), 0),
+            None => encoder.set_fragment_buffer(3, Some(&self.shared.unit_vertices), 0),
         }
         encoder.set_fragment_texture(0, Some(source));
         encoder.set_fragment_texture(1, Some(mask_a.unwrap_or(source)));
@@ -2048,7 +1948,7 @@ impl MetalRenderer {
     ) {
         let encoder = new_command_encoder_for_texture(command_buffer, target, viewport_size, None);
         self.encode_composite(
-            &self.effect_pipelines.composite_backdrop,
+            &self.shared.effect_pipelines.composite_backdrop,
             encoder,
             viewport_size,
             params,
@@ -2184,7 +2084,7 @@ impl MetalRenderer {
             _ => None,
         };
         self.encode_composite(
-            &self.effect_pipelines.composite,
+            &self.shared.effect_pipelines.composite,
             encoder,
             viewport_size,
             &params,
@@ -2474,8 +2374,8 @@ fn group_indices(scene: &Scene, orders: OrderRange) -> Range<usize> {
 
 /// Where paths are rasterized before being copied into a target of the same size.
 #[derive(Clone)]
-struct PathIntermediate {
-    texture: metal::Texture,
+pub(crate) struct PathIntermediate {
+    pub(crate) texture: metal::Texture,
     msaa: Option<metal::Texture>,
 }
 
@@ -2515,10 +2415,10 @@ fn make_path_intermediate(
 
 /// The pipelines for the primitive kinds, which differ between drawing into the window and into
 /// an effect group's texture only in how they blend alpha.
-struct Pipelines {
+pub(crate) struct Pipelines {
     path_sprites: metal::RenderPipelineState,
     shadows: metal::RenderPipelineState,
-    quads: metal::RenderPipelineState,
+    pub(crate) quads: metal::RenderPipelineState,
     underlines: metal::RenderPipelineState,
     monochrome_sprites: metal::RenderPipelineState,
     polychrome_sprites: metal::RenderPipelineState,
@@ -2572,7 +2472,7 @@ impl Pipelines {
 }
 
 /// The passes that put effect groups together.
-struct EffectPipelines {
+pub(crate) struct EffectPipelines {
     composite: metal::RenderPipelineState,
     composite_backdrop: metal::RenderPipelineState,
     filter_color: metal::RenderPipelineState,

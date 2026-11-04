@@ -47,9 +47,12 @@ impl MetalAtlas {
     }
 
     fn wait_for_pending_submissions(&self) {
-        // All frames use one ordered Metal command queue. Waiting for the most
-        // recent submission also completes every older frame that could sample
-        // an atlas tile before replace_region mutates it in place.
+        // All frames of every layer use one Metal command queue (the overlay renderers share the
+        // window renderer's), and Metal runs the command buffers of a queue in the order they were
+        // committed. Waiting for the most recent submission also completes every older frame, of
+        // any layer, that could sample an atlas tile before replace_region mutates it in place.
+        // A second queue would break that: the newest buffer could finish before an older one on
+        // the other queue.
         if let Some(command_buffer) = self.last_submission.lock().take() {
             command_buffer.wait_until_completed();
         }
