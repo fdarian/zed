@@ -1,9 +1,4 @@
-use crate::{
-    DevicePixels, Pixels, Result, SharedString, Size,
-    image_pixels::{FrameInfo, ImageBytes, PixelState},
-    size,
-};
-use parking_lot::Mutex;
+use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
 use smallvec::SmallVec;
 
 use image::{Delay, Frame};
@@ -11,10 +6,7 @@ use std::{
     borrow::Cow,
     fmt,
     hash::Hash,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering::SeqCst},
-    },
+    sync::atomic::{AtomicUsize, Ordering::SeqCst},
 };
 
 /// A source of assets for this app to use.
@@ -53,8 +45,7 @@ pub struct RenderImage {
     pub id: ImageId,
     /// The scale factor of this image on render.
     pub(crate) scale_factor: f32,
-    pub(crate) frames: SmallVec<[FrameInfo; 1]>,
-    pub(crate) pixels: Mutex<PixelState>,
+    data: SmallVec<[Frame; 1]>,
 }
 
 impl PartialEq for RenderImage {
@@ -70,12 +61,10 @@ impl RenderImage {
     pub fn new(data: impl Into<SmallVec<[Frame; 1]>>) -> Self {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-        let data = data.into();
         Self {
             id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
             scale_factor: 1.0,
-            frames: data.iter().map(FrameInfo::of).collect(),
-            pixels: Mutex::new(PixelState::Cpu(Arc::new(data))),
+            data: data.into(),
         }
     }
 
@@ -85,20 +74,21 @@ impl RenderImage {
         Some(Self::new(SmallVec::from_elem(Frame::new(buffer), 1)))
     }
 
-    /// The pixels of a frame, `None` past the last frame.
-    ///
-    /// A single-frame image that has been uploaded to a window's atlas keeps its pixels only
-    /// there, so this reads them back from the atlas (a copy) and panics if that fails.
-    pub fn as_bytes(&self, frame_index: usize) -> Option<ImageBytes> {
-        self.read_pixels(frame_index)
-            .expect("the atlas holding an image's pixels failed to read them back")
+    /// Convert this image into a byte slice.
+    pub fn as_bytes(&self, frame_index: usize) -> Option<&[u8]> {
+        self.data
+            .get(frame_index)
+            .map(|frame| frame.buffer().as_raw().as_slice())
     }
 
     /// Get the size of this image, in pixels.
     pub fn size(&self, frame_index: usize) -> Size<DevicePixels> {
-        self.frames
+        self.data
             .get(frame_index)
-            .map(|frame| size(frame.width.into(), frame.height.into()))
+            .map(|frame| {
+                let (width, height) = frame.buffer().dimensions();
+                size(width.into(), height.into())
+            })
             .unwrap_or_default()
     }
 
@@ -112,15 +102,15 @@ impl RenderImage {
 
     /// Get the delay of this frame from the previous
     pub fn delay(&self, frame_index: usize) -> Delay {
-        self.frames
+        self.data
             .get(frame_index)
-            .map(|frame| frame.delay)
+            .map(|frame| frame.delay())
             .unwrap_or(Delay::from_numer_denom_ms(100, 1))
     }
 
     /// Get the number of frames for this image.
     pub fn frame_count(&self) -> usize {
-        self.frames.len()
+        self.data.len()
     }
 }
 
@@ -128,7 +118,7 @@ impl fmt::Debug for RenderImage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ImageData")
             .field("id", &self.id)
-            .field("size", &self.frames.first().map(|f| (f.width, f.height)))
+            .field("size", &self.data.first().map(|f| f.buffer().dimensions()))
             .finish()
     }
 }
@@ -143,7 +133,7 @@ mod tests {
         let image = RenderImage::new(SmallVec::new());
         assert_eq!(image.frame_count(), 0);
         assert_eq!(image.size(0), Size::default());
-        assert!(image.as_bytes(0).is_none());
+        assert_eq!(image.as_bytes(0), None);
         assert_eq!(image.render_size(0), Size::default());
         assert_eq!(image.delay(0), Delay::from_numer_denom_ms(100, 1));
         let _ = format!("{image:?}");
@@ -154,7 +144,7 @@ mod tests {
         let bytes = vec![0x10, 0x20, 0x30, 0xff, 0xaa, 0xbb, 0xcc, 0xff];
         let image = RenderImage::from_bgra(2, 1, bytes.clone()).expect("valid BGRA image");
         assert_eq!(image.size(0), size(DevicePixels(2), DevicePixels(1)));
-        assert_eq!(image.as_bytes(0).as_deref(), Some(bytes.as_slice()));
+        assert_eq!(image.as_bytes(0), Some(bytes.as_slice()));
         assert!(RenderImage::from_bgra(2, 1, vec![0; 4]).is_none());
     }
 }

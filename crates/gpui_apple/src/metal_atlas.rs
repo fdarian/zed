@@ -4,11 +4,11 @@ use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    PlatformAtlas, Point, Size, TileReader,
+    PlatformAtlas, Point, Size,
 };
 use metal::Device;
 use parking_lot::Mutex;
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
 
 const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
     width: DevicePixels(1024),
@@ -143,40 +143,6 @@ impl PlatformAtlas for MetalAtlas {
                 *texture_slot = Some(texture);
             }
         }
-    }
-
-    // Only a Shared texture can be read by the CPU; a Managed one would need a blit to sync first.
-    fn tile_reader(self: Arc<Self>) -> Option<Arc<dyn TileReader>> {
-        if self.state.lock().is_apple_gpu {
-            Some(self)
-        } else {
-            None
-        }
-    }
-}
-
-impl TileReader for MetalAtlas {
-    fn read_tile(&self, key: &AtlasKey) -> Result<Vec<u8>> {
-        let lock = self.state.lock();
-        let tile = lock
-            .tiles_by_key
-            .get(key)
-            .context("the atlas has no tile for the key")?;
-        let texture = lock.texture(tile.texture_id);
-        let bytes_per_row = tile.bounds.size.width.to_bytes(texture.bytes_per_pixel()) as usize;
-        let mut bytes = vec![0u8; bytes_per_row * tile.bounds.size.height.0 as usize];
-        texture.metal_texture.get_bytes(
-            bytes.as_mut_ptr() as *mut _,
-            bytes_per_row as u64,
-            metal::MTLRegion::new_2d(
-                tile.bounds.origin.x.into(),
-                tile.bounds.origin.y.into(),
-                tile.bounds.size.width.into(),
-                tile.bounds.size.height.into(),
-            ),
-            0,
-        );
-        Ok(bytes)
     }
 }
 
@@ -612,48 +578,6 @@ mod tests {
 
         assert_eq!(small.texture_id, large.texture_id);
         assert_eq!(texture_extent(&atlas, &small), (1024, 1024));
-    }
-
-    fn patterned_bytes(size: Size<DevicePixels>, seed: usize) -> Vec<u8> {
-        (0..(size.width.0 * size.height.0 * 4) as usize)
-            .map(|byte| (byte * 7 + seed) as u8)
-            .collect()
-    }
-
-    fn insert_bytes(atlas: &MetalAtlas, key: &AtlasKey, size: Size<DevicePixels>, bytes: &[u8]) {
-        atlas
-            .get_or_insert_with(key, &mut || Ok(Some((size, Cow::Owned(bytes.to_vec())))))
-            .expect("allocation should succeed")
-            .expect("callback returns Some");
-    }
-
-    #[test]
-    fn test_read_tile_returns_the_uploaded_bytes_of_small_and_large_tiles() {
-        let Some(atlas) = create_atlas() else {
-            return;
-        };
-        let atlas = Arc::new(atlas);
-        let reader = atlas.clone().tile_reader().expect("an Apple GPU atlas reads tiles back");
-        let tiles = [
-            (make_image_key(1, 0), Size { width: DevicePixels(3), height: DevicePixels(2) }),
-            (make_image_key(2, 0), Size { width: DevicePixels(17), height: DevicePixels(5) }),
-            (make_image_key(3, 0), Size { width: DevicePixels(700), height: DevicePixels(300) }),
-        ];
-        for (seed, (key, size)) in tiles.iter().enumerate() {
-            insert_bytes(&atlas, key, *size, &patterned_bytes(*size, seed));
-        }
-        for (seed, (key, size)) in tiles.iter().enumerate() {
-            assert_eq!(reader.read_tile(key).unwrap(), patterned_bytes(*size, seed));
-        }
-        assert!(reader.read_tile(&make_image_key(4, 0)).is_err());
-    }
-
-    #[test]
-    fn test_an_atlas_off_an_apple_gpu_has_no_tile_reader() {
-        let Some(device) = metal::Device::system_default() else {
-            return;
-        };
-        assert!(Arc::new(MetalAtlas::new(device, false)).tile_reader().is_none());
     }
 
     #[test]

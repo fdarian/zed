@@ -5,7 +5,6 @@ use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::element::Culled;
-use crate::image_pixels::AtlasImages;
 use crate::shrink::clear_shrinking;
 use crate::{
     Action, Anchor, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
@@ -1960,7 +1959,6 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
-    atlas_images: Option<AtlasImages>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2776,7 +2774,6 @@ impl Window {
             display_id,
             is_resizable,
             is_minimizable,
-            atlas_images: AtlasImages::new(&sprite_atlas),
             sprite_atlas,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
@@ -8588,25 +8585,18 @@ impl Window {
             frame_index,
         };
 
-        let pixels = OnceCell::new();
         let tile = self
             .sprite_atlas
             .get_or_insert_with(&params.into(), &mut || {
-                if pixels.get().is_none() {
-                    let read = data
-                        .read_pixels(frame_index)?
-                        .expect("It's the caller's job to pass a valid frame index");
-                    let _ = pixels.set(read);
-                }
-                let bytes = pixels.get().expect("set above");
-                Ok(Some((data.size(frame_index), Cow::Borrowed(&**bytes))))
+                Ok(Some((
+                    data.size(frame_index),
+                    Cow::Borrowed(
+                        data.as_bytes(frame_index)
+                            .expect("It's the caller's job to pass a valid frame index"),
+                    ),
+                )))
             })?
             .expect("Callback above only returns Some");
-        if pixels.get().is_some()
-            && let Some(atlas_images) = &self.atlas_images
-        {
-            atlas_images.adopt(&data);
-        }
 
         let placement = self.placement();
         let visible_bounds_snapped = placement.shift(self.snap_bounds(visible_bounds));
@@ -8773,11 +8763,11 @@ impl Window {
                 .sprite_atlas
                 .get_or_insert_with(&key, &mut || Ok(None))?;
             let bytes = data
-                .read_pixels(frame_index)?
+                .as_bytes(frame_index)
                 .ok_or_else(|| anyhow!("missing image frame {frame_index}"))?;
             let updated_tile = self
                 .sprite_atlas
-                .update(&key, data.size(frame_index), &bytes)?;
+                .update(&key, data.size(frame_index), bytes)?;
             retained_all_tiles &= previous_tile.is_some() && previous_tile == updated_tile;
         }
         Ok(retained_all_tiles)
@@ -8785,9 +8775,6 @@ impl Window {
 
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
-        if let Some(atlas_images) = &self.atlas_images {
-            atlas_images.release(&data)?;
-        }
         for frame_index in 0..data.frame_count() {
             let params = RenderImageParams {
                 image_id: data.id,

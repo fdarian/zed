@@ -217,11 +217,7 @@ impl TestWindow {
     ) -> Self {
         let sprite_atlas: Arc<dyn PlatformAtlas> = match &renderer {
             Some(r) => r.sprite_atlas(),
-            None => Arc::new(TestAtlas::new(
-                platform
-                    .upgrade()
-                    .is_some_and(|platform| platform.atlas_read_back.get()),
-            )),
+            None => Arc::new(TestAtlas::new()),
         };
         let scale_factor = platform
             .upgrade()
@@ -705,31 +701,16 @@ impl PlatformWindow for TestWindow {
 pub(crate) struct TestAtlasState {
     next_id: u32,
     tiles: HashMap<AtlasKey, AtlasTile>,
-    /// The bytes of each tile, kept only by an atlas that can read tiles back.
-    bytes: Option<HashMap<AtlasKey, Vec<u8>>>,
 }
 
 pub(crate) struct TestAtlas(Mutex<TestAtlasState>);
 
 impl TestAtlas {
-    pub fn new(read_back: bool) -> Self {
+    pub fn new() -> Self {
         TestAtlas(Mutex::new(TestAtlasState {
             next_id: 0,
             tiles: HashMap::default(),
-            bytes: read_back.then(HashMap::default),
         }))
-    }
-}
-
-impl crate::TileReader for TestAtlas {
-    fn read_tile(&self, key: &AtlasKey) -> anyhow::Result<Vec<u8>> {
-        self.0
-            .lock()
-            .bytes
-            .as_ref()
-            .and_then(|bytes| bytes.get(key))
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no tile for the key"))
     }
 }
 
@@ -747,14 +728,11 @@ impl PlatformAtlas for TestAtlas {
         }
         drop(state);
 
-        let Some((size, bytes)) = build()? else {
+        let Some((size, _)) = build()? else {
             return Ok(None);
         };
 
         let mut state = self.0.lock();
-        if let Some(stored) = &mut state.bytes {
-            stored.insert(key.clone(), bytes.into_owned());
-        }
         state.next_id += 1;
         let texture_id = state.next_id;
         state.next_id += 1;
@@ -782,17 +760,6 @@ impl PlatformAtlas for TestAtlas {
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
         state.tiles.remove(key);
-        if let Some(bytes) = &mut state.bytes {
-            bytes.remove(key);
-        }
-    }
-
-    fn tile_reader(self: Arc<Self>) -> Option<Arc<dyn crate::TileReader>> {
-        if self.0.lock().bytes.is_some() {
-            Some(self)
-        } else {
-            None
-        }
     }
 
     fn contains(&self, key: &AtlasKey) -> bool {
