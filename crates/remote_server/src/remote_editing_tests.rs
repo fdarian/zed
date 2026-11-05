@@ -398,7 +398,7 @@ async fn test_remote_project_image_source(cx: &mut TestAppContext, server_cx: &m
             let result = load_image(window, cx);
             if let Some(Ok(image)) = &result {
                 *loaded_bytes.lock().expect("loaded image mutex poisoned") =
-                    image.as_bytes(0).map(|bytes| bytes.to_vec());
+                    image.as_bytes(0).map(ToOwned::to_owned);
             }
             result
         }

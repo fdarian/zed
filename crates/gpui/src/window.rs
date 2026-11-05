@@ -8800,28 +8800,6 @@ impl Window {
         Ok(())
     }
 
-    /// Removes an image's tiles from the sprite atlas without telling the window, as an atlas
-    /// that loses a tile would.
-    #[cfg(test)]
-    pub(crate) fn lose_image_atlas_entry(&self, data: &RenderImage) {
-        for frame_index in 0..data.frame_count() {
-            self.sprite_atlas.remove(
-                &RenderImageParams {
-                    image_id: data.id,
-                    frame_index,
-                }
-                .into(),
-            );
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tracks_atlas_image(&self, data: &RenderImage) -> bool {
-        self.atlas_images
-            .as_ref()
-            .is_some_and(|atlas_images| atlas_images.tracks(data))
-    }
-
     /// Returns whether every frame of an image is present in the sprite atlas.
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_image_atlas_entry(&self, data: &RenderImage) -> bool {

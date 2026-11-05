@@ -77,26 +77,21 @@ impl PlatformAtlas for MetalAtlas {
         key: &AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        if let Some(tile) = self.state.lock().tiles_by_key.get(key) {
-            return Ok(Some(*tile));
-        }
-
-        // `build` may read tiles back from this atlas, which locks `state`.
-        let Some((size, bytes)) = build()? else {
-            return Ok(None);
-        };
-
         let mut lock = self.state.lock();
         if let Some(tile) = lock.tiles_by_key.get(key) {
-            return Ok(Some(*tile));
+            Ok(Some(*tile))
+        } else {
+            let Some((size, bytes)) = build()? else {
+                return Ok(None);
+            };
+            let tile = lock
+                .allocate(size, key.texture_kind())
+                .context("failed to allocate")?;
+            let texture = lock.texture(tile.texture_id);
+            texture.upload(tile.bounds, &bytes);
+            lock.tiles_by_key.insert(key.clone(), tile);
+            Ok(Some(tile))
         }
-        let tile = lock
-            .allocate(size, key.texture_kind())
-            .context("failed to allocate")?;
-        let texture = lock.texture(tile.texture_id);
-        texture.upload(tile.bounds, &bytes);
-        lock.tiles_by_key.insert(key.clone(), tile);
-        Ok(Some(tile))
     }
 
     fn update(
@@ -388,81 +383,6 @@ mod tests {
             })
             .expect("allocation should succeed")
             .expect("callback returns Some")
-    }
-
-    fn within_a_second<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(work());
-        });
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("the atlas call deadlocked")
-    }
-
-    #[test]
-    fn test_build_can_read_a_tile_back_from_the_same_atlas() {
-        let Some(atlas) = create_atlas() else {
-            return;
-        };
-        let atlas = Arc::new(atlas);
-        let size = Size {
-            width: DevicePixels(2),
-            height: DevicePixels(1),
-        };
-        let source = make_image_key(1, 0);
-        let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
-        atlas
-            .update(&source, size, &pixels)
-            .expect("upload should succeed");
-        let copy = make_image_key(2, 0);
-
-        let read_back = within_a_second({
-            let atlas = atlas.clone();
-            move || {
-                let mut read = Vec::new();
-                let tile = atlas
-                    .get_or_insert_with(&copy, &mut || {
-                        read = atlas.read_tile(&source)?;
-                        Ok(Some((size, Cow::Owned(read.clone()))))
-                    })
-                    .expect("build should succeed")
-                    .expect("callback returns Some");
-                (tile, read, atlas.read_tile(&copy).unwrap())
-            }
-        });
-
-        assert_eq!(read_back.1, pixels);
-        assert_eq!(read_back.2, pixels);
-    }
-
-    #[test]
-    fn test_build_reading_a_missing_tile_returns_an_error() {
-        let Some(atlas) = create_atlas() else {
-            return;
-        };
-        let atlas = Arc::new(atlas);
-
-        let result = within_a_second({
-            let atlas = atlas.clone();
-            move || {
-                atlas
-                    .get_or_insert_with(&make_image_key(2, 0), &mut || {
-                        let bytes = atlas.read_tile(&make_image_key(1, 0))?;
-                        Ok(Some((
-                            Size {
-                                width: DevicePixels(2),
-                                height: DevicePixels(1),
-                            },
-                            Cow::Owned(bytes),
-                        )))
-                    })
-                    .is_err()
-            }
-        });
-
-        assert!(result);
-        assert!(!atlas.state.lock().tiles_by_key.contains_key(&make_image_key(2, 0)));
     }
 
     #[test]
