@@ -69,15 +69,10 @@ pub struct InstanceBufferPool {
     buffers: Vec<metal::Buffer>,
 }
 
-/// Each frame in flight holds one buffer, so the pool's idle cost is a few of these. An idle
-/// window writes tens of KB a frame: gpui's 2 MiB start kept 6-12 MB resident per app. A frame that
-/// writes more chains buffers ([`InstanceBufferWriter::grow`]) and the pool keeps the larger size.
-const INITIAL_INSTANCE_BUFFER_SIZE: usize = 256 * 1024;
-
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: INITIAL_INSTANCE_BUFFER_SIZE,
+            buffer_size: 2 * 1024 * 1024,
             buffers: Vec::new(),
         }
     }
@@ -3272,31 +3267,6 @@ mod tests {
     use std::sync::Arc;
 
     const SIZE: f32 = 40.;
-
-    #[test]
-    fn the_instance_buffer_pool_starts_small_and_keeps_the_size_a_frame_needed() {
-        let Some(device) = metal::Device::system_default() else {
-            return;
-        };
-        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let initial = super::INITIAL_INSTANCE_BUFFER_SIZE;
-
-        let mut writer = super::InstanceBufferWriter::new(&device, &pool, true);
-        let words = vec![7u32; initial / 4];
-        let first = writer.write(&words).unwrap();
-        let second = writer.write(&words).unwrap();
-        assert_eq!(first.offset, 0);
-        assert_eq!(second.offset, 0, "the second write starts a larger buffer");
-        assert_eq!(pool.lock().buffer_size, 2 * initial);
-        pool.lock().release(writer.finish());
-
-        let buffers = pool.lock().buffers.len();
-        assert_eq!(buffers, 1);
-        let mut writer = super::InstanceBufferWriter::new(&device, &pool, true);
-        assert_eq!(writer.write(&words).unwrap().offset, 0);
-        assert_eq!(writer.write(&words).unwrap().offset, initial, "both fit the grown buffer");
-        assert_eq!(pool.lock().buffer_size, 2 * initial);
-    }
 
     fn render(scene: &mut Scene) -> image::RgbaImage {
         scene.finish();
