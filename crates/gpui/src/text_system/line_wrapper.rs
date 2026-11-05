@@ -18,9 +18,24 @@ pub struct LineWrapper {
     text_system: Arc<TextSystem>,
     pub(crate) font_id: FontId,
     pub(crate) font_size: Pixels,
-    cached_ascii_char_widths: [Option<Pixels>; 128],
-    cached_other_char_widths: HashMap<char, Pixels>,
-    cached_run_char_widths: HashMap<(FontId, u32, char), Pixels>,
+    char_widths: CharWidthCache,
+}
+
+/// Cached character widths for one font and size.
+pub(crate) struct CharWidthCache {
+    ascii: [Option<Pixels>; 128],
+    other: HashMap<char, Pixels>,
+    run: HashMap<(FontId, u32, char), Pixels>,
+}
+
+impl Default for CharWidthCache {
+    fn default() -> Self {
+        Self {
+            ascii: [None; 128],
+            other: HashMap::default(),
+            run: HashMap::default(),
+        }
+    }
 }
 
 /// The font and size a run of text is measured with.
@@ -43,15 +58,22 @@ impl LineWrapper {
     /// The maximum indent that can be applied to a line.
     pub const MAX_INDENT: u32 = 256;
 
-    pub(crate) fn new(font_id: FontId, font_size: Pixels, text_system: Arc<TextSystem>) -> Self {
+    pub(crate) fn new(
+        font_id: FontId,
+        font_size: Pixels,
+        text_system: Arc<TextSystem>,
+        char_widths: CharWidthCache,
+    ) -> Self {
         Self {
             text_system,
             font_id,
             font_size,
-            cached_ascii_char_widths: [None; 128],
-            cached_other_char_widths: HashMap::default(),
-            cached_run_char_widths: HashMap::default(),
+            char_widths,
         }
+    }
+
+    pub(crate) fn into_char_widths(self) -> CharWidthCache {
+        self.char_widths
     }
 
     /// Wrap a line of text to the given width with this wrapper's font and font size.
@@ -412,22 +434,22 @@ impl LineWrapper {
     #[inline(always)]
     fn width_for_char(&mut self, c: char) -> Pixels {
         if (c as u32) < 128 {
-            if let Some(cached_width) = self.cached_ascii_char_widths[c as usize] {
+            if let Some(cached_width) = self.char_widths.ascii[c as usize] {
                 cached_width
             } else {
                 let width = self
                     .text_system
                     .layout_width(self.font_id, self.font_size, c);
-                self.cached_ascii_char_widths[c as usize] = Some(width);
+                self.char_widths.ascii[c as usize] = Some(width);
                 width
             }
-        } else if let Some(cached_width) = self.cached_other_char_widths.get(&c) {
+        } else if let Some(cached_width) = self.char_widths.other.get(&c) {
             *cached_width
         } else {
             let width = self
                 .text_system
                 .layout_width(self.font_id, self.font_size, c);
-            self.cached_other_char_widths.insert(c, width);
+            self.char_widths.other.insert(c, width);
             width
         }
     }
@@ -477,13 +499,13 @@ impl LineWrapper {
             return self.width_for_char(c);
         }
         let key = (style.font_id, style.font_size.0.to_bits(), c);
-        if let Some(width) = self.cached_run_char_widths.get(&key) {
+        if let Some(width) = self.char_widths.run.get(&key) {
             return *width;
         }
         let width = self
             .text_system
             .layout_width(style.font_id, style.font_size, c);
-        self.cached_run_char_widths.insert(key, width);
+        self.char_widths.run.insert(key, width);
         width
     }
 
@@ -693,7 +715,12 @@ mod tests {
         let dispatcher = TestDispatcher::new(0);
         let cx = TestAppContext::build(dispatcher, None);
         let id = cx.text_system().resolve_font(&font(".ZedMono"));
-        LineWrapper::new(id, px(16.), cx.text_system().clone())
+        LineWrapper::new(
+            id,
+            px(16.),
+            cx.text_system().clone(),
+            CharWidthCache::default(),
+        )
     }
 
     fn generate_test_runs(input_run_len: &[usize]) -> Vec<TextRun> {
@@ -2402,6 +2429,7 @@ mod tests {
                     cx.text_system().resolve_font(&font("Menlo")),
                     px(16.),
                     cx.text_system().clone(),
+                    CharWidthCache::default(),
                 )
             });
             let (result, runs) = wrapper.truncate_line(text.into(), budget, affix, &runs, from);
@@ -2433,6 +2461,7 @@ mod tests {
                         cx.text_system().resolve_font(&font("Menlo")),
                         px(16.),
                         cx.text_system().clone(),
+                        CharWidthCache::default(),
                     )
                 });
                 let cut = wrapper
