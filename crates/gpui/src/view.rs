@@ -303,6 +303,7 @@ struct ViewElementCacheKey {
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
     visibility: Visibility,
+    opacity: f32,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -395,12 +396,16 @@ impl<V: View> Element for ViewElement<V> {
                         let content_mask = window.content_mask();
                         let text_style = window.text_style();
                         let visibility = window.visibility();
+                        let opacity = window.element_opacity();
 
+                        // Opacity is compared by bits so that a NaN opacity still matches itself
+                        // and the view keeps using its cache.
                         if let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
                             && element_state.cache_key.visibility == visibility
+                            && element_state.cache_key.opacity.to_bits() == opacity.to_bits()
                             && element_state.reusable
                             && element_state.prepaint_serial == window.rendered_serial()
                             && element_state.paint_serial == window.rendered_serial()
@@ -456,6 +461,7 @@ impl<V: View> Element for ViewElement<V> {
                                     content_mask,
                                     text_style,
                                     visibility,
+                                    opacity,
                                 },
                             },
                         )
@@ -497,13 +503,23 @@ impl<V: View> Element for ViewElement<V> {
                             let mut element_state = element_state.unwrap();
 
                             let paint_start = window.paint_index();
+                            let opacity = window.element_opacity();
 
+                            // Prepaint can only predict the opacity paint applies: an ancestor's
+                            // hover or drag-over style depends on this frame's hit test, which
+                            // isn't known until prepaint finishes. The key records what was
+                            // actually painted, and output replayed under a different opacity is
+                            // redrawn on the next frame.
                             if let Some(element) = element {
                                 let refreshing = mem::replace(&mut window.refreshing, true);
                                 element.paint(window, cx);
                                 window.refreshing = refreshing;
+                                element_state.cache_key.opacity = opacity;
                             } else {
                                 window.reuse_paint(element_state.paint_range.clone());
+                                if element_state.cache_key.opacity.to_bits() != opacity.to_bits() {
+                                    window.request_animation_frame();
+                                }
                             }
 
                             let paint_end = window.paint_index();
