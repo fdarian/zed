@@ -1,6 +1,6 @@
 use crate::{
     BoolExt, MacDispatcher, MacDisplay, MacKeyboardLayout, MacKeyboardMapper, MacWindow,
-    events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
+    events::key_to_menu_equivalent, ns_string, pasteboard::Pasteboard, renderer,
     set_active_window_cursor_style,
 };
 use anyhow::{Context as _, anyhow};
@@ -539,7 +539,7 @@ impl MacPlatform {
                                 .initWithTitle_action_keyEquivalent_(
                                     ns_string(name),
                                     selector,
-                                    ns_string(key_to_native(keystroke.key()).as_ref()),
+                                    ns_string(key_to_menu_equivalent(keystroke.key()).as_ref()),
                                 )
                                 .autorelease();
                             if Self::os_version() >= Version::new(12, 0, 0) {
