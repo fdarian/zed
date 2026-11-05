@@ -2054,9 +2054,6 @@ pub struct Window {
     /// Whether the first button of the press now held went down over a window drag area (see
     /// [`Window::window_control_area_at`]). The arrow then lasts until the last button is up.
     press_began_in_drag_area: bool,
-    /// The last value of [`Window::drag_area_overrides_cursor`] that the platform cursor was
-    /// reset for.
-    cursor_arrow_over_drag_area: bool,
     dom_hit_testing: bool,
     /// Hitboxes whose element is currently being prepainted, innermost last.
     hitbox_parent_stack: Vec<HitboxId>,
@@ -2829,7 +2826,6 @@ impl Window {
             mouse_hit_test: HitTest::default(),
             pressed_mouse_buttons: SmallVec::new(),
             press_began_in_drag_area: false,
-            cursor_arrow_over_drag_area: false,
             dom_hit_testing: false,
             hitbox_parent_stack: Vec::new(),
             pointer_outside: false,
@@ -9749,7 +9745,12 @@ impl Window {
         // Set the cursor only if we're the active window.
         // Over a native surface the cursor is the native view's.
         if self.is_window_hovered() && !crate::composition::pointer_over_native_surface(self) {
-            cx.platform.set_cursor_style(self.pointer_cursor_style());
+            // A drag can start before the next paint records its cursor in the frame.
+            let style = match cx.active_drag_cursor_style() {
+                Some(drag_style) if !self.drag_area_overrides_cursor() => drag_style,
+                _ => self.pointer_cursor_style(),
+            };
+            cx.platform.set_cursor_style(style);
         }
     }
 
@@ -10144,17 +10145,11 @@ impl Window {
             self.rendered_frame
                 .hit_test(self.mouse_position(), self.dom_hit_testing)
         };
-        let arrow_over_drag_area = self.drag_area_overrides_cursor();
-        if hit_test != self.mouse_hit_test
-            || arrow_over_drag_area != self.cursor_arrow_over_drag_area
-        {
-            self.mouse_hit_test = hit_test;
-            self.cursor_arrow_over_drag_area = arrow_over_drag_area;
-            self.reset_cursor_style(cx);
-        }
+        self.mouse_hit_test = hit_test;
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         if self.is_inspector_picking(cx) {
+            self.reset_cursor_style(cx);
             self.handle_inspector_mouse_event(event, cx);
             // When inspector is picking, all other mouse handling is skipped.
             return;
@@ -10202,6 +10197,10 @@ impl Window {
         if event.is::<MouseUpEvent>() && self.captured_hitbox.is_some() {
             self.release_pointer();
         }
+
+        // Runs after the listeners so that a drag they start takes effect in this event. Resolving
+        // the cursor any earlier would briefly select whatever is under the pointer instead.
+        self.reset_cursor_style(cx);
     }
 
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
@@ -11981,10 +11980,10 @@ mod tests {
     use super::{Frame, Hitbox, HitboxId};
     use crate::util::FluentBuilder as _;
     use crate::{
-        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, Context, Corners,
+        ActionRegistry, AnyWindowHandle, App, AppContext as _, Bounds, Context, Corners, CursorStyle,
         DispatchTree, DragMoveEvent, DragOperation, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
         FileDropEvent, FocusHandle, HitboxBehavior, InputEvent as _, InteractiveElement as _,
-        IntoElement, Keymap, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, NativeKey, ParentElement, Pixels,
+        IntoElement, Keymap, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NativeKey, ParentElement, Pixels,
         Point, Render, RequestFrameOptions, ResolvedClipPath, StatefulInteractiveElement as _,
         Styled, TestAppContext, Window, WindowAppearance, WindowOptions, canvas, div, point, px,
         size,
@@ -14938,5 +14937,80 @@ mod tests {
         // the hover.
         let widen = |root: &mut Root, _: &mut Window, _: &mut Context<Root>| root.width = px(300.);
         assert_eq!(update_and_draw(window, &child, cx, widen).0, 1);
+    }
+
+    #[gpui::test]
+    fn test_drag_cursor_applies_before_next_paint(cx: &mut TestAppContext) {
+        struct ResizeHandle;
+
+        impl Render for ResizeHandle {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().cursor_text().child(
+                    div()
+                        .id("resize-handle")
+                        .w(px(4.))
+                        .h_full()
+                        .cursor_col_resize()
+                        .on_drag((), |_, _, _, cx| cx.new(|_| Empty)),
+                )
+            }
+        }
+
+        let window = cx.add_window(|_, _| ResizeHandle);
+        let handle_position = point(px(1.), px(10.));
+        let drag_position = point(px(20.), px(10.));
+        let cursor_observer = cx.clone();
+
+        let update_result = cx.update_window(window.into(), |_, window, cx| {
+            window.hovered.set(true);
+            window.active.set(true);
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: handle_position,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: handle_position,
+                    button: MouseButton::Left,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: drag_position,
+                    pressed_button: Some(MouseButton::Left),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.has_active_drag());
+            // Asserted here because leaving this update flushes effects, which paints a frame.
+            assert_eq!(cursor_observer.active_cursor(), CursorStyle::ResizeColumn);
+
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: drag_position,
+                    button: MouseButton::Left,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to run drag: {update_result:?}"
+        );
+        assert_eq!(cursor_observer.active_cursor(), CursorStyle::IBeam);
     }
 }
