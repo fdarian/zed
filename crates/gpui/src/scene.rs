@@ -99,6 +99,10 @@ pub struct Scene {
     op_slots: Option<Vec<OpSlot>>,
     /// Set while a rebuild works `op_slots` out, until [`Scene::finish`] sorts the vectors.
     slot_tracker: Option<SlotTracker>,
+    /// While a rebuild puts the operations of this scene's own log into it again: how many it has
+    /// put. The log is the one the rebuild takes the operations from, so an operation is counted
+    /// and not recorded, which would be a copy of every primitive and a drop of the old one.
+    rebuilt: Option<usize>,
 }
 
 /// Where the primitive an operation painted is in the sorted typed vectors of the scene.
@@ -279,10 +283,21 @@ impl Scene {
         }
     }
 
-    fn record(&mut self, operation: PaintOperation) {
-        if !self.is_sub_scene {
-            self.paint_operations.push(operation);
+    /// Appends the operation `make` builds to the log, which is not built at all by a scene that
+    /// has no log, or one that is being rebuilt from its own.
+    fn record_with(&mut self, make: impl FnOnce() -> PaintOperation) {
+        if self.is_sub_scene {
+            return;
         }
+        match &mut self.rebuilt {
+            Some(count) => *count += 1,
+            None => self.paint_operations.push(make()),
+        }
+    }
+
+    /// The length of the log as the operations recorded so far make it.
+    fn logged(&self) -> usize {
+        self.rebuilt.unwrap_or(self.paint_operations.len())
     }
 
     /// The scene primitives currently go to: the innermost open group's, or this one.
@@ -302,7 +317,7 @@ impl Scene {
         // Whatever the empty bounds were cut to, a layer clipped away is recorded one way: a replay
         // and a painter must record the same operations.
         let bounds = if opened { bounds } else { Bounds::default() };
-        self.record(PaintOperation::StartLayer(bounds));
+        self.record_with(|| PaintOperation::StartLayer(bounds));
         let current = self.current_mut();
         current.open_layers.push(opened.then_some(bounds));
         if opened {
@@ -312,7 +327,7 @@ impl Scene {
     }
 
     pub fn pop_layer(&mut self) {
-        self.record(PaintOperation::EndLayer);
+        self.record_with(|| PaintOperation::EndLayer);
         let current = self.current_mut();
         if current.open_layers.pop().flatten().is_some() {
             current.layer_stack.pop();
@@ -337,11 +352,11 @@ impl Scene {
     /// Marks the start of what is painted under a content mask that replaces the one around it,
     /// see [`PaintOperation::Replaced`].
     pub(crate) fn begin_replaced(&mut self, derived: bool) {
-        self.record(PaintOperation::Replaced { derived });
+        self.record_with(|| PaintOperation::Replaced { derived });
     }
 
     pub(crate) fn end_replaced(&mut self) {
-        self.record(PaintOperation::EndReplaced);
+        self.record_with(|| PaintOperation::EndReplaced);
     }
 
     /// While hidden, primitives are dropped (`visibility: hidden`): the element keeps its box in
@@ -373,15 +388,15 @@ impl Scene {
             glyph.is_clipped_away(),
             "a pending glyph is clipped away by its mask, which a replay moves it with and only narrows"
         );
-        self.record(PaintOperation::PendingGlyph(glyph));
+        self.record_with(|| PaintOperation::PendingGlyph(glyph));
     }
 
     fn insert(&mut self, primitive: Primitive, glyph: bool) {
         if self.hidden {
             return;
         }
-        self.place(&primitive, glyph, Some(self.paint_operations.len()));
-        self.record(PaintOperation::of(primitive, glyph));
+        self.place(&primitive, glyph, Some(self.logged()));
+        self.record_with(|| PaintOperation::of(primitive, glyph));
     }
 
     /// [`Scene::insert`] of a recorded primitive that stays where it is, as a replay finds it: the
@@ -390,10 +405,8 @@ impl Scene {
         if self.hidden {
             return;
         }
-        self.place(primitive, true, Some(self.paint_operations.len()));
-        if !self.is_sub_scene {
-            self.record(PaintOperation::Primitive(primitive.clone()));
-        }
+        self.place(primitive, true, Some(self.logged()));
+        self.record_with(|| PaintOperation::Primitive(primitive.clone()));
     }
 
     /// Routes a primitive unless the content mask clips it away. One that is clipped away is
@@ -470,11 +483,11 @@ impl Scene {
         if self.hidden {
             return;
         }
-        self.record(PaintOperation::Quad(quad));
+        self.record_with(|| PaintOperation::Quad(quad));
         if quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty() {
             return;
         }
-        let op = self.paint_operations.len().checked_sub(1);
+        let op = self.logged().checked_sub(1);
         let Some(strips) = border_strips(&quad) else {
             self.route(&quad.into(), true, op);
             return;
@@ -503,7 +516,7 @@ impl Scene {
         if self.hidden {
             return;
         }
-        self.record(PaintOperation::NativeSurface(placeholder.clone()));
+        self.record_with(|| PaintOperation::NativeSurface(placeholder.clone()));
         if placeholder.is_clipped_away() {
             return;
         }
@@ -726,7 +739,7 @@ impl Scene {
         content_mask: ContentMask<ScaledPixels>,
         reserved: Option<Bounds<ScaledPixels>>,
     ) {
-        self.record(PaintOperation::StartGroup {
+        self.record_with(|| PaintOperation::StartGroup {
             effect: effect.clone(),
             content_mask,
             reserved,
@@ -778,7 +791,7 @@ impl Scene {
     /// they were painted with, so only what the filters spread of the clipped part is let past
     /// the clip.
     pub fn widen_groups(&mut self, escaped: ContentMask<ScaledPixels>) {
-        self.record(PaintOperation::WidenGroups(escaped));
+        self.record_with(|| PaintOperation::WidenGroups(escaped));
         for builder in &mut self.group_stack {
             let union = builder.content_mask.bounds.union(&escaped.bounds);
             if union != builder.content_mask.bounds {
@@ -802,7 +815,7 @@ impl Scene {
     }
 
     fn close_group(&mut self) {
-        self.record(PaintOperation::EndGroup);
+        self.record_with(|| PaintOperation::EndGroup);
         if !self.effect_groups_enabled {
             self.flat_opacities.pop();
             return;
@@ -924,7 +937,7 @@ impl Scene {
     /// Starts keeping a copy of every glyph painted from now until [`Scene::end_text_clip`]. The
     /// next group opened with a text mask is multiplied by the glyphs' alpha.
     pub fn start_text_clip(&mut self) {
-        self.record(PaintOperation::StartTextClip);
+        self.record_with(|| PaintOperation::StartTextClip);
         if self.effect_groups_enabled {
             self.text_clips.push(TextClip {
                 scene: Scene::sub_scene(),
@@ -934,7 +947,7 @@ impl Scene {
     }
 
     pub fn end_text_clip(&mut self) {
-        self.record(PaintOperation::EndTextClip);
+        self.record_with(|| PaintOperation::EndTextClip);
         if !self.effect_groups_enabled {
             return;
         }
@@ -1140,6 +1153,7 @@ impl Scene {
         if self.order_reuse_failed {
             self.rebuild(&operations, None, group_base, true);
         }
+        self.paint_operations = operations;
     }
 
     /// `track` works `op_slots` out as the scene is sorted, which a rebuild that a patch does is
@@ -1155,7 +1169,7 @@ impl Scene {
         if track {
             self.slot_tracker = Some(SlotTracker::new(operations.len()));
         }
-        self.paint_operations.reserve(operations.len());
+        self.rebuilt = Some(0);
         self.next_group_id = group_base;
         self.group_base = group_base;
         if let Some((log, groups)) = reuse {
@@ -1164,6 +1178,11 @@ impl Scene {
             self.tree_stale = true;
         }
         self.replay_operations(operations, PrimitiveCount::Uncounted);
+        debug_assert!(
+            self.is_sub_scene || self.rebuilt == Some(operations.len()),
+            "an operation of the log is replayed as one operation"
+        );
+        self.rebuilt = None;
         if self.order_reuse.as_ref().is_some_and(|reuse| reuse.cursor != reuse.log.len()) {
             self.order_reuse_failed = true;
         }
@@ -1178,7 +1197,7 @@ impl Scene {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
         let inserting = mem::replace(&mut self.inserting, count);
-        if !self.is_sub_scene {
+        if !self.is_sub_scene && self.rebuilt.is_none() {
             self.paint_operations.reserve(operations.len());
         }
         for operation in operations {
@@ -1244,6 +1263,7 @@ impl Scene {
         let operations = mem::take(&mut self.paint_operations);
         let group_base = self.group_base;
         self.rebuild(&operations, None, group_base, false);
+        self.paint_operations = operations;
     }
 
     /// Makes the scene again from its operations if it has no slots yet, so that a patch can write
@@ -4454,6 +4474,27 @@ mod tests {
         scene.rebuild_from_operations();
         assert_eq!(drawn(&scene), drawn(&page(red(), 30.)));
         assert!(scene.counts.bounds_inserts > inserts, "the orders were worked out again");
+    }
+
+    #[test]
+    fn a_scene_made_again_keeps_the_log_it_is_made_from_and_does_not_record_it_again() {
+        let green = Hsla { h: 0.33, s: 1., l: 0.5, a: 1. };
+        for moved in [0., 30.] {
+            for orders_reused in [true, false] {
+                let mut scene = patched_page(red(), green, moved);
+                let log = scene.paint_operations.as_ptr();
+                let operations = scene.describe_operations(0..scene.len(), false);
+                if orders_reused {
+                    scene.rebuild_from_operations();
+                } else {
+                    scene.rebuild_moved();
+                }
+                assert_eq!(scene.paint_operations.as_ptr(), log, "the log is the one that was there");
+                assert_eq!(scene.describe_operations(0..scene.len(), false), operations);
+                assert_eq!(scene.rebuilt, None);
+                assert_eq!(drawn(&scene), drawn(&page(green, moved)));
+            }
+        }
     }
 
     #[test]
