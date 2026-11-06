@@ -1921,7 +1921,10 @@ fn primitive_placement(primitive: &Primitive) -> Placement {
 /// the shader does not shade every transparent pixel inside a large outline; none when it is
 /// drawn whole.
 fn border_strips(quad: &Quad) -> Option<[Bounds<ScaledPixels>; 4]> {
-    if !quad.background.is_transparent() {
+    // Without a border there is nothing to cut around: a transparent quad that has none is the
+    // background `Style::keep_transparent_background` keeps, and it stays one operation that a
+    // patch can write a colour over.
+    if !quad.background.is_transparent() || !quad.border_widths.any(|width| width.0 > 0.) {
         return None;
     }
     let outer_bounds = quad.bounds;

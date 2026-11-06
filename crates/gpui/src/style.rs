@@ -385,6 +385,11 @@ pub struct Style {
     /// The fill color of this element
     pub background: Option<Fill>,
 
+    /// Paint the background quad when `background` is fully transparent, which is skipped
+    /// otherwise. Ghia sets it on an element whose hover gives it a background, so that the
+    /// quad is there in both styles and the hover is a patch of its colour.
+    pub keep_transparent_background: bool,
+
     /// Gradient layers painted above the background color, like CSS `background-image`. The first
     /// layer is on top.
     pub background_layers: Vec<BackgroundLayer>,
@@ -1607,7 +1612,9 @@ impl Style {
         window: &mut Window,
     ) {
         let background_color = self.background.as_ref().and_then(Fill::color);
-        if background_color.is_some_and(|color| !color.is_transparent()) {
+        if background_color
+            .is_some_and(|color| self.keep_transparent_background || !color.is_transparent())
+        {
             let mut border_color = match background_color {
                 Some(color) => match color.tag {
                     BackgroundTag::Solid
@@ -1818,6 +1825,7 @@ impl Default for Style {
             border_collapse: false,
             cell_vertical_align: CellVerticalAlign::Baseline,
             collapsed_border: false,
+            keep_transparent_background: false,
 
             #[cfg(debug_assertions)]
             debug: false,

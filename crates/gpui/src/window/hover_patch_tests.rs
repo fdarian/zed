@@ -25,11 +25,19 @@ struct Knobs {
     patch: RefCell<Vec<usize>>,
     /// Whether the patcher builds the row with the colour of the hover, or as the frame did.
     painted: Cell<bool>,
+    /// Whether a row that is not hot has a fully transparent background that is kept.
+    transparent: Cell<bool>,
 }
 
-fn row_element(ix: usize, hot: bool) -> AnyElement {
-    let color = if hot { crate::red() } else { crate::blue() };
-    div().id(("row", ix)).w_full().h(px(ROW)).bg(color).always_hitbox().into_any_element()
+fn row_element(ix: usize, hot: bool, transparent: bool) -> AnyElement {
+    let mut row = div().id(("row", ix)).w_full().h(px(ROW)).always_hitbox();
+    if transparent {
+        row.style().keep_transparent_background = Some(true);
+        row = row.bg(if hot { crate::red() } else { crate::transparent_black() });
+    } else {
+        row = row.bg(if hot { crate::red() } else { crate::blue() });
+    }
+    row.into_any_element()
 }
 
 #[derive(Clone)]
@@ -41,10 +49,11 @@ struct Page {
 impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let knobs = self.knobs.clone();
+        let transparent = knobs.transparent.get();
         div().size_full().child(
             list(self.state.clone(), move |ix, _, _| {
                 let hot = knobs.hot.get() == Some(ix);
-                retained(("row", ix), knobs.key.get() * 1_000 + u64::from(hot), move |_, _| row_element(ix, hot))
+                retained(("row", ix), knobs.key.get() * 1_000 + u64::from(hot), move |_, _| row_element(ix, hot, transparent))
                     .relocatable(px(100.))
                     .patchable()
                     .into_any_element()
@@ -62,8 +71,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(cx: &mut TestAppContext) -> Self {
+        Self::with_transparent(cx, false)
+    }
+
+    fn with_transparent(cx: &mut TestAppContext, transparent: bool) -> Self {
         let knobs = Rc::new(Knobs::default());
         knobs.key.set(1);
+        knobs.transparent.set(transparent);
         let state = ListState::new(100, ListAlignment::Top, px(0.)).with_uniform_item_height(px(ROW));
         let page = Page { knobs: knobs.clone(), state };
         let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(300.)), move |_, _| page));
@@ -77,7 +91,7 @@ impl Fixture {
                     .patch
                     .borrow()
                     .iter()
-                    .map(|&ix| (ElementId::from(("row", ix)), row_element(ix, knobs.painted.get())))
+                    .map(|&ix| (ElementId::from(("row", ix)), row_element(ix, knobs.painted.get(), knobs.transparent.get())))
                     .collect();
                 window.repaint_in_place(units, cx, |_, _| true).is_ok()
             })));
@@ -163,6 +177,46 @@ fn a_row_at_its_recorded_place_is_patched_and_paints_what_a_frame_built_whole_pa
     let patched = fixture.scene(cx);
     fixture.whole(cx, None);
     assert_eq!(patched, fixture.scene(cx));
+}
+
+#[gpui::test]
+fn a_row_with_a_kept_transparent_background_is_patched_to_the_colour_of_the_hover(cx: &mut TestAppContext) {
+    let fixture = Fixture::with_transparent(cx, true);
+    let quads = cx.update_window(fixture.window, |_, window, _| window.painted_quads().len()).unwrap();
+    assert_eq!(quads, 4, "the rows in view each paint a quad of the kept background");
+    assert!(fixture.can_patch(cx, 1));
+    fixture.patch(cx, &[1], true);
+    let counters = fixture.patched(cx);
+    assert_eq!((counters.patched_frames, counters.patched_units, counters.total_declines()), (1, 1, 0), "{counters:?}");
+    let patched = fixture.scene(cx);
+    fixture.whole(cx, Some(1));
+    assert_eq!(patched, fixture.scene(cx), "the patch wrote what the frame paints");
+
+    fixture.patch(cx, &[1], false);
+    let counters = fixture.patched(cx);
+    assert_eq!((counters.patched_frames, counters.total_declines()), (2, 0), "{counters:?}");
+    let patched = fixture.scene(cx);
+    fixture.whole(cx, None);
+    assert_eq!(patched, fixture.scene(cx));
+}
+
+#[gpui::test]
+fn a_transparent_background_paints_no_quad_unless_it_is_kept(cx: &mut TestAppContext) {
+    let kept = |cx: &mut TestAppContext, keep: bool| {
+        let cx = cx.add_empty_window();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            let mut row = div().w_full().h(px(ROW)).bg(crate::transparent_black());
+            if keep {
+                row.style().keep_transparent_background = Some(true);
+            }
+            row
+        });
+        cx.update(|window, _| window.painted_quads())
+    };
+    assert!(kept(cx, false).is_empty());
+    let quads = kept(cx, true);
+    assert_eq!(quads.len(), 1);
+    assert!(quads[0].background.is_transparent());
 }
 
 #[gpui::test]
