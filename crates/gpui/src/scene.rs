@@ -17,6 +17,7 @@ use std::{
     iter::Peekable,
     mem,
     ops::{Add, Range, Sub},
+    rc::Rc,
     slice,
 };
 
@@ -344,9 +345,24 @@ impl Scene {
         }
     }
 
+    /// Makes a scene that was a recorder before a recorder of `parent` again: as empty as
+    /// [`Scene::recorder`] makes one, with the room its vectors grew to.
+    pub(crate) fn become_recorder_of(&mut self, parent: &Scene) {
+        self.clear();
+        self.counts = Default::default();
+        self.effect_groups_enabled = parent.effect_groups_enabled;
+        self.hidden = parent.hidden;
+    }
+
     /// The operations that were recorded, to be put into another scene.
     pub(crate) fn into_operations(self) -> Vec<PaintOperation> {
         self.paint_operations
+    }
+
+    /// The operations that were recorded, moved to a recording. The scene keeps the room of its
+    /// log, which is empty.
+    pub(crate) fn take_operations(&mut self) -> Rc<[PaintOperation]> {
+        self.paint_operations.drain(..).collect()
     }
 
     /// Marks the start of what is painted under a content mask that replaces the one around it,
@@ -4491,6 +4507,42 @@ mod tests {
             let places = |sprites: &[MonochromeSprite]| sprites.iter().map(|sprite| sprite.bounds.origin.x.0 as u32).collect::<Vec<_>>();
             assert_eq!(places(&sprites), places(&expected), "{count} sprites");
         }
+    }
+
+    #[test]
+    fn a_recorder_that_was_used_records_as_a_new_one_does_and_keeps_its_room() {
+        let mut parent = scene();
+        parent.set_hidden(false);
+        let mut recorder = parent.recorder();
+        for operation in varied_recording().iter() {
+            recorder.replay_operation(operation);
+        }
+        let first = recorder.take_operations();
+        let text = |operations: &[PaintOperation]| {
+            let mut scene = scene();
+            scene.paint_operations = operations.to_vec();
+            describe(&scene)
+        };
+        assert_eq!(text(&first), text(&varied_recording()));
+        assert!(recorder.paint_operations.is_empty());
+        let room = recorder.paint_operations.capacity();
+        assert!(room >= first.len(), "the log keeps the room it grew to");
+        assert!(recorder.counts.bounds_inserts > 0);
+
+        parent.set_effect_groups_enabled(false);
+        recorder.become_recorder_of(&parent);
+        assert_eq!(recorder.counts.bounds_inserts, 0, "what the last recording counted is not counted again");
+        assert!(!recorder.effect_groups_enabled());
+        for operation in varied_recording().iter() {
+            recorder.replay_operation(operation);
+        }
+        let mut fresh = parent.recorder();
+        for operation in varied_recording().iter() {
+            fresh.replay_operation(operation);
+        }
+        assert_eq!(describe(&recorder), describe(&fresh));
+        assert_eq!(recorder.paint_operations.capacity(), room);
+        assert_eq!(drawn(&recorder), drawn(&fresh));
     }
 
     #[test]

@@ -466,6 +466,10 @@ pub(crate) struct RetainedWindow {
     /// Counts the frames that were drawn. A recording indexes the vectors of the frame it was
     /// made in, which is the rendered frame only in the draw that follows.
     pub(crate) rendered_serial: u64,
+    /// The scene the last recording was painted in, empty and with the room it grew to, for the
+    /// next: a subtree is recorded in a scene of its own, and that scene would grow from nothing
+    /// in every frame that builds one.
+    pub(crate) spare_recorder: Option<Scene>,
     /// Counts the calls of [`Window::refresh`]. `refreshing` stays set until a frame is drawn, so a
     /// layout record made after the last refresh is told from one made before it by this.
     pub(crate) refresh_epoch: u64,
@@ -2598,7 +2602,13 @@ impl Window {
                 .push(ContentMask::from_bounds(relocation.info.region));
             relocation.saved_exact_clips = self.exact_clips.take();
             if paint {
-                let recorder = self.next_frame.scene.recorder();
+                let recorder = match self.retained.spare_recorder.take() {
+                    Some(mut spare) => {
+                        spare.become_recorder_of(&self.next_frame.scene);
+                        spare
+                    }
+                    None => self.next_frame.scene.recorder(),
+                };
                 relocation.saved_scene = Some(mem::replace(&mut self.next_frame.scene, recorder));
             }
         }
@@ -2618,9 +2628,10 @@ impl Window {
             self.content_mask_stack.pop();
             self.exact_clips = relocation.saved_exact_clips.take();
             if let Some(scene) = relocation.saved_scene.take() {
-                let recorder = mem::replace(&mut self.next_frame.scene, scene);
+                let mut recorder = mem::replace(&mut self.next_frame.scene, scene);
                 self.next_frame.scene.absorb_counts(&recorder);
-                operations = Some(recorder.into_operations().into());
+                operations = Some(recorder.take_operations());
+                self.retained.spare_recorder = Some(recorder);
             }
         }
         (relocation, operations)
