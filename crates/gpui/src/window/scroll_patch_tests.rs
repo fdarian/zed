@@ -289,6 +289,26 @@ fn a_focus_in_a_row_the_list_builds_for_it_alone_is_a_reason(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn every_reason_that_holds_is_counted_and_the_first_is_the_reason(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), false);
+    fixture.with_window(cx, |window| {
+        window.set_scroll_patch_gate(Some(Rc::new(|_| Some(ScrollPatchReason::Edited))));
+        window.set_a11y_active_for_tests(true);
+    });
+    fixture.draw(cx);
+    fixture.scroll(cx, 10., 10., 40.);
+    let counters = fixture.counters(cx);
+    assert_eq!(counters.reasons(ScrollPatchReason::Edited), 1, "{counters:?}");
+    assert_eq!(counters.reasons(ScrollPatchReason::Membership), 0, "{counters:?}");
+    let held: Vec<_> = ScrollPatchReason::ALL.into_iter().filter(|reason| counters.held(*reason) == 1).collect();
+    assert_eq!(
+        held,
+        [ScrollPatchReason::Edited, ScrollPatchReason::Membership, ScrollPatchReason::A11y],
+        "{counters:?}"
+    );
+}
+
+#[gpui::test]
 fn a_window_that_does_not_classify_counts_nothing(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| window.set_scroll_patch(false));

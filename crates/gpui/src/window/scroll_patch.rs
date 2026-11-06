@@ -94,16 +94,22 @@ pub struct ScrollPatchCounters {
     /// Of the eligible ones, frames whose build was not what the prediction said: a row built
     /// where a recording was to be put, a delta other than the translate, other rows.
     pub mispredicted: u64,
-    /// Of the frames counted as [`ScrollPatchReason::Hover`], those that nothing else stops: they
-    /// would be eligible with the pointer elsewhere.
+    /// Of the frames not eligible, those that only the hover stops: they would be eligible with the
+    /// pointer elsewhere.
     pub hover_only: u64,
     reasons: [u64; ScrollPatchReason::ALL.len()],
+    held: [u64; ScrollPatchReason::ALL.len()],
 }
 
 impl ScrollPatchCounters {
     /// How many frames were not a pure translate, first for this reason.
     pub fn reasons(&self, reason: ScrollPatchReason) -> u64 {
         self.reasons[reason.index()]
+    }
+
+    /// How many frames this reason held for, first or not.
+    pub fn held(&self, reason: ScrollPatchReason) -> u64 {
+        self.held[reason.index()]
     }
 }
 
@@ -158,10 +164,23 @@ impl ScrollFrame {
     }
 }
 
-/// The first reason a frame is not a translate, and whether the hover is the only one.
+/// The reasons a frame is not a translate, in the order of [`ScrollPatchReason::ALL`].
+#[derive(Clone, Copy)]
 struct Rejected {
-    reason: ScrollPatchReason,
-    hover_only: bool,
+    held: u16,
+}
+
+impl Rejected {
+    fn of(reasons: &[ScrollPatchReason]) -> Self {
+        Self { held: reasons.iter().fold(0, |held, reason| held | 1 << reason.index()) }
+    }
+
+    fn first(self) -> ScrollPatchReason {
+        ScrollPatchReason::ALL
+            .into_iter()
+            .find(|reason| self.held & 1 << reason.index() != 0)
+            .expect("a frame is rejected for a reason")
+    }
 }
 
 /// What the frame drawn after the scroll has to be to be what was predicted.
@@ -323,9 +342,13 @@ impl Window {
                 counters.eligible += 1;
                 self.scroll_patch.predicted = Some(prediction);
             }
-            Err(Rejected { reason, hover_only }) => {
+            Err(rejected) => {
+                let reason = rejected.first();
                 counters.reasons[reason.index()] += 1;
-                counters.hover_only += u64::from(hover_only);
+                counters.hover_only += u64::from(rejected.held == 1 << ScrollPatchReason::Hover.index());
+                for other in ScrollPatchReason::ALL {
+                    counters.held[other.index()] += u64::from(rejected.held & 1 << other.index() != 0);
+                }
             }
         }
     }
@@ -333,26 +356,28 @@ impl Window {
     fn scroll_verdict(&self, view: EntityId, cx: &App) -> Result<Prediction, Rejected> {
         use ScrollPatchReason as Reason;
 
-        let reject = |reason| Rejected { reason, hover_only: false };
-
+        let other = Rejected::of(&[Reason::Other]);
         let shown = &self.rendered_frame.scroll;
         let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self));
         if self.scroll_patch.gate.is_none() || gate == Some(Reason::Other) || shown.lists.is_empty() {
-            return Err(reject(Reason::Other));
+            return Err(other);
         }
         if shown.viewport != self.viewport_size || shown.scale_factor != self.scale_factor {
-            return Err(reject(Reason::Other));
+            return Err(other);
         }
         let mut moved = shown.lists.iter().filter(|list| list.state.scrolled() != list.scrolled);
         let (Some(list), None) = (moved.next(), moved.next()) else {
-            return Err(reject(Reason::Other));
+            return Err(other);
         };
         if list.state.is_settling() {
-            return Err(reject(Reason::Other));
+            return Err(other);
         }
 
+        // Every check runs, whatever an earlier one found: the first in the order of
+        // `ScrollPatchReason::ALL` is the reason, and the others say what else would have stopped it.
+        let mut held = Vec::new();
         if gate == Some(Reason::Edited) || self.refreshing || self.views_other_than(view) {
-            return Err(reject(Reason::Edited));
+            held.push(Reason::Edited);
         }
 
         let scrolled = list.state.scrolled();
@@ -361,7 +386,7 @@ impl Window {
             && list.rows.start <= needed.rows.start
             && needed.rows.end <= list.rows.end;
         if needed.settles || !contained {
-            return Err(reject(Reason::Membership));
+            held.push(Reason::Membership);
         }
 
         let scale_factor = self.scale_factor;
@@ -393,36 +418,33 @@ impl Window {
                     })
             });
         }
-        // What the checks that follow find is counted after the hover, which comes first.
-        let rejected = |reason| {
-            if hover {
-                Rejected { reason: Reason::Hover, hover_only: false }
-            } else {
-                reject(reason)
-            }
-        };
+        if hover {
+            held.push(Reason::Hover);
+        }
 
-        if let Some(miss) = places.iter().find_map(|(_, _, place)| place.as_ref().err().copied().flatten()) {
-            return Err(rejected(match miss {
-                RelocationMiss::Place => Reason::Place,
-                RelocationMiss::Region => Reason::Region,
-                RelocationMiss::Clip => Reason::Clip,
-            }));
+        for miss in [RelocationMiss::Place, RelocationMiss::Region, RelocationMiss::Clip] {
+            if places.iter().any(|(_, _, place)| *place == Err(Some(miss))) {
+                held.push(match miss {
+                    RelocationMiss::Place => Reason::Place,
+                    RelocationMiss::Region => Reason::Region,
+                    RelocationMiss::Clip => Reason::Clip,
+                });
+            }
         }
         if list.off_screen_focus || needed.off_screen_focus {
-            return Err(rejected(Reason::Focus));
+            held.push(Reason::Focus);
         }
         if self.a11y.is_active() {
-            return Err(rejected(Reason::A11y));
+            held.push(Reason::A11y);
         }
         if gate == Some(Reason::ScrollAnimation) {
-            return Err(rejected(Reason::ScrollAnimation));
+            held.push(Reason::ScrollAnimation);
         }
-        if places.len() != list.rows.len() || places.iter().any(|(_, _, place)| place.is_err()) {
-            return Err(rejected(Reason::NotRelocatable));
+        if places.len() != list.rows.len() || places.iter().any(|(_, _, place)| *place == Err(None)) {
+            held.push(Reason::NotRelocatable);
         }
-        if hover {
-            return Err(Rejected { reason: Reason::Hover, hover_only: true });
+        if !held.is_empty() {
+            return Err(Rejected::of(&held));
         }
 
         Ok(Prediction {
