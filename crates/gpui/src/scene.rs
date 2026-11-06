@@ -1346,19 +1346,19 @@ impl Scene {
             }
             Primitive::MonochromeSprite(sprite) => {
                 let old = &self.monochrome_sprites[index];
-                let retiled = old.tile.tile_id != sprite.tile.tile_id;
+                let retiled = old.tile.texture_id != sprite.tile.texture_id;
                 self.monochrome_sprites[index] = MonochromeSprite { order: old.order, ..*sprite };
                 return retiled;
             }
             Primitive::SubpixelSprite(sprite) => {
                 let old = &self.subpixel_sprites[index];
-                let retiled = old.tile.tile_id != sprite.tile.tile_id;
+                let retiled = old.tile.texture_id != sprite.tile.texture_id;
                 self.subpixel_sprites[index] = SubpixelSprite { order: old.order, ..*sprite };
                 return retiled;
             }
             Primitive::PolychromeSprite(sprite) => {
                 let old = &self.polychrome_sprites[index];
-                let retiled = old.tile.tile_id != sprite.tile.tile_id;
+                let retiled = old.tile.texture_id != sprite.tile.texture_id;
                 self.polychrome_sprites[index] = PolychromeSprite { order: old.order, ..*sprite };
                 return retiled;
             }
@@ -1371,42 +1371,26 @@ impl Scene {
         false
     }
 
+    /// Sorts the typed vectors by draw order, and when the scene is made to be patched notes where
+    /// the primitive of each operation went.
+    ///
+    /// A sprite is ordered by its order and the texture of its tile, and the sort is stable:
+    /// primitives of one order do not overlap (the bounds tree gives an overlapping one a higher
+    /// order), so which of two is painted first is not seen, and the texture is what the renderer
+    /// batches by. Upstream breaks the tie with the id of the tile.
     pub fn finish(&mut self) {
-        self.op_slots = None;
-        match self.slot_tracker.take() {
-            Some(tracker) => self.finish_tracked(tracker),
-            None => {
-                self.shadows.sort_by_key(|shadow| shadow.order);
-                self.quads.sort_by_key(|quad| quad.order);
-                self.paths.sort_by_key(|path| path.order);
-                self.underlines.sort_by_key(|underline| underline.order);
-                self.monochrome_sprites
-                    .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-                self.subpixel_sprites
-                    .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-                self.polychrome_sprites
-                    .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-                self.surfaces.sort_by_key(|surface| surface.order);
-            }
-        }
+        let mut tracker = self.slot_tracker.take();
+        sort_items(&mut self.shadows, |shadow| shadow.order, placed_in(&mut tracker, PrimitiveKind::Shadow));
+        sort_items(&mut self.quads, |quad| quad.order, placed_in(&mut tracker, PrimitiveKind::Quad));
+        sort_items(&mut self.paths, |path| path.order, placed_in(&mut tracker, PrimitiveKind::Path));
+        sort_items(&mut self.underlines, |underline| underline.order, placed_in(&mut tracker, PrimitiveKind::Underline));
+        sort_items(&mut self.monochrome_sprites, sprite_key, placed_in(&mut tracker, PrimitiveKind::MonochromeSprite));
+        sort_items(&mut self.subpixel_sprites, sprite_key, placed_in(&mut tracker, PrimitiveKind::SubpixelSprite));
+        sort_items(&mut self.polychrome_sprites, sprite_key, placed_in(&mut tracker, PrimitiveKind::PolychromeSprite));
+        sort_items(&mut self.surfaces, |surface| surface.order, placed_in(&mut tracker, PrimitiveKind::Surface));
+        self.op_slots = tracker.map(|tracker| tracker.slots);
         self.groups.sort_by_key(|group| group.order);
         self.native_surfaces.sort_by_key(|placeholder| placeholder.order);
-    }
-
-    /// [`Scene::finish`] of the typed vectors, noting where the sort puts the primitive of each
-    /// operation.
-    fn finish_tracked(&mut self, mut tracker: SlotTracker) {
-        let slots = &mut tracker.slots;
-        let inserted = &tracker.inserted;
-        sort_placed(&mut self.shadows, &inserted[PrimitiveKind::Shadow as usize], PrimitiveKind::Shadow, slots, |shadow| shadow.order);
-        sort_placed(&mut self.quads, &inserted[PrimitiveKind::Quad as usize], PrimitiveKind::Quad, slots, |quad| quad.order);
-        sort_placed(&mut self.paths, &inserted[PrimitiveKind::Path as usize], PrimitiveKind::Path, slots, |path| path.order);
-        sort_placed(&mut self.underlines, &inserted[PrimitiveKind::Underline as usize], PrimitiveKind::Underline, slots, |underline| underline.order);
-        sort_placed(&mut self.monochrome_sprites, &inserted[PrimitiveKind::MonochromeSprite as usize], PrimitiveKind::MonochromeSprite, slots, |sprite| (sprite.order, sprite.tile.tile_id));
-        sort_placed(&mut self.subpixel_sprites, &inserted[PrimitiveKind::SubpixelSprite as usize], PrimitiveKind::SubpixelSprite, slots, |sprite| (sprite.order, sprite.tile.tile_id));
-        sort_placed(&mut self.polychrome_sprites, &inserted[PrimitiveKind::PolychromeSprite as usize], PrimitiveKind::PolychromeSprite, slots, |sprite| (sprite.order, sprite.tile.tile_id));
-        sort_placed(&mut self.surfaces, &inserted[PrimitiveKind::Surface as usize], PrimitiveKind::Surface, slots, |surface| surface.order);
-        self.op_slots = Some(tracker.slots);
     }
 
     #[cfg_attr(
@@ -1675,29 +1659,43 @@ fn same_debug_form(left: &impl Debug, right: &impl Debug) -> bool {
     compare.same && compare.rest.is_empty()
 }
 
-/// Sorts `items` by `key` as a stable `sort_by_key` does, and notes in `slots` where it puts the
-/// primitive of each operation. `inserted` is the operation of each item before the sort.
-fn sort_placed<T, K: Ord>(
-    items: &mut [T],
-    inserted: &[u32],
+/// Where the primitives of one vector came from, for [`sort_items`] to note where it puts them.
+struct Placed<'a> {
+    /// The operation of each item before the sort.
+    inserted: &'a [u32],
     kind: PrimitiveKind,
-    slots: &mut [OpSlot],
-    key: impl Fn(&T) -> K,
-) {
-    debug_assert_eq!(items.len(), inserted.len());
-    let mut gather: Vec<u32> = (0..items.len() as u32).collect();
-    gather.sort_by_key(|&from| key(&items[from as usize]));
-    for (to, &from) in gather.iter().enumerate() {
-        let op = inserted[from as usize];
-        if op != SlotTracker::NO_OP {
-            slots[op as usize] = OpSlot::At(kind, to as u32);
+    slots: &'a mut [OpSlot],
+}
+
+fn placed_in(tracker: &mut Option<SlotTracker>, kind: PrimitiveKind) -> Option<Placed<'_>> {
+    tracker
+        .as_mut()
+        .map(|tracker| Placed { inserted: &tracker.inserted[kind as usize], kind, slots: &mut tracker.slots })
+}
+
+/// Sorts `items` by `key`, equal keys in the order they were in. The keys are sorted with the
+/// index of their item, a pair of a few bytes where an item is up to 240, and each item is moved
+/// once, to where its pair went. `placed` notes where the primitive of each operation went.
+fn sort_items<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K, placed: Option<Placed<'_>>) {
+    if items.len() < 2 && placed.is_none() {
+        return;
+    }
+    let mut gather: Vec<(K, u32)> = items.iter().enumerate().map(|(index, item)| (key(item), index as u32)).collect();
+    gather.sort_unstable();
+    if let Some(placed) = placed {
+        debug_assert_eq!(items.len(), placed.inserted.len());
+        for (to, (_, from)) in gather.iter().enumerate() {
+            let op = placed.inserted[*from as usize];
+            if op != SlotTracker::NO_OP {
+                placed.slots[op as usize] = OpSlot::At(placed.kind, to as u32);
+            }
         }
     }
     // Moves each item to where `gather` says, a cycle at a time, with no second vector of items.
     for first in 0..gather.len() {
         let mut to = first;
         loop {
-            let from = mem::replace(&mut gather[to], to as u32) as usize;
+            let from = mem::replace(&mut gather[to].1, to as u32) as usize;
             if from == first {
                 break;
             }
@@ -1707,20 +1705,20 @@ fn sort_placed<T, K: Ord>(
     }
 }
 
-fn sprite_key<S: SpriteOrder>(sprite: &S) -> (DrawOrder, crate::TileId) {
+/// What a sprite is ordered by in [`Scene::finish`].
+fn sprite_key<S: SpriteOrder>(sprite: &S) -> (DrawOrder, AtlasTextureId) {
     sprite.key()
 }
 
-/// The order a sprite is sorted by in [`Scene::finish`].
 trait SpriteOrder {
-    fn key(&self) -> (DrawOrder, crate::TileId);
+    fn key(&self) -> (DrawOrder, AtlasTextureId);
 }
 
 macro_rules! sprite_order {
     ($($sprite:ty),*) => {
         $(impl SpriteOrder for $sprite {
-            fn key(&self) -> (DrawOrder, crate::TileId) {
-                (self.order, self.tile.tile_id)
+            fn key(&self) -> (DrawOrder, AtlasTextureId) {
+                (self.order, self.tile.texture_id)
             }
         })*
     };
@@ -4420,11 +4418,11 @@ mod tests {
     }
 
     /// What a page paints that a patch can change: a card, two quads in a layer, a row of glyphs
-    /// with the atlas tile each has, a border-only quad (drawn as strips) and a quad in a group.
+    /// with the atlas texture each has, a border-only quad (drawn as strips) and a quad in a group.
     struct Flat {
         card: Hsla,
         layered: Hsla,
-        tiles: [u32; 6],
+        textures: [u32; 6],
         glyph_x: f32,
         card_width: f32,
         group: Hsla,
@@ -4436,7 +4434,7 @@ mod tests {
             Self {
                 card: red(),
                 layered: red(),
-                tiles: [1, 2, 3, 4, 5, 6],
+                textures: [1, 2, 3, 4, 5, 6],
                 glyph_x: 10.,
                 card_width: 300.,
                 group: red(),
@@ -4451,9 +4449,9 @@ mod tests {
             scene.insert_primitive(Quad { background: self.layered.into(), ..quad(130., 30., 20., 20.) });
             scene.insert_primitive(quad(140., 40., 20., 20.));
             scene.pop_layer();
-            for (column, tile) in self.tiles.into_iter().enumerate() {
+            for (column, texture) in self.textures.into_iter().enumerate() {
                 let mut sprite = glyph(self.glyph_x + column as f32 * 9., 150.);
-                sprite.tile.tile_id = TileId(tile);
+                sprite.tile.texture_id.index = texture;
                 scene.insert_primitive(sprite);
             }
             scene.insert_quad(Quad {
@@ -4560,21 +4558,86 @@ mod tests {
     }
 
     #[test]
-    fn a_glyph_that_gets_a_tile_that_sorts_it_elsewhere_is_made_again_from_the_log() {
-        // Same order, so the tile decides: 3 to 9 passes 4, 5 and 6.
-        let passes = Flat { tiles: [1, 2, 9, 4, 5, 6], ..Flat::new() };
+    fn a_glyph_that_gets_a_texture_that_sorts_it_elsewhere_is_made_again_from_the_log() {
+        // Same order, so the texture decides: 3 to 9 passes 4, 5 and 6.
+        let passes = Flat { textures: [1, 2, 9, 4, 5, 6], ..Flat::new() };
         let (scene, in_place) = patched(&Flat::new(), &passes);
         assert!(!in_place);
         assert_eq!(scene.describe_primitives(), passes.scene().describe_primitives());
     }
 
     #[test]
-    fn a_glyph_that_gets_a_tile_between_its_neighbors_is_written_in_place() {
-        let shown = Flat { tiles: [10, 20, 30, 40, 50, 60], ..Flat::new() };
-        let painted = Flat { tiles: [10, 20, 35, 40, 50, 60], ..Flat::new() };
+    fn a_glyph_that_gets_a_texture_between_its_neighbors_is_written_in_place() {
+        let shown = Flat { textures: [10, 20, 30, 40, 50, 60], ..Flat::new() };
+        let painted = Flat { textures: [10, 20, 35, 40, 50, 60], ..Flat::new() };
         let (scene, in_place) = patched(&shown, &painted);
         assert!(in_place);
         assert_eq!(scene.describe_primitives(), painted.scene().describe_primitives());
+    }
+
+    fn glyph_in(texture: u32, tile: u32, x: f32) -> MonochromeSprite {
+        let mut sprite = glyph(x, 150.);
+        sprite.tile.texture_id.index = texture;
+        sprite.tile.tile_id = TileId(tile);
+        sprite
+    }
+
+    #[test]
+    fn sprites_of_one_order_keep_the_order_they_were_painted_in_within_a_texture_and_group_by_texture() {
+        // Eight glyphs side by side get one order. The tile ids run the other way from the paint order.
+        let mut scene = scene();
+        for (column, texture) in [1, 0, 1, 0, 1, 0, 1, 0].into_iter().enumerate() {
+            scene.insert_primitive(glyph_in(texture, 100 - column as u32, 10. + column as f32 * 10.));
+        }
+        scene.finish();
+        let sorted: Vec<(u32, f32)> = scene
+            .monochrome_sprites
+            .iter()
+            .map(|sprite| (sprite.tile.texture_id.index, sprite.bounds.origin.x.0))
+            .collect();
+        assert_eq!(
+            sorted,
+            [(0, 20.), (0, 40.), (0, 60.), (0, 80.), (1, 10.), (1, 30.), (1, 50.), (1, 70.)],
+            "grouped by texture, painted order within one"
+        );
+        let batches = scene.batches().count();
+        assert_eq!(batches, 2, "one batch for each texture");
+    }
+
+    #[test]
+    fn a_sprite_over_another_is_painted_after_it_whatever_its_texture() {
+        let mut scene = scene();
+        scene.insert_primitive(glyph_in(5, 1, 10.));
+        scene.insert_primitive(glyph_in(0, 2, 12.));
+        scene.finish();
+        let textures: Vec<u32> = scene.monochrome_sprites.iter().map(|sprite| sprite.tile.texture_id.index).collect();
+        assert_eq!(textures, [5, 0], "the order of an overlapping sprite is higher, and the key leads with it");
+    }
+
+    #[test]
+    fn sorting_in_place_moves_every_kind_to_where_a_stable_sort_puts_it() {
+        let mut scene = scene();
+        // Quads that overlap get rising orders; a quad apart from them shares the first one's.
+        for index in 0..40 {
+            let x = (index % 8) as f32 * 40.;
+            let y = (index / 8) as f32 * 40.;
+            scene.insert_primitive(Quad { background: Hsla { h: index as f32 / 40., s: 1., l: 0.5, a: 1. }.into(), ..quad(x, y, 30., 30.) });
+            scene.insert_primitive(glyph_in(index % 3, 100 - index, x + 2.));
+        }
+        scene.insert_primitive(quad(0., 0., 400., 400.));
+        scene.finish();
+        assert!(scene.quads.windows(2).all(|pair| pair[0].order <= pair[1].order));
+        assert!(scene
+            .monochrome_sprites
+            .windows(2)
+            .all(|pair| (pair[0].order, pair[0].tile.texture_id) <= (pair[1].order, pair[1].tile.texture_id)));
+        // Equal keys keep their paint order: the glyphs of a texture, in one order, run by x.
+        for pair in scene.monochrome_sprites.windows(2) {
+            if (pair[0].order, pair[0].tile.texture_id) == (pair[1].order, pair[1].tile.texture_id) {
+                let (a, b) = (&pair[0].bounds.origin, &pair[1].bounds.origin);
+                assert!((a.y.0, a.x.0) < (b.y.0, b.x.0), "painted in the order inserted");
+            }
+        }
     }
 
     #[test]

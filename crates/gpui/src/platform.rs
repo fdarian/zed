@@ -1554,7 +1554,7 @@ pub struct AtlasTile {
     pub bounds: Bounds<DevicePixels>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct AtlasTextureId {
@@ -1565,7 +1565,7 @@ pub struct AtlasTextureId {
     pub kind: AtlasTextureKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(C)]
 #[cfg_attr(
     all(
