@@ -1276,6 +1276,15 @@ impl ReplayKey {
     }
 }
 
+/// The edge of the content mask around a subtree that the region it was recorded in does not cover
+/// where it is put.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UncoveredEdge {
+    Top,
+    Bottom,
+    Side,
+}
+
 /// What a recording of a relocatable subtree needs to be put elsewhere: where it was recorded,
 /// and what painting decided about the clips in it that depends on the content mask around.
 #[derive(Clone)]
@@ -1309,6 +1318,20 @@ impl RelocationInfo {
     /// Whether the region of the recording put `delta` away covers the content mask `ambient`.
     pub(crate) fn covers_mask(&self, delta: Point<Pixels>, ambient: &ContentMask<Pixels>) -> bool {
         covers(&Bounds::new(self.region.origin + delta, self.region.size), &ambient.bounds)
+    }
+
+    /// Which edge of the content mask `ambient` the region put `delta` away leaves uncovered, for a
+    /// region that [`Self::covers_mask`] says does not cover it: the top before the bottom, and a
+    /// side otherwise.
+    pub(crate) fn uncovered_edge(&self, delta: Point<Pixels>, ambient: &ContentMask<Pixels>) -> UncoveredEdge {
+        let region = Bounds::new(self.region.origin + delta, self.region.size);
+        if region.top() > ambient.bounds.top() {
+            UncoveredEdge::Top
+        } else if region.bottom() < ambient.bounds.bottom() {
+            UncoveredEdge::Bottom
+        } else {
+            UncoveredEdge::Side
+        }
     }
 
     /// Whether the subtree recorded here is what painting it `delta` away, inside `ambient`,

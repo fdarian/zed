@@ -80,12 +80,12 @@ mod scroll_patch_tests;
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
-pub use scroll_patch::{ScrollPatchCounters, ScrollPatchReason};
+pub use scroll_patch::{ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason};
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
 pub(crate) use scroll_patch::{ScrollFrame, ScrollPatchWindow};
 pub(crate) use retained::{
     HandleList, LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
-    Origin, RetainedWindow, StateOwner, SubtreeText, blocker_bit, first_blocker,
+    Origin, RetainedWindow, StateOwner, SubtreeText, UncoveredEdge, blocker_bit, first_blocker,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1862,9 +1862,19 @@ impl Frame {
     /// hitboxes that enclose it. A clip path cuts away the hit area of its whole subtree, as in
     /// CSS.
     fn clipped_out(&self, clips: &ClipIndex, ix: usize, position: Point<Pixels>) -> bool {
+        self.clipped_out_by(clips, ix, position, |ix| &self.hitboxes[ix])
+    }
+
+    fn clipped_out_by<'h>(
+        &self,
+        clips: &ClipIndex,
+        ix: usize,
+        position: Point<Pixels>,
+        hitbox_at: impl Fn(usize) -> &'h Hitbox,
+    ) -> bool {
         debug_assert_eq!(clips.enclosing_clip.len(), self.hitboxes.len());
         let clipped = |ix: usize| {
-            let hitbox = &self.hitboxes[ix];
+            let hitbox = hitbox_at(ix);
             hitbox.clip.as_ref().is_some_and(|clip| match hitbox.to_local(position) {
                 Some(local) => !clip.contains(Point::new(local.x.0, local.y.0)),
                 None => true,
@@ -1887,15 +1897,22 @@ impl Frame {
     /// Parents are included wherever the point is: an ancestor is hovered by a descendant that
     /// overflows it, or that was deferred out of it.
     fn dom_hit_test(&self, position: Point<Pixels>) -> HitTest {
+        self.dom_hit_test_by(position, |ix| &self.hitboxes[ix])
+    }
+
+    /// [`Self::dom_hit_test`] over the hitboxes `hitbox_at` gives for the indices of the frame: the
+    /// scroll classifier asks what the pointer would hit with some of them moved.
+    pub(crate) fn dom_hit_test_by<'h>(&self, position: Point<Pixels>, hitbox_at: impl Fn(usize) -> &'h Hitbox) -> HitTest {
         let clips = self.clip_index();
         let mut hit_test = HitTest::default();
-        let mut next = self.hitboxes.iter().enumerate().rposition(|(ix, hitbox)| {
+        let mut next = (0..self.hitboxes.len()).rev().find(|ix| {
+            let hitbox = hitbox_at(*ix);
             hitbox.behavior != HitboxBehavior::PassThrough
                 && hitbox.contains_point(position)
-                && !clips.is_some_and(|clips| self.clipped_out(clips, ix, position))
+                && !clips.is_some_and(|clips| self.clipped_out_by(clips, *ix, position, &hitbox_at))
         });
         while let Some(index) = next {
-            let hitbox = &self.hitboxes[index];
+            let hitbox = hitbox_at(index);
             hit_test.ids.push(hitbox.id);
             hit_test.chain.push(HitChainLink {
                 identity: hitbox.identity.clone(),
@@ -1906,15 +1923,10 @@ impl Frame {
             // A parent is inserted before its children unless a z-indexed element moved the
             // child, so look behind first and then ahead.
             next = hitbox.parent.map(|parent| {
-                self.hitboxes[..index]
-                    .iter()
-                    .rposition(|candidate| candidate.id == parent)
-                    .or_else(|| {
-                        self.hitboxes[index + 1..]
-                            .iter()
-                            .position(|candidate| candidate.id == parent)
-                            .map(|offset| index + 1 + offset)
-                    })
+                (0..index)
+                    .rev()
+                    .find(|candidate| hitbox_at(*candidate).id == parent)
+                    .or_else(|| (index + 1..self.hitboxes.len()).find(|candidate| hitbox_at(*candidate).id == parent))
                     .expect("hitbox parent is missing from the frame")
             });
         }

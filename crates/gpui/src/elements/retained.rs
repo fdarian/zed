@@ -5323,6 +5323,7 @@ mod tests {
 }
 
 mod scroll_probe;
+pub(crate) use scroll_probe::ScrollMiss;
 #[cfg(test)]
 mod fragment_tests;
 #[cfg(test)]

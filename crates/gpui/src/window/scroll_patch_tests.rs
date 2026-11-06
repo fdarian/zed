@@ -2,9 +2,10 @@
 //! reason, the frame that has none, and that nothing is drawn differently.
 
 use crate::{
-    AnyWindowHandle, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement, ListAlignment,
-    ListState, MouseMoveEvent, ParentElement, PlatformInput, Render, ScrollDelta, ScrollPatchReason, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, TestAppContext, Window, div, list, point, px, retained, size,
+    AnyWindowHandle, AppContext as _, Context, ElementId, FocusHandle, GlobalElementId, InteractiveElement,
+    IntoElement, ListAlignment, ListState, MouseMoveEvent, ParentElement, PlatformInput, Render, ScrollDelta,
+    ScrollPatchCause, ScrollPatchReason, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext,
+    Window, div, list, point, px, retained, size,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -21,6 +22,8 @@ struct Page {
     overscan: Option<f32>,
     /// The rows have a hitbox.
     hitboxes: bool,
+    /// A relocatable root inside each row, with the overscan of the row.
+    nested: bool,
     /// The key of the rows: another one builds them again.
     key: Rc<Cell<u64>>,
     focus: Rc<RefCell<Option<FocusHandle>>>,
@@ -32,9 +35,18 @@ impl Render for Page {
         div().size_full().child(
             list(self.state.clone(), move |ix, _, _| {
                 let hitboxes = page.hitboxes;
+                let key = page.key.get();
+                let nested = page.nested.then_some(page.overscan).flatten();
                 let focus = (ix == FOCUSED).then(|| page.focus.borrow().clone()).flatten();
-                let mut row = retained(("row", ix), page.key.get(), move |_, _| {
+                let mut row = retained(("row", ix), key, move |_, _| {
                     let row = div().id(("row", ix)).w_full().h(px(ROW)).bg(crate::blue());
+                    let row = match nested {
+                        Some(overscan) => row.child(
+                            retained(("inner", ix), key, |_, _| div().size_full().into_any_element())
+                                .relocatable(px(overscan)),
+                        ),
+                        None => row,
+                    };
                     let row = if hitboxes { row.always_hitbox() } else { row };
                     match focus {
                         Some(focus) => row.track_focus(&focus).into_any_element(),
@@ -59,11 +71,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool) -> Self {
+        Self::with_nested(cx, overscan, hitboxes, false)
+    }
+
+    fn with_nested(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool, nested: bool) -> Self {
         let state = ListState::new(100, ListAlignment::Top, px(0.)).with_uniform_item_height(px(ROW));
         let page = Page {
             state,
             overscan,
             hitboxes,
+            nested,
             key: Rc::new(Cell::new(1)),
             focus: Rc::default(),
         };
@@ -201,20 +218,120 @@ fn the_hover_change_is_the_only_reason_when_it_is_counted_apart(cx: &mut TestApp
     assert_eq!(counters.hover_only, 1, "{counters:?}");
 }
 
+/// Names the hitbox ids of a chain by the last segment of their path, topmost first.
+fn named(chain: &[GlobalElementId]) -> Vec<String> {
+    chain.iter().map(|id| format!("{:?}", id.last().expect("a hitbox id has a path"))).collect()
+}
+
+#[gpui::test]
+fn a_hitbox_change_the_owner_does_not_mind_is_counted_and_not_a_blocker(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), true);
+    let asked = Rc::new(RefCell::new(Vec::new()));
+    let seen = asked.clone();
+    fixture.with_window(cx, move |window| {
+        window.set_scroll_patch_hover(Some(Rc::new(move |_, before, after| {
+            seen.borrow_mut().push((named(before), named(after)));
+            false
+        })))
+    });
+    // The row 0 spans 0 to 30: the pointer at 28 is in the row 1 after a scroll by 5.
+    fixture.scroll(cx, 10., 28., 5.);
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.mispredicted), (1, 1, 0), "{counters:?}");
+    assert_eq!(counters.held(ScrollPatchReason::HitboxChain), 1, "{counters:?}");
+    assert_eq!(counters.held(ScrollPatchReason::Hover), 0, "{counters:?}");
+    assert_eq!(counters.reasons(ScrollPatchReason::Hover), 0, "{counters:?}");
+    let asked = asked.borrow();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let (before, after) = &asked[0];
+    assert!(before[0].ends_with("0)"), "the row 0 is under the pointer before: {asked:?}");
+    assert!(after[0].ends_with("1)"), "the row 1 is under the pointer after: {asked:?}");
+}
+
+#[gpui::test]
+fn a_hitbox_change_the_owner_minds_is_a_hover_change(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), true);
+    fixture.with_window(cx, |window| window.set_scroll_patch_hover(Some(Rc::new(|_, _, _| true))));
+    fixture.scroll(cx, 10., 28., 5.);
+    let counters = fixture.counters(cx);
+    assert_eq!(counters.held(ScrollPatchReason::HitboxChain), 1, "{counters:?}");
+    only(&counters, ScrollPatchReason::Hover);
+    assert_eq!(counters.hover_only, 1, "{counters:?}");
+}
+
+#[gpui::test]
+fn the_owner_is_not_asked_when_the_hitboxes_under_the_pointer_are_the_same(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), true);
+    let asked = Rc::new(Cell::new(0));
+    let seen = asked.clone();
+    fixture.with_window(cx, move |window| {
+        window.set_scroll_patch_hover(Some(Rc::new(move |_, _, _| {
+            seen.set(seen.get() + 1);
+            true
+        })))
+    });
+    fixture.scroll(cx, 10., 10., 5.);
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.eligible, asked.get()), (1, 0), "{counters:?}");
+    assert_eq!(counters.held(ScrollPatchReason::HitboxChain), 0, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_pointer_that_moved_is_a_hover_change_whatever_the_owner_says(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), true);
+    fixture.with_window(cx, |window| window.set_scroll_patch_hover(Some(Rc::new(|_, _, _| false))));
+    fixture.point_at(cx, 10., 10.);
+    // The wheel event is at another place than the pointer was drawn at.
+    fixture.wheel_with(cx, 10., 50., 5., |_, _| {});
+    only(&fixture.counters(cx), ScrollPatchReason::Hover);
+}
+
 #[gpui::test]
 fn rows_recorded_with_no_overscan_miss_the_region(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(0.), false);
     // The row 3 spans 90 to 120 and the region is the view: a row moved up by 5 leaves 95 to 100 of the
     // view with nothing recorded.
     fixture.scroll(cx, 10., 10., 5.);
-    only(&fixture.counters(cx), ScrollPatchReason::Region);
+    let counters = fixture.counters(cx);
+    only(&counters, ScrollPatchReason::Region);
+    let causes: Vec<_> = ScrollPatchCause::ALL.into_iter().filter(|cause| counters.held_cause(*cause) == 1).collect();
+    assert_eq!(causes, [ScrollPatchCause::RegionBottom], "the rows moved up and the region ends where the view does: {counters:?}");
+}
+
+#[gpui::test]
+fn rows_moved_down_miss_the_top_of_the_region(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(0.), false);
+    fixture.scroll(cx, 10., 10., 40.);
+    fixture.scroll(cx, 10., 10., -5.);
+    let counters = fixture.counters(cx);
+    assert_eq!(counters.held_cause(ScrollPatchCause::RegionTop), 1, "{counters:?}");
 }
 
 #[gpui::test]
 fn rows_that_are_not_relocatable_are_not_runs(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, None, false);
     fixture.scroll(cx, 10., 10., 5.);
-    only(&fixture.counters(cx), ScrollPatchReason::NotRelocatable);
+    let counters = fixture.counters(cx);
+    only(&counters, ScrollPatchReason::NotRelocatable);
+    let causes: Vec<_> = ScrollPatchCause::ALL.into_iter().filter(|cause| counters.held_cause(*cause) == 1).collect();
+    assert_eq!(causes, [ScrollPatchCause::NoRun], "{counters:?}");
+}
+
+#[gpui::test]
+fn a_root_inside_a_row_that_was_built_is_no_run(cx: &mut TestAppContext) {
+    let fixture = Fixture::with_nested(cx, Some(100.), false, true);
+    // The rows are built again: the roots inside them are built in the region of the row, and keep no
+    // recording of their own.
+    fixture.point_at(cx, 10., 10.);
+    fixture.page.key.set(2);
+    // The window draws when the update ends, and that frame is the one shown.
+    fixture.with_window(cx, |window| window.refresh());
+    fixture.wheel_with(cx, 10., 10., 5., |_, _| {});
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.mispredicted), (1, 1, 0), "{counters:?}");
+    for cause in ScrollPatchCause::ALL {
+        assert_eq!(counters.held_cause(cause), 0, "{cause:?}: {counters:?}");
+    }
 }
 
 #[gpui::test]
