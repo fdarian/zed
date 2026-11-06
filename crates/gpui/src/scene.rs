@@ -342,37 +342,56 @@ impl Scene {
         if self.hidden {
             return;
         }
-        // A primitive that the content mask clips away is recorded all the same: whether one
-        // slides under the mask must not change how many operations an element paints, which
-        // is what a patch holds the recording to.
-        let clipped_away = primitive
-            .window_bounds()
-            .intersect(&primitive.content_mask().bounds)
-            .is_empty();
-        match (&primitive, glyph) {
-            (Primitive::PolychromeSprite(sprite), false) => {
-                self.record(PaintOperation::Image(*sprite))
-            }
-            _ => self.record(PaintOperation::Primitive(primitive.clone())),
+        self.place(&primitive, glyph);
+        self.record(PaintOperation::of(primitive, glyph));
+    }
+
+    /// [`Scene::insert`] of a recorded primitive that stays where it is, as a replay finds it: the
+    /// log gets the one copy it needs, and a scene that records nothing gets none.
+    fn replay_primitive(&mut self, primitive: &Primitive) {
+        if self.hidden {
+            return;
         }
-        if !clipped_away {
-            self.route(primitive, glyph);
+        self.place(primitive, true);
+        if !self.is_sub_scene {
+            self.record(PaintOperation::Primitive(primitive.clone()));
         }
+    }
+
+    /// Routes a primitive unless the content mask clips it away. One that is clipped away is
+    /// recorded all the same: whether one slides under the mask must not change how many
+    /// operations an element paints, which is what a patch holds the recording to.
+    fn place(&mut self, primitive: &Primitive, glyph: bool) {
+        let window_bounds = primitive.window_bounds();
+        if window_bounds.intersect(&primitive.content_mask().bounds).is_empty() {
+            return;
+        }
+        self.route_within(primitive, glyph, window_bounds);
     }
 
     /// Puts an already recorded primitive where it is drawn: opacity of a flat group, the open text
     /// clips, and the scene of the innermost open group.
-    fn route(&mut self, primitive: Primitive, glyph: bool) {
+    fn route(&mut self, primitive: &Primitive, glyph: bool) {
+        self.route_within(primitive, glyph, primitive.window_bounds());
+    }
+
+    /// [`Scene::route`] of a primitive whose [`Primitive::window_bounds`] are known, which opacity
+    /// and the glyph mask leave as they are.
+    fn route_within(&mut self, primitive: &Primitive, glyph: bool, window_bounds: Bounds<ScaledPixels>) {
+        let faded;
         let mut primitive = primitive;
         if !self.effect_groups_enabled {
             let opacity: f32 = self.flat_opacities.iter().product();
             if opacity < 1. {
-                primitive.apply_opacity(opacity);
+                let mut copy = primitive.clone();
+                copy.apply_opacity(opacity);
+                faded = copy;
+                primitive = &faded;
             }
         }
-        if glyph && let Some(glyph) = primitive.as_glyph_mask() {
+        if glyph && !self.text_clips.is_empty() && let Some(glyph) = primitive.as_glyph_mask() {
             for clip in &mut self.text_clips {
-                clip.scene.insert_primitive_local(glyph.clone());
+                clip.scene.insert_primitive_local(&glyph, window_bounds);
             }
         }
         match self.inserting {
@@ -380,7 +399,7 @@ impl Scene {
             PrimitiveCount::Replayed => self.counts.replayed_primitives += 1,
             PrimitiveCount::Uncounted => {}
         }
-        self.current_mut().insert_primitive_local(primitive);
+        self.current_mut().insert_primitive_local(primitive, window_bounds);
     }
 
     /// Adds what a recorder scene counted to this one's, which the recorder's primitives are
@@ -402,7 +421,7 @@ impl Scene {
             return;
         }
         if !quad.background.is_transparent() {
-            self.route(quad.into(), true);
+            self.route(&quad.into(), true);
             return;
         }
         let outer_bounds = quad.bounds;
@@ -416,7 +435,7 @@ impl Scene {
             || quad.content_mask.corner_radii != Corners::default()
             || quad.transformation != TransformationMatrix::unit()
         {
-            self.route(quad.into(), true);
+            self.route(&quad.into(), true);
             return;
         }
 
@@ -454,7 +473,7 @@ impl Scene {
                     },
                     ..quad
                 };
-                self.route(piece.into(), true);
+                self.route(&piece.into(), true);
             }
         }
     }
@@ -508,14 +527,14 @@ impl Scene {
     }
 
     /// Stores the primitive in this scene with an order, without recording or routing it.
-    fn insert_primitive_local(&mut self, mut primitive: Primitive) {
-        let clipped_bounds = primitive
-            .window_bounds()
-            .intersect(&primitive.content_mask().bounds);
+    fn insert_primitive_local(&mut self, primitive: &Primitive, window_bounds: Bounds<ScaledPixels>) {
+        let mask = primitive.content_mask().bounds;
+        let clipped_bounds = window_bounds.intersect(&mask);
         // What a primitive draws beyond its bounds is ordered against what it overlaps there.
-        let drawn_bounds = primitive
-            .drawn_bounds()
-            .intersect(&primitive.content_mask().bounds);
+        let drawn_bounds = match primitive {
+            Primitive::Shadow(shadow) => shadow.drawn_bounds().intersect(&mask),
+            _ => clipped_bounds,
+        };
 
         if clipped_bounds.is_empty() || drawn_bounds.is_empty() {
             return;
@@ -526,39 +545,35 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.insert_bounds(drawn_bounds));
-        match &mut primitive {
+        match primitive {
             Primitive::Shadow(shadow) => {
-                shadow.order = order;
-                self.shadows.push(*shadow);
+                self.shadows.push(Shadow { order, ..*shadow });
             }
             Primitive::Quad(quad) => {
-                quad.order = order;
-                self.quads.push(*quad);
+                self.quads.push(Quad { order, ..*quad });
             }
             Primitive::Path(path) => {
+                let mut path = path.clone();
                 path.order = order;
                 path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
+                self.paths.push(path);
             }
             Primitive::Underline(underline) => {
-                underline.order = order;
-                self.underlines.push(*underline);
+                self.underlines.push(Underline { order, ..*underline });
             }
             Primitive::MonochromeSprite(sprite) => {
-                sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
+                self.monochrome_sprites.push(MonochromeSprite { order, ..*sprite });
             }
             Primitive::SubpixelSprite(sprite) => {
-                sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
+                self.subpixel_sprites.push(SubpixelSprite { order, ..*sprite });
             }
             Primitive::PolychromeSprite(sprite) => {
-                sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
+                self.polychrome_sprites.push(PolychromeSprite { order, ..*sprite });
             }
             Primitive::Surface(surface) => {
+                let mut surface = surface.clone();
                 surface.order = order;
-                self.surfaces.push(surface.clone());
+                self.surfaces.push(surface);
             }
         }
     }
@@ -804,7 +819,8 @@ impl Scene {
         if effect.is_opacity_only() && reserved_order.is_none() {
             if let Some(mut only) = scene.take_only_primitive() {
                 only.apply_opacity(effect.opacity);
-                self.current_mut().insert_primitive_local(only);
+                let window_bounds = only.window_bounds();
+                self.current_mut().insert_primitive_local(&only, window_bounds);
                 return;
             }
         }
@@ -1133,32 +1149,37 @@ impl Scene {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
         let inserting = mem::replace(&mut self.inserting, count);
+        if !self.is_sub_scene {
+            self.paint_operations.reserve(operations.len());
+        }
         for operation in operations {
-            self.replay_operation(operation.clone());
+            self.replay_operation(operation);
         }
         self.inserting = inserting;
         self.hidden = hidden;
     }
 
-    fn replay_operation(&mut self, operation: PaintOperation) {
+    /// Paints a recorded operation again. The one copy of its primitive goes to the log, where it
+    /// is recorded: the typed vectors get theirs from the recording itself.
+    fn replay_operation(&mut self, operation: &PaintOperation) {
         match operation {
-            PaintOperation::Primitive(primitive) => self.insert_primitive(primitive),
-            PaintOperation::Quad(quad) => self.insert_quad(quad),
-            PaintOperation::Image(sprite) => self.insert_image(sprite),
-            PaintOperation::PendingGlyph(glyph) => self.insert_pending_glyph(glyph),
-            PaintOperation::NativeSurface(placeholder) => self.insert_native_surface(placeholder),
-            PaintOperation::StartLayer(bounds) => self.push_layer(bounds),
+            PaintOperation::Primitive(primitive) => self.replay_primitive(primitive),
+            PaintOperation::Quad(quad) => self.insert_quad(*quad),
+            PaintOperation::Image(sprite) => self.insert_image(*sprite),
+            PaintOperation::PendingGlyph(glyph) => self.insert_pending_glyph(glyph.clone()),
+            PaintOperation::NativeSurface(placeholder) => self.insert_native_surface(placeholder.clone()),
+            PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
             PaintOperation::EndLayer => self.pop_layer(),
             PaintOperation::StartGroup {
                 effect,
                 content_mask,
                 reserved,
-            } => self.start_group(effect, content_mask, reserved),
+            } => self.start_group(effect.clone(), *content_mask, *reserved),
             PaintOperation::EndGroup => self.end_group(),
-            PaintOperation::WidenGroups(escaped) => self.widen_groups(escaped),
+            PaintOperation::WidenGroups(escaped) => self.widen_groups(*escaped),
             PaintOperation::StartTextClip => self.start_text_clip(),
             PaintOperation::EndTextClip => self.end_text_clip(),
-            PaintOperation::Replaced { derived } => self.begin_replaced(derived),
+            PaintOperation::Replaced { derived } => self.begin_replaced(*derived),
             PaintOperation::EndReplaced => self.end_replaced(),
         }
     }
@@ -1178,9 +1199,10 @@ impl Scene {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
         let inserting = mem::replace(&mut self.inserting, count);
-        for operation in TranslatedOperations::new(operations, delta, clip) {
-            self.replay_operation(operation);
+        if !self.is_sub_scene {
+            self.paint_operations.reserve(operations.len());
         }
+        TranslatedOperations::new(operations, delta, clip).replay_into(self);
         self.inserting = inserting;
         self.hidden = hidden;
     }
@@ -1354,6 +1376,15 @@ pub(crate) enum PaintOperation {
 }
 
 impl PaintOperation {
+    /// What [`Scene::insert`] records for `primitive`: an image keeps its kind, which a replay
+    /// puts back as one.
+    fn of(primitive: Primitive, glyph: bool) -> PaintOperation {
+        match primitive {
+            Primitive::PolychromeSprite(sprite) if !glyph => PaintOperation::Image(sprite),
+            primitive => PaintOperation::Primitive(primitive),
+        }
+    }
+
     /// Whether the content mask clips the primitive away, which draws nothing: what a painter
     /// records, and an element that is culled does not paint.
     fn is_clipped_away(&self) -> bool {
@@ -1708,21 +1739,37 @@ impl<'a> TranslatedOperations<'a> {
     }
 }
 
-impl Iterator for TranslatedOperations<'_> {
-    type Item = PaintOperation;
+impl TranslatedOperations<'_> {
+    /// Puts what is left of the operations into `scene`, which is what iterating them and
+    /// replaying each does, except that a primitive is built where the scene takes it from and not
+    /// passed through an operation, which is a copy of it for each step.
+    fn replay_into(mut self, scene: &mut Scene) {
+        while let Some(operation) = self.operations.next() {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let primitive = self.translated_primitive(primitive);
+                    scene.insert(primitive, true);
+                }
+                operation => scene.replay_operation(&self.translate(operation)),
+            }
+        }
+    }
 
-    fn next(&mut self) -> Option<PaintOperation> {
-        let operation = self.operations.next()?;
+    fn translated_primitive(&self, primitive: &Primitive) -> Primitive {
+        let mut primitive = primitive.clone();
+        primitive.translate_replayed(self.delta);
+        if self.clipping.last().copied().unwrap_or(true) {
+            primitive.clip_to(self.clip);
+        }
+        primitive
+    }
+
+    fn translate(&mut self, operation: &PaintOperation) -> PaintOperation {
         let (delta, clip) = (self.delta, self.clip);
         let clipped = self.clipping.last().copied().unwrap_or(true);
-        Some(match operation {
+        match operation {
             PaintOperation::Primitive(primitive) => {
-                let mut primitive = primitive.clone();
-                primitive.translate_replayed(delta);
-                if clipped {
-                    primitive.clip_to(clip);
-                }
-                PaintOperation::Primitive(primitive)
+                PaintOperation::Primitive(self.translated_primitive(primitive))
             }
             PaintOperation::Quad(quad) => {
                 let mut quad = *quad;
@@ -1805,7 +1852,16 @@ impl Iterator for TranslatedOperations<'_> {
             PaintOperation::EndGroup => PaintOperation::EndGroup,
             PaintOperation::StartTextClip => PaintOperation::StartTextClip,
             PaintOperation::EndTextClip => PaintOperation::EndTextClip,
-        })
+        }
+    }
+}
+
+impl Iterator for TranslatedOperations<'_> {
+    type Item = PaintOperation;
+
+    fn next(&mut self) -> Option<PaintOperation> {
+        let operation = self.operations.next()?;
+        Some(self.translate(operation))
     }
 }
 
@@ -3541,6 +3597,47 @@ mod tests {
             .map(|quad| quad.background.as_solid().unwrap().a)
             .collect();
         assert_eq!(alphas, vec![0.5, 0.25, 1.]);
+    }
+
+    #[test]
+    fn a_replay_fades_what_it_puts_without_group_support_as_painting_it_there_does() {
+        let mut sprite = glyph(10., 10.);
+        sprite.color = red();
+        let primitives: [Primitive; 3] = [quad(0., 0., 10., 10.).into(), sprite.into(), quad(900., 900., 10., 10.).into()];
+        let mut recorded = Scene::default();
+        for primitive in &primitives {
+            recorded.insert_primitive(primitive.clone());
+        }
+        let fading = || {
+            let mut scene = Scene::default();
+            scene.start_group(fade(0.5), mask(), None);
+            scene
+        };
+        let mut painted = fading();
+        for primitive in &primitives {
+            painted.insert_primitive(primitive.clone());
+        }
+        let mut replayed = fading();
+        replayed.replay(0..recorded.len(), &recorded);
+        let mut moved = fading();
+        moved.replay_translated(
+            &recorded.paint_operations,
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            &clip(-1000., -1000., 3000., 3000.),
+            PrimitiveCount::Replayed,
+        );
+
+        for scene in [&mut painted, &mut replayed, &mut moved] {
+            scene.finish();
+        }
+        for scene in [&replayed, &moved] {
+            assert_eq!(describe(scene), describe(&painted));
+            assert_eq!(scene.quads.len(), 1, "the quad the mask clips away is recorded and not put");
+            assert_eq!(scene.quads[0].background.as_solid().unwrap().a, painted.quads[0].background.as_solid().unwrap().a);
+            assert_eq!(scene.monochrome_sprites[0].color.a, painted.monochrome_sprites[0].color.a);
+            assert_eq!(scene.monochrome_sprites[0].color.a, 0.5);
+            assert_eq!(scene.monochrome_sprites[0].order, painted.monochrome_sprites[0].order);
+        }
     }
 
     #[test]
