@@ -726,7 +726,9 @@ impl Window {
 
         let shown = &self.rendered_frame.scroll;
         let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self));
-        if self.scroll_patch.gate.is_none() || gate == Some(Reason::Other) || shown.lists.is_empty() {
+        // A row that a patch repainted is shown as the patch painted it, and its recording is of the paint
+        // before: a translate would put that back.
+        if self.scroll_patch.gate.is_none() || gate == Some(Reason::Other) || shown.lists.is_empty() || self.patch.recordings_stale {
             return Verdict::other();
         }
         if shown.viewport != self.viewport_size || shown.scale_factor != self.scale_factor {

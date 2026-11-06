@@ -444,9 +444,10 @@ impl RetainedState {
         let recorded = self.recorded.as_ref()?;
         let paint = recorded.paint.as_ref()?;
         let rendered = window.rendered_serial();
+        // A recording that is put elsewhere than it was recorded is not what a patch paints over.
         (recorded.patch.is_some()
-            && paint.is_plain()
-            && recorded.relocation.is_none()
+            && paint.is_plain_or_relocated(recorded.relocation.is_some())
+            && recorded.delta.is_zero()
             && recorded.prepaint.lifts.is_none()
             && recorded.is_placed_in(rendered)
             && self.engine == window.layout_engine_id()
@@ -803,7 +804,7 @@ impl Retained {
                 if let Some(relocation) = relocation {
                     window.begin_relocation(relocation, true);
                 }
-                let patchable = self.patchable && self.overscan.is_none();
+                let patchable = self.patchable;
                 let accessed_entities = if *record {
                     let owner = self.state_owner(global_id, window);
                     window
@@ -866,7 +867,7 @@ impl Retained {
                             if let Some(recorded) = state.recorded.as_mut() {
                                 recorded.relocation = relocation;
                                 recorded.settle_movability(&paint, translates, relocatable, window);
-                                if !paint.is_plain() {
+                                if !paint.is_plain_or_relocated(relocatable) {
                                     recorded.patch = None;
                                 }
                                 recorded.patch = recorded.patch.take().and_then(|unit| window.painted_patch_unit(&unit));
@@ -1224,6 +1225,7 @@ impl Retained {
             else {
                 return (false, state);
             };
+            let exact = recorded.key == key;
             let Some(delta) = recorded.place(&key, &ambient, window) else {
                 return (false, state);
             };
@@ -1242,10 +1244,14 @@ impl Retained {
             if recorded.is_loose() {
                 window.retained.relocated_inside += 1;
             }
-            if delta.is_zero()
-                && let Some(unit) = &recorded.patch
-            {
-                window.register_patch_unit(&id, unit);
+            if let Some(unit) = &recorded.patch {
+                // A recording put elsewhere than it was made is no source for a patch, which
+                // paints it where its surroundings were captured.
+                if delta.is_zero() && exact {
+                    window.register_patch_unit(&id, unit);
+                } else {
+                    window.note_relocated_patch_unit(&id);
+                }
             }
             window.retained.counters.replays += 1;
             if !delta.is_zero() {
@@ -1587,8 +1593,11 @@ impl Retained {
         prepaint: impl FnOnce(&mut Window, &mut App),
     ) -> (bool, Option<Relocation>) {
         let publishes = self.on_replay.is_some();
-        let patch = (self.patchable && self.overscan.is_none())
-            .then(|| window.capture_patch_unit(global_id, &self.id, self.lift_z))
+        // A root that is recorded to be put elsewhere is patched where it was recorded (`Recorded::patch`
+        // is only handed to a patch while the root is at its recorded place), and one that is placed by a
+        // block outside it is not recorded, so it has nothing to patch from.
+        let patch = (self.patchable && (self.overscan.is_none() || root_escape.is_none()))
+            .then(|| window.capture_patch_unit(global_id, &self.id, self.lift_z, self.overscan.is_some()))
             .flatten();
         let (relocation, unmovable_at_start) = self.plan_relocation(window);
         if relocation.as_ref().is_some_and(|relocation| !relocation.direct) {

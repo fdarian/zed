@@ -59,6 +59,9 @@ pub enum PatchDecline {
     /// that is patched never did: the root stopped being a stacking context (an opacity animation
     /// that ended), and its positioned children are the page's to paint now.
     Lifts,
+    /// The root was recorded to be put elsewhere and the frame put it elsewhere than it was
+    /// recorded: a patch paints a root where its surroundings were captured.
+    Relocated,
     /// The hitboxes are not the ones recorded.
     Hitboxes,
     /// The listeners, tooltips, cursors, tab stops, input handlers, dispatch nodes or focus are
@@ -76,7 +79,7 @@ pub enum PatchDecline {
 
 impl PatchDecline {
     /// Every reason.
-    pub const ALL: [PatchDecline; 14] = [
+    pub const ALL: [PatchDecline; 15] = [
         PatchDecline::PendingView,
         PatchDecline::Refreshing,
         PatchDecline::UnknownUnit,
@@ -86,6 +89,7 @@ impl PatchDecline {
         PatchDecline::UnstableLayout,
         PatchDecline::Effects,
         PatchDecline::Lifts,
+        PatchDecline::Relocated,
         PatchDecline::Hitboxes,
         PatchDecline::Registrations,
         PatchDecline::Operations,
@@ -172,6 +176,10 @@ pub(crate) struct PatchWindow {
     pub(crate) hitbox_ids: Option<RecordedHitboxIds>,
     outcome: Option<PatchOutcome>,
     trace: Option<PatchTrace>,
+    /// A patch repainted a root that is recorded to be put elsewhere, so the recording of it is of
+    /// the paint before: a scroll translate, which puts rows where their recordings paint them,
+    /// would show it. Until a frame is built whole.
+    pub(crate) recordings_stale: bool,
 }
 
 /// The ids of the hitboxes a recording holds, handed out again in the order they were inserted
@@ -224,6 +232,8 @@ pub(crate) struct PatchUnit {
     /// What the root says of itself, which its new element must say too: whether it is handed to
     /// a stacking context depends on the parent, which a patch does not build.
     lift_z: Option<i32>,
+    /// The root is recorded to be put elsewhere (`Retained::relocatable`).
+    relocatable: bool,
     prepaint: Surroundings,
     placement: Placement,
 }
@@ -510,6 +520,7 @@ impl Window {
         id: &GlobalElementId,
         name: &ElementId,
         lift_z: Option<i32>,
+        relocatable: bool,
     ) -> Option<Rc<PatchUnit>> {
         let placement = if self.lifts_open == 0 {
             Placement::InPlace
@@ -520,6 +531,7 @@ impl Window {
             id: id.clone(),
             name: name.clone(),
             lift_z,
+            relocatable,
             prepaint: self.capture_surroundings()?,
             placement,
         }))
@@ -539,6 +551,7 @@ impl Window {
             id: unit.id.clone(),
             name: unit.name.clone(),
             lift_z: unit.lift_z,
+            relocatable: unit.relocatable,
             prepaint: unit.prepaint.clone(),
             placement,
         }))
@@ -585,6 +598,23 @@ impl Window {
         }
     }
 
+    /// Says that the retained root `id` of the frame being built is patchable and was put elsewhere
+    /// than it was recorded.
+    pub(crate) fn note_relocated_patch_unit(&mut self, id: &ElementId) {
+        self.next_frame.relocated.insert(id.clone());
+    }
+
+    /// Why [`Window::repaint_in_place`] would decline the retained root `id` of the rendered frame
+    /// before it paints it, if it would: the root is not patchable, or was recorded to be put elsewhere
+    /// and the frame has it elsewhere. An embedder asks before it builds a root for nothing.
+    pub fn patch_blocker(&self, id: &ElementId) -> Option<PatchDecline> {
+        match self.rendered_frame.patchable.get(id) {
+            Some(Some(_)) => None,
+            _ if self.rendered_frame.relocated.contains(id) => Some(PatchDecline::Relocated),
+            _ => Some(PatchDecline::UnknownUnit),
+        }
+    }
+
     fn try_repaint_in_place(
         &mut self,
         units: Vec<(ElementId, AnyElement)>,
@@ -598,7 +628,7 @@ impl Window {
                 return Err(PatchDecline::UnknownUnit);
             }
             let Some(Some(unit)) = self.rendered_frame.patchable.get(&id).cloned() else {
-                return Err(PatchDecline::UnknownUnit);
+                return Err(self.patch_blocker(&id).expect("a root that is not registered has a blocker"));
             };
             let source = self
                 .peek_element_state(&unit.id, |state: &RetainedState| state.patch_source(self))
@@ -622,6 +652,9 @@ impl Window {
             return Err(PatchDecline::Rejected);
         }
         let changed = runs.iter().any(|run| !run.changed.is_empty());
+        if changed && resolved.iter().any(|unit| unit.unit.relocatable) {
+            self.patch.recordings_stale = true;
+        }
         if self.retained.verifier.is_some() {
             self.patch.trace = Some(PatchTrace {
                 units: resolved

@@ -68,6 +68,8 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod patch;
 #[cfg(test)]
+mod hover_patch_tests;
+#[cfg(test)]
 mod patch_tests;
 #[cfg(test)]
 mod transform_tests;
@@ -1569,6 +1571,9 @@ pub(crate) struct Frame {
     /// of the root; `None` for an id that two of them have. Good for the frame that holds it, and
     /// only while it is the rendered one.
     pub(crate) patchable: FxHashMap<ElementId, Option<Rc<PatchUnit>>>,
+    /// The patchable roots of this frame that a replay put elsewhere than they were recorded, which
+    /// a patch declines as such (`PatchDecline::Relocated`).
+    pub(crate) relocated: FxHashSet<ElementId>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     /// Every insertion into `debug_bounds`, in order, for a replay to repeat.
@@ -1746,6 +1751,7 @@ impl Frame {
             retained_recordings: Vec::new(),
             scroll: ScrollFrame::default(),
             patchable: FxHashMap::default(),
+            relocated: FxHashSet::default(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -1776,6 +1782,7 @@ impl Frame {
         clear_shrinking(&mut self.retained_recordings);
         self.scroll.clear();
         clear_shrinking(&mut self.patchable);
+        self.relocated.clear();
         clear_shrinking(&mut self.hitboxes);
         self.hitboxes_changed();
         self.window_control_hitboxes.clear();
@@ -5275,6 +5282,7 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.retained.rendered_serial += 1;
+        self.patch.recordings_stale = false;
         self.next_frame.clear();
         self.settle_scroll_patch();
         if let Some(trace) = patched {

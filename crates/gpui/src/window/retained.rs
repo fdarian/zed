@@ -2837,6 +2837,13 @@ impl PaintRecord {
         self.lift_markers.is_empty() && self.operations.is_none() && !self.moves
     }
 
+    /// [`PaintRecord::is_plain`], or what a subtree recorded to be put elsewhere (`relocated`)
+    /// leaves in a scene of its own, which is the recording of that subtree and of nothing inside
+    /// it (a subtree is not recorded to be moved inside another that is).
+    pub(crate) fn is_plain_or_relocated(&self, relocated: bool) -> bool {
+        self.lift_markers.is_empty() && (relocated || (self.operations.is_none() && !self.moves))
+    }
+
     /// What the paint left in the frame being built, as text. `loose` leaves out what only a hitbox
     /// that cannot be reached has, see [`PrepaintRecord::describe`].
     pub(crate) fn describe(&self, window: &Window, loose: bool) -> String {

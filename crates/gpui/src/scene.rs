@@ -1598,11 +1598,64 @@ impl PaintOperation {
         if !self.same_kind(other) {
             return true;
         }
+        // Most operations of a root are glyphs, quads and markers that are as they were, and are known to be by
+        // their fields: formatting two of them costs a hundred thousand instructions, a root of a hundred
+        // operations several million. What the fields do not call equal is told apart by the debug form.
+        if self.has_equal_fields(other) {
+            return false;
+        }
         match (self, other) {
             (PaintOperation::NativeSurface(left), PaintOperation::NativeSurface(right)) => {
                 !same_debug_form(&PaintedSurface(left), &PaintedSurface(right))
             }
             _ => !same_debug_form(self, other),
+        }
+    }
+}
+
+impl PaintOperation {
+    /// Whether the operations are of a kind whose fields are compared here and all of them are equal.
+    /// False for any other kind, and for fields that are not equal; the debug form decides those.
+    fn has_equal_fields(&self, other: &PaintOperation) -> bool {
+        match (self, other) {
+            (PaintOperation::Primitive(Primitive::MonochromeSprite(a)), PaintOperation::Primitive(Primitive::MonochromeSprite(b))) => {
+                a.order == b.order
+                    && a.pad == b.pad
+                    && a.bounds == b.bounds
+                    && a.content_mask == b.content_mask
+                    && a.color == b.color
+                    && a.tile == b.tile
+                    && a.transformation == b.transformation
+                    && a.local_clip == b.local_clip
+                    && a.clip_transformation == b.clip_transformation
+            }
+            (PaintOperation::Quad(a), PaintOperation::Quad(b)) => {
+                a.order == b.order
+                    && a.border_styles == b.border_styles
+                    && a.bounds == b.bounds
+                    && a.content_mask == b.content_mask
+                    && a.background == b.background
+                    && a.border_colors == b.border_colors
+                    && a.border_inner_colors == b.border_inner_colors
+                    && a.corner_radii == b.corner_radii
+                    && a.corner_radii_y == b.corner_radii_y
+                    && a.border_widths == b.border_widths
+                    && a.background_tile == b.background_tile
+                    && a.transformation == b.transformation
+                    && a.local_clip == b.local_clip
+            }
+            (PaintOperation::StartLayer(a), PaintOperation::StartLayer(b)) => a == b,
+            (PaintOperation::WidenGroups(a), PaintOperation::WidenGroups(b)) => a == b,
+            // Whether the mask was cut from masks inside the subtree is how a recording is put elsewhere. A recording that
+            // is put elsewhere has it, and a build at its own place does not: both paint the same, and a patch keeps the
+            // recording's.
+            (PaintOperation::Replaced { .. }, PaintOperation::Replaced { .. }) => true,
+            (PaintOperation::EndLayer, PaintOperation::EndLayer)
+            | (PaintOperation::EndGroup, PaintOperation::EndGroup)
+            | (PaintOperation::StartTextClip, PaintOperation::StartTextClip)
+            | (PaintOperation::EndTextClip, PaintOperation::EndTextClip)
+            | (PaintOperation::EndReplaced, PaintOperation::EndReplaced) => true,
+            _ => false,
         }
     }
 }
@@ -4529,6 +4582,24 @@ mod tests {
             assert!(scene.patch_in_place(edits.iter().copied(), &mut 0));
             assert_eq!(scene.describe_primitives(), painted.scene().describe_primitives());
         }
+    }
+
+    #[test]
+    fn operations_are_told_apart_by_their_fields_and_a_marker_by_its_kind() {
+        let green = Hsla { h: 0.33, s: 1., l: 0.5, a: 1. };
+        let flat = Flat::new().scene().into_operations();
+        let other = Flat { card: green, ..Flat::new() }.scene().into_operations();
+        assert_eq!(flat.len(), other.len());
+        for (a, b) in flat.iter().zip(&flat) {
+            assert!(!a.differs_from(b), "an operation does not differ from itself: {a:?}");
+        }
+        assert!(
+            flat.iter().zip(&other).any(|(a, b)| a.differs_from(b)),
+            "the card of another colour paints differently"
+        );
+        // How a recording is put elsewhere is not how it paints.
+        assert!(!PaintOperation::Replaced { derived: true }.differs_from(&PaintOperation::Replaced { derived: false }));
+        assert!(PaintOperation::Replaced { derived: true }.differs_from(&PaintOperation::EndReplaced));
     }
 
     #[test]
