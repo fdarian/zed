@@ -1808,7 +1808,9 @@ fn sort_items<T>(items: &mut [T], key: impl Fn(&T) -> u128, placed: Option<Place
             key << INDEX_BITS | index as u128
         })
         .collect();
-    gather.sort_unstable();
+    // The numbers of a frame are a dozen sorted runs (a row of a list at a time), which the stable
+    // sort finds and merges where the unstable one sorts them over.
+    gather.sort();
     if let Some(placed) = placed {
         debug_assert_eq!(items.len(), placed.inserted.len());
         for (to, number) in gather.iter().enumerate() {
