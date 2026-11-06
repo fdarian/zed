@@ -1164,6 +1164,19 @@ impl ReplayKey {
 }
 
 impl ReplayKey {
+    /// Whether [`Self::relocation`] puts a subtree `delta` away from where this key recorded it
+    /// when nothing else of what it reads differs and the surroundings have no exact clip: what
+    /// a scroll changes. The checks of `relocation` that compare two keys hold by construction.
+    pub(crate) fn relocates_by(&self, delta: Point<Pixels>) -> bool {
+        let power_of_two = self.scale_factor > 0. && self.scale_factor.to_bits() & 0x007f_ffff == 0;
+        power_of_two
+            && self.exact_clips.is_empty()
+            && !self.content_mask.is_rounded()
+            && !(self.transform.as_ref().is_some_and(AmbientKey::is_general) && !delta.is_zero())
+    }
+}
+
+impl ReplayKey {
     /// How far a layout moved the subtree from where this key recorded it, if that is all that
     /// differs: the box, the place the layout engine gave it and the content mask around it moved
     /// by one whole number of device pixels, and everything else the subtree reads is the same.

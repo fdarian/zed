@@ -21,6 +21,9 @@ use refineable::Refineable as _;
 use std::{cell::RefCell, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
 
+mod scroll_patch;
+pub(crate) use scroll_patch::ListFrame;
+
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
 
 /// Construct a new list element
@@ -1146,6 +1149,7 @@ impl StateInner {
             );
         }
 
+        window.note_list_scrolled(current_view);
         cx.notify(current_view);
     }
 
@@ -1519,6 +1523,7 @@ impl StateInner {
                 item_origin.y += scroll_snap - layout_response.first_row_offset;
                 for item in &mut layout_response.item_layouts {
                     window.with_exact_hit_mask(Some(clip), |window| {
+                        window.scroll_patch_row(item.index);
                         item.element.prepaint_at_fractional(item_origin, window, cx);
                     });
 
@@ -1860,12 +1865,15 @@ impl Element for List {
         });
 
         let escapes_before = window.escapes_prepainted();
+        let list_id = scroll_routing::scroller_id_of_state(&self.state.0);
         let layout = window.with_element_space(space.clone(), |window| {
             window.with_hitbox_parent(&hitbox, |window| {
+                window.scroll_patch_begin_list(list_id);
                 match state.prepaint_items(viewport, clip, unsnapped, padding, true, &mut self.render_item, window, cx) {
                     Ok(layout) => layout,
                     Err(autoscroll_request) => {
                         state.logical_scroll_top = Some(autoscroll_request);
+                        window.scroll_patch_begin_list(list_id);
                         state
                             .prepaint_items(viewport, clip, unsnapped, padding, false, &mut self.render_item, window, cx)
                             .unwrap()
@@ -1878,6 +1886,10 @@ impl Element for List {
         state.last_rows_origin = Some(unsnapped.origin + Point::new(padding.left, padding.top));
         state.last_content_width = Some(content_width);
         state.last_padding = Some(padding);
+        if window.scroll_patch_records() {
+            let frame = state.frame_of(list_id, &self.state, &layout, viewport, padding);
+            window.scroll_patch_end_list(frame);
+        }
         // The overlay reads the list state, which must not be borrowed meanwhile.
         drop(state_guard);
         // After the rows: they are built here, not before layout, and a listener that asks whether

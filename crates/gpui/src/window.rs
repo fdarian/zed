@@ -73,11 +73,16 @@ mod patch_tests;
 mod transform_tests;
 mod prompts;
 mod retained;
+mod scroll_patch;
+#[cfg(test)]
+mod scroll_patch_tests;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
+pub use scroll_patch::{ScrollPatchCounters, ScrollPatchReason};
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
+pub(crate) use scroll_patch::{ScrollFrame, ScrollPatchWindow};
 pub(crate) use retained::{
     HandleList, LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
     Origin, RetainedWindow, StateOwner, SubtreeText, blocker_bit, first_blocker,
@@ -1555,6 +1560,8 @@ pub(crate) struct Frame {
     /// The element states of the retained subtrees (see [`crate::retained`]) recorded this
     /// frame, so that a rolled-back prepaint can drop the recordings it made.
     retained_recordings: Vec<((GlobalElementId, TypeId), Rc<Origin>)>,
+    /// The lists and the relocatable roots in them, see [`scroll_patch`].
+    pub(crate) scroll: ScrollFrame,
     /// The retained roots of this frame that [`Window::repaint_in_place`] can repaint, by the id
     /// of the root; `None` for an id that two of them have. Good for the frame that holds it, and
     /// only while it is the rendered one.
@@ -1734,6 +1741,7 @@ impl Frame {
             layout_publications: Vec::new(),
             scrollers: Vec::new(),
             retained_recordings: Vec::new(),
+            scroll: ScrollFrame::default(),
             patchable: FxHashMap::default(),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -1763,6 +1771,7 @@ impl Frame {
         self.layout_publications.clear();
         self.scrollers.clear();
         clear_shrinking(&mut self.retained_recordings);
+        self.scroll.clear();
         clear_shrinking(&mut self.patchable);
         clear_shrinking(&mut self.hitboxes);
         self.hitboxes_changed();
@@ -2147,6 +2156,8 @@ pub struct Window {
     pub(crate) a11y: A11y,
     pub(crate) retained: RetainedWindow,
     pub(crate) patch: PatchWindow,
+    /// What the frames drawn after a list scroll are classified by, see [`scroll_patch`].
+    pub(crate) scroll_patch: ScrollPatchWindow,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2888,6 +2899,7 @@ impl Window {
             ),
             retained: RetainedWindow::default(),
             patch: PatchWindow::default(),
+            scroll_patch: ScrollPatchWindow::default(),
         })
     }
 
@@ -5171,6 +5183,7 @@ impl Window {
             }
         }
 
+        self.classify_scroll_patch(cx);
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -5233,6 +5246,7 @@ impl Window {
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.retained.rendered_serial += 1;
         self.next_frame.clear();
+        self.settle_scroll_patch();
         if let Some(trace) = patched {
             self.verify_patch(trace);
         }

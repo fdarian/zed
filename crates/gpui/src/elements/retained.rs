@@ -663,10 +663,14 @@ impl Element for Retained {
         let global_id = &self.global_id(window);
         let outer_scope = std::mem::replace(&mut window.layout_scope, global_id.scope_hash());
         let ignores_text_color = self.ignores_text_color;
+        let scroll_run = self.overscan.and_then(|_| window.scroll_patch_begin_root());
         let result = with_fixed_text_color(ignores_text_color, window, |window| {
             self.prepaint_in_scope(global_id, bounds, request_layout, window, cx)
         });
         window.layout_scope = outer_scope;
+        if let Some(hitboxes_start) = scroll_run {
+            window.scroll_patch_end_root_prepaint(global_id, hitboxes_start, matches!(result, RetainedPrepaint::Replayed));
+        }
         // The parent hands this subtree to the stacking context around it once this returns, unless
         // it is in a culled subtree, where nothing is handed over: the next element that is would
         // take this one for the subtree it hands over.
@@ -700,7 +704,11 @@ impl Element for Retained {
     ) {
         let global_id = &self.global_id(window);
         let ignores_text_color = self.ignores_text_color;
+        let scroll_ops = self.overscan.and_then(|_| window.scroll_patch_begin_paint());
         with_fixed_text_color(ignores_text_color, window, |window| self.paint_subtree(global_id, prepaint, window, cx));
+        if let Some(ops_start) = scroll_ops {
+            window.scroll_patch_end_root_paint(global_id, ops_start);
+        }
     }
 }
 
@@ -5314,6 +5322,7 @@ mod tests {
     }
 }
 
+mod scroll_probe;
 #[cfg(test)]
 mod fragment_tests;
 #[cfg(test)]
