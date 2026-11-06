@@ -665,6 +665,52 @@ fn a_hovered_hitbox_in_the_unit_keeps_its_id_and_its_look(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn ticks_that_only_recolor_write_the_scene_in_place_after_the_first_makes_it_again(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.tick(cx);
+    let first = page.patches(cx);
+    assert_eq!((first.scene_rebuilds, first.in_place_primitives), (1, 0), "the frame built whole has no slots yet");
+    for _ in 0..4 {
+        page.tick(cx);
+    }
+    let patches = page.patches(cx);
+    assert_eq!(patches.patched_frames, 5);
+    assert_eq!(patches.scene_rebuilds, 1, "no tick after the first made the scene again");
+    assert!(patches.in_place_primitives >= 4);
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "the scene written in place");
+}
+
+#[gpui::test]
+fn a_scene_written_in_place_is_the_scene_the_verifier_builds(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    cx.update_window(page.window, |_, window, _| {
+        window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+    })
+    .unwrap();
+    for _ in 0..4 {
+        page.tick(cx);
+    }
+    assert!(page.patches(cx).in_place_primitives > 0);
+    let counters = page.retained(cx);
+    assert_eq!((counters.verified, counters.mismatches), (4, 0));
+}
+
+#[gpui::test]
+fn a_frame_built_whole_after_a_patch_has_no_slots_for_the_next_one(cx: &mut TestAppContext) {
+    let page = Fixture::new(cx, 3);
+    page.tick(cx);
+    page.tick(cx);
+    page.draw_whole(cx);
+    page.tick(cx);
+    let patches = page.patches(cx);
+    assert_eq!(patches.scene_rebuilds, 2, "the first patch of each frame built whole makes the scene again");
+    page.tick(cx);
+    assert_eq!(page.patches(cx).scene_rebuilds, 2);
+}
+
+#[gpui::test]
 fn a_tick_that_changes_no_operation_presents_nothing(cx: &mut TestAppContext) {
     let page = Fixture::new(cx, 3);
     page.present(cx);

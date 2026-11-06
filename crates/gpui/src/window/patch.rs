@@ -111,6 +111,12 @@ pub struct PatchCounters {
     /// Ticks that repainted no root, because nothing that is drawn changed: no frame was built
     /// and none is presented.
     pub empty_ticks: u64,
+    /// Patched frames that made the scene again from its operations, the primitives and their
+    /// draw orders of the whole frame, because a changed operation moved or changed kind.
+    pub scene_rebuilds: u64,
+    /// Primitives that patched frames wrote over their place in the scene, which a patch that
+    /// changes nothing but how an operation paints does instead of making the scene again.
+    pub in_place_primitives: u64,
     declines: [u64; PatchDecline::ALL.len()],
 }
 
@@ -199,6 +205,8 @@ pub(crate) struct PatchTrace {
     /// The counters when the patch was made, for what the frame built whole did to the recordings.
     counters: RetainedCounters,
     redraw_requests: u32,
+    /// The scene's primitives with their draw orders, when the patch wrote them in place.
+    in_place_scene: Option<String>,
 }
 
 pub(crate) enum PatchedFrame {
@@ -277,7 +285,8 @@ struct UnitRun {
     scratch: Range<usize>,
     /// Where the recording's are in the rendered scene.
     rendered: Range<usize>,
-    changed: bool,
+    /// The operations that paint differently from the recording, as offsets into both ranges.
+    changed: Vec<usize>,
     /// Where the unit's places are in the rendered frame, and what the patch made of them.
     places: Places,
     /// Where the unit's scrollers are in the scratch scene and in the rendered one.
@@ -450,6 +459,15 @@ impl Window {
                 ));
             }
         }
+        if let Some(patched) = &trace.in_place_scene {
+            let built = self.rendered_frame.scene.describe_primitives();
+            if *patched != built {
+                differences.push(format!(
+                    "the scene with its draw orders, written in place\n{}",
+                    super::retained::first_difference(patched, &built)
+                ));
+            }
+        }
         if differences.is_empty() {
             return;
         }
@@ -603,7 +621,7 @@ impl Window {
         if !accept(self, cx) {
             return Err(PatchDecline::Rejected);
         }
-        let changed = runs.iter().any(|run| run.changed);
+        let changed = runs.iter().any(|run| !run.changed.is_empty());
         if self.retained.verifier.is_some() {
             self.patch.trace = Some(PatchTrace {
                 units: resolved
@@ -613,16 +631,33 @@ impl Window {
                     .collect(),
                 counters: self.retained.counters,
                 redraw_requests: self.retained.redraw_requests,
+                in_place_scene: None,
             });
         }
         if changed {
-            for run in &runs {
-                let target = &mut self.rendered_frame.scene.paint_operations[run.rendered.clone()];
-                for (slot, painted) in target.iter_mut().zip(&operations[run.scratch.clone()]) {
-                    slot.clone_from(painted);
-                }
+            let edits = runs.iter().flat_map(|run| {
+                let painted = &operations[run.scratch.clone()];
+                run.changed.iter().map(move |offset| (run.rendered.start + offset, &painted[*offset]))
+            });
+            let mut written = 0;
+            if self.retained.verifier.is_some() {
+                self.rendered_frame.scene.track_slots();
             }
-            self.rendered_frame.scene.rebuild_from_operations();
+            if self.rendered_frame.scene.patch_in_place(edits, &mut written) {
+                self.patch.counters.in_place_primitives += written;
+                if let Some(trace) = &mut self.patch.trace {
+                    trace.in_place_scene = Some(self.rendered_frame.scene.describe_primitives());
+                }
+            } else {
+                for run in &runs {
+                    let target = &mut self.rendered_frame.scene.paint_operations[run.rendered.clone()];
+                    for (slot, painted) in target.iter_mut().zip(&operations[run.scratch.clone()]) {
+                        slot.clone_from(painted);
+                    }
+                }
+                self.rendered_frame.scene.rebuild_from_operations();
+                self.patch.counters.scene_rebuilds += 1;
+            }
         }
         for run in &runs {
             self.rendered_frame.scrollers[run.scrollers.1.clone()]
@@ -909,7 +944,13 @@ impl Window {
         if painted.len() != recorded.len() || !painted.iter().zip(recorded).all(|(painted, recorded)| painted.same_kind(recorded)) {
             return Err(PatchDecline::Operations);
         }
-        let changed = painted.iter().zip(recorded).any(|(painted, recorded)| painted.differs_from(recorded));
+        let changed: Vec<usize> = painted
+            .iter()
+            .zip(recorded)
+            .enumerate()
+            .filter(|(_, (painted, recorded))| painted.differs_from(recorded))
+            .map(|(offset, _)| offset)
+            .collect();
         let scrollers = (
             prepaint_start.scrollers_index..prepaint_end.scrollers_index,
             source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,

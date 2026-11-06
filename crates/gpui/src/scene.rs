@@ -93,6 +93,42 @@ pub struct Scene {
     group_base: u64,
     /// The logs of the groups of the build being reused, taken by the groups of this one.
     group_reuse: Option<std::collections::HashMap<u64, Vec<OrderEntry>>>,
+    /// Where in the typed vectors the primitive of each operation sits, for the scene a rebuild
+    /// made last and nothing has changed since but what [`Scene::patch_in_place`] wrote. See
+    /// [`OpSlot`].
+    op_slots: Option<Vec<OpSlot>>,
+    /// Set while a rebuild works `op_slots` out, until [`Scene::finish`] sorts the vectors.
+    slot_tracker: Option<SlotTracker>,
+}
+
+/// Where the primitive an operation painted is in the sorted typed vectors of the scene.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpSlot {
+    /// The operation put nothing in them: a primitive the content mask clips away, a pending
+    /// glyph, or an operation that is not a primitive.
+    Nothing,
+    /// The operation put something in the scene that is not one primitive of its own: a piece
+    /// of a quad that was split around its interior, a primitive inside an effect group (which
+    /// has a scene of its own) or a text clip, or one faded flat.
+    Elsewhere,
+    /// The primitive is `index` in the vector of this kind.
+    At(PrimitiveKind, u32),
+}
+
+/// What a rebuild keeps to work `op_slots` out: the operation of each primitive in the order the
+/// typed vectors got them, which the sort of each vector then moves.
+struct SlotTracker {
+    slots: Vec<OpSlot>,
+    inserted: [Vec<u32>; PrimitiveKind::PLACED.len()],
+}
+
+impl SlotTracker {
+    /// Stands for a primitive in `inserted` that no operation owns the slot of.
+    const NO_OP: u32 = u32::MAX;
+
+    fn new(operations: usize) -> Self {
+        Self { slots: vec![OpSlot::Nothing; operations], inserted: Default::default() }
+    }
 }
 
 /// A bounds a scene put in its tree, and the order the tree gave it.
@@ -176,6 +212,8 @@ impl Scene {
         self.tree_stale = false;
         self.group_logs.clear();
         self.group_reuse = None;
+        self.op_slots = None;
+        self.slot_tracker = None;
         self.group_base = self.next_group_id;
     }
 
@@ -342,7 +380,7 @@ impl Scene {
         if self.hidden {
             return;
         }
-        self.place(&primitive, glyph);
+        self.place(&primitive, glyph, Some(self.paint_operations.len()));
         self.record(PaintOperation::of(primitive, glyph));
     }
 
@@ -352,7 +390,7 @@ impl Scene {
         if self.hidden {
             return;
         }
-        self.place(primitive, true);
+        self.place(primitive, true, Some(self.paint_operations.len()));
         if !self.is_sub_scene {
             self.record(PaintOperation::Primitive(primitive.clone()));
         }
@@ -360,26 +398,28 @@ impl Scene {
 
     /// Routes a primitive unless the content mask clips it away. One that is clipped away is
     /// recorded all the same: whether one slides under the mask must not change how many
-    /// operations an element paints, which is what a patch holds the recording to.
-    fn place(&mut self, primitive: &Primitive, glyph: bool) {
+    /// operations an element paints, which is what a patch holds the recording to. `op` is the
+    /// index in the log of the operation that records the primitive, for `op_slots`.
+    fn place(&mut self, primitive: &Primitive, glyph: bool, op: Option<usize>) {
         let window_bounds = primitive.window_bounds();
         if window_bounds.intersect(&primitive.content_mask().bounds).is_empty() {
             return;
         }
-        self.route_within(primitive, glyph, window_bounds);
+        self.route_within(primitive, glyph, window_bounds, op);
     }
 
     /// Puts an already recorded primitive where it is drawn: opacity of a flat group, the open text
     /// clips, and the scene of the innermost open group.
-    fn route(&mut self, primitive: &Primitive, glyph: bool) {
-        self.route_within(primitive, glyph, primitive.window_bounds());
+    fn route(&mut self, primitive: &Primitive, glyph: bool, op: Option<usize>) {
+        self.route_within(primitive, glyph, primitive.window_bounds(), op);
     }
 
     /// [`Scene::route`] of a primitive whose [`Primitive::window_bounds`] are known, which opacity
     /// and the glyph mask leave as they are.
-    fn route_within(&mut self, primitive: &Primitive, glyph: bool, window_bounds: Bounds<ScaledPixels>) {
+    fn route_within(&mut self, primitive: &Primitive, glyph: bool, window_bounds: Bounds<ScaledPixels>, op: Option<usize>) {
         let faded;
         let mut primitive = primitive;
+        let mut flat = false;
         if !self.effect_groups_enabled {
             let opacity: f32 = self.flat_opacities.iter().product();
             if opacity < 1. {
@@ -387,11 +427,18 @@ impl Scene {
                 copy.apply_opacity(opacity);
                 faded = copy;
                 primitive = &faded;
+                flat = true;
             }
         }
+        let op = if flat || !self.group_stack.is_empty() || !self.text_clips.is_empty() {
+            self.note_elsewhere(op);
+            None
+        } else {
+            op
+        };
         if glyph && !self.text_clips.is_empty() && let Some(glyph) = primitive.as_glyph_mask() {
             for clip in &mut self.text_clips {
-                clip.scene.insert_primitive_local(&glyph, window_bounds);
+                clip.scene.insert_primitive_local(&glyph, window_bounds, None);
             }
         }
         match self.inserting {
@@ -399,7 +446,14 @@ impl Scene {
             PrimitiveCount::Replayed => self.counts.replayed_primitives += 1,
             PrimitiveCount::Uncounted => {}
         }
-        self.current_mut().insert_primitive_local(primitive, window_bounds);
+        self.current_mut().insert_primitive_local(primitive, window_bounds, op);
+    }
+
+    /// Says that operation `op` put something in the scene that `op_slots` cannot point at.
+    fn note_elsewhere(&mut self, op: Option<usize>) {
+        if let (Some(tracker), Some(op)) = (&mut self.slot_tracker, op) {
+            tracker.slots[op] = OpSlot::Elsewhere;
+        }
     }
 
     /// Adds what a recorder scene counted to this one's, which the recorder's primitives are
@@ -420,48 +474,12 @@ impl Scene {
         if quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty() {
             return;
         }
-        if !quad.background.is_transparent() {
-            self.route(&quad.into(), true);
+        let op = self.paint_operations.len().checked_sub(1);
+        let Some(strips) = border_strips(&quad) else {
+            self.route(&quad.into(), true, op);
             return;
-        }
-        let outer_bounds = quad.bounds;
-        let inner_bounds = largest_border_interior(&quad);
-
-        // A strip narrows the mask to a different rectangle, which would drop the mask's rounded
-        // corners, so a rounded mask paints the whole quad.
-        // The strips are cut out of the window-space mask, which is the quad's own space only
-        // when nothing transforms it.
-        if inner_bounds.is_empty()
-            || quad.content_mask.corner_radii != Corners::default()
-            || quad.transformation != TransformationMatrix::unit()
-        {
-            self.route(&quad.into(), true);
-            return;
-        }
-
-        let strips = [
-            // Top
-            Bounds::from_corners(
-                outer_bounds.origin,
-                point(outer_bounds.right(), inner_bounds.top()),
-            ),
-            // Bottom
-            Bounds::from_corners(
-                point(outer_bounds.left(), inner_bounds.bottom()),
-                outer_bounds.bottom_right(),
-            ),
-            // Left
-            Bounds::from_corners(
-                point(outer_bounds.left(), inner_bounds.top()),
-                inner_bounds.bottom_left(),
-            ),
-            // Right
-            Bounds::from_corners(
-                inner_bounds.top_right(),
-                point(outer_bounds.right(), inner_bounds.bottom()),
-            ),
-        ];
-
+        };
+        self.note_elsewhere(op);
         for strip in strips {
             let content_mask_bounds = quad.content_mask.bounds.intersect(&strip);
             if !content_mask_bounds.is_empty() {
@@ -473,7 +491,7 @@ impl Scene {
                     },
                     ..quad
                 };
-                self.route(&piece.into(), true);
+                self.route(&piece.into(), true, None);
             }
         }
     }
@@ -526,8 +544,9 @@ impl Scene {
         self.native_surfaces.push(placeholder);
     }
 
-    /// Stores the primitive in this scene with an order, without recording or routing it.
-    fn insert_primitive_local(&mut self, primitive: &Primitive, window_bounds: Bounds<ScaledPixels>) {
+    /// Stores the primitive in this scene with an order, without recording or routing it. `op` is
+    /// the operation that recorded it when this scene is the root, for `op_slots`.
+    fn insert_primitive_local(&mut self, primitive: &Primitive, window_bounds: Bounds<ScaledPixels>, op: Option<usize>) {
         let mask = primitive.content_mask().bounds;
         let clipped_bounds = window_bounds.intersect(&mask);
         // What a primitive draws beyond its bounds is ordered against what it overlaps there.
@@ -545,6 +564,10 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.insert_bounds(drawn_bounds));
+        if let Some(tracker) = &mut self.slot_tracker {
+            let op = op.map_or(SlotTracker::NO_OP, |op| op as u32);
+            tracker.inserted[primitive.kind() as usize].push(op);
+        }
         match primitive {
             Primitive::Shadow(shadow) => {
                 self.shadows.push(Shadow { order, ..*shadow });
@@ -820,7 +843,7 @@ impl Scene {
             if let Some(mut only) = scene.take_only_primitive() {
                 only.apply_opacity(effect.opacity);
                 let window_bounds = only.window_bounds();
-                self.current_mut().insert_primitive_local(&only, window_bounds);
+                self.current_mut().insert_primitive_local(&only, window_bounds, None);
                 return;
             }
         }
@@ -1113,19 +1136,25 @@ impl Scene {
         let log = mem::take(&mut self.order_log);
         let groups = mem::take(&mut self.group_logs);
         let group_base = self.group_base;
-        self.rebuild(&operations, Some((log, groups)), group_base);
+        self.rebuild(&operations, Some((log, groups)), group_base, true);
         if self.order_reuse_failed {
-            self.rebuild(&operations, None, group_base);
+            self.rebuild(&operations, None, group_base, true);
         }
     }
 
+    /// `track` works `op_slots` out as the scene is sorted, which a rebuild that a patch does is
+    /// for, so that the next one can write into the vectors.
     fn rebuild(
         &mut self,
         operations: &[PaintOperation],
         reuse: Option<(Vec<OrderEntry>, std::collections::HashMap<u64, Vec<OrderEntry>>)>,
         group_base: u64,
+        track: bool,
     ) {
         self.clear();
+        if track {
+            self.slot_tracker = Some(SlotTracker::new(operations.len()));
+        }
         self.paint_operations.reserve(operations.len());
         self.next_group_id = group_base;
         self.group_base = group_base;
@@ -1214,23 +1243,170 @@ impl Scene {
     pub(crate) fn rebuild_moved(&mut self) {
         let operations = mem::take(&mut self.paint_operations);
         let group_base = self.group_base;
-        self.rebuild(&operations, None, group_base);
+        self.rebuild(&operations, None, group_base, false);
+    }
+
+    /// Makes the scene again from its operations if it has no slots yet, so that a patch can write
+    /// in it. The retention verifier does this ahead of a patch, which would otherwise never find
+    /// any: the frame it follows with is built whole.
+    pub(crate) fn track_slots(&mut self) {
+        if self.op_slots.is_none() {
+            self.rebuild_from_operations();
+        }
+    }
+
+    /// Whether a patch can put `edits`, each the new operation for the log's index, into the scene
+    /// without making it again: every one paints the same kind of primitive over the same bounds
+    /// as the one it replaces, so that its draw order and its place in the sorted vector are the
+    /// same, and the primitive of the operation it replaces is one that this scene holds as
+    /// `op_slots` says (the scene is the one the last [`Scene::rebuild_from_operations`] made). If
+    /// so, the primitives are written over their slots, which is what the scene made again would
+    /// hold, and so are the operations.
+    ///
+    /// A `false` can come after some of the writes (a sprite whose atlas tile changed would sort
+    /// somewhere else): the scene is then left to be made again, which a patch does with the
+    /// operations written over the log.
+    pub(crate) fn patch_in_place<'a>(
+        &mut self,
+        edits: impl Iterator<Item = (usize, &'a PaintOperation)> + Clone,
+        written: &mut u64,
+    ) -> bool {
+        let Some(slots) = self.op_slots.take() else {
+            return false;
+        };
+        let fits = edits.clone().all(|(at, new)| match (slots[at], new.placement()) {
+            (OpSlot::Nothing, Placement::Nowhere) => true,
+            (OpSlot::At(kind, _), Placement::Slot { kind: new_kind, drawn }) => {
+                kind == new_kind
+                    && matches!(
+                        self.paint_operations[at].placement(),
+                        Placement::Slot { kind: old_kind, drawn: old_drawn } if old_kind == kind && old_drawn == drawn
+                    )
+            }
+            _ => false,
+        });
+        if !fits {
+            self.op_slots = Some(slots);
+            return false;
+        }
+        let mut retiled = Vec::new();
+        for (at, new) in edits {
+            if let OpSlot::At(kind, index) = slots[at] {
+                if self.put_primitive(index as usize, new) {
+                    retiled.push((kind, index as usize));
+                }
+                *written += 1;
+            }
+            self.paint_operations[at].clone_from(new);
+        }
+        let sorted = retiled.into_iter().all(|(kind, index)| match kind {
+            PrimitiveKind::MonochromeSprite => key_is_between_neighbors(&self.monochrome_sprites, index, sprite_key),
+            PrimitiveKind::SubpixelSprite => key_is_between_neighbors(&self.subpixel_sprites, index, sprite_key),
+            PrimitiveKind::PolychromeSprite => key_is_between_neighbors(&self.polychrome_sprites, index, sprite_key),
+            _ => unreachable!("only a sprite is sorted by more than its order"),
+        });
+        if sorted {
+            self.op_slots = Some(slots);
+        }
+        sorted
+    }
+
+    /// Writes the primitive that `operation` paints over the one at `index` of its vector, which
+    /// keeps its draw order. Returns whether a sprite got an atlas tile that sorts it differently
+    /// among the sprites of its order.
+    fn put_primitive(&mut self, index: usize, operation: &PaintOperation) -> bool {
+        let copy;
+        let primitive = match operation {
+            PaintOperation::Primitive(primitive) => primitive,
+            PaintOperation::Quad(quad) => {
+                copy = Primitive::Quad(*quad);
+                &copy
+            }
+            PaintOperation::Image(sprite) => {
+                copy = Primitive::PolychromeSprite(*sprite);
+                &copy
+            }
+            _ => unreachable!("an operation that has a slot paints a primitive"),
+        };
+        match primitive {
+            Primitive::Shadow(shadow) => {
+                self.shadows[index] = Shadow { order: self.shadows[index].order, ..*shadow };
+            }
+            Primitive::Quad(quad) => {
+                self.quads[index] = Quad { order: self.quads[index].order, ..*quad };
+            }
+            Primitive::Path(path) => {
+                let old = &self.paths[index];
+                let mut path = path.clone();
+                (path.order, path.id) = (old.order, old.id);
+                self.paths[index] = path;
+            }
+            Primitive::Underline(underline) => {
+                self.underlines[index] = Underline { order: self.underlines[index].order, ..*underline };
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                let old = &self.monochrome_sprites[index];
+                let retiled = old.tile.tile_id != sprite.tile.tile_id;
+                self.monochrome_sprites[index] = MonochromeSprite { order: old.order, ..*sprite };
+                return retiled;
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                let old = &self.subpixel_sprites[index];
+                let retiled = old.tile.tile_id != sprite.tile.tile_id;
+                self.subpixel_sprites[index] = SubpixelSprite { order: old.order, ..*sprite };
+                return retiled;
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                let old = &self.polychrome_sprites[index];
+                let retiled = old.tile.tile_id != sprite.tile.tile_id;
+                self.polychrome_sprites[index] = PolychromeSprite { order: old.order, ..*sprite };
+                return retiled;
+            }
+            Primitive::Surface(surface) => {
+                let mut surface = surface.clone();
+                surface.order = self.surfaces[index].order;
+                self.surfaces[index] = surface;
+            }
+        }
+        false
     }
 
     pub fn finish(&mut self) {
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.surfaces.sort_by_key(|surface| surface.order);
+        self.op_slots = None;
+        match self.slot_tracker.take() {
+            Some(tracker) => self.finish_tracked(tracker),
+            None => {
+                self.shadows.sort_by_key(|shadow| shadow.order);
+                self.quads.sort_by_key(|quad| quad.order);
+                self.paths.sort_by_key(|path| path.order);
+                self.underlines.sort_by_key(|underline| underline.order);
+                self.monochrome_sprites
+                    .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+                self.subpixel_sprites
+                    .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+                self.polychrome_sprites
+                    .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+                self.surfaces.sort_by_key(|surface| surface.order);
+            }
+        }
         self.groups.sort_by_key(|group| group.order);
         self.native_surfaces.sort_by_key(|placeholder| placeholder.order);
+    }
+
+    /// [`Scene::finish`] of the typed vectors, noting where the sort puts the primitive of each
+    /// operation.
+    fn finish_tracked(&mut self, mut tracker: SlotTracker) {
+        let slots = &mut tracker.slots;
+        let inserted = &tracker.inserted;
+        sort_placed(&mut self.shadows, &inserted[PrimitiveKind::Shadow as usize], PrimitiveKind::Shadow, slots, |shadow| shadow.order);
+        sort_placed(&mut self.quads, &inserted[PrimitiveKind::Quad as usize], PrimitiveKind::Quad, slots, |quad| quad.order);
+        sort_placed(&mut self.paths, &inserted[PrimitiveKind::Path as usize], PrimitiveKind::Path, slots, |path| path.order);
+        sort_placed(&mut self.underlines, &inserted[PrimitiveKind::Underline as usize], PrimitiveKind::Underline, slots, |underline| underline.order);
+        sort_placed(&mut self.monochrome_sprites, &inserted[PrimitiveKind::MonochromeSprite as usize], PrimitiveKind::MonochromeSprite, slots, |sprite| (sprite.order, sprite.tile.tile_id));
+        sort_placed(&mut self.subpixel_sprites, &inserted[PrimitiveKind::SubpixelSprite as usize], PrimitiveKind::SubpixelSprite, slots, |sprite| (sprite.order, sprite.tile.tile_id));
+        sort_placed(&mut self.polychrome_sprites, &inserted[PrimitiveKind::PolychromeSprite as usize], PrimitiveKind::PolychromeSprite, slots, |sprite| (sprite.order, sprite.tile.tile_id));
+        sort_placed(&mut self.surfaces, &inserted[PrimitiveKind::Surface as usize], PrimitiveKind::Surface, slots, |surface| surface.order);
+        self.op_slots = Some(tracker.slots);
     }
 
     #[cfg_attr(
@@ -1340,6 +1516,20 @@ pub(crate) enum PrimitiveKind {
     PolychromeSprite,
     Surface,
     EffectGroup,
+}
+
+impl PrimitiveKind {
+    /// The kinds that are a [`Primitive`], which a rebuild notes the slots of: all but the group.
+    const PLACED: [PrimitiveKind; 8] = [
+        PrimitiveKind::Shadow,
+        PrimitiveKind::Quad,
+        PrimitiveKind::Path,
+        PrimitiveKind::Underline,
+        PrimitiveKind::MonochromeSprite,
+        PrimitiveKind::SubpixelSprite,
+        PrimitiveKind::PolychromeSprite,
+        PrimitiveKind::Surface,
+    ];
 }
 
 #[derive(Clone, Debug)]
@@ -1485,6 +1675,159 @@ fn same_debug_form(left: &impl Debug, right: &impl Debug) -> bool {
     compare.same && compare.rest.is_empty()
 }
 
+/// Sorts `items` by `key` as a stable `sort_by_key` does, and notes in `slots` where it puts the
+/// primitive of each operation. `inserted` is the operation of each item before the sort.
+fn sort_placed<T, K: Ord>(
+    items: &mut [T],
+    inserted: &[u32],
+    kind: PrimitiveKind,
+    slots: &mut [OpSlot],
+    key: impl Fn(&T) -> K,
+) {
+    debug_assert_eq!(items.len(), inserted.len());
+    let mut gather: Vec<u32> = (0..items.len() as u32).collect();
+    gather.sort_by_key(|&from| key(&items[from as usize]));
+    for (to, &from) in gather.iter().enumerate() {
+        let op = inserted[from as usize];
+        if op != SlotTracker::NO_OP {
+            slots[op as usize] = OpSlot::At(kind, to as u32);
+        }
+    }
+    // Moves each item to where `gather` says, a cycle at a time, with no second vector of items.
+    for first in 0..gather.len() {
+        let mut to = first;
+        loop {
+            let from = mem::replace(&mut gather[to], to as u32) as usize;
+            if from == first {
+                break;
+            }
+            items.swap(to, from);
+            to = from;
+        }
+    }
+}
+
+fn sprite_key<S: SpriteOrder>(sprite: &S) -> (DrawOrder, crate::TileId) {
+    sprite.key()
+}
+
+/// The order a sprite is sorted by in [`Scene::finish`].
+trait SpriteOrder {
+    fn key(&self) -> (DrawOrder, crate::TileId);
+}
+
+macro_rules! sprite_order {
+    ($($sprite:ty),*) => {
+        $(impl SpriteOrder for $sprite {
+            fn key(&self) -> (DrawOrder, crate::TileId) {
+                (self.order, self.tile.tile_id)
+            }
+        })*
+    };
+}
+sprite_order!(MonochromeSprite, SubpixelSprite, PolychromeSprite);
+
+/// Whether the item at `index` sorts strictly after the one before it and before the one after,
+/// which puts it where a stable sort of all of the items would, whatever order they were in.
+fn key_is_between_neighbors<T, K: Ord>(items: &[T], index: usize, key: impl Fn(&T) -> K) -> bool {
+    let key_at = key(&items[index]);
+    (index == 0 || key(&items[index - 1]) < key_at) && (index + 1 == items.len() || key_at < key(&items[index + 1]))
+}
+
+/// What an operation puts in the typed vectors of a scene.
+enum Placement {
+    /// Nothing: the content mask clips the primitive away, or the operation is a pending glyph.
+    Nowhere,
+    /// One primitive of `kind`, ordered against the others by `drawn`.
+    Slot {
+        kind: PrimitiveKind,
+        drawn: Bounds<ScaledPixels>,
+    },
+    /// Anything else: a mark, a group, a native surface, a quad drawn as strips.
+    Other,
+}
+
+impl PaintOperation {
+    /// What [`Scene::insert_primitive_local`] would do with the primitive this paints, when the
+    /// scene it is painted in has no group or text clip open.
+    fn placement(&self) -> Placement {
+        match self {
+            PaintOperation::Primitive(primitive) => primitive_placement(primitive),
+            PaintOperation::Quad(quad) => {
+                if quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty() {
+                    Placement::Nowhere
+                } else if border_strips(quad).is_some() {
+                    Placement::Other
+                } else {
+                    primitive_placement(&Primitive::Quad(*quad))
+                }
+            }
+            PaintOperation::Image(sprite) => primitive_placement(&Primitive::PolychromeSprite(*sprite)),
+            PaintOperation::PendingGlyph(_) => Placement::Nowhere,
+            _ => Placement::Other,
+        }
+    }
+}
+
+fn primitive_placement(primitive: &Primitive) -> Placement {
+    let mask = primitive.content_mask().bounds;
+    let clipped = primitive.window_bounds().intersect(&mask);
+    let drawn = match primitive {
+        Primitive::Shadow(shadow) => shadow.drawn_bounds().intersect(&mask),
+        _ => clipped,
+    };
+    if clipped.is_empty() || drawn.is_empty() {
+        Placement::Nowhere
+    } else {
+        Placement::Slot { kind: primitive.kind(), drawn }
+    }
+}
+
+/// The four rectangles a quad with no background is drawn as, around its empty interior, so that
+/// the shader does not shade every transparent pixel inside a large outline; none when it is
+/// drawn whole.
+fn border_strips(quad: &Quad) -> Option<[Bounds<ScaledPixels>; 4]> {
+    if !quad.background.is_transparent() {
+        return None;
+    }
+    let outer_bounds = quad.bounds;
+    let inner_bounds = largest_border_interior(quad);
+
+    // A strip narrows the mask to a different rectangle, which would drop the mask's rounded
+    // corners, so a rounded mask paints the whole quad.
+    // The strips are cut out of the window-space mask, which is the quad's own space only
+    // when nothing transforms it.
+    if inner_bounds.is_empty()
+        || quad.content_mask.corner_radii != Corners::default()
+        || quad.transformation != TransformationMatrix::unit()
+    {
+        return None;
+    }
+
+    Some([
+        // Top
+        Bounds::from_corners(
+            outer_bounds.origin,
+            point(outer_bounds.right(), inner_bounds.top()),
+        ),
+        // Bottom
+        Bounds::from_corners(
+            point(outer_bounds.left(), inner_bounds.bottom()),
+            outer_bounds.bottom_right(),
+        ),
+        // Left
+        Bounds::from_corners(
+            point(outer_bounds.left(), inner_bounds.top()),
+            inner_bounds.bottom_left(),
+        ),
+        // Right
+        Bounds::from_corners(
+            inner_bounds.top_right(),
+            point(outer_bounds.right(), inner_bounds.bottom()),
+        ),
+    ])
+}
+
 fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
     let horizontal = &quad.corner_radii;
     let vertical = CornerRadii {
@@ -1569,6 +1912,19 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    pub(crate) fn kind(&self) -> PrimitiveKind {
+        match self {
+            Primitive::Shadow(_) => PrimitiveKind::Shadow,
+            Primitive::Quad(_) => PrimitiveKind::Quad,
+            Primitive::Path(_) => PrimitiveKind::Path,
+            Primitive::Underline(_) => PrimitiveKind::Underline,
+            Primitive::MonochromeSprite(_) => PrimitiveKind::MonochromeSprite,
+            Primitive::SubpixelSprite(_) => PrimitiveKind::SubpixelSprite,
+            Primitive::PolychromeSprite(_) => PrimitiveKind::PolychromeSprite,
+            Primitive::Surface(_) => PrimitiveKind::Surface,
+        }
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -4061,6 +4417,164 @@ mod tests {
         painted.insert_primitive(quad(5., 5., 100., 100.));
         painted.finish();
         assert_eq!(drawn(&scene), drawn(&painted));
+    }
+
+    /// What a page paints that a patch can change: a card, two quads in a layer, a row of glyphs
+    /// with the atlas tile each has, a border-only quad (drawn as strips) and a quad in a group.
+    struct Flat {
+        card: Hsla,
+        layered: Hsla,
+        tiles: [u32; 6],
+        glyph_x: f32,
+        card_width: f32,
+        group: Hsla,
+        border: Hsla,
+    }
+
+    impl Flat {
+        fn new() -> Self {
+            Self {
+                card: red(),
+                layered: red(),
+                tiles: [1, 2, 3, 4, 5, 6],
+                glyph_x: 10.,
+                card_width: 300.,
+                group: red(),
+                border: red(),
+            }
+        }
+
+        fn scene(&self) -> Scene {
+            let mut scene = scene();
+            scene.insert_primitive(Quad { background: self.card.into(), ..quad(0., 0., self.card_width, 200.) });
+            scene.push_layer(bounds(120., 20., 100., 100.));
+            scene.insert_primitive(Quad { background: self.layered.into(), ..quad(130., 30., 20., 20.) });
+            scene.insert_primitive(quad(140., 40., 20., 20.));
+            scene.pop_layer();
+            for (column, tile) in self.tiles.into_iter().enumerate() {
+                let mut sprite = glyph(self.glyph_x + column as f32 * 9., 150.);
+                sprite.tile.tile_id = TileId(tile);
+                scene.insert_primitive(sprite);
+            }
+            scene.insert_quad(Quad {
+                background: Hsla::transparent_black().into(),
+                border_widths: Edges::all(ScaledPixels(2.)),
+                border_colors: Edges::all(self.border),
+                ..quad(220., 150., 60., 40.)
+            });
+            scene.start_group(fade(0.5), mask(), None);
+            scene.insert_primitive(Quad { background: self.group.into(), ..quad(200., 250., 40., 40.) });
+            scene.end_group();
+            scene.finish();
+            scene
+        }
+    }
+
+    /// A scene made again from `shown`'s log, as the first patch does, and the patch of it to what
+    /// `painted` paints: whether it was written in place. As a patch does, the others are made
+    /// again from the log.
+    fn patched(shown: &Flat, painted: &Flat) -> (Scene, bool) {
+        let mut scene = shown.scene();
+        scene.rebuild_from_operations();
+        let painted_operations = painted.scene().into_operations();
+        let edits: Vec<(usize, &PaintOperation)> = painted_operations
+            .iter()
+            .enumerate()
+            .filter(|(at, operation)| operation.differs_from(&scene.paint_operations[*at]))
+            .collect();
+        let mut written = 0;
+        let in_place = scene.patch_in_place(edits.iter().copied(), &mut written);
+        if !in_place {
+            for (slot, operation) in scene.paint_operations.iter_mut().zip(&painted_operations) {
+                slot.clone_from(operation);
+            }
+            scene.rebuild_from_operations();
+        }
+        (scene, in_place)
+    }
+
+    #[test]
+    fn a_patch_that_only_recolors_writes_the_primitives_in_place() {
+        let green = Hsla { h: 0.33, s: 1., l: 0.5, a: 1. };
+        let painted = Flat { card: green, layered: green, ..Flat::new() };
+        let mut scene = Flat::new().scene();
+        scene.rebuild_from_operations();
+        let inserts = scene.counts.bounds_inserts;
+        let operations = painted.scene().into_operations();
+        let edits: Vec<_> = operations
+            .iter()
+            .enumerate()
+            .filter(|(at, operation)| operation.differs_from(&scene.paint_operations[*at]))
+            .collect();
+        assert_eq!(edits.len(), 2);
+        let mut written = 0;
+        assert!(scene.patch_in_place(edits.iter().copied(), &mut written));
+        assert_eq!(written, 2);
+        assert_eq!(scene.counts.bounds_inserts, inserts);
+        assert_eq!(scene.describe_primitives(), painted.scene().describe_primitives());
+        assert_eq!(scene.describe_drawn(), painted.scene().describe_drawn());
+    }
+
+    #[test]
+    fn a_scene_patched_in_place_is_patched_again_in_place() {
+        let green = Hsla { h: 0.33, s: 1., l: 0.5, a: 1. };
+        let mut scene = Flat::new().scene();
+        scene.rebuild_from_operations();
+        for color in [green, red(), green] {
+            let painted = Flat { card: color, ..Flat::new() };
+            let operations = painted.scene().into_operations();
+            let edits: Vec<_> = operations
+                .iter()
+                .enumerate()
+                .filter(|(at, operation)| operation.differs_from(&scene.paint_operations[*at]))
+                .collect();
+            assert!(scene.patch_in_place(edits.iter().copied(), &mut 0));
+            assert_eq!(scene.describe_primitives(), painted.scene().describe_primitives());
+        }
+    }
+
+    #[test]
+    fn a_scene_not_made_again_has_no_slots_to_write_in() {
+        let green = Hsla { h: 0.33, s: 1., l: 0.5, a: 1. };
+        let mut scene = Flat::new().scene();
+        let operations = Flat { card: green, ..Flat::new() }.scene().into_operations();
+        assert!(!scene.patch_in_place([(0, &operations[0])].into_iter(), &mut 0));
+    }
+
+    #[test]
+    fn a_patch_that_moves_a_primitive_is_made_again_from_the_log() {
+        let painted = Flat { card_width: 250., ..Flat::new() };
+        let (scene, in_place) = patched(&Flat::new(), &painted);
+        assert!(!in_place);
+        assert_eq!(scene.describe_primitives(), painted.scene().describe_primitives());
+    }
+
+    #[test]
+    fn a_patch_of_a_primitive_in_a_group_or_drawn_as_strips_is_made_again_from_the_log() {
+        let green = Hsla { h: 0.33, s: 1., l: 0.5, a: 1. };
+        for (name, painted) in [("group", Flat { group: green, ..Flat::new() }), ("border", Flat { border: green, ..Flat::new() })] {
+            let (scene, in_place) = patched(&Flat::new(), &painted);
+            assert!(!in_place, "{name}");
+            assert_eq!(scene.describe_primitives(), painted.scene().describe_primitives());
+        }
+    }
+
+    #[test]
+    fn a_glyph_that_gets_a_tile_that_sorts_it_elsewhere_is_made_again_from_the_log() {
+        // Same order, so the tile decides: 3 to 9 passes 4, 5 and 6.
+        let passes = Flat { tiles: [1, 2, 9, 4, 5, 6], ..Flat::new() };
+        let (scene, in_place) = patched(&Flat::new(), &passes);
+        assert!(!in_place);
+        assert_eq!(scene.describe_primitives(), passes.scene().describe_primitives());
+    }
+
+    #[test]
+    fn a_glyph_that_gets_a_tile_between_its_neighbors_is_written_in_place() {
+        let shown = Flat { tiles: [10, 20, 30, 40, 50, 60], ..Flat::new() };
+        let painted = Flat { tiles: [10, 20, 35, 40, 50, 60], ..Flat::new() };
+        let (scene, in_place) = patched(&shown, &painted);
+        assert!(in_place);
+        assert_eq!(scene.describe_primitives(), painted.scene().describe_primitives());
     }
 
     #[test]
