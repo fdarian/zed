@@ -1,11 +1,13 @@
 //! The classifier of the frames drawn after a list scroll (see [`super::scroll_patch`]): each
-//! reason, the frame that has none, and that nothing is drawn differently.
+//! reason, the frame that has none, and that nothing is drawn differently; and the translate of
+//! the rows of the frame shown that an eligible frame is drawn by: it is the frame built whole,
+//! it declines before it writes, and the verifier checks it.
 
 use crate::{
-    AnyWindowHandle, AppContext as _, Context, ElementId, FocusHandle, GlobalElementId, InteractiveElement,
+    AnyWindowHandle, AppContext as _, Context, FocusHandle, GlobalElementId, InteractiveElement,
     IntoElement, ListAlignment, ListState, MouseMoveEvent, ParentElement, PlatformInput, Render, ScrollDelta,
-    ScrollPatchCause, ScrollPatchReason, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext,
-    Window, div, list, point, px, retained, size,
+    ScrollApplyDecline, ScrollPatchCause, ScrollPatchReason, ScrollWheelEvent, Styled, TestAppContext, Window,
+    div, list, point, px, retained, size,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -450,4 +452,173 @@ fn a_frame_after_a_scroll_is_drawn_as_it_is_without_the_classifier(cx: &mut Test
     let with = describe(cx, true);
     let without = describe(cx, false);
     assert_eq!(with, without);
+}
+
+/// The frame shown as text: the scene with its draw orders and every hitbox by value, and the
+/// hit test at the pointer.
+fn shown(window: &mut Window) -> String {
+    use std::fmt::Write as _;
+
+    let frame = &window.rendered_frame;
+    let mut out = frame.scene.describe_primitives();
+    out.push_str(&frame.scene.describe_operations(0..frame.scene.len(), false));
+    for hitbox in &frame.hitboxes {
+        writeln!(out, "hitbox {}", hitbox.describe()).ok();
+    }
+    let pointer = window.mouse_position();
+    let chain = window.rendered_frame.hit_test(pointer, true).chain.iter().filter_map(|link| link.identity.clone()).collect::<Vec<_>>();
+    writeln!(out, "pointer {pointer:?} over {}", named(&chain).join(" ")).ok();
+    without_identities_of_the_window(&out)
+}
+
+/// `text` without the entity of the window and the hash of the paths, which two windows of one
+/// test differ in.
+fn without_identities_of_the_window(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((at, marker)) = ["EntityId(", "hash: "]
+        .into_iter()
+        .filter_map(|marker| rest.find(marker).map(|at| (at, marker)))
+        .min_by_key(|(at, _)| *at)
+    {
+        out.push_str(&rest[..at + marker.len()]);
+        rest = &rest[at + marker.len()..];
+        let end = rest.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The frame shown after each of `wheels`, with the translate on or off.
+fn after_wheels(cx: &mut TestAppContext, nested: bool, patch: bool, at: (f32, f32), wheels: &[f32]) -> (Vec<String>, crate::ScrollPatchCounters) {
+    let fixture = Fixture::with_nested(cx, Some(100.), true, nested);
+    fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+    let frames = wheels
+        .iter()
+        .map(|by| {
+            fixture.scroll(cx, at.0, at.1, *by);
+            fixture.with_window(cx, shown)
+        })
+        .collect();
+    (frames, fixture.counters(cx))
+}
+
+#[gpui::test]
+fn a_translate_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    // Fractions of a row inside the pointer's row, up and down, and past the region of the rows
+    // (the region reaches 100 beyond the list, so 30 of 3 rows at 12 is a miss and builds).
+    let wheels = [5., 5., 7., -3., -4., 6., 2., -15., 1.];
+    for nested in [false, true] {
+        let (translated, counters) = after_wheels(cx, nested, true, (10., 12.), &wheels);
+        let (built, off) = after_wheels(cx, nested, false, (10., 12.), &wheels);
+        assert_eq!(off.frames, 0, "{off:?}");
+        assert!(counters.patched >= 4, "{counters:?}");
+        assert_eq!(counters.mispredicted, 0, "{counters:?}");
+        for (frame, (translated, built)) in translated.iter().zip(&built).enumerate() {
+            assert!(
+                translated == built,
+                "frame {frame}, nested {nested}, {counters:?}\n{}",
+                super::retained::first_difference(translated, built)
+            );
+        }
+    }
+}
+
+#[gpui::test]
+fn a_translate_keeps_the_recording_of_the_rows_for_the_frame_after(cx: &mut TestAppContext) {
+    // A frame built whole after translated ones puts the rows from their recordings, and a
+    // translate after it is from that frame: the two kinds interleave.
+    let wheels = [5., 5., 25., 5., 5., 40., 4., 4.];
+    let (translated, counters) = after_wheels(cx, false, true, (10., 12.), &wheels);
+    let (built, _) = after_wheels(cx, false, false, (10., 12.), &wheels);
+    assert!(counters.patched >= 3 && counters.patched < counters.frames, "{counters:?}");
+    assert_eq!(translated, built, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_translate_follows_the_pointer_over_the_rows_it_moved(cx: &mut TestAppContext) {
+    // The pointer at 28 is over the row 1 after 5 and the hit test is the moved rows'.
+    let wheels = [5., 5., -5., 2.];
+    let (translated, counters) = after_wheels(cx, false, true, (10., 28.), &wheels);
+    let (built, _) = after_wheels(cx, false, false, (10., 28.), &wheels);
+    assert_eq!(translated, built, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_translate_that_cannot_be_made_is_a_whole_frame_and_says_why(cx: &mut TestAppContext) {
+    let broken = |cx: &mut TestAppContext, patch: bool| {
+        let fixture = Fixture::new(cx, Some(100.), true);
+        fixture.point_at(cx, 10., 12.);
+        fixture.with_window(cx, |window| {
+            window.set_scroll_patch(patch);
+            // The hitbox of the last row is not the one it recorded.
+            let last = window.rendered_frame.hitboxes.last_mut().expect("the rows have hitboxes");
+            last.id = crate::window::HitboxId(u64::MAX);
+        });
+        fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+        (fixture.counters(cx), fixture.with_window(cx, shown))
+    };
+    let (counters, frame) = broken(cx, true);
+    assert_eq!((counters.eligible, counters.patched), (1, 0), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::Hitboxes), 1, "{counters:?}");
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    let (_, whole) = broken(cx, false);
+    assert_eq!(frame, whole);
+}
+
+#[gpui::test]
+fn a_thumb_the_owner_reports_is_a_reason_and_nothing_is_moved(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), false);
+    fixture.with_window(cx, |window| window.set_scroll_patch_gate(Some(Rc::new(|_| Some(ScrollPatchReason::Thumb)))));
+    fixture.scroll(cx, 10., 10., 5.);
+    let counters = fixture.counters(cx);
+    only(&counters, ScrollPatchReason::Thumb);
+    assert_eq!(counters.patched, 0, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_translate_is_checked_against_the_frame_built_whole_after_it(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), true);
+    let described = Rc::new(Cell::new(0));
+    let verifier = described.clone();
+    // The frame that shows the pointer is built before the verifier is on: one that a verifier
+    // checks is built whole a second time, and its rows are not recorded to be moved.
+    fixture.point_at(cx, 10., 12.);
+    fixture.with_window(cx, move |window| {
+        window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        window.set_scroll_patch_registries(Some(Rc::new(move |_| {
+            verifier.set(verifier.get() + 1);
+            String::new()
+        })));
+    });
+    fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.eligible, counters.patched), (1, 1), "{counters:?}");
+    assert_eq!(described.get(), 2, "the owner described the registries of the translate and of the build");
+    fixture.with_window(cx, |window| {
+        assert_eq!(window.retention_mismatches(), &[] as &[String]);
+        assert!(window.retained_counters().verified >= 1);
+    });
+}
+
+#[gpui::test]
+fn a_translate_that_differs_from_the_frame_built_whole_is_a_mismatch(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), true);
+    let described = Rc::new(Cell::new(0));
+    let verifier = described.clone();
+    fixture.point_at(cx, 10., 12.);
+    fixture.with_window(cx, move |window| {
+        window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        // What the owner keeps outside the frame is not the same after the build.
+        window.set_scroll_patch_registries(Some(Rc::new(move |_| {
+            verifier.set(verifier.get() + 1);
+            format!("described {}", verifier.get())
+        })));
+    });
+    fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+    fixture.with_window(cx, |window| {
+        assert_eq!(window.retention_mismatches().len(), 1);
+        assert!(window.retention_mismatches()[0].contains("outside the frame"), "{:?}", window.retention_mismatches());
+    });
 }

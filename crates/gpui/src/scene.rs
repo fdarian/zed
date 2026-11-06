@@ -973,6 +973,47 @@ impl Scene {
         self.describe_operations_with(range, true, loose)
     }
 
+    /// The primitives of the scene with their draw orders, in the order they are drawn in, and the
+    /// groups with theirs: what the scene paints, which the operations it was made from do not
+    /// say (an operation holds no order). A group is described by what it paints and not by its id.
+    pub(crate) fn describe_primitives(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = String::new();
+        for shadow in &self.shadows {
+            writeln!(out, "{shadow:?}").ok();
+        }
+        for quad in &self.quads {
+            writeln!(out, "{quad:?}").ok();
+        }
+        for path in &self.paths {
+            writeln!(out, "{path:?}").ok();
+        }
+        for underline in &self.underlines {
+            writeln!(out, "{underline:?}").ok();
+        }
+        for sprite in &self.monochrome_sprites {
+            writeln!(out, "{sprite:?}").ok();
+        }
+        for sprite in &self.subpixel_sprites {
+            writeln!(out, "{sprite:?}").ok();
+        }
+        for sprite in &self.polychrome_sprites {
+            writeln!(out, "{sprite:?}").ok();
+        }
+        for surface in &self.surfaces {
+            writeln!(out, "{surface:?}").ok();
+        }
+        for placeholder in &self.native_surfaces {
+            writeln!(out, "{:?}", PaintedSurface(placeholder)).ok();
+        }
+        for group in &self.groups {
+            writeln!(out, "group {:?} {:?} {:?}", group.order, group.bounds, group.content_mask).ok();
+            out.push_str(&group.scene.describe_primitives());
+        }
+        out
+    }
+
     /// The operations of the whole scene that are drawn: all but the marks that only say how a
     /// recording of them is put under another content mask.
     pub(crate) fn describe_drawn(&self) -> String {
@@ -1093,29 +1134,33 @@ impl Scene {
         let hidden = mem::take(&mut self.hidden);
         let inserting = mem::replace(&mut self.inserting, count);
         for operation in operations {
-            match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::Quad(quad) => self.insert_quad(*quad),
-                PaintOperation::Image(sprite) => self.insert_image(*sprite),
-                PaintOperation::PendingGlyph(glyph) => self.insert_pending_glyph(glyph.clone()),
-                PaintOperation::NativeSurface(placeholder) => self.insert_native_surface(placeholder.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
-                PaintOperation::EndLayer => self.pop_layer(),
-                PaintOperation::StartGroup {
-                    effect,
-                    content_mask,
-                    reserved,
-                } => self.start_group(effect.clone(), *content_mask, *reserved),
-                PaintOperation::EndGroup => self.end_group(),
-                PaintOperation::WidenGroups(escaped) => self.widen_groups(*escaped),
-                PaintOperation::StartTextClip => self.start_text_clip(),
-                PaintOperation::EndTextClip => self.end_text_clip(),
-                PaintOperation::Replaced { derived } => self.begin_replaced(*derived),
-                PaintOperation::EndReplaced => self.end_replaced(),
-            }
+            self.replay_operation(operation.clone());
         }
         self.inserting = inserting;
         self.hidden = hidden;
+    }
+
+    fn replay_operation(&mut self, operation: PaintOperation) {
+        match operation {
+            PaintOperation::Primitive(primitive) => self.insert_primitive(primitive),
+            PaintOperation::Quad(quad) => self.insert_quad(quad),
+            PaintOperation::Image(sprite) => self.insert_image(sprite),
+            PaintOperation::PendingGlyph(glyph) => self.insert_pending_glyph(glyph),
+            PaintOperation::NativeSurface(placeholder) => self.insert_native_surface(placeholder),
+            PaintOperation::StartLayer(bounds) => self.push_layer(bounds),
+            PaintOperation::EndLayer => self.pop_layer(),
+            PaintOperation::StartGroup {
+                effect,
+                content_mask,
+                reserved,
+            } => self.start_group(effect, content_mask, reserved),
+            PaintOperation::EndGroup => self.end_group(),
+            PaintOperation::WidenGroups(escaped) => self.widen_groups(escaped),
+            PaintOperation::StartTextClip => self.start_text_clip(),
+            PaintOperation::EndTextClip => self.end_text_clip(),
+            PaintOperation::Replaced { derived } => self.begin_replaced(derived),
+            PaintOperation::EndReplaced => self.end_replaced(),
+        }
     }
 
     /// Puts recorded `operations` into this scene `delta` away from where they were recorded,
@@ -1133,109 +1178,21 @@ impl Scene {
         // The recorded operations already left out whatever was hidden when they were recorded.
         let hidden = mem::take(&mut self.hidden);
         let inserting = mem::replace(&mut self.inserting, count);
-        // The masks that replaced the one around them in the recording are not cut by the one
-        // around the place the recording is put, unless they were cut from the masks inside it.
-        // Whether what is put now is cut by `clip`: inside a mask that replaced the one around
-        // it, until one that was cut from the masks inside the recording (a box handed to a
-        // stacking context inside it, painted under the mask it was handed over with) replaces
-        // that in turn.
-        let mut clipping: Vec<bool> = Vec::new();
-        for operation in operations {
-            let clipped = clipping.last().copied().unwrap_or(true);
-            match operation {
-                PaintOperation::Primitive(primitive) => {
-                    let mut primitive = primitive.clone();
-                    primitive.translate_replayed(delta);
-                    if clipped {
-                        primitive.clip_to(clip);
-                    }
-                    self.insert_primitive(primitive);
-                }
-                PaintOperation::Quad(quad) => {
-                    let mut quad = *quad;
-                    quad.translate(delta);
-                    if clipped {
-                        clip_mask(&mut quad.content_mask, &clip.snapped);
-                    }
-                    self.insert_quad(quad);
-                }
-                PaintOperation::Image(sprite) => {
-                    let mut sprite = *sprite;
-                    sprite.translate(delta);
-                    if clipped {
-                        clip_mask(&mut sprite.content_mask, &clip.snapped);
-                    }
-                    self.insert_image(sprite);
-                }
-                PaintOperation::PendingGlyph(glyph) => {
-                    let mut glyph = glyph.clone();
-                    glyph.translate(delta);
-                    if clipped {
-                        clip_mask(&mut glyph.content_mask, &clip.snapped);
-                    }
-                    self.insert_pending_glyph(glyph);
-                }
-                PaintOperation::NativeSurface(placeholder) => {
-                    let mut placeholder = placeholder.clone();
-                    placeholder.translate(delta);
-                    if clipped {
-                        clip_mask(&mut placeholder.content_mask, &clip.snapped);
-                    }
-                    self.insert_native_surface(placeholder);
-                }
-                PaintOperation::StartLayer(bounds) => {
-                    let mut bounds = *bounds;
-                    translate_bounds(&mut bounds, delta);
-                    if clipped {
-                        bounds = bounds.intersect(&clip.snapped);
-                    }
-                    self.push_layer(bounds);
-                }
-                PaintOperation::EndLayer => self.pop_layer(),
-                PaintOperation::StartGroup {
-                    effect,
-                    content_mask,
-                    reserved,
-                } => {
-                    let mut effect = effect.clone();
-                    // The group of an exact clip has no box of its own: its effect is a default.
-                    if !effect.exact_clip {
-                        effect.translate(delta);
-                    }
-                    let mut content_mask = *content_mask;
-                    translate_mask(&mut content_mask, delta);
-                    if clipped {
-                        clip_mask(&mut content_mask, &clip.snapped);
-                    }
-                    let reserved = reserved.map(|mut bounds| {
-                        translate_bounds(&mut bounds, delta);
-                        bounds
-                    });
-                    self.start_group(effect, content_mask, reserved);
-                }
-                PaintOperation::EndGroup => self.end_group(),
-                PaintOperation::WidenGroups(escaped) => {
-                    let mut escaped = *escaped;
-                    translate_mask(&mut escaped, delta);
-                    if clipped {
-                        clip_mask(&mut escaped, &clip.snapped);
-                    }
-                    self.widen_groups(escaped);
-                }
-                PaintOperation::StartTextClip => self.start_text_clip(),
-                PaintOperation::EndTextClip => self.end_text_clip(),
-                PaintOperation::Replaced { derived } => {
-                    clipping.push(*derived);
-                    self.begin_replaced(*derived);
-                }
-                PaintOperation::EndReplaced => {
-                    clipping.pop();
-                    self.end_replaced();
-                }
-            }
+        for operation in TranslatedOperations::new(operations, delta, clip) {
+            self.replay_operation(operation);
         }
         self.inserting = inserting;
         self.hidden = hidden;
+    }
+
+    /// Makes the scene what painting its operations in order makes of an empty one, with the draw
+    /// orders worked out again, for a log in which some operations were moved (see
+    /// [`Scene::rebuild_from_operations`], which reuses the orders of the log and so is for
+    /// operations that were not).
+    pub(crate) fn rebuild_moved(&mut self) {
+        let operations = mem::take(&mut self.paint_operations);
+        let group_base = self.group_base;
+        self.rebuild(&operations, None, group_base);
     }
 
     pub fn finish(&mut self) {
@@ -1728,6 +1685,128 @@ impl Primitive {
 pub(crate) struct ReplayClip {
     pub(crate) snapped: Bounds<ScaledPixels>,
     pub(crate) plain: Bounds<ScaledPixels>,
+}
+
+/// Recorded operations `delta` away from where they were recorded, clipped by `clip`: what
+/// [`Scene::replay_translated`] puts into a scene, one operation at a time.
+pub(crate) struct TranslatedOperations<'a> {
+    operations: std::slice::Iter<'a, PaintOperation>,
+    delta: Point<ScaledPixels>,
+    clip: &'a ReplayClip,
+    /// The masks that replaced the one around them in the recording are not cut by the one
+    /// around the place the recording is put, unless they were cut from the masks inside it.
+    /// Whether what is put now is cut by `clip`: inside a mask that replaced the one around
+    /// it, until one that was cut from the masks inside the recording (a box handed to a
+    /// stacking context inside it, painted under the mask it was handed over with) replaces
+    /// that in turn.
+    clipping: Vec<bool>,
+}
+
+impl<'a> TranslatedOperations<'a> {
+    pub(crate) fn new(operations: &'a [PaintOperation], delta: Point<ScaledPixels>, clip: &'a ReplayClip) -> Self {
+        Self { operations: operations.iter(), delta, clip, clipping: Vec::new() }
+    }
+}
+
+impl Iterator for TranslatedOperations<'_> {
+    type Item = PaintOperation;
+
+    fn next(&mut self) -> Option<PaintOperation> {
+        let operation = self.operations.next()?;
+        let (delta, clip) = (self.delta, self.clip);
+        let clipped = self.clipping.last().copied().unwrap_or(true);
+        Some(match operation {
+            PaintOperation::Primitive(primitive) => {
+                let mut primitive = primitive.clone();
+                primitive.translate_replayed(delta);
+                if clipped {
+                    primitive.clip_to(clip);
+                }
+                PaintOperation::Primitive(primitive)
+            }
+            PaintOperation::Quad(quad) => {
+                let mut quad = *quad;
+                quad.translate(delta);
+                if clipped {
+                    clip_mask(&mut quad.content_mask, &clip.snapped);
+                }
+                PaintOperation::Quad(quad)
+            }
+            PaintOperation::Image(sprite) => {
+                let mut sprite = *sprite;
+                sprite.translate(delta);
+                if clipped {
+                    clip_mask(&mut sprite.content_mask, &clip.snapped);
+                }
+                PaintOperation::Image(sprite)
+            }
+            PaintOperation::PendingGlyph(glyph) => {
+                let mut glyph = glyph.clone();
+                glyph.translate(delta);
+                if clipped {
+                    clip_mask(&mut glyph.content_mask, &clip.snapped);
+                }
+                PaintOperation::PendingGlyph(glyph)
+            }
+            PaintOperation::NativeSurface(placeholder) => {
+                let mut placeholder = placeholder.clone();
+                placeholder.translate(delta);
+                if clipped {
+                    clip_mask(&mut placeholder.content_mask, &clip.snapped);
+                }
+                PaintOperation::NativeSurface(placeholder)
+            }
+            PaintOperation::StartLayer(bounds) => {
+                let mut bounds = *bounds;
+                translate_bounds(&mut bounds, delta);
+                if clipped {
+                    bounds = bounds.intersect(&clip.snapped);
+                }
+                PaintOperation::StartLayer(bounds)
+            }
+            PaintOperation::StartGroup {
+                effect,
+                content_mask,
+                reserved,
+            } => {
+                let mut effect = effect.clone();
+                // The group of an exact clip has no box of its own: its effect is a default.
+                if !effect.exact_clip {
+                    effect.translate(delta);
+                }
+                let mut content_mask = *content_mask;
+                translate_mask(&mut content_mask, delta);
+                if clipped {
+                    clip_mask(&mut content_mask, &clip.snapped);
+                }
+                let reserved = reserved.map(|mut bounds| {
+                    translate_bounds(&mut bounds, delta);
+                    bounds
+                });
+                PaintOperation::StartGroup { effect, content_mask, reserved }
+            }
+            PaintOperation::WidenGroups(escaped) => {
+                let mut escaped = *escaped;
+                translate_mask(&mut escaped, delta);
+                if clipped {
+                    clip_mask(&mut escaped, &clip.snapped);
+                }
+                PaintOperation::WidenGroups(escaped)
+            }
+            PaintOperation::Replaced { derived } => {
+                self.clipping.push(*derived);
+                PaintOperation::Replaced { derived: *derived }
+            }
+            PaintOperation::EndReplaced => {
+                self.clipping.pop();
+                PaintOperation::EndReplaced
+            }
+            PaintOperation::EndLayer => PaintOperation::EndLayer,
+            PaintOperation::EndGroup => PaintOperation::EndGroup,
+            PaintOperation::StartTextClip => PaintOperation::StartTextClip,
+            PaintOperation::EndTextClip => PaintOperation::EndTextClip,
+        })
+    }
 }
 
 /// Cuts `mask` by the plain rectangle `clip`, as [`ContentMask::intersect`] does: a rounded corner

@@ -19,11 +19,19 @@
 //! difference of the scroll positions rounded to a device pixel, as the list places its rows) and
 //! the runs of the frame shown are enough to ask each of the checks that a translate depends on.
 //! The first that fails is the reason; see [`ScrollPatchReason`]. A frame that passes all of them
-//! is predicted, and the frame that is then built is compared with the prediction
-//! ([`ScrollPatchCounters::mispredicted`]).
+//! is predicted, and when it is drawn whole all the same the frame that is then built is compared
+//! with the prediction ([`ScrollPatchCounters::mispredicted`]).
+//!
+//! **Translate.** The rows are put where a replay of their recordings at the new position puts
+//! them, not where the frame shown moved by the offset puts them: the operations and hitboxes of
+//! each row are made again from its recording (cut by the content mask around it, as a replay
+//! cuts them), written over the ones it has in the frame, and the scene is made again from the
+//! log. Everything is worked out before anything is written, and a row that cannot be put so
+//! declines the whole translate ([`ScrollApplyDecline`]) and the frame is drawn whole.
 
 use super::*;
-use crate::elements::{ListFrame, RetainedState, ScrollMiss};
+use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss};
+use crate::scene::{PaintOperation, TranslatedOperations};
 use crate::scroll_routing::ScrollerId;
 
 /// Why a frame drawn after a list scroll is not a pure translate of the frame shown, the first of
@@ -61,6 +69,9 @@ pub enum ScrollPatchReason {
     A11y,
     /// A smooth scroll or a scrollbar fade has frames of its own to run.
     ScrollAnimation,
+    /// The list has a scrollbar, whose thumb a scroll moves or shows: the owner says it. The
+    /// translate does not paint it yet.
+    Thumb,
     /// A row of the frame shown has no recording that can be put elsewhere: it is not a
     /// relocatable root, or one that was built late or could not be recorded.
     NotRelocatable,
@@ -71,7 +82,7 @@ pub enum ScrollPatchReason {
 
 impl ScrollPatchReason {
     /// Every reason, in the order the checks run.
-    pub const ALL: [ScrollPatchReason; 12] = [
+    pub const ALL: [ScrollPatchReason; 13] = [
         ScrollPatchReason::Edited,
         ScrollPatchReason::Membership,
         ScrollPatchReason::Hover,
@@ -82,6 +93,7 @@ impl ScrollPatchReason {
         ScrollPatchReason::Focus,
         ScrollPatchReason::A11y,
         ScrollPatchReason::ScrollAnimation,
+        ScrollPatchReason::Thumb,
         ScrollPatchReason::NotRelocatable,
         ScrollPatchReason::Other,
     ];
@@ -156,8 +168,42 @@ impl ScrollPatchCause {
     }
 }
 
-/// How the frames drawn after a list scroll would have been drawn by translating the rows of the
-/// frame shown, since the window was made.
+/// Why a frame the classifier called a translate was drawn whole all the same: something a row
+/// needs to be put elsewhere was not as the frame shown left it. Found before anything is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScrollApplyDecline {
+    /// A row has no recording to make its operations and hitboxes from: its state is gone, or it
+    /// hands elements to a stacking context.
+    Recording,
+    /// The scene operations a row left in the frame shown are not as many as it recorded, which a
+    /// hidden row is: they cannot be written over by the recording's.
+    Operations,
+    /// The hitboxes a row left in the frame shown are not the ones it recorded.
+    Hitboxes,
+    /// The runs of the list are not what the classifier saw, or there is nothing to translate.
+    Runs,
+    /// The window is in a state a frame is not swapped in: it only lays out, measures, or an
+    /// input is being dispatched.
+    Window,
+}
+
+impl ScrollApplyDecline {
+    /// Every reason.
+    pub const ALL: [ScrollApplyDecline; 5] = [
+        ScrollApplyDecline::Recording,
+        ScrollApplyDecline::Operations,
+        ScrollApplyDecline::Hitboxes,
+        ScrollApplyDecline::Runs,
+        ScrollApplyDecline::Window,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// How the frames drawn after a list scroll were drawn by translating the rows of the frame shown
+/// or would have been, since the window was made.
 #[derive(Clone, Debug, Default)]
 pub struct ScrollPatchCounters {
     /// Frames drawn after a list scroll that were classified.
@@ -170,6 +216,9 @@ pub struct ScrollPatchCounters {
     /// Of the frames not eligible, those that only the hover stops: they would be eligible with the
     /// pointer elsewhere.
     pub hover_only: u64,
+    /// Of the eligible ones, frames drawn by moving the rows of the frame shown.
+    pub patched: u64,
+    apply_declines: [u64; ScrollApplyDecline::ALL.len()],
     reasons: [u64; ScrollPatchReason::ALL.len()],
     held: [u64; ScrollPatchReason::ALL.len()],
     held_causes: [u64; ScrollPatchCause::ALL.len()],
@@ -192,6 +241,11 @@ impl ScrollPatchCounters {
     pub fn held_cause(&self, cause: ScrollPatchCause) -> u64 {
         self.held_causes[cause.index()]
     }
+
+    /// How many eligible frames were drawn whole because the translate declined for this reason.
+    pub fn apply_declines(&self, reason: ScrollApplyDecline) -> u64 {
+        self.apply_declines[reason.index()]
+    }
 }
 
 /// A retained root painted inside a list.
@@ -205,11 +259,16 @@ struct ScrollRun {
     ops: Range<usize>,
     /// How far from its recording it was put.
     delta: Point<Pixels>,
-    /// The content mask around the root, and whether an exact clip cut it.
+    /// The content mask around the root in prepaint, and whether an exact clip cut it.
     ambient: ContentMask<Pixels>,
     exact_clips: bool,
+    /// The content mask around the root in paint, which cuts its operations: the list's clip is in
+    /// it and not in `ambient`.
+    paint_mask: ContentMask<Pixels>,
     /// The root was put from its recording, and not built.
     replayed: bool,
+    /// Tells the owner of the root that it moved.
+    hook: Option<ReplayHook>,
 }
 
 /// A run of the frame shown with where a scroll would put it.
@@ -298,6 +357,10 @@ impl Verdict {
 /// What the frame drawn after the scroll has to be to be what was predicted.
 struct Prediction {
     list: ScrollerId,
+    /// Where the list is scrolled to, as [`ListState::scrolled`] reads it, and how far the rows
+    /// move from where the frame shown has them.
+    scrolled: Pixels,
+    shift: Point<Pixels>,
     rows: Range<usize>,
     /// How far from its recording each row is put.
     deltas: Vec<(GlobalElementId, Point<Pixels>)>,
@@ -305,10 +368,14 @@ struct Prediction {
 
 pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window) -> Option<ScrollPatchReason>>;
 pub(crate) type ScrollPatchHover = Rc<dyn Fn(&Window, &[GlobalElementId], &[GlobalElementId]) -> bool>;
+pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App)>;
+pub(crate) type ScrollPatchRegistries = Rc<dyn Fn(&Window) -> String>;
 
 #[derive(Default)]
 pub(crate) struct ScrollPatchWindow {
     enabled: bool,
+    settled: Option<ScrollPatchSettled>,
+    registries: Option<ScrollPatchRegistries>,
     /// A list scrolled since the last draw, and the view it notified.
     scrolled: Option<EntityId>,
     gate: Option<ScrollPatchGate>,
@@ -347,6 +414,21 @@ impl Window {
         hover: Option<Rc<dyn Fn(&Window, &[GlobalElementId], &[GlobalElementId]) -> bool>>,
     ) {
         self.scroll_patch.hover = hover;
+    }
+
+    /// Lets the owner of the window follow a frame that moved the rows in place: `settled` runs
+    /// after the draw (as a callback deferred from it), for what the owner does after a frame
+    /// that built the content under the pointer, such as following a hover that the moved rows
+    /// changed.
+    pub fn set_scroll_patch_settled(&mut self, settled: Option<Rc<dyn Fn(&mut Window, &mut App)>>) {
+        self.scroll_patch.settled = settled;
+    }
+
+    /// Lets the owner of the window say what it keeps outside the frame for the rows of a list
+    /// (the boxes and regions registered for them), as text, for the check of a patched frame
+    /// against the frame built whole after it (see [`Window::set_retention_verifier`]).
+    pub fn set_scroll_patch_registries(&mut self, registries: Option<Rc<dyn Fn(&Window) -> String>>) {
+        self.scroll_patch.registries = registries;
     }
 
     /// How the frames drawn after a list scroll were classified since the window was made.
@@ -409,7 +491,13 @@ impl Window {
         .then(|| self.next_frame.hitboxes.len())
     }
 
-    pub(crate) fn scroll_patch_end_root_prepaint(&mut self, id: &GlobalElementId, hitboxes_start: usize, replayed: bool) {
+    pub(crate) fn scroll_patch_end_root_prepaint(
+        &mut self,
+        id: &GlobalElementId,
+        hitboxes_start: usize,
+        replayed: bool,
+        hook: Option<ReplayHook>,
+    ) {
         let delta = if replayed {
             let placed = self.peek_element_state(id, |state: &RetainedState| state.placed_by());
             match placed.flatten() {
@@ -434,9 +522,11 @@ impl Window {
             hitboxes,
             ops: 0..0,
             delta,
+            paint_mask: ambient,
             ambient,
             exact_clips,
             replayed,
+            hook,
         });
     }
 
@@ -449,10 +539,12 @@ impl Window {
 
     pub(crate) fn scroll_patch_end_root_paint(&mut self, id: &GlobalElementId, ops_start: usize) {
         let end = self.next_frame.scene.len();
+        let paint_mask = self.content_mask();
         let frame = &mut self.next_frame.scroll;
         let from = frame.painted;
         if let Some(offset) = frame.runs[from..].iter().position(|run| run.id == *id) {
             frame.runs[from + offset].ops = ops_start..end;
+            frame.runs[from + offset].paint_mask = paint_mask;
             frame.painted = from + offset + 1;
         }
     }
@@ -570,8 +662,10 @@ impl Window {
         if self.a11y.is_active() {
             held.reason(Reason::A11y);
         }
-        if gate == Some(Reason::ScrollAnimation) {
-            held.reason(Reason::ScrollAnimation);
+        match gate {
+            Some(Reason::ScrollAnimation) => held.reason(Reason::ScrollAnimation),
+            Some(Reason::Thumb) => held.reason(Reason::Thumb),
+            _ => {}
         }
         if places.len() != list.rows.len() {
             held.cause(ScrollPatchCause::NoRun);
@@ -584,6 +678,8 @@ impl Window {
             held,
             prediction: Some(Prediction {
                 list: list.id,
+                scrolled,
+                shift,
                 rows: needed.rows,
                 deltas: places.into_iter().map(|(run, total, _)| (run.id.clone(), total)).collect(),
             }),
@@ -663,6 +759,197 @@ impl Window {
         });
         if !same {
             self.scroll_patch.counters.mispredicted += 1;
+        }
+    }
+}
+
+/// What a draw that tried to move the rows of the frame shown did.
+pub(crate) enum ScrollPatchDraw {
+    /// Nothing was written: the frame is built whole.
+    Declined,
+    /// The rows were moved, and the frame is the frame shown.
+    Done,
+    /// The rows were moved, and the frame is built whole as well to be compared with.
+    Verify(ScrollPatchTrace),
+}
+
+/// The frame a translate made, as text, for the frame built whole after it to be compared with.
+pub(crate) struct ScrollPatchTrace {
+    /// The scene's primitives with their draw orders.
+    scene: String,
+    /// The frame as [`Window::describe_frame`] says it, without the draw orders.
+    frame: String,
+    registries: String,
+}
+
+/// One row put where the new position puts it: everything is worked out before anything is
+/// written.
+struct ScrollMove {
+    run: usize,
+    total: Point<Pixels>,
+    operations: Vec<PaintOperation>,
+    hitboxes: Vec<Hitbox>,
+}
+
+impl Window {
+    /// Draws the frame after a list scroll that the classifier called a translate by moving the
+    /// rows of the frame shown, if every row can be: the operations and hitboxes of each are made
+    /// from its recording at the new place and written over the ones it has, the scene is made
+    /// again from the log, and what the roots hold outside the frame is moved (their handles, the
+    /// owner's registries through the listener of each). Nothing is built. A row that cannot be
+    /// put so declines the whole translate before anything is written, and the frame is drawn
+    /// whole.
+    pub(crate) fn apply_scroll_patch(&mut self, cx: &mut App) -> ScrollPatchDraw {
+        let Some(prediction) = self.scroll_patch.predicted.take() else {
+            return ScrollPatchDraw::Declined;
+        };
+        let planned = if cx.mode.skip_drawing() || self.layout_only || self.measuring || self.dispatch_depth.get() > 0 {
+            Err(ScrollApplyDecline::Window)
+        } else {
+            self.plan_scroll_moves(&prediction)
+        };
+        let moves = match planned {
+            Ok(moves) => moves,
+            Err(decline) => {
+                self.scroll_patch.counters.apply_declines[decline.index()] += 1;
+                self.scroll_patch.predicted = Some(prediction);
+                return ScrollPatchDraw::Declined;
+            }
+        };
+        self.scroll_patch.counters.patched += 1;
+        self.write_scroll_moves(moves, &prediction, cx);
+
+        // The frame is the frame shown, which is current: what a draw does when it is over.
+        self.invalidator.set_dirty(false);
+        self.invalidator.mark_layout_current();
+        self.measured_at = None;
+        self.needs_present.set(true);
+        self.reset_cursor_style(cx);
+        if let Some(settled) = self.scroll_patch.settled.clone() {
+            self.defer(cx, move |window, cx| settled(window, cx));
+        }
+        if !self.drawing_for_frame_request {
+            self.platform_window.schedule_frame();
+        }
+        match self.retained.verifier {
+            Some(_) => ScrollPatchDraw::Verify(self.scroll_trace()),
+            None => ScrollPatchDraw::Done,
+        }
+    }
+
+    fn plan_scroll_moves(&self, prediction: &Prediction) -> Result<Vec<ScrollMove>, ScrollApplyDecline> {
+        let shown = &self.rendered_frame.scroll;
+        let list = shown
+            .lists
+            .iter()
+            .find(|list| list.id == prediction.list)
+            .ok_or(ScrollApplyDecline::Runs)?;
+        let runs: Vec<(usize, &ScrollRun)> = shown.runs.iter().enumerate().filter(|(_, run)| run.list == list.id).collect();
+        if runs.is_empty() || runs.len() != list.rows.len() {
+            return Err(ScrollApplyDecline::Runs);
+        }
+        let scale_factor = self.scale_factor;
+        let mut moves = Vec::with_capacity(runs.len());
+        for (index, run) in runs {
+            let total = run.delta + prediction.shift;
+            let source = self
+                .peek_element_state(&run.id, |state: &RetainedState| state.scroll_source())
+                .flatten()
+                .ok_or(ScrollApplyDecline::Recording)?;
+            if source.operations.len() != run.ops.len() {
+                return Err(ScrollApplyDecline::Operations);
+            }
+            if source.hitboxes.hitboxes.len() != run.hitboxes.len() {
+                return Err(ScrollApplyDecline::Hitboxes);
+            }
+            let clip = self.replay_clip(&run.paint_mask);
+            let operations = TranslatedOperations::new(&source.operations, total.scale(scale_factor), &clip).collect();
+            let mut hitboxes = Vec::with_capacity(run.hitboxes.len());
+            for (recorded, at) in source.hitboxes.hitboxes.iter().zip(run.hitboxes.clone()) {
+                let shown = &self.rendered_frame.hitboxes[at];
+                if recorded.id != shown.id || (recorded.unclipped && !total.is_zero()) {
+                    return Err(ScrollApplyDecline::Hitboxes);
+                }
+                let mut moved = recorded.relocated(total, &run.ambient);
+                moved.parent = shown.parent;
+                hitboxes.push(moved);
+            }
+            moves.push(ScrollMove { run: index, total, operations, hitboxes });
+        }
+        Ok(moves)
+    }
+
+    fn write_scroll_moves(&mut self, moves: Vec<ScrollMove>, prediction: &Prediction, cx: &mut App) {
+        let mut roots = Vec::with_capacity(moves.len());
+        for movement in moves {
+            let frame = &mut self.rendered_frame;
+            let run = &mut frame.scroll.runs[movement.run];
+            for (slot, operation) in frame.scene.paint_operations[run.ops.clone()].iter_mut().zip(movement.operations) {
+                *slot = operation;
+            }
+            for (slot, hitbox) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(movement.hitboxes) {
+                *slot = hitbox;
+            }
+            run.delta = movement.total;
+            roots.push((run.id.clone(), movement.total, run.hook.clone()));
+        }
+        let frame = &mut self.rendered_frame;
+        frame.scene.rebuild_moved();
+        frame.hitboxes_changed();
+        if let Some(list) = frame.scroll.lists.iter_mut().find(|list| list.id == prediction.list) {
+            list.scrolled = prediction.scrolled;
+        }
+        if !self.pointer_outside {
+            self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position, self.dom_hit_testing);
+        }
+        for (id, total, hook) in roots {
+            let key = (id, TypeId::of::<RetainedState>());
+            self.retained_state_mut(&key)
+                .expect("a root that a scroll patch moves has its state")
+                .scrolled_to(total);
+            if let Some(hook) = hook {
+                hook(RetainedPhase::Scrolled(prediction.shift), total, self, cx);
+            }
+        }
+    }
+
+    /// The rendered frame as text, in the forms a translate is compared with the frame built whole.
+    fn scroll_trace(&mut self) -> ScrollPatchTrace {
+        // `describe_frame` reads the frame being built.
+        mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        let scene = self.next_frame.scene.describe_primitives();
+        let frame = self.describe_frame(false);
+        mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        let registries = self.scroll_patch.registries.as_ref().map_or_else(String::new, |describe| describe(self));
+        ScrollPatchTrace { scene, frame, registries }
+    }
+
+    /// Compares the frame a translate made with the frame built whole at the same instant.
+    pub(crate) fn verify_scroll_patch(&mut self, patched: ScrollPatchTrace) {
+        self.retained.counters.verified += 1;
+        let built = self.scroll_trace();
+        let mut differences = Vec::new();
+        for (what, patched, built) in [
+            ("the scene with its draw orders", &patched.scene, &built.scene),
+            ("the frame", &patched.frame, &built.frame),
+            ("what the owner keeps outside the frame", &patched.registries, &built.registries),
+        ] {
+            if patched != built {
+                differences.push(format!("{what}\n{}", super::retained::first_difference(patched, built)));
+            }
+        }
+        if differences.is_empty() {
+            return;
+        }
+        self.retained.counters.mismatches += 1;
+        let message = format!(
+            "a frame that translated the rows of a list differs from the frame built whole in {} places\n{}",
+            differences.len(),
+            differences.join("\n")
+        );
+        eprintln!("[retained] {message}");
+        if self.retained.mismatches.len() < 32 {
+            self.retained.mismatches.push(message);
         }
     }
 }

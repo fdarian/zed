@@ -143,6 +143,13 @@ pub enum RetainedPhase {
     /// when it was built, at the place the context paints the element; inside the brackets of the
     /// recordings that are open around the subtree when it is replayed.
     LiftedPaint(u32),
+    /// A frame that moved the rows of a list in place (`window::scroll_patch`) put
+    /// the subtree, which the frame shown already had, another place: the listener is given how
+    /// far from where it was recorded it is now, as for [`RetainedPhase::Prepaint`], and this is
+    /// how far it moved from where the frame shown had it. What the frame shown wrote of the
+    /// subtree outside the frame is where the frame shown put it, and is moved by this much
+    /// (not written again: that would write it twice).
+    Scrolled(Point<Pixels>),
 }
 
 type Build = Box<dyn FnOnce(&mut Window, &mut App) -> AnyElement>;
@@ -669,7 +676,12 @@ impl Element for Retained {
         });
         window.layout_scope = outer_scope;
         if let Some(hitboxes_start) = scroll_run {
-            window.scroll_patch_end_root_prepaint(global_id, hitboxes_start, matches!(result, RetainedPrepaint::Replayed));
+            window.scroll_patch_end_root_prepaint(
+                global_id,
+                hitboxes_start,
+                matches!(result, RetainedPrepaint::Replayed),
+                self.on_replay.clone(),
+            );
         }
         // The parent hands this subtree to the stacking context around it once this returns, unless
         // it is in a culled subtree, where nothing is handed over: the next element that is would

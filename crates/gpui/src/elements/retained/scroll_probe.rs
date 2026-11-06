@@ -1,15 +1,44 @@
-//! What the scroll-only patch classifier (`window::scroll_patch`) asks of a relocatable root's
-//! recording: how it was last put where it is, and whether the same recording would be put
-//! another delta away. Ghia-only; it changes nothing the root does.
+//! What the scroll-only patch (`window::scroll_patch`) asks of a relocatable root's recording:
+//! how it was last put where it is, whether the same recording would be put another delta away,
+//! and what puts it there. Ghia-only; it changes nothing the root does.
 
 use super::*;
 use crate::ContentMask;
 use crate::UncoveredEdge;
+use crate::scene::PaintOperation;
+use crate::window::RecordedHitboxes;
+
+/// What a recording holds of a root that a scroll patch puts elsewhere without building it.
+pub(crate) struct ScrollSource {
+    pub(crate) operations: Rc<[PaintOperation]>,
+    pub(crate) hitboxes: Rc<RecordedHitboxes>,
+}
 
 impl RetainedState {
     /// How far from its recording the root was last put, if it has one.
     pub(crate) fn placed_by(&self) -> Option<Point<Pixels>> {
         self.recorded.as_ref().map(|recorded| recorded.delta)
+    }
+
+    /// The operations and hitboxes the recording holds as they were recorded, in the region, if it
+    /// is one a scroll can put elsewhere and hands no element to a stacking context.
+    pub(crate) fn scroll_source(&self) -> Option<ScrollSource> {
+        let recorded = self.recorded.as_ref()?;
+        let paint = recorded.paint.as_ref()?;
+        if recorded.prepaint.lifts.is_some() || !paint.lift_markers.is_empty() {
+            return None;
+        }
+        Some(ScrollSource { operations: paint.operations.clone()?, hitboxes: recorded.prepaint.hitboxes.clone() })
+    }
+
+    /// Notes that a scroll patch put the root `delta` from its recording, and moves what it holds
+    /// outside the frame there (the handles of [`Relocation`]), as a replay at that place does.
+    pub(crate) fn scrolled_to(&mut self, delta: Point<Pixels>) {
+        let recorded = self.recorded.as_mut().expect("a root that a scroll patch moves has its recording");
+        recorded.delta = delta;
+        if let Some(relocation) = &recorded.relocation {
+            relocation.apply(delta);
+        }
     }
 
     /// Whether `Recorded::place` would put the root `delta` away from where it was recorded,

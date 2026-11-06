@@ -80,9 +80,9 @@ mod scroll_patch_tests;
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
-pub use scroll_patch::{ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason};
+pub use scroll_patch::{ScrollApplyDecline, ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason};
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
-pub(crate) use scroll_patch::{ScrollFrame, ScrollPatchWindow};
+pub(crate) use scroll_patch::{ScrollFrame, ScrollPatchDraw, ScrollPatchWindow};
 pub(crate) use retained::{
     HandleList, LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
     Origin, RetainedWindow, StateOwner, SubtreeText, UncoveredEdge, blocker_bit, first_blocker,
@@ -5196,6 +5196,21 @@ impl Window {
         }
 
         self.classify_scroll_patch(cx);
+        let mut translated = None;
+        match self.apply_scroll_patch(cx) {
+            ScrollPatchDraw::Declined => {}
+            ScrollPatchDraw::Done => {
+                #[cfg(feature = "profiler")]
+                {
+                    let draw_duration = self
+                        .window_profiler
+                        .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
+                    self.debug_frame_overlay.record_frame(draw_duration);
+                }
+                return arena_scope.exit(&cx.element_arena);
+            }
+            ScrollPatchDraw::Verify(trace) => translated = Some(trace),
+        }
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -5222,11 +5237,11 @@ impl Window {
             }
         }
         // The frame that checks a patch builds every subtree, as the one a replay is compared with.
-        self.retained.reference |= patched.is_some();
+        self.retained.reference |= patched.is_some() || translated.is_some();
         if !cx.mode.skip_drawing() {
             self.build_next_frame(cx);
         }
-        if patched.is_some() {
+        if patched.is_some() || translated.is_some() {
             self.retained.reference = false;
         }
         self.dirty_views.clear();
@@ -5261,6 +5276,9 @@ impl Window {
         self.settle_scroll_patch();
         if let Some(trace) = patched {
             self.verify_patch(trace);
+        }
+        if let Some(trace) = translated {
+            self.verify_scroll_patch(trace);
         }
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;

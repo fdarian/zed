@@ -971,7 +971,7 @@ pub(crate) struct PaintRecord {
     /// Where in `tab_stops` the paint skipped an element that was handed to the stacking context
     /// around it (so that its tab stops go there), and which of the ones the prepaint handed over,
     /// counted from the first.
-    lift_markers: Rc<[(usize, u32)]>,
+    pub(crate) lift_markers: Rc<[(usize, u32)]>,
     /// What paint gives the accessibility tree: the action listeners of the nodes.
     a11y: Option<Rc<a11y::A11yRecording>>,
     pub(crate) has_publications: bool,
@@ -2236,7 +2236,7 @@ impl Window {
     }
 
     /// The retained state under `key`.
-    fn retained_state_mut(&mut self, key: &(GlobalElementId, TypeId)) -> Option<&mut crate::elements::RetainedState> {
+    pub(crate) fn retained_state_mut(&mut self, key: &(GlobalElementId, TypeId)) -> Option<&mut crate::elements::RetainedState> {
         self.element_states
             .get_mut(key)?
             .inner
@@ -2635,15 +2635,18 @@ impl Window {
         count: PrimitiveCount,
     ) {
         self.retained.relocated_replays += 1;
-        let scale_factor = self.scale_factor;
-        let ambient = self.content_mask();
-        let clip = ReplayClip {
-            snapped: self.cover_bounds(ambient.bounds),
-            plain: ambient.bounds.scale(scale_factor),
-        };
+        let clip = self.replay_clip(&self.content_mask());
         self.next_frame
             .scene
-            .replay_translated(operations, delta.scale(scale_factor), &clip, count);
+            .replay_translated(operations, delta.scale(self.scale_factor), &clip, count);
+    }
+
+    /// What a recording put under the content mask `ambient` is cut by.
+    pub(crate) fn replay_clip(&self, ambient: &ContentMask<Pixels>) -> ReplayClip {
+        ReplayClip {
+            snapped: self.cover_bounds(ambient.bounds),
+            plain: ambient.bounds.scale(self.scale_factor),
+        }
     }
 
     /// Notes that a rounded content mask was pushed while a subtree is recorded in a region of its
