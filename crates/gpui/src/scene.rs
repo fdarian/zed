@@ -1755,6 +1755,15 @@ impl TranslatedOperations<'_> {
         }
     }
 
+    /// Writes the operations over `slots`, one for each, which is what iterating them into the
+    /// slots does without the vector the iteration would collect.
+    pub(crate) fn overwrite(mut self, slots: &mut [PaintOperation]) {
+        for slot in slots {
+            let Some(operation) = self.operations.next() else { break };
+            *slot = self.translate(operation);
+        }
+    }
+
     fn translated_primitive(&self, primitive: &Primitive) -> Primitive {
         let mut primitive = primitive.clone();
         primitive.translate_replayed(self.delta);

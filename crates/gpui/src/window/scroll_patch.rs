@@ -30,8 +30,8 @@
 //! declines the whole translate ([`ScrollApplyDecline`]) and the frame is drawn whole.
 
 use super::*;
-use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss};
-use crate::scene::{PaintOperation, TranslatedOperations};
+use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss, ScrollSource};
+use crate::scene::{ReplayClip, TranslatedOperations};
 use crate::scroll_routing::ScrollerId;
 
 /// Why a frame drawn after a list scroll is not a pure translate of the frame shown, the first of
@@ -782,13 +782,14 @@ pub(crate) struct ScrollPatchTrace {
     registries: String,
 }
 
-/// One row put where the new position puts it: everything is worked out before anything is
-/// written.
+/// One row put where the new position puts it: everything that can decline is checked before
+/// anything is written, and the operations and hitboxes are made as they are written over the
+/// ones the frame has.
 struct ScrollMove {
     run: usize,
     total: Point<Pixels>,
-    operations: Vec<PaintOperation>,
-    hitboxes: Vec<Hitbox>,
+    source: ScrollSource,
+    clip: ReplayClip,
 }
 
 impl Window {
@@ -848,7 +849,6 @@ impl Window {
         if runs.is_empty() || runs.len() != list.rows.len() {
             return Err(ScrollApplyDecline::Runs);
         }
-        let scale_factor = self.scale_factor;
         let mut moves = Vec::with_capacity(runs.len());
         for (index, run) in runs {
             let total = run.delta + prediction.shift;
@@ -863,32 +863,29 @@ impl Window {
                 return Err(ScrollApplyDecline::Hitboxes);
             }
             let clip = self.replay_clip(&run.paint_mask);
-            let operations = TranslatedOperations::new(&source.operations, total.scale(scale_factor), &clip).collect();
-            let mut hitboxes = Vec::with_capacity(run.hitboxes.len());
-            for (recorded, at) in source.hitboxes.hitboxes.iter().zip(run.hitboxes.clone()) {
-                let shown = &self.rendered_frame.hitboxes[at];
+            for (recorded, shown) in source.hitboxes.hitboxes.iter().zip(&self.rendered_frame.hitboxes[run.hitboxes.clone()]) {
                 if recorded.id != shown.id || (recorded.unclipped && !total.is_zero()) {
                     return Err(ScrollApplyDecline::Hitboxes);
                 }
-                let mut moved = recorded.relocated(total, &run.ambient);
-                moved.parent = shown.parent;
-                hitboxes.push(moved);
             }
-            moves.push(ScrollMove { run: index, total, operations, hitboxes });
+            moves.push(ScrollMove { run: index, total, source, clip });
         }
         Ok(moves)
     }
 
     fn write_scroll_moves(&mut self, moves: Vec<ScrollMove>, prediction: &Prediction, cx: &mut App) {
+        let scale_factor = self.scale_factor;
         let mut roots = Vec::with_capacity(moves.len());
         for movement in moves {
             let frame = &mut self.rendered_frame;
             let run = &mut frame.scroll.runs[movement.run];
-            for (slot, operation) in frame.scene.paint_operations[run.ops.clone()].iter_mut().zip(movement.operations) {
-                *slot = operation;
-            }
-            for (slot, hitbox) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(movement.hitboxes) {
-                *slot = hitbox;
+            TranslatedOperations::new(&movement.source.operations, movement.total.scale(scale_factor), &movement.clip)
+                .overwrite(&mut frame.scene.paint_operations[run.ops.clone()]);
+            let recorded = movement.source.hitboxes.hitboxes.iter();
+            for (slot, recorded) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(recorded) {
+                let mut moved = recorded.relocated(movement.total, &run.ambient);
+                moved.parent = slot.parent;
+                *slot = moved;
             }
             run.delta = movement.total;
             roots.push((run.id.clone(), movement.total, run.hook.clone()));
