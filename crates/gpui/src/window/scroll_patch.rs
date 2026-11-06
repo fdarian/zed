@@ -28,11 +28,22 @@
 //! cuts them), written over the ones it has in the frame, and the scene is made again from the
 //! log. Everything is worked out before anything is written, and a row that cannot be put so
 //! declines the whole translate ([`ScrollApplyDecline`]) and the frame is drawn whole.
+//!
+//! **Thumbs.** A list's overlay scrollbar paints a thumb that a scroll moves, so the owner notes
+//! each bar it paints for a list ([`Window::paint_scroll_thumb`]): the quad it painted, as the one
+//! operation it left in the frame, and two closures. Before the frame is built the first says,
+//! for the new position, where the thumb goes or why it cannot go there (the bar would show where
+//! it did not, fade a step, thicken, or lie elsewhere: [`ScrollThumbMiss`], counted as the causes
+//! of [`ScrollPatchReason::Thumb`]). When the rows are moved the quad is made again at the new
+//! bounds the way the owner would paint it (snapped to the device pixel, placed by the offset the
+//! painted one had) and written over the operation, and the second tells the owner the bar moved.
+//! The hitbox of the bar is its track, which a scroll does not move.
 
 use super::*;
 use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss, ScrollSource};
-use crate::scene::{ReplayClip, TranslatedOperations};
+use crate::scene::{PaintOperation, ReplayClip, TranslatedOperations};
 use crate::scroll_routing::ScrollerId;
+use crate::ListState;
 
 /// Why a frame drawn after a list scroll is not a pure translate of the frame shown, the first of
 /// them, in the order the checks run.
@@ -69,8 +80,10 @@ pub enum ScrollPatchReason {
     A11y,
     /// A smooth scroll or a scrollbar fade has frames of its own to run.
     ScrollAnimation,
-    /// The list has a scrollbar, whose thumb a scroll moves or shows: the owner says it. The
-    /// translate does not paint it yet.
+    /// The thumb of a bar cannot be put where the scroll puts it: the owner says it for a bar of
+    /// a list it painted no thumb for or whose bar it cannot place (see
+    /// [`Window::paint_scroll_thumb`]), or for any other bar it cannot predict. Which of the two
+    /// is in [`ScrollPatchCause`].
     Thumb,
     /// A row of the frame shown has no recording that can be put elsewhere: it is not a
     /// relocatable root, or one that was built late or could not be recorded.
@@ -126,17 +139,33 @@ pub enum ScrollPatchCause {
     RegionBottom,
     /// [`ScrollPatchReason::Region`]: the same at a side.
     RegionSide,
+    /// [`ScrollPatchReason::Thumb`]: the thumb would not be the size the frame shown painted, or
+    /// the bar would end or begin to be painted.
+    ThumbSize,
+    /// [`ScrollPatchReason::Thumb`]: the bar would be painted at another alpha, a fade step.
+    ThumbAlpha,
+    /// [`ScrollPatchReason::Thumb`]: the bar is not painted in the frame shown and the scroll
+    /// would show it.
+    ThumbAppear,
+    /// [`ScrollPatchReason::Thumb`]: the track of the bar is not the one the frame shown painted,
+    /// or the thumb it painted cannot be moved in place (it was painted under a transform, or
+    /// inside the recording of a row).
+    ThumbTrack,
 }
 
 impl ScrollPatchCause {
     /// Every cause.
-    pub const ALL: [ScrollPatchCause; 6] = [
+    pub const ALL: [ScrollPatchCause; 10] = [
         ScrollPatchCause::NoRun,
         ScrollPatchCause::NoRecording,
         ScrollPatchCause::Unmovable,
         ScrollPatchCause::RegionTop,
         ScrollPatchCause::RegionBottom,
         ScrollPatchCause::RegionSide,
+        ScrollPatchCause::ThumbSize,
+        ScrollPatchCause::ThumbAlpha,
+        ScrollPatchCause::ThumbAppear,
+        ScrollPatchCause::ThumbTrack,
     ];
 
     /// The reason it is a cause of.
@@ -148,6 +177,10 @@ impl ScrollPatchCause {
             ScrollPatchCause::RegionTop | ScrollPatchCause::RegionBottom | ScrollPatchCause::RegionSide => {
                 ScrollPatchReason::Region
             }
+            ScrollPatchCause::ThumbSize
+            | ScrollPatchCause::ThumbAlpha
+            | ScrollPatchCause::ThumbAppear
+            | ScrollPatchCause::ThumbTrack => ScrollPatchReason::Thumb,
         }
     }
 
@@ -160,6 +193,10 @@ impl ScrollPatchCause {
             ScrollPatchCause::RegionTop => "top",
             ScrollPatchCause::RegionBottom => "bottom",
             ScrollPatchCause::RegionSide => "side",
+            ScrollPatchCause::ThumbSize => "size",
+            ScrollPatchCause::ThumbAlpha => "alpha",
+            ScrollPatchCause::ThumbAppear => "appear",
+            ScrollPatchCause::ThumbTrack => "track",
         }
     }
 
@@ -182,6 +219,8 @@ pub enum ScrollApplyDecline {
     Hitboxes,
     /// The runs of the list are not what the classifier saw, or there is nothing to translate.
     Runs,
+    /// The operation a thumb painted in the frame shown is not the quad it noted.
+    Thumb,
     /// The window is in a state a frame is not swapped in: it only lays out, measures, or an
     /// input is being dispatched.
     Window,
@@ -189,11 +228,12 @@ pub enum ScrollApplyDecline {
 
 impl ScrollApplyDecline {
     /// Every reason.
-    pub const ALL: [ScrollApplyDecline; 5] = [
+    pub const ALL: [ScrollApplyDecline; 6] = [
         ScrollApplyDecline::Recording,
         ScrollApplyDecline::Operations,
         ScrollApplyDecline::Hitboxes,
         ScrollApplyDecline::Runs,
+        ScrollApplyDecline::Thumb,
         ScrollApplyDecline::Window,
     ];
 
@@ -271,6 +311,66 @@ struct ScrollRun {
     hook: Option<ReplayHook>,
 }
 
+/// Why the thumb of a bar cannot be put where a scroll puts it, as the owner says it of the bar
+/// of a list (see [`Window::paint_scroll_thumb`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollThumbMiss {
+    /// The thumb would be thicker or longer than the one painted, or the bar would stop having one.
+    Size,
+    /// The bar would be painted at another alpha.
+    Alpha,
+    /// The bar was not painted and would be.
+    Appear,
+    /// The track of the bar is not the one painted.
+    Track,
+}
+
+impl ScrollThumbMiss {
+    fn cause(self) -> ScrollPatchCause {
+        match self {
+            ScrollThumbMiss::Size => ScrollPatchCause::ThumbSize,
+            ScrollThumbMiss::Alpha => ScrollPatchCause::ThumbAlpha,
+            ScrollThumbMiss::Appear => ScrollPatchCause::ThumbAppear,
+            ScrollThumbMiss::Track => ScrollPatchCause::ThumbTrack,
+        }
+    }
+}
+
+/// What the owner says of a bar, once the list is scrolled and before the frame is built: the
+/// bounds its thumb is painted at, if they are not the ones of the frame shown, or why it cannot
+/// be put there.
+pub type ScrollThumbPlan = Rc<dyn Fn(&Window) -> Result<Option<Bounds<Pixels>>, ScrollThumbMiss>>;
+
+/// Tells the owner that a frame moved the rows without building the bar: what its prepaint would
+/// have taken from the new position.
+pub type ScrollThumbMoved = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// What a bar painted for its thumb in the frame shown.
+#[derive(Clone, Copy)]
+enum ThumbPaint {
+    /// Nothing: the bar was not shown, or has no thumb.
+    Nothing,
+    /// The quad at this operation, painted at these bounds.
+    Quad { op: usize, bounds: Bounds<Pixels> },
+    /// Something that is not one quad that can be written over.
+    Untracked,
+}
+
+/// The bar of a list as the frame shown painted it.
+struct ScrollThumb {
+    list: ScrollerId,
+    paint: ThumbPaint,
+    plan: ScrollThumbPlan,
+    moved: ScrollThumbMoved,
+}
+
+/// A thumb of the frame shown with where the scroll puts it.
+struct ThumbMove {
+    thumb: usize,
+    /// The new quad, if the thumb moves.
+    quad: Option<(usize, Quad, Bounds<Pixels>)>,
+}
+
 /// A run of the frame shown with where a scroll would put it.
 type PlacedRun<'a> = (&'a ScrollRun, Point<Pixels>, Result<(), ScrollMiss>);
 
@@ -284,6 +384,7 @@ struct OpenList {
 pub(crate) struct ScrollFrame {
     lists: Vec<ListFrame>,
     runs: Vec<ScrollRun>,
+    thumbs: Vec<ScrollThumb>,
     open: Vec<OpenList>,
     row: Option<usize>,
     /// Where in `runs` the paint of the roots is.
@@ -297,6 +398,7 @@ impl ScrollFrame {
     pub(crate) fn clear(&mut self) {
         self.lists.clear();
         self.runs.clear();
+        self.thumbs.clear();
         self.open.clear();
         self.row = None;
         self.painted = 0;
@@ -364,6 +466,9 @@ struct Prediction {
     rows: Range<usize>,
     /// How far from its recording each row is put.
     deltas: Vec<(GlobalElementId, Point<Pixels>)>,
+    /// Where each bar of the frame shown has its thumb once the rows are moved: the index of the
+    /// bar, and the bounds if the thumb moves.
+    thumbs: Vec<(usize, Option<Bounds<Pixels>>)>,
 }
 
 pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window) -> Option<ScrollPatchReason>>;
@@ -454,6 +559,7 @@ impl Window {
             return;
         }
         let frame = &mut self.next_frame.scroll;
+        frame.thumbs.retain(|thumb| thumb.list != id);
         match frame.open.last() {
             Some(open) if open.id == id => frame.runs.truncate(open.start),
             _ => frame.open.push(OpenList { id, start: frame.runs.len() }),
@@ -547,6 +653,41 @@ impl Window {
             frame.runs[from + offset].paint_mask = paint_mask;
             frame.painted = from + offset + 1;
         }
+    }
+
+    /// Paints the thumb of a bar over `list` (`None` when the bar paints none: it is not shown, or
+    /// the content fits) and notes the bar for a frame that moves the rows without building it.
+    /// `plan` says, once the list is scrolled and before the frame is built, where the thumb goes
+    /// or why it cannot go there, and `moved` runs after the rows were moved with the thumb. A
+    /// bar that does not note itself is not known to a translate, which would leave its thumb
+    /// where it was: a list whose bar is painted that way is declined for by the owner (see
+    /// [`Window::set_scroll_patch_gate`]).
+    pub fn paint_scroll_thumb(
+        &mut self,
+        list: &ListState,
+        thumb: Option<PaintQuad>,
+        plan: ScrollThumbPlan,
+        moved: ScrollThumbMoved,
+    ) {
+        let first = self.next_frame.scene.len();
+        let bounds = thumb.as_ref().map(|quad| quad.bounds);
+        if let Some(quad) = thumb {
+            self.paint_quad(quad);
+        }
+        if !self.scroll_patch_records() {
+            return;
+        }
+        let end = self.next_frame.scene.len();
+        let one_quad = end == first + 1
+            && matches!(self.next_frame.scene.paint_operations[first], PaintOperation::Quad(_))
+            && !self.placement().general
+            && !self.is_recording_any_relocation();
+        let paint = match bounds {
+            _ if end == first && !self.is_recording_any_relocation() => ThumbPaint::Nothing,
+            Some(bounds) if one_quad => ThumbPaint::Quad { op: first, bounds },
+            _ => ThumbPaint::Untracked,
+        };
+        self.next_frame.scroll.thumbs.push(ScrollThumb { list: list.scroller_id(), paint, plan, moved });
     }
 
     /// Classifies the frame about to be drawn if a list scrolled since the last one, and counts it.
@@ -670,6 +811,17 @@ impl Window {
         if places.len() != list.rows.len() {
             held.cause(ScrollPatchCause::NoRun);
         }
+        let mut thumbs = Vec::new();
+        for (index, thumb) in shown.thumbs.iter().enumerate() {
+            if matches!(thumb.paint, ThumbPaint::Untracked) {
+                held.cause(ScrollPatchCause::ThumbTrack);
+                continue;
+            }
+            match (thumb.plan)(self) {
+                Ok(bounds) => thumbs.push((index, bounds)),
+                Err(miss) => held.cause(miss.cause()),
+            }
+        }
 
         if held.first().is_some() {
             return Verdict { held, prediction: None };
@@ -682,6 +834,7 @@ impl Window {
                 shift,
                 rows: needed.rows,
                 deltas: places.into_iter().map(|(run, total, _)| (run.id.clone(), total)).collect(),
+                thumbs,
             }),
         }
     }
@@ -809,8 +962,8 @@ impl Window {
         } else {
             self.plan_scroll_moves(&prediction)
         };
-        let moves = match planned {
-            Ok(moves) => moves,
+        let (moves, thumbs) = match planned {
+            Ok(planned) => planned,
             Err(decline) => {
                 self.scroll_patch.counters.apply_declines[decline.index()] += 1;
                 self.scroll_patch.predicted = Some(prediction);
@@ -818,7 +971,7 @@ impl Window {
             }
         };
         self.scroll_patch.counters.patched += 1;
-        self.write_scroll_moves(moves, &prediction, cx);
+        self.write_scroll_moves(moves, thumbs, &prediction, cx);
 
         // The frame is the frame shown, which is current: what a draw does when it is over.
         self.invalidator.set_dirty(false);
@@ -838,7 +991,10 @@ impl Window {
         }
     }
 
-    fn plan_scroll_moves(&self, prediction: &Prediction) -> Result<Vec<ScrollMove>, ScrollApplyDecline> {
+    fn plan_scroll_moves(
+        &self,
+        prediction: &Prediction,
+    ) -> Result<(Vec<ScrollMove>, Vec<ThumbMove>), ScrollApplyDecline> {
         let shown = &self.rendered_frame.scroll;
         let list = shown
             .lists
@@ -870,10 +1026,29 @@ impl Window {
             }
             moves.push(ScrollMove { run: index, total, source, clip });
         }
-        Ok(moves)
+        let mut thumbs = Vec::with_capacity(prediction.thumbs.len());
+        for (index, bounds) in &prediction.thumbs {
+            let quad = match (bounds, shown.thumbs[*index].paint) {
+                (Some(bounds), ThumbPaint::Quad { op, bounds: painted }) => {
+                    let PaintOperation::Quad(old) = &self.rendered_frame.scene.paint_operations[op] else {
+                        return Err(ScrollApplyDecline::Thumb);
+                    };
+                    // The quad is made as `device_quad` makes it: snapped to the device pixel, and
+                    // placed by the offset the painted one had.
+                    let offset = old.bounds.origin - self.snap_bounds(painted).origin;
+                    let mut quad = *old;
+                    quad.bounds = Bounds { origin: self.snap_bounds(*bounds).origin + offset, size: self.snap_bounds(*bounds).size };
+                    Some((op, quad, *bounds))
+                }
+                (None, _) | (Some(_), ThumbPaint::Nothing) => None,
+                (Some(_), ThumbPaint::Untracked) => return Err(ScrollApplyDecline::Thumb),
+            };
+            thumbs.push(ThumbMove { thumb: *index, quad });
+        }
+        Ok((moves, thumbs))
     }
 
-    fn write_scroll_moves(&mut self, moves: Vec<ScrollMove>, prediction: &Prediction, cx: &mut App) {
+    fn write_scroll_moves(&mut self, moves: Vec<ScrollMove>, thumbs: Vec<ThumbMove>, prediction: &Prediction, cx: &mut App) {
         let scale_factor = self.scale_factor;
         let mut roots = Vec::with_capacity(moves.len());
         for movement in moves {
@@ -890,6 +1065,15 @@ impl Window {
             run.delta = movement.total;
             roots.push((run.id.clone(), movement.total, run.hook.clone()));
         }
+        let mut bars = Vec::with_capacity(thumbs.len());
+        for movement in thumbs {
+            let thumb = &mut self.rendered_frame.scroll.thumbs[movement.thumb];
+            if let Some((op, quad, bounds)) = movement.quad {
+                thumb.paint = ThumbPaint::Quad { op, bounds };
+                self.rendered_frame.scene.paint_operations[op] = PaintOperation::Quad(quad);
+            }
+            bars.push(thumb.moved.clone());
+        }
         let frame = &mut self.rendered_frame;
         frame.scene.rebuild_moved();
         frame.hitboxes_changed();
@@ -898,6 +1082,9 @@ impl Window {
         }
         if !self.pointer_outside {
             self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position, self.dom_hit_testing);
+        }
+        for moved in bars {
+            moved(self, cx);
         }
         for (id, total, hook) in roots {
             let key = (id, TypeId::of::<RetainedState>());

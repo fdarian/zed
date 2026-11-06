@@ -4,10 +4,10 @@
 //! it declines before it writes, and the verifier checks it.
 
 use crate::{
-    AnyWindowHandle, AppContext as _, Context, FocusHandle, GlobalElementId, InteractiveElement,
+    AnyWindowHandle, AppContext as _, Bounds, Context, FocusHandle, GlobalElementId, InteractiveElement,
     IntoElement, ListAlignment, ListState, MouseMoveEvent, ParentElement, PlatformInput, Render, ScrollDelta,
-    ScrollApplyDecline, ScrollPatchCause, ScrollPatchReason, ScrollWheelEvent, Styled, TestAppContext, Window,
-    div, list, point, px, retained, size,
+    ScrollApplyDecline, ScrollPatchCause, ScrollPatchReason, ScrollThumbMiss, ScrollWheelEvent,
+    StatefulInteractiveElement as _, Styled, TestAppContext, Window, div, fill, list, point, px, retained, size,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -17,8 +17,45 @@ const LIST: f32 = 100.;
 /// The row that holds the focus in the test of the focus: far from the view.
 const FOCUSED: usize = 50;
 
+/// The bar a list is given in the tests of the thumb: a thumb of `length` at `alpha` that lies along
+/// the list as far down as the list is scrolled. The cells are what the bar would be in the next
+/// frame, which a test changes to say the thumb cannot be put there.
+#[derive(Clone)]
+struct Bar {
+    alpha: Rc<Cell<f32>>,
+    length: Rc<Cell<f32>>,
+    track: Rc<Cell<f32>>,
+    /// How far from where the bar paints it the plan says the thumb goes.
+    lie: Rc<Cell<f32>>,
+    /// The thumb is painted under a rotation, which a quad cannot be moved under in place.
+    rotated: Rc<Cell<bool>>,
+    /// How many frames that moved the rows told the bar.
+    moved: Rc<Cell<u32>>,
+}
+
+impl Bar {
+    fn new() -> Self {
+        Self {
+            alpha: Rc::new(Cell::new(1.)),
+            length: Rc::new(Cell::new(20.)),
+            track: Rc::new(Cell::new(0.)),
+            lie: Rc::default(),
+            rotated: Rc::default(),
+            moved: Rc::default(),
+        }
+    }
+
+    /// The thumb for the list scrolled where it is: 3000 of content in a window of 100.
+    fn thumb(state: &ListState, length: f32, track: f32) -> Bounds<crate::Pixels> {
+        let travel = LIST - length;
+        let top = f32::from(state.scrolled()) / (ROW * 100. - LIST) * travel;
+        Bounds::new(point(px(92. + track), px(top)), size(px(6.), px(length)))
+    }
+}
+
 #[derive(Clone)]
 struct Page {
+    bar: Option<Bar>,
     state: ListState,
     /// The overscan of the rows, if they are relocatable.
     overscan: Option<f32>,
@@ -34,8 +71,9 @@ struct Page {
 impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let page = self.clone();
-        div().size_full().child(
-            list(self.state.clone(), move |ix, _, _| {
+        let bar = self.bar.clone().map(|bar| (bar, self.state.clone()));
+        div().size_full().child({
+            let rows = list(self.state.clone(), move |ix, _, _| {
                 let hitboxes = page.hitboxes;
                 let key = page.key.get();
                 let nested = page.nested.then_some(page.overscan).flatten();
@@ -61,8 +99,51 @@ impl Render for Page {
                 row.into_any_element()
             })
             .w(px(100.))
-            .h(px(LIST)),
-        )
+            .h(px(LIST));
+            match bar {
+                None => rows.into_any_element(),
+                Some((bar, state)) => rows
+                    .paint_overlay(move |_, window, _| {
+                        let painted = (bar.alpha.get(), bar.length.get(), bar.track.get());
+                        let (alpha, length, track) = painted;
+                        let thumb = (alpha > 0.).then(|| {
+                            let mut color = crate::black();
+                            color.a = alpha;
+                            fill(Bar::thumb(&state, length, track), color)
+                        });
+                        let at = Bar::thumb(&state, length, track);
+                        let plan_state = state.clone();
+                        let plan_bar = bar.clone();
+                        let plan = Rc::new(move |_: &Window| {
+                            if painted.0 <= 0. {
+                                return if plan_bar.alpha.get() > 0. { Err(ScrollThumbMiss::Appear) } else { Ok(None) };
+                            }
+                            if plan_bar.alpha.get() != painted.0 {
+                                return Err(ScrollThumbMiss::Alpha);
+                            }
+                            if plan_bar.track.get() != painted.2 {
+                                return Err(ScrollThumbMiss::Track);
+                            }
+                            if plan_bar.length.get() != painted.1 {
+                                return Err(ScrollThumbMiss::Size);
+                            }
+                            let mut next = Bar::thumb(&plan_state, painted.1, painted.2);
+                            let moved_to = next;
+                            next.origin.y += px(plan_bar.lie.get());
+                            Ok((moved_to != at).then_some(next))
+                        });
+                        let told = bar.moved.clone();
+                        let moved = Rc::new(move |_: &mut Window, _: &mut crate::App| told.set(told.get() + 1));
+                        if bar.rotated.get() {
+                            let turn = crate::TransformationMatrix::unit().rotate(crate::radians(0.1));
+                            window.with_transform(turn, |window| window.paint_scroll_thumb(&state, thumb, plan, moved));
+                        } else {
+                            window.paint_scroll_thumb(&state, thumb, plan, moved);
+                        }
+                    })
+                    .into_any_element(),
+            }
+        })
     }
 }
 
@@ -77,8 +158,17 @@ impl Fixture {
     }
 
     fn with_nested(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool, nested: bool) -> Self {
+        Self::open(cx, overscan, hitboxes, nested, None)
+    }
+
+    fn with_bar(cx: &mut TestAppContext, bar: &Bar) -> Self {
+        Self::open(cx, Some(100.), true, false, Some(bar.clone()))
+    }
+
+    fn open(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool, nested: bool, bar: Option<Bar>) -> Self {
         let state = ListState::new(100, ListAlignment::Top, px(0.)).with_uniform_item_height(px(ROW));
         let page = Page {
+            bar,
             state,
             overscan,
             hitboxes,
@@ -621,4 +711,145 @@ fn a_translate_that_differs_from_the_frame_built_whole_is_a_mismatch(cx: &mut Te
         assert_eq!(window.retention_mismatches().len(), 1);
         assert!(window.retention_mismatches()[0].contains("outside the frame"), "{:?}", window.retention_mismatches());
     });
+}
+
+/// The frame shown after each of `wheels` with a bar on the list, the translate on or off, and how
+/// many frames told the bar.
+fn after_wheels_with_bar(cx: &mut TestAppContext, patch: bool, wheels: &[f32]) -> (Vec<String>, crate::ScrollPatchCounters, u32) {
+    let bar = Bar::new();
+    let fixture = Fixture::with_bar(cx, &bar);
+    fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+    let frames = wheels
+        .iter()
+        .map(|by| {
+            fixture.scroll(cx, 10., 12., *by);
+            fixture.with_window(cx, shown)
+        })
+        .collect();
+    (frames, fixture.counters(cx), bar.moved.get())
+}
+
+#[gpui::test]
+fn a_translate_moves_the_thumb_of_the_bar_and_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    let wheels = [5., 5., 7., -3., -4., 6., 2., -15., 1.];
+    let (translated, counters, told) = after_wheels_with_bar(cx, true, &wheels);
+    let (built, off, _) = after_wheels_with_bar(cx, false, &wheels);
+    assert_eq!(off.frames, 0, "{off:?}");
+    assert!(counters.patched >= 4, "{counters:?}");
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    assert_eq!(u64::from(told), counters.patched, "the bar is told once for each frame that moved the rows");
+    for cause in ScrollPatchCause::ALL {
+        assert_eq!(counters.held_cause(cause), 0, "{cause:?}: {counters:?}");
+    }
+    for (frame, (translated, built)) in translated.iter().zip(&built).enumerate() {
+        assert!(
+            translated == built,
+            "frame {frame}, {counters:?}\n{}",
+            super::retained::first_difference(translated, built)
+        );
+    }
+}
+
+#[gpui::test]
+fn a_thumb_that_the_scroll_moves_is_checked_against_the_frame_built_whole(cx: &mut TestAppContext) {
+    let fixture = Fixture::with_bar(cx, &Bar::new());
+    fixture.point_at(cx, 10., 12.);
+    fixture.with_window(cx, |window| {
+        window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+    });
+    fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.eligible, counters.patched), (1, 1), "{counters:?}");
+    fixture.with_window(cx, |window| {
+        assert_eq!(window.retention_mismatches(), &[] as &[String]);
+        assert!(window.retained_counters().verified >= 1);
+    });
+}
+
+#[gpui::test]
+fn a_thumb_put_where_the_bar_would_not_paint_it_is_a_mismatch(cx: &mut TestAppContext) {
+    let bar = Bar::new();
+    let fixture = Fixture::with_bar(cx, &bar);
+    fixture.point_at(cx, 10., 12.);
+    fixture.with_window(cx, |window| window.set_retention_verifier(Some(Rc::new(|_| String::new()))));
+    bar.lie.set(3.);
+    fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+    fixture.with_window(cx, |window| {
+        assert_eq!(window.retention_mismatches().len(), 1, "{:?}", window.retention_mismatches());
+        assert!(window.retention_mismatches()[0].contains("the scene"), "{:?}", window.retention_mismatches());
+    });
+}
+
+#[gpui::test]
+fn a_bar_that_would_be_painted_otherwise_is_a_thumb_and_the_frame_is_whole(cx: &mut TestAppContext) {
+    let causes = [
+        ("alpha", ScrollPatchCause::ThumbAlpha, (|bar: &Bar| bar.alpha.set(0.5)) as fn(&Bar)),
+        ("size", ScrollPatchCause::ThumbSize, |bar| bar.length.set(30.)),
+        ("track", ScrollPatchCause::ThumbTrack, |bar| bar.track.set(1.)),
+    ];
+    for (name, cause, change) in causes {
+        let bar = Bar::new();
+        let fixture = Fixture::with_bar(cx, &bar);
+        fixture.point_at(cx, 10., 12.);
+        change(&bar);
+        fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+        let counters = fixture.counters(cx);
+        only(&counters, ScrollPatchReason::Thumb);
+        assert_eq!(counters.patched, 0, "{name}: {counters:?}");
+        for other in ScrollPatchCause::ALL {
+            assert_eq!(counters.held_cause(other), u64::from(other == cause), "{name} {other:?}: {counters:?}");
+        }
+        assert_eq!(bar.moved.get(), 0, "{name}");
+    }
+}
+
+#[gpui::test]
+fn a_bar_that_is_not_painted_and_would_be_is_a_thumb(cx: &mut TestAppContext) {
+    let bar = Bar::new();
+    bar.alpha.set(0.);
+    let fixture = Fixture::with_bar(cx, &bar);
+    fixture.point_at(cx, 10., 12.);
+
+    // Not painted and not to be: nothing of the bar to move.
+    fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.eligible, counters.patched), (1, 1), "{counters:?}");
+
+    bar.alpha.set(1.);
+    fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.eligible, counters.patched), (1, 1), "{counters:?}");
+    assert_eq!(counters.reasons(ScrollPatchReason::Thumb), 1, "{counters:?}");
+    assert_eq!(counters.held_cause(ScrollPatchCause::ThumbAppear), 1, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_thumb_that_is_not_the_quad_it_noted_declines_the_translate_before_it_writes(cx: &mut TestAppContext) {
+    let broken = |cx: &mut TestAppContext, patch: bool| {
+        let fixture = Fixture::with_bar(cx, &Bar::new());
+        fixture.point_at(cx, 10., 12.);
+        fixture.with_window(cx, |window| {
+            window.set_scroll_patch(patch);
+            // The thumb is the last thing the list paints.
+            let last = window.rendered_frame.scene.paint_operations.last_mut().expect("the frame has operations");
+            *last = crate::scene::PaintOperation::EndLayer;
+        });
+        fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+        fixture.counters(cx)
+    };
+    let counters = broken(cx, true);
+    assert_eq!((counters.eligible, counters.patched), (1, 0), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::Thumb), 1, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_thumb_painted_under_a_transform_is_one_that_cannot_be_moved(cx: &mut TestAppContext) {
+    let bar = Bar::new();
+    bar.rotated.set(true);
+    let fixture = Fixture::with_bar(cx, &bar);
+    fixture.point_at(cx, 10., 12.);
+    fixture.wheel_with(cx, 10., 12., 5., |_, _| {});
+    let counters = fixture.counters(cx);
+    only(&counters, ScrollPatchReason::Thumb);
+    assert_eq!(counters.held_cause(ScrollPatchCause::ThumbTrack), 1, "{counters:?}");
 }

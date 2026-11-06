@@ -372,6 +372,10 @@ struct Count(usize);
 struct Height(Pixels);
 
 impl ListState {
+    pub(crate) fn scroller_id(&self) -> crate::scroll_routing::ScrollerId {
+        crate::scroll_routing::scroller_id_of_state(&self.0)
+    }
+
     /// Construct a new list state, for storage on a view.
     ///
     /// The overdraw parameter controls how much extra space is rendered

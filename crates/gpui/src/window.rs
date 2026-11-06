@@ -80,7 +80,10 @@ mod scroll_patch_tests;
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
-pub use scroll_patch::{ScrollApplyDecline, ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason};
+pub use scroll_patch::{
+    ScrollApplyDecline, ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason, ScrollThumbMiss, ScrollThumbMoved,
+    ScrollThumbPlan,
+};
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
 pub(crate) use scroll_patch::{ScrollFrame, ScrollPatchDraw, ScrollPatchWindow};
 pub(crate) use retained::{
