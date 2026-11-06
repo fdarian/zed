@@ -1427,14 +1427,14 @@ impl Scene {
     /// batches by. Upstream breaks the tie with the id of the tile.
     pub fn finish(&mut self) {
         let mut tracker = self.slot_tracker.take();
-        sort_items(&mut self.shadows, |shadow| shadow.order, placed_in(&mut tracker, PrimitiveKind::Shadow));
-        sort_items(&mut self.quads, |quad| quad.order, placed_in(&mut tracker, PrimitiveKind::Quad));
-        sort_items(&mut self.paths, |path| path.order, placed_in(&mut tracker, PrimitiveKind::Path));
-        sort_items(&mut self.underlines, |underline| underline.order, placed_in(&mut tracker, PrimitiveKind::Underline));
-        sort_items(&mut self.monochrome_sprites, sprite_key, placed_in(&mut tracker, PrimitiveKind::MonochromeSprite));
-        sort_items(&mut self.subpixel_sprites, sprite_key, placed_in(&mut tracker, PrimitiveKind::SubpixelSprite));
-        sort_items(&mut self.polychrome_sprites, sprite_key, placed_in(&mut tracker, PrimitiveKind::PolychromeSprite));
-        sort_items(&mut self.surfaces, |surface| surface.order, placed_in(&mut tracker, PrimitiveKind::Surface));
+        sort_items(&mut self.shadows, |shadow| shadow.order.into(), placed_in(&mut tracker, PrimitiveKind::Shadow));
+        sort_items(&mut self.quads, |quad| quad.order.into(), placed_in(&mut tracker, PrimitiveKind::Quad));
+        sort_items(&mut self.paths, |path| path.order.into(), placed_in(&mut tracker, PrimitiveKind::Path));
+        sort_items(&mut self.underlines, |underline| underline.order.into(), placed_in(&mut tracker, PrimitiveKind::Underline));
+        sort_items(&mut self.monochrome_sprites, sprite_sort_key, placed_in(&mut tracker, PrimitiveKind::MonochromeSprite));
+        sort_items(&mut self.subpixel_sprites, sprite_sort_key, placed_in(&mut tracker, PrimitiveKind::SubpixelSprite));
+        sort_items(&mut self.polychrome_sprites, sprite_sort_key, placed_in(&mut tracker, PrimitiveKind::PolychromeSprite));
+        sort_items(&mut self.surfaces, |surface| surface.order.into(), placed_in(&mut tracker, PrimitiveKind::Surface));
         self.op_slots = tracker.map(|tracker| tracker.slots);
         self.groups.sort_by_key(|group| group.order);
         self.native_surfaces.sort_by_key(|placeholder| placeholder.order);
@@ -1774,18 +1774,29 @@ fn placed_in(tracker: &mut Option<SlotTracker>, kind: PrimitiveKind) -> Option<P
 }
 
 /// Sorts `items` by `key`, equal keys in the order they were in. The keys are sorted with the
-/// index of their item, a pair of a few bytes where an item is up to 240, and each item is moved
-/// once, to where its pair went. `placed` notes where the primitive of each operation went.
-fn sort_items<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K, placed: Option<Placed<'_>>) {
+/// index of their item, which is the low half of a number that compares as one, where an item is
+/// up to 240 bytes, and each item is moved once, to where its number went. `placed` notes where
+/// the primitive of each operation went.
+fn sort_items<T>(items: &mut [T], key: impl Fn(&T) -> u128, placed: Option<Placed<'_>>) {
+    const INDEX_BITS: u32 = 32;
+    const INDEX: u128 = (1 << INDEX_BITS) - 1;
     if items.len() < 2 && placed.is_none() {
         return;
     }
-    let mut gather: Vec<(K, u32)> = items.iter().enumerate().map(|(index, item)| (key(item), index as u32)).collect();
+    let mut gather: Vec<u128> = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let key = key(item);
+            debug_assert!(key >> (128 - INDEX_BITS) == 0, "a key leaves room for the index");
+            key << INDEX_BITS | index as u128
+        })
+        .collect();
     gather.sort_unstable();
     if let Some(placed) = placed {
         debug_assert_eq!(items.len(), placed.inserted.len());
-        for (to, (_, from)) in gather.iter().enumerate() {
-            let op = placed.inserted[*from as usize];
+        for (to, number) in gather.iter().enumerate() {
+            let op = placed.inserted[(number & INDEX) as usize];
             if op != SlotTracker::NO_OP {
                 placed.slots[op as usize] = OpSlot::At(placed.kind, to as u32);
             }
@@ -1795,7 +1806,7 @@ fn sort_items<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K, placed: Option<
     for first in 0..gather.len() {
         let mut to = first;
         loop {
-            let from = mem::replace(&mut gather[to].1, to as u32) as usize;
+            let from = (mem::replace(&mut gather[to], to as u128) & INDEX) as usize;
             if from == first {
                 break;
             }
@@ -1803,6 +1814,13 @@ fn sort_items<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K, placed: Option<
             to = from;
         }
     }
+}
+
+/// [`sprite_key`] as a number that compares as the key does: the order, then the index of the
+/// texture, then its kind.
+fn sprite_sort_key<S: SpriteOrder>(sprite: &S) -> u128 {
+    let (order, texture) = sprite.key();
+    (order as u128) << 34 | (texture.index as u128) << 2 | texture.kind as u128
 }
 
 /// What a sprite is ordered by in [`Scene::finish`].
@@ -4445,6 +4463,33 @@ mod tests {
 
             assert_eq!(describe(&replayed), describe(&painted));
             assert_eq!(drawn(&replayed), drawn(&painted));
+        }
+    }
+
+    #[test]
+    fn sprites_are_sorted_by_order_then_texture_and_equal_ones_keep_their_places() {
+        let kinds = [AtlasTextureKind::Monochrome, AtlasTextureKind::Polychrome, AtlasTextureKind::Subpixel];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        for count in [0, 1, 2, 17, 300] {
+            let mut sprites: Vec<MonochromeSprite> = (0..count)
+                .map(|at| {
+                    let mut sprite = glyph(at as f32, 0.);
+                    sprite.order = next(6) as DrawOrder;
+                    sprite.tile.texture_id = AtlasTextureId { index: next(4) as u32, kind: kinds[next(3) as usize] };
+                    sprite
+                })
+                .collect();
+            let mut expected = sprites.clone();
+            expected.sort_by_key(sprite_key);
+            sort_items(&mut sprites, sprite_sort_key, None);
+            let places = |sprites: &[MonochromeSprite]| sprites.iter().map(|sprite| sprite.bounds.origin.x.0 as u32).collect::<Vec<_>>();
+            assert_eq!(places(&sprites), places(&expected), "{count} sprites");
         }
     }
 
