@@ -409,6 +409,33 @@ impl Scene {
         self.record_with(|| PaintOperation::Primitive(primitive.clone()));
     }
 
+    /// [`Scene::replay_primitive`] of a recorded primitive that `translate` moves first. It is
+    /// copied once into the slot the log keeps it in, moved there, and placed from there: the
+    /// typed vector gets the one other copy. A scene with no log of its own, or one being
+    /// rebuilt from it, has no slot to move it in.
+    fn replay_primitive_moved(&mut self, source: &Primitive, translate: impl FnOnce(&mut Primitive)) {
+        if self.hidden {
+            return;
+        }
+        if self.is_sub_scene || self.rebuilt.is_some() {
+            let mut primitive = source.clone();
+            translate(&mut primitive);
+            self.replay_primitive(&primitive);
+            return;
+        }
+        // The log is out of the scene while the primitive is placed from it, which the scene
+        // does not read: the index is the one the operation takes.
+        let mut log = mem::take(&mut self.paint_operations);
+        let op = log.len();
+        log.push(PaintOperation::Primitive(source.clone()));
+        let PaintOperation::Primitive(primitive) = &mut log[op] else {
+            unreachable!("the operation that was just pushed is a primitive")
+        };
+        translate(primitive);
+        self.place(primitive, true, Some(op));
+        self.paint_operations = log;
+    }
+
     /// Routes a primitive unless the content mask clips it away. One that is clipped away is
     /// recorded all the same: whether one slides under the mask must not change how many
     /// operations an element paints, which is what a patch holds the recording to. `op` is the
@@ -2084,6 +2111,20 @@ impl Primitive {
         }
     }
 
+    /// Makes `self` a copy of `source`, which is a copy of the primitive's bytes when both are of
+    /// one kind and `Copy`, where `clone` builds a temporary first.
+    fn copy_from(&mut self, source: &Primitive) {
+        match (&mut *self, source) {
+            (Primitive::Shadow(held), Primitive::Shadow(source)) => *held = *source,
+            (Primitive::Quad(held), Primitive::Quad(source)) => *held = *source,
+            (Primitive::Underline(held), Primitive::Underline(source)) => *held = *source,
+            (Primitive::MonochromeSprite(held), Primitive::MonochromeSprite(source)) => *held = *source,
+            (Primitive::SubpixelSprite(held), Primitive::SubpixelSprite(source)) => *held = *source,
+            (Primitive::PolychromeSprite(held), Primitive::PolychromeSprite(source)) => *held = *source,
+            _ => *self = source.clone(),
+        }
+    }
+
     /// Moves the primitive by `delta`, the way a painter that painted it there would have put it
     /// where it ends up on screen.
     fn translate_replayed(&mut self, delta: Point<ScaledPixels>) {
@@ -2174,8 +2215,7 @@ impl TranslatedOperations<'_> {
         while let Some(operation) = self.operations.next() {
             match operation {
                 PaintOperation::Primitive(primitive) => {
-                    let primitive = self.translated_primitive(primitive);
-                    scene.insert(primitive, true);
+                    scene.replay_primitive_moved(primitive, |moved| self.translate_primitive(moved));
                 }
                 operation => scene.replay_operation(&self.translate(operation)),
             }
@@ -2187,16 +2227,27 @@ impl TranslatedOperations<'_> {
     pub(crate) fn overwrite(mut self, slots: &mut [PaintOperation]) {
         for slot in slots {
             let Some(operation) = self.operations.next() else { break };
-            *slot = self.translate(operation);
+            match (operation, &mut *slot) {
+                // The same kind of primitive as the slot held is copied over it and moved there.
+                (PaintOperation::Primitive(primitive), PaintOperation::Primitive(held)) => {
+                    held.copy_from(primitive);
+                    self.translate_primitive(held);
+                }
+                (operation, slot) => *slot = self.translate(operation),
+            }
+        }
+    }
+
+    fn translate_primitive(&self, primitive: &mut Primitive) {
+        primitive.translate_replayed(self.delta);
+        if self.clipping.last().copied().unwrap_or(true) {
+            primitive.clip_to(self.clip);
         }
     }
 
     fn translated_primitive(&self, primitive: &Primitive) -> Primitive {
         let mut primitive = primitive.clone();
-        primitive.translate_replayed(self.delta);
-        if self.clipping.last().copied().unwrap_or(true) {
-            primitive.clip_to(self.clip);
-        }
+        self.translate_primitive(&mut primitive);
         primitive
     }
 
@@ -4322,6 +4373,79 @@ mod tests {
         painted.finish();
         let orders = |scene: &Scene| scene.quads.iter().map(|quad| quad.order).collect::<Vec<_>>();
         assert_eq!(orders(&replayed), orders(&painted));
+    }
+
+    /// A recording with a quad, glyphs, a layer and a group.
+    fn varied_recording() -> Vec<PaintOperation> {
+        let mut recorded = scene();
+        recorded.insert_quad(quad(10., 10., 50., 20.));
+        recorded.push_layer(bounds(0., 100., 100., 100.));
+        recorded.insert_primitive(glyph(20., 130.));
+        recorded.pop_layer();
+        recorded.start_group(fade(0.5), mask(), None);
+        recorded.insert_primitive(glyph(40., 40.));
+        recorded.end_group();
+        recorded.insert_primitive(glyph(60., 60.));
+        recorded.into_operations()
+    }
+
+    #[test]
+    fn operations_written_over_slots_are_the_operations_iterated_whatever_the_slots_held() {
+        let recording = varied_recording();
+        let delta = point(ScaledPixels(5.), ScaledPixels(-3.));
+        let viewport = clip(0., 0., 80., 90.);
+        let iterated: Vec<PaintOperation> = TranslatedOperations::new(&recording, delta, &viewport).collect();
+
+        // Slots of the same kinds, of other kinds, and of ones that are not primitives.
+        let other_kinds = || {
+            let mut other = scene();
+            other.insert_primitive(glyph(300., 300.));
+            other.insert_quad(quad(1., 1., 2., 2.));
+            other.push_layer(bounds(0., 0., 5., 5.));
+            other.pop_layer();
+            other.insert_primitive(glyph(310., 310.));
+            let mut operations = other.into_operations();
+            operations.resize(recording.len(), PaintOperation::EndLayer);
+            operations
+        };
+        for mut slots in [recording.clone(), other_kinds()] {
+            TranslatedOperations::new(&recording, delta, &viewport).overwrite(&mut slots);
+            let text = |operations: &[PaintOperation]| {
+                let mut scene = scene();
+                scene.paint_operations = operations.to_vec();
+                describe(&scene)
+            };
+            assert_eq!(text(&slots), text(&iterated));
+        }
+    }
+
+    #[test]
+    fn a_translated_replay_inside_an_open_group_places_what_painting_there_places() {
+        let recording = varied_recording();
+        let delta = point(ScaledPixels(5.), ScaledPixels(-3.));
+        let viewport = clip(0., 0., 80., 90.);
+        for effect_groups in [true, false] {
+            let mut replayed = scene();
+            replayed.set_effect_groups_enabled(effect_groups);
+            replayed.insert_quad(quad(0., 0., 10., 10.));
+            replayed.start_group(fade(0.5), mask(), None);
+            replayed.replay_translated(&recording, delta, &viewport, PrimitiveCount::Replayed);
+            replayed.end_group();
+            replayed.finish();
+
+            let mut painted = scene();
+            painted.set_effect_groups_enabled(effect_groups);
+            painted.insert_quad(quad(0., 0., 10., 10.));
+            painted.start_group(fade(0.5), mask(), None);
+            for operation in TranslatedOperations::new(&recording, delta, &viewport) {
+                painted.replay_operation(&operation);
+            }
+            painted.end_group();
+            painted.finish();
+
+            assert_eq!(describe(&replayed), describe(&painted));
+            assert_eq!(drawn(&replayed), drawn(&painted));
+        }
     }
 
     #[test]
