@@ -274,9 +274,11 @@ fn a_patched_row_keeps_a_scroll_from_putting_back_the_paint_before(cx: &mut Test
         cx.update_window(fixture.window, |_, window, _| window.scroll_patch_counters().eligible).unwrap()
     };
     let eligible_before = eligible(cx);
-    // The recording of the row is of the paint before the patch: a translate would show it.
+    // The patch rewrote the recording of the row, so the translate puts the paint the patch made.
     fixture.wheel(cx, 5.);
-    assert_eq!(eligible(cx), eligible_before, "the wheel after a patch is a frame built whole");
     fixture.wheel(cx, 5.);
-    assert_eq!(eligible(cx), eligible_before + 1, "and the frame after it is a translate again");
+    assert!(eligible(cx) > eligible_before, "the wheel after a patch is a translate");
+    let translated = fixture.scene(cx);
+    fixture.whole(cx, Some(1));
+    assert_eq!(translated, fixture.scene(cx), "the rows moved show the paint of the patch");
 }

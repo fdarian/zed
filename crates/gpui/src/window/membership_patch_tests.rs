@@ -252,6 +252,23 @@ impl Fixture {
         .unwrap();
     }
 
+    /// Writes the offset as an embedder that scrolls with no notification does: the list is said to have
+    /// scrolled, and nothing else is invalidated.
+    fn write_offset_quietly(&self, cx: &mut TestAppContext, to: f32) {
+        let state = self.shared.state.clone();
+        let view = self.view;
+        cx.update_window(self.window, move |_, window, _| {
+            state.set_offset_from_scrollbar(point(px(0.), px(-to)));
+            window.note_list_scrolled(view);
+        })
+        .unwrap();
+    }
+
+    /// How many frames this window has swapped in: a patch and a translate swap none.
+    fn built_whole(&self, cx: &mut TestAppContext) -> u64 {
+        self.with_window(cx, |window, _| window.rendered_serial())
+    }
+
     fn scrolled(&self) -> f32 {
         f32::from(self.shared.state.scrolled())
     }
@@ -798,4 +815,226 @@ fn a_jump_that_keeps_none_of_the_rows_is_a_membership_change_and_is_drawn_whole(
     let counters = translated.counters(cx);
     assert_eq!((counters.frames, counters.patched), (2, 1), "{counters:?}");
     assert_same(&translated.observe(cx), &built.observe(cx), "the translate after the jump");
+}
+
+/// The two windows of a step that restyles rows and scrolls the list: the one patches the rows and translates
+/// the list in one draw, the other builds the frame whole.
+impl Pair {
+    /// Restyles the rows `rows` (green or back) and writes the offset `to` in one draw of the window that patches.
+    /// `to` of `None` restyles without scrolling.
+    fn restyle_and_scroll(&self, cx: &mut TestAppContext, rows: &[usize], green: bool, to: Option<f32>) {
+        for fixture in [&self.translated, &self.built] {
+            for row in rows {
+                let mut set = fixture.shared.green.borrow_mut();
+                if green { set.insert(*row) } else { set.remove(row) };
+            }
+        }
+        self.translated.shared.patch_row.set(None);
+        let patched = rows.first().copied();
+        self.translated.shared.patch_row.set(patched);
+        assert!(rows.len() <= 1, "the patcher of this fixture repaints one row");
+        // One update, so that nothing draws between the tick and the write.
+        let (state, view) = (self.translated.shared.state.clone(), self.translated.view);
+        cx.update_window(self.translated.window, move |_, window, cx| {
+            window.request_tick();
+            if let Some(to) = to {
+                state.set_offset_from_scrollbar(point(px(0.), px(-to)));
+                window.note_list_scrolled(view);
+            }
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        self.translated.shared.patch_row.set(None);
+
+        cx.update_window(self.built.window, |_, window, _| window.refresh()).unwrap();
+        match to {
+            Some(to) => self.built.write_offset(cx, to),
+            None => {}
+        }
+        self.built.draw(cx);
+    }
+}
+
+fn visible_row(fixture: &Fixture, cx: &mut TestAppContext, nth: usize) -> usize {
+    fixture.rows(cx).start + nth
+}
+
+#[gpui::test]
+fn a_restyle_and_a_scroll_in_one_draw_are_a_patch_then_a_translate(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    // The rows are moved once first, so that the row restyled is one that is put elsewhere than it was recorded.
+    let first = pair.translated.bringing_in_below(cx, 1);
+    pair.scroll_to(cx, first);
+    pair.same(cx, "after a first scroll");
+    let row = visible_row(&pair.translated, cx, 3);
+    let before = pair.translated.counters(cx);
+    let serial = pair.translated.built_whole(cx);
+    let rows = pair.translated.rows(cx);
+
+    let to = pair.translated.scrolled() + 2.;
+    pair.restyle_and_scroll(cx, &[row], true, Some(to));
+
+    let counters = pair.translated.counters(cx);
+    assert_eq!(pair.translated.rows(cx), rows, "no row comes in or leaves");
+    assert_eq!(counters.patched - before.patched, 1, "{counters:?}");
+    assert_eq!(counters.composed, 1, "{counters:?}");
+    assert_eq!(counters.membership_frames, before.membership_frames, "{counters:?}");
+    assert_eq!(pair.translated.built_whole(cx), serial, "no frame was built whole");
+    let patches = pair.translated.with_window(cx, |window, _| window.patch_counters());
+    assert_eq!((patches.patched_frames, patches.total_declines()), (1, 0), "{patches:?}");
+    assert_eq!(pair.translated.shared.seen.borrow().last(), Some(&Ok(())));
+    no_declines(&counters);
+    pair.same(cx, "a restyle and a scroll of 2 pixels");
+}
+
+#[gpui::test]
+fn a_restyle_of_a_row_that_stays_and_rows_that_come_in_are_one_patch_and_one_translate(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    let row = visible_row(&pair.translated, cx, 2);
+    for count in [1, 2] {
+        let before = pair.translated.counters(cx);
+        let serial = pair.translated.built_whole(cx);
+        let to = pair.translated.bringing_in_below(cx, count);
+        pair.restyle_and_scroll(cx, &[row], count == 1, Some(to));
+        let counters = pair.translated.counters(cx);
+        assert_eq!(counters.composed - before.composed, 1, "{counters:?} {:?}", pair.translated.shared.seen);
+        assert_eq!(counters.membership_frames - before.membership_frames, 1, "{counters:?}");
+        assert_eq!(pair.translated.built_whole(cx), serial, "no frame was built whole");
+        no_declines(&counters);
+        assert_eq!(pair.translated.shared.seen.borrow().last(), Some(&Ok(())));
+        pair.same(cx, &format!("a restyle and {count} rows in"));
+    }
+    assert!(pair.translated.rows(cx).start == 0 || pair.translated.rows(cx).contains(&row), "the restyled row stays");
+}
+
+#[gpui::test]
+fn a_relayout_patch_prepared_before_a_scroll_write_is_finished_and_the_rows_are_translated(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    for kids in [7, 2] {
+        for fixture in [&pair.translated, &pair.built] {
+            fixture.shared.kids.set(kids);
+            fixture.shared.version.set(fixture.shared.version.get() + 1);
+        }
+        let before = pair.translated.counters(cx);
+        let serial = pair.translated.built_whole(cx);
+        let to = pair.translated.bringing_in_below(cx, 1);
+        let (shared, state, view) = (pair.translated.shared.clone(), pair.translated.shared.state.clone(), pair.translated.view);
+        // One update, so that nothing draws between the tick and the draw, as the work of a commit and its frame.
+        let units = pair.translated.with_window(cx, move |window, cx| {
+            window.request_tick();
+            let patch = shared.clone();
+            let prepared = window.prepare_patch(cx, move |_, _| vec![(ElementId::from(UNIT), patch.unit())]);
+            assert_eq!(prepared, Ok(()));
+            state.set_offset_from_scrollbar(point(px(0.), px(-to)));
+            window.note_list_scrolled(view);
+            let units = window.prepared_patch_units();
+            shared.patch_unit.set(true);
+            window.draw(cx).clear(cx);
+            shared.patch_unit.set(false);
+            units
+        });
+        assert_eq!(units, Some(vec![ElementId::from(UNIT)]), "a scroll write does not discard what was prepared");
+        let counters = pair.translated.counters(cx);
+        assert_eq!(counters.composed - before.composed, 1, "{counters:?}");
+        assert_eq!(pair.translated.built_whole(cx), serial, "no frame was built whole");
+        let patches = pair.translated.with_window(cx, |window, _| window.patch_counters());
+        assert!(patches.relayout_patches >= 1 && patches.total_declines() == 0, "{patches:?}");
+        no_declines(&counters);
+
+        pair.built.write_offset(cx, to);
+        pair.built.draw_whole(cx);
+        pair.same(cx, &format!("a unit with {kids} boxes prepared before the scroll"));
+    }
+}
+
+#[gpui::test]
+fn a_restyle_then_a_translate_then_a_restyle_of_the_same_row_are_all_patches(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    let row = visible_row(&pair.translated, cx, 3);
+    let serial = pair.translated.built_whole(cx);
+    pair.restyle_and_scroll(cx, &[row], true, None);
+    pair.same(cx, "restyled in place");
+    // A translate puts the row elsewhere than it was recorded, with the new paint.
+    let to = pair.translated.scrolled() + 9.;
+    pair.scroll_to(cx, to);
+    pair.same(cx, "translated after the restyle");
+    // And a restyle of the row where it is now patches it there.
+    pair.restyle_and_scroll(cx, &[row], false, None);
+    pair.same(cx, "restyled where it was put");
+    let to = pair.translated.scrolled() + 9.;
+    pair.restyle_and_scroll(cx, &[row], true, Some(to));
+    pair.same(cx, "restyled and translated again");
+
+    assert_eq!(pair.translated.built_whole(cx), serial, "no frame was built whole");
+    let counters = pair.translated.counters(cx);
+    assert_eq!(counters.composed, 1, "{counters:?}");
+    assert_eq!(counters.patched, 2, "{counters:?}");
+    no_declines(&counters);
+    let patches = pair.translated.with_window(cx, |window, _| window.patch_counters());
+    assert_eq!((patches.patched_frames, patches.total_declines()), (3, 0), "{patches:?}");
+    assert!(patches.rewritten_recordings >= 3, "{patches:?}");
+    // The frame built whole from the recordings the patches left is the same as well.
+    pair.translated.draw_whole(cx);
+    pair.built.draw_whole(cx);
+    pair.same(cx, "the frame built whole after them");
+}
+
+#[gpui::test]
+fn fifty_steps_of_restyles_and_scrolls_are_the_frames_built_whole_under_the_verifier(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    pair.translated.with_window(cx, |window, _| {
+        window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+    });
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    let mut composed_expected = 0;
+    for step in 0..50 {
+        let rows = pair.translated.rows(cx);
+        let row = rows.start + next(4);
+        let restyle = next(3) != 0;
+        let scroll = next(3) != 0;
+        let to = scroll.then(|| match next(3) {
+            0 if rows.start > 2 => pair.translated.bringing_in_above(cx, 1 + next(2)),
+            1 => pair.translated.bringing_in_below(cx, 1 + next(2)),
+            _ => pair.translated.scrolled() + 3. + next(12) as f32,
+        });
+        let green = !pair.translated.shared.green.borrow().contains(&row);
+        match (restyle, to) {
+            (true, to) => {
+                composed_expected += u64::from(to.is_some());
+                pair.restyle_and_scroll(cx, &[row], green, to);
+            }
+            (false, Some(to)) => pair.scroll_to(cx, to),
+            (false, None) => {}
+        }
+        pair.same(cx, &format!("step {step}"));
+    }
+    let counters = pair.translated.counters(cx);
+    assert!(counters.composed >= 1, "{counters:?} of {composed_expected} steps that restyled and scrolled");
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    pair.translated.with_window(cx, |window, _| {
+        assert_eq!(window.retention_mismatches(), &[] as &[String]);
+    });
+}
+
+#[gpui::test]
+fn a_restyle_with_a_scroll_that_cannot_be_a_translate_is_the_patch_and_a_frame_built_whole(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    let row = visible_row(&pair.translated, cx, 3);
+    // A jump that keeps none of the rows: the translate declines, the patch has been made, and the frame built whole
+    // after it draws the list from the offset written, with no view notified.
+    pair.restyle_and_scroll(cx, &[row], true, Some(top(100)));
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.patched, counters.composed), (1, 0, 0), "{counters:?}");
+    assert_eq!(counters.held_cause(ScrollPatchCause::Disjoint), 1, "{counters:?}");
+    pair.same(cx, "the frame built whole after a patch");
+    // And the translate that follows is made from it.
+    let to = pair.translated.bringing_in_below(cx, 1);
+    pair.restyle_and_scroll(cx, &[row + 50], true, Some(to));
+    pair.same(cx, "the translate after it");
 }
