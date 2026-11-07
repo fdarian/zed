@@ -50,6 +50,8 @@ struct Shared {
     /// A row that defers the draw of a child.
     deferred: Cell<Option<usize>>,
     kids: Cell<usize>,
+    /// How many boxes with a background of their own each row holds, the height of the row between them.
+    row_kids: Cell<usize>,
     /// The key of the unit, which moves when what it holds does.
     version: Cell<u64>,
     patch_unit: Cell<bool>,
@@ -79,6 +81,7 @@ impl Shared {
             taller: Cell::new(None),
             deferred: Cell::new(None),
             kids: Cell::new(3),
+            row_kids: Cell::new(0),
             version: Cell::new(0),
             patch_unit: Cell::new(false),
             patch_row: Cell::new(None),
@@ -122,6 +125,14 @@ impl Shared {
                 .track_focus(handle)
                 .tab_stop(true)
                 .on_key_down(move |event, _, _| keys.log.borrow_mut().push(format!("row {ix} key {}", event.keystroke.key)));
+        }
+        let kids = self.row_kids.get();
+        if kids > 0 {
+            row = row.child(format!("Row {ix}"));
+        }
+        for kid in 0..kids {
+            let color = if self.green.borrow().contains(&ix) { red() } else { green() };
+            row = row.child(div().id(("part", ix * 100 + kid)).w_full().h(px((height(ix) + extra) / kids as f32)).bg(color));
         }
         if self.deferred.get() == Some(ix) {
             row = row.child(deferred(div().id(("tip", ix)).w(px(10.)).h(px(10.)).bg(red())));
@@ -1036,7 +1047,39 @@ fn a_restyle_then_a_translate_then_a_restyle_of_the_same_row_are_all_patches(cx:
 
 #[gpui::test]
 fn fifty_steps_of_restyles_and_scrolls_are_the_frames_built_whole_under_the_verifier(cx: &mut TestAppContext) {
-    let pair = Pair::new(cx);
+    restyles_and_scrolls_under_the_verifier(cx, 0, 0., 5000., false);
+}
+
+#[gpui::test]
+fn fifty_steps_of_restyles_and_scrolls_of_rows_with_parts_are_the_frames_built_whole_under_the_verifier(cx: &mut TestAppContext) {
+    restyles_and_scrolls_under_the_verifier(cx, 4, 0., 5000., false);
+}
+
+#[gpui::test]
+fn fifty_steps_of_restyles_and_scrolls_the_frame_builds_again_are_the_frames_built_whole_under_the_verifier(cx: &mut TestAppContext) {
+    restyles_and_scrolls_under_the_verifier(cx, 4, 0., 5000., true);
+}
+
+#[gpui::test]
+fn fifty_steps_of_restyles_and_scrolls_with_overdraw_are_the_frames_built_whole_under_the_verifier(cx: &mut TestAppContext) {
+    restyles_and_scrolls_under_the_verifier(cx, 4, 120., 5000., true);
+}
+
+#[gpui::test]
+fn fifty_steps_of_restyles_and_scrolls_of_rows_with_a_short_overscan_are_the_frames_built_whole_under_the_verifier(cx: &mut TestAppContext) {
+    restyles_and_scrolls_under_the_verifier(cx, 4, 0., 24., true);
+}
+
+fn restyles_and_scrolls_under_the_verifier(cx: &mut TestAppContext, parts: usize, overdraw: f32, overscan: f32, rekey: bool) {
+    let open = |cx: &mut TestAppContext, patch: bool| {
+        let shared = Shared::with_overdraw(cx, true, overdraw, overscan);
+        Fixture::open(cx, patch, shared)
+    };
+    let pair = Pair { translated: open(cx, true), built: open(cx, false) };
+    for fixture in [&pair.translated, &pair.built] {
+        fixture.shared.row_kids.set(parts);
+        fixture.draw_whole(cx);
+    }
     pair.translated.with_window(cx, |window, _| {
         window.set_retention_verifier(Some(Rc::new(|_| String::new())));
     });
@@ -1056,12 +1099,18 @@ fn fifty_steps_of_restyles_and_scrolls_are_the_frames_built_whole_under_the_veri
         let to = scroll.then(|| match next(3) {
             0 if rows.start > 2 => pair.translated.bringing_in_above(cx, 1 + next(2)),
             1 => pair.translated.bringing_in_below(cx, 1 + next(2)),
-            _ => pair.translated.scrolled() + 3. + next(12) as f32,
+            _ => pair.translated.scrolled() + 3. + next(24) as f32 * 0.5,
         });
         let green = !pair.translated.shared.green.borrow().contains(&row);
         match (restyle, to) {
             (true, to) => {
                 composed_expected += u64::from(to.is_some());
+                if rekey {
+                    // The frame that follows the patch builds the row again, as a frame does for a row whose key changed.
+                    for fixture in [&pair.translated, &pair.built] {
+                        fixture.shared.key.set(fixture.shared.key.get() + 1);
+                    }
+                }
                 pair.restyle_and_scroll(cx, &[row], green, to);
             }
             (false, Some(to)) => pair.scroll_to(cx, to),
@@ -1072,6 +1121,8 @@ fn fifty_steps_of_restyles_and_scrolls_are_the_frames_built_whole_under_the_veri
     let counters = pair.translated.counters(cx);
     assert!(counters.composed >= 1, "{counters:?} of {composed_expected} steps that restyled and scrolled");
     assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    let patches = pair.translated.with_window(cx, |window, _| window.patch_counters());
+    assert!(patches.patched_frames >= 20 && patches.rewritten_recordings >= 1, "{patches:?}");
     pair.translated.with_window(cx, |window, _| {
         assert_eq!(window.retention_mismatches(), &[] as &[String]);
     });
