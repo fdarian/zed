@@ -567,24 +567,18 @@ impl Window {
     /// Puts what the scratch frame got for the roots in the place of what the rendered frame has
     /// of them, last root first so that the places of the others are the ones their recordings
     /// give.
-    pub(super) fn splice(&mut self, mut splices: Vec<Splice>) {
-        splices.sort_by_key(|splice| std::cmp::Reverse(splice.order()));
-        let mut input_handlers = false;
-        for splice in splices {
-            let held = splice.paint.start.input_handlers_index..splice.paint.end.input_handlers_index;
-            input_handlers |= !held.is_empty() || !splice.input_handlers.is_empty();
-            self.splice_one(splice, true);
-        }
-        if input_handlers {
-            self.register_input_handler();
-        }
-        self.rendered_frame.hitboxes_changed();
+    pub(super) fn splice(&mut self, splices: Vec<Splice>) {
+        self.splice_last_first(splices, true);
     }
 
     /// [`Window::splice`] for the rows of a list that come and go: the splices were all planned against
     /// the frame as it is, and are made last first. The scene is left with its operations spliced, for
     /// the caller to make again once.
-    pub(super) fn splice_rows(&mut self, mut splices: Vec<Splice>) {
+    pub(super) fn splice_rows(&mut self, splices: Vec<Splice>) {
+        self.splice_last_first(splices, false);
+    }
+
+    fn splice_last_first(&mut self, mut splices: Vec<Splice>, rebuild_scene: bool) {
         splices.sort_by_key(|splice| std::cmp::Reverse(splice.order()));
         let mut input_handlers = false;
         // The element states the paint accessed follow all the ones the prepaint did, so that a splice that
@@ -603,7 +597,7 @@ impl Window {
             }
             lead += splice.prepaint_states.len() as isize
                 - (splice.prepaint.end.accessed_element_states_index - splice.prepaint.start.accessed_element_states_index) as isize;
-            self.splice_one(splice, false);
+            self.splice_one(splice, rebuild_scene);
         }
         if input_handlers {
             self.register_input_handler();
