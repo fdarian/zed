@@ -310,6 +310,11 @@ impl WindowInvalidator {
         }
     }
 
+    /// Queues `entity` to render again in the next frame, as an invalidation does, without counting one.
+    pub fn queue_view(&self, entity: EntityId) {
+        self.inner.borrow_mut().dirty_views.insert(entity);
+    }
+
     /// Whether a view is queued to render again in the next frame.
     pub fn has_views(&self) -> bool {
         !self.inner.borrow().dirty_views.is_empty()
@@ -5267,30 +5272,53 @@ impl Window {
 
         let mut patched = None;
         let ticked = mem::take(&mut self.patch.tick);
+        // The tick is taken by the patch that draws it: what is left of the frame is a list scroll, which
+        // the frame the patch made is translated by, and nothing follows the clock for it.
+        let mut clock_ticked = ticked;
+        let mut patch_drawn = false;
         if ticked {
             match self.patch_frame(cx) {
                 PatchedFrame::Declined => {}
                 PatchedFrame::Patched => {
-                    #[cfg(feature = "profiler")]
-                    {
-                        let draw_duration = self
-                            .window_profiler
-                            .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
-                        self.debug_frame_overlay.record_frame(draw_duration);
+                    if self.scroll_patch.scrolled.is_none() {
+                        #[cfg(feature = "profiler")]
+                        {
+                            let draw_duration = self
+                                .window_profiler
+                                .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
+                            self.debug_frame_overlay.record_frame(draw_duration);
+                        }
+                        return arena_scope.exit(&cx.element_arena);
                     }
-                    return arena_scope.exit(&cx.element_arena);
+                    (clock_ticked, patch_drawn) = (false, true);
                 }
-                PatchedFrame::Verify(trace) => patched = Some(trace),
+                PatchedFrame::Verify(trace) => {
+                    patched = Some(trace);
+                    (clock_ticked, patch_drawn) = (false, true);
+                }
             }
         }
         // What was prepared for a patch that did not draw this frame is not what it shows.
         self.discard_prepared_patch(cx);
 
-        self.classify_scroll_patch(ticked, cx);
+        let scrolled_view = self.scroll_patch.scrolled;
+        // What the patch painted is where the list was before the scroll, and the frame built whole after it
+        // is where the scroll puts the rows: the two are not compared.
+        if scrolled_view.is_some() {
+            patched = None;
+        }
+        self.classify_scroll_patch(clock_ticked, cx);
         let mut translated = None;
         match self.apply_scroll_patch(cx) {
-            ScrollPatchDraw::Declined => {}
+            ScrollPatchDraw::Declined => {
+                // The list was scrolled by a write that notified no view: the frame built whole
+                // draws the list again.
+                if let Some(view) = scrolled_view {
+                    self.invalidator.queue_view(view);
+                }
+            }
             ScrollPatchDraw::Done => {
+                self.scroll_patch.note_composed(patch_drawn);
                 #[cfg(feature = "profiler")]
                 {
                     let draw_duration = self
@@ -5300,7 +5328,10 @@ impl Window {
                 }
                 return arena_scope.exit(&cx.element_arena);
             }
-            ScrollPatchDraw::Verify(trace) => translated = Some(trace),
+            ScrollPatchDraw::Verify(trace) => {
+                self.scroll_patch.note_composed(patch_drawn);
+                translated = Some(trace);
+            }
         }
         self.invalidate_entities();
         cx.entities.clear_accessed();

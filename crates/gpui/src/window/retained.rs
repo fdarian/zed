@@ -792,7 +792,7 @@ impl Effects {
 
     /// The reasons the subtree cannot be put elsewhere, that happened between `self` and `later`,
     /// as a set of [`NonRelocatable`] indices.
-    fn blockers(&self, later: &Effects) -> u16 {
+    pub(super) fn blockers(&self, later: &Effects) -> u16 {
         let mut reasons = 0u16;
         let mut add = |differs: bool, reason: NonRelocatable| {
             if differs {
@@ -1526,6 +1526,21 @@ impl Relocation {
         }
     }
 
+    /// A recording of the same subtree in the same region, with nothing noted yet: what a patch that
+    /// paints the subtree again records it in.
+    pub(crate) fn reopened(&self) -> Self {
+        Self {
+            info: RelocationInfo { region: self.info.region, rounded: Vec::new(), decisions: Vec::new() },
+            handles: Vec::new(),
+            ambient: self.ambient,
+            direct: false,
+            culled: false,
+            frames_below: 0,
+            saved_exact_clips: None,
+            saved_scene: None,
+        }
+    }
+
     /// Whether the subtree is recorded in a region of its own, which stands in for the content
     /// mask around it.
     pub(crate) fn regional(&self) -> bool {
@@ -2164,7 +2179,7 @@ impl Window {
         }
     }
 
-    fn relocate_hitboxes_in_place(&mut self, range: Range<usize>, surroundings: &ContentMask<Pixels>) {
+    pub(super) fn relocate_hitboxes_in_place(&mut self, range: Range<usize>, surroundings: &ContentMask<Pixels>) {
         for hitbox in &mut self.next_frame.hitboxes[range] {
             *hitbox = hitbox.relocated(Point::default(), surroundings);
         }
@@ -2976,6 +2991,12 @@ impl PaintRecord {
     /// painted where it is, with nothing in a scene of its own.
     pub(crate) fn can_be_rewritten(&self) -> bool {
         self.is_plain() && self.a11y.is_none()
+    }
+
+    /// [`PaintRecord::can_be_rewritten`] for a paint recorded to be put elsewhere, whose operations a patch
+    /// that paints it again in its region replaces.
+    pub(crate) fn can_be_rewritten_relocated(&self) -> bool {
+        self.lift_markers.is_empty() && self.operations.is_some() && self.a11y.is_none()
     }
 
     /// [`PrepaintRecord::rewrite`] for the paint: `tab_stops` are the ones it inserted.

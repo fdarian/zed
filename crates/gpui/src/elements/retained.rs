@@ -204,9 +204,10 @@ impl Retained {
 
     /// Says that a tick which changes only how the subtree paints may repaint it in place, with
     /// [`Window::repaint_in_place`], leaving the rest of the frame as it is. A frame that records
-    /// the subtree leaves what that needs of its surroundings, if the recording is a plain one: not
-    /// [relocatable](Self::relocatable), nothing in it handed to a stacking context outside, not
-    /// culled and with no deferred draw. A subtree that is [lifted](Self::lift_z) is repainted
+    /// the subtree leaves what that needs of its surroundings, if the recording is a plain one: nothing
+    /// in it handed to a stacking context outside, not culled and with no deferred draw. A
+    /// [relocatable](Self::relocatable) subtree is repainted in its region, wherever the frame has it, and
+    /// its recording is made again from the patch, so that a scroll can still put it elsewhere. A subtree that is [lifted](Self::lift_z) is repainted
     /// where the stacking context paints it, if the context takes it from the parent that
     /// prepaints it and nothing else is lifted around it.
     pub fn patchable(mut self) -> Self {
@@ -461,10 +462,12 @@ impl RetainedState {
         let paint = recorded.paint.as_ref()?;
         let rendered = window.rendered_serial();
         let publishes = recorded.patch.as_ref().is_some_and(|patch| patch.publishes);
-        // A recording that is put elsewhere than it was recorded is not what a patch paints over.
+        let regional = recorded.relocation.as_ref().is_some_and(Relocation::regional);
+        // A recording that is put elsewhere than it was recorded is a source for a patch only when the patch
+        // can paint it in its region and put what it paints where the frame has the root.
         (recorded.patch.is_some()
             && paint.is_plain_or_relocated(recorded.relocation.is_some())
-            && recorded.delta.is_zero()
+            && (recorded.delta.is_zero() || regional)
             && recorded.prepaint.lifts.is_none()
             && recorded.is_placed_in(rendered)
             && self.engine == window.layout_engine_id()
@@ -484,6 +487,13 @@ impl RetainedState {
                 && paint.can_be_rewritten()
                 && (publishes || !(recorded.prepaint.has_publications || paint.has_publications)),
             publishes,
+            relocation: recorded.relocation.as_ref().filter(|relocation| relocation.regional()).map(Relocation::reopened),
+            delta: recorded.delta,
+            blockers: recorded.prepaint.blockers | paint.blockers,
+            relocated_rewritable: regional
+                && recorded.prepaint.can_be_rewritten()
+                && paint.can_be_rewritten_relocated()
+                && (publishes || !(recorded.prepaint.has_publications || paint.has_publications)),
         })
     }
 
@@ -512,6 +522,13 @@ impl RetainedState {
         recorded.generation = generation;
         recorded.prepaint.rewrite(rewrite.hitboxes, rewrite.prepaint_lengths);
         paint.rewrite(rewrite.tab_stops, rewrite.paint_lengths);
+        if let Some(relocated) = rewrite.relocation {
+            paint.operations = Some(relocated.operations);
+            // What the root holds outside the frame is where the root was put: the handles the patch noted
+            // were not told.
+            relocated.relocation.apply(recorded.delta);
+            recorded.relocation = Some(relocated.relocation);
+        }
         recorded.prepaint.has_publications = rewrite.publications.0;
         paint.has_publications = rewrite.publications.1;
         self.accessed_entities.extend(rewrite.accessed_entities);

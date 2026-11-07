@@ -41,7 +41,7 @@
 use super::patch_splice::{FIELDS, Splice, paint_lengths, prepaint_lengths};
 use super::*;
 use crate::elements::{RetainedState, ScrollExtent, ScrollHandle};
-use crate::scene::PaintOperation;
+use crate::scene::{PaintOperation, PrimitiveCount};
 use std::fmt::Write as _;
 
 pub(crate) type FramePatcher = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
@@ -82,8 +82,9 @@ pub enum PatchDecline {
     /// that is patched never did: the root stopped being a stacking context (an opacity animation
     /// that ended), and its positioned children are the page's to paint now.
     Lifts,
-    /// The root was recorded to be put elsewhere and the frame put it elsewhere than it was
-    /// recorded: a patch paints a root where its surroundings were captured.
+    /// The root was recorded to be put elsewhere and a frame built whole put it elsewhere than it was
+    /// recorded, or a root that a scroll put there cannot be painted in its region again (an exact clip, a
+    /// box that escapes): a patch paints a root where its surroundings were captured.
     Relocated,
     /// The hitboxes are not the ones recorded.
     Hitboxes,
@@ -207,9 +208,10 @@ pub(crate) struct PatchWindow {
     pub(crate) hitbox_ids: Option<RecordedHitboxIds>,
     outcome: Option<PatchOutcome>,
     trace: Option<PatchTrace>,
-    /// A patch repainted a root that is recorded to be put elsewhere, so the recording of it is of
-    /// the paint before: a scroll translate, which puts rows where their recordings paint them,
-    /// would show it. Until a frame is built whole.
+    /// A patch repainted a root that is recorded to be put elsewhere and could not make its recording
+    /// the paint it left (see [`RecordingRewrite::relocation`]), so the recording is of the paint before:
+    /// a scroll translate, which puts rows where their recordings paint them, would show it. Until a frame
+    /// is built whole.
     pub(crate) recordings_stale: bool,
     /// A root that says so may lay out again in a patch, see [`Window::set_contained_patches`].
     contained: bool,
@@ -348,6 +350,17 @@ pub(crate) struct PatchSource {
     /// The root has an `on_replay` listener, see [`PatchUnit::publishes`]: a patch that published
     /// keeps the recording of it, as a frame built whole does.
     pub(crate) publishes: bool,
+    /// What the root was recorded to be put elsewhere in, when it is a region of its own: a patch
+    /// that does not lay the root out again prepaints and paints it in that region and puts the
+    /// operations where the frame has them, `delta` from where they were recorded.
+    pub(crate) relocation: Option<Relocation>,
+    pub(crate) delta: Point<Pixels>,
+    /// The reasons the recording cannot be put elsewhere, as they were recorded: a patch that finds others
+    /// leaves the recording as it is and the frame is not one that can be translated until it is built whole.
+    pub(crate) blockers: u16,
+    /// Whether a patch that does not lay the root out again can leave a recording equal to a frame built
+    /// whole's, see [`RecordingRewrite::relocation`].
+    pub(crate) relocated_rewritable: bool,
 }
 
 /// What a patch that laid a root out again leaves of the root's recording, when it is accepted:
@@ -377,11 +390,21 @@ pub(crate) struct RecordingRewrite {
     pub(crate) publications: (bool, bool),
     pub(crate) hitboxes: RecordedHitboxes,
     pub(crate) tab_stops: Rc<[TabStopOperation]>,
+    /// For a root recorded to be put elsewhere that a patch painted again in its region: what it recorded
+    /// there, the operations as a frame built whole records them and what the region decided about the
+    /// clips and holds outside the frame, in the place of the recording's.
+    pub(crate) relocation: Option<RelocatedRewrite>,
     /// How much of each vector the root holds when a splice replaced its part of the frame: its
     /// range, from where its origin starts. `None` when the vectors are as they were.
     pub(crate) prepaint_lengths: Option<[usize; FIELDS]>,
     pub(crate) paint_lengths: Option<[usize; FIELDS]>,
     pub(crate) accessed_entities: FxHashSet<EntityId>,
+}
+
+/// What a root recorded to be put elsewhere records when it is painted again in its region.
+pub(crate) struct RelocatedRewrite {
+    pub(crate) relocation: Relocation,
+    pub(crate) operations: Rc<[PaintOperation]>,
 }
 
 struct ResolvedUnit {
@@ -437,6 +460,18 @@ struct PreparedStep {
     published: bool,
     /// The entities the layout and prepaint of the root read.
     accessed: FxHashSet<EntityId>,
+    /// A root recorded to be put elsewhere is prepainted and painted in its region.
+    relocated: Option<RelocatedStep>,
+}
+
+/// What prepaint noted of a root that is recorded in a region of its own, for paint to go on from.
+struct RelocatedStep {
+    relocation: Relocation,
+    /// The hitboxes the prepaint inserted, as the region holds them: the frame has them cut by the content
+    /// mask around, and `delta` from where they were recorded.
+    hitboxes: Vec<Hitbox>,
+    /// The reasons the recording cannot be put elsewhere that the prepaint found.
+    blockers: u16,
 }
 
 /// Keeps the element arena from clearing: the elements of a prepared patch are in it.
@@ -1064,7 +1099,7 @@ impl Window {
             return Err(PatchDecline::Rejected);
         }
         let changed = runs.iter().any(|run| !run.changed.is_empty());
-        if changed && resolved.iter().any(|unit| unit.unit.relocatable) {
+        if resolved.iter().zip(&runs).any(|(unit, run)| !run.changed.is_empty() && unit.unit.relocatable && run.rewrite.is_none()) {
             self.patch.recordings_stale = true;
         }
         if self.retained.verifier.is_some() {
@@ -1489,6 +1524,17 @@ impl Window {
             return Err(PatchDecline::Surroundings);
         }
 
+        // A root recorded to be put elsewhere is prepainted and painted in its region, as a frame built whole
+        // records it, so that the recording can be made what that frame records.
+        let region = match (&source.relocation, &around.placement) {
+            (Some(relocation), Placement::InPlace) if !relaid && self.content_mask() == relocation.ambient => {
+                Some(relocation.reopened())
+            }
+            _ => None,
+        };
+        if region.is_none() && !source.delta.is_zero() {
+            return Err(PatchDecline::Relocated);
+        }
         self.patch.hitbox_ids = Some(RecordedHitboxIds {
             ids: source.hitboxes.hitboxes.iter().map(|hitbox| hitbox.id).collect(),
             taken: 0,
@@ -1497,7 +1543,12 @@ impl Window {
         });
         let prepaint_start = self.prepaint_index();
         let outside = mem::replace(&mut self.root_escape, (unit.element.escapes_to() == Some(Escape::ContainingBlock)).then_some(built_root));
+        let ambient = region.as_ref().map(|relocation| relocation.ambient);
+        if let Some(relocation) = region {
+            self.begin_relocation(relocation, false);
+        }
         unit.element.prepaint(self, cx);
+        let relocation = ambient.map(|_| self.end_relocation().0);
         self.root_escape = outside;
         let hitbox_ids = self.patch.hitbox_ids.take().expect("a patch gives the hitboxes ids");
         self.publish_prepared(prepaint_start.layout_publications_index, cx);
@@ -1510,6 +1561,15 @@ impl Window {
         }
 
         let after_prepaint = self.effects().without_root_escapes(&effects);
+        let relocated = relocation.zip(ambient).map(|(relocation, ambient)| {
+            let range = prepaint_start.hitboxes_index..prepaint_end.hitboxes_index;
+            let hitboxes = self.next_frame.hitboxes[range.clone()].to_vec();
+            self.relocate_hitboxes_in_place(range, &ambient);
+            RelocatedStep { relocation, hitboxes, blockers: effects.blockers(&after_prepaint) }
+        });
+        if !source.delta.is_zero() && relocated.as_ref().is_some_and(|step| step.hitboxes.iter().any(|hitbox| hitbox.unclipped)) {
+            return Err(PatchDecline::Relocated);
+        }
         Ok(PreparedStep {
             built_root,
             relaid,
@@ -1518,6 +1578,7 @@ impl Window {
             effects: effects.reasons(&after_prepaint),
             published: effects.published(&after_prepaint),
             accessed: FxHashSet::default(),
+            relocated,
         })
     }
 
@@ -1556,7 +1617,21 @@ impl Window {
             _ => None,
         };
         let outside = mem::replace(&mut self.root_escape, (unit.element.escapes_to() == Some(Escape::ContainingBlock)).then_some(built_root));
+        let mut region = step.relocated.take();
+        if let Some(step) = &mut region {
+            let relocation = mem::replace(&mut step.relocation, source.relocation.as_ref().expect("a root painted in its region has one").reopened());
+            self.begin_relocation(relocation, true);
+        }
         self.with_every_glyph_painted(|window| unit.element.paint(window, cx));
+        let region = region.map(|mut step| {
+            let (relocation, operations) = self.end_relocation();
+            step.relocation = relocation;
+            let operations = operations.expect("a subtree painted in a region painted into a scene of its own");
+            // What was painted in the region is put into the scene as a replay at the place it was recorded
+            // would, which is where the frame has it.
+            self.emit_relocated(&operations, source.delta, PrimitiveCount::Uncounted);
+            (step, operations)
+        });
         self.root_escape = outside;
         if let Some(prepainted) = prepainted {
             self.leave_surroundings(prepainted);
@@ -1615,7 +1690,15 @@ impl Window {
             return Err(PatchDecline::Registrations);
         }
 
-        let places = self.places_of(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end, relaid)?;
+        let mut places = self.places_of(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end, relaid)?;
+        if let Some((step, _)) = &region {
+            // The hitboxes of a root put elsewhere are the recorded ones, `delta` from where they were recorded.
+            for ((placed, _), recorded) in places.hitboxes.iter_mut().zip(&step.hitboxes) {
+                let mut moved = recorded.relocated(source.delta, &step.relocation.ambient);
+                moved.parent = placed.parent;
+                *placed = moved;
+            }
+        }
         if !self.operations_are(&scratch, &rendered) {
             return Err(PatchDecline::Operations);
         }
@@ -1632,8 +1715,22 @@ impl Window {
             prepaint_start.scrollers_index..prepaint_end.scrollers_index,
             source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
         );
-        let rewrite = (relaid && source.rewritable && (!published || source.publishes))
-            .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications));
+        let rewrite = if relaid {
+            (source.rewritable && (!published || source.publishes))
+                .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications))
+        } else {
+            region.and_then(|(step, operations)| {
+                let blockers = step.blockers | before_paint.blockers(&patched);
+                let movable = step.relocation.info.fits(Point::default(), &step.relocation.ambient).is_ok();
+                (source.relocated_rewritable && blockers == source.blockers && movable && (!published || source.publishes)).then(|| {
+                    let mut rewrite =
+                        self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications);
+                    rewrite.hitboxes = RecordedHitboxes::new(step.hitboxes, around.prepaint.hitbox_parent);
+                    rewrite.relocation = Some(RelocatedRewrite { relocation: step.relocation, operations });
+                    rewrite
+                })
+            })
+        };
         Ok(UnitRun { scratch, rendered, changed, places, scrollers, relaid, splice: None, rewrite })
     }
 
@@ -1653,6 +1750,7 @@ impl Window {
                 unit.prepaint.hitbox_parent,
             ),
             tab_stops: frame.tab_stops.insertion_history[paint.start.tab_handle_index..paint.end.tab_handle_index].into(),
+            relocation: None,
             prepaint_lengths: None,
             paint_lengths: None,
             accessed_entities: FxHashSet::default(),

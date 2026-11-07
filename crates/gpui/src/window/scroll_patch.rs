@@ -329,6 +329,9 @@ pub struct ScrollPatchCounters {
     pub hover_only: u64,
     /// Of the eligible ones, frames drawn by moving the rows of the frame shown.
     pub patched: u64,
+    /// Of those, the frames that a patch drawn in the same draw (the roots a tick repainted, see
+    /// [`Window::repaint_in_place`]) came first: the rows were moved from the frame the patch left.
+    pub composed: u64,
     /// Of those, the frames that built rows that came in or took out rows that left.
     pub membership_frames: u64,
     /// The rows those frames built, which came in.
@@ -682,13 +685,19 @@ pub(crate) struct ScrollPatchWindow {
     settled: Option<ScrollPatchSettled>,
     registries: Option<ScrollPatchRegistries>,
     /// A list scrolled since the last draw, and the view it notified.
-    scrolled: Option<EntityId>,
+    pub(crate) scrolled: Option<EntityId>,
     /// A tick was requested for the draw being classified (taken by [`Window::draw`] before it).
     ticked: bool,
     gate: Option<ScrollPatchGate>,
     hover: Option<ScrollPatchHover>,
     predicted: Option<Prediction>,
     counters: ScrollPatchCounters,
+}
+
+impl ScrollPatchWindow {
+    pub(crate) fn note_composed(&mut self, patch_drawn: bool) {
+        self.counters.composed += u64::from(patch_drawn);
+    }
 }
 
 impl Window {
@@ -748,11 +757,15 @@ impl Window {
     /// Says that the list of the view `view` was scrolled by something other than a wheel (a write of its
     /// offset), as [`ListState::scroll`] says it for one: the next draw asks whether the frame it draws
     /// moves the rows of the frame shown, builds the ones that come in and takes out the ones that
-    /// leave, so that no frame is built whole for it. The embedder notifies the view as well, which
-    /// is what draws the frame.
+    /// leave, so that no frame is built whole for it. It asks for that draw itself, as
+    /// [`Window::request_tick`] does and without a tick: no view is queued and no invalidation counted, so a
+    /// patch prepared for the window is not discarded by it, and a patch that the draw makes is followed
+    /// by the translate in the same draw. An embedder that writes the offset does not notify the view; when
+    /// the rows cannot be moved the draw builds the view whole.
     pub fn note_list_scrolled(&mut self, view: EntityId) {
         if self.scroll_patch.enabled {
             self.scroll_patch.scrolled = Some(view);
+            self.invalidator.request_tick();
         }
     }
 
