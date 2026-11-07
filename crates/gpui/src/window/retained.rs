@@ -715,6 +715,13 @@ impl Effects {
         self
     }
 
+    /// `self` with the layout runs of `later`: what a patch ran itself is not a layout nested in the
+    /// elements it paints.
+    pub(super) fn counting_layout_runs_of(mut self, later: &Effects) -> Effects {
+        self.layout_runs = later.layout_runs;
+        self
+    }
+
     /// The reasons the subtree cannot be put elsewhere, that happened between `self` and `later`,
     /// as a set of [`NonRelocatable`] indices.
     fn blockers(&self, later: &Effects) -> u16 {
@@ -1571,6 +1578,16 @@ impl Window {
         let key = (global_id.clone(), TypeId::of::<S>());
         let state = self.element_states.get(&key)?;
         state.inner.downcast_ref::<Option<S>>()?.as_ref().map(read)
+    }
+
+    /// Changes the state of type `S` of the element `global_id`, in place and without counting an
+    /// access to it.
+    pub(crate) fn update_element_state<S: 'static>(&mut self, global_id: &GlobalElementId, update: impl FnOnce(&mut S)) {
+        let key = (global_id.clone(), TypeId::of::<S>());
+        let state = self.element_states.get_mut(&key).and_then(|state| state.inner.downcast_mut::<Option<S>>());
+        if let Some(Some(state)) = state {
+            update(state);
+        }
     }
 
     /// Runs `build` with the states it accesses belonging to `owner`.

@@ -22,6 +22,14 @@
 //! is an `absolute` one, whose node layout rewrote against its containing block in the frame it was
 //! recorded in (a frame builds it whole every time, as it is never skipped); one fixed to the
 //! viewport is not.
+//!
+//! A root that is [`patchable_relayout`](crate::Retained::patchable_relayout) in a window that
+//! [allows it](Window::set_contained_patches) may also lay out again. Its new element is allowed
+//! other nodes, styles and children than the recording, and the layout is computed from the
+//! window's root, where what has an answer keeps it. The patch is accepted only when nothing
+//! outside the root moved and the root has the box it had ([`PatchDecline::NotContained`]); what
+//! lies inside is repainted from the new layout, and the recording of the root is dropped, as the
+//! frame no longer holds what it would repeat.
 
 use super::*;
 use crate::elements::{RetainedState, ScrollExtent, ScrollHandle};
@@ -52,6 +60,9 @@ pub enum PatchDecline {
     LayoutMismatch,
     /// The new element asks for a layout the frame cannot keep.
     UnstableLayout,
+    /// The root laid out again, and its box is not the one it had or a node outside it is laid out
+    /// differently: the patch would not be the frame built whole.
+    NotContained,
     /// Painting did something a recording cannot repeat: asked for another frame, scrolled
     /// something into view, deferred a draw or loaded an asset.
     Effects,
@@ -79,7 +90,7 @@ pub enum PatchDecline {
 
 impl PatchDecline {
     /// Every reason.
-    pub const ALL: [PatchDecline; 15] = [
+    pub const ALL: [PatchDecline; 16] = [
         PatchDecline::PendingView,
         PatchDecline::Refreshing,
         PatchDecline::UnknownUnit,
@@ -87,6 +98,7 @@ impl PatchDecline {
         PatchDecline::Surroundings,
         PatchDecline::LayoutMismatch,
         PatchDecline::UnstableLayout,
+        PatchDecline::NotContained,
         PatchDecline::Effects,
         PatchDecline::Lifts,
         PatchDecline::Relocated,
@@ -121,6 +133,9 @@ pub struct PatchCounters {
     /// Primitives that patched frames wrote over their place in the scene, which a patch that
     /// changes nothing but how an operation paints does instead of making the scene again.
     pub in_place_primitives: u64,
+    /// Retained roots that patched frames repainted after laying them out again, see
+    /// [`Retained::patchable_relayout`](crate::Retained::patchable_relayout).
+    pub relayout_patches: u64,
     declines: [u64; PatchDecline::ALL.len()],
 }
 
@@ -180,6 +195,8 @@ pub(crate) struct PatchWindow {
     /// the paint before: a scroll translate, which puts rows where their recordings paint them,
     /// would show it. Until a frame is built whole.
     pub(crate) recordings_stale: bool,
+    /// A root that says so may lay out again in a patch, see [`Window::set_contained_patches`].
+    contained: bool,
 }
 
 /// The ids of the hitboxes a recording holds, handed out again in the order they were inserted
@@ -234,6 +251,8 @@ pub(crate) struct PatchUnit {
     lift_z: Option<i32>,
     /// The root is recorded to be put elsewhere (`Retained::relocatable`).
     relocatable: bool,
+    /// The root may lay out again in a patch (`Retained::patchable_relayout`).
+    relayout: bool,
     prepaint: Surroundings,
     placement: Placement,
 }
@@ -301,6 +320,8 @@ struct UnitRun {
     places: Places,
     /// Where the unit's scrollers are in the scratch scene and in the rendered one.
     scrollers: (Range<usize>, Range<usize>),
+    /// The unit laid out again.
+    relaid: bool,
 }
 
 /// What the rendered frame takes from a patch besides its operations: the transforms, which a
@@ -314,6 +335,21 @@ struct Places {
     /// frame's listeners they stand for.
     listener_spaces: Vec<Option<Rc<HitSpace>>>,
     listeners: Range<usize>,
+    /// What a unit that laid out again registered, which closes over where its boxes are now.
+    registrations: Option<Registrations>,
+}
+
+/// What the scratch frame registered for a unit that laid out again, to take the place of what the
+/// rendered frame has: the closures of a frame built whole know the layout it was built from.
+struct Registrations {
+    mouse_listeners: Vec<Option<MouseListener>>,
+    mouse_listeners_at: Range<usize>,
+    key_listeners: Vec<Option<KeyListener>>,
+    key_listeners_at: Range<usize>,
+    input_handlers: Vec<Option<PlatformInputHandler>>,
+    input_handlers_at: Range<usize>,
+    tooltips: Vec<Option<TooltipRequest>>,
+    tooltips_at: Range<usize>,
 }
 
 /// What the window was before a patch ran in it.
@@ -348,6 +384,16 @@ impl Window {
     pub fn request_tick(&mut self) {
         self.patch.tick = true;
         self.invalidator.request_tick();
+    }
+
+    /// Lets a root that is [`patchable_relayout`](crate::Retained::patchable_relayout) lay out again
+    /// in a patch (off by default): its new element may have other nodes, styles and children
+    /// than the recording. The layout is computed from the layout root of the window, and the patch
+    /// is declined as [`PatchDecline::NotContained`] unless nothing outside the root moved and the
+    /// root has the box it had. While an accessibility tree is built, such a patch is declined as
+    /// [`PatchDecline::LayoutMismatch`].
+    pub fn set_contained_patches(&mut self, allowed: bool) {
+        self.patch.contained = allowed;
     }
 
     /// Sets what a draw asks first for a frame requested with [`Window::request_tick`]. `patcher`
@@ -521,6 +567,7 @@ impl Window {
         name: &ElementId,
         lift_z: Option<i32>,
         relocatable: bool,
+        relayout: bool,
     ) -> Option<Rc<PatchUnit>> {
         let placement = if self.lifts_open == 0 {
             Placement::InPlace
@@ -532,6 +579,7 @@ impl Window {
             name: name.clone(),
             lift_z,
             relocatable,
+            relayout,
             prepaint: self.capture_surroundings()?,
             placement,
         }))
@@ -552,6 +600,7 @@ impl Window {
             name: unit.name.clone(),
             lift_z: unit.lift_z,
             relocatable: unit.relocatable,
+            relayout: unit.relayout,
             prepaint: unit.prepaint.clone(),
             placement,
         }))
@@ -641,12 +690,13 @@ impl Window {
         }
 
         let scratch = self.begin_scratch(cx);
-        let patched = self.patch_units(&mut resolved, cx);
+        let patched = self.patch_units(&mut resolved, cx, scratch.a11y_was_active);
         let operations = mem::take(&mut self.next_frame.scene.paint_operations);
         let scrollers = mem::take(&mut self.next_frame.scrollers);
         self.finish_scratch(scratch, cx);
         let (runs, moves) = patched?;
         let runs_len = runs.len();
+        let relaid = runs.iter().filter(|run| run.relaid).count();
 
         if !accept(self, cx) {
             return Err(PatchDecline::Rejected);
@@ -697,6 +747,13 @@ impl Window {
                 .clone_from_slice(&scrollers[run.scrollers.0.clone()]);
         }
         let scroll_extents = self.apply_scroll_range_moves(moves);
+        for (unit, run) in resolved.iter().zip(&runs) {
+            if run.relaid {
+                // The frame holds what the recording would not repeat.
+                self.update_element_state(&unit.unit.id, |state: &mut RetainedState| state.forget_recording());
+            }
+        }
+        self.patch.counters.relayout_patches += relaid as u64;
         let mut moved_hitboxes = false;
         for run in runs {
             moved_hitboxes |= self.put_places(run.places);
@@ -750,6 +807,7 @@ impl Window {
         &mut self,
         units: &mut [ResolvedUnit],
         cx: &mut App,
+        a11y_active: bool,
     ) -> Result<(Vec<UnitRun>, Vec<ScrollRangeMove>), PatchDecline> {
         let extent_changes = self.layout_engine().extent_changes();
         let mut runs = Vec::with_capacity(units.len());
@@ -757,21 +815,28 @@ impl Window {
             let around = unit.unit.clone();
             let saved = self.enter_surroundings(&around.id, &around.prepaint);
             let owner = unit.source.owner.clone();
-            let run = self.with_state_owner(&owner, |window| window.patch_unit(unit, cx));
+            let run = self.with_state_owner(&owner, |window| window.patch_unit(unit, cx, a11y_active));
             self.leave_surroundings(saved);
             runs.push(run?);
         }
         let roots: Vec<LayoutId> = units.iter().map(|unit| unit.source.root).collect();
-        let moves = self.scroll_range_moves(&roots, extent_changes)?;
+        let relaid = runs.iter().any(|run| run.relaid);
+        let moves = self.scroll_range_moves(&roots, extent_changes, relaid)?;
         Ok((runs, moves))
     }
 
     /// The scrollers around `roots` whose scrollable overflow the transforms below them moved,
     /// once every root has laid out again. A scroller is not prepainted by a patch, so its range is
     /// worked out here; the patch is declined when the frame would show the difference, which a
-    /// frame built whole shows.
-    fn scroll_range_moves(&mut self, roots: &[LayoutId], extent_changes: u64) -> Result<Vec<ScrollRangeMove>, PatchDecline> {
-        if self.layout_engine().extent_changes() == extent_changes || self.rendered_frame.scrollers.is_empty() {
+    /// frame built whole shows. A root that laid out again may have moved the overflow of any scroller
+    /// around it without a transform, so they are all measured then.
+    fn scroll_range_moves(
+        &mut self,
+        roots: &[LayoutId],
+        extent_changes: u64,
+        relaid: bool,
+    ) -> Result<Vec<ScrollRangeMove>, PatchDecline> {
+        if (!relaid && self.layout_engine().extent_changes() == extent_changes) || self.rendered_frame.scrollers.is_empty() {
             return Ok(Vec::new());
         }
         let mut around: FxHashSet<LayoutId> = FxHashSet::default();
@@ -879,7 +944,7 @@ impl Window {
 
     /// Lays out, prepaints and paints one root in its surroundings, and checks what it left
     /// against its recording.
-    fn patch_unit(&mut self, unit: &mut ResolvedUnit, cx: &mut App) -> Result<UnitRun, PatchDecline> {
+    fn patch_unit(&mut self, unit: &mut ResolvedUnit, cx: &mut App, a11y_active: bool) -> Result<UnitRun, PatchDecline> {
         let source = &unit.source;
         let around = unit.unit.clone();
         if matches!(around.placement, Placement::Deferred { paint: None }) {
@@ -891,7 +956,7 @@ impl Window {
         if unit.element.lift_z() != around.lift_z || unit.element.escapes_to() == Some(Escape::Viewport) {
             return Err(PatchDecline::Surroundings);
         }
-        let effects = self.effects();
+        let mut effects = self.effects();
         let scene_start = self.next_frame.scene.len();
 
         self.invalidator.set_phase(DrawPhase::Prepaint);
@@ -902,17 +967,21 @@ impl Window {
         let escapable = self.escapable_layout_requests();
         let built_root = unit.element.request_layout(self, cx);
         let after = self.engine_counters();
-        if built_root != root
-            || after.nodes_created != counters.nodes_created
+        let relaid = after.nodes_created != counters.nodes_created
             || after.styles_set != counters.styles_set
             || after.children_set != counters.children_set
             || self.layout_dirty_generation(built_root) != dirty_generation
-            || self.layout_is_dirty(built_root)
-        {
+            || self.layout_is_dirty(built_root);
+        if built_root != root || (relaid && !(around.relayout && self.patch.contained && !a11y_active)) {
             return Err(PatchDecline::LayoutMismatch);
         }
         if self.unstable_layout_requests() != unstable || self.layout_requests_escape(built_root, escapable) {
             return Err(PatchDecline::UnstableLayout);
+        }
+        if relaid {
+            self.lay_out_again(built_root, cx)?;
+            // The runs of the patch's own layout are not a layout nested in what it paints.
+            effects = effects.counting_layout_runs_of(&self.effects());
         }
 
         let bounds = self.layout_bounds(built_root);
@@ -961,7 +1030,7 @@ impl Window {
         }
         if hitbox_ids.overrun
             || hitbox_ids.taken != hitbox_ids.ids.len()
-            || !self.hitboxes_are(&source.hitboxes.hitboxes, prepaint_start.hitboxes_index..prepaint_end.hitboxes_index)
+            || !self.hitboxes_are(&source.hitboxes.hitboxes, prepaint_start.hitboxes_index..prepaint_end.hitboxes_index, relaid)
         {
             return Err(PatchDecline::Hitboxes);
         }
@@ -969,7 +1038,7 @@ impl Window {
             return Err(PatchDecline::Registrations);
         }
 
-        let places = self.places_of(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end)?;
+        let places = self.places_of(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end, relaid)?;
         let rendered = source.paint.start.scene_index..source.paint.end.scene_index;
         let scratch = scene_start..self.next_frame.scene.len();
         let painted = &self.next_frame.scene.paint_operations[scratch.clone()];
@@ -988,17 +1057,46 @@ impl Window {
             prepaint_start.scrollers_index..prepaint_end.scrollers_index,
             source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
         );
-        Ok(UnitRun { scratch, rendered, changed, places, scrollers })
+        Ok(UnitRun { scratch, rendered, changed, places, scrollers, relaid })
+    }
+
+    /// Computes the layout from the window's root, which the requests of the new element
+    /// dirtied the nodes of: whatever has an answer keeps it. The root of the unit stays attached
+    /// to its parent, so what is around it is what the frame laid it out in. Declines unless the
+    /// nodes outside the root are laid out as they were and the root has the box it had.
+    fn lay_out_again(&mut self, root: LayoutId, cx: &mut App) -> Result<(), PatchDecline> {
+        let window_root = self.rendered_frame.root_layout.ok_or(PatchDecline::LayoutMismatch)?;
+        if window_root.engine != self.layout_engine_id() || !self.layout_node_alive(window_root.id) {
+            return Err(PatchDecline::LayoutMismatch);
+        }
+        // A root laid out as one of its own (a row of a list) is not in the tree the window computes.
+        let mut node = root;
+        while node != window_root.id {
+            node = self.layout_engine().layout_parent(node).ok_or(PatchDecline::LayoutMismatch)?;
+        }
+        let unmeasured = self.layout_engine().unmeasured_leaves();
+        self.stretch_layout_root(window_root.id, window_root.size);
+        self.compute_layout_tracking_changes(window_root.id, window_root.size.into(), cx);
+        let contained = self.layout_engine_mut().changes_stay_inside(root);
+        // A leaf that layout measures and has no measure function would have been laid out empty.
+        if self.layout_engine().unmeasured_leaves() != unmeasured {
+            return Err(PatchDecline::LayoutMismatch);
+        }
+        if !contained {
+            return Err(PatchDecline::NotContained);
+        }
+        Ok(())
     }
 
     /// Where in the rendered frame the hitboxes and mouse listeners that the scratch frame got
     /// for the unit are. They are the recording's one for one: the ids are the recording's, and
     /// the counts were checked.
     fn places_of(
-        &self,
+        &mut self,
         source: &PatchSource,
         prepaint: Range<&PrepaintStateIndex>,
         paint: Range<&PaintIndex>,
+        relaid: bool,
     ) -> Result<Places, PatchDecline> {
         let inserted = &self.next_frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index];
         let rendered = &self.rendered_frame.hitboxes;
@@ -1024,14 +1122,41 @@ impl Window {
         if self.rendered_frame.mouse_listeners.get(rendered_listeners.clone()).is_none_or(|rendered| rendered.len() != listeners.len()) {
             return Err(PatchDecline::Registrations);
         }
-        Ok(Places {
-            hitboxes,
-            listener_spaces: listeners
-                .iter()
-                .map(|listener| listener.as_ref().and_then(|listener| listener.space.clone()))
+        let listener_spaces = listeners
+            .iter()
+            .map(|listener| listener.as_ref().and_then(|listener| listener.space.clone()))
+            .collect();
+        let registrations = relaid.then(|| self.take_registrations(source, prepaint, paint));
+        Ok(Places { hitboxes, listener_spaces, listeners: rendered_listeners, registrations })
+    }
+
+    /// What the scratch frame registered for the unit that closes over the layout, which the
+    /// registrations of the rendered frame (as many, counted by [`Self::registrations_are`]) give
+    /// way to.
+    fn take_registrations(
+        &mut self,
+        source: &PatchSource,
+        prepaint: Range<&PrepaintStateIndex>,
+        paint: Range<&PaintIndex>,
+    ) -> Registrations {
+        let frame = &mut self.next_frame;
+        Registrations {
+            mouse_listeners: frame.mouse_listeners[paint.start.mouse_listeners_index..paint.end.mouse_listeners_index]
+                .iter_mut()
+                .map(Option::take)
                 .collect(),
-            listeners: rendered_listeners,
-        })
+            mouse_listeners_at: source.paint.start.mouse_listeners_index..source.paint.end.mouse_listeners_index,
+            key_listeners: frame.root_key_listeners[paint.start.root_key_listeners_index..paint.end.root_key_listeners_index]
+                .to_vec(),
+            key_listeners_at: source.paint.start.root_key_listeners_index..source.paint.end.root_key_listeners_index,
+            input_handlers: frame.input_handlers[paint.start.input_handlers_index..paint.end.input_handlers_index]
+                .iter_mut()
+                .map(Option::take)
+                .collect(),
+            input_handlers_at: source.paint.start.input_handlers_index..source.paint.end.input_handlers_index,
+            tooltips: frame.tooltip_requests[prepaint.start.tooltips_index..prepaint.end.tooltips_index].to_vec(),
+            tooltips_at: source.prepaint.start.tooltips_index..source.prepaint.end.tooltips_index,
+        }
     }
 
     /// Gives the rendered frame the places of a unit that a patch made.
@@ -1040,6 +1165,9 @@ impl Window {
         for (hitbox, slot) in places.hitboxes {
             let rendered = &mut self.rendered_frame.hitboxes[slot];
             changed |= !rendered.is_placed_like(&hitbox);
+            rendered.bounds = hitbox.bounds;
+            rendered.corner_radii = hitbox.corner_radii;
+            rendered.clip = hitbox.clip;
             rendered.content_mask = hitbox.content_mask;
             rendered.space = hitbox.space;
             rendered.local_clip = hitbox.local_clip;
@@ -1053,13 +1181,24 @@ impl Window {
                 listener.space = space;
             }
         }
+        if let Some(registrations) = places.registrations {
+            let frame = &mut self.rendered_frame;
+            frame.mouse_listeners[registrations.mouse_listeners_at].iter_mut().zip(registrations.mouse_listeners).for_each(|(slot, new)| *slot = new);
+            frame.root_key_listeners[registrations.key_listeners_at].iter_mut().zip(registrations.key_listeners).for_each(|(slot, new)| *slot = new);
+            frame.input_handlers[registrations.input_handlers_at].iter_mut().zip(registrations.input_handlers).for_each(|(slot, new)| *slot = new);
+            frame.tooltip_requests[registrations.tooltips_at].iter_mut().zip(registrations.tooltips).for_each(|(slot, new)| *slot = new);
+        }
         changed
     }
 
-    /// Whether the hitboxes the scratch frame got in `range` are `recorded`, field by field.
-    fn hitboxes_are(&self, recorded: &[Hitbox], range: Range<usize>) -> bool {
+    /// Whether the hitboxes the scratch frame got in `range` are `recorded`, field by field. After a
+    /// layout of the root, the boxes may be elsewhere and of another size.
+    fn hitboxes_are(&self, recorded: &[Hitbox], range: Range<usize>, relaid: bool) -> bool {
         let inserted = &self.next_frame.hitboxes[range];
-        inserted.len() == recorded.len() && inserted.iter().zip(recorded).all(|(inserted, recorded)| inserted.same_as(recorded))
+        inserted.len() == recorded.len()
+            && inserted.iter().zip(recorded).all(|(inserted, recorded)| {
+                if relaid { inserted.same_apart_from_place(recorded) } else { inserted.same_as(recorded) }
+            })
     }
 
     /// Whether what prepaint and paint registered outside the scene is what the recording
@@ -1118,21 +1257,35 @@ impl Hitbox {
     /// Whether `other` is the hitbox, but for where it is in the window: the transform around it,
     /// the content mask and the clips that follow from it are what a patch is for.
     fn same_as(&self, other: &Hitbox) -> bool {
-        self.id == other.id
-            && self.bounds == other.bounds
-            && self.behavior == other.behavior
+        self.bounds == other.bounds
             && self.corner_radii == other.corner_radii
+            && self.clip_text() == other.clip_text()
+            && self.same_apart_from_place(other)
+    }
+
+    /// Whether `other` is the hitbox but for its bounds and what follows from them: a box that
+    /// laid out again is elsewhere and of another size, with other rounded corners and another
+    /// clip path.
+    fn same_apart_from_place(&self, other: &Hitbox) -> bool {
+        self.id == other.id
+            && self.behavior == other.behavior
             && self.identity == other.identity
             && self.parent == other.parent
             && self.unclipped == other.unclipped
             && self.clip.is_some() == other.clip.is_some()
-            && self.clip.as_ref().map(|clip| format!("{clip:?}")) == other.clip.as_ref().map(|clip| format!("{clip:?}"))
             && self.exact_clips.as_ref().map(|clips| clips.depth()) == other.exact_clips.as_ref().map(|clips| clips.depth())
+    }
+
+    fn clip_text(&self) -> Option<String> {
+        self.clip.as_ref().map(|clip| format!("{clip:?}"))
     }
 
     /// Whether `other` is in the same place in the window.
     fn is_placed_like(&self, other: &Hitbox) -> bool {
-        self.content_mask == other.content_mask
+        self.bounds == other.bounds
+            && self.corner_radii == other.corner_radii
+            && (self.clip.is_none() || self.clip_text() == other.clip_text())
+            && self.content_mask == other.content_mask
             && self.local_clip == other.local_clip
             && self.space.as_deref().map(|space| space.to_window) == other.space.as_deref().map(|space| space.to_window)
             && self.exact_clips == other.exact_clips

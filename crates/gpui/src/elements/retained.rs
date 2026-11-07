@@ -98,6 +98,7 @@ pub fn retained(
         cull_outset: None,
         overscan: None,
         patchable: false,
+        relayout: false,
         ignores_text_color: false,
     }
 }
@@ -167,6 +168,7 @@ pub struct Retained {
     cull_outset: Option<Edges<Pixels>>,
     overscan: Option<Pixels>,
     patchable: bool,
+    relayout: bool,
     ignores_text_color: bool,
 }
 
@@ -209,6 +211,18 @@ impl Retained {
     /// prepaints it and nothing else is lifted around it.
     pub fn patchable(mut self) -> Self {
         self.patchable = true;
+        self
+    }
+
+    /// [`Retained::patchable`], and a patch of the subtree may lay out again: the new element can
+    /// have other nodes, styles or children than the recording, and the patch is accepted when
+    /// nothing outside the subtree moves and the box of the subtree is the one it had. Only for a
+    /// window that [allows it](Window::set_contained_patches), and while no accessibility tree is
+    /// built. The recording of the subtree is not replayed or patched again until a frame built
+    /// whole records it.
+    pub fn patchable_relayout(mut self) -> Self {
+        self.patchable = true;
+        self.relayout = true;
         self
     }
 
@@ -462,6 +476,13 @@ impl RetainedState {
             tab_stops: paint.tab_stops.clone(),
             owner: self.owner.clone(),
         })
+    }
+
+    /// Drops what the subtree recorded: after a patch that laid it out again, the frame holds
+    /// what the recording would not repeat, so no frame replays or patches from it.
+    pub(crate) fn forget_recording(&mut self) {
+        self.recorded = None;
+        self.layout = None;
     }
 
     /// Whether the subtree was recorded with `key`.
@@ -1597,7 +1618,9 @@ impl Retained {
         // is only handed to a patch while the root is at its recorded place), and one that is placed by a
         // block outside it is not recorded, so it has nothing to patch from.
         let patch = (self.patchable && (self.overscan.is_none() || root_escape.is_none()))
-            .then(|| window.capture_patch_unit(global_id, &self.id, self.lift_z, self.overscan.is_some()))
+            .then(|| {
+                window.capture_patch_unit(global_id, &self.id, self.lift_z, self.overscan.is_some(), self.relayout)
+            })
             .flatten();
         let (relocation, unmovable_at_start) = self.plan_relocation(window);
         if relocation.as_ref().is_some_and(|relocation| !relocation.direct) {

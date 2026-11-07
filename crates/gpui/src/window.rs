@@ -68,6 +68,8 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod patch;
 #[cfg(test)]
+mod contained_patch_tests;
+#[cfg(test)]
 mod hover_patch_tests;
 #[cfg(test)]
 mod patch_tests;
@@ -1538,6 +1540,15 @@ pub(crate) struct DeferredDraw {
 
 type LayoutPublication = Box<dyn FnOnce(&mut Window, &mut App)>;
 
+/// The layout root of a window's view, and the space it was laid out in.
+#[derive(Clone, Copy)]
+pub(crate) struct WindowRootLayout {
+    pub(crate) id: LayoutId,
+    /// The engine the id is in: see [`Window::layout_engine_id`].
+    pub(crate) engine: u64,
+    pub(crate) size: Size<Pixels>,
+}
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -1567,6 +1578,9 @@ pub(crate) struct Frame {
     retained_recordings: Vec<((GlobalElementId, TypeId), Rc<Origin>)>,
     /// The lists and the relocatable roots in them, see [`scroll_patch`].
     pub(crate) scroll: ScrollFrame,
+    /// The layout root of the window's view and the space it was laid out in, which a patch that
+    /// lays out again does the same with.
+    pub(crate) root_layout: Option<WindowRootLayout>,
     /// The retained roots of this frame that [`Window::repaint_in_place`] can repaint, by the id
     /// of the root; `None` for an id that two of them have. Good for the frame that holds it, and
     /// only while it is the rendered one.
@@ -1752,6 +1766,7 @@ impl Frame {
             scroll: ScrollFrame::default(),
             patchable: FxHashMap::default(),
             relocated: FxHashSet::default(),
+            root_layout: None,
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -1783,6 +1798,7 @@ impl Frame {
         self.scroll.clear();
         clear_shrinking(&mut self.patchable);
         self.relocated.clear();
+        self.root_layout = None;
         clear_shrinking(&mut self.hitboxes);
         self.hitboxes_changed();
         self.window_control_hitboxes.clear();
@@ -5625,6 +5641,11 @@ impl Window {
             .as_mut()
             .unwrap()
             .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
+        self.next_frame.root_layout = Some(WindowRootLayout {
+            id: root_layout_id,
+            engine: self.layout_engine_id(),
+            size: root_size,
+        });
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -9008,6 +9029,21 @@ impl Window {
 
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
+        self.layout_engine = Some(layout_engine);
+    }
+
+    /// [`Self::compute_layout`] for a patch, see
+    /// [`TaffyLayoutEngine::compute_layout_tracking_changes`].
+    pub(crate) fn compute_layout_tracking_changes(
+        &mut self,
+        layout_id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        cx: &mut App,
+    ) {
+        self.invalidator.debug_assert_prepaint();
+
+        let mut layout_engine = self.layout_engine.take().unwrap();
+        layout_engine.compute_layout_tracking_changes(layout_id, available_space, self, cx);
         self.layout_engine = Some(layout_engine);
     }
 

@@ -396,6 +396,9 @@ pub struct TaffyLayoutEngine {
     anchor_restyled_nodes: Vec<LayoutId>,
     /// The scrollers that asked for layout in the pass and have not picked their anchor yet.
     anchor_scrollers: Vec<AnchorScroller>,
+    /// Times taffy asked for the size of a leaf that layout measures and found no measure function
+    /// on it: it was answered as empty.
+    unmeasured_leaves: u64,
 }
 
 /// A scroll container that anchors, as the pass under way found it.
@@ -512,6 +515,7 @@ impl TaffyLayoutEngine {
             unstable_requests: 0,
             anchor_restyled_nodes: Vec::new(),
             anchor_scrollers: Vec::new(),
+            unmeasured_leaves: 0,
         }
     }
 
@@ -1675,6 +1679,8 @@ impl TaffyLayoutEngine {
         let run = self.run;
         let probed = &mut self.probed;
         let measures = &mut self.counters.measures;
+        let meta = &self.meta;
+        let unmeasured_leaves = &mut self.unmeasured_leaves;
         self.taffy
             .compute_layout_with_leaf_measure_in(
                 id.into(),
@@ -1682,6 +1688,9 @@ impl TaffyLayoutEngine {
                 parent_size,
                 |known_dimensions, available_space, node, node_context, _style, run_mode| {
                     let Some(node_context) = node_context else {
+                        if meta.get(&LayoutId(node)).is_some_and(|meta| meta.measured) {
+                            *unmeasured_leaves += 1;
+                        }
                         return taffy::MeasuredLeaf {
                             size: taffy::geometry::Size::default(),
                             first_baseline: None,
@@ -1826,6 +1835,48 @@ impl TaffyLayoutEngine {
     /// Changes whenever the extents of some node may have changed with no change to its layout.
     pub(crate) fn extent_changes(&self) -> u64 {
         self.extent_epoch + self.transform_changes
+    }
+
+    /// How many times a computation found a leaf that layout measures with no measure function to
+    /// ask.
+    pub(crate) fn unmeasured_leaves(&self) -> u64 {
+        self.unmeasured_leaves
+    }
+
+    /// [`Self::compute_layout`] for a patch, from the window's root: the nodes that have an answer
+    /// keep it, so the work is the nodes the patch's requests dirtied. Notes the nodes whose layout
+    /// changes, see [`Self::changes_stay_inside`]. The root is not left among the roots the pass
+    /// computed: a collection at the end of the pass would free every tree but its own.
+    pub(crate) fn compute_layout_tracking_changes(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.taffy.track_layout_changes();
+        self.compute_layout(id, available_space, window, cx);
+        self.computed_layouts.remove(&id);
+    }
+
+    /// Ends the noting of [`Self::compute_layout_tracking_changes`] and says whether the layout of
+    /// no node outside the subtree of `root` is other than it was, and `root` itself is where it
+    /// was and as large: whatever it holds may have changed.
+    pub(crate) fn changes_stay_inside(&mut self, root: LayoutId) -> bool {
+        self.taffy.take_layout_changes().into_iter().all(|change| {
+            let node = LayoutId(change.node);
+            if node == root {
+                return !change.moved_or_resized;
+            }
+            let mut ancestor = self.taffy.parent(change.node);
+            while let Some(parent) = ancestor {
+                if parent == root.0 {
+                    return true;
+                }
+                ancestor = self.taffy.parent(parent);
+            }
+            false
+        })
     }
 
     /// Forgets the extents kept for `id` and for every node it is in, which a change of the
