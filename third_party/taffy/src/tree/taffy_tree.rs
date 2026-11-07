@@ -384,6 +384,24 @@ pub struct TaffyTree<NodeContext = ()> {
     ///
     /// fdarian fork patch.
     box_generation: u64,
+
+    /// While [`TaffyTree::track_layout_changes`] is on: the layout each node had before the first time a layout that
+    /// differs from it was stored. Off, it costs one check per stored layout.
+    ///
+    /// fdarian fork patch.
+    layout_changes: Option<SecondaryMap<DefaultKey, Layout>>,
+}
+
+/// A node whose layout a computation changed, see [`TaffyTree::take_layout_changes`].
+///
+/// fdarian fork patch.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct LayoutChange {
+    /// The node.
+    pub node: NodeId,
+    /// Its location or its size is not what it was: where it is on the page changed, and not only what it holds
+    /// (its content size, border, padding or scrollbars).
+    pub moved_or_resized: bool,
 }
 
 impl Default for TaffyTree {
@@ -749,6 +767,13 @@ where
     #[inline(always)]
     fn set_unrounded_layout(&mut self, node_id: NodeId, layout: &Layout) {
         let taffy = &mut *self.taffy;
+        if let Some(changes) = taffy.layout_changes.as_mut() {
+            let key = node_id.into();
+            let stored = taffy.nodes[key].unrounded_layout;
+            if stored != *layout && !changes.contains_key(key) {
+                changes.insert(key, stored);
+            }
+        }
         let node = &mut taffy.nodes[node_id.into()];
         if node.unrounded_layout.differs_inside(layout) {
             node.layout_generation += 1;
@@ -979,6 +1004,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
             boundary_relayouts: 0,
             boundary_fallbacks: 0,
             box_generation: 0,
+            layout_changes: None,
         }
     }
 
@@ -1638,6 +1664,34 @@ impl<NodeContext> TaffyTree<NodeContext> {
     #[inline]
     pub fn box_changed_at(&self, node: NodeId) -> TaffyResult<u64> {
         Ok(self.nodes[node.into()].box_changed_at)
+    }
+
+    /// Starts noting the nodes whose layout the computations from now on change, until
+    /// [`take_layout_changes`](Self::take_layout_changes) ends it.
+    ///
+    /// fdarian fork patch.
+    pub fn track_layout_changes(&mut self) {
+        self.layout_changes = Some(SecondaryMap::new());
+    }
+
+    /// Ends [`track_layout_changes`](Self::track_layout_changes) and lists the nodes whose layout is not what it was
+    /// when it began: location, size, border, padding, scrollbars or content size. A node that was laid out to
+    /// another layout and back is not listed.
+    ///
+    /// fdarian fork patch.
+    pub fn take_layout_changes(&mut self) -> Vec<LayoutChange> {
+        let Some(before) = self.layout_changes.take() else {
+            return Vec::new();
+        };
+        before
+            .into_iter()
+            .filter_map(|(key, before)| {
+                let now = &self.nodes[key].unrounded_layout;
+                let moved_or_resized = before.location != now.location || before.size != now.size;
+                (moved_or_resized || before.differs_inside(now) || before.differs_box(now))
+                    .then_some(LayoutChange { node: key.into(), moved_or_resized })
+            })
+            .collect()
     }
 
     /// Indicates whether the layout of this node needs to be recomputed
@@ -2425,6 +2479,62 @@ mod tests {
         assert!(taffy.box_changed_at(before).unwrap() > grown, "this one grew");
         assert_eq!(taffy.box_changed_at(after).unwrap(), taffy.box_generation(), "and the one beside it moved, the last change");
         assert_eq!(taffy.box_changed_at(root), Ok(stamps[0]), "the root's box is the same");
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn the_layout_changes_of_a_computation_are_the_nodes_that_are_not_as_they_were() {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let fixed = |width: f32, height: f32| Style {
+            size: Size { width: length(width), height: length(height) },
+            flex_shrink: 0.0,
+            ..Default::default()
+        };
+        let inner = taffy.new_leaf(fixed(20.0, 10.0)).unwrap();
+        let before = taffy.new_with_children(Style { display: Display::Flex, ..fixed(50.0, 30.0) }, &[inner]).unwrap();
+        let after = taffy.new_leaf(fixed(30.0, 10.0)).unwrap();
+        let root_style = Style {
+            display: Display::Flex,
+            size: Size { width: length(400.0), height: length(100.0) },
+            ..Default::default()
+        };
+        let root = taffy.new_with_children(root_style, &[before, after]).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+
+        taffy.set_style(inner, fixed(25.0, 10.0)).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert!(taffy.take_layout_changes().is_empty(), "nothing was noted before it was asked for");
+
+        taffy.track_layout_changes();
+        taffy.set_style(inner, fixed(25.0, 12.0)).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let mut changes = taffy.take_layout_changes();
+        changes.sort_by_key(|change| u64::from(change.node));
+        let mut expected = vec![
+            LayoutChange { node: inner, moved_or_resized: true },
+            LayoutChange { node: before, moved_or_resized: false },
+        ];
+        expected.sort_by_key(|change| u64::from(change.node));
+        assert_eq!(changes, expected, "the box around it keeps its box and reaches further");
+        assert!(taffy.take_layout_changes().is_empty(), "taking ends the noting");
+
+        taffy.track_layout_changes();
+        taffy.mark_dirty(root).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        assert!(taffy.take_layout_changes().is_empty(), "a layout that gives every node the layout it had notes none");
+
+        taffy.track_layout_changes();
+        taffy.set_style(before, fixed(70.0, 30.0)).unwrap();
+        taffy.compute_layout(root, Size::MAX_CONTENT).unwrap();
+        let mut changes = taffy.take_layout_changes();
+        changes.sort_by_key(|change| u64::from(change.node));
+        let mut expected = vec![
+            LayoutChange { node: before, moved_or_resized: true },
+            LayoutChange { node: after, moved_or_resized: true },
+            LayoutChange { node: root, moved_or_resized: false },
+        ];
+        expected.sort_by_key(|change| u64::from(change.node));
+        assert_eq!(changes, expected, "the node that grew, the one it moved, and the root whose content reaches further");
     }
 
     // fdarian fork patch.
