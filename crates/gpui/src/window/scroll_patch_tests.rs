@@ -451,6 +451,17 @@ fn a_commit_the_owner_reports_is_an_edit(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_translate_takes_the_view_the_scroll_notified_off_the_queue(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), false);
+    fixture.point_at(cx, 10., 10.);
+    fixture.scroll_once(cx, 10., 10., 5.);
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.eligible, counters.patched), (1, 1), "{counters:?}");
+    // A tick drawn next would decline `PendingView` with the list's view still queued.
+    assert!(!fixture.with_window(cx, |window| window.invalidator.has_views()));
+}
+
+#[gpui::test]
 fn a_scroll_animation_the_owner_reports_is_one(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| {

@@ -999,6 +999,12 @@ impl Window {
         // The frame is the frame shown, which is current: what a draw does when it is over.
         self.invalidator.set_dirty(false);
         self.invalidator.mark_layout_current();
+        // The view the scroll notified is drawn: left queued, it would make the next tick decline
+        // (`PatchDecline::PendingView`) and be drawn whole. The classifier found no view but the list's.
+        // The frame that checks the translate builds the page whole and takes the views itself.
+        if self.retained.verifier.is_none() {
+            drop(self.invalidator.take_views());
+        }
         self.measured_at = None;
         self.needs_present.set(true);
         self.reset_cursor_style(cx);
