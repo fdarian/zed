@@ -773,6 +773,73 @@ mod prepared {
     }
 
     #[gpui::test]
+    fn a_patch_made_after_a_prepared_one_was_discarded_is_made_from_the_recording_that_was_on_screen(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.direct.set(false);
+        // The preparation laid the root out for 25, and the content that is drawn is another, and then the one on screen.
+        for (discarded, drawn) in [(kids(3, 25.), kids(4, 22.)), (kids(2, 30.), kids(3, 20.))] {
+            page.commit(cx, discarded);
+            page.prepare(cx).unwrap();
+            cx.update_window(page.window, |_, window, cx| window.discard_prepared_patch(cx)).unwrap();
+            assert!(!page.holds_prepared(cx));
+            page.commit(cx, drawn);
+            control.commit(cx, drawn);
+            let before = page.patches(cx);
+            page.tick(cx);
+            control.tick(cx);
+            let after = page.patches(cx);
+            assert_eq!(after.declines(PatchDecline::StaleRecording), 0, "{:?}", page.state.seen.borrow());
+            assert_eq!(after.patched_frames - before.patched_frames, 1, "{:?}", page.state.seen.borrow());
+            assert_eq!(after.relayout_patches - before.relayout_patches, 1);
+            assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame patched after a discard");
+            assert_eq!(page.unit_bounds(cx), control.unit_bounds(cx));
+            assert_eq!(page.kid_bounds(), control.kid_bounds(), "the listeners reported the same");
+        }
+        page.assert_whole(cx, "a frame built whole after the patches");
+    }
+
+    #[gpui::test]
+    fn a_second_preparation_after_a_discard_is_made_from_the_recording_that_was_on_screen(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.direct.set(false);
+        page.commit(cx, kids(3, 25.));
+        page.prepare(cx).unwrap();
+        cx.update_window(page.window, |_, window, cx| window.discard_prepared_patch(cx)).unwrap();
+        page.commit(cx, kids(5, 12.));
+        control.commit(cx, kids(5, 12.));
+        page.prepare(cx).expect("the recording of the frame on screen is still there to patch");
+        assert_eq!(page.prepared(cx), Some(vec![ElementId::from(UNIT)]));
+        page.tick(cx);
+        control.tick(cx);
+        assert_eq!(page.patches(cx).relayout_patches, 1, "{:?}", page.state.seen.borrow());
+        assert_eq!(page.patches(cx).total_declines(), 0);
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame the second preparation drew");
+        page.assert_whole(cx, "a frame built whole after it");
+    }
+
+    #[gpui::test]
+    fn a_whole_frame_after_a_discard_leaves_nothing_of_it_to_patch_from(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.patcher.set(false);
+        page.commit(cx, kids(3, 25.));
+        control.commit(cx, kids(3, 25.));
+        page.prepare(cx).unwrap();
+        cx.update_window(page.window, |_, window, cx| window.discard_prepared_patch(cx)).unwrap();
+        page.draw_whole(cx);
+        control.draw_whole(cx);
+        // The frame on screen is another: what follows is as it is for a window that never prepared.
+        for fixture in [&page, &control] {
+            fixture.commit(cx, kids(4, 18.));
+            fixture.tick(cx);
+        }
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame after the whole frame");
+        page.assert_whole(cx, "a frame built whole after it");
+    }
+
+    #[gpui::test]
     fn a_prepare_that_declines_not_contained_leaves_the_next_whole_frame_as_if_it_had_not_tried(cx: &mut TestAppContext) {
         let page = Fixture::tracked(cx, kids(3, 20.));
         let control = Fixture::tracked(cx, kids(3, 20.));
