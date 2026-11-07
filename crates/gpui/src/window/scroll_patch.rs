@@ -479,7 +479,7 @@ struct Prediction {
     thumbs: Vec<(usize, Option<Bounds<Pixels>>)>,
 }
 
-pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window) -> Option<ScrollPatchReason>>;
+pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window, &App) -> Option<ScrollPatchReason>>;
 pub(crate) type ScrollPatchHover = Rc<dyn Fn(&Window, &[GlobalElementId], &[GlobalElementId]) -> bool>;
 pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App)>;
 pub(crate) type ScrollPatchRegistries = Rc<dyn Fn(&Window) -> String>;
@@ -509,11 +509,13 @@ impl Window {
     }
 
     /// Lets the owner of the window say what only it knows about a frame drawn after a list
-    /// scroll: [`ScrollPatchReason::Edited`] when its tree changed since the frame shown,
-    /// [`ScrollPatchReason::ScrollAnimation`] when an animation of its own has frames to run, and
-    /// [`ScrollPatchReason::Other`] when it has no whole frame shown. It runs once per classified
-    /// frame, before the frame is built.
-    pub fn set_scroll_patch_gate(&mut self, gate: Option<Rc<dyn Fn(&Window) -> Option<ScrollPatchReason>>>) {
+    /// scroll: [`ScrollPatchReason::Edited`] when its tree, or anything else it builds from that is
+    /// not the scroll, changed since the frame shown, [`ScrollPatchReason::ScrollAnimation`] when
+    /// an animation of its own has frames to run, [`ScrollPatchReason::Clock`] when something
+    /// that follows the clock asked for the next frame and [`ScrollPatchReason::Other`] when it
+    /// has no whole frame shown. It runs once per classified frame, before the frame is built,
+    /// with the [`App`] for the entities that hold what it reads.
+    pub fn set_scroll_patch_gate(&mut self, gate: Option<Rc<dyn Fn(&Window, &App) -> Option<ScrollPatchReason>>>) {
         self.scroll_patch.gate = gate;
     }
 
@@ -737,7 +739,7 @@ impl Window {
         use ScrollPatchReason as Reason;
 
         let shown = &self.rendered_frame.scroll;
-        let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self));
+        let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self, cx));
         // A row that a patch repainted is shown as the patch painted it, and its recording is of the paint
         // before: a translate would put that back.
         if self.scroll_patch.gate.is_none() || gate == Some(Reason::Other) || shown.lists.is_empty() || self.patch.recordings_stale {

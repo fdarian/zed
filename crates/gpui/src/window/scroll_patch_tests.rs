@@ -181,7 +181,7 @@ impl Fixture {
         cx.update_window(window, |_, window, _| {
             window.set_dom_hit_testing(true);
             window.set_scroll_patch(true);
-            window.set_scroll_patch_gate(Some(Rc::new(|_| None)));
+            window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
         })
         .unwrap();
         let fixture = Self { window, page };
@@ -444,7 +444,7 @@ fn a_root_inside_a_row_that_was_built_is_no_run(cx: &mut TestAppContext) {
 fn a_commit_the_owner_reports_is_an_edit(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| {
-        window.set_scroll_patch_gate(Some(Rc::new(|_| Some(ScrollPatchReason::Edited))))
+        window.set_scroll_patch_gate(Some(Rc::new(|_, _| Some(ScrollPatchReason::Edited))))
     });
     fixture.scroll(cx, 10., 10., 5.);
     only(&fixture.counters(cx), ScrollPatchReason::Edited);
@@ -454,7 +454,7 @@ fn a_commit_the_owner_reports_is_an_edit(cx: &mut TestAppContext) {
 fn a_scroll_animation_the_owner_reports_is_one(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| {
-        window.set_scroll_patch_gate(Some(Rc::new(|_| Some(ScrollPatchReason::ScrollAnimation))))
+        window.set_scroll_patch_gate(Some(Rc::new(|_, _| Some(ScrollPatchReason::ScrollAnimation))))
     });
     fixture.scroll(cx, 10., 10., 5.);
     only(&fixture.counters(cx), ScrollPatchReason::ScrollAnimation);
@@ -477,7 +477,7 @@ fn a_tick_due_in_the_draw_is_a_reason_and_is_not_taken_by_a_translate(cx: &mut T
 fn a_frame_the_owner_says_asked_for_the_next_is_a_clock(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| {
-        window.set_scroll_patch_gate(Some(Rc::new(|_| Some(ScrollPatchReason::Clock))))
+        window.set_scroll_patch_gate(Some(Rc::new(|_, _| Some(ScrollPatchReason::Clock))))
     });
     fixture.scroll(cx, 10., 10., 5.);
     only(&fixture.counters(cx), ScrollPatchReason::Clock);
@@ -538,7 +538,7 @@ fn a_focus_in_a_row_the_list_builds_for_it_alone_is_a_reason(cx: &mut TestAppCon
 fn every_reason_that_holds_is_counted_and_the_first_is_the_reason(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| {
-        window.set_scroll_patch_gate(Some(Rc::new(|_| Some(ScrollPatchReason::Edited))));
+        window.set_scroll_patch_gate(Some(Rc::new(|_, _| Some(ScrollPatchReason::Edited))));
         window.set_a11y_active_for_tests(true);
     });
     fixture.draw(cx);
@@ -697,7 +697,7 @@ fn a_translate_that_cannot_be_made_is_a_whole_frame_and_says_why(cx: &mut TestAp
 #[gpui::test]
 fn a_thumb_the_owner_reports_is_a_reason_and_nothing_is_moved(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
-    fixture.with_window(cx, |window| window.set_scroll_patch_gate(Some(Rc::new(|_| Some(ScrollPatchReason::Thumb)))));
+    fixture.with_window(cx, |window| window.set_scroll_patch_gate(Some(Rc::new(|_, _| Some(ScrollPatchReason::Thumb)))));
     fixture.scroll(cx, 10., 10., 5.);
     let counters = fixture.counters(cx);
     only(&counters, ScrollPatchReason::Thumb);

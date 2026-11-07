@@ -84,7 +84,7 @@ impl Fixture {
         cx.update_window(window, |_, window, _| {
             window.set_dom_hit_testing(true);
             window.set_scroll_patch(true);
-            window.set_scroll_patch_gate(Some(Rc::new(|_| None)));
+            window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
             let knobs = knobs.clone();
             window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
                 let units = knobs
