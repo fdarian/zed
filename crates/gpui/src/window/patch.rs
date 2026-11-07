@@ -278,6 +278,9 @@ pub(crate) struct PatchUnit {
     relocatable: bool,
     /// The root may lay out again in a patch (`Retained::patchable_relayout`).
     relayout: bool,
+    /// The root has an `on_replay` listener: its owner republishes what its listeners report whenever
+    /// a replay stands for them, so the recording of it may hold publications.
+    pub(crate) publishes: bool,
     prepaint: Surroundings,
     placement: Placement,
     /// The dispatch node that was open where the root was prepainted, in the frame the root was last
@@ -331,6 +334,9 @@ pub(crate) struct PatchSource {
     /// Whether a patch that lays the root out again can leave a recording equal to a frame built
     /// whole's, see [`RecordingRewrite`].
     pub(crate) rewritable: bool,
+    /// The root has an `on_replay` listener, see [`PatchUnit::publishes`]: a patch that published
+    /// keeps the recording of it, as a frame built whole does.
+    pub(crate) publishes: bool,
 }
 
 /// What a patch that laid a root out again leaves of the root's recording, when it is accepted:
@@ -346,13 +352,18 @@ pub(crate) struct PatchSource {
 /// A root that cannot be given such a recording loses it, as before: one recorded to be put
 /// elsewhere (its operations are in a scene of its own), one that handed elements to a stacking
 /// context outside it, one whose listeners report to their owner (the patch cannot say how a
-/// frame built whole would have recorded that), and one with an accessibility recording (a patch
+/// frame built whole would have recorded that, unless the root has an `on_replay` listener), and one with an accessibility recording (a patch
 /// that lays out again is declined while an accessibility tree is built, so it cannot have one that
 /// is current). The roots recorded inside it are dropped too, as the patch builds it with no
 /// retained root in it. The line layouts the patch shaped are given back to the text system, so the
 /// recording keeps the range of line layouts it had: a replay carries those, and a frame that
 /// builds the text shapes it again.
 pub(crate) struct RecordingRewrite {
+    /// Whether the patch published, from prepaint and from paint: the recording says so, as one made by
+    /// a frame built whole does. A root whose listeners report to their owner has its recording kept only
+    /// when it has an `on_replay` listener, which republishes what the patch's listeners reported (the
+    /// owner holds it) when a later frame replays the root.
+    pub(crate) publications: (bool, bool),
     pub(crate) hitboxes: RecordedHitboxes,
     pub(crate) tab_stops: Rc<[TabStopOperation]>,
     /// How much of each vector the root holds when a splice replaced its part of the frame: its
@@ -683,6 +694,7 @@ impl Window {
         lift_z: Option<i32>,
         relocatable: bool,
         relayout: bool,
+        publishes: bool,
     ) -> Option<Rc<PatchUnit>> {
         let placement = if self.lifts_open == 0 {
             Placement::InPlace
@@ -695,6 +707,7 @@ impl Window {
             lift_z,
             relocatable,
             relayout,
+            publishes,
             prepaint: self.capture_surroundings()?,
             placement,
             dispatch_parent: Cell::new(self.next_frame.dispatch_tree.active_node_id()),
@@ -717,6 +730,7 @@ impl Window {
             lift_z: unit.lift_z,
             relocatable: unit.relocatable,
             relayout: unit.relayout,
+            publishes: unit.publishes,
             prepaint: unit.prepaint.clone(),
             placement,
             dispatch_parent: Cell::new(unit.dispatch_parent.get()),
@@ -1505,7 +1519,9 @@ impl Window {
 
         let patched = self.effects().without_root_escapes(&before_paint);
         let reasons = step.effects | before_paint.reasons(&patched);
-        let published = step.published || before_paint.published(&patched);
+        // Which phase published, as a recording says it.
+        let publications = (step.published, before_paint.published(&patched));
+        let published = publications.0 || publications.1;
         if reasons != 0 || self.redraw_before_present || self.requested_autoscroll.is_some() {
             return Err(PatchDecline::Effects);
         }
@@ -1522,7 +1538,7 @@ impl Window {
                 return Err(PatchDecline::Registrations);
             }
             let operations = self.next_frame.scene.paint_operations[scratch.clone()].to_vec();
-            let rewrites = source.rewritable && !published;
+            let rewrites = source.rewritable && (!published || source.publishes);
             let splice = self.plan_splice(
                 source,
                 &around.id,
@@ -1533,7 +1549,8 @@ impl Window {
                 rewrites,
             )?;
             let rewrite = rewrites.then(|| {
-                let mut rewrite = self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end);
+                let mut rewrite =
+                    self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications);
                 rewrite.prepaint_lengths = Some(prepaint_lengths(&prepaint_start, &prepaint_end));
                 rewrite.paint_lengths = Some(paint_lengths(&paint_start, &paint_end));
                 rewrite
@@ -1569,8 +1586,8 @@ impl Window {
             prepaint_start.scrollers_index..prepaint_end.scrollers_index,
             source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
         );
-        let rewrite = (relaid && source.rewritable && !published)
-            .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end));
+        let rewrite = (relaid && source.rewritable && (!published || source.publishes))
+            .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications));
         Ok(UnitRun { scratch, rendered, changed, places, scrollers, relaid, splice: None, rewrite })
     }
 
@@ -1580,9 +1597,11 @@ impl Window {
         unit: &PatchUnit,
         prepaint: Range<&PrepaintStateIndex>,
         paint: Range<&PaintIndex>,
+        publications: (bool, bool),
     ) -> RecordingRewrite {
         let frame = &self.next_frame;
         RecordingRewrite {
+            publications,
             hitboxes: RecordedHitboxes::new(
                 frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec(),
                 unit.prepaint.hitbox_parent,

@@ -2850,11 +2850,11 @@ impl PrepaintRecord {
     }
 
     /// Whether a patch that laid the subtree out again can leave a recording equal to the one a
-    /// frame built whole would: nothing was handed to a stacking context outside or published, and
+    /// frame built whole would: nothing was handed to a stacking context outside, and
     /// no accessibility tree was recorded (a patch that lays out again is declined while one is
     /// built).
     pub(crate) fn can_be_rewritten(&self) -> bool {
-        self.lifts.is_none() && self.a11y.is_none() && !self.has_publications
+        self.lifts.is_none() && self.a11y.is_none()
     }
 
     /// Makes the recording what the prepaint of a patch left: `hitboxes` are the ones it inserted,
@@ -2945,7 +2945,7 @@ impl PaintRecord {
     /// frame built whole would, see [`PrepaintRecord::can_be_rewritten`]. The paint is one that is
     /// painted where it is, with nothing in a scene of its own.
     pub(crate) fn can_be_rewritten(&self) -> bool {
-        self.is_plain() && self.a11y.is_none() && !self.has_publications
+        self.is_plain() && self.a11y.is_none()
     }
 
     /// [`PrepaintRecord::rewrite`] for the paint: `tab_stops` are the ones it inserted.

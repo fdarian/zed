@@ -44,6 +44,11 @@ struct State {
     /// The boxes of the unit's kids and of the header and footer report their bounds as they paint.
     track: Cell<bool>,
     kid_bounds: RefCell<Vec<Bounds<Pixels>>>,
+    /// The user key of the unit does not move with the content, so that a frame replays the recording it left.
+    key_stays: Cell<bool>,
+    /// How many times the owner republished what the unit's listeners report, and what it republished.
+    replays: Cell<usize>,
+    republished: RefCell<Vec<Bounds<Pixels>>>,
     outside_bounds: RefCell<Vec<Bounds<Pixels>>>,
 }
 
@@ -66,6 +71,9 @@ impl State {
             direct: Cell::new(true),
             track: Cell::new(false),
             kid_bounds: RefCell::new(Vec::new()),
+            key_stays: Cell::new(false),
+            replays: Cell::new(0),
+            republished: RefCell::new(Vec::new()),
             outside_bounds: RefCell::new(vec![Bounds::default(); 2]),
         })
     }
@@ -114,11 +122,15 @@ impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let state = self.0.clone();
         let build = state.clone();
-        let mut unit = retained(UNIT, 1_000 + state.version.get(), move |_, _| build.unit());
+        let mut unit = retained(UNIT, 1_000 + if state.key_stays.get() { 0 } else { state.version.get() }, move |_, _| build.unit());
         unit = if state.relayout.get() { unit.patchable_relayout() } else { unit.patchable() };
         if state.track.get() {
             // Listeners that report to their owner keep a subtree from being recorded unless the owner reports for it.
-            unit = unit.on_replay(|_, _, _| {});
+            let owner = state.clone();
+            unit = unit.on_replay(move |_, _, _| {
+                owner.replays.set(owner.replays.get() + 1);
+                *owner.republished.borrow_mut() = owner.kid_bounds.borrow().clone();
+            });
         }
         let page = div().id("page").w(px(400.)).h(px(300.));
         let page = if state.block.get() {
@@ -861,5 +873,43 @@ mod prepared {
         assert_eq!(page.patches(cx).declines(PatchDecline::LayoutMismatch), 1);
         page.tick(cx);
         page.assert_whole(cx, "a frame built whole after the decline");
+    }
+
+    #[gpui::test]
+    fn a_root_that_publishes_and_has_a_replay_hook_is_rewritten_by_three_patches_in_a_row_and_republishes_what_they_published(
+        cx: &mut TestAppContext,
+    ) {
+        let state = State::new(kids(3, 20.));
+        state.track.set(true);
+        state.key_stays.set(true);
+        let page = Fixture::new(cx, state);
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.patcher.set(false);
+        let first = page.kid_bounds();
+
+        for (index, height) in [25., 30., 35.].into_iter().enumerate() {
+            page.commit(cx, kids(3, height));
+            control.commit(cx, kids(3, height));
+            page.tick(cx);
+            control.tick(cx);
+            let after = page.patches(cx);
+            assert_eq!(after.relayout_patches, index as u64 + 1, "{height}: {:?}", page.state.seen.borrow());
+            assert_eq!(after.rewritten_recordings, index as u64 + 1, "{height}: the recording is rewritten though the root published");
+            assert_eq!(after.declines(PatchDecline::StaleRecording), 0, "{height}: {:?}", page.state.seen.borrow());
+            assert_same(&page.snapshot(cx), &control.snapshot(cx), &format!("a patch of height {height}"));
+            assert_eq!(page.kid_bounds(), control.kid_bounds(), "{height}: the listeners reported the same");
+        }
+        assert_eq!(page.patches(cx).rewritten_recordings, 3);
+
+        // A frame that replays the root republishes what the patches published.
+        let replays = page.state.replays.get();
+        for fixture in [&page, &control] {
+            cx.update_window(fixture.window, |view, _, cx| cx.notify(view.entity_id())).unwrap();
+        }
+        assert!(page.state.replays.get() > replays, "the root was replayed, from the recording the patch left");
+        assert_ne!(*page.state.republished.borrow(), first, "what is republished is not what the first frame published");
+        assert_eq!(*page.state.republished.borrow(), control.kid_bounds());
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "a frame that replays the root after three patches");
+        page.assert_whole(cx, "a frame built whole after them");
     }
 }

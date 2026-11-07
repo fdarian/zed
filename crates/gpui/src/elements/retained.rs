@@ -459,6 +459,7 @@ impl RetainedState {
         let recorded = self.recorded.as_ref()?;
         let paint = recorded.paint.as_ref()?;
         let rendered = window.rendered_serial();
+        let publishes = recorded.patch.as_ref().is_some_and(|patch| patch.publishes);
         // A recording that is put elsewhere than it was recorded is not what a patch paints over.
         (recorded.patch.is_some()
             && paint.is_plain_or_relocated(recorded.relocation.is_some())
@@ -476,9 +477,12 @@ impl RetainedState {
             hitboxes: recorded.prepaint.hitboxes.clone(),
             tab_stops: paint.tab_stops.clone(),
             owner: self.owner.clone(),
+            // A recording that holds publications is kept by a frame built whole when its root has the hook.
             rewritable: recorded.relocation.is_none()
                 && recorded.prepaint.can_be_rewritten()
-                && paint.can_be_rewritten(),
+                && paint.can_be_rewritten()
+                && (publishes || !(recorded.prepaint.has_publications || paint.has_publications)),
+            publishes,
         })
     }
 
@@ -507,6 +511,8 @@ impl RetainedState {
         recorded.generation = generation;
         recorded.prepaint.rewrite(rewrite.hitboxes, rewrite.prepaint_lengths);
         paint.rewrite(rewrite.tab_stops, rewrite.paint_lengths);
+        recorded.prepaint.has_publications = rewrite.publications.0;
+        paint.has_publications = rewrite.publications.1;
         self.accessed_entities.extend(rewrite.accessed_entities);
         self.layout = None;
     }
@@ -1646,7 +1652,7 @@ impl Retained {
         // block outside it is not recorded, so it has nothing to patch from.
         let patch = (self.patchable && (self.overscan.is_none() || root_escape.is_none()))
             .then(|| {
-                window.capture_patch_unit(global_id, &self.id, self.lift_z, self.overscan.is_some(), self.relayout)
+                window.capture_patch_unit(global_id, &self.id, self.lift_z, self.overscan.is_some(), self.relayout, publishes)
             })
             .flatten();
         let (relocation, unmovable_at_start) = self.plan_relocation(window);
