@@ -770,3 +770,183 @@ fn the_verifier_finds_no_difference_in_what_a_frame_replays_of_a_recording_a_pat
     assert_eq!(patches.rewritten_recordings, 5);
     assert_eq!(patches.total_declines(), 0, "{:?}", page.state.seen.borrow());
 }
+
+/// Several roots that lay out again in one patch, each spliced: the splices are made last first, and the
+/// element states the paint accessed are counted after all the ones the prepaint did, so a root that
+/// had more or fewer of them moves where the paint states of the roots before it are.
+mod several_roots {
+    use super::*;
+    use crate::GlobalElementId;
+    use crate::elements::RetainedState;
+    use std::any::TypeId;
+
+    const ROOTS: [&str; 3] = ["first", "second", "third"];
+
+    struct Roots {
+        kids: [Cell<usize>; 3],
+        version: Cell<u64>,
+        seen: RefCell<Vec<Result<(), PatchDecline>>>,
+    }
+
+    impl Roots {
+        fn unit(&self, root: usize) -> AnyElement {
+            let name = ROOTS[root];
+            let mut unit = div().id(name).w(px(120.)).h(px(60.)).flex_none().overflow_hidden().bg(blue());
+            for index in 0..self.kids[root].get() {
+                unit = unit.child(div().id((name, index)).h(px(8.)).flex_none().bg(if index % 2 == 0 { red() } else { green() }));
+            }
+            unit.into_any_element()
+        }
+    }
+
+    struct Rooted(Rc<Roots>);
+
+    impl Render for Rooted {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut page = div()
+                .id("page")
+                .w(px(400.))
+                .h(px(400.))
+                .flex()
+                .flex_col()
+                .child(div().id("header").w(px(60.)).h(px(20.)).flex_none().bg(green()));
+            for root in 0..ROOTS.len() {
+                let state = self.0.clone();
+                page = page.child(retained(ROOTS[root], 1_000 + self.0.version.get(), move |_, _| state.unit(root)).patchable_relayout());
+            }
+            page.child(div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green())).into_any_element()
+        }
+    }
+
+    struct Page {
+        window: AnyWindowHandle,
+        state: Rc<Roots>,
+    }
+
+    impl Page {
+        fn new(cx: &mut TestAppContext, kids: [usize; 3]) -> Self {
+            let state = Rc::new(Roots { kids: kids.map(Cell::new), version: Cell::new(0), seen: RefCell::new(Vec::new()) });
+            let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(400.)), {
+                let state = state.clone();
+                move |_, _| Rooted(state)
+            }));
+            cx.update_window(window, |_, window, cx| {
+                window.set_dom_hit_testing(true);
+                window.set_contained_patches(true);
+                let patched = state.clone();
+                window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                    let units = (0..ROOTS.len()).map(|root| (ElementId::from(ROOTS[root]), patched.unit(root))).collect();
+                    let outcome = window.repaint_in_place(units, cx, |_, _| true);
+                    patched.seen.borrow_mut().push(outcome.as_ref().map(|_| ()).map_err(|decline| *decline));
+                    outcome.is_ok()
+                })));
+                window.draw(cx).clear(cx);
+                window.draw(cx).clear(cx);
+                window.present_cached_frame();
+            })
+            .unwrap();
+            Self { window, state }
+        }
+
+        fn change(&self, kids: [usize; 3]) {
+            for (cell, count) in self.state.kids.iter().zip(kids) {
+                cell.set(count);
+            }
+            self.state.version.set(self.state.version.get() + 1);
+        }
+
+        fn draw(&self, cx: &mut TestAppContext, tick: bool) {
+            cx.update_window(self.window, |_, window, cx| {
+                match tick {
+                    true => window.request_tick(),
+                    false => window.refresh(),
+                }
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+
+        /// Settles the page with frames built whole, so that a later tick patches from recordings.
+        fn settle(&self, cx: &mut TestAppContext) {
+            self.draw(cx, false);
+            self.draw(cx, false);
+        }
+
+        fn patches(&self, cx: &mut TestAppContext) -> PatchCounters {
+            cx.update_window(self.window, |_, window, _| window.patch_counters()).unwrap()
+        }
+
+        /// What the rendered frame paints, which hitboxes it holds, and the element states it accessed, in order.
+        fn shown(&self, cx: &mut TestAppContext) -> (String, Vec<(GlobalElementId, TypeId)>) {
+            cx.update_window(self.window, |_, window, _| {
+                let frame = &window.rendered_frame;
+                let hitboxes: Vec<String> = frame.hitboxes.iter().map(|hitbox| hitbox.describe()).collect();
+                (format!("{:#?}\n{hitboxes:#?}", frame.scene.quads), frame.accessed_element_states.clone())
+            })
+            .unwrap()
+        }
+
+        /// Draws a frame that patches and then one built whole, and asserts that they leave the same.
+        #[track_caller]
+        fn assert_whole(&self, cx: &mut TestAppContext, what: &str) {
+            let (patched, patched_states) = self.shown(cx);
+            self.draw(cx, false);
+            let (whole, whole_states) = self.shown(cx);
+            assert_same(&same_window(&patched), &same_window(&whole), what);
+            // The states the layout accessed come first, and a patch makes no layout of the page: the ones the prepaint
+            // and the paint accessed are what it splices. The root's own state is its recording's, which a patch keeps.
+            let names = |states: &[(GlobalElementId, TypeId)]| -> Vec<String> {
+                let own = TypeId::of::<RetainedState>();
+                let names: Vec<String> = states.iter().filter(|(_, ty)| *ty != own).map(|(id, _)| format!("{:?}", &id.ids[1..])).collect();
+                let page = names.iter().skip(1).position(|name| *name == names[0]).expect("the prepaint starts at the page") + 1;
+                names[page..].to_vec()
+            };
+            let (patched_names, whole_names) = (names(&patched_states), names(&whole_states));
+            if patched_names != whole_names {
+                let short = |names: &[String]| {
+                    names.iter().map(|name| name.replace("Name(", "").replace("NamedInteger(", "").replace([')', '"', '[', ']'], "").replace("page, ", "")).collect::<Vec<_>>().join(" | ")
+                };
+                panic!(
+                    "{what}: the element states the frame accessed differ ({} against {}):\npatched: {}\nwhole:   {}",
+                    patched_names.len(),
+                    whole_names.len(),
+                    short(&patched_names),
+                    short(&whole_names)
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn roots_that_each_gain_or_lose_element_states_in_one_patch_leave_the_accessed_states_a_frame_built_whole_does(cx: &mut TestAppContext) {
+        let page = Page::new(cx, [3, 3, 3]);
+        page.settle(cx);
+        for (what, kids) in [("more, fewer, more", [6, 1, 5]), ("fewer, more, fewer", [2, 7, 3]), ("more, more, more", [4, 9, 12])] {
+            let before = page.patches(cx);
+            page.change(kids);
+            page.draw(cx, true);
+            let after = page.patches(cx);
+            let seen = page.state.seen.borrow();
+            assert_eq!(after.relayout_patches - before.relayout_patches, 3, "{what}: {seen:?}");
+            assert_eq!(after.total_declines(), 0, "{what}: {seen:?}");
+            drop(seen);
+            page.assert_whole(cx, what);
+        }
+    }
+
+    #[gpui::test]
+    fn a_frame_that_replays_roots_that_were_spliced_together_shows_what_a_frame_built_whole_does(cx: &mut TestAppContext) {
+        let page = Page::new(cx, [3, 3, 3]);
+        page.settle(cx);
+        for kids in [[6, 1, 5], [2, 7, 5]] {
+            page.change(kids);
+            page.draw(cx, true);
+            assert_eq!(page.patches(cx).total_declines(), 0, "{:?}", page.state.seen.borrow());
+            // The recordings of the roots hold the places the splices left them: another patch and a replay use them.
+            page.change([kids[0] + 1, kids[1] + 2, kids[2]]);
+            page.draw(cx, true);
+            assert_eq!(page.patches(cx).total_declines(), 0, "{:?}", page.state.seen.borrow());
+            page.assert_whole(cx, &format!("patched again after {kids:?}"));
+        }
+    }
+}
