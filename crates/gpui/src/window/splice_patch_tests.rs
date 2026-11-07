@@ -950,3 +950,25 @@ mod several_roots {
         }
     }
 }
+
+#[gpui::test]
+fn the_verifier_finds_no_difference_in_a_patch_of_a_root_in_place_and_a_root_spliced(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    let page = Fixture::new(cx, state);
+    cx.update_window(page.window, |_, window, _| window.set_retention_verifier(Some(Rc::new(|_| String::new())))).unwrap();
+    page.settle(cx);
+    for (kids, green) in [(7, true), (1, false), (5, true)] {
+        page.state.change(kids);
+        page.state.patch_sibling.set(true);
+        page.state.sibling_green.set(green);
+        page.tick(cx);
+        page.settle(cx);
+    }
+    let (verified, mismatches) = cx
+        .update_window(page.window, |_, window, _| (window.retained_counters().verified, window.retention_mismatches().to_vec()))
+        .unwrap();
+    assert!(verified > 0);
+    assert_eq!(page.patches(cx).relayout_patches, 3, "{:?}", page.state.seen.borrow());
+    assert_eq!(page.patches(cx).patched_units, 6, "{:?}", page.state.seen.borrow());
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}

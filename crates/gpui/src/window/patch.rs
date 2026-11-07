@@ -1126,6 +1126,7 @@ impl Window {
                 splices.push(splice);
             }
         }
+        let mut wrote_in_place = false;
         if changed {
             let edits = runs.iter().flat_map(|run| {
                 let painted = &operations[run.scratch.clone()];
@@ -1137,9 +1138,7 @@ impl Window {
             }
             if self.rendered_frame.scene.patch_in_place(edits, &mut written) {
                 self.patch.counters.in_place_primitives += written;
-                if let Some(trace) = &mut self.patch.trace {
-                    trace.in_place_scene = Some(self.rendered_frame.scene.describe_primitives());
-                }
+                wrote_in_place = true;
             } else {
                 for run in &runs {
                     let target = &mut self.rendered_frame.scene.paint_operations[run.rendered.clone()];
@@ -1170,6 +1169,11 @@ impl Window {
         let spliced = !splices.is_empty();
         if spliced {
             self.splice(splices);
+        }
+        // Described once a splice has made the scene again, which it does with other draw orders than the
+        // ones the in-place writes left.
+        if wrote_in_place && let Some(trace) = &mut self.patch.trace {
+            trace.in_place_scene = Some(self.rendered_frame.scene.describe_primitives());
         }
         // The recordings are rewritten once the roots are where the patch put them in the vectors.
         self.patch.counters.rewritten_recordings += rewrites.len() as u64;
