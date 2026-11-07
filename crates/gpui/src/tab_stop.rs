@@ -320,6 +320,14 @@ impl TabStopMap {
         }
     }
 
+    /// Puts `new` in the place of the part of the log in `range`, and works the tab order out again:
+    /// the log is all the order is made of.
+    pub(crate) fn splice(&mut self, range: std::ops::Range<usize>, new: Vec<TabStopOperation>) {
+        let mut operations = std::mem::take(&mut self.insertion_history);
+        operations.splice(range, new);
+        self.rebuild(operations);
+    }
+
     fn rebuild(&mut self, operations: Vec<TabStopOperation>) {
         self.clear();
         for operation in operations {

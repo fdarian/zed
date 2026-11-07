@@ -334,7 +334,7 @@ thread_local! {
 }
 
 /// An index into the vectors of a frame, which a range of a recording is made of.
-pub(crate) trait FrameIndex: Clone {
+pub(crate) trait FrameIndex: Positions {
     /// Where the index, which is inside the range that started at `from`, is once that range was
     /// copied to `to`.
     fn moved(&self, from: &Self, to: &Self) -> Self;
@@ -447,6 +447,49 @@ impl Origin {
 
     pub(crate) fn place_paint(&self, start: PaintIndex, serial: u64, pass: u64, within: Option<&Rc<Origin>>) {
         self.place(|origin| &origin.paint, start, serial, pass, within);
+    }
+
+    /// Where the prepaint starts if the recording is placed in the frame `serial`.
+    pub(crate) fn prepaint_in(&self, serial: u64) -> Option<PrepaintStateIndex> {
+        let (start, placed) = self.prepaint_now();
+        (placed == serial).then_some(start)
+    }
+
+    /// Where the paint starts if the recording is placed in the frame `serial`.
+    pub(crate) fn paint_in(&self, serial: u64) -> Option<PaintIndex> {
+        let (start, placed) = self.paint_now();
+        (placed == serial).then_some(start)
+    }
+
+    /// Says that the prepaint now starts at `at`, in the frame it is in: a frame was spliced.
+    /// `outer_at` gives where the recording around it starts once it is moved too, which the
+    /// start of one placed inside another is counted from.
+    pub(crate) fn move_prepaint(&self, at: &PrepaintStateIndex, outer_at: &dyn Fn(&Rc<Origin>) -> PrepaintStateIndex) {
+        self.move_to(|origin| &origin.prepaint, at, outer_at);
+    }
+
+    /// [`Self::move_prepaint`] for the paint.
+    pub(crate) fn move_paint(&self, at: &PaintIndex, outer_at: &dyn Fn(&Rc<Origin>) -> PaintIndex) {
+        self.move_to(|origin| &origin.paint, at, outer_at);
+    }
+
+    fn move_to<I: Positions>(
+        &self,
+        side: fn(&Origin) -> &RefCell<Placed<I>>,
+        at: &I,
+        outer_at: &dyn Fn(&Rc<Origin>) -> I,
+    ) {
+        let mut placed = side(self).borrow_mut();
+        placed.start = match &placed.within {
+            None => at.clone(),
+            Some((outer, base)) => {
+                let outer_at = outer_at(outer).positions();
+                let (at, base) = (at.positions(), base.positions());
+                placed.start.with_positions(std::array::from_fn(|field| {
+                    at[field].wrapping_sub(outer_at[field]).wrapping_add(base[field])
+                }))
+            }
+        };
     }
 
     /// The recording is in no frame, nor are the ones inside it.
@@ -666,6 +709,10 @@ impl PlainPaint {
             }
             _ => "\nlifted (not painted)".to_owned(),
         }
+    }
+
+    pub(crate) fn origin(&self) -> &Rc<Origin> {
+        &self.origin
     }
 
     pub(crate) fn new(descendants: u32) -> Self {

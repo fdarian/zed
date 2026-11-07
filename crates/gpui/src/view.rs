@@ -282,6 +282,33 @@ impl<V: View> IntoElement for ViewElement<V> {
     }
 }
 
+/// Gives the ranges that the cached views of the frame `serial` hold to `remap`, which moves them
+/// and says whether they are still good: a view it says no for is drawn again, as one whose ranges are
+/// of another frame is.
+pub(crate) fn remap_cached_views(
+    states: &mut collections::FxHashMap<(GlobalElementId, std::any::TypeId), crate::window::ElementStateBox>,
+    serial: u64,
+    remap: &mut dyn FnMut(&mut Range<PrepaintStateIndex>, Option<&mut Range<PaintIndex>>) -> bool,
+) {
+    let kind = std::any::TypeId::of::<ViewElementState>();
+    for ((_, state_kind), state) in states.iter_mut() {
+        if *state_kind != kind {
+            continue;
+        }
+        let Some(Some(view)) = state.inner.downcast_mut::<Option<ViewElementState>>() else {
+            continue;
+        };
+        if view.prepaint_serial != serial {
+            continue;
+        }
+        let paint = (view.paint_serial == serial).then_some(&mut view.paint_range);
+        if !remap(&mut view.prepaint_range, paint) {
+            view.prepaint_serial = 0;
+            view.paint_serial = 0;
+        }
+    }
+}
+
 struct ViewElementState {
     /// False for a view prepainted inside a stacking context. The ranges below index the frame's
     /// hitboxes and tab stops by position, and the context moves those about once it is done.

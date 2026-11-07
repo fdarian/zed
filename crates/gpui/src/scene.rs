@@ -1298,6 +1298,18 @@ impl Scene {
         self.hidden = hidden;
     }
 
+    /// Puts `new` in the place of the operations in `range` and makes the scene again from the log with
+    /// the draw orders worked out again: for a patch that painted a part of the page with other
+    /// operations than it had, which moves the ones after it and changes the draw order of what
+    /// comes after, so that neither the slots nor the order log of the scene are what it holds.
+    pub(crate) fn splice_operations(&mut self, range: Range<usize>, new: Vec<PaintOperation>) {
+        self.paint_operations.splice(range, new);
+        let operations = mem::take(&mut self.paint_operations);
+        let group_base = self.group_base;
+        self.rebuild(&operations, None, group_base, true);
+        self.paint_operations = operations;
+    }
+
     /// Makes the scene what painting its operations in order makes of an empty one, with the draw
     /// orders worked out again, for a log in which some operations were moved (see
     /// [`Scene::rebuild_from_operations`], which reuses the orders of the log and so is for

@@ -478,6 +478,13 @@ impl RetainedState {
         })
     }
 
+    /// Where the paint of the elements the recording handed to the stacking context around it is
+    /// placed: each of their cells is placed as the subtrees inside it are.
+    pub(crate) fn lifted_origins(&self) -> Vec<Rc<Origin>> {
+        let lifts = self.recorded.as_ref().and_then(|recorded| recorded.prepaint.lifts.as_ref());
+        lifts.map_or_else(Vec::new, |lifts| lifts.cells().map(|cell| cell.origin().clone()).collect())
+    }
+
     /// Drops what the subtree recorded: after a patch that laid it out again, the frame holds
     /// what the recording would not repeat, so no frame replays or patches from it.
     pub(crate) fn forget_recording(&mut self) {
@@ -1269,6 +1276,7 @@ impl Retained {
                 // A recording put elsewhere than it was made is no source for a patch, which
                 // paints it where its surroundings were captured.
                 if delta.is_zero() && exact {
+                    unit.dispatch_parent.set(window.next_frame.dispatch_tree.active_node_id());
                     window.register_patch_unit(&id, unit);
                 } else {
                     window.note_relocated_patch_unit(&id);

@@ -67,6 +67,7 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod patch;
+mod patch_splice;
 #[cfg(test)]
 mod contained_patch_tests;
 #[cfg(test)]
@@ -89,6 +90,7 @@ pub use scroll_patch::{
     ScrollThumbPlan,
 };
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
+pub(crate) use patch_splice::Positions;
 pub(crate) use scroll_patch::{ScrollFrame, ScrollPatchDraw, ScrollPatchWindow};
 pub(crate) use retained::{
     HandleList, LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
@@ -1703,31 +1705,32 @@ struct ClipIndex {
 
 impl ClipIndex {
     fn new(hitboxes: &[Hitbox]) -> Option<Self> {
-        if !hitboxes.iter().any(|hitbox| hitbox.clip.is_some()) {
+        Self::over(hitboxes.len(), |ix| &hitboxes[ix])
+    }
+
+    /// [`Self::new`] for the `len` hitboxes that `hitbox_at` gives for the indices `0..len`.
+    fn over<'h>(len: usize, hitbox_at: impl Fn(usize) -> &'h Hitbox) -> Option<Self> {
+        if !(0..len).any(|ix| hitbox_at(ix).clip.is_some()) {
             return None;
         }
-        let positions: FxHashMap<HitboxId, usize> = hitboxes
-            .iter()
-            .enumerate()
-            .map(|(ix, hitbox)| (hitbox.id, ix))
-            .collect();
+        let positions: FxHashMap<HitboxId, usize> = (0..len).map(|ix| (hitbox_at(ix).id, ix)).collect();
         // A hitbox can sit before its parent: a z-indexed element is moved to where it paints.
-        let mut enclosing_clip: Vec<Option<Option<u32>>> = vec![None; hitboxes.len()];
+        let mut enclosing_clip: Vec<Option<Option<u32>>> = vec![None; len];
         let mut unresolved = Vec::new();
-        for start in 0..hitboxes.len() {
+        for start in 0..len {
             let mut current = start;
             let resolved = loop {
                 if let Some(known) = enclosing_clip[current] {
                     break known;
                 }
                 unresolved.push(current);
-                let Some(parent) = hitboxes[current]
+                let Some(parent) = hitbox_at(current)
                     .parent
                     .and_then(|parent| positions.get(&parent).copied())
                 else {
                     break None;
                 };
-                if hitboxes[parent].clip.is_some() {
+                if hitbox_at(parent).clip.is_some() {
                     break Some(parent as u32);
                 }
                 current = parent;
@@ -1841,18 +1844,54 @@ impl Frame {
     }
 
     pub(crate) fn hit_test(&self, position: Point<Pixels>, dom_hit_testing: bool) -> HitTest {
+        let hitbox_at = |ix: usize| &self.hitboxes[ix];
+        self.hit_test_over(position, dom_hit_testing, self.hitboxes.len(), self.clip_index(), hitbox_at)
+    }
+
+    /// [`Self::hit_test`] of the frame with the hitboxes at `range` taken out and `replacement`
+    /// put in their place, which is what a patch that splices a root has: the frame it paints in
+    /// is hit tested before the rendered frame has the new hitboxes.
+    pub(crate) fn hit_test_replacing(
+        &self,
+        position: Point<Pixels>,
+        dom_hit_testing: bool,
+        range: Range<usize>,
+        replacement: &[Hitbox],
+    ) -> HitTest {
+        let len = self.hitboxes.len() - range.len() + replacement.len();
+        let hitbox_at = |ix: usize| {
+            if ix < range.start {
+                &self.hitboxes[ix]
+            } else if ix < range.start + replacement.len() {
+                &replacement[ix - range.start]
+            } else {
+                &self.hitboxes[ix - replacement.len() + range.len()]
+            }
+        };
+        let clips = ClipIndex::over(len, hitbox_at);
+        self.hit_test_over(position, dom_hit_testing, len, clips.as_ref(), hitbox_at)
+    }
+
+    fn hit_test_over<'h>(
+        &self,
+        position: Point<Pixels>,
+        dom_hit_testing: bool,
+        len: usize,
+        clips: Option<&ClipIndex>,
+        hitbox_at: impl Fn(usize) -> &'h Hitbox,
+    ) -> HitTest {
         if dom_hit_testing {
-            return self.dom_hit_test(position);
+            return self.dom_hit_test_over(position, len, clips, hitbox_at);
         }
-        let clips = self.clip_index();
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for (ix, hitbox) in self.hitboxes.iter().enumerate().rev() {
+        for ix in (0..len).rev() {
+            let hitbox = hitbox_at(ix);
             if hitbox.behavior == HitboxBehavior::PassThrough {
                 continue;
             }
             if hitbox.contains_point(position)
-                && !clips.is_some_and(|clips| self.clipped_out(clips, ix, position))
+                && !clips.is_some_and(|clips| self.clipped_out_by(clips, ix, position, &hitbox_at))
             {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
@@ -1887,10 +1926,6 @@ impl Frame {
     /// Whether `position` is outside the `clip-path` of the hitbox at `ix` or of one of the
     /// hitboxes that enclose it. A clip path cuts away the hit area of its whole subtree, as in
     /// CSS.
-    fn clipped_out(&self, clips: &ClipIndex, ix: usize, position: Point<Pixels>) -> bool {
-        self.clipped_out_by(clips, ix, position, |ix| &self.hitboxes[ix])
-    }
-
     fn clipped_out_by<'h>(
         &self,
         clips: &ClipIndex,
@@ -1898,7 +1933,7 @@ impl Frame {
         position: Point<Pixels>,
         hitbox_at: impl Fn(usize) -> &'h Hitbox,
     ) -> bool {
-        debug_assert_eq!(clips.enclosing_clip.len(), self.hitboxes.len());
+        debug_assert!(ix < clips.enclosing_clip.len());
         let clipped = |ix: usize| {
             let hitbox = hitbox_at(ix);
             hitbox.clip.as_ref().is_some_and(|clip| match hitbox.to_local(position) {
@@ -1919,19 +1954,18 @@ impl Frame {
         false
     }
 
-    /// The topmost non-`PassThrough` hitbox containing the point, then its chain of parents.
-    /// Parents are included wherever the point is: an ancestor is hovered by a descendant that
-    /// overflows it, or that was deferred out of it.
-    fn dom_hit_test(&self, position: Point<Pixels>) -> HitTest {
-        self.dom_hit_test_by(position, |ix| &self.hitboxes[ix])
-    }
-
-    /// [`Self::dom_hit_test`] over the hitboxes `hitbox_at` gives for the indices of the frame: the
-    /// scroll classifier asks what the pointer would hit with some of them moved.
-    pub(crate) fn dom_hit_test_by<'h>(&self, position: Point<Pixels>, hitbox_at: impl Fn(usize) -> &'h Hitbox) -> HitTest {
-        let clips = self.clip_index();
+    /// [`Self::hit_test_over`] in the DOM model: the topmost non-`PassThrough` hitbox containing the
+    /// point, then its chain of parents. Parents are included wherever the point is: an ancestor is
+    /// hovered by a descendant that overflows it, or that was deferred out of it.
+    fn dom_hit_test_over<'h>(
+        &self,
+        position: Point<Pixels>,
+        len: usize,
+        clips: Option<&ClipIndex>,
+        hitbox_at: impl Fn(usize) -> &'h Hitbox,
+    ) -> HitTest {
         let mut hit_test = HitTest::default();
-        let mut next = (0..self.hitboxes.len()).rev().find(|ix| {
+        let mut next = (0..len).rev().find(|ix| {
             let hitbox = hitbox_at(*ix);
             hitbox.behavior != HitboxBehavior::PassThrough
                 && hitbox.contains_point(position)
@@ -1952,12 +1986,18 @@ impl Frame {
                 (0..index)
                     .rev()
                     .find(|candidate| hitbox_at(*candidate).id == parent)
-                    .or_else(|| (index + 1..self.hitboxes.len()).find(|candidate| hitbox_at(*candidate).id == parent))
+                    .or_else(|| (index + 1..len).find(|candidate| hitbox_at(*candidate).id == parent))
                     .expect("hitbox parent is missing from the frame")
             });
         }
         hit_test.hover_hitbox_count = hit_test.ids.len();
         hit_test
+    }
+
+    /// [`Self::hit_test`] in the DOM model over the hitboxes `hitbox_at` gives for the indices of the
+    /// frame: the scroll classifier asks what the pointer would hit with some of them moved.
+    pub(crate) fn dom_hit_test_by<'h>(&self, position: Point<Pixels>, hitbox_at: impl Fn(usize) -> &'h Hitbox) -> HitTest {
+        self.dom_hit_test_over(position, self.hitboxes.len(), self.clip_index(), hitbox_at)
     }
 
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
@@ -9483,8 +9523,8 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
-        let id = match self.patch.hitbox_ids.as_mut() {
-            Some(recorded) => recorded.next(),
+        let id = match self.patch.hitbox_ids.as_mut().and_then(|recorded| recorded.next()) {
+            Some(id) => id,
             None => {
                 let id = self.next_hitbox_id;
                 self.next_hitbox_id = self.next_hitbox_id.next();

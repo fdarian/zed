@@ -412,6 +412,25 @@ impl ScrollFrame {
         self.painted = 0;
     }
 
+    /// Moves the places in the vectors of the frame that the runs and the thumbs hold, after a patch put
+    /// other items in the place of some. `run` moves the hitboxes and the operations of a run and says
+    /// whether it is still a run of the frame; `operation` says where the operation of a thumb went,
+    /// and a thumb that goes nowhere is one that cannot be put elsewhere.
+    pub(crate) fn remap_places(
+        &mut self,
+        run: &mut dyn FnMut(&mut Range<usize>, &mut Range<usize>) -> bool,
+        operation: &mut dyn FnMut(usize) -> Option<usize>,
+    ) {
+        self.runs.retain_mut(|scroll| run(&mut scroll.hitboxes, &mut scroll.ops));
+        for thumb in &mut self.thumbs {
+            let ThumbPaint::Quad { op, bounds } = thumb.paint else { continue };
+            thumb.paint = match operation(op) {
+                Some(op) => ThumbPaint::Quad { op, bounds },
+                None => ThumbPaint::Untracked,
+            };
+        }
+    }
+
     fn runs_of(&self, list: ScrollerId) -> impl Iterator<Item = &ScrollRun> {
         self.runs.iter().filter(move |run| run.list == list)
     }

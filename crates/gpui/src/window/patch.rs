@@ -31,6 +31,7 @@
 //! lies inside is repainted from the new layout, and the recording of the root is dropped, as the
 //! frame no longer holds what it would repeat.
 
+use super::patch_splice::Splice;
 use super::*;
 use crate::elements::{RetainedState, ScrollExtent, ScrollHandle};
 use crate::scene::PaintOperation;
@@ -63,6 +64,10 @@ pub enum PatchDecline {
     /// The root laid out again, and its box is not the one it had or a node outside it is laid out
     /// differently: the patch would not be the frame built whole.
     NotContained,
+    /// The root registered other things than it did, and the rendered frame does not hold what it
+    /// recorded where it recorded it (a stacking context moved its hitboxes or tab stops), or two
+    /// roots that are patched hold places in each other: there is no part of the frame to replace.
+    Splice,
     /// Painting did something a recording cannot repeat: asked for another frame, scrolled
     /// something into view, deferred a draw or loaded an asset.
     Effects,
@@ -90,7 +95,7 @@ pub enum PatchDecline {
 
 impl PatchDecline {
     /// Every reason.
-    pub const ALL: [PatchDecline; 16] = [
+    pub const ALL: [PatchDecline; 17] = [
         PatchDecline::PendingView,
         PatchDecline::Refreshing,
         PatchDecline::UnknownUnit,
@@ -99,6 +104,7 @@ impl PatchDecline {
         PatchDecline::LayoutMismatch,
         PatchDecline::UnstableLayout,
         PatchDecline::NotContained,
+        PatchDecline::Splice,
         PatchDecline::Effects,
         PatchDecline::Lifts,
         PatchDecline::Relocated,
@@ -206,18 +212,23 @@ pub(crate) struct RecordedHitboxIds {
     ids: Vec<HitboxId>,
     taken: usize,
     overrun: bool,
+    /// A root that laid out again may have more hitboxes than it had: those after the recorded ones
+    /// get new ids, as they would in a frame built whole.
+    spill: bool,
 }
 
 impl RecordedHitboxIds {
-    pub(crate) fn next(&mut self) -> HitboxId {
+    /// The id of the next hitbox, or `None` if the root has more than it had and may.
+    pub(crate) fn next(&mut self) -> Option<HitboxId> {
         match self.ids.get(self.taken) {
             Some(id) => {
                 self.taken += 1;
-                *id
+                Some(*id)
             }
+            None if self.spill => None,
             None => {
                 self.overrun = true;
-                HitboxId(u64::MAX)
+                Some(HitboxId(u64::MAX))
             }
         }
     }
@@ -244,7 +255,7 @@ pub(crate) enum PatchedFrame {
 /// What of its surroundings a retained root needs to be prepainted and painted again where it
 /// was, besides what its [`ReplayKey`] holds and checks.
 pub(crate) struct PatchUnit {
-    id: GlobalElementId,
+    pub(crate) id: GlobalElementId,
     name: ElementId,
     /// What the root says of itself, which its new element must say too: whether it is handed to
     /// a stacking context depends on the parent, which a patch does not build.
@@ -255,6 +266,10 @@ pub(crate) struct PatchUnit {
     relayout: bool,
     prepaint: Surroundings,
     placement: Placement,
+    /// The dispatch node that was open where the root was prepainted, in the frame the root was last
+    /// built or replayed in: a root that hands the frame other dispatch nodes than it did hangs them off
+    /// it. Moved with the nodes when a patch splices.
+    pub(crate) dispatch_parent: Cell<Option<DispatchNodeId>>,
 }
 
 impl PatchUnit {
@@ -322,6 +337,9 @@ struct UnitRun {
     scrollers: (Range<usize>, Range<usize>),
     /// The unit laid out again.
     relaid: bool,
+    /// What replaces the part of the rendered frame the root held, when it registered or painted
+    /// other things than it did: nothing of the rest of the run is then used.
+    splice: Option<Splice>,
 }
 
 /// What the rendered frame takes from a patch besides its operations: the transforms, which a
@@ -582,6 +600,7 @@ impl Window {
             relayout,
             prepaint: self.capture_surroundings()?,
             placement,
+            dispatch_parent: Cell::new(self.next_frame.dispatch_tree.active_node_id()),
         }))
     }
 
@@ -603,6 +622,7 @@ impl Window {
             relayout: unit.relayout,
             prepaint: unit.prepaint.clone(),
             placement,
+            dispatch_parent: Cell::new(unit.dispatch_parent.get()),
         }))
     }
 
@@ -690,15 +710,24 @@ impl Window {
         }
 
         let scratch = self.begin_scratch(cx);
+        // A root that lays out again hit tests the pointer against the hitboxes it is about to have.
+        let hit_test = self.mouse_hit_test.clone();
         let patched = self.patch_units(&mut resolved, cx, scratch.a11y_was_active);
         let operations = mem::take(&mut self.next_frame.scene.paint_operations);
         let scrollers = mem::take(&mut self.next_frame.scrollers);
         self.finish_scratch(scratch, cx);
-        let (runs, moves) = patched?;
+        let (mut runs, moves) = match patched {
+            Ok(patched) => patched,
+            Err(decline) => {
+                self.mouse_hit_test = hit_test;
+                return Err(decline);
+            }
+        };
         let runs_len = runs.len();
         let relaid = runs.iter().filter(|run| run.relaid).count();
 
         if !accept(self, cx) {
+            self.mouse_hit_test = hit_test;
             return Err(PatchDecline::Rejected);
         }
         let changed = runs.iter().any(|run| !run.changed.is_empty());
@@ -716,6 +745,14 @@ impl Window {
                 redraw_requests: self.retained.redraw_requests,
                 in_place_scene: None,
             });
+        }
+        let mut splices = Vec::new();
+        for run in &mut runs {
+            if let Some(splice) = run.splice.take() {
+                // The rest of the run is of no use: the splice has what the root had and what it has now.
+                (run.scratch, run.rendered, run.scrollers) = (0..0, 0..0, (0..0, 0..0));
+                splices.push(splice);
+            }
         }
         if changed {
             let edits = runs.iter().flat_map(|run| {
@@ -758,14 +795,22 @@ impl Window {
         for run in runs {
             moved_hitboxes |= self.put_places(run.places);
         }
-        if moved_hitboxes {
-            // A transform that ticked moved what is under the pointer.
+        let spliced = !splices.is_empty();
+        if spliced {
+            self.splice(splices);
+        }
+        if moved_hitboxes || spliced {
+            // A transform that ticked moved what is under the pointer, or the roots have other hitboxes.
             self.rendered_frame.hitboxes_changed();
             if !self.pointer_outside {
                 self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position, self.dom_hit_testing);
             }
         }
-        Ok(PatchOutcome { units: runs_len, changed, scroll_extents })
+        if spliced {
+            // A frame built whole ends by asking the platform for the cursor the pointer is over.
+            self.reset_cursor_style(cx);
+        }
+        Ok(PatchOutcome { units: runs_len, changed: changed || spliced, scroll_extents })
     }
 
     /// Makes the scratch frame a clean one to draw the roots into.
@@ -818,6 +863,12 @@ impl Window {
             let run = self.with_state_owner(&owner, |window| window.patch_unit(unit, cx, a11y_active));
             self.leave_surroundings(saved);
             runs.push(run?);
+        }
+        for (index, run) in runs.iter().enumerate() {
+            let Some(splice) = &run.splice else { continue };
+            if units.iter().enumerate().any(|(other, unit)| other != index && splice.overlaps(&unit.source)) {
+                return Err(PatchDecline::Splice);
+            }
         }
         let roots: Vec<LayoutId> = units.iter().map(|unit| unit.source.root).collect();
         let relaid = runs.iter().any(|run| run.relaid);
@@ -997,12 +1048,16 @@ impl Window {
             ids: source.hitboxes.hitboxes.iter().map(|hitbox| hitbox.id).collect(),
             taken: 0,
             overrun: false,
+            spill: relaid,
         });
         let prepaint_start = self.prepaint_index();
         let outside = mem::replace(&mut self.root_escape, (unit.element.escapes_to() == Some(Escape::ContainingBlock)).then_some(built_root));
         unit.element.prepaint(self, cx);
         let prepaint_end = self.prepaint_index();
         let hitbox_ids = self.patch.hitbox_ids.take().expect("a patch gives the hitboxes ids");
+        if relaid {
+            self.refresh_hit_test_for_root(source, &prepaint_start..&prepaint_end);
+        }
         // The lists of the surroundings are scratch ones, painted by no one: the recording of a
         // patched root handed nothing to a context outside it, and what was handed here would have
         // `mark_lifted` skip a child that nothing paints.
@@ -1028,24 +1083,46 @@ impl Window {
         if effects.reasons(&patched) != 0 || self.redraw_before_present || self.requested_autoscroll.is_some() {
             return Err(PatchDecline::Effects);
         }
-        if hitbox_ids.overrun
-            || hitbox_ids.taken != hitbox_ids.ids.len()
-            || !self.hitboxes_are(&source.hitboxes.hitboxes, prepaint_start.hitboxes_index..prepaint_end.hitboxes_index, relaid)
-        {
+        let scratch = scene_start..self.next_frame.scene.len();
+        let rendered = source.paint.start.scene_index..source.paint.end.scene_index;
+        let hitboxes_match = !hitbox_ids.overrun
+            && hitbox_ids.taken == hitbox_ids.ids.len()
+            && self.hitboxes_are(&source.hitboxes.hitboxes, prepaint_start.hitboxes_index..prepaint_end.hitboxes_index, relaid);
+        let registrations_match = self.registrations_are(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end);
+        if relaid && !(hitboxes_match && registrations_match && self.operations_are(&scratch, &rendered)) {
+            // The root has other things than it had, which replace what the frame has of it.
+            if !self.focus_is_recorded(source) {
+                return Err(PatchDecline::Registrations);
+            }
+            let operations = self.next_frame.scene.paint_operations[scratch.clone()].to_vec();
+            let splice = self.plan_splice(
+                source,
+                &around.id,
+                around.dispatch_parent.get(),
+                &prepaint_start..&prepaint_end,
+                &paint_start..&paint_end,
+                operations,
+            )?;
+            let places = Places { hitboxes: Vec::new(), listener_spaces: Vec::new(), listeners: 0..0, registrations: None };
+            let scrollers = (
+                prepaint_start.scrollers_index..prepaint_end.scrollers_index,
+                source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
+            );
+            return Ok(UnitRun { scratch, rendered, changed: Vec::new(), places, scrollers, relaid, splice: Some(splice) });
+        }
+        if !hitboxes_match {
             return Err(PatchDecline::Hitboxes);
         }
-        if !self.registrations_are(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end) {
+        if !registrations_match {
             return Err(PatchDecline::Registrations);
         }
 
         let places = self.places_of(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end, relaid)?;
-        let rendered = source.paint.start.scene_index..source.paint.end.scene_index;
-        let scratch = scene_start..self.next_frame.scene.len();
-        let painted = &self.next_frame.scene.paint_operations[scratch.clone()];
-        let recorded = &self.rendered_frame.scene.paint_operations[rendered.clone()];
-        if painted.len() != recorded.len() || !painted.iter().zip(recorded).all(|(painted, recorded)| painted.same_kind(recorded)) {
+        if !self.operations_are(&scratch, &rendered) {
             return Err(PatchDecline::Operations);
         }
+        let painted = &self.next_frame.scene.paint_operations[scratch.clone()];
+        let recorded = &self.rendered_frame.scene.paint_operations[rendered.clone()];
         let changed: Vec<usize> = painted
             .iter()
             .zip(recorded)
@@ -1057,7 +1134,7 @@ impl Window {
             prepaint_start.scrollers_index..prepaint_end.scrollers_index,
             source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
         );
-        Ok(UnitRun { scratch, rendered, changed, places, scrollers, relaid })
+        Ok(UnitRun { scratch, rendered, changed, places, scrollers, relaid, splice: None })
     }
 
     /// Computes the layout from the window's root, which the requests of the new element
@@ -1201,6 +1278,51 @@ impl Window {
             })
     }
 
+    /// Whether the roots that was painted as the scratch frame has it paints the kinds of operations the
+    /// recording has.
+    fn operations_are(&self, scratch: &Range<usize>, rendered: &Range<usize>) -> bool {
+        let painted = &self.next_frame.scene.paint_operations[scratch.clone()];
+        let Some(recorded) = self.rendered_frame.scene.paint_operations.get(rendered.clone()) else {
+            return false;
+        };
+        painted.len() == recorded.len() && painted.iter().zip(recorded).all(|(painted, recorded)| painted.same_kind(recorded))
+    }
+
+    /// Whether the root holds the focus now exactly when its recording did. The focus is the
+    /// window's: a root that holds the focused element finds it again, as the recording did, and one
+    /// that gains or loses it is not the recording.
+    fn focus_is_recorded(&self, source: &PatchSource) -> bool {
+        let recorded_prepaint = &source.prepaint;
+        let recorded_focus = self.focus.is_some_and(|focus| {
+            self.rendered_frame.dispatch_tree.range_has_focus(
+                recorded_prepaint.start.dispatch_tree_index..recorded_prepaint.end.dispatch_tree_index,
+                focus,
+            )
+        });
+        self.next_frame.focus.is_some() == recorded_focus
+    }
+
+    /// What the pointer hits is the question that a frame built whole answers between prepaint and
+    /// paint, with the hitboxes it has made: an element reads whether it is hovered when it paints. The
+    /// hitboxes of a root that laid out again are not the ones the rendered frame has, so this asks
+    /// the rendered frame with the root's part replaced.
+    fn refresh_hit_test_for_root(&mut self, source: &PatchSource, prepaint: Range<&PrepaintStateIndex>) {
+        if self.pointer_outside {
+            return;
+        }
+        let range = source.prepaint.start.hitboxes_index..source.prepaint.end.hitboxes_index;
+        let recorded = &source.hitboxes.hitboxes;
+        let holds_recorded = self.rendered_frame.hitboxes.get(range.clone()).is_some_and(|held| {
+            held.len() == recorded.len() && held.iter().zip(recorded).all(|(held, recorded)| held.id == recorded.id)
+        });
+        if !holds_recorded {
+            return;
+        }
+        let new = &self.next_frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index];
+        let hit_test = self.rendered_frame.hit_test_replacing(self.mouse_position, self.dom_hit_testing, range, new);
+        self.mouse_hit_test = hit_test;
+    }
+
     /// Whether what prepaint and paint registered outside the scene is what the recording
     /// registered.
     fn registrations_are(
@@ -1220,15 +1342,7 @@ impl Window {
             (paint.end.root_key_listeners_index - paint.start.root_key_listeners_index, recorded_paint.end.root_key_listeners_index - recorded_paint.start.root_key_listeners_index),
             (paint.end.input_handlers_index - paint.start.input_handlers_index, recorded_paint.end.input_handlers_index - recorded_paint.start.input_handlers_index),
         ];
-        // The focus is the window's: a unit that holds the focused element finds it again, as the
-        // recording did, and one that gains or loses it is not the recording.
-        let recorded_focus = self.focus.is_some_and(|focus| {
-            self.rendered_frame.dispatch_tree.range_has_focus(
-                recorded_prepaint.start.dispatch_tree_index..recorded_prepaint.end.dispatch_tree_index,
-                focus,
-            )
-        });
-        if frame.focus.is_some() != recorded_focus || counts.iter().any(|(painted, recorded)| painted != recorded) {
+        if !self.focus_is_recorded(source) || counts.iter().any(|(painted, recorded)| painted != recorded) {
             return false;
         }
         let cursors = &frame.cursor_styles[paint.start.cursor_styles_index..paint.end.cursor_styles_index];

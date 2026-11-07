@@ -67,6 +67,16 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct DispatchNodeId(usize);
 
+impl DispatchNodeId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+
+    pub(crate) fn at(index: usize) -> Self {
+        Self(index)
+    }
+}
+
 pub(crate) struct DispatchTree {
     node_stack: Vec<DispatchNodeId>,
     pub(crate) context_stack: Vec<KeyContext>,
@@ -398,6 +408,100 @@ impl DispatchTree {
             self.pop_node();
         }
         contains_focus
+    }
+
+    /// The parent of the node at `index`, which is the node that was open when it was made.
+    pub(crate) fn parent_of(&self, index: usize) -> Option<DispatchNodeId> {
+        self.nodes[index].parent
+    }
+
+    /// Takes the nodes of `range` out of the tree, leaving empty ones in their place: a tree that
+    /// has them taken is then [spliced](Self::splice_nodes) with them, or no longer used.
+    pub(crate) fn take_nodes(&mut self, range: Range<usize>) -> Vec<DispatchNode> {
+        self.nodes[range].iter_mut().map(std::mem::take).collect()
+    }
+
+    /// Puts `new` in the place of the nodes of `old`, and moves what follows by the difference. `new`
+    /// was made in another tree, as the nodes from `base` on: a parent in `base..` is the node it
+    /// is at the new place, and one that is none (a node made with nothing open) hangs off `parent`,
+    /// the node that was open where the nodes of `old` were made.
+    pub(crate) fn splice_nodes(
+        &mut self,
+        old: Range<usize>,
+        new: Vec<DispatchNode>,
+        base: usize,
+        parent: Option<DispatchNodeId>,
+    ) {
+        let (start, end) = (old.start, old.end);
+        let new_len = new.len();
+        let moved = |id: usize| if id >= end { id + new_len - old.len() } else { id };
+        let mut focus_removed = Vec::new();
+        let mut view_removed = Vec::new();
+        for (offset, node) in self.nodes[old.clone()].iter().enumerate() {
+            let id = DispatchNodeId(start + offset);
+            if let Some(focus_id) = node.focus_id
+                && self.focusable_node_ids.get(&focus_id) == Some(&id)
+            {
+                self.focusable_node_ids.remove(&focus_id);
+                focus_removed.push(focus_id);
+            }
+            if let Some(view_id) = node.view_id
+                && self.view_node_ids.get(&view_id) == Some(&id)
+            {
+                self.view_node_ids.remove(&view_id);
+                view_removed.push(view_id);
+            }
+        }
+        for id in self.focusable_node_ids.values_mut().chain(self.view_node_ids.values_mut()) {
+            id.0 = moved(id.0);
+        }
+        for node in &mut self.nodes[end..] {
+            if let Some(parent) = &mut node.parent {
+                parent.0 = moved(parent.0);
+            }
+        }
+        let placed: Vec<DispatchNode> = new
+            .into_iter()
+            .map(|mut node| {
+                node.parent = match node.parent {
+                    Some(node_parent) => {
+                        debug_assert!(node_parent.0 >= base, "a node of a spliced range has its parent in it or none");
+                        Some(DispatchNodeId(node_parent.0 - base + start))
+                    }
+                    None => parent,
+                };
+                node
+            })
+            .collect();
+        self.nodes.splice(old, placed);
+        // What the nodes that came out had in the maps, and no node of the new ones or outside names
+        // now, is the last node that has it among the others, as in a tree made whole.
+        for focus_id in focus_removed {
+            if !self.focusable_node_ids.contains_key(&focus_id)
+                && let Some(at) = self.nodes.iter().rposition(|node| node.focus_id == Some(focus_id))
+            {
+                self.focusable_node_ids.insert(focus_id, DispatchNodeId(at));
+            }
+        }
+        for view_id in view_removed {
+            if !self.view_node_ids.contains_key(&view_id)
+                && let Some(at) = self.nodes.iter().rposition(|node| node.view_id == Some(view_id))
+            {
+                self.view_node_ids.insert(view_id, DispatchNodeId(at));
+            }
+        }
+        for offset in 0..new_len {
+            let id = DispatchNodeId(start + offset);
+            let node = &self.nodes[start + offset];
+            if let Some(focus_id) = node.focus_id {
+                let held = self.focusable_node_ids.entry(focus_id).or_insert(id);
+                held.0 = held.0.max(id.0);
+            }
+            if let Some(view_id) = node.view_id {
+                let held = self.view_node_ids.entry(view_id).or_insert(id);
+                held.0 = held.0.max(id.0);
+            }
+        }
     }
 
     pub fn truncate(&mut self, index: usize) {
