@@ -10,15 +10,23 @@ use std::{
 /// Higher values = shorter tree = fewer cache misses, but more work per node.
 const MAX_CHILDREN: usize = 12;
 
+/// How many of the latest inserts a query checks before it searches the tree.
+///
+/// GPUI paints a parent before its children, so the bounds inserted just before a child's are
+/// usually its parent's background, which encloses the child. Such an enclosing leaf ends the
+/// query (see `find_max_ordering`), and a frame's inserts mostly skip the tree search.
+const RECENT_LEAVES: usize = 16;
+
 /// A spatial tree optimized for finding maximum ordering among intersecting bounds.
 ///
 /// This is an R-tree variant specifically designed for the use case of assigning
 /// z-order to overlapping UI elements. Key optimizations:
 /// - Tracks the leaf with global max ordering for O(1) fast-path queries
+/// - Checks the latest inserts before the tree, and stops at one that encloses the query
 /// - Uses higher branching factor (4) for lower tree height
 /// - Aggressive pruning during search based on max_order metadata
 #[derive(Debug)]
-pub(crate) struct BoundsTree<U>
+pub(crate) struct BoundsTree<U, const RECENT: usize = RECENT_LEAVES>
 where
     U: Clone + Debug + Default + PartialEq,
 {
@@ -32,6 +40,51 @@ where
     insert_path: Vec<usize>,
     /// Reusable stack for search operations.
     search_stack: Vec<NonNull<Node<U>>>,
+    /// The last `RECENT` inserted leaves.
+    recent: RecentLeaves<U, RECENT>,
+}
+
+/// A ring of the last `RECENT` inserted bounds and their orders.
+#[derive(Debug)]
+struct RecentLeaves<U, const RECENT: usize>
+where
+    U: Clone + Debug + Default + PartialEq,
+{
+    leaves: [(Bounds<U>, u32); RECENT],
+    len: usize,
+    /// Where the next insert goes, one past the newest.
+    next: usize,
+}
+
+impl<U, const RECENT: usize> RecentLeaves<U, RECENT>
+where
+    U: Clone + Debug + Default + PartialEq,
+{
+    fn new() -> Self {
+        Self {
+            leaves: std::array::from_fn(|_| (Bounds::default(), 0)),
+            len: 0,
+            next: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.next = 0;
+    }
+
+    fn push(&mut self, bounds: Bounds<U>, order: u32) {
+        if RECENT == 0 {
+            return;
+        }
+        self.leaves[self.next] = (bounds, order);
+        self.next = (self.next + 1) % RECENT;
+        self.len = cmp::min(self.len + 1, RECENT);
+    }
+
+    fn newest_first(&self) -> impl Iterator<Item = &(Bounds<U>, u32)> {
+        (1..=self.len).map(move |age| &self.leaves[(self.next + RECENT - age) % RECENT])
+    }
 }
 
 /// A node in the bounds tree.
@@ -93,7 +146,7 @@ impl NodeChildren {
     }
 }
 
-impl<U> BoundsTree<U>
+impl<U, const RECENT: usize> BoundsTree<U, RECENT>
 where
     U: Clone
         + Debug
@@ -111,6 +164,7 @@ where
         self.max_leaf = None;
         self.insert_path.clear();
         self.search_stack.clear();
+        self.recent.clear();
     }
 
     /// Inserts bounds into the tree and returns its assigned ordering.
@@ -123,6 +177,7 @@ where
         let ordering = max_intersecting + 1;
 
         // Insert the new leaf
+        self.recent.push(new_bounds.clone(), ordering);
         let new_leaf_idx = self.insert_leaf(new_bounds, ordering);
 
         // Update max_leaf tracking
@@ -149,11 +204,22 @@ where
             }
         }
 
-        // Slow path: search the tree
+        // Recent leaves, newest first. Once one that intersects the query also encloses it, the
+        // answer is known: a leaf older than it that intersects the query intersects it too, so
+        // has a lower order than it, and every leaf newer than it is in the ring and was checked.
+        let mut max_found = 0u32;
+        for (bounds, order) in self.recent.newest_first() {
+            if query.intersects(bounds) {
+                max_found = cmp::max(max_found, *order);
+                if encloses(bounds, query) {
+                    return max_found;
+                }
+            }
+        }
+
+        // Slow path: search the tree, for anything above what the recent leaves found
         self.search_stack.clear();
         self.search_stack.push(NonNull::from(&self.nodes[root_idx]));
-
-        let mut max_found = 0u32;
 
         while let Some(node) = self.search_stack.pop() {
             // SAFETY: `node` is guaranteed to be valid as the `nodes` stack is unmodified in this function
@@ -356,7 +422,22 @@ where
     }
 }
 
-impl<U> Default for BoundsTree<U>
+/// Whether `outer` contains `inner`, edges included. The corners are worked out as
+/// `Bounds::intersects` works them out, so that a leaf that intersects `inner` is sure to
+/// intersect `outer` by `intersects` too.
+fn encloses<U>(outer: &Bounds<U>, inner: &Bounds<U>) -> bool
+where
+    U: Clone + Debug + Default + PartialEq + PartialOrd + Add<U, Output = U>,
+{
+    let outer_bottom_right = outer.bottom_right();
+    let inner_bottom_right = inner.bottom_right();
+    outer.origin.x <= inner.origin.x
+        && outer.origin.y <= inner.origin.y
+        && inner_bottom_right.x <= outer_bottom_right.x
+        && inner_bottom_right.y <= outer_bottom_right.y
+}
+
+impl<U, const RECENT: usize> Default for BoundsTree<U, RECENT>
 where
     U: Clone + Debug + Default + PartialEq,
 {
@@ -367,9 +448,13 @@ where
             max_leaf: None,
             insert_path: Vec::new(),
             search_stack: Vec::new(),
+            recent: RecentLeaves::new(),
         }
     }
 }
+
+#[cfg(test)]
+mod differential_tests;
 
 #[cfg(test)]
 mod tests {
@@ -439,7 +524,7 @@ mod tests {
         let max_bounds = 100;
         for seed in 1..=1000 {
             // let seed = 44;
-            let mut tree = BoundsTree::default();
+            let mut tree = BoundsTree::<f32>::default();
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
             let mut expected_quads: Vec<(Bounds<f32>, u32)> = Vec::new();
 
