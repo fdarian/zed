@@ -1905,7 +1905,7 @@ impl Element for List {
                 listener(bounds, layout_id, window, cx);
             }
         }
-        if window.is_layout_pass() {
+        if window.publishes_from_prepaint() {
             self.interactivity
                 .publish_layout(bounds, style.visibility.unwrap_or(window.visibility()), window);
         }

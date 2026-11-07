@@ -3,7 +3,7 @@
 //! accepted when nothing outside it moved.
 
 use crate::{
-    AnyElement, AnyWindowHandle, App, AppContext as _, Context, ElementId, InteractiveElement, IntoElement, ParentElement, PatchCounters,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Context, ElementId, InteractiveElement, IntoElement, ParentElement, PatchCounters,
     PatchDecline, Pixels, Render, ScrollHandle, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div, green, point, px, red,
     retained, size,
 };
@@ -37,6 +37,14 @@ struct State {
     relayout: Cell<bool>,
     patcher: Cell<bool>,
     seen: RefCell<Vec<PatchOutcomeLog>>,
+    /// How many times the unit was built.
+    builds: Cell<usize>,
+    /// The patcher finishes the patch that was prepared, and does not build the unit again.
+    direct: Cell<bool>,
+    /// The boxes of the unit's kids and of the header and footer report their bounds as they paint.
+    track: Cell<bool>,
+    kid_bounds: RefCell<Vec<Bounds<Pixels>>>,
+    outside_bounds: RefCell<Vec<Bounds<Pixels>>>,
 }
 
 type PatchOutcomeLog = Result<(), PatchDecline>;
@@ -54,6 +62,11 @@ impl State {
             relayout: Cell::new(true),
             patcher: Cell::new(true),
             seen: RefCell::new(Vec::new()),
+            builds: Cell::new(0),
+            direct: Cell::new(true),
+            track: Cell::new(false),
+            kid_bounds: RefCell::new(Vec::new()),
+            outside_bounds: RefCell::new(vec![Bounds::default(); 2]),
         })
     }
 
@@ -62,7 +75,8 @@ impl State {
         self.version.set(self.version.get() + 1);
     }
 
-    fn unit(&self) -> AnyElement {
+    fn unit(self: &Rc<Self>) -> AnyElement {
+        self.builds.set(self.builds.get() + 1);
         let mut unit = div().id(UNIT).h(px(self.unit_height.get())).bg(blue()).overflow_hidden();
         unit = match self.unit_width.get() {
             Some(width) => unit.w(px(width)).flex_none(),
@@ -70,10 +84,14 @@ impl State {
         };
         match self.content.get() {
             Content::Kids { count, height } => {
+                self.kid_bounds.borrow_mut().resize(count, Bounds::default());
                 for index in 0..count {
-                    unit = unit.child(
-                        div().id(("kid", index)).h(px(height)).flex_none().bg(red()).hover(|style| style.bg(green())),
-                    );
+                    let mut kid = div().id(("kid", index)).h(px(height)).flex_none().bg(red()).hover(|style| style.bg(green()));
+                    if self.track.get() {
+                        let state = self.clone();
+                        kid = kid.on_painted(move |bounds, _, _| state.kid_bounds.borrow_mut()[index] = bounds);
+                    }
+                    unit = unit.child(kid);
                 }
             }
             Content::Text { text, width } => {
@@ -98,6 +116,10 @@ impl Render for Page {
         let build = state.clone();
         let mut unit = retained(UNIT, 1_000 + state.version.get(), move |_, _| build.unit());
         unit = if state.relayout.get() { unit.patchable_relayout() } else { unit.patchable() };
+        if state.track.get() {
+            // Listeners that report to their owner keep a subtree from being recorded unless the owner reports for it.
+            unit = unit.on_replay(|_, _, _| {});
+        }
         let page = div().id("page").w(px(400.)).h(px(300.));
         let page = if state.block.get() {
             page
@@ -106,10 +128,15 @@ impl Render for Page {
         } else {
             page.flex().flex_col()
         };
-        page.child(div().id("header").w(px(60.)).h(px(20.)).flex_none().bg(green()))
-            .child(unit)
-            .child(div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green()))
-            .into_any_element()
+        let outside = |name: &'static str, at: usize| {
+            let mut outside = div().id(name).w(px(60.)).h(px(20.)).flex_none().bg(green());
+            if state.track.get() {
+                let state = state.clone();
+                outside = outside.on_painted(move |bounds, _, _| state.outside_bounds.borrow_mut()[at] = bounds);
+            }
+            outside
+        };
+        page.child(outside("header", 0)).child(unit).child(outside("footer", 1)).into_any_element()
     }
 }
 
@@ -137,8 +164,12 @@ impl Fixture {
                 if !patched.patcher.get() {
                     return false;
                 }
-                let element = patched.unit();
-                let outcome = window.repaint_in_place(vec![(ElementId::from(UNIT), element)], cx, |_, _| true);
+                let outcome = if patched.direct.get() && window.prepared_patch_units().is_some() {
+                    window.finish_prepared_patch(cx, |_, _| true)
+                } else {
+                    let element = patched.unit();
+                    window.repaint_in_place(vec![(ElementId::from(UNIT), element)], cx, |_, _| true)
+                };
                 patched.seen.borrow_mut().push(outcome.as_ref().map(|_| ()).map_err(|decline| *decline));
                 outcome.is_ok()
             })));
@@ -499,4 +530,336 @@ fn a_window_with_an_accessibility_tree_declines_a_relayout(cx: &mut TestAppConte
     let after = page.patches(cx);
     assert_eq!(after.declines(PatchDecline::LayoutMismatch), 1, "{:?}", page.state.seen.borrow());
     assert_eq!(after.relayout_patches, 0);
+}
+
+/// A patch that is prepared ahead of the draw (`Window::prepare_patch`): a read in between is answered by
+/// it, and the draw finishes it without building or laying out again.
+mod prepared {
+    use super::*;
+
+    impl Fixture {
+        fn prepare(&self, cx: &mut TestAppContext) -> Result<(), PatchDecline> {
+            let state = self.state.clone();
+            cx.update_window(self.window, |_, window, cx| {
+                window.prepare_patch(cx, move |_, _| vec![(ElementId::from(UNIT), state.unit())])
+            })
+            .unwrap()
+        }
+
+        fn prepared(&self, cx: &mut TestAppContext) -> Option<Vec<ElementId>> {
+            cx.update_window(self.window, |_, window, _| window.prepared_patch_units()).unwrap()
+        }
+
+        /// Whether the window holds a prepared patch, current or not.
+        fn holds_prepared(&self, cx: &mut TestAppContext) -> bool {
+            cx.update_window(self.window, |_, window, _| window.patch.prepared.is_some()).unwrap()
+        }
+
+        fn layout_passes(&self, cx: &mut TestAppContext) -> u64 {
+            cx.update_window(self.window, |_, window, _| window.layout_pass_count()).unwrap()
+        }
+
+        /// A read of the layout, as the embedder makes it after a commit.
+        fn read(&self, cx: &mut TestAppContext) -> bool {
+            cx.update_window(self.window, |_, window, cx| window.draw_if_dirty(cx)).unwrap()
+        }
+
+        fn kid_bounds(&self) -> Vec<Bounds<Pixels>> {
+            self.state.kid_bounds.borrow().clone()
+        }
+
+        fn outside_bounds(&self) -> Vec<Bounds<Pixels>> {
+            self.state.outside_bounds.borrow().clone()
+        }
+
+        /// A page, with the unit's bounds reported, that patches as the test says.
+        fn tracked(cx: &mut TestAppContext, content: Content) -> Self {
+            let state = State::new(content);
+            state.track.set(true);
+            Self::new(cx, state)
+        }
+
+        /// The commit whose frame is drawn by the next tick: nothing is requested, as a test window draws a
+        /// dirty window when an update ends.
+        fn commit(&self, _: &mut TestAppContext, content: Content) {
+            self.state.change(content);
+        }
+    }
+
+    #[gpui::test]
+    fn a_prepared_patch_shows_the_frame_that_repaint_in_place_alone_does_and_builds_and_lays_out_once(cx: &mut TestAppContext) {
+        let prepared = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.direct.set(false);
+        let (builds, runs) = (prepared.state.builds.get(), prepared.layout_runs(cx));
+        let (control_builds, control_runs) = (control.state.builds.get(), control.layout_runs(cx));
+
+        prepared.commit(cx, kids(3, 25.));
+        control.commit(cx, kids(3, 25.));
+        prepared.prepare(cx).expect("the commit stays inside the root");
+        assert_eq!(prepared.state.builds.get() - builds, 1, "the root is built once to be prepared");
+        let after_prepare = prepared.layout_runs(cx);
+        assert!(after_prepare > runs, "the preparation laid out");
+        assert_eq!(prepared.prepared(cx), Some(vec![ElementId::from(UNIT)]));
+        assert_eq!(prepared.patches(cx).patched_frames, 0, "nothing was drawn yet");
+
+        prepared.tick(cx);
+        control.tick(cx);
+        assert_eq!(prepared.state.builds.get() - builds, 1, "the draw builds nothing: {:?}", prepared.state.seen.borrow());
+        assert_eq!(prepared.layout_runs(cx), after_prepare, "the draw does not lay out again");
+        // Laid out once by the preparation, as the control lays out once by its patch.
+        assert_eq!(after_prepare - runs, control.layout_runs(cx) - control_runs);
+        assert_eq!(control.state.builds.get() - control_builds, 1, "the control builds the root for its patch");
+        let after = prepared.patches(cx);
+        assert_eq!(after.patched_frames, 1, "{:?}", prepared.state.seen.borrow());
+        assert_eq!(after.relayout_patches, 1);
+        assert_eq!(after.total_declines(), 0);
+        assert_eq!(after, control.patches(cx));
+        assert!(!prepared.holds_prepared(cx), "the draw took it");
+        assert_same(&prepared.snapshot(cx), &control.snapshot(cx), "the frame the draw shows");
+        assert_eq!(prepared.unit_bounds(cx), control.unit_bounds(cx));
+        prepared.assert_whole(cx, "the frame built whole after a prepared patch");
+    }
+
+    #[gpui::test]
+    fn a_repaint_in_place_of_the_roots_that_were_prepared_finishes_the_patch(cx: &mut TestAppContext) {
+        let prepared = Fixture::tracked(cx, kids(3, 20.));
+        prepared.state.direct.set(false);
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.direct.set(false);
+        let runs = prepared.layout_runs(cx);
+        prepared.commit(cx, kids(3, 25.));
+        control.commit(cx, kids(3, 25.));
+        prepared.prepare(cx).unwrap();
+        let after_prepare = prepared.layout_runs(cx);
+        prepared.tick(cx);
+        control.tick(cx);
+        assert_eq!(prepared.layout_runs(cx), after_prepare, "laid out once: {:?}", prepared.state.seen.borrow());
+        assert!(after_prepare > runs);
+        assert_eq!(prepared.patches(cx).relayout_patches, 1);
+        assert_same(&prepared.snapshot(cx), &control.snapshot(cx), "the frame the draw shows");
+    }
+
+    #[gpui::test]
+    fn a_read_between_the_preparation_and_the_draw_is_answered_by_the_post_commit_layout(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let (before, outside) = (page.kid_bounds(), page.outside_bounds());
+        assert_eq!(before.len(), 3);
+
+        page.commit(cx, kids(3, 25.));
+        let passes = page.layout_passes(cx);
+        page.prepare(cx).unwrap();
+        assert!(!page.read(cx), "a read runs no pass: the patch that was prepared answers");
+        assert_eq!(page.layout_passes(cx), passes);
+        let read = page.kid_bounds();
+        assert_ne!(read, before, "the boxes inside the root report the layout after the commit");
+        assert_eq!(read[1].size.height, px(25.));
+        assert_eq!(read[2].origin.y, before[2].origin.y + px(10.), "the third box moved by what the two before it grew");
+        assert_eq!(page.outside_bounds(), outside, "the header and footer answer as before");
+        assert_eq!(page.layout_passes(cx), passes);
+
+        page.tick(cx);
+        assert_eq!(page.kid_bounds(), read, "what the draw reports is what the preparation did");
+        assert_eq!(page.outside_bounds(), outside);
+        assert_eq!(page.patches(cx).relayout_patches, 1, "{:?}", page.state.seen.borrow());
+    }
+
+    #[gpui::test]
+    fn the_extent_of_a_scroller_inside_the_root_is_the_prepared_one_before_the_draw(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, Content::Scroller { count: 4, height: 50. });
+        assert_eq!(page.state.scroll.max_offset().y, px(100.));
+        page.commit(cx, Content::Scroller { count: 4, height: 60. });
+        page.prepare(cx).unwrap();
+        assert_eq!(page.state.scroll.max_offset().y, px(140.), "the scroller has its new extent when it is read");
+        page.tick(cx);
+        assert_eq!(page.state.scroll.max_offset().y, px(140.));
+        assert_eq!(page.patches(cx).relayout_patches, 1, "{:?}", page.state.seen.borrow());
+        page.assert_whole(cx, "a scroller that holds more");
+    }
+
+    #[gpui::test]
+    fn another_invalidation_discards_the_prepared_patch_and_the_draw_is_whole_and_correct(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.patcher.set(false);
+        page.commit(cx, kids(3, 25.));
+        control.commit(cx, kids(3, 25.));
+        page.prepare(cx).unwrap();
+        assert!(page.holds_prepared(cx));
+
+        // A test window draws what is dirty when the update ends: this draw is built whole.
+        for fixture in [&page, &control] {
+            cx.update_window(fixture.window, |_, window, _| window.refresh()).unwrap();
+        }
+        assert!(!page.holds_prepared(cx), "the draw discarded it");
+        let after = page.patches(cx);
+        assert_eq!(after.patched_frames, 0, "the frame was built whole");
+        assert_eq!(after.relayout_patches, 0);
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame built after the discard");
+        assert_eq!(page.unit_bounds(cx), control.unit_bounds(cx));
+
+        // And what follows is as it is for a window that never prepared.
+        for fixture in [&page, &control] {
+            fixture.state.change(kids(5, 15.));
+            fixture.tick(cx);
+        }
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the next tick");
+        for fixture in [&page, &control] {
+            fixture.draw_whole(cx);
+        }
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the next whole frame");
+    }
+
+    #[gpui::test]
+    fn a_view_notified_after_the_preparation_discards_it(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.patcher.set(false);
+        page.commit(cx, kids(3, 25.));
+        control.commit(cx, kids(3, 25.));
+        page.prepare(cx).unwrap();
+        assert!(page.holds_prepared(cx));
+        for fixture in [&page, &control] {
+            cx.update_window(fixture.window, |view, _, cx| cx.notify(view.entity_id())).unwrap();
+        }
+        assert!(!page.holds_prepared(cx), "the draw the notify made discarded it");
+        assert_eq!(page.patches(cx).patched_frames, 0);
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame built after the notify");
+        assert_eq!(page.unit_bounds(cx), control.unit_bounds(cx));
+    }
+
+    #[gpui::test]
+    fn a_draw_that_patches_other_roots_or_none_discards_the_prepared_patch(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.patcher.set(false);
+        page.commit(cx, kids(3, 25.));
+        control.commit(cx, kids(3, 25.));
+        page.prepare(cx).unwrap();
+        // The embedder's patcher does not patch this tick.
+        page.state.patcher.set(false);
+        page.tick(cx);
+        control.tick(cx);
+        assert!(!page.holds_prepared(cx));
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame built whole");
+
+        // Discarding by hand leaves the same.
+        page.state.patcher.set(true);
+        control.state.patcher.set(true);
+        for fixture in [&page, &control] {
+            fixture.commit(cx, kids(3, 30.));
+        }
+        page.prepare(cx).unwrap();
+        cx.update_window(page.window, |_, window, cx| window.discard_prepared_patch(cx)).unwrap();
+        assert!(!page.holds_prepared(cx));
+        page.tick(cx);
+        control.tick(cx);
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame after a discard by hand");
+        page.draw_whole(cx);
+        control.draw_whole(cx);
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the next whole frame");
+    }
+
+    #[gpui::test]
+    fn a_prepare_that_declines_not_contained_leaves_the_next_whole_frame_as_if_it_had_not_tried(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.patcher.set(false);
+        for fixture in [&page, &control] {
+            fixture.state.unit_height.set(140.);
+            fixture.commit(cx, kids(4, 20.));
+        }
+        assert_eq!(page.prepare(cx), Err(PatchDecline::NotContained));
+        assert_eq!(page.prepared(cx), None);
+        assert!(!page.holds_prepared(cx), "a decline leaves nothing behind");
+        assert_eq!(page.patches(cx).declines(PatchDecline::NotContained), 1);
+        let passes = page.layout_passes(cx);
+        // The embedder lays out as it would have.
+        assert!(page.read(cx) || page.layout_passes(cx) == passes);
+
+        page.tick(cx);
+        control.tick(cx);
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame drawn after the decline");
+        page.draw_whole(cx);
+        control.draw_whole(cx);
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the next whole frame");
+        assert_eq!(page.unit_bounds(cx), control.unit_bounds(cx));
+    }
+
+    #[gpui::test]
+    fn a_prepared_patch_whose_root_gains_and_loses_boxes_is_spliced_when_it_is_finished(cx: &mut TestAppContext) {
+        let page = Fixture::new(cx, State::new(kids(3, 20.)));
+        let control = Fixture::new(cx, State::new(kids(3, 20.)));
+        control.state.direct.set(false);
+        for (count, height) in [(7, 10.), (1, 30.), (5, 12.)] {
+            page.commit(cx, kids(count, height));
+            control.commit(cx, kids(count, height));
+            page.prepare(cx).unwrap();
+            let runs = page.layout_runs(cx);
+            page.tick(cx);
+            control.tick(cx);
+            assert_eq!(page.layout_runs(cx), runs, "{count} kids: the draw lays out nothing");
+            assert_eq!(page.patches(cx).relayout_patches, control.patches(cx).relayout_patches, "{count} kids: {:?}", page.state.seen.borrow());
+            assert_same(&page.snapshot(cx), &control.snapshot(cx), &format!("{count} kids"));
+        }
+        assert_eq!(page.patches(cx).relayout_patches, 3);
+        page.assert_whole(cx, "a frame built whole after three prepared patches with other counts");
+    }
+
+    #[gpui::test]
+    fn a_second_preparation_takes_over_from_the_layout_the_first_left(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.direct.set(false);
+        for (count, height) in [(4, 25.), (4, 20.)] {
+            page.commit(cx, kids(count, height));
+            page.prepare(cx).unwrap();
+        }
+        // The second commit is the one that is drawn; it equals the recording's content for a root
+        // whose boxes were laid out for the first.
+        control.commit(cx, kids(4, 20.));
+        page.tick(cx);
+        control.tick(cx);
+        assert_eq!(page.patches(cx).relayout_patches, 1, "{:?}", page.state.seen.borrow());
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame of the second commit");
+        page.assert_whole(cx, "a frame built whole after it");
+    }
+
+    #[gpui::test]
+    fn a_patch_for_other_roots_than_the_prepared_ones_is_made_from_what_was_prepared_for(cx: &mut TestAppContext) {
+        let page = Fixture::tracked(cx, kids(3, 20.));
+        let control = Fixture::tracked(cx, kids(3, 20.));
+        control.state.direct.set(false);
+        page.commit(cx, kids(3, 25.));
+        control.commit(cx, kids(3, 25.));
+        page.prepare(cx).unwrap();
+        // The patcher builds the unit and one that does not exist, which no patch can name.
+        page.state.direct.set(false);
+        cx.update_window(page.window, |_, window, cx| {
+            let outcome = window.repaint_in_place(
+                vec![(ElementId::from(UNIT), page.state.unit()), (ElementId::from("nothing"), div().into_any_element())],
+                cx,
+                |_, _| true,
+            );
+            assert_eq!(outcome.map(|_| ()), Err(PatchDecline::UnknownUnit));
+        })
+        .unwrap();
+        assert!(!page.holds_prepared(cx), "asking for other roots discards it");
+        page.state.patcher.set(false);
+        control.state.patcher.set(false);
+        page.tick(cx);
+        control.tick(cx);
+        assert_same(&page.snapshot(cx), &control.snapshot(cx), "the frame built whole");
+    }
+
+    #[gpui::test]
+    fn a_window_that_does_not_allow_it_declines_the_preparation(cx: &mut TestAppContext) {
+        let page = Fixture::with(cx, State::new(kids(3, 20.)), false);
+        page.state.change(kids(3, 25.));
+        assert_eq!(page.prepare(cx), Err(PatchDecline::LayoutMismatch));
+        assert!(!page.holds_prepared(cx));
+        assert_eq!(page.patches(cx).declines(PatchDecline::LayoutMismatch), 1);
+        page.tick(cx);
+        page.assert_whole(cx, "a frame built whole after the decline");
+    }
 }

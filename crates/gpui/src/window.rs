@@ -5114,6 +5114,12 @@ impl Window {
         self.layout_only
     }
 
+    /// Whether prepaint reports the boxes that paint would report: a pass that only lays out, or a
+    /// patch prepared ahead of its draw, see [`Window::prepare_patch`].
+    pub(crate) fn publishes_from_prepaint(&self) -> bool {
+        self.layout_only || self.patch.preparing
+    }
+
     /// In a layout-only pass, runs `publish` once the whole tree is prepainted: layout is final
     /// and every text and element has its bounds, which an element's own prepaint may not yet
     /// have for what comes after it. Does nothing in a pass that paints, where paint publishes.
@@ -5126,8 +5132,11 @@ impl Window {
     /// under the one that was current when it was queued, which is not the window's own inside
     /// an atomic inline.
     pub fn publish_layout(&mut self, publish: impl FnOnce(&mut Window, &mut App) + 'static) {
-        if self.layout_only {
-            self.note_publication();
+        if self.publishes_from_prepaint() {
+            // A patch that is prepared runs what it queues at once, which no recording of it has to repeat.
+            if self.layout_only {
+                self.note_publication();
+            }
             let publication: LayoutPublication = match self.borrowed_layout_engine.clone() {
                 Some(engine) => Box::new(move |window, cx| {
                     window.with_layout_engine(&engine, |window| publish(window, cx));
@@ -5160,6 +5169,15 @@ impl Window {
     fn layout_pass(&mut self, cx: &mut App, paint: bool, again: bool) -> bool {
         if cx.mode.skip_drawing() {
             return false;
+        }
+        if self.patch.prepared.is_some() {
+            // A patch prepared for these invalidations has already laid out and published what the
+            // pass would: a read is answered from it. A pass that paints, or one that follows another
+            // invalidation, builds in the frame the prepared patch holds.
+            if !paint && self.prepared_patch_is_current() {
+                return false;
+            }
+            self.discard_prepared_patch(cx);
         }
         let invalidations = self.invalidator.update_count();
         if !again
@@ -5263,6 +5281,8 @@ impl Window {
                 PatchedFrame::Verify(trace) => patched = Some(trace),
             }
         }
+        // What was prepared for a patch that did not draw this frame is not what it shows.
+        self.discard_prepared_patch(cx);
 
         self.classify_scroll_patch(ticked, cx);
         let mut translated = None;

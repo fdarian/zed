@@ -31,6 +31,12 @@
 //! lies inside is repainted from the new layout, and the recording of the root is rewritten from the
 //! patch, as a frame built whole would have made it ([`RecordingRewrite`]): the next tick patches
 //! the root again and a later frame replays it. Where that cannot be, the recording is dropped.
+//!
+//! The patch of such a root is made in two steps, which may be apart: [`Window::prepare_patch`]
+//! lays out and prepaints (the layout engine, scroll handles and what the roots' listeners report
+//! are those of the commit, for a read before the frame), and the draw finishes it with paint, the
+//! comparisons, the splice and the rewrite, without building or laying out again. What invalidates
+//! the window in between discards it.
 
 use super::patch_splice::{FIELDS, Splice, paint_lengths, prepaint_lengths};
 use super::*;
@@ -207,6 +213,10 @@ pub(crate) struct PatchWindow {
     pub(crate) recordings_stale: bool,
     /// A root that says so may lay out again in a patch, see [`Window::set_contained_patches`].
     contained: bool,
+    /// The patch that [`Window::prepare_patch`] made, which the draw finishes.
+    pub(crate) prepared: Option<PreparedPatch>,
+    /// Prepaint is queueing what paint would report, for a patch being prepared to report at once.
+    pub(crate) preparing: bool,
 }
 
 /// The ids of the hitboxes a recording holds, handed out again in the order they were inserted
@@ -357,6 +367,70 @@ struct ResolvedUnit {
     unit: Rc<PatchUnit>,
     source: PatchSource,
     element: AnyElement,
+    /// The layout of the root is no longer the one recorded: a patch prepared for it was laid out and
+    /// then superseded or discarded.
+    relaid_before: bool,
+}
+
+/// A patch that was laid out and prepainted into the scratch frame, which is kept as it is until it is
+/// finished ([`Window::finish_patch`]) or discarded. What the embedder reads in between is what it
+/// computed: the layout engine holds the layout of the roots after the commit, scroll handles and
+/// element states hold what prepaint left in them, and what the listeners of the roots report was
+/// reported.
+pub(crate) struct PreparedPatch {
+    units: Vec<ResolvedUnit>,
+    steps: Vec<PreparedStep>,
+    /// The invalidations of the window when it was made: another one makes it not what the draw shows.
+    stamp: usize,
+    extent_changes: u64,
+    layouts: LineLayoutIndex,
+    /// The callbacks for the next frame that the elements asked for in the window's list.
+    callbacks: Range<usize>,
+    /// What prepaint asked for, for paint to check along with what it asks.
+    requested_autoscroll: Option<Bounds<Pixels>>,
+    redraw_before_present: bool,
+    /// Last, so that the elements are dropped before the arena they are in may be cleared.
+    arena: Option<ArenaHold>,
+}
+
+impl PreparedPatch {
+    /// Whether `units` name the roots this patch was prepared for.
+    fn names(&self, units: &[(ElementId, AnyElement)]) -> bool {
+        units.len() == self.units.len()
+            && units.iter().enumerate().all(|(at, (id, _))| {
+                self.units.iter().any(|unit| unit.id == *id) && !units[..at].iter().any(|(other, _)| other == id)
+            })
+    }
+}
+
+/// What a root's prepaint left for its paint to compare.
+struct PreparedStep {
+    built_root: LayoutId,
+    relaid: bool,
+    prepaint: Range<PrepaintStateIndex>,
+    hitbox_ids: RecordedHitboxIds,
+    /// The reasons for the patch to be declined that happened before paint, as [`Effects::reasons`], and
+    /// whether the root published anything.
+    effects: u16,
+    published: bool,
+    /// The entities the layout and prepaint of the root read.
+    accessed: FxHashSet<EntityId>,
+}
+
+/// Keeps the element arena from clearing: the elements of a prepared patch are in it.
+struct ArenaHold(Rc<RefCell<Arena>>);
+
+impl ArenaHold {
+    fn new(arena: &Rc<RefCell<Arena>>) -> Self {
+        arena.borrow_mut().begin_scope();
+        Self(arena.clone())
+    }
+}
+
+impl Drop for ArenaHold {
+    fn drop(&mut self) {
+        self.0.borrow_mut().end_scope();
+    }
 }
 
 /// What painting a root again left, to put into the rendered frame.
@@ -411,7 +485,6 @@ struct Registrations {
 /// What the window was before a patch ran in it.
 struct Scratch {
     a11y_was_active: bool,
-    frame_callbacks: usize,
     layouts: LineLayoutIndex,
 }
 
@@ -485,22 +558,8 @@ impl Window {
         cx: &mut App,
         accept: impl FnOnce(&mut Window, &mut App) -> bool,
     ) -> Result<PatchOutcome, PatchDecline> {
-        match self.try_repaint_in_place(units, cx, accept) {
-            Ok(outcome) => {
-                if outcome.units == 0 {
-                    self.patch.counters.empty_ticks += 1;
-                } else {
-                    self.patch.counters.patched_frames += 1;
-                    self.patch.counters.patched_units += outcome.units as u64;
-                }
-                self.patch.outcome = Some(outcome.clone());
-                Ok(outcome)
-            }
-            Err(reason) => {
-                self.patch.counters.declines[reason.index()] += 1;
-                Err(reason)
-            }
-        }
+        let result = self.try_repaint_in_place(units, cx, accept);
+        self.count_patch(result)
     }
 
     /// What [`Window::draw`] does first for a tick.
@@ -722,6 +781,124 @@ impl Window {
         }
     }
 
+    /// Lays out and prepaints, ahead of the draw, the retained roots that the next draw will paint
+    /// again by [`Window::repaint_in_place`], so that what the embedder reads in between (boxes,
+    /// scroll metrics, what `on_painted` listeners report) is what the draw will show, without a layout
+    /// pass from the root of the window. Meant for a commit that [`Retained::patchable_relayout`]
+    /// roots absorb, which the embedder reads the layout of before the frame.
+    ///
+    /// `build` makes the roots' elements, as the patcher of [`Window::set_frame_patcher`] would, and
+    /// runs in the element arena that the prepared patch keeps alive until it is drawn or discarded.
+    /// They are laid out onto the nodes they have, the layout is computed from the root of the window
+    /// and checked to have stayed inside them, and they are prepainted, all as [`Window::repaint_in_place`]
+    /// does, which then finishes the patch if it is asked for the same roots: it paints, compares and
+    /// puts the result in the rendered frame, without building or laying out again. A call made while a
+    /// patch is prepared and nothing invalidated the window takes it over, from the layout it left.
+    ///
+    /// A decline leaves nothing prepared, and the window as it is after a patch that declined: the layout
+    /// nodes the elements asked for stay, and the frame built whole next takes them as it would have asked
+    /// for them itself. The embedder lays out as it would have. A window that cannot patch now (one that is
+    /// drawing, only lays out, or draws nothing) declines as [`PatchDecline::Rejected`], which is not counted.
+    ///
+    /// While the patch is prepared, [`Window::draw_if_dirty`] and its variants run no pass, and answer from it.
+    /// Anything that invalidates the window, a draw that does not patch these roots and a patch for other
+    /// ones discard it: see [`Window::discard_prepared_patch`].
+    pub fn prepare_patch(
+        &mut self,
+        cx: &mut App,
+        build: impl FnOnce(&mut Window, &mut App) -> Vec<(ElementId, AnyElement)>,
+    ) -> Result<(), PatchDecline> {
+        if cx.mode.skip_drawing() || self.layout_only || self.measuring || !self.invalidator.not_drawing() {
+            return Err(PatchDecline::Rejected);
+        }
+        let arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        match self.try_prepare_patch(cx, build) {
+            Ok(mut prepared) => {
+                prepared.arena = Some(ArenaHold::new(&cx.element_arena));
+                self.patch.prepared = Some(prepared);
+                drop(arena_scope.exit(&cx.element_arena));
+                Ok(())
+            }
+            Err(reason) => {
+                self.patch.counters.declines[reason.index()] += 1;
+                arena_scope.exit(&cx.element_arena).clear(cx);
+                Err(reason)
+            }
+        }
+    }
+
+    fn try_prepare_patch(
+        &mut self,
+        cx: &mut App,
+        build: impl FnOnce(&mut Window, &mut App) -> Vec<(ElementId, AnyElement)>,
+    ) -> Result<PreparedPatch, PatchDecline> {
+        if self.invalidator.has_views() {
+            return Err(PatchDecline::PendingView);
+        }
+        if self.refreshing {
+            return Err(PatchDecline::Refreshing);
+        }
+        let mut earlier = match self.take_current_prepared(cx) {
+            Some(prepared) => self.salvage(prepared, cx),
+            None => FxHashMap::default(),
+        };
+        let units = build(self, cx);
+        let resolved = self.resolve_units(units, &mut earlier)?;
+        if resolved.is_empty() {
+            return Err(PatchDecline::UnknownUnit);
+        }
+        self.prepare_resolved(resolved, cx)
+    }
+
+    /// The roots that [`Window::prepare_patch`] prepared and the window has not been invalidated
+    /// since, which [`Window::repaint_in_place`] or [`Window::finish_prepared_patch`] draws.
+    pub fn prepared_patch_units(&self) -> Option<Vec<ElementId>> {
+        let prepared = self.patch.prepared.as_ref().filter(|_| self.prepared_patch_is_current())?;
+        Some(prepared.units.iter().map(|unit| unit.id.clone()).collect())
+    }
+
+    /// Draws the patch that [`Window::prepare_patch`] prepared: paints, compares and puts the roots in
+    /// the rendered frame, as [`Window::repaint_in_place`] does, but without building the roots again.
+    /// For a [frame patcher](Window::set_frame_patcher) that knows the roots it asks for are the ones
+    /// prepared ([`Window::prepared_patch_units`]). Declines as [`PatchDecline::UnknownUnit`] when none
+    /// is prepared or the window was invalidated since.
+    pub fn finish_prepared_patch(
+        &mut self,
+        cx: &mut App,
+        accept: impl FnOnce(&mut Window, &mut App) -> bool,
+    ) -> Result<PatchOutcome, PatchDecline> {
+        let result = match self.take_current_prepared(cx) {
+            Some(prepared) => self.finish_patch(prepared, cx, accept),
+            None => Err(PatchDecline::UnknownUnit),
+        };
+        self.count_patch(result)
+    }
+
+    /// Throws the prepared patch away, if there is one: the rendered frame is as it was, and the
+    /// layout the patch computed stays in the engine, as it does for a patch that declines. The next
+    /// frame is built whole, or patched from what the engine has.
+    pub fn discard_prepared_patch(&mut self, cx: &mut App) {
+        if let Some(prepared) = self.patch.prepared.take() {
+            self.end_prepared(prepared, cx);
+        }
+    }
+
+    fn count_patch(&mut self, result: Result<PatchOutcome, PatchDecline>) -> Result<PatchOutcome, PatchDecline> {
+        match &result {
+            Ok(outcome) => {
+                if outcome.units == 0 {
+                    self.patch.counters.empty_ticks += 1;
+                } else {
+                    self.patch.counters.patched_frames += 1;
+                    self.patch.counters.patched_units += outcome.units as u64;
+                }
+                self.patch.outcome = Some(outcome.clone());
+            }
+            Err(reason) => self.patch.counters.declines[reason.index()] += 1,
+        }
+        result
+    }
+
     fn try_repaint_in_place(
         &mut self,
         units: Vec<(ElementId, AnyElement)>,
@@ -729,6 +906,30 @@ impl Window {
         accept: impl FnOnce(&mut Window, &mut App) -> bool,
     ) -> Result<PatchOutcome, PatchDecline> {
         debug_assert!(self.invalidator.not_drawing(), "a patch is made between the phases of a draw");
+        let mut earlier = FxHashMap::default();
+        if let Some(prepared) = self.take_current_prepared(cx) {
+            if prepared.names(&units) {
+                // What the patch was prepared with is what it paints: the elements it was asked with are not built from.
+                drop(units);
+                return self.finish_patch(prepared, cx, accept);
+            }
+            earlier = self.salvage(prepared, cx);
+        }
+        let resolved = self.resolve_units(units, &mut earlier)?;
+        if resolved.is_empty() {
+            return Ok(PatchOutcome { units: 0, changed: false, scroll_extents: Vec::new() });
+        }
+        let prepared = self.prepare_resolved(resolved, cx)?;
+        self.finish_patch(prepared, cx, accept)
+    }
+
+    /// The units named by `units`, with the recordings they have in the rendered frame: the one the
+    /// prepared patch they were part of was made from, if it was.
+    fn resolve_units(
+        &self,
+        units: Vec<(ElementId, AnyElement)>,
+        earlier: &mut FxHashMap<ElementId, (PatchSource, bool)>,
+    ) -> Result<Vec<ResolvedUnit>, PatchDecline> {
         let mut resolved: Vec<ResolvedUnit> = Vec::with_capacity(units.len());
         for (id, element) in units {
             if resolved.iter().any(|unit| unit.id == id) {
@@ -737,23 +938,85 @@ impl Window {
             let Some(Some(unit)) = self.rendered_frame.patchable.get(&id).cloned() else {
                 return Err(self.patch_blocker(&id).expect("a root that is not registered has a blocker"));
             };
-            let source = self
-                .peek_element_state(&unit.id, |state: &RetainedState| state.patch_source(self))
-                .flatten()
-                .ok_or(PatchDecline::StaleRecording)?;
-            resolved.push(ResolvedUnit { id, unit, source, element });
+            let (source, relaid_before) = match earlier.remove(&id) {
+                Some((source, relaid)) => (source, relaid),
+                None => (
+                    self.peek_element_state(&unit.id, |state: &RetainedState| state.patch_source(self))
+                        .flatten()
+                        .ok_or(PatchDecline::StaleRecording)?,
+                    false,
+                ),
+            };
+            resolved.push(ResolvedUnit { id, unit, source, element, relaid_before });
         }
-        if resolved.is_empty() {
-            return Ok(PatchOutcome { units: 0, changed: false, scroll_extents: Vec::new() });
-        }
+        Ok(resolved)
+    }
 
+    /// Lays out and prepaints `resolved` into the scratch frame, which the patch is finished from
+    /// by [`Self::finish_patch`]. Leaves nothing behind when it declines.
+    fn prepare_resolved(&mut self, resolved: Vec<ResolvedUnit>, cx: &mut App) -> Result<PreparedPatch, PatchDecline> {
+        let mut resolved = resolved;
+        self.a11y.sync_active_flag();
         let scratch = self.begin_scratch(cx);
-        // A root that lays out again hit tests the pointer against the hitboxes it is about to have.
+        let callbacks_from = self.next_frame_callbacks.borrow().len();
+        let extent_changes = self.layout_engine().extent_changes();
+        self.patch.preparing = true;
+        let steps = self.prepare_units(&mut resolved, cx, scratch.a11y_was_active);
+        self.patch.preparing = false;
+        let callbacks = callbacks_from..self.next_frame_callbacks.borrow().len();
+        let steps = match steps {
+            Ok(steps) => steps,
+            Err(decline) => {
+                self.forget_frame_callbacks(&[callbacks]);
+                self.finish_scratch(scratch, cx);
+                return Err(decline);
+            }
+        };
+        // What the patch asked for is checked once it is painted, with what paint asks for.
+        let requested_autoscroll = self.requested_autoscroll.take();
+        let redraw_before_present = mem::take(&mut self.redraw_before_present);
+        // The window is left as it was between the draws: another patch, a read or the draw is what follows.
+        self.invalidator.set_phase(DrawPhase::None);
+        self.a11y.resume(scratch.a11y_was_active);
+        cx.entities.clear_accessed();
+        Ok(PreparedPatch {
+            units: resolved,
+            steps,
+            stamp: self.invalidator.update_count(),
+            extent_changes,
+            layouts: scratch.layouts,
+            callbacks,
+            requested_autoscroll,
+            redraw_before_present,
+            arena: None,
+        })
+    }
+
+    /// Paints, compares and puts into the rendered frame what `prepared` laid out and prepainted.
+    fn finish_patch(
+        &mut self,
+        mut prepared: PreparedPatch,
+        cx: &mut App,
+        accept: impl FnOnce(&mut Window, &mut App) -> bool,
+    ) -> Result<PatchOutcome, PatchDecline> {
+        self.a11y.sync_active_flag();
+        // A root that laid out again hit tests the pointer against the hitboxes it is about to have.
         let hit_test = self.mouse_hit_test.clone();
-        let patched = self.patch_units(&mut resolved, cx, scratch.a11y_was_active);
+        cx.entities.clear_accessed();
+        let a11y_was_active = self.a11y.suspend();
+        let callbacks_from = self.next_frame_callbacks.borrow().len();
+        self.requested_autoscroll = prepared.requested_autoscroll.take();
+        self.redraw_before_present = prepared.redraw_before_present;
+        let patched = if a11y_was_active && prepared.steps.iter().any(|step| step.relaid) {
+            Err(PatchDecline::LayoutMismatch)
+        } else {
+            self.finish_units(&mut prepared, cx)
+        };
         let operations = mem::take(&mut self.next_frame.scene.paint_operations);
         let scrollers = mem::take(&mut self.next_frame.scrollers);
-        self.finish_scratch(scratch, cx);
+        let painted = callbacks_from..self.next_frame_callbacks.borrow().len();
+        self.forget_frame_callbacks(&[prepared.callbacks.clone(), painted]);
+        self.finish_scratch(Scratch { a11y_was_active, layouts: prepared.layouts.clone() }, cx);
         let (mut runs, moves) = match patched {
             Ok(patched) => patched,
             Err(decline) => {
@@ -761,6 +1024,7 @@ impl Window {
                 return Err(decline);
             }
         };
+        let resolved = &prepared.units;
         let runs_len = runs.len();
         let relaid = runs.iter().filter(|run| run.relaid).count();
 
@@ -870,16 +1134,17 @@ impl Window {
         );
         let effect_groups = self.rendered_frame.scene.effect_groups_enabled();
         self.next_frame.scene.set_effect_groups_enabled(effect_groups);
-        Scratch {
-            a11y_was_active: self.a11y.suspend(),
-            frame_callbacks: self.next_frame_callbacks.borrow().len(),
-            layouts: self.text_system.layout_index(),
-        }
+        Scratch { a11y_was_active: self.a11y.suspend(), layouts: self.text_system.layout_index() }
     }
 
     /// Puts the window back as it was before the patch, but for the layout engine, which ends its
     /// pass.
     fn finish_scratch(&mut self, scratch: Scratch, cx: &mut App) {
+        self.clear_scratch(scratch.layouts, cx);
+        self.a11y.resume(scratch.a11y_was_active);
+    }
+
+    fn clear_scratch(&mut self, layouts: LineLayoutIndex, cx: &mut App) {
         self.patch.hitbox_ids = None;
         self.invalidator.set_phase(DrawPhase::None);
         self.next_frame.clear();
@@ -888,33 +1153,62 @@ impl Window {
             .as_mut()
             .expect("the layout engine is in the window outside layout")
             .end_pass();
-        self.a11y.resume(scratch.a11y_was_active);
-        self.next_frame_callbacks.borrow_mut().truncate(scratch.frame_callbacks);
-        self.text_system.truncate_layouts(scratch.layouts);
+        self.text_system.truncate_layouts(layouts);
         self.requested_autoscroll = None;
         self.redraw_before_present = false;
         cx.entities.clear_accessed();
     }
 
-    fn patch_units(
+    /// Takes the callbacks the patch's elements asked for the next frame out of the window's, which
+    /// others (the embedder's) may have added to in between: `ranges` are in order.
+    fn forget_frame_callbacks(&mut self, ranges: &[Range<usize>]) {
+        let mut callbacks = self.next_frame_callbacks.borrow_mut();
+        for range in ranges.iter().rev() {
+            callbacks.drain(range.clone());
+        }
+    }
+
+    fn prepare_units(
         &mut self,
         units: &mut [ResolvedUnit],
         cx: &mut App,
         a11y_active: bool,
-    ) -> Result<(Vec<UnitRun>, Vec<ScrollRangeMove>), PatchDecline> {
-        let extent_changes = self.layout_engine().extent_changes();
-        let mut runs = Vec::with_capacity(units.len());
+    ) -> Result<Vec<PreparedStep>, PatchDecline> {
+        let mut steps = Vec::with_capacity(units.len());
         for unit in units.iter_mut() {
             let around = unit.unit.clone();
             let saved = self.enter_surroundings(&around.id, &around.prepaint);
             let owner = unit.source.owner.clone();
+            let (step, accessed) = self.detect_observed_entities(cx, |window, cx| {
+                window.with_state_owner(&owner, |window| window.prepare_unit(unit, cx, a11y_active))
+            });
+            self.leave_surroundings(saved);
+            let mut step = step?;
+            step.accessed = accessed;
+            steps.push(step);
+        }
+        Ok(steps)
+    }
+
+    fn finish_units(
+        &mut self,
+        prepared: &mut PreparedPatch,
+        cx: &mut App,
+    ) -> Result<(Vec<UnitRun>, Vec<ScrollRangeMove>), PatchDecline> {
+        let units = &mut prepared.units;
+        let mut runs = Vec::with_capacity(units.len());
+        for (unit, step) in units.iter_mut().zip(prepared.steps.iter_mut()) {
+            let around = unit.unit.clone();
+            let saved = self.enter_surroundings(&around.id, &around.prepaint);
+            let owner = unit.source.owner.clone();
             let (run, accessed) = self.detect_observed_entities(cx, |window, cx| {
-                window.with_state_owner(&owner, |window| window.patch_unit(unit, cx, a11y_active))
+                window.with_state_owner(&owner, |window| window.finish_unit(unit, step, cx))
             });
             self.leave_surroundings(saved);
             let mut run = run?;
             if let Some(rewrite) = &mut run.rewrite {
-                rewrite.accessed_entities = accessed;
+                rewrite.accessed_entities = mem::take(&mut step.accessed);
+                rewrite.accessed_entities.extend(accessed);
             }
             runs.push(run);
         }
@@ -926,8 +1220,44 @@ impl Window {
         }
         let roots: Vec<LayoutId> = units.iter().map(|unit| unit.source.root).collect();
         let relaid = runs.iter().any(|run| run.relaid);
-        let moves = self.scroll_range_moves(&roots, extent_changes, relaid)?;
+        let moves = self.scroll_range_moves(&roots, prepared.extent_changes, relaid)?;
         Ok((runs, moves))
+    }
+
+    /// The prepared patch, if one is pending and nothing invalidated the window since. One that
+    /// something did is discarded.
+    fn take_current_prepared(&mut self, cx: &mut App) -> Option<PreparedPatch> {
+        let prepared = self.patch.prepared.take()?;
+        if prepared.stamp == self.invalidator.update_count() {
+            return Some(prepared);
+        }
+        self.end_prepared(prepared, cx);
+        None
+    }
+
+    /// Ends the prepared patch without painting it, and keeps the recordings it was made from,
+    /// each with whether the layout of the root is no longer the one that was recorded: a patch
+    /// made from them goes on from what was laid out.
+    fn salvage(&mut self, prepared: PreparedPatch, cx: &mut App) -> FxHashMap<ElementId, (PatchSource, bool)> {
+        let units = self.end_prepared(prepared, cx);
+        units.into_iter().map(|unit| (unit.id, (unit.source, unit.relaid_before))).collect()
+    }
+
+    /// Puts the window back as it was before the patch was prepared, but for the layout engine,
+    /// which ends its pass: what was laid out stays in it, as it does for a patch that declines.
+    fn end_prepared(&mut self, mut prepared: PreparedPatch, cx: &mut App) -> Vec<ResolvedUnit> {
+        self.clear_scratch(prepared.layouts.clone(), cx);
+        self.forget_frame_callbacks(&[prepared.callbacks.clone()]);
+        for (unit, step) in prepared.units.iter_mut().zip(&prepared.steps) {
+            unit.relaid_before = step.relaid;
+        }
+        mem::take(&mut prepared.units)
+    }
+
+    /// Whether the patch that [`Window::prepare_patch`] made is still the one to draw: nothing
+    /// invalidated the window since.
+    pub(crate) fn prepared_patch_is_current(&self) -> bool {
+        self.patch.prepared.as_ref().is_some_and(|prepared| prepared.stamp == self.invalidator.update_count())
     }
 
     /// The scrollers around `roots` whose scrollable overflow the transforms below them moved,
@@ -1047,9 +1377,9 @@ impl Window {
         self.sync_scene_hidden();
     }
 
-    /// Lays out, prepaints and paints one root in its surroundings, and checks what it left
-    /// against its recording.
-    fn patch_unit(&mut self, unit: &mut ResolvedUnit, cx: &mut App, a11y_active: bool) -> Result<UnitRun, PatchDecline> {
+    /// Lays out and prepaints one root in its surroundings, up to what its recording is compared with
+    /// once it is painted ([`Self::finish_unit`]).
+    fn prepare_unit(&mut self, unit: &mut ResolvedUnit, cx: &mut App, a11y_active: bool) -> Result<PreparedStep, PatchDecline> {
         let source = &unit.source;
         let around = unit.unit.clone();
         if matches!(around.placement, Placement::Deferred { paint: None }) {
@@ -1062,7 +1392,6 @@ impl Window {
             return Err(PatchDecline::Surroundings);
         }
         let mut effects = self.effects();
-        let scene_start = self.next_frame.scene.len();
 
         self.invalidator.set_phase(DrawPhase::Prepaint);
         let root = source.root;
@@ -1072,7 +1401,9 @@ impl Window {
         let escapable = self.escapable_layout_requests();
         let built_root = unit.element.request_layout(self, cx);
         let after = self.engine_counters();
-        let relaid = after.nodes_created != counters.nodes_created
+        // A root prepared before is laid out as the patch it was part of left it, which is not the recording.
+        let relaid = unit.relaid_before
+            || after.nodes_created != counters.nodes_created
             || after.styles_set != counters.styles_set
             || after.children_set != counters.children_set
             || self.layout_dirty_generation(built_root) != dirty_generation
@@ -1107,17 +1438,55 @@ impl Window {
         let prepaint_start = self.prepaint_index();
         let outside = mem::replace(&mut self.root_escape, (unit.element.escapes_to() == Some(Escape::ContainingBlock)).then_some(built_root));
         unit.element.prepaint(self, cx);
-        let prepaint_end = self.prepaint_index();
+        self.root_escape = outside;
         let hitbox_ids = self.patch.hitbox_ids.take().expect("a patch gives the hitboxes ids");
-        if relaid {
-            self.refresh_hit_test_for_root(source, &prepaint_start..&prepaint_end);
-        }
+        self.publish_prepared(prepaint_start.layout_publications_index, cx);
+        let prepaint_end = self.prepaint_index();
         // The lists of the surroundings are scratch ones, painted by no one: the recording of a
         // patched root handed nothing to a context outside it, and what was handed here would have
         // `mark_lifted` skip a child that nothing paints.
         if self.lift_lists.iter().flatten().any(|list| list.next_ordinal != 0) {
-            self.root_escape = outside;
             return Err(PatchDecline::Lifts);
+        }
+
+        let after_prepaint = self.effects().without_root_escapes(&effects);
+        Ok(PreparedStep {
+            built_root,
+            relaid,
+            prepaint: prepaint_start..prepaint_end,
+            hitbox_ids,
+            effects: effects.reasons(&after_prepaint),
+            published: effects.published(&after_prepaint),
+            accessed: FxHashSet::default(),
+        })
+    }
+
+    /// Reports what prepaint queued to report from paint: what a pass that lays out publishes, for
+    /// a read between the preparation of a patch and its draw. Paint reports it again.
+    fn publish_prepared(&mut self, from: usize, cx: &mut App) {
+        let publications = self.next_frame.layout_publications.split_off(from);
+        if publications.is_empty() {
+            return;
+        }
+        // The listeners see a pass that lays out, as they do before every draw that follows one.
+        self.layout_only = true;
+        for publish in publications {
+            publish(self, cx);
+        }
+        self.layout_only = false;
+    }
+
+    /// Paints one root that [`Self::prepare_unit`] laid out and prepainted, and checks what it left
+    /// against its recording.
+    fn finish_unit(&mut self, unit: &mut ResolvedUnit, step: &mut PreparedStep, cx: &mut App) -> Result<UnitRun, PatchDecline> {
+        let source = &unit.source;
+        let around = unit.unit.clone();
+        let (built_root, relaid) = (step.built_root, step.relaid);
+        let (prepaint_start, prepaint_end) = (step.prepaint.start.clone(), step.prepaint.end.clone());
+        let before_paint = self.effects();
+        let scene_start = self.next_frame.scene.len();
+        if relaid {
+            self.refresh_hit_test_for_root(source, &prepaint_start..&prepaint_end);
         }
 
         self.invalidator.set_phase(DrawPhase::Paint);
@@ -1126,18 +1495,21 @@ impl Window {
             Placement::Deferred { paint: Some(paint) } => Some(self.enter_surroundings(&around.id, paint)),
             _ => None,
         };
+        let outside = mem::replace(&mut self.root_escape, (unit.element.escapes_to() == Some(Escape::ContainingBlock)).then_some(built_root));
         self.with_every_glyph_painted(|window| unit.element.paint(window, cx));
+        self.root_escape = outside;
         if let Some(prepainted) = prepainted {
             self.leave_surroundings(prepainted);
         }
         let paint_end = self.paint_index();
 
-        let patched = self.effects().without_root_escapes(&effects);
-        let published = effects.published(&patched);
-        self.root_escape = outside;
-        if effects.reasons(&patched) != 0 || self.redraw_before_present || self.requested_autoscroll.is_some() {
+        let patched = self.effects().without_root_escapes(&before_paint);
+        let reasons = step.effects | before_paint.reasons(&patched);
+        let published = step.published || before_paint.published(&patched);
+        if reasons != 0 || self.redraw_before_present || self.requested_autoscroll.is_some() {
             return Err(PatchDecline::Effects);
         }
+        let hitbox_ids = &step.hitbox_ids;
         let scratch = scene_start..self.next_frame.scene.len();
         let rendered = source.paint.start.scene_index..source.paint.end.scene_index;
         let hitboxes_match = !hitbox_ids.overrun
@@ -1498,3 +1870,4 @@ fn describe_operations(operations: &[PaintOperation]) -> String {
     }
     text
 }
+

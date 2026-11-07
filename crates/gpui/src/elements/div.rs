@@ -3208,7 +3208,7 @@ impl Interactivity {
                 }
 
                 let visibility = style.visibility.unwrap_or(window.visibility());
-                if window.is_layout_pass() {
+                if window.publishes_from_prepaint() {
                     self.publish_layout(bounds, visibility, window);
                 }
                 // A hidden element is never the target of the pointer. It stays in the chain of
@@ -3312,7 +3312,7 @@ impl Interactivity {
                 Point::default(),
             )
         };
-        if window.is_layout_pass() {
+        if window.publishes_from_prepaint() {
             self.publish_layout(bounds, visibility, window);
         }
         // Nothing is drawn or hit here, but the boxes of the descendants are reported through the
