@@ -651,6 +651,11 @@ unsafe fn pump_app_nonblocking() {
                 break;
             }
             let _: () = msg_send![app, sendEvent: event];
+            // `sendEvent:` begins an implicit Core Animation transaction. From macOS 26, AppKit's
+            // update cycle commits one that began before the next frame boundary from a timer at
+            // that boundary, which wakes the embedder once more. Committed here, it leaves the
+            // update cycle nothing to commit, and no timer is armed.
+            let _: () = msg_send![class!(CATransaction), flush];
         }
         let _: () = msg_send![app, updateWindows];
 
