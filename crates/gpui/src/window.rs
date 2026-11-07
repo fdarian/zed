@@ -81,6 +81,8 @@ mod retained;
 mod scroll_patch;
 #[cfg(test)]
 mod scroll_patch_tests;
+#[cfg(test)]
+mod splice_patch_tests;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
