@@ -888,14 +888,8 @@ impl ListState {
         let client = state.last_client?;
         let max_top = state.scroll_max(state.items.summary().height)?;
         let padding = state.last_padding.unwrap_or_default();
-        let top = if state.logical_scroll_top.is_none() && state.alignment == ListAlignment::Bottom
-        {
-            max_top
-        } else {
-            state.scroll_top(&state.logical_scroll_top()).min(max_top)
-        };
         Some(ListDomScroll {
-            top: round_to_device_half_up(top, client.scale_factor),
+            top: round_to_device_half_up(state.current_scroll_top(max_top), client.scale_factor),
             content_height: state.items.summary().height + padding.top + padding.bottom,
             client: client.size,
         })
@@ -1089,15 +1083,27 @@ impl StateInner {
         }
     }
 
-    /// The scroll position of the list's first visible edge, and the furthest it can go.
-    fn scroll_extent(&self, scroll_top: &ListOffset) -> (Pixels, Pixels) {
-        let scroll_max = self.scroll_max(self.items.summary().height).unwrap_or_default();
-        (self.scroll_top(scroll_top), scroll_max)
+    /// Where the list is scrolled now, as a distance from the top of the rows, held to what it can
+    /// scroll to.
+    fn current_scroll_top(&self, max_top: Pixels) -> Pixels {
+        if self.logical_scroll_top.is_none() && self.alignment == ListAlignment::Bottom {
+            max_top
+        } else {
+            self.scroll_top(&self.logical_scroll_top()).min(max_top)
+        }
     }
 
+    /// The scroll position of the list's first visible edge, and the furthest it can go. Read when
+    /// the event arrives, not from the frame that registered the listener: a write to the offset
+    /// that was drawn as a translate has moved it since.
+    fn scroll_extent(&self) -> (Pixels, Pixels) {
+        let scroll_max = self.scroll_max(self.items.summary().height).unwrap_or_default();
+        (self.current_scroll_top(scroll_max), scroll_max)
+    }
+
+    /// Scrolls the content up by `delta.y` from where the list is now.
     fn scroll(
         &mut self,
-        scroll_top: &ListOffset,
         height: Pixels,
         delta: Point<Pixels>,
         current_view: EntityId,
@@ -1111,7 +1117,7 @@ impl StateInner {
         }
 
         let scroll_max = self.scroll_max(self.items.summary().height).unwrap_or_default();
-        let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
+        let new_scroll_top = (self.current_scroll_top(scroll_max) - delta.y)
             .max(px(0.))
             .min(scroll_max);
 
@@ -1974,14 +1980,10 @@ impl Element for List {
             let viewport = prepaint.viewport;
             let clip = prepaint.clip;
             let height = viewport.size.height;
-            let scroll_top = prepaint.layout.scroll_top;
             let hitbox = prepaint.hitbox.clone();
             // Set with `InteractiveElement::overscroll_behavior`; a list scrolls along y only.
             let overscroll = self.interactivity.overscroll_behavior.y;
             let scroller = scroll_routing::scroller_id_of_state(&list_state.0);
-            // How far the content has been moved this frame, measured from where the frame began:
-            // `scroll` moves relative to `scroll_top`, which stays fixed until the next layout.
-            let mut moved = Pixels::ZERO;
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Capture {
                     scroll_routing::begin(window, cx, event, scroller);
@@ -1991,8 +1993,8 @@ impl Element for List {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-                let (base_top, scroll_max) = list_state.0.borrow().scroll_extent(&scroll_top);
-                let offset = point(Pixels::ZERO, moved - base_top);
+                let (base_top, scroll_max) = list_state.0.borrow().scroll_extent();
+                let offset = point(Pixels::ZERO, -base_top);
                 let claim = scroll_routing::Claim {
                     scroller,
                     under_pointer: scroll_routing::is_candidate(window, &hitbox),
@@ -2012,11 +2014,9 @@ impl Element for List {
                 if taken.is_zero() {
                     return;
                 }
-                moved += taken;
                 list_state.0.borrow_mut().scroll(
-                    &scroll_top,
                     height,
-                    point(Pixels::ZERO, moved),
+                    point(Pixels::ZERO, taken),
                     current_view,
                     window,
                     cx,

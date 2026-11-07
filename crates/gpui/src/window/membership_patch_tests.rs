@@ -1282,3 +1282,19 @@ mod overdraw {
         });
     }
 }
+
+#[gpui::test]
+fn a_wheel_after_a_programmatic_write_goes_on_from_the_write(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    for fixture in [&pair.translated, &pair.built] {
+        fixture.wheel(cx, 100.);
+        fixture.wheel(cx, 100.);
+        let to = fixture.scrolled() + 70.;
+        fixture.write_offset(cx, to);
+        assert_eq!(fixture.scrolled(), 270.);
+        fixture.wheel(cx, 100.);
+        assert_eq!(fixture.scrolled(), 370.);
+        fixture.draw(cx);
+    }
+    pair.same(cx, "a wheel after a write");
+}
