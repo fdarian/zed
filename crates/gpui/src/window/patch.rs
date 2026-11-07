@@ -1675,7 +1675,7 @@ impl Window {
             )?;
             let rewrite = rewrites.then(|| {
                 let mut rewrite =
-                    self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications);
+                    self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications, None);
                 rewrite.prepaint_lengths = Some(prepaint_lengths(&prepaint_start, &prepaint_end));
                 rewrite.paint_lengths = Some(paint_lengths(&paint_start, &paint_end));
                 rewrite
@@ -1695,8 +1695,9 @@ impl Window {
         }
 
         let mut places = self.places_of(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end, relaid)?;
-        if let Some((step, _)) = &region {
-            // The hitboxes of a root put elsewhere are the recorded ones, `delta` from where they were recorded.
+        if let Some((step, _)) = region.as_ref().filter(|_| !source.delta.is_zero()) {
+            // The hitboxes of a root put elsewhere are the recorded ones, `delta` from where they were recorded. At
+            // delta zero they are the ones the prepaint relocated in place.
             for ((placed, _), recorded) in places.hitboxes.iter_mut().zip(&step.hitboxes) {
                 let mut moved = recorded.relocated(source.delta, &step.relocation.ambient);
                 moved.parent = placed.parent;
@@ -1721,15 +1722,19 @@ impl Window {
         );
         let rewrite = if relaid {
             (source.rewritable && (!published || source.publishes))
-                .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications))
+                .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications, None))
         } else {
             region.and_then(|(step, operations)| {
                 let blockers = step.blockers | before_paint.blockers(&patched);
                 let movable = step.relocation.info.fits(Point::default(), &step.relocation.ambient).is_ok();
                 (source.relocated_rewritable && blockers == source.blockers && movable && (!published || source.publishes)).then(|| {
-                    let mut rewrite =
-                        self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications);
-                    rewrite.hitboxes = RecordedHitboxes::new(step.hitboxes, around.prepaint.hitbox_parent);
+                    let mut rewrite = self.recording_rewrite(
+                        &around,
+                        &prepaint_start..&prepaint_end,
+                        &paint_start..&paint_end,
+                        publications,
+                        Some(step.hitboxes),
+                    );
                     rewrite.relocation = Some(RelocatedRewrite { relocation: step.relocation, operations });
                     rewrite
                 })
@@ -1745,14 +1750,13 @@ impl Window {
         prepaint: Range<&PrepaintStateIndex>,
         paint: Range<&PaintIndex>,
         publications: (bool, bool),
+        hitboxes: Option<Vec<Hitbox>>,
     ) -> RecordingRewrite {
         let frame = &self.next_frame;
+        let hitboxes = hitboxes.unwrap_or_else(|| frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec());
         RecordingRewrite {
             publications,
-            hitboxes: RecordedHitboxes::new(
-                frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec(),
-                unit.prepaint.hitbox_parent,
-            ),
+            hitboxes: RecordedHitboxes::new(hitboxes, unit.prepaint.hitbox_parent),
             tab_stops: frame.tab_stops.insertion_history[paint.start.tab_handle_index..paint.end.tab_handle_index].into(),
             relocation: None,
             prepaint_lengths: None,
