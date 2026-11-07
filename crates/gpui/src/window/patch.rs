@@ -217,6 +217,17 @@ pub(crate) struct PatchWindow {
     pub(crate) prepared: Option<PreparedPatch>,
     /// Prepaint is queueing what paint would report, for a patch being prepared to report at once.
     pub(crate) preparing: bool,
+    /// The roots a discarded patch had laid out again: the layout in the engine is that patch's, which
+    /// is not the recording's of the frame on screen, and a patch made next goes on from it.
+    pub(crate) discarded: FxHashMap<ElementId, DiscardedLayout>,
+}
+
+/// What the layout engine holds of a root whose prepared patch was thrown away.
+pub(crate) struct DiscardedLayout {
+    /// The frame that was on screen: a later one holds other recordings.
+    serial: u64,
+    /// The layout generation of the root as the discarded patch left it. Another is a layout made since.
+    generation: u64,
 }
 
 /// The ids of the hitboxes a recording holds, handed out again in the order they were inserted
@@ -890,10 +901,12 @@ impl Window {
 
     /// Throws the prepared patch away, if there is one: the rendered frame is as it was, and the
     /// layout the patch computed stays in the engine, as it does for a patch that declines. The next
-    /// frame is built whole, or patched from what the engine has.
+    /// frame is built whole, or patched from the recordings of the frame on screen, which a patch of
+    /// the same roots lays out again from.
     pub fn discard_prepared_patch(&mut self, cx: &mut App) {
         if let Some(prepared) = self.patch.prepared.take() {
-            self.end_prepared(prepared, cx);
+            let units = self.end_prepared(prepared, cx);
+            self.remember_discarded_layouts(&units);
         }
     }
 
@@ -940,7 +953,7 @@ impl Window {
     /// The units named by `units`, with the recordings they have in the rendered frame: the one the
     /// prepared patch they were part of was made from, if it was.
     fn resolve_units(
-        &self,
+        &mut self,
         units: Vec<(ElementId, AnyElement)>,
         earlier: &mut FxHashMap<ElementId, (PatchSource, bool)>,
     ) -> Result<Vec<ResolvedUnit>, PatchDecline> {
@@ -954,12 +967,16 @@ impl Window {
             };
             let (source, relaid_before) = match earlier.remove(&id) {
                 Some((source, relaid)) => (source, relaid),
-                None => (
-                    self.peek_element_state(&unit.id, |state: &RetainedState| state.patch_source(self))
+                None => {
+                    let discarded = self.patch.discarded.remove(&id).filter(|layout| layout.serial == self.rendered_serial());
+                    let source = self
+                        .peek_element_state(&unit.id, |state: &RetainedState| {
+                            state.patch_source(self, discarded.as_ref().map(|layout| layout.generation))
+                        })
                         .flatten()
-                        .ok_or(PatchDecline::StaleRecording)?,
-                    false,
-                ),
+                        .ok_or(PatchDecline::StaleRecording)?;
+                    (source, discarded.is_some())
+                }
             };
             resolved.push(ResolvedUnit { id, unit, source, element, relaid_before });
         }
@@ -1255,8 +1272,22 @@ impl Window {
         if prepared.stamp == self.invalidator.update_count() {
             return Some(prepared);
         }
-        self.end_prepared(prepared, cx);
+        let units = self.end_prepared(prepared, cx);
+        self.remember_discarded_layouts(&units);
         None
+    }
+
+    /// Notes the roots of a prepared patch that was thrown away after it laid them out again, for the
+    /// next patch of them to start from the recording of the frame on screen.
+    fn remember_discarded_layouts(&mut self, units: &[ResolvedUnit]) {
+        let serial = self.rendered_serial();
+        for unit in units {
+            if !unit.relaid_before || !self.layout_node_alive(unit.source.root) {
+                continue;
+            }
+            let generation = self.layout_generation(unit.source.root);
+            self.patch.discarded.insert(unit.id.clone(), DiscardedLayout { serial, generation });
+        }
     }
 
     /// Ends the prepared patch without painting it, and keeps the recordings it was made from,

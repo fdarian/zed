@@ -454,8 +454,9 @@ impl RetainedState {
     }
 
     /// What [`Window::repaint_in_place`] needs of the recording, if the subtree is a plain one
-    /// recorded in the frame that is rendered, with the layout it was recorded with.
-    pub(crate) fn patch_source(&self, window: &Window) -> Option<PatchSource> {
+    /// recorded in the frame that is rendered, with the layout it was recorded with, or with the one
+    /// of `layout_left_by`, a generation that a patch that was thrown away left the root's layout in.
+    pub(crate) fn patch_source(&self, window: &Window, layout_left_by: Option<u64>) -> Option<PatchSource> {
         let recorded = self.recorded.as_ref()?;
         let paint = recorded.paint.as_ref()?;
         let rendered = window.rendered_serial();
@@ -468,7 +469,7 @@ impl RetainedState {
             && recorded.is_placed_in(rendered)
             && self.engine == window.layout_engine_id()
             && window.layout_node_alive(self.root)
-            && recorded.generation == window.layout_generation(self.root)
+            && (recorded.generation == window.layout_generation(self.root) || layout_left_by == Some(window.layout_generation(self.root)))
             && !window.layout_is_dirty(self.root))
         .then(|| PatchSource {
             root: self.root,

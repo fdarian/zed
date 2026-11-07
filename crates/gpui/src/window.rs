@@ -5364,6 +5364,7 @@ impl Window {
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.retained.rendered_serial += 1;
         self.patch.recordings_stale = false;
+        self.patch.discarded.clear();
         self.next_frame.clear();
         self.settle_scroll_patch();
         if let Some(trace) = patched {
