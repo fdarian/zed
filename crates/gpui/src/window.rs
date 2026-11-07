@@ -73,6 +73,8 @@ mod contained_patch_tests;
 #[cfg(test)]
 mod hover_patch_tests;
 #[cfg(test)]
+mod membership_patch_tests;
+#[cfg(test)]
 mod patch_tests;
 #[cfg(test)]
 mod transform_tests;
