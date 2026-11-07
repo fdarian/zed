@@ -92,6 +92,24 @@ impl ListState {
             .rows_needed(scrolled, available_height, padding, window, cx)
     }
 
+    /// Measures the rows in the overdraw that a layout at the position the list is scrolled to would
+    /// measure, as `layout_items` does, so that the extent of the list, the clamp of a wheel and the
+    /// thumb are what a frame built whole would leave. Touches nothing if a row that shows has no
+    /// measured size: a layout builds it, and measures what is around it from there.
+    pub(crate) fn measure_overdraw(
+        &self,
+        available_height: Pixels,
+        padding: &Edges<Pixels>,
+        content_width: Pixels,
+        render_item: &mut RenderItemFn,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0
+            .borrow_mut()
+            .measure_overdraw(available_height, padding, content_width, render_item, window, cx)
+    }
+
     /// The size row `ix` was measured at, and how far its top is below the top of the first row.
     pub(crate) fn measured_row(&self, ix: usize) -> Option<(Size<Pixels>, Pixels)> {
         let state = self.0.borrow();
@@ -146,6 +164,97 @@ impl StateInner {
             padding,
             entry,
         }
+    }
+
+    /// The walk of `layout_items` over the rows in the overdraw: the trailing ones from the first row that
+    /// shows, then the leading ones, each measured the way `layout_items` measures it.
+    fn measure_overdraw(
+        &mut self,
+        available_height: Pixels,
+        padding: &Edges<Pixels>,
+        content_width: Pixels,
+        render_item: &mut RenderItemFn,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let scroll_top = self.logical_scroll_top();
+        if self.pending_scroll.is_some()
+            || self.follow_state.is_following()
+            || self.reset
+            || scroll_top.offset_in_item < px(0.)
+        {
+            return;
+        }
+        let available_item_space = size(AvailableSpace::Definite(content_width), AvailableSpace::MinContent);
+        let mut measure = |ix: usize, window: &mut Window, cx: &mut App| {
+            render_item(ix, window, cx).layout_as_root_unsnapped(available_item_space, window, cx)
+        };
+
+        let old_items = self.items.clone();
+        let first_row = Self::first_visible_row(&old_items, padding.top, &scroll_top);
+        let mut first_row_offset = first_row.offset_in_item;
+        let mut rendered_height = padding.top;
+        let mut span = VecDeque::new();
+        let mut measured_any = false;
+
+        let mut cursor = old_items.cursor::<Count>(());
+        cursor.seek(&Count(first_row.item_ix), Bias::Right);
+        for (ix, item) in cursor.by_ref().enumerate() {
+            let item_index = first_row.item_ix + ix;
+            if item_index == scroll_top.item_ix {
+                first_row_offset = rendered_height - padding.top + scroll_top.offset_in_item;
+            }
+            let visible_height = rendered_height - first_row_offset;
+            if visible_height >= available_height + self.overdraw {
+                break;
+            }
+            let size = match item.size() {
+                Some(size) => size,
+                None if visible_height < available_height => return,
+                None => {
+                    measured_any = true;
+                    measure(item_index, window, cx)
+                }
+            };
+            rendered_height += size.height;
+            span.push_back(ListItem::Measured { size, focus_handle: item.focus_handle() });
+        }
+        rendered_height += padding.bottom;
+
+        let mut lowest = first_row.item_ix;
+        // A layout that does not fill the viewport scrolls up to fill it, and measures the rows it passes
+        // instead of the leading overdraw.
+        if self.fills_viewport(rendered_height - first_row_offset, available_height) {
+            cursor.seek(&Count(first_row.item_ix), Bias::Right);
+            let mut leading_overdraw = first_row_offset;
+            while leading_overdraw < self.overdraw {
+                cursor.prev();
+                let Some(item) = cursor.item() else {
+                    break;
+                };
+                let size = match item.size() {
+                    Some(size) => size,
+                    None => {
+                        measured_any = true;
+                        measure(cursor.start().0, window, cx)
+                    }
+                };
+                leading_overdraw += size.height;
+                lowest = cursor.start().0;
+                span.push_front(ListItem::Measured { size, focus_handle: item.focus_handle() });
+            }
+        }
+        if !measured_any {
+            return;
+        }
+
+        let mut cursor = old_items.cursor::<Count>(());
+        let mut new_items = cursor.slice(&Count(lowest), Bias::Right);
+        let end = lowest + span.len();
+        new_items.extend(span, ());
+        cursor.seek(&Count(end), Bias::Right);
+        new_items.append(cursor.suffix(), ());
+        self.items = new_items;
     }
 
     /// The walk of `layout_items` over the rows it already has measured, with nothing built.

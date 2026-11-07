@@ -55,12 +55,19 @@ struct Shared {
     patch_unit: Cell<bool>,
     patch_row: Cell<Option<usize>>,
     seen: RefCell<Vec<Result<(), PatchDecline>>>,
+    /// How far past the clip a row records what it paints, which is how far it can be moved from where it
+    /// was recorded before it is built again.
+    overscan: f32,
 }
 
 impl Shared {
     fn new(cx: &mut TestAppContext, measure_all: bool) -> Rc<Self> {
+        Self::with_overdraw(cx, measure_all, 0., 5000.)
+    }
+
+    fn with_overdraw(cx: &mut TestAppContext, measure_all: bool, overdraw: f32, overscan: f32) -> Rc<Self> {
         let focus = cx.update(|cx| (0..ROWS / FOCUSABLE).map(|_| cx.focus_handle().tab_stop(true)).collect());
-        let state = ListState::new(ROWS, ListAlignment::Top, px(0.));
+        let state = ListState::new(ROWS, ListAlignment::Top, px(overdraw));
         Rc::new(Self {
             // A row that is not measured has the height of a hint, which is what the list scrolls by.
             state: if measure_all { state.measure_all() } else { state.with_uniform_item_height(px(32.)) },
@@ -76,7 +83,22 @@ impl Shared {
             patch_unit: Cell::new(false),
             patch_row: Cell::new(None),
             seen: RefCell::new(Vec::new()),
+            overscan,
         })
+    }
+
+    /// What the list knows of its rows and its extent, which a frame built whole leaves: the heights it
+    /// measured, how far it scrolls and where it is.
+    fn list_text(&self) -> String {
+        let state = &self.state;
+        let sizes: Vec<_> = (0..ROWS).map(|ix| state.measured_row(ix).map(|(size, top)| (size.height, top))).collect();
+        format!(
+            "list max {:?} offset {:?} top {:?} extent {:?}\nmeasured {sizes:?}",
+            state.max_offset_for_scrollbar(),
+            state.scroll_px_offset_for_scrollbar(),
+            state.logical_scroll_top(),
+            state.averaged_scroll_extent(),
+        )
     }
 
     fn handle(&self, ix: usize) -> Option<&FocusHandle> {
@@ -110,7 +132,7 @@ impl Shared {
     fn row(self: &Rc<Self>, ix: usize) -> AnyElement {
         let build = self.clone();
         retained(("row", ix), self.key.get(), move |_, _| build.row_inner(ix))
-            .relocatable(px(5000.))
+            .relocatable(px(self.overscan))
             .patchable()
             .into_any_element()
     }
@@ -168,6 +190,13 @@ struct Fixture {
 impl Fixture {
     fn new(cx: &mut TestAppContext, patch: bool) -> Self {
         let shared = Shared::new(cx, true);
+        Self::open(cx, patch, shared)
+    }
+
+    /// A list whose rows have no measured size until the list lays them out: it hints 32 for each, and
+    /// measures `overdraw` pixels past the rows it shows.
+    fn estimated(cx: &mut TestAppContext, patch: bool, overdraw: f32, overscan: f32) -> Self {
+        let shared = Shared::with_overdraw(cx, false, overdraw, overscan);
         Self::open(cx, patch, shared)
     }
 
@@ -340,6 +369,7 @@ impl Fixture {
                 at = tabs.prev(Some(&handle.id));
             }
             text.push_str(&format!("\ntab order {forward:?} back {backward:?}"));
+            text.push_str(&format!("\n{}", shared.list_text()));
             same_window(&text)
         })
         .unwrap()
@@ -445,6 +475,10 @@ fn same_window(text: &str) -> String {
 
 #[track_caller]
 fn assert_same(translated: &str, built: &str, what: &str) {
+    if translated != built {
+        std::fs::write("/tmp/z3d-translated.txt", translated).ok();
+        std::fs::write("/tmp/z3d-built.txt", built).ok();
+    }
     assert!(translated == built, "{what}\n{}", super::retained::first_difference(translated, built));
 }
 
@@ -457,6 +491,27 @@ struct Pair {
 impl Pair {
     fn new(cx: &mut TestAppContext) -> Self {
         Self { translated: Fixture::new(cx, true), built: Fixture::new(cx, false) }
+    }
+
+    fn estimated(cx: &mut TestAppContext, overdraw: f32, overscan: f32) -> Self {
+        Self {
+            translated: Fixture::estimated(cx, true, overdraw, overscan),
+            built: Fixture::estimated(cx, false, overdraw, overscan),
+        }
+    }
+
+    fn with_overscan(cx: &mut TestAppContext, overscan: f32) -> Self {
+        let open = |cx: &mut TestAppContext, patch: bool| {
+            let shared = Shared::with_overdraw(cx, true, 0., overscan);
+            Fixture::open(cx, patch, shared)
+        };
+        Self { translated: open(cx, true), built: open(cx, false) }
+    }
+
+    /// Both windows are wheeled by `by` pixels at the pointer.
+    fn wheel(&self, cx: &mut TestAppContext, by: f32) {
+        self.translated.wheel(cx, by);
+        self.built.wheel(cx, by);
     }
 
     #[track_caller]
@@ -1037,4 +1092,193 @@ fn a_restyle_with_a_scroll_that_cannot_be_a_translate_is_the_patch_and_a_frame_b
     let to = pair.translated.bringing_in_below(cx, 1);
     pair.restyle_and_scroll(cx, &[row + 50], true, Some(to));
     pair.same(cx, "the translate after it");
+}
+
+/// A list that hints each row's height: the rows past the ones it shows have no measured size, and a layout
+/// measures those in the overdraw as it goes.
+mod overdraw {
+    use super::*;
+
+    const OVERDRAW: f32 = 512.;
+
+    fn assert_translates(pair: &Pair, cx: &mut TestAppContext, frames: u64, serial: u64, what: &str) {
+        let counters = pair.translated.counters(cx);
+        assert_eq!((counters.frames, counters.patched), (frames, frames), "{what}: {counters:?}");
+        assert_eq!(pair.translated.built_whole(cx), serial, "{what}: a frame was built whole");
+        assert_eq!(counters.held_cause(ScrollPatchCause::UnmeasuredOverdraw), 0, "{what}: {counters:?}");
+        assert_eq!(counters.mispredicted, 0, "{what}: {counters:?}");
+        no_declines(&counters);
+    }
+
+    #[gpui::test]
+    fn scrolling_down_over_rows_with_no_measured_size_and_back_up_is_all_translates(cx: &mut TestAppContext) {
+        for overscan in [5000., 120.] {
+            let pair = Pair::estimated(cx, OVERDRAW, overscan);
+            pair.same(cx, "before any scroll");
+            let serial = pair.translated.built_whole(cx);
+            assert!(pair.translated.shared.state.measured_row(40).is_none(), "the rows far below are not measured");
+
+            let mut frames = 0;
+            for step in 0..30 {
+                pair.wheel(cx, 150.);
+                frames += 1;
+                assert_translates(&pair, cx, frames, serial, &format!("overscan {overscan}, down, step {step}"));
+                pair.same(cx, &format!("overscan {overscan}, down, step {step}"));
+            }
+            let counters = pair.translated.counters(cx);
+            assert!(pair.translated.rows(cx).start > 100, "scrolled past many viewports: {:?}", pair.translated.rows(cx));
+            assert!(counters.rows_built >= 100, "{counters:?}");
+            assert_eq!(counters.rows_rebuilt > 0, overscan < 1000., "{counters:?}");
+
+            for step in 0..30 {
+                pair.wheel(cx, -150.);
+                frames += 1;
+                assert_translates(&pair, cx, frames, serial, &format!("overscan {overscan}, up, step {step}"));
+                pair.same(cx, &format!("overscan {overscan}, up, step {step}"));
+            }
+            assert_eq!(pair.translated.rows(cx).start, 0);
+            assert_eq!(pair.built.counters(cx).frames, 0);
+        }
+    }
+
+    #[gpui::test]
+    fn the_extent_and_the_wheel_clamp_are_what_the_frames_built_whole_leave(cx: &mut TestAppContext) {
+        let pair = Pair::estimated(cx, OVERDRAW, 5000.);
+        // Down to the end of the list: the rows are measured on the way, and the clamp of the wheel is the one
+        // of the heights measured so far.
+        for step in 0..120 {
+            pair.wheel(cx, 400.);
+            pair.same(cx, &format!("step {step}"));
+        }
+        assert_eq!(pair.translated.rows(cx).end, ROWS);
+        assert_eq!(pair.translated.scrolled(), pair.built.scrolled());
+        assert_eq!(f32::from(pair.translated.shared.state.max_offset_for_scrollbar().y), top(ROWS) - LIST_H);
+    }
+
+    #[gpui::test]
+    fn rows_above_the_scroll_position_measured_by_the_translate_move_it_as_a_whole_frame_does(cx: &mut TestAppContext) {
+        let pair = Pair::estimated(cx, OVERDRAW, 5000.);
+        for _ in 0..12 {
+            pair.wheel(cx, 150.);
+        }
+        let above = pair.translated.rows(cx).start - 2;
+        // A row in the leading overdraw is measured again, at another height than it had.
+        for fixture in [&pair.translated, &pair.built] {
+            fixture.shared.taller.set(Some(above));
+            fixture.shared.state.remeasure_items(above..above + 1);
+        }
+        let before = pair.translated.scrolled();
+        let serial = pair.translated.built_whole(cx);
+        let frames = pair.translated.counters(cx).frames;
+        for fixture in [&pair.translated, &pair.built] {
+            let to = fixture.scrolled() + 70.;
+            fixture.write_offset(cx, to);
+        }
+        assert!(
+            pair.translated.scrolled() > before + 70.,
+            "the row above grew by 10 and the scroll position with it: {before} to {}",
+            pair.translated.scrolled()
+        );
+        assert_translates(&pair, cx, frames + 1, serial, "a row above measured");
+        pair.same(cx, "a row above the scroll position measured by the translate");
+        // Written, not wheeled: the wheel of a frame moves from where that frame was drawn.
+        for fixture in [&pair.translated, &pair.built] {
+            let to = fixture.scrolled() + 150.;
+            fixture.write_offset(cx, to);
+        }
+        pair.same(cx, "the translate after it");
+    }
+
+    #[gpui::test]
+    fn a_row_with_no_measured_size_that_shows_is_still_drawn_whole(cx: &mut TestAppContext) {
+        let pair = Pair::estimated(cx, 0., 5000.);
+        pair.wheel(cx, 90.);
+        let counters = pair.translated.counters(cx);
+        assert_eq!((counters.frames, counters.patched), (1, 0), "{counters:?}");
+        assert_eq!(counters.held_cause(ScrollPatchCause::Unmeasured), 1, "{counters:?}");
+        pair.same(cx, "the frame built whole");
+    }
+
+    #[gpui::test]
+    fn kept_rows_past_their_region_are_built_where_they_are(cx: &mut TestAppContext) {
+        let pair = Pair::with_overscan(cx, 100.);
+        pair.same(cx, "before any scroll");
+        let serial = pair.translated.built_whole(cx);
+        let mut frames = 0;
+        // Each step moves the rows a little: after a few they have moved further than they recorded.
+        for step in 0..14 {
+            pair.wheel(cx, 40.);
+            frames += 1;
+            let counters = pair.translated.counters(cx);
+            assert_eq!((counters.frames, counters.patched), (frames, frames), "step {step}: {counters:?}");
+            assert_eq!(counters.held(ScrollPatchReason::Region), 0, "step {step}: {counters:?}");
+            assert_eq!(pair.translated.built_whole(cx), serial);
+            no_declines(&counters);
+            pair.same(cx, &format!("step {step}"));
+        }
+        let counters = pair.translated.counters(cx);
+        assert!(counters.rows_rebuilt >= 5, "{counters:?}");
+        assert!(counters.membership_frames >= 5, "{counters:?}");
+        assert_eq!(counters.mispredicted, 0, "{counters:?}");
+        // And up again.
+        for step in 0..14 {
+            pair.wheel(cx, -40.);
+            pair.same(cx, &format!("up, step {step}"));
+        }
+        let counters = pair.translated.counters(cx);
+        assert_eq!(counters.patched, counters.frames, "{counters:?}");
+        assert_eq!(pair.translated.built_whole(cx), serial);
+        // The frame built whole from the recordings the translates left is the same.
+        pair.translated.draw_whole(cx);
+        pair.built.draw_whole(cx);
+        pair.same(cx, "the frame built whole after the translates");
+    }
+
+    #[gpui::test]
+    fn a_kept_row_built_again_under_the_pointer_is_still_one_frame(cx: &mut TestAppContext) {
+        let pair = Pair::with_overscan(cx, 60.);
+        for step in 0..10 {
+            pair.wheel(cx, 25.);
+            pair.same(cx, &format!("step {step}"));
+        }
+        let counters = pair.translated.counters(cx);
+        assert_eq!(counters.apply_declines(ScrollApplyDecline::Pointer), 0, "{counters:?}");
+        assert!(counters.rows_rebuilt >= 1, "{counters:?}");
+        // What a click reaches in the rows built again is what it reaches in a frame built whole.
+        assert_eq!(pair.translated.clicks(cx), pair.built.clicks(cx));
+    }
+
+    #[gpui::test]
+    fn fifty_random_steps_over_unmeasured_rows_are_the_frames_built_whole_under_the_verifier(cx: &mut TestAppContext) {
+        let pair = Pair::estimated(cx, OVERDRAW, 150.);
+        pair.translated.with_window(cx, |window, _| {
+            window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        });
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for step in 0..50 {
+            let by = match next(4) {
+                0 => -(1. + next(120) as f32),
+                _ => 1. + next(220) as f32,
+            };
+            // Writes only: the wheel of a frame moves from where that frame was drawn, which a write between two
+            // translates is not.
+            let offset = (pair.translated.scrolled() + by).max(0.);
+            pair.translated.write_offset(cx, offset);
+            pair.built.write_offset(cx, offset);
+            pair.same(cx, &format!("step {step}"));
+        }
+        let counters = pair.translated.counters(cx);
+        assert!(counters.patched >= 20, "{counters:?}");
+        assert!(counters.rows_rebuilt >= 1, "{counters:?}");
+        assert_eq!(counters.mispredicted, 0, "{counters:?}");
+        pair.translated.with_window(cx, |window, _| {
+            assert_eq!(window.retention_mismatches(), &[] as &[String]);
+        });
+    }
 }

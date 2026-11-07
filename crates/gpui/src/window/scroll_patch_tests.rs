@@ -393,24 +393,30 @@ fn a_pointer_that_moved_is_a_hover_change_whatever_the_owner_says(cx: &mut TestA
 }
 
 #[gpui::test]
-fn rows_recorded_with_no_overscan_miss_the_region(cx: &mut TestAppContext) {
+fn rows_recorded_with_no_overscan_are_built_again_where_they_are(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(0.), false);
     // The row 3 spans 90 to 120 and the region is the view: a row moved up by 5 leaves 95 to 100 of the
-    // view with nothing recorded.
+    // view with nothing recorded, so the rows are built where they are put.
     fixture.scroll(cx, 10., 10., 5.);
     let counters = fixture.counters(cx);
-    only(&counters, ScrollPatchReason::Region);
-    let causes: Vec<_> = ScrollPatchCause::ALL.into_iter().filter(|cause| counters.held_cause(*cause) == 1).collect();
-    assert_eq!(causes, [ScrollPatchCause::RegionBottom], "the rows moved up and the region ends where the view does: {counters:?}");
+    assert_eq!((counters.frames, counters.eligible, counters.patched, counters.mispredicted), (1, 1, 1, 0), "{counters:?}");
+    assert_eq!((counters.rows_rebuilt, counters.rows_removed), (counters.rows_built, 0), "{counters:?}");
+    assert!(counters.rows_rebuilt >= 1, "{counters:?}");
+    for reason in ScrollPatchReason::ALL {
+        assert_eq!(counters.reasons(reason), 0, "{reason:?}: {counters:?}");
+    }
 }
 
 #[gpui::test]
-fn rows_moved_down_miss_the_top_of_the_region(cx: &mut TestAppContext) {
+fn rows_moved_down_are_built_again_where_they_are(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(0.), false);
     fixture.scroll(cx, 10., 10., 40.);
+    let before = fixture.counters(cx);
     fixture.scroll(cx, 10., 10., -5.);
     let counters = fixture.counters(cx);
-    assert_eq!(counters.held_cause(ScrollPatchCause::RegionTop), 1, "{counters:?}");
+    assert_eq!(counters.eligible - before.eligible, 1, "{counters:?}");
+    assert!(counters.rows_rebuilt > before.rows_rebuilt, "{counters:?}");
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
 }
 
 #[gpui::test]

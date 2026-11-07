@@ -237,6 +237,9 @@ pub(super) struct Splice {
     /// The part holds a root, and the recording that is noted after its prepaint: false for rows that
     /// come in, which have an empty part of no root to be put in.
     holds_root: bool,
+    /// The part is taken out to be put back by another splice of the batch that recorded what is in it again:
+    /// the recordings its roots have now are those, and are not forgotten with the part.
+    keeps_states: bool,
     /// The recordings the scratch frame made for what is put in an empty part, in the order they were
     /// noted.
     recordings: Vec<((GlobalElementId, TypeId), Rc<Origin>)>,
@@ -443,6 +446,7 @@ impl Window {
             paint: old_paint,
             keeps_recording: false,
             holds_root: true,
+            keeps_states: false,
             recordings: Vec::new(),
             runs: None,
             places: None,
@@ -487,6 +491,7 @@ impl Window {
         footprint: (Range<[usize; FIELDS]>, Range<[usize; FIELDS]>),
         runs: RunEdit,
         places: PlaceEdit,
+        rebuilt: bool,
     ) -> Option<Splice> {
         let (pre, paint) = footprint;
         for part in parts {
@@ -512,6 +517,7 @@ impl Window {
             paint: paint_empty.with_positions(paint.start)..paint_empty.with_positions(paint.end),
             keeps_recording: false,
             holds_root: false,
+            keeps_states: rebuilt,
             recordings: Vec::new(),
             runs: Some(runs),
             places: Some(places),
@@ -627,7 +633,7 @@ impl Window {
         // The recordings of the part: with a root, those inside it and its own after them; without, those
         // made in the part.
         let inside = first..own.map_or(splice.prepaint.end.retained_recordings_index, |own| own + 1);
-        let dropped = self.move_recordings(&pre_cut, &paint_cut, &inside, own, splice.keeps_recording, serial);
+        let dropped = self.move_recordings(&pre_cut, &paint_cut, &inside, own, splice.keeps_recording, splice.keeps_states, serial);
         for origin in dropped {
             origin.drop_placement();
         }
@@ -800,6 +806,7 @@ impl Window {
         inside: &Range<usize>,
         own: Option<usize>,
         keeps_own: bool,
+        keeps_states: bool,
         serial: u64,
     ) -> Vec<Rc<Origin>> {
         let mut dropped = Vec::new();
@@ -865,7 +872,9 @@ impl Window {
         // patches or translates them until a frame built whole records them again. Their runs in a
         // list are inside the part and go with it.
         for id in nested {
-            self.update_element_state(&id, |state: &mut RetainedState| state.forget_recording());
+            if !keeps_states {
+                self.update_element_state(&id, |state: &mut RetainedState| state.forget_recording());
+            }
             let frame = &mut self.rendered_frame;
             frame.patchable.retain(|_, unit| unit.as_ref().is_none_or(|unit| unit.id != id));
             if let Some(name) = id.ids.last() {
