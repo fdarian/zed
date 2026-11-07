@@ -5188,7 +5188,8 @@ impl Window {
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
         let mut patched = None;
-        if mem::take(&mut self.patch.tick) {
+        let ticked = mem::take(&mut self.patch.tick);
+        if ticked {
             match self.patch_frame(cx) {
                 PatchedFrame::Declined => {}
                 PatchedFrame::Patched => {
@@ -5205,7 +5206,7 @@ impl Window {
             }
         }
 
-        self.classify_scroll_patch(cx);
+        self.classify_scroll_patch(ticked, cx);
         let mut translated = None;
         match self.apply_scroll_patch(cx) {
             ScrollPatchDraw::Declined => {}

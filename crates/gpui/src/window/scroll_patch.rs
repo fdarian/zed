@@ -80,6 +80,12 @@ pub enum ScrollPatchReason {
     A11y,
     /// A smooth scroll or a scrollbar fade has frames of its own to run.
     ScrollAnimation,
+    /// Something that follows the clock has a frame to draw: a tick was requested for this draw
+    /// ([`Window::request_tick`]: a transition, a keyframe animation, a motion value, a caret, a
+    /// hover paint) or the owner says its last frame asked for another (see
+    /// [`Window::set_scroll_patch_gate`]). A translate builds nothing, so the tick would be taken
+    /// and nothing would ask for the next one.
+    Clock,
     /// The thumb of a bar cannot be put where the scroll puts it: the owner says it for a bar of
     /// a list it painted no thumb for or whose bar it cannot place (see
     /// [`Window::paint_scroll_thumb`]), or for any other bar it cannot predict. Which of the two
@@ -95,7 +101,7 @@ pub enum ScrollPatchReason {
 
 impl ScrollPatchReason {
     /// Every reason, in the order the checks run.
-    pub const ALL: [ScrollPatchReason; 13] = [
+    pub const ALL: [ScrollPatchReason; 14] = [
         ScrollPatchReason::Edited,
         ScrollPatchReason::Membership,
         ScrollPatchReason::Hover,
@@ -106,6 +112,7 @@ impl ScrollPatchReason {
         ScrollPatchReason::Focus,
         ScrollPatchReason::A11y,
         ScrollPatchReason::ScrollAnimation,
+        ScrollPatchReason::Clock,
         ScrollPatchReason::Thumb,
         ScrollPatchReason::NotRelocatable,
         ScrollPatchReason::Other,
@@ -483,6 +490,8 @@ pub(crate) struct ScrollPatchWindow {
     registries: Option<ScrollPatchRegistries>,
     /// A list scrolled since the last draw, and the view it notified.
     scrolled: Option<EntityId>,
+    /// A tick was requested for the draw being classified (taken by [`Window::draw`] before it).
+    ticked: bool,
     gate: Option<ScrollPatchGate>,
     hover: Option<ScrollPatchHover>,
     predicted: Option<Prediction>,
@@ -691,8 +700,10 @@ impl Window {
     }
 
     /// Classifies the frame about to be drawn if a list scrolled since the last one, and counts it.
-    pub(crate) fn classify_scroll_patch(&mut self, cx: &App) {
+    /// `ticked` says a tick was requested for this draw.
+    pub(crate) fn classify_scroll_patch(&mut self, ticked: bool, cx: &App) {
         self.scroll_patch.predicted = None;
+        self.scroll_patch.ticked = ticked;
         let Some(view) = self.scroll_patch.scrolled.take() else {
             return;
         };
@@ -809,6 +820,9 @@ impl Window {
             Some(Reason::ScrollAnimation) => held.reason(Reason::ScrollAnimation),
             Some(Reason::Thumb) => held.reason(Reason::Thumb),
             _ => {}
+        }
+        if gate == Some(Reason::Clock) || self.scroll_patch.ticked {
+            held.reason(Reason::Clock);
         }
         if places.len() != list.rows.len() {
             held.cause(ScrollPatchCause::NoRun);

@@ -447,6 +447,29 @@ fn a_scroll_animation_the_owner_reports_is_one(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_tick_due_in_the_draw_is_a_reason_and_is_not_taken_by_a_translate(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), false);
+    fixture.point_at(cx, 10., 10.);
+    fixture.wheel_with(cx, 10., 10., 5., |window, _| window.request_tick());
+    only(&fixture.counters(cx), ScrollPatchReason::Clock);
+
+    // Without the tick the next scroll is a translate again.
+    fixture.wheel_with(cx, 10., 10., 5., |_, _| {});
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.reasons(ScrollPatchReason::Clock)), (2, 1, 1), "{counters:?}");
+}
+
+#[gpui::test]
+fn a_frame_the_owner_says_asked_for_the_next_is_a_clock(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), false);
+    fixture.with_window(cx, |window| {
+        window.set_scroll_patch_gate(Some(Rc::new(|_| Some(ScrollPatchReason::Clock))))
+    });
+    fixture.scroll(cx, 10., 10., 5.);
+    only(&fixture.counters(cx), ScrollPatchReason::Clock);
+}
+
+#[gpui::test]
 fn a_window_without_an_owner_has_no_frame_to_translate(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| window.set_scroll_patch_gate(None));
