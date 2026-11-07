@@ -33,6 +33,10 @@ struct State {
     kids: Cell<usize>,
     /// The key of the unit, which moves when what it holds does.
     version: Cell<u64>,
+    /// The key of the unit stays what it was, so that a frame replays the recording it left.
+    key_stays: Cell<bool>,
+    kid_height: Cell<f32>,
+    kid_green: Cell<bool>,
     sibling_green: Cell<bool>,
     /// The unit has a key context and a key listener of its own, so that it always has a dispatch node.
     key_context: Cell<bool>,
@@ -56,6 +60,9 @@ impl State {
         Rc::new(Self {
             kids: Cell::new(kids),
             version: Cell::new(0),
+            key_stays: Cell::new(false),
+            kid_height: Cell::new(12.),
+            kid_green: Cell::new(false),
             sibling_green: Cell::new(false),
             key_context: Cell::new(true),
             nested: Cell::new(false),
@@ -79,9 +86,9 @@ impl State {
         let down = self.clone();
         let mut kid = div()
             .id(("kid", index))
-            .h(px(12.))
+            .h(px(self.kid_height.get()))
             .flex_none()
-            .bg(red())
+            .bg(if self.kid_green.get() { green() } else { red() })
             .hover(|style| style.bg(green()))
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_, _, _| down.log.borrow_mut().push(format!("down {index}")));
@@ -143,7 +150,8 @@ impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let state = self.0.clone();
         let build = state.clone();
-        let unit = retained(UNIT, 1_000 + state.version.get(), move |_, _| build.unit()).patchable_relayout();
+        let key = if state.key_stays.get() { 1_000 } else { 1_000 + state.version.get() };
+        let unit = retained(UNIT, key, move |_, _| build.unit()).patchable_relayout();
         let sibling_state = state.clone();
         let sibling = retained(SIBLING, 2_000, move |_, _| sibling_state.sibling()).patchable();
         let mut page = div()
@@ -271,31 +279,7 @@ impl Fixture {
     fn observe(&self, cx: &mut TestAppContext) -> Observed {
         let state = self.state.clone();
         cx.update_window(self.window, |_, window, cx| {
-            // The frame, as a frame being built is described.
-            std::mem::swap(&mut window.rendered_frame, &mut window.next_frame);
-            let described = window.describe_frame(false);
-            let primitives = window.next_frame.scene.describe_primitives();
-            std::mem::swap(&mut window.rendered_frame, &mut window.next_frame);
-            let frame = &window.rendered_frame;
-            let name = |id: crate::HitboxId| {
-                frame
-                    .hitboxes
-                    .iter()
-                    .find(|hitbox| hitbox.id == id)
-                    .map_or_else(|| "(none)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
-            };
-            let mut bounds: Vec<_> = frame.debug_bounds.iter().map(|(name, bounds)| format!("{name} {bounds:?}")).collect();
-            bounds.sort();
-            let cursors: Vec<_> = frame
-                .cursor_styles
-                .iter()
-                .map(|request| (request.hitbox_id.map(name), request.style))
-                .collect();
-            let text = format!(
-                "{described}\n{primitives}\nbounds {bounds:?}\ncursors {cursors:?}\ntooltips {}\nhitbox count {}",
-                frame.tooltip_requests.len(),
-                frame.hitboxes.len()
-            );
+            let text = frame_text(window);
 
             let mut probes = Vec::new();
             // What is at the points, which listener a click there reaches, and the cursor.
@@ -342,6 +326,34 @@ impl Fixture {
         .unwrap()
     }
 
+    /// What the rendered frame is and what its hitboxes and tab stops answer, with no event sent to the
+    /// window: nothing is drawn, so the next tick patches from the recording the last one left.
+    fn passive(&self, cx: &mut TestAppContext) -> Observed {
+        let state = self.state.clone();
+        cx.update_window(self.window, |_, window, _| {
+            let text = frame_text(window);
+            let mut probes = Vec::new();
+            let mut points: Vec<Point<crate::Pixels>> = (0..8).map(|kid| point(px(10.), px(26. + 12. * kid as f32))).collect();
+            points.extend([point(px(10.), px(5.)), point(px(10.), px(130.)), point(px(10.), px(150.)), point(px(200.), px(60.))]);
+            for at in points {
+                let hits: Vec<String> = window.rendered_frame.hit_test(at, true).ids.iter().map(|id| name_of(window, *id)).collect();
+                probes.push(format!("{at:?}: hits {hits:?}"));
+            }
+            let tabs = &window.rendered_frame.tab_stops;
+            let label = |handle: &FocusHandle| state.focusable.iter().position(|focusable| focusable.id == handle.id);
+            let mut forward = Vec::new();
+            let mut at = tabs.next(None);
+            for _ in 0..4 {
+                let Some(handle) = at else { break };
+                forward.push(label(&handle));
+                at = tabs.next(Some(&handle.id));
+            }
+            probes.push(format!("tab order {forward:?}"));
+            Observed { frame: text, probes }
+        })
+        .unwrap()
+    }
+
     /// Asserts that what the last tick patched is what a frame built whole shows, in the frame and in what
     /// it answers.
     #[track_caller]
@@ -361,6 +373,35 @@ impl Fixture {
     }
 }
 
+/// What the rendered frame is, as a frame being built is described.
+fn frame_text(window: &mut Window) -> String {
+    // The frame, as a frame being built is described.
+    std::mem::swap(&mut window.rendered_frame, &mut window.next_frame);
+    let described = window.describe_frame(false);
+    let primitives = window.next_frame.scene.describe_primitives();
+    std::mem::swap(&mut window.rendered_frame, &mut window.next_frame);
+    let frame = &window.rendered_frame;
+    let name = |id: crate::HitboxId| {
+        frame
+            .hitboxes
+            .iter()
+            .find(|hitbox| hitbox.id == id)
+            .map_or_else(|| "(none)".to_owned(), |hitbox| format!("{:?}", hitbox.identity))
+    };
+    let mut bounds: Vec<_> = frame.debug_bounds.iter().map(|(name, bounds)| format!("{name} {bounds:?}")).collect();
+    bounds.sort();
+    let cursors: Vec<_> = frame
+        .cursor_styles
+        .iter()
+        .map(|request| (request.hitbox_id.map(name), request.style))
+        .collect();
+    format!(
+        "{described}\n{primitives}\nbounds {bounds:?}\ncursors {cursors:?}\ntooltips {}\nhitbox count {}",
+        frame.tooltip_requests.len(),
+        frame.hitboxes.len()
+    )
+}
+
 fn name_of(window: &Window, id: crate::HitboxId) -> String {
     window
         .rendered_frame
@@ -368,6 +409,35 @@ fn name_of(window: &Window, id: crate::HitboxId) -> String {
         .iter()
         .find(|hitbox| hitbox.id == id)
         .map_or_else(|| "(none)".to_owned(), |hitbox| format!("{:?}", hitbox.identity.as_ref().and_then(|identity| identity.ids.last())))
+}
+
+/// `frame` without what two windows do not share: what names a hitbox or a tab stop carries the
+/// window's view and its handles, and the hashes of element ids hold them.
+fn same_window(frame: &str) -> String {
+    let mut text = frame.to_owned();
+    for prefix in ["EntityId(", "FocusId("] {
+        let mut stripped = String::new();
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(prefix) {
+            let (before, after) = rest.split_at(at);
+            stripped.push_str(before);
+            stripped.push_str(prefix);
+            stripped.push('_');
+            rest = &after[after.find(')').unwrap()..];
+        }
+        stripped.push_str(rest);
+        text = stripped;
+    }
+    let mut hashed = String::new();
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find("hash: ") {
+        let (before, after) = rest.split_at(at + "hash: ".len());
+        hashed.push_str(before);
+        hashed.push('_');
+        rest = after.trim_start_matches(|digit: char| digit.is_ascii_digit());
+    }
+    hashed.push_str(rest);
+    hashed
 }
 
 #[track_caller]
@@ -572,36 +642,131 @@ fn the_rows_of_a_list_after_a_spliced_root_are_translated_as_the_frame_built_who
     };
     let (patched, shown, counters) = run(cx, true);
     let (_, built, _) = run(cx, false);
-    // The two runs are two windows: what names a hitbox or a tab stop carries the window's view and its handles.
-    let same_window = |frame: &str| {
-        let mut text = frame.to_owned();
-        for prefix in ["EntityId(", "FocusId("] {
-            let mut stripped = String::new();
-            let mut rest = text.as_str();
-            while let Some(at) = rest.find(prefix) {
-                let (before, after) = rest.split_at(at);
-                stripped.push_str(before);
-                stripped.push_str(prefix);
-                stripped.push('_');
-                rest = &after[after.find(')').unwrap()..];
-            }
-            stripped.push_str(rest);
-            text = stripped;
-        }
-        let mut hashed = String::new();
-        let mut rest = text.as_str();
-        while let Some(at) = rest.find("hash: ") {
-            let (before, after) = rest.split_at(at + "hash: ".len());
-            hashed.push_str(before);
-            hashed.push('_');
-            rest = after.trim_start_matches(|digit: char| digit.is_ascii_digit());
-        }
-        hashed.push_str(rest);
-        hashed
-    };
-
+    // The two runs are two windows.
     assert_eq!(patched.patches(cx).relayout_patches, 1, "{:?}", patched.state.seen.borrow());
     assert!(counters.patched >= 1, "the rows are translated after the splice: {counters:?}");
     assert_eq!(counters.mispredicted, 0, "{counters:?}");
     assert_same(&same_window(&shown.frame), &same_window(&built.frame), "the rows translated after a splice");
+}
+
+/// A page patched by `ticks` and one that is built whole for the same state, to compare what they show.
+struct Pair {
+    patched: Fixture,
+    whole: Fixture,
+}
+
+impl Pair {
+    fn new(cx: &mut TestAppContext, kids: usize, key_stays: bool) -> Self {
+        let state = State::new(cx, kids, false);
+        let patched = Fixture::new(cx, state);
+        let reference = State::new(cx, kids, false);
+        reference.patch_unit.set(false);
+        let whole = Fixture::new(cx, reference);
+        for state in [&patched.state, &whole.state] {
+            state.key_stays.set(key_stays);
+        }
+        Self { patched, whole }
+    }
+
+    fn set(&self, change: impl Fn(&State)) {
+        for state in [&self.patched.state, &self.whole.state] {
+            change(state);
+            state.version.set(state.version.get() + 1);
+        }
+    }
+
+    /// The patched page shows what the other, built whole from the same state, does, without a frame being
+    /// drawn in it (a window that is sent events draws).
+    #[track_caller]
+    fn assert_same(&self, cx: &mut TestAppContext, what: &str) {
+        self.whole.draw_whole(cx);
+        let patched = self.patched.passive(cx);
+        let whole = self.whole.passive(cx);
+        assert_same(&same_window(&patched.frame), &same_window(&whole.frame), what);
+        assert_eq!(
+            patched.probes.iter().map(|probe| same_window(probe)).collect::<Vec<_>>(),
+            whole.probes.iter().map(|probe| same_window(probe)).collect::<Vec<_>>(),
+            "{what}: what the frame answers"
+        );
+    }
+}
+
+#[gpui::test]
+fn three_relayout_patches_of_a_root_in_a_row_are_all_patched_and_each_frame_is_the_one_built_whole(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx, 3, false);
+    let steps: [(&str, Box<dyn Fn(&State)>); 3] = [
+        ("same shape", Box::new(|state: &State| state.kid_height.set(14.))),
+        ("more children", Box::new(|state: &State| state.kids.set(7))),
+        ("fewer children", Box::new(|state: &State| state.kids.set(2))),
+    ];
+    for (what, change) in steps {
+        let before = pair.patched.patches(cx);
+        pair.set(change);
+        pair.patched.tick(cx);
+        let after = pair.patched.patches(cx);
+        let seen = pair.patched.state.seen.borrow();
+        assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{what}: {seen:?}");
+        assert_eq!(after.rewritten_recordings, before.rewritten_recordings + 1, "{what}: {seen:?}");
+        assert_eq!(after.total_declines(), 0, "{what}: {seen:?}");
+        drop(seen);
+        pair.assert_same(cx, what);
+    }
+}
+
+#[gpui::test]
+fn a_frame_that_replays_a_root_after_relayout_patches_shows_what_a_frame_built_whole_does(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx, 3, true);
+    for kids in [7, 1, 5] {
+        pair.set(|state| state.kids.set(kids));
+        pair.patched.tick(cx);
+        assert_eq!(pair.patched.patches(cx).total_declines(), 0, "{:?}", pair.patched.state.seen.borrow());
+        let replays = pair.patched.replays(cx);
+        pair.patched.draw_plain(cx);
+        assert!(pair.patched.replays(cx) > replays, "{kids} kids: the unit is replayed from the recording the patch left");
+        pair.assert_same(cx, &format!("replayed after a patch to {kids} kids"));
+    }
+}
+
+#[gpui::test]
+fn a_patch_that_does_not_lay_out_again_patches_from_the_recording_a_relayout_patch_left(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx, 3, false);
+    // A change of how many boxes there are lays the root out again; one of their colour is repainted over the hitboxes and
+    // tab stops that the rewritten recording holds.
+    for (kids, green, relaid) in [(7, false, true), (7, true, false), (4, true, true), (4, false, false)] {
+        pair.set(|state| {
+            state.kids.set(kids);
+            state.kid_green.set(green);
+        });
+        let before = pair.patched.patches(cx);
+        pair.patched.tick(cx);
+        let after = pair.patched.patches(cx);
+        let seen = pair.patched.state.seen.borrow();
+        assert_eq!(after.patched_frames, before.patched_frames + 1, "{kids} {green}: {seen:?}");
+        assert_eq!(after.relayout_patches - before.relayout_patches, u64::from(relaid), "{kids} {green}: {seen:?}");
+        assert_eq!(after.total_declines(), 0, "{kids} {green}: {seen:?}");
+        drop(seen);
+        pair.assert_same(cx, &format!("{kids} boxes, green {green}"));
+    }
+}
+
+#[gpui::test]
+fn the_verifier_finds_no_difference_in_what_a_frame_replays_of_a_recording_a_patch_rewrote(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    state.key_stays.set(true);
+    let page = Fixture::new(cx, state);
+    cx.update_window(page.window, |_, window, _| window.set_retention_verifier(Some(Rc::new(|_| String::new())))).unwrap();
+    page.settle(cx);
+    for kids in [7, 1, 5, 3, 6] {
+        page.state.change(kids);
+        page.tick(cx);
+    }
+    let (verified, mismatches) = cx
+        .update_window(page.window, |_, window, _| (window.retained_counters().verified, window.retention_mismatches().to_vec()))
+        .unwrap();
+    assert!(verified >= 5, "{verified}");
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+    let patches = page.patches(cx);
+    assert_eq!(patches.relayout_patches, 5, "{:?}", page.state.seen.borrow());
+    assert_eq!(patches.rewritten_recordings, 5);
+    assert_eq!(patches.total_declines(), 0, "{:?}", page.state.seen.borrow());
 }

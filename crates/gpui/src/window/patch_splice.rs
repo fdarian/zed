@@ -23,6 +23,10 @@
 //! what the root had (its hitboxes by value, how far it went), so it is dropped too: the frame built
 //! whole after the patch records them again. Nothing is moved by a recording that is dropped: its
 //! step in the frame is the root's own.
+//!
+//! The root's own recording is dropped as well, unless the patch [rewrites it](super::RecordingRewrite):
+//! then its step stays in the frame (it is moved with the rest, and its range is what the splice put
+//! in the vectors), and the recordings after it move by one less.
 
 use super::*;
 use crate::DispatchNode;
@@ -30,7 +34,7 @@ use crate::elements::{RetainedState, ScrollerRecord};
 use crate::scene::PaintOperation;
 
 /// The number of positions that a [`PrepaintStateIndex`] and a [`PaintIndex`] hold.
-const FIELDS: usize = 8;
+pub(crate) const FIELDS: usize = 8;
 
 // Where each vector is in the positions of a `PrepaintStateIndex`. The element states the prepaint
 // accessed and the ones the paint accessed are in the same vector, the first ones before the others.
@@ -201,6 +205,8 @@ pub(super) struct Splice {
     /// Where the recording of the root was in the rendered frame.
     prepaint: Range<PrepaintStateIndex>,
     paint: Range<PaintIndex>,
+    /// The patch rewrites the recording of the root, which then keeps its place among the recordings.
+    keeps_recording: bool,
     old_hitbox_ids: Vec<HitboxId>,
     operations: Vec<PaintOperation>,
     hitboxes: Vec<Hitbox>,
@@ -259,7 +265,7 @@ impl Splice {
         prepaint.delta[DISPATCH_NODES] = self.nodes.len() as isize - old(&prepaint, DISPATCH_NODES);
         prepaint.delta[PREPAINT_STATES] = self.prepaint_states.len() as isize - old(&prepaint, PREPAINT_STATES);
         prepaint.delta[SCROLLERS] = self.scrollers.len() as isize - old(&prepaint, SCROLLERS);
-        prepaint.delta[RECORDINGS] = -old(&prepaint, RECORDINGS);
+        prepaint.delta[RECORDINGS] = -old(&prepaint, RECORDINGS) + self.keeps_recording as isize;
         painted.delta[OPERATIONS] = self.operations.len() as isize - old(&painted, OPERATIONS);
         painted.delta[MOUSE_LISTENERS] = self.mouse_listeners.len() as isize - old(&painted, MOUSE_LISTENERS);
         painted.delta[KEY_LISTENERS] = self.key_listeners.len() as isize - old(&painted, KEY_LISTENERS);
@@ -289,6 +295,7 @@ impl Window {
         prepaint: Range<&PrepaintStateIndex>,
         paint: Range<&PaintIndex>,
         operations: Vec<PaintOperation>,
+        keeps_recording: bool,
     ) -> Result<Splice, PatchDecline> {
         let rendered = &self.rendered_frame;
         let (old_pre, old_paint) = (&source.prepaint, &source.paint);
@@ -355,6 +362,7 @@ impl Window {
         let splice = Splice {
             prepaint: old_pre.clone(),
             paint: old_paint.clone(),
+            keeps_recording,
             old_hitbox_ids: source.hitboxes.hitboxes.iter().map(|hitbox| hitbox.id).collect(),
             operations,
             hitboxes: scratch.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec(),
@@ -423,7 +431,7 @@ impl Window {
         let (pre_cut, paint_cut) = splice.side_cuts();
         let own = splice.prepaint.end.retained_recordings_index;
         let inside = splice.prepaint.start.retained_recordings_index..own + 1;
-        let dropped = self.move_recordings(&pre_cut, &paint_cut, &inside, own, serial);
+        let dropped = self.move_recordings(&pre_cut, &paint_cut, &inside, own, splice.keeps_recording, serial);
         for origin in dropped {
             origin.drop_placement();
         }
@@ -531,7 +539,8 @@ impl Window {
             splice.nodes_parent,
         );
         frame.scrollers.splice(pre.start.scrollers_index..pre.end.scrollers_index, splice.scrollers);
-        frame.retained_recordings.drain(inside);
+        // The recording of the root itself is the last of the part: it is noted after its prepaint.
+        frame.retained_recordings.drain(inside.start..if splice.keeps_recording { own } else { own + 1 });
         frame.mouse_listeners.splice(paint.start.mouse_listeners_index..paint.end.mouse_listeners_index, splice.mouse_listeners);
         frame
             .root_key_listeners
@@ -562,6 +571,7 @@ impl Window {
         paint: &SideCut,
         inside: &Range<usize>,
         own: usize,
+        keeps_own: bool,
         serial: u64,
     ) -> Vec<Rc<Origin>> {
         let mut dropped = Vec::new();
@@ -572,7 +582,7 @@ impl Window {
         let mut moves: Vec<(Rc<Origin>, Option<PrepaintStateIndex>, Option<PaintIndex>)> = Vec::new();
         let mut seen: FxHashSet<*const Origin> = FxHashSet::default();
         for (index, (key, origin)) in self.rendered_frame.retained_recordings.iter().enumerate() {
-            if inside.contains(&index) {
+            if inside.contains(&index) && !(keeps_own && index == own) {
                 dropped.push(origin.clone());
                 if index != own {
                     nested.push(key.0.clone());
@@ -655,4 +665,17 @@ fn single_place(part: &Range<usize>, at: &Range<usize>) -> Option<Place> {
     } else {
         Some(Place::Inside)
     }
+}
+
+/// How much of each vector a prepaint that began at `start` and ended at `end` holds, for a root
+/// whose part of the frame was replaced: it holds no recordings, as the ones made inside it are gone.
+pub(super) fn prepaint_lengths(start: &PrepaintStateIndex, end: &PrepaintStateIndex) -> [usize; FIELDS] {
+    let (start, end) = (start.positions(), end.positions());
+    std::array::from_fn(|field| if field == RECORDINGS { 0 } else { end[field] - start[field] })
+}
+
+/// [`prepaint_lengths`] for a paint.
+pub(super) fn paint_lengths(start: &PaintIndex, end: &PaintIndex) -> [usize; FIELDS] {
+    let (start, end) = (start.positions(), end.positions());
+    std::array::from_fn(|field| end[field] - start[field])
 }

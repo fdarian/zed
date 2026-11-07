@@ -76,7 +76,7 @@ use crate::{
     IntoElement, LayoutId, NonReusable, PaintRecord, Pixels, Point, PrepaintRecord,
     Relocation, ReplayKey, Window, NonRelocatable, RelocationMiss,
     blocker_bit, first_blocker, HandleList, IsZero, SubtreeText, scene::PrimitiveCount,
-    PatchUnit, PatchSource,
+    PatchUnit, PatchSource, RecordingRewrite,
 };
 use collections::FxHashSet;
 use std::{any::TypeId, cell::Cell, ops::Range, rc::Rc};
@@ -218,7 +218,8 @@ impl Retained {
     /// have other nodes, styles or children than the recording, and the patch is accepted when
     /// nothing outside the subtree moves and the box of the subtree is the one it had. Only for a
     /// window that [allows it](Window::set_contained_patches), and while no accessibility tree is
-    /// built. The recording of the subtree is not replayed or patched again until a frame built
+    /// built. The recording of the subtree is made again from the patch, so that it is patched or
+    /// replayed as before; one that cannot be (see [`RecordingRewrite`]) is dropped until a frame built
     /// whole records it.
     pub fn patchable_relayout(mut self) -> Self {
         self.patchable = true;
@@ -475,6 +476,9 @@ impl RetainedState {
             hitboxes: recorded.prepaint.hitboxes.clone(),
             tab_stops: paint.tab_stops.clone(),
             owner: self.owner.clone(),
+            rewritable: recorded.relocation.is_none()
+                && recorded.prepaint.can_be_rewritten()
+                && paint.can_be_rewritten(),
         })
     }
 
@@ -485,10 +489,25 @@ impl RetainedState {
         lifts.map_or_else(Vec::new, |lifts| lifts.cells().map(|cell| cell.origin().clone()).collect())
     }
 
-    /// Drops what the subtree recorded: after a patch that laid it out again, the frame holds
-    /// what the recording would not repeat, so no frame replays or patches from it.
+    /// Drops what the subtree recorded: a frame that holds what the recording would not repeat
+    /// is not replayed or patched from it.
     pub(crate) fn forget_recording(&mut self) {
         self.recorded = None;
+        self.layout = None;
+    }
+
+    /// Makes the recording what a frame built whole would have recorded for the element that a patch
+    /// laid out again and painted, with `generation` the layout of the root now has. Only for a
+    /// subtree whose [`PatchSource::rewritable`] said so. What a whole frame leaves of the surroundings,
+    /// the key and the place of the root in them, is what the patch ran in, so it stays. The layout
+    /// record of a pass that only laid out is of the layout before.
+    pub(crate) fn rewrite_recording(&mut self, generation: u64, rewrite: RecordingRewrite) {
+        let recorded = self.recorded.as_mut().expect("a subtree that is rewritten after its patch has its recording");
+        let paint = recorded.paint.as_mut().expect("a patched subtree has its paint recorded");
+        recorded.generation = generation;
+        recorded.prepaint.rewrite(rewrite.hitboxes, rewrite.prepaint_lengths);
+        paint.rewrite(rewrite.tab_stops, rewrite.paint_lengths);
+        self.accessed_entities.extend(rewrite.accessed_entities);
         self.layout = None;
     }
 

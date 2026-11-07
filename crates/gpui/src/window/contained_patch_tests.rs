@@ -474,25 +474,18 @@ fn a_root_that_does_not_say_it_may_lay_out_again_declines_a_relayout_as_before(c
 }
 
 #[gpui::test]
-fn the_recording_of_a_root_that_laid_out_again_is_not_patched_until_a_frame_records_it(cx: &mut TestAppContext) {
+fn the_recording_of_a_root_that_laid_out_again_is_patched_again_with_no_frame_built_between(cx: &mut TestAppContext) {
     let page = Fixture::new(cx, State::new(kids(3, 20.)));
-    page.state.change(kids(3, 25.));
-    page.tick(cx);
-    assert_eq!(page.patches(cx).relayout_patches, 1, "{:?}", page.state.seen.borrow());
-
-    page.state.change(kids(3, 30.));
-    page.tick(cx);
-    let after = page.patches(cx);
-    assert_eq!(after.declines(PatchDecline::StaleRecording), 1, "{:?}", page.state.seen.borrow());
-    assert_eq!(after.relayout_patches, 1);
-    page.assert_whole(cx, "a frame built whole after the stale recording");
-
-    // The frame that was built whole recorded it again; the next frame replays it and registers it.
-    page.draw_whole(cx);
-    page.state.change(kids(3, 35.));
-    page.tick(cx);
-    assert_eq!(page.patches(cx).relayout_patches, 2, "{:?}", page.state.seen.borrow());
-    page.assert_whole(cx, "patched again once a whole frame recorded it");
+    for (height, what) in [(25., "first"), (30., "second"), (35., "third")] {
+        let before = page.patches(cx);
+        page.state.change(kids(3, height));
+        page.tick(cx);
+        let after = page.patches(cx);
+        assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{what}: {:?}", page.state.seen.borrow());
+        assert_eq!(after.rewritten_recordings, before.rewritten_recordings + 1, "{what}");
+        assert_eq!(after.declines(PatchDecline::StaleRecording), 0, "{what}: {:?}", page.state.seen.borrow());
+    }
+    page.assert_whole(cx, "a frame built whole after three patches in a row");
 }
 
 #[gpui::test]

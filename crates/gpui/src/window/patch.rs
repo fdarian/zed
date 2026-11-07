@@ -28,10 +28,11 @@
 //! other nodes, styles and children than the recording, and the layout is computed from the
 //! window's root, where what has an answer keeps it. The patch is accepted only when nothing
 //! outside the root moved and the root has the box it had ([`PatchDecline::NotContained`]); what
-//! lies inside is repainted from the new layout, and the recording of the root is dropped, as the
-//! frame no longer holds what it would repeat.
+//! lies inside is repainted from the new layout, and the recording of the root is rewritten from the
+//! patch, as a frame built whole would have made it ([`RecordingRewrite`]): the next tick patches
+//! the root again and a later frame replays it. Where that cannot be, the recording is dropped.
 
-use super::patch_splice::Splice;
+use super::patch_splice::{FIELDS, Splice, paint_lengths, prepaint_lengths};
 use super::*;
 use crate::elements::{RetainedState, ScrollExtent, ScrollHandle};
 use crate::scene::PaintOperation;
@@ -142,6 +143,9 @@ pub struct PatchCounters {
     /// Retained roots that patched frames repainted after laying them out again, see
     /// [`Retained::patchable_relayout`](crate::Retained::patchable_relayout).
     pub relayout_patches: u64,
+    /// Those roots whose recording was rewritten from the patch, so that the next tick patches them
+    /// again and a frame built whole replays them; the others lose it, see [`RecordingRewrite`].
+    pub rewritten_recordings: u64,
     declines: [u64; PatchDecline::ALL.len()],
 }
 
@@ -314,6 +318,38 @@ pub(crate) struct PatchSource {
     pub(crate) tab_stops: Rc<[TabStopOperation]>,
     /// Owns the element states of the root.
     pub(crate) owner: Rc<StateOwner>,
+    /// Whether a patch that lays the root out again can leave a recording equal to a frame built
+    /// whole's, see [`RecordingRewrite`].
+    pub(crate) rewritable: bool,
+}
+
+/// What a patch that laid a root out again leaves of the root's recording, when it is accepted:
+/// the recording a frame built whole would have made of the same element at the same place.
+///
+/// What the recording holds and a patch changes is the layout generation of the root, the
+/// hitboxes it inserted (by value, with their new bounds), its tab stops, where it is in the vectors
+/// of the frame (when a splice made the vectors another size) and the entities its element read.
+/// The key it was recorded with, the surroundings it is patched in, what it was placed in and the
+/// ambient state a replay checks are what the patch ran in: a patch is declined when the key
+/// differs. The layout record of a pass that only lays out is dropped, as a frame leaves none.
+///
+/// A root that cannot be given such a recording loses it, as before: one recorded to be put
+/// elsewhere (its operations are in a scene of its own), one that handed elements to a stacking
+/// context outside it, one whose listeners report to their owner (the patch cannot say how a
+/// frame built whole would have recorded that), and one with an accessibility recording (a patch
+/// that lays out again is declined while an accessibility tree is built, so it cannot have one that
+/// is current). The roots recorded inside it are dropped too, as the patch builds it with no
+/// retained root in it. The line layouts the patch shaped are given back to the text system, so the
+/// recording keeps the range of line layouts it had: a replay carries those, and a frame that
+/// builds the text shapes it again.
+pub(crate) struct RecordingRewrite {
+    pub(crate) hitboxes: RecordedHitboxes,
+    pub(crate) tab_stops: Rc<[TabStopOperation]>,
+    /// How much of each vector the root holds when a splice replaced its part of the frame: its
+    /// range, from where its origin starts. `None` when the vectors are as they were.
+    pub(crate) prepaint_lengths: Option<[usize; FIELDS]>,
+    pub(crate) paint_lengths: Option<[usize; FIELDS]>,
+    pub(crate) accessed_entities: FxHashSet<EntityId>,
 }
 
 struct ResolvedUnit {
@@ -340,6 +376,8 @@ struct UnitRun {
     /// What replaces the part of the rendered frame the root held, when it registered or painted
     /// other things than it did: nothing of the rest of the run is then used.
     splice: Option<Splice>,
+    /// What its recording is made of once the patch is in the frame, if it can be.
+    rewrite: Option<RecordingRewrite>,
 }
 
 /// What the rendered frame takes from a patch besides its operations: the transforms, which a
@@ -747,7 +785,11 @@ impl Window {
             });
         }
         let mut splices = Vec::new();
-        for run in &mut runs {
+        let mut rewrites = Vec::new();
+        for (unit, run) in resolved.iter().zip(&mut runs) {
+            if let Some(rewrite) = run.rewrite.take() {
+                rewrites.push((unit.unit.id.clone(), unit.source.root, rewrite));
+            }
             if let Some(splice) = run.splice.take() {
                 // The rest of the run is of no use: the splice has what the root had and what it has now.
                 (run.scratch, run.rendered, run.scrollers) = (0..0, 0..0, (0..0, 0..0));
@@ -785,7 +827,7 @@ impl Window {
         }
         let scroll_extents = self.apply_scroll_range_moves(moves);
         for (unit, run) in resolved.iter().zip(&runs) {
-            if run.relaid {
+            if run.relaid && !rewrites.iter().any(|(id, ..)| *id == unit.unit.id) {
                 // The frame holds what the recording would not repeat.
                 self.update_element_state(&unit.unit.id, |state: &mut RetainedState| state.forget_recording());
             }
@@ -798,6 +840,12 @@ impl Window {
         let spliced = !splices.is_empty();
         if spliced {
             self.splice(splices);
+        }
+        // The recordings are rewritten once the roots are where the patch put them in the vectors.
+        self.patch.counters.rewritten_recordings += rewrites.len() as u64;
+        for (id, root, rewrite) in rewrites {
+            let generation = self.layout_generation(root);
+            self.update_element_state(&id, |state: &mut RetainedState| state.rewrite_recording(generation, rewrite));
         }
         if moved_hitboxes || spliced {
             // A transform that ticked moved what is under the pointer, or the roots have other hitboxes.
@@ -860,9 +908,15 @@ impl Window {
             let around = unit.unit.clone();
             let saved = self.enter_surroundings(&around.id, &around.prepaint);
             let owner = unit.source.owner.clone();
-            let run = self.with_state_owner(&owner, |window| window.patch_unit(unit, cx, a11y_active));
+            let (run, accessed) = self.detect_observed_entities(cx, |window, cx| {
+                window.with_state_owner(&owner, |window| window.patch_unit(unit, cx, a11y_active))
+            });
             self.leave_surroundings(saved);
-            runs.push(run?);
+            let mut run = run?;
+            if let Some(rewrite) = &mut run.rewrite {
+                rewrite.accessed_entities = accessed;
+            }
+            runs.push(run);
         }
         for (index, run) in runs.iter().enumerate() {
             let Some(splice) = &run.splice else { continue };
@@ -1079,6 +1133,7 @@ impl Window {
         let paint_end = self.paint_index();
 
         let patched = self.effects().without_root_escapes(&effects);
+        let published = effects.published(&patched);
         self.root_escape = outside;
         if effects.reasons(&patched) != 0 || self.redraw_before_present || self.requested_autoscroll.is_some() {
             return Err(PatchDecline::Effects);
@@ -1095,6 +1150,7 @@ impl Window {
                 return Err(PatchDecline::Registrations);
             }
             let operations = self.next_frame.scene.paint_operations[scratch.clone()].to_vec();
+            let rewrites = source.rewritable && !published;
             let splice = self.plan_splice(
                 source,
                 &around.id,
@@ -1102,13 +1158,20 @@ impl Window {
                 &prepaint_start..&prepaint_end,
                 &paint_start..&paint_end,
                 operations,
+                rewrites,
             )?;
+            let rewrite = rewrites.then(|| {
+                let mut rewrite = self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end);
+                rewrite.prepaint_lengths = Some(prepaint_lengths(&prepaint_start, &prepaint_end));
+                rewrite.paint_lengths = Some(paint_lengths(&paint_start, &paint_end));
+                rewrite
+            });
             let places = Places { hitboxes: Vec::new(), listener_spaces: Vec::new(), listeners: 0..0, registrations: None };
             let scrollers = (
                 prepaint_start.scrollers_index..prepaint_end.scrollers_index,
                 source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
             );
-            return Ok(UnitRun { scratch, rendered, changed: Vec::new(), places, scrollers, relaid, splice: Some(splice) });
+            return Ok(UnitRun { scratch, rendered, changed: Vec::new(), places, scrollers, relaid, splice: Some(splice), rewrite });
         }
         if !hitboxes_match {
             return Err(PatchDecline::Hitboxes);
@@ -1134,7 +1197,29 @@ impl Window {
             prepaint_start.scrollers_index..prepaint_end.scrollers_index,
             source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
         );
-        Ok(UnitRun { scratch, rendered, changed, places, scrollers, relaid, splice: None })
+        let rewrite = (relaid && source.rewritable && !published)
+            .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end));
+        Ok(UnitRun { scratch, rendered, changed, places, scrollers, relaid, splice: None, rewrite })
+    }
+
+    /// What the scratch frame got for the unit that its recording holds by value.
+    fn recording_rewrite(
+        &self,
+        unit: &PatchUnit,
+        prepaint: Range<&PrepaintStateIndex>,
+        paint: Range<&PaintIndex>,
+    ) -> RecordingRewrite {
+        let frame = &self.next_frame;
+        RecordingRewrite {
+            hitboxes: RecordedHitboxes::new(
+                frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec(),
+                unit.prepaint.hitbox_parent,
+            ),
+            tab_stops: frame.tab_stops.insertion_history[paint.start.tab_handle_index..paint.end.tab_handle_index].into(),
+            prepaint_lengths: None,
+            paint_lengths: None,
+            accessed_entities: FxHashSet::default(),
+        }
     }
 
     /// Computes the layout from the window's root, which the requests of the new element

@@ -5,6 +5,7 @@
 use super::*;
 use crate::scene::{PaintOperation, PrimitiveCount, ReplayClip};
 use crate::LayoutCounters;
+use super::patch_splice::FIELDS;
 use std::cell::{Cell, RefCell};
 
 /// Why the recording of a retained subtree cannot be replayed, so the subtree is built again
@@ -836,7 +837,7 @@ impl Effects {
         reasons
     }
 
-    fn published(&self, later: &Effects) -> bool {
+    pub(super) fn published(&self, later: &Effects) -> bool {
         self.publications != later.publications
     }
 }
@@ -865,6 +866,19 @@ pub(crate) struct RecordedHitboxes {
     /// The positions in `hitboxes` of those whose parent was the hitbox enclosing the subtree.
     /// Each frame that replays them has another enclosing hitbox.
     roots: Vec<usize>,
+}
+
+impl RecordedHitboxes {
+    /// What a subtree that inserted `hitboxes` under the hitbox `enclosing` records.
+    pub(crate) fn new(hitboxes: Vec<Hitbox>, enclosing: Option<HitboxId>) -> Self {
+        let roots = hitboxes
+            .iter()
+            .enumerate()
+            .filter(|(_, hitbox)| hitbox.parent == enclosing)
+            .map(|(position, _)| position)
+            .collect();
+        Self { hitboxes, roots }
+    }
 }
 
 /// Where the stacking context that elements are handed to stood when a recording began.
@@ -1976,12 +1990,6 @@ impl Window {
         if let Some(surroundings) = surroundings {
             self.relocate_hitboxes_in_place(hitbox_range, surroundings);
         }
-        let roots = hitboxes
-            .iter()
-            .enumerate()
-            .filter(|(_, hitbox)| hitbox.parent == stale_parent)
-            .map(|(position, _)| position)
-            .collect();
         let mut blockers = mark.effects.blockers(&effects);
         if lifts.is_some() {
             blockers |= blocker_bit(NonRelocatable::Hole);
@@ -1991,7 +1999,7 @@ impl Window {
             origin: mark.origin,
             relocated_inside: self.retained.relocated_inside != mark.relocated_inside,
             lifts,
-            hitboxes: Rc::new(RecordedHitboxes { hitboxes, roots }),
+            hitboxes: Rc::new(RecordedHitboxes::new(hitboxes, stale_parent)),
             a11y: a11y.map(Rc::new),
             has_publications: mark.effects.published(&effects),
             blockers,
@@ -2841,6 +2849,29 @@ impl PrepaintRecord {
         self.range = range;
     }
 
+    /// Whether a patch that laid the subtree out again can leave a recording equal to the one a
+    /// frame built whole would: nothing was handed to a stacking context outside or published, and
+    /// no accessibility tree was recorded (a patch that lays out again is declined while one is
+    /// built).
+    pub(crate) fn can_be_rewritten(&self) -> bool {
+        self.lifts.is_none() && self.a11y.is_none() && !self.has_publications
+    }
+
+    /// Makes the recording what the prepaint of a patch left: `hitboxes` are the ones it inserted,
+    /// and, if the part of the frame that holds it was replaced by a splice, `lengths` say how much
+    /// of each vector it holds now, from where the origin starts it. The line layouts keep the
+    /// range they had: the patch shaped its text in layouts that it gave back, so a replay carries
+    /// the layouts of the recording before.
+    pub(crate) fn rewrite(&mut self, hitboxes: RecordedHitboxes, lengths: Option<[usize; FIELDS]>) {
+        self.hitboxes = Rc::new(hitboxes);
+        if let Some(lengths) = lengths {
+            let now = self.range_now();
+            let start = now.start.positions();
+            let end = now.end.with_positions(std::array::from_fn(|field| start[field] + lengths[field]));
+            self.range = now.start..end;
+        }
+    }
+
     /// What the prepaint left in the frame being built, as text. `loose` leaves out what cannot be
     /// reached by the pointer, which a subtree recorded in a region has more of than a build under
     /// the content mask around it.
@@ -2908,6 +2939,24 @@ impl PaintRecord {
     /// Notes where the paint is, which the origin knows.
     pub(crate) fn set_range(&mut self, range: Range<PaintIndex>) {
         self.range = range;
+    }
+
+    /// Whether a patch that laid the subtree out again can leave a recording equal to the one a
+    /// frame built whole would, see [`PrepaintRecord::can_be_rewritten`]. The paint is one that is
+    /// painted where it is, with nothing in a scene of its own.
+    pub(crate) fn can_be_rewritten(&self) -> bool {
+        self.is_plain() && self.a11y.is_none() && !self.has_publications
+    }
+
+    /// [`PrepaintRecord::rewrite`] for the paint: `tab_stops` are the ones it inserted.
+    pub(crate) fn rewrite(&mut self, tab_stops: Rc<[TabStopOperation]>, lengths: Option<[usize; FIELDS]>) {
+        self.tab_stops = tab_stops;
+        if let Some(lengths) = lengths {
+            let now = self.range_now();
+            let start = now.start.positions();
+            let end = now.end.with_positions(std::array::from_fn(|field| start[field] + lengths[field]));
+            self.range = now.start..end;
+        }
     }
 
     /// Whether the paint is one that can be painted again where it is: it handed no element to a

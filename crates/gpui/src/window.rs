@@ -91,7 +91,7 @@ pub use scroll_patch::{
     ScrollApplyDecline, ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason, ScrollThumbMiss, ScrollThumbMoved,
     ScrollThumbPlan,
 };
-pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame};
+pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame, RecordingRewrite};
 pub(crate) use patch_splice::Positions;
 pub(crate) use scroll_patch::{ScrollFrame, ScrollPatchDraw, ScrollPatchWindow};
 pub(crate) use retained::{
