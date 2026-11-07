@@ -493,6 +493,26 @@ impl Origin {
         };
     }
 
+    /// The recording was made in the scratch frame and is now in the rendered frame, where each vector
+    /// holds what the scratch frame's did from the places `prepaint` and `paint` (the ones before it, in
+    /// the numbering of the frame it is put in). The line layouts it shaped were given back, so it
+    /// has none to carry.
+    pub(crate) fn adopt(&self, prepaint: &[usize; FIELDS], paint: &[usize; FIELDS], serial: u64, pass: u64) {
+        let by = |at: [usize; FIELDS], by: &[usize; FIELDS]| std::array::from_fn(|field| at[field] + by[field]);
+        let mut placed = self.prepaint.borrow_mut();
+        if placed.within.is_none() {
+            placed.start = PrepaintStateIndex { line_layout_index: Default::default(), ..placed.start.with_positions(by(placed.start.positions(), prepaint)) };
+            placed.serial = serial;
+            placed.pass = pass;
+        }
+        let mut placed = self.paint.borrow_mut();
+        if placed.within.is_none() {
+            placed.start = PaintIndex { line_layout_index: Default::default(), ..placed.start.with_positions(by(placed.start.positions(), paint)) };
+            placed.serial = serial;
+            placed.pass = pass;
+        }
+    }
+
     /// The recording is in no frame, nor are the ones inside it.
     pub(crate) fn drop_placement(&self) {
         *self.prepaint.borrow_mut() = Placed::default();
@@ -2849,6 +2869,11 @@ impl PrepaintRecord {
         self.range = range;
     }
 
+    /// The line layouts the prepaint shaped were given back to the text system: a replay carries none.
+    pub(crate) fn forget_line_layouts(&mut self) {
+        self.range.end.line_layout_index = self.range.start.line_layout_index.clone();
+    }
+
     /// Whether a patch that laid the subtree out again can leave a recording equal to the one a
     /// frame built whole would: nothing was handed to a stacking context outside, and
     /// no accessibility tree was recorded (a patch that lays out again is declined while one is
@@ -2939,6 +2964,11 @@ impl PaintRecord {
     /// Notes where the paint is, which the origin knows.
     pub(crate) fn set_range(&mut self, range: Range<PaintIndex>) {
         self.range = range;
+    }
+
+    /// See [`PrepaintRecord::forget_line_layouts`].
+    pub(crate) fn forget_line_layouts(&mut self) {
+        self.range.end.line_layout_index = self.range.start.line_layout_index.clone();
     }
 
     /// Whether a patch that laid the subtree out again can leave a recording equal to the one a

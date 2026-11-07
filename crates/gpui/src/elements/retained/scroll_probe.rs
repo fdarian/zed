@@ -6,7 +6,7 @@ use super::*;
 use crate::ContentMask;
 use crate::UncoveredEdge;
 use crate::scene::PaintOperation;
-use crate::window::RecordedHitboxes;
+use crate::window::{RecordedHitboxes, RowPart};
 
 /// What a recording holds of a root that a scroll patch puts elsewhere without building it.
 pub(crate) struct ScrollSource {
@@ -29,6 +29,37 @@ impl RetainedState {
             return None;
         }
         Some(ScrollSource { operations: paint.operations.clone()?, hitboxes: recorded.prepaint.hitboxes.clone() })
+    }
+
+    /// Whether the recording is one a scroll can put elsewhere: it can be moved, and holds what a
+    /// translate puts (see [`Self::scroll_source`]).
+    pub(crate) fn is_scroll_movable(&self) -> bool {
+        self.recorded.as_ref().is_some_and(|recorded| recorded.movable && recorded.relocation.is_some())
+            && self.scroll_source().is_some()
+    }
+
+    /// Where the recording of the root is in the rendered frame, and what it recorded there, if the root
+    /// was placed in it.
+    pub(crate) fn frame_part(&self, window: &Window) -> Option<RowPart> {
+        let recorded = self.recorded.as_ref()?;
+        let paint = recorded.paint.as_ref()?;
+        recorded.is_placed_in(window.rendered_serial()).then(|| RowPart {
+            id: self.id.clone(),
+            prepaint: recorded.prepaint.range_now(),
+            paint: paint.range_now(),
+            hitboxes: recorded.prepaint.hitboxes.clone(),
+            tab_stops: paint.tab_stops.clone(),
+        })
+    }
+
+    /// The line layouts the root shaped were given back to the text system: a replay carries none.
+    pub(crate) fn forget_line_layouts(&mut self) {
+        if let Some(recorded) = self.recorded.as_mut() {
+            recorded.prepaint.forget_line_layouts();
+            if let Some(paint) = recorded.paint.as_mut() {
+                paint.forget_line_layouts();
+            }
+        }
     }
 
     /// Notes that a scroll patch put the root `delta` from its recording, and moves what it holds

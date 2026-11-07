@@ -92,8 +92,8 @@ pub use scroll_patch::{
     ScrollThumbPlan,
 };
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame, RecordingRewrite};
-pub(crate) use patch_splice::Positions;
-pub(crate) use scroll_patch::{ScrollFrame, ScrollPatchDraw, ScrollPatchWindow};
+pub(crate) use patch_splice::{FIELDS, Positions, RowPart};
+pub(crate) use scroll_patch::{RowSurroundings, ScrollFrame, ScrollPatchDraw, ScrollPatchWindow};
 pub(crate) use retained::{
     HandleList, LiftOwner, PaintRecord, PlainPaint, PrepaintRecord, RecordedHitboxes, Relocation, ReplayKey,
     Origin, RetainedWindow, StateOwner, SubtreeText, UncoveredEdge, blocker_bit, first_blocker,

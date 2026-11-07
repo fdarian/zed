@@ -705,6 +705,12 @@ impl TaffyLayoutEngine {
         {
             self.collect_garbage();
         }
+        self.end_pass_keeping_nodes();
+    }
+
+    /// [`Self::end_pass`] that frees no node, for a pass that laid out some roots of the page and not
+    /// the page: the nodes of the rest are not reached from them, and are not garbage.
+    pub fn end_pass_keeping_nodes(&mut self) {
         self.give_back_stretched_widths(false);
         clear_shrinking(&mut self.absolute_layout_bounds);
         clear_shrinking(&mut self.absolute_outer_origins);

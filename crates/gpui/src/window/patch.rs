@@ -306,7 +306,7 @@ enum Placement {
 
 /// The state of the window around a root while it is prepainted or painted.
 #[derive(Clone)]
-struct Surroundings {
+pub(super) struct Surroundings {
     context: PaintContext,
     content_mask: ContentMask<Pixels>,
     exact_clips: Option<Rc<ExactClips>>,
@@ -494,14 +494,14 @@ struct Registrations {
 }
 
 /// What the window was before a patch ran in it.
-struct Scratch {
-    a11y_was_active: bool,
-    layouts: LineLayoutIndex,
+pub(super) struct Scratch {
+    pub(super) a11y_was_active: bool,
+    pub(super) layouts: LineLayoutIndex,
 }
 
 /// The state of the window a root is drawn in, as it was before the root's surroundings were put
 /// in its place.
-struct SavedSurroundings {
+pub(super) struct SavedSurroundings {
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
     visibility: Visibility,
@@ -737,7 +737,7 @@ impl Window {
         }))
     }
 
-    fn capture_surroundings(&self) -> Option<Surroundings> {
+    pub(super) fn capture_surroundings(&self) -> Option<Surroundings> {
         if self.culling
             || self.layout_only
             || self.retained.relocation.is_some()
@@ -1140,7 +1140,7 @@ impl Window {
     }
 
     /// Makes the scratch frame a clean one to draw the roots into.
-    fn begin_scratch(&mut self, cx: &mut App) -> Scratch {
+    pub(super) fn begin_scratch(&mut self, cx: &mut App) -> Scratch {
         cx.entities.clear_accessed();
         debug_assert!(
             self.next_frame.hitboxes.is_empty() && self.next_frame.scene.len() == 0,
@@ -1159,14 +1159,24 @@ impl Window {
     }
 
     fn clear_scratch(&mut self, layouts: LineLayoutIndex, cx: &mut App) {
+        self.clear_scratch_pass(layouts, cx, true);
+    }
+
+    /// [`Self::clear_scratch`]; `collect` says whether the layout engine may free the nodes that the
+    /// roots the scratch laid out do not reach, which only a scratch that laid out the page may.
+    pub(super) fn clear_scratch_pass(&mut self, layouts: LineLayoutIndex, cx: &mut App, collect: bool) {
         self.patch.hitbox_ids = None;
         self.invalidator.set_phase(DrawPhase::None);
         self.next_frame.clear();
         self.next_frame.scene.set_hidden(false);
-        self.layout_engine
+        let engine = self
+            .layout_engine
             .as_mut()
-            .expect("the layout engine is in the window outside layout")
-            .end_pass();
+            .expect("the layout engine is in the window outside layout");
+        match collect {
+            true => engine.end_pass(),
+            false => engine.end_pass_keeping_nodes(),
+        }
         self.text_system.truncate_layouts(layouts);
         self.requested_autoscroll = None;
         self.redraw_before_present = false;
@@ -1175,7 +1185,7 @@ impl Window {
 
     /// Takes the callbacks the patch's elements asked for the next frame out of the window's, which
     /// others (the embedder's) may have added to in between: `ranges` are in order.
-    fn forget_frame_callbacks(&mut self, ranges: &[Range<usize>]) {
+    pub(super) fn forget_frame_callbacks(&mut self, ranges: &[Range<usize>]) {
         let mut callbacks = self.next_frame_callbacks.borrow_mut();
         for range in ranges.iter().rev() {
             callbacks.drain(range.clone());
@@ -1341,6 +1351,11 @@ impl Window {
     }
 
     fn enter_surroundings(&mut self, id: &GlobalElementId, unit: &Surroundings) -> SavedSurroundings {
+        self.enter_surroundings_in(id.scope_hash(), unit)
+    }
+
+    /// [`Self::enter_surroundings`] with the scope the layout requests are numbered under given as it was.
+    pub(super) fn enter_surroundings_in(&mut self, layout_scope: u64, unit: &Surroundings) -> SavedSurroundings {
         let lift_lists = unit.stacking_contexts.iter().map(|stacking| stacking.then(LiftList::default)).collect();
         let saved = SavedSurroundings {
             element_id_stack: mem::replace(&mut self.element_id_stack, unit.context.element_id_stack.clone()),
@@ -1353,7 +1368,7 @@ impl Window {
             lifts_open: mem::replace(&mut self.lifts_open, unit.lifts_open),
             hitbox_parent_stack: mem::replace(&mut self.hitbox_parent_stack, unit.hitbox_parent.into_iter().collect()),
             positioned_frames: mem::replace(&mut self.positioned_frames, unit.positioned_frame.into_iter().collect()),
-            layout_scope: mem::replace(&mut self.layout_scope, id.scope_hash()),
+            layout_scope: mem::replace(&mut self.layout_scope, layout_scope),
             pushed_image_cache: unit.image_cache.is_some(),
         };
         self.rendered_entity_stack.push(unit.context.current_view);
@@ -1368,7 +1383,7 @@ impl Window {
         saved
     }
 
-    fn leave_surroundings(&mut self, saved: SavedSurroundings) {
+    pub(super) fn leave_surroundings(&mut self, saved: SavedSurroundings) {
         if saved.pushed_image_cache {
             self.image_cache_stack.pop();
         }

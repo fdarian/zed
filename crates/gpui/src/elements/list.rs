@@ -22,9 +22,9 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 mod scroll_patch;
-pub(crate) use scroll_patch::ListFrame;
+pub(crate) use scroll_patch::{ListFrame, RowEntry};
 
-type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
+pub(crate) type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
 
 /// Construct a new list element
 pub fn list(
@@ -33,7 +33,7 @@ pub fn list(
 ) -> List {
     List {
         state,
-        render_item: Box::new(render_item),
+        render_item: Rc::new(RefCell::new(render_item)),
         style: StyleRefinement::default(),
         sizing_behavior: ListSizingBehavior::default(),
         interactivity: Interactivity::new(),
@@ -43,7 +43,7 @@ pub fn list(
 /// A list element
 pub struct List {
     state: ListState,
-    render_item: Box<RenderItemFn>,
+    render_item: Rc<RefCell<RenderItemFn>>,
     style: StyleRefinement,
     sizing_behavior: ListSizingBehavior,
     interactivity: Interactivity,
@@ -277,6 +277,9 @@ fn padding_box(bounds: Bounds<Pixels>, border: &Edges<Pixels>) -> Bounds<Pixels>
 }
 
 struct LayoutItemsResponse {
+    /// Where each row's part of the frame being built begins, and where the last one ends, when a scroll
+    /// patch may move the rows (see `window::scroll_patch`).
+    row_places: Vec<[usize; crate::window::FIELDS]>,
     max_item_width: Pixels,
     scroll_top: ListOffset,
     /// How far the scroll top is below the top of the first row in `item_layouts`: rows above the
@@ -1474,6 +1477,7 @@ impl StateInner {
         }
 
         LayoutItemsResponse {
+            row_places: Vec::new(),
             max_item_width,
             scroll_top,
             first_row_offset,
@@ -1525,7 +1529,12 @@ impl StateInner {
                 let scroll_snap = scrolled - round_to_device_half_up(scrolled, window.scale_factor());
                 let mut item_origin = unsnapped.origin + Point::new(padding.left, padding.top);
                 item_origin.y += scroll_snap - layout_response.first_row_offset;
+                let mut row_places = Vec::new();
+                let notes_places = window.scroll_patch_records();
                 for item in &mut layout_response.item_layouts {
+                    if notes_places {
+                        row_places.push(window.prepaint_place());
+                    }
                     window.with_exact_hit_mask(Some(clip), |window| {
                         window.scroll_patch_row(item.index);
                         item.element.prepaint_at_fractional(item_origin, window, cx);
@@ -1601,6 +1610,10 @@ impl StateInner {
 
                     item_origin.y += item.size.height;
                 }
+                if notes_places {
+                    row_places.push(window.prepaint_place());
+                }
+                layout_response.row_places = row_places;
             } else {
                 layout_response.item_layouts.clear();
             }
@@ -1749,7 +1762,7 @@ impl Element for List {
                         None,
                         available_height,
                         &padding,
-                        &mut self.render_item,
+                        &mut *self.render_item.borrow_mut(),
                         window,
                         cx,
                     );
@@ -1870,16 +1883,20 @@ impl Element for List {
 
         let escapes_before = window.escapes_prepainted();
         let list_id = scroll_routing::scroller_id_of_state(&self.state.0);
+        let mut row_surroundings = None;
         let layout = window.with_element_space(space.clone(), |window| {
             window.with_hitbox_parent(&hitbox, |window| {
                 window.scroll_patch_begin_list(list_id);
-                match state.prepaint_items(viewport, clip, unsnapped, padding, true, &mut self.render_item, window, cx) {
+                row_surroundings = window.capture_row_surroundings();
+                let mut render_item = self.render_item.borrow_mut();
+                let render_item = &mut *render_item;
+                match state.prepaint_items(viewport, clip, unsnapped, padding, true, render_item, window, cx) {
                     Ok(layout) => layout,
                     Err(autoscroll_request) => {
                         state.logical_scroll_top = Some(autoscroll_request);
                         window.scroll_patch_begin_list(list_id);
                         state
-                            .prepaint_items(viewport, clip, unsnapped, padding, false, &mut self.render_item, window, cx)
+                            .prepaint_items(viewport, clip, unsnapped, padding, false, render_item, window, cx)
                             .unwrap()
                     }
                 }
@@ -1891,7 +1908,16 @@ impl Element for List {
         state.last_content_width = Some(content_width);
         state.last_padding = Some(padding);
         if window.scroll_patch_records() {
-            let frame = state.frame_of(list_id, &self.state, &layout, viewport, padding);
+            let row_entry = row_surroundings.map(|prepaint| RowEntry {
+                render_item: self.render_item.clone(),
+                prepaint,
+                paint: None,
+                clip,
+                content_width,
+                prepaint_places: layout.row_places.clone(),
+                paint_places: Vec::new(),
+            });
+            let frame = state.frame_of(list_id, &self.state, &layout, viewport, padding, row_entry);
             window.scroll_patch_end_list(frame);
         }
         // The overlay reads the list state, which must not be borrowed meanwhile.
@@ -2013,8 +2039,17 @@ impl Element for List {
                         Some(clip),
                         escape_inside,
                         |window| {
+                            let mut places = Vec::new();
+                            let notes_places = window.scroll_patch_records();
                             for item in &mut layout.item_layouts {
+                                if notes_places {
+                                    places.push(window.paint_place());
+                                }
                                 item.element.paint(window, cx);
+                            }
+                            if notes_places {
+                                places.push(window.paint_place());
+                                window.scroll_patch_list_painted(scroller, window.capture_row_surroundings(), places);
                             }
                             if let Some(painter) = overlay_painter {
                                 painter(bounds, window, cx);
