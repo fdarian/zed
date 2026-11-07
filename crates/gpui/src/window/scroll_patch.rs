@@ -344,9 +344,10 @@ impl ScrollThumbMiss {
 }
 
 /// What the owner says of a bar, once the list is scrolled and before the frame is built: the
-/// bounds its thumb is painted at, if they are not the ones of the frame shown, or why it cannot
-/// be put there.
-pub type ScrollThumbPlan = Rc<dyn Fn(&Window) -> Result<Option<Bounds<Pixels>>, ScrollThumbMiss>>;
+/// bounds its thumb is painted at, if they are not the ones it is drawn at now, or why it cannot
+/// be put there. The second argument is where the thumb is drawn now: where the frame shown
+/// painted it, or where the last translate put it (`None` when the bar has no thumb quad).
+pub type ScrollThumbPlan = Rc<dyn Fn(&Window, Option<Bounds<Pixels>>) -> Result<Option<Bounds<Pixels>>, ScrollThumbMiss>>;
 
 /// Tells the owner that a frame moved the rows without building the bar: what its prepaint would
 /// have taken from the new position.
@@ -833,7 +834,11 @@ impl Window {
                 held.cause(ScrollPatchCause::ThumbTrack);
                 continue;
             }
-            match (thumb.plan)(self) {
+            let drawn = match thumb.paint {
+                ThumbPaint::Quad { bounds, .. } => Some(bounds),
+                ThumbPaint::Nothing | ThumbPaint::Untracked => None,
+            };
+            match (thumb.plan)(self, drawn) {
                 Ok(bounds) => thumbs.push((index, bounds)),
                 Err(miss) => held.cause(miss.cause()),
             }

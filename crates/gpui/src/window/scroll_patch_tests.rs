@@ -111,10 +111,9 @@ impl Render for Page {
                             color.a = alpha;
                             fill(Bar::thumb(&state, length, track), color)
                         });
-                        let at = Bar::thumb(&state, length, track);
                         let plan_state = state.clone();
                         let plan_bar = bar.clone();
-                        let plan = Rc::new(move |_: &Window| {
+                        let plan = Rc::new(move |_: &Window, drawn: Option<Bounds<crate::Pixels>>| {
                             if painted.0 <= 0. {
                                 return if plan_bar.alpha.get() > 0. { Err(ScrollThumbMiss::Appear) } else { Ok(None) };
                             }
@@ -130,7 +129,7 @@ impl Render for Page {
                             let mut next = Bar::thumb(&plan_state, painted.1, painted.2);
                             let moved_to = next;
                             next.origin.y += px(plan_bar.lie.get());
-                            Ok((moved_to != at).then_some(next))
+                            Ok((drawn != Some(moved_to)).then_some(next))
                         });
                         let told = bar.moved.clone();
                         let moved = Rc::new(move |_: &mut Window, _: &mut crate::App| told.set(told.get() + 1));
@@ -230,6 +229,21 @@ impl Fixture {
     fn scroll(&self, cx: &mut TestAppContext, x: f32, y: f32, by: f32) {
         self.point_at(cx, x, y);
         self.wheel_with(cx, x, y, by, |_, _| {});
+    }
+
+    /// As `scroll`, without the draw after the update: the frame shown is the one the update drew, which a translate leaves
+    /// as it made it.
+    fn scroll_once(&self, cx: &mut TestAppContext, x: f32, y: f32, by: f32) {
+        self.point_at(cx, x, y);
+        cx.update_window(self.window, |_, window, cx| {
+            let event = ScrollWheelEvent {
+                position: point(px(x), px(y)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
+                ..Default::default()
+            };
+            window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+        })
+        .unwrap();
     }
 
     fn counters(&self, cx: &mut TestAppContext) -> crate::ScrollPatchCounters {
@@ -739,13 +753,23 @@ fn a_translate_that_differs_from_the_frame_built_whole_is_a_mismatch(cx: &mut Te
 /// The frame shown after each of `wheels` with a bar on the list, the translate on or off, and how
 /// many frames told the bar.
 fn after_wheels_with_bar(cx: &mut TestAppContext, patch: bool, wheels: &[f32]) -> (Vec<String>, crate::ScrollPatchCounters, u32) {
+    after_wheels_with_bar_at(cx, patch, wheels, true)
+}
+
+/// As [`after_wheels_with_bar`], with rows that have a hitbox or not.
+fn after_wheels_with_bar_at(
+    cx: &mut TestAppContext,
+    patch: bool,
+    wheels: &[f32],
+    hitboxes: bool,
+) -> (Vec<String>, crate::ScrollPatchCounters, u32) {
     let bar = Bar::new();
-    let fixture = Fixture::with_bar(cx, &bar);
+    let fixture = Fixture::open(cx, Some(100.), hitboxes, false, Some(bar.clone()));
     fixture.with_window(cx, |window| window.set_scroll_patch(patch));
     let frames = wheels
         .iter()
         .map(|by| {
-            fixture.scroll(cx, 10., 12., *by);
+            fixture.scroll_once(cx, 10., 12., *by);
             fixture.with_window(cx, shown)
         })
         .collect();
@@ -764,6 +788,25 @@ fn a_translate_moves_the_thumb_of_the_bar_and_is_the_frame_built_whole(cx: &mut 
     for cause in ScrollPatchCause::ALL {
         assert_eq!(counters.held_cause(cause), 0, "{cause:?}: {counters:?}");
     }
+    for (frame, (translated, built)) in translated.iter().zip(&built).enumerate() {
+        assert!(
+            translated == built,
+            "frame {frame}, {counters:?}\n{}",
+            super::retained::first_difference(translated, built)
+        );
+    }
+}
+
+#[gpui::test]
+fn a_scroll_that_brings_the_thumb_back_to_where_the_frame_shown_painted_it_moves_it_back(cx: &mut TestAppContext) {
+    // The second and the fourth wheel put the rows, and the thumb, where the frame shown had them. The rows built are the first
+    // four, so 20 is as far as they move: the thumb moves by more than half a pixel. The rows have no hitbox, so the pointer is
+    // no reason.
+    let wheels = [20., -20., 18., -18., 3.];
+    let (translated, counters, _) = after_wheels_with_bar_at(cx, true, &wheels, false);
+    let (built, _, _) = after_wheels_with_bar_at(cx, false, &wheels, false);
+    assert_eq!(counters.patched, wheels.len() as u64, "{counters:?}");
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
     for (frame, (translated, built)) in translated.iter().zip(&built).enumerate() {
         assert!(
             translated == built,
