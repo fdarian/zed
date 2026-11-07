@@ -2631,6 +2631,10 @@ impl Window {
                 let mut recorder = mem::replace(&mut self.next_frame.scene, scene);
                 self.next_frame.scene.absorb_counts(&recorder);
                 operations = Some(recorder.take_operations());
+                // What it painted is in the recording now: the primitives its typed vectors still hold
+                // (path vertices, the pixel buffers of surfaces) would stay alive until the next
+                // relocation that takes it.
+                recorder.clear();
                 self.retained.spare_recorder = Some(recorder);
             }
         }

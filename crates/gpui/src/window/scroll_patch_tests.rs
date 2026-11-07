@@ -462,6 +462,15 @@ fn a_translate_takes_the_view_the_scroll_notified_off_the_queue(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn the_recorder_kept_for_the_next_relocation_holds_nothing_it_painted(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), false);
+    fixture.with_window(cx, |window| {
+        let spare = window.retained.spare_recorder.as_ref().expect("the rows were painted through a recorder");
+        assert_eq!(spare.describe_primitives(), "", "what a row painted is in its recording and not in the kept recorder");
+    });
+}
+
+#[gpui::test]
 fn a_scroll_animation_the_owner_reports_is_one(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| {
