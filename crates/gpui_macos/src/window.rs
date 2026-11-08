@@ -26,7 +26,7 @@ use cocoa::{
 };
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
+    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, DevicePixels, ExternalDragPayload,
     ExternalPaths, DragOperation, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NativeKey,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
@@ -2140,6 +2140,11 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    fn draw_with_damage(&self, scene: &gpui::Scene, damage: Option<Bounds<DevicePixels>>) {
+        let mut this = self.0.lock();
+        this.renderer.draw_with_damage(scene, damage);
+    }
+
     fn draw_composed(&self, scene: gpui::ComposedScene<'_>) {
         composition::report(composition::draw_composed(&self.0, scene));
     }
@@ -2402,6 +2407,12 @@ impl PlatformWindow for MacWindow {
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn shown_picture(&self) -> Result<Option<RgbaImage>> {
+        let mut this = self.0.lock();
+        this.renderer.shown_picture()
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {

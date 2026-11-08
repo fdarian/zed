@@ -796,12 +796,18 @@ impl Window {
             }
         }
         frame.hitboxes_changed();
+        self.damage.begin(&frame.scene);
+        if self.damage.enabled() {
+            self.damage.add_operations(&frame.scene.paint_operations[paint.start.scene_index..paint.end.scene_index]);
+            self.damage.add_operations(&splice.operations);
+        }
         match rebuild_scene {
             true => frame.scene.splice_operations(paint.start.scene_index..paint.end.scene_index, splice.operations),
             false => {
                 frame.scene.paint_operations.splice(paint.start.scene_index..paint.end.scene_index, splice.operations);
             }
         }
+        self.damage.end(&frame.scene);
     }
 
     /// Moves the starts of the recordings of the rendered frame that come after the part of the root, and

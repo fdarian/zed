@@ -1184,7 +1184,15 @@ impl Window {
             });
             let mut written = 0;
             if self.retained.verifier.is_some() && !translate_follows {
+                self.damage.begin(&self.rendered_frame.scene);
                 self.rendered_frame.scene.track_slots();
+                self.damage.end(&self.rendered_frame.scene);
+            }
+            self.damage.begin(&self.rendered_frame.scene);
+            if self.damage.enabled() {
+                for (at, new) in edits.clone() {
+                    self.damage.add_change(&self.rendered_frame.scene.paint_operations[at], new);
+                }
             }
             if self.rendered_frame.scene.patch_in_place(edits, &mut written) {
                 self.patch.counters.in_place_primitives += written;
@@ -1207,6 +1215,7 @@ impl Window {
                     }
                 }
             }
+            self.damage.end(&self.rendered_frame.scene);
         }
         for run in &runs {
             self.rendered_frame.scrollers[run.scrollers.1.clone()]

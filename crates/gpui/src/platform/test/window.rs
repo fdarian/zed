@@ -52,6 +52,7 @@ pub(crate) struct TestWindowState {
     last_mouse_movement: Point<Pixels>,
     scale_factor: f32,
     plain_draws: usize,
+    damage_draws: Vec<crate::window::DamageDraw>,
     last_composition_frame: Option<CompositionFrame>,
     composed_frames: usize,
     native_surface_events: Rc<RefCell<Vec<NativeSurfaceEvent>>>,
@@ -253,12 +254,18 @@ impl TestWindow {
             pointer_locked: false,
             last_mouse_movement: Point::default(),
             plain_draws: 0,
+            damage_draws: Vec::new(),
             last_composition_frame: None,
             composed_frames: 0,
             native_surface_events: Rc::new(RefCell::new(Vec::new())),
             next_native_surface: 0,
         })))
     }
+    /// The frames drawn with `draw_with_damage`, what each was told changed and what each held.
+    pub fn damage_draws(&self) -> Vec<crate::window::DamageDraw> {
+        self.0.lock().damage_draws.clone()
+    }
+
     /// How many frames were drawn with `draw`, which a window without native surfaces does.
     pub fn plain_draw_count(&self) -> usize {
         self.0.lock().plain_draws
@@ -614,6 +621,11 @@ impl PlatformWindow for TestWindow {
 
     fn draw(&self, scene: &Scene) {
         self.0.lock().plain_draws += 1;
+        self.draw_scene(scene);
+    }
+
+    fn draw_with_damage(&self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
+        self.0.lock().damage_draws.push(crate::window::DamageDraw::record(scene, damage));
         self.draw_scene(scene);
     }
 

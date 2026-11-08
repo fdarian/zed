@@ -66,12 +66,15 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+pub(crate) mod damage;
 mod patch;
 mod patch_splice;
 #[cfg(test)]
 mod contained_patch_tests;
 #[cfg(test)]
 mod hover_patch_tests;
+#[cfg(test)]
+mod damage_tests;
 #[cfg(test)]
 mod membership_patch_tests;
 #[cfg(test)]
@@ -87,6 +90,8 @@ mod scroll_patch_tests;
 mod splice_patch_tests;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
+#[cfg(any(test, feature = "test-support"))]
+pub use damage::DamageDraw;
 pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub use scroll_patch::{
@@ -2260,6 +2265,7 @@ pub struct Window {
     pub(crate) a11y: A11y,
     pub(crate) retained: RetainedWindow,
     pub(crate) patch: PatchWindow,
+    pub(crate) damage: damage::DamageLedger,
     /// What the frames drawn after a list scroll are classified by, see [`scroll_patch`].
     pub(crate) scroll_patch: ScrollPatchWindow,
 }
@@ -2700,6 +2706,7 @@ impl Window {
                                 }
                                 window.drawing_for_frame_request = true;
                                 let arena_clear_needed = window.draw(cx);
+                                crate::frame_kind::note_draw();
                                 window.drawing_for_frame_request = false;
                                 // A tick that patched nothing visible leaves the last picture
                                 // as it is.
@@ -3003,6 +3010,7 @@ impl Window {
             ),
             retained: RetainedWindow::default(),
             patch: PatchWindow::default(),
+            damage: damage::DamageLedger::new(),
             scroll_patch: ScrollPatchWindow::default(),
         })
     }
@@ -4207,6 +4215,14 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// The picture the platform keeps for a window that draws only what changed
+    /// ([`Window::set_partial_redraw`]): what the frames drawn in part added up to. It is what
+    /// [`Window::render_to_image`] draws when the damage was right.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shown_picture(&self) -> anyhow::Result<Option<image::RgbaImage>> {
+        self.platform_window.shown_picture()
+    }
+
     /// Returns the quads in the most recently rendered frame's scene, so tests can assert on
     /// painted output without rasterizing the frame. Quad bounds are in scaled pixels and are
     /// not clipped; each quad carries the content mask it will be clipped to when drawn. Quads
@@ -5305,7 +5321,9 @@ impl Window {
                 PatchedFrame::Patched => {
                     if self.scroll_patch.scrolled.is_none() {
                         if scene_deferred {
+                            self.damage.begin(&self.rendered_frame.scene);
                             self.rendered_frame.scene.rebuild_from_operations();
+                            self.damage.end(&self.rendered_frame.scene);
                         }
                         #[cfg(feature = "profiler")]
                         {
@@ -5419,6 +5437,7 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.damage.frame_built(&self.rendered_frame.scene);
         self.retained.rendered_serial += 1;
         self.patch.recordings_stale = false;
         self.patch.thumb_vanished = false;
@@ -5641,6 +5660,9 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        if crate::frame_kind::enabled() {
+            crate::frame_kind::note_present(self.patch.counters, &self.scroll_patch_counters());
+        }
         crate::composition::present(self);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -5658,6 +5680,7 @@ impl Window {
     /// This is intended for stable scenes whose external GPU resources changed,
     /// such as an atlas image updated in place.
     pub fn present_cached_frame(&mut self) {
+        self.damage.everything();
         self.present();
     }
 
@@ -5666,7 +5689,7 @@ impl Window {
     /// Benchmarks drive drawing synchronously rather than through a platform
     /// frame-request loop, so they call this after each measured update to
     /// submit the frame like production presentation would.
-    #[cfg(any(feature = "bench", all(test, feature = "profiler")))]
+    #[cfg(any(feature = "bench", feature = "test-support", all(test, feature = "profiler")))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
             self.present();

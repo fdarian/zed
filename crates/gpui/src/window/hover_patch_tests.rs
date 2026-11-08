@@ -16,11 +16,11 @@ const LIST: f32 = 100.;
 
 /// What the rows are, as the frame builds them and the patcher builds them again.
 #[derive(Default)]
-struct Knobs {
+pub(super) struct Knobs {
     /// The row that has the hover, if any.
     hot: Cell<Option<usize>>,
     /// The key of the rows: another one builds them again.
-    key: Cell<u64>,
+    pub(super) key: Cell<u64>,
     /// The rows that patchers are asked to repaint, by the next tick.
     patch: RefCell<Vec<usize>>,
     /// Whether the patcher builds the row with the colour of the hover, or as the frame did.
@@ -64,13 +64,13 @@ impl Render for Page {
     }
 }
 
-struct Fixture {
-    window: AnyWindowHandle,
-    knobs: Rc<Knobs>,
+pub(super) struct Fixture {
+    pub(super) window: AnyWindowHandle,
+    pub(super) knobs: Rc<Knobs>,
 }
 
 impl Fixture {
-    fn new(cx: &mut TestAppContext) -> Self {
+    pub(super) fn new(cx: &mut TestAppContext) -> Self {
         Self::with_transparent(cx, false)
     }
 
@@ -104,12 +104,12 @@ impl Fixture {
         fixture
     }
 
-    fn draw(&self, cx: &mut TestAppContext) {
+    pub(super) fn draw(&self, cx: &mut TestAppContext) {
         cx.update_window(self.window, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
     }
 
     /// Draws the tick that patches `rows` to the colour of the hover (or back).
-    fn patch(&self, cx: &mut TestAppContext, rows: &[usize], painted: bool) {
+    pub(super) fn patch(&self, cx: &mut TestAppContext, rows: &[usize], painted: bool) {
         *self.knobs.patch.borrow_mut() = rows.to_vec();
         self.knobs.painted.set(painted);
         cx.update_window(self.window, |_, window, cx| {
@@ -120,7 +120,7 @@ impl Fixture {
     }
 
     /// Builds the rows with `hot` as the one under the pointer, in a frame built whole.
-    fn whole(&self, cx: &mut TestAppContext, hot: Option<usize>) {
+    pub(super) fn whole(&self, cx: &mut TestAppContext, hot: Option<usize>) {
         self.knobs.hot.set(hot);
         cx.update_window(self.window, |_, window, cx| {
             window.refresh();
@@ -129,7 +129,7 @@ impl Fixture {
         .unwrap();
     }
 
-    fn wheel(&self, cx: &mut TestAppContext, by: f32) {
+    pub(super) fn wheel(&self, cx: &mut TestAppContext, by: f32) {
         cx.update_window(self.window, |_, window, cx| {
             let event = ScrollWheelEvent {
                 position: point(px(10.), px(10.)),

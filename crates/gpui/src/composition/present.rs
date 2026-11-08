@@ -196,8 +196,12 @@ fn placement(placeholder: &NativeSurfacePlaceholder, scale_factor: f32, window: 
 /// Shows the frame the window last drew. A window that never made a native surface hands its scene
 /// to the platform whole, as if there were no composition.
 pub(crate) fn present(window: &mut Window) {
+    let damage = window.take_damage();
     let Some(state) = window.composition.state.clone() else {
-        window.platform_window.draw(&window.rendered_frame.scene);
+        match window.partial_redraw() {
+            true => window.platform_window.draw_with_damage(&window.rendered_frame.scene, damage),
+            false => window.platform_window.draw(&window.rendered_frame.scene),
+        }
         return;
     };
     let scale_factor = window.scale_factor();

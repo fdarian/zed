@@ -892,6 +892,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Like [`PlatformWindow::draw`] for a window that asked to draw only what changed (see
+    /// [`Window::set_partial_redraw`]): `damage` is the part of the window, in device pixels, in which
+    /// `scene` can differ from the scene that was drawn before, and `None` is all of it. A platform
+    /// that cannot draw part of a window draws all of it.
+    fn draw_with_damage(&self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
+        let _ = damage;
+        self.draw(scene);
+    }
     /// Draws a frame that has native surfaces (see [`NativeSurface`](crate::NativeSurface)): the GPUI layers each
     /// draw the primitives of `scene` in their order range, the native layers are placed between
     /// them, bottom to top. Every frame lists every layer: a layer missing from a frame no longer
@@ -1079,6 +1087,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
+    }
+
+    /// The picture a window that draws part of the frame (see [`PlatformWindow::draw_with_damage`])
+    /// keeps, or `None` if it keeps none: what the pictures of the frames drawn in part add up to, to
+    /// be compared with [`PlatformWindow::render_to_image`] of the scene they were drawn from.
+    #[cfg(any(test, feature = "test-support"))]
+    fn shown_picture(&self) -> Result<Option<RgbaImage>> {
+        Ok(None)
     }
 }
 

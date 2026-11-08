@@ -104,6 +104,10 @@ pub struct Scene {
     /// put. The log is the one the rebuild takes the operations from, so an operation is counted
     /// and not recorded, which would be a copy of every primitive and a drop of the old one.
     rebuilt: Option<usize>,
+    /// How many times the scene was cleared, which is what a rebuild does first: a rebuild that
+    /// changes what it shows has to be accounted for by whoever tracks the damage of the picture
+    /// (see [`crate::window::damage`]), and one that is not is seen by this having moved.
+    revision: u64,
 }
 
 /// Where the primitive an operation painted is in the sorted typed vectors of the scene.
@@ -193,6 +197,7 @@ pub struct EffectGroup {
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
+        self.revision += 1;
         clear_shrinking(&mut self.paint_operations);
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -1957,6 +1962,66 @@ fn primitive_placement(primitive: &Primitive) -> Placement {
         Placement::Nowhere
     } else {
         Placement::Slot { kind: primitive.kind(), drawn }
+    }
+}
+
+/// Where an operation draws, for the damage of a picture (see [`crate::window::damage`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Extent {
+    /// Nothing: the content mask clips the primitive away, or it is a pending glyph.
+    Nowhere,
+    /// Pixels inside this area, in window space and device pixels, and none outside it.
+    Area(Bounds<ScaledPixels>),
+    /// A mark (a layer, a mask, a text clip): it draws nothing, and sets how the primitives around it
+    /// are ordered and clipped.
+    Mark,
+    /// A group, a native surface or a surface of video frames: what it does to the pixels is not a box.
+    Unknown,
+}
+
+impl PaintOperation {
+    pub(crate) fn extent(&self) -> Extent {
+        match self {
+            PaintOperation::Primitive(Primitive::Surface(_)) => Extent::Unknown,
+            PaintOperation::Primitive(primitive) => slot_extent(primitive_placement(primitive)),
+            // A quad that is drawn as strips draws inside the box it is a part of.
+            PaintOperation::Quad(quad) => {
+                let clipped = quad.window_bounds().intersect(&quad.content_mask.bounds);
+                if clipped.is_empty() { Extent::Nowhere } else { Extent::Area(clipped) }
+            }
+            PaintOperation::Image(sprite) => slot_extent(primitive_placement(&Primitive::PolychromeSprite(*sprite))),
+            PaintOperation::PendingGlyph(_) => Extent::Nowhere,
+            PaintOperation::NativeSurface(_) | PaintOperation::StartGroup { .. } | PaintOperation::EndGroup => Extent::Unknown,
+            PaintOperation::StartLayer(_)
+            | PaintOperation::EndLayer
+            | PaintOperation::WidenGroups(_)
+            | PaintOperation::StartTextClip
+            | PaintOperation::EndTextClip
+            | PaintOperation::Replaced { .. }
+            | PaintOperation::EndReplaced => Extent::Mark,
+        }
+    }
+}
+
+fn slot_extent(placement: Placement) -> Extent {
+    match placement {
+        Placement::Nowhere => Extent::Nowhere,
+        Placement::Slot { drawn, .. } => Extent::Area(drawn),
+        Placement::Other => Extent::Unknown,
+    }
+}
+
+impl Scene {
+    /// How many times the scene was cleared since it was made.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Whether the scene holds something whose pixels are not a function of its primitives drawn
+    /// inside a box: an effect group (which reads and writes the picture around it), a native
+    /// surface or a surface of video frames.
+    pub(crate) fn has_unboxed_content(&self) -> bool {
+        !self.groups.is_empty() || !self.native_surfaces.is_empty() || !self.surfaces.is_empty()
     }
 }
 
