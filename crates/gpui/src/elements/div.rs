@@ -24,7 +24,7 @@ use crate::{
     LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, OverflowAnchor, OverscrollBehavior,
     ParentElement, Position, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
+    StyleRefinement, Styled, Task, TooltipId, TransformationMatrix, Visibility, Window, WindowControlArea, point, px,
     scroll_routing, size,
     sticky::{self, StickyInsets},
     tab_stop::PaintedChild,
@@ -759,6 +759,57 @@ impl Interactivity {
     }
 }
 
+/// What a [`LayoutProbe`] read of an element's layout in prepaint, for it to report in paint.
+#[derive(Clone, Copy)]
+pub struct LayoutSample {
+    /// See [`Window::layout_unsnapped_bounds`].
+    pub border_box: Bounds<Pixels>,
+    /// How far the scrollable overflow of the element reaches, or its border box.
+    pub content: Size<Pixels>,
+    /// The window's scale factor.
+    pub scale: f32,
+    /// Prepaint walked the element as part of a culled subtree.
+    pub culled: bool,
+    /// See [`Window::layout_to_window`].
+    pub to_window: TransformationMatrix,
+    /// See [`Window::layout_faces_away`].
+    pub faces_away: bool,
+}
+
+/// Observes the layout of the elements that carry it ([`InteractiveElement::layout_probe`]).
+pub trait LayoutProbe {
+    /// The element is prepainted: layout has produced its box and nothing is painted yet.
+    fn prepainted(
+        &self,
+        key: u64,
+        flags: u8,
+        bounds: Bounds<Pixels>,
+        layout_id: LayoutId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> LayoutSample;
+
+    /// The element is painted, or reports as if it was ([`Window::publish_layout`]), with what
+    /// `prepainted` returned for it.
+    fn painted(
+        &self,
+        key: u64,
+        flags: u8,
+        sample: LayoutSample,
+        bounds: Bounds<Pixels>,
+        layout_id: LayoutId,
+        window: &mut Window,
+        cx: &mut App,
+    );
+}
+
+pub(crate) struct LayoutProbeBinding {
+    probe: Rc<dyn LayoutProbe>,
+    key: u64,
+    flags: u8,
+    sample: Option<LayoutSample>,
+}
+
 /// A trait for elements that want to use the standard GPUI event handlers that don't
 /// require any state.
 pub trait InteractiveElement: Sized {
@@ -834,6 +885,17 @@ pub trait InteractiveElement: Sized {
         self.interactivity()
             .prepaint_layout_listeners
             .push(Box::new(listener));
+        self
+    }
+
+    /// Reports the element's layout the way [`InteractiveElement::on_prepainted_layout`] and
+    /// [`InteractiveElement::on_painted_layout`] do together, to one `probe` shared by the elements
+    /// that use it, which is told apart by `key` and `flags`: nothing is allocated for the
+    /// element, where two listeners are boxed. `probe` is called for the prepaint first and for
+    /// the paint after it, before the listeners of `on_painted` and `on_painted_layout`, and in
+    /// the same passes.
+    fn layout_probe(mut self, probe: Rc<dyn LayoutProbe>, key: u64, flags: u8) -> Self {
+        self.interactivity().layout_probe = Some(LayoutProbeBinding { probe, key, flags, sample: None });
         self
     }
 
@@ -2948,6 +3010,7 @@ pub struct Interactivity {
         Option<Rc<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
     pub(crate) prepaint_layout_listeners:
         Vec<Box<dyn Fn(Bounds<Pixels>, LayoutId, &mut Window, &mut App)>>,
+    pub(crate) layout_probe: Option<LayoutProbeBinding>,
     pub(crate) layout_id: Option<LayoutId>,
     /// The borders a `display: table` element paints, once its content is painted, in place of the
     /// borders of its own. See [`InteractiveElement::collapsed_borders`].
@@ -3158,6 +3221,10 @@ impl Interactivity {
 
         let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
         if let Some(layout_id) = self.layout_id {
+            if let Some(binding) = self.layout_probe.as_mut() {
+                window.note_publication();
+                binding.sample = Some(binding.probe.prepainted(binding.key, binding.flags, bounds, layout_id, window, cx));
+            }
             for listener in prepaint_layout_listeners {
                 window.note_publication();
                 listener(bounds, layout_id, window, cx);
@@ -3280,6 +3347,10 @@ impl Interactivity {
 
         let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
         if let Some(layout_id) = self.layout_id {
+            if let Some(binding) = self.layout_probe.as_mut() {
+                window.note_publication();
+                binding.sample = Some(binding.probe.prepainted(binding.key, binding.flags, bounds, layout_id, window, cx));
+            }
             for listener in prepaint_layout_listeners {
                 window.note_publication();
                 listener(bounds, layout_id, window, cx);
@@ -3370,6 +3441,13 @@ impl Interactivity {
     /// What paint reports to the `on_painted` and `on_painted_layout` listeners of an element,
     /// under the visibility it is painted with.
     pub(crate) fn run_paint_listeners(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        if let Some(binding) = self.layout_probe.take()
+            && let Some(layout_id) = self.layout_id
+            && let Some(sample) = binding.sample
+        {
+            window.note_publication();
+            binding.probe.painted(binding.key, binding.flags, sample, bounds, layout_id, window, cx);
+        }
         if let Some(listener) = self.paint_bounds_listener.take() {
             window.note_publication();
             listener(bounds, window, cx);
@@ -3389,11 +3467,17 @@ impl Interactivity {
             .paint_layout_listener
             .clone()
             .zip(self.layout_id);
-        if bounds_listener.is_none() && layout_listener.is_none() {
+        let probe = self.layout_probe.as_ref().and_then(|binding| {
+            Some((binding.probe.clone(), binding.key, binding.flags, binding.sample?, self.layout_id?))
+        });
+        if bounds_listener.is_none() && layout_listener.is_none() && probe.is_none() {
             return;
         }
         window.publish_layout(move |window, cx| {
             window.with_visibility(visibility, |window| {
+                if let Some((probe, key, flags, sample, layout_id)) = &probe {
+                    probe.painted(*key, *flags, *sample, bounds, *layout_id, window, cx);
+                }
                 if let Some(listener) = &bounds_listener {
                     listener(bounds, window, cx);
                 }
@@ -6247,6 +6331,72 @@ mod tests {
         assert_eq!(insets.border.left, px(3.));
         assert_eq!(insets.border.bottom, px(2.));
         assert_eq!(insets.border.top, px(0.));
+    }
+
+    struct RecordingProbe(RefCell<Vec<&'static str>>);
+
+    impl LayoutProbe for RecordingProbe {
+        fn prepainted(
+            &self,
+            key: u64,
+            flags: u8,
+            bounds: Bounds<Pixels>,
+            layout_id: LayoutId,
+            window: &mut Window,
+            _: &mut App,
+        ) -> LayoutSample {
+            assert_eq!((key, flags), (7, 3));
+            self.0.borrow_mut().push("prepainted");
+            LayoutSample {
+                border_box: window.layout_unsnapped_bounds(layout_id),
+                content: bounds.size,
+                scale: 1.,
+                culled: false,
+                to_window: TransformationMatrix::unit(),
+                faces_away: false,
+            }
+        }
+
+        fn painted(
+            &self,
+            key: u64,
+            flags: u8,
+            sample: LayoutSample,
+            bounds: Bounds<Pixels>,
+            _: LayoutId,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            assert_eq!((key, flags), (7, 3));
+            assert_eq!(sample.content, bounds.size);
+            self.0.borrow_mut().push("painted");
+        }
+    }
+
+    struct ProbedView(Rc<RecordingProbe>);
+
+    impl Render for ProbedView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let probe: Rc<dyn LayoutProbe> = self.0.clone();
+            div().w(px(50.)).h(px(20.)).layout_probe(probe, 7, 3)
+        }
+    }
+
+    #[gpui::test]
+    fn a_layout_probe_hears_prepaint_then_paint(cx: &mut TestAppContext) {
+        let probe = Rc::new(RecordingProbe(RefCell::new(Vec::new())));
+        let window = cx.add_window({
+            let probe = probe.clone();
+            move |_, _| ProbedView(probe)
+        });
+        let any_window = AnyWindowHandle::from(window);
+
+        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        let heard = probe.0.borrow();
+        assert!(!heard.is_empty() && heard.len() % 2 == 0);
+        assert!(heard.chunks(2).all(|draw| draw == ["prepainted", "painted"]));
     }
 
     struct ContainedItems {

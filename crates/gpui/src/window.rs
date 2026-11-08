@@ -1508,6 +1508,39 @@ pub(crate) enum LiftedContent {
     Replay(Option<Box<dyn FnOnce(&mut Window, &mut App)>>),
 }
 
+/// Puts `entries` in paint order: by z-index, then by place in the tree.
+///
+/// Elements are handed over when their prepaint ends, so a parent follows its children where the
+/// tree order has it first, and nearly every context has to move entries. An entry is several
+/// hundred bytes, so the order is found on small keys and each entry is moved once, where sorting
+/// the entries themselves moves them at every pass.
+fn sort_lifted(entries: &mut [LiftedElement]) {
+    sort_by_distinct_key(entries, |entry| (entry.z, entry.ordinal));
+}
+
+/// A sort by a key no two items share, for items that are costly to move.
+fn sort_by_distinct_key<T, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K) {
+    if items.windows(2).all(|pair| key(&pair[0]) <= key(&pair[1])) {
+        return;
+    }
+    let mut source: Vec<u32> = (0..items.len() as u32).collect();
+    source.sort_unstable_by_key(|&at| key(&items[at as usize]));
+    // `source[to]` is where the item that belongs at `to` is now: follow each cycle of the
+    // permutation, placing what belongs at `to` with one swap.
+    for start in 0..source.len() {
+        let mut to = start;
+        loop {
+            let from = source[to] as usize;
+            source[to] = to as u32;
+            if from == start {
+                break;
+            }
+            items.swap(to, from);
+            to = from;
+        }
+    }
+}
+
 #[derive(Default)]
 struct LiftList {
     entries: Vec<LiftedElement>,
@@ -7153,7 +7186,7 @@ impl Window {
             Some(Some(list)) => list.entries,
             _ => panic!("end_stacking_context without begin_stacking_context"),
         };
-        entries.sort_by_key(|entry| (entry.z, entry.ordinal));
+        sort_lifted(&mut entries);
         let first_above = entries.partition_point(|entry| entry.z < 0);
         let hitboxes = &mut self.next_frame.hitboxes;
         let mut below = Vec::new();
@@ -12185,6 +12218,32 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use super::point_in_rounded_rect;
+
+    #[test]
+    fn sorting_by_a_distinct_key_in_place_agrees_with_the_standard_sort() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for length in [0usize, 1, 2, 3, 7, 64, 250] {
+            let mut items: Vec<(i32, u32, [u8; 40])> = (0..length as u32)
+                .map(|ordinal| ((next() % 4) as i32 - 1, ordinal, [ordinal as u8; 40]))
+                .collect();
+            for at in (1..items.len()).rev() {
+                items.swap(at, (next() % (at as u64 + 1)) as usize);
+            }
+            let mut expected = items.iter().map(|item| (item.0, item.1)).collect::<Vec<_>>();
+            expected.sort();
+            super::sort_by_distinct_key(&mut items, |item| (item.0, item.1));
+            let sorted = items.iter().map(|item| (item.0, item.1)).collect::<Vec<_>>();
+            assert_eq!(sorted, expected);
+            assert!(items.iter().all(|item| item.2 == [item.1 as u8; 40]));
+        }
+    }
+
     use crate::{ContentMask, CornerRadii, FontId, GlyphId, ScaledPixels, UnderlineStyle};
     use std::{
         cell::{Cell, RefCell},
