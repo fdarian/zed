@@ -914,6 +914,21 @@ impl ListState {
         self.0.borrow_mut().set_offset_from_scrollbar(point);
     }
 
+    /// [`Self::set_offset_from_scrollbar`] for a user dragging the scrollbar or clicking its
+    /// track: the scroll handler hears of it as it hears of the wheel, with the rows the list shows
+    /// at the new offset, unless the offset (and whether the list follows its tail) stays what it was.
+    /// A list that has not been laid out has no rows to report.
+    pub fn set_offset_from_scrollbar_by_user(
+        &self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0
+            .borrow_mut()
+            .set_offset_from_scrollbar_by_user(point, window, cx);
+    }
+
     /// Returns the maximum scroll offset according to the items we have measured.
     /// This value remains constant while dragging to prevent the scrollbar from moving away unexpectedly.
     pub fn max_offset_for_scrollbar(&self) -> Point<Pixels> {
@@ -1783,6 +1798,45 @@ impl StateInner {
     }
 
     // Scrollbar support
+
+    fn set_offset_from_scrollbar_by_user(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let position = |state: &Self| {
+            let offset = state.logical_scroll_top();
+            (
+                offset.item_ix,
+                offset.offset_in_item,
+                matches!(state.follow_state, FollowState::Tail { is_following: true }),
+            )
+        };
+        let before = position(self);
+        self.set_offset_from_scrollbar(point);
+        if position(self) == before || self.scroll_handler.is_none() {
+            return;
+        }
+        let (Some(bounds), Some(padding)) = (self.last_layout_bounds, self.last_padding) else {
+            return;
+        };
+        let visible_range = Self::visible_range(
+            &self.items,
+            bounds.size.height,
+            padding.top,
+            &self.logical_scroll_top(),
+        );
+        let event = ListScrollEvent {
+            visible_range,
+            count: self.items.summary().count,
+            is_scrolled: self.logical_scroll_top.is_some(),
+            is_following_tail: matches!(self.follow_state, FollowState::Tail { is_following: true }),
+        };
+        if let Some(handler) = self.scroll_handler.as_mut() {
+            handler(&event, window, cx);
+        }
+    }
 
     fn set_offset_from_scrollbar(&mut self, point: Point<Pixels>) {
         let new_scroll_top = (-point.y).max(px(0.));
@@ -4130,5 +4184,60 @@ mod test {
             }
             assert!(checked >= 10, "declared {declared}: {checked} scrolls reported");
         }
+    }
+
+    /// A user dragging the scrollbar reports the rows at each new offset, as a wheel does; the write
+    /// that an embedder makes with `set_offset_from_scrollbar` reports nothing.
+    #[gpui::test]
+    fn test_a_scrollbar_drag_reports_the_visible_range_a_wheel_reports(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| window.set_scale_factor(1.));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let state = ListState::new(40, crate::ListAlignment::Top, px(20.)).with_uniform_item_height(px(33.));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        state.set_scroll_handler(move |event, _, _| {
+            recorded.borrow_mut().push((event.visible_range.clone(), event.count, event.is_scrolled, event.is_following_tail));
+        });
+
+        // Nothing is laid out yet, so there are no rows to report.
+        cx.update(|window, cx| state.set_offset_from_scrollbar_by_user(point(px(0.), px(-100.)), window, cx));
+        assert!(events.borrow().is_empty());
+
+        draw_bordered_list(&state, &seen, cx);
+        state.scrollbar_drag_started();
+        let mut reported = 0;
+        for to in [-50., -50., -400., -401., -30., -1e6, -1e6, 0., -250.] {
+            events.borrow_mut().clear();
+            let before = state.logical_scroll_top();
+            cx.update(|window, cx| state.set_offset_from_scrollbar_by_user(point(px(0.), px(to)), window, cx));
+            let after = state.logical_scroll_top();
+            let moved = (before.item_ix, before.offset_in_item) != (after.item_ix, after.offset_in_item);
+            let events = events.borrow();
+            if !moved {
+                assert!(events.is_empty(), "a drag to {to} that moves nothing reports {events:?}");
+                continue;
+            }
+            assert_eq!(events.len(), 1, "drag to {to}");
+            assert_eq!(Some(&events[0].0), state.visible_range_at(after).as_ref(), "drag to {to}");
+            assert_eq!((events[0].1, events[0].2, events[0].3), (40, true, false), "drag to {to}");
+            reported += 1;
+            drop(events);
+            draw_bordered_list(&state, &seen, cx);
+        }
+        state.scrollbar_drag_ended();
+        assert!(reported >= 5, "{reported} drags reported");
+
+        events.borrow_mut().clear();
+        state.set_offset_from_scrollbar(point(px(0.), px(-300.)));
+        assert!(events.borrow().is_empty(), "the write of an embedder is not reported");
+
+        draw_bordered_list(&state, &seen, cx);
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(30.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            ..Default::default()
+        });
+        assert_eq!(events.borrow().len(), 1, "the wheel reports as it did");
     }
 }

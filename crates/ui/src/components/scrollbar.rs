@@ -777,8 +777,8 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
         &self.scroll_handle
     }
 
-    fn set_offset(&mut self, offset: Point<Pixels>, cx: &mut Context<Self>) {
-        self.scroll_handle.set_offset(offset);
+    fn set_offset(&mut self, offset: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_handle.set_offset_by_user(offset, window, cx);
         self.notify_parent(cx);
         cx.notify();
     }
@@ -980,6 +980,10 @@ impl ScrollableHandle for ListState {
         self.set_offset_from_scrollbar(point);
     }
 
+    fn set_offset_by_user(&self, point: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        self.set_offset_from_scrollbar_by_user(point, window, cx);
+    }
+
     fn offset(&self) -> Point<Pixels> {
         self.scroll_px_offset_for_scrollbar()
     }
@@ -1018,6 +1022,11 @@ impl ScrollableHandle for ScrollHandle {
 pub trait ScrollableHandle: 'static + Any + Sized + Clone {
     fn max_offset(&self) -> Point<Pixels>;
     fn set_offset(&self, point: Point<Pixels>);
+    /// Sets the offset for a user dragging the thumb or clicking the track, which a handle that
+    /// reports scrolls to its owner reports.
+    fn set_offset_by_user(&self, point: Point<Pixels>, _window: &mut Window, _cx: &mut App) {
+        self.set_offset(point);
+    }
     fn offset(&self) -> Point<Pixels>;
     fn viewport(&self) -> Bounds<Pixels>;
     fn drag_started(&self) {}
@@ -1542,6 +1551,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                             );
                             state.set_offset(
                                 scroll_handle.offset().apply_along(*axis, |_| click_offset),
+                                window,
                                 cx,
                             );
                         };
@@ -1583,7 +1593,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                                 let new_offset =
                                     scroll_handle.offset().apply_along(axis, |_| drag_offset);
 
-                                state.update(cx, |state, cx| state.set_offset(new_offset, cx));
+                                state.update(cx, |state, cx| state.set_offset(new_offset, window, cx));
                                 cx.stop_propagation();
                             }
                         }
