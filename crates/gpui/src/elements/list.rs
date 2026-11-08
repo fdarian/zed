@@ -685,6 +685,16 @@ impl ListState {
         self.0.borrow_mut().scroll_handler = Some(Box::new(handler))
     }
 
+    /// The rows a scroll to `offset` reports in [`ListScrollEvent::visible_range`]: the rows in the
+    /// padding box, those in the top padding included, from the last layout's size and the rows as
+    /// measured now. `None` before the list has been laid out.
+    pub fn visible_range_at(&self, offset: ListOffset) -> Option<Range<usize>> {
+        let state = self.0.borrow();
+        let bounds = state.last_layout_bounds?;
+        let padding = state.last_padding?;
+        Some(StateInner::visible_range(&state.items, bounds.size.height, padding.top, &offset))
+    }
+
     /// Get the current scroll offset, in terms of the list's items.
     pub fn logical_scroll_top(&self) -> ListOffset {
         self.0.borrow().logical_scroll_top()
@@ -4078,5 +4088,47 @@ mod test {
 
         // The padding box shows the rows from 16 to 91 (75 tall): rows 0 to 4.
         assert_eq!(ranges.borrow().as_slice(), &[0..5]);
+    }
+
+    /// What a scroll to an offset reports is what `visible_range_at` says of the offset the scroll left,
+    /// at any padding, with rows measured, hinted or declared.
+    #[gpui::test]
+    fn test_visible_range_at_is_the_range_a_wheel_reports(cx: &mut TestAppContext) {
+        let fresh = ListState::new(40, crate::ListAlignment::Top, px(20.));
+        assert_eq!(fresh.visible_range_at(gpui::ListOffset { item_ix: 0, offset_in_item: px(0.) }), None);
+
+        for declared in [false, true] {
+            let cx = cx.add_empty_window();
+            cx.update(|window, _| window.set_scale_factor(1.));
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let state = ListState::new(40, crate::ListAlignment::Top, px(20.)).with_uniform_item_height(px(33.));
+            if declared {
+                state.set_exact_item_size(|_, width| Some(size(width?, px(20.))));
+            }
+            let reported = Rc::new(RefCell::new(Vec::new()));
+            let recorded = reported.clone();
+            state.set_scroll_handler(move |event, _, _| recorded.borrow_mut().push(event.visible_range.clone()));
+            draw_bordered_list(&state, &seen, cx);
+
+            let mut checked = 0;
+            for (step, by) in [-1., -7., -25., -3., -40., -130., 60., -300., -500., 700., -20., -19., 200., -2.].into_iter().enumerate() {
+                reported.borrow_mut().clear();
+                cx.simulate_event(ScrollWheelEvent {
+                    position: point(px(50.), px(30.)),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(by))),
+                    ..Default::default()
+                });
+                // Before any draw measures what the scroll moved to, so the rows are as the wheel found them.
+                if let Some(range) = reported.borrow().last() {
+                    let at = state.visible_range_at(state.logical_scroll_top());
+                    assert_eq!(at.as_ref(), Some(range), "declared {declared}, step {step}: {:?}", state.logical_scroll_top());
+                    checked += 1;
+                }
+                if step % 3 == 2 {
+                    draw_bordered_list(&state, &seen, cx);
+                }
+            }
+            assert!(checked >= 10, "declared {declared}: {checked} scrolls reported");
+        }
     }
 }
