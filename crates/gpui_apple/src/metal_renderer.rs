@@ -3067,8 +3067,7 @@ fn new_command_encoder_for_texture<'a>(
         .unwrap();
     color_attachment.set_texture(Some(texture));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
-    let probe = std::env::var("GPUI_PROBE_SCISSOR").ok();
-    if let (Some(clear_color), None) = (clear_color, &probe) {
+    if let Some(clear_color) = clear_color {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(clear_color);
     } else {
@@ -3076,15 +3075,6 @@ fn new_command_encoder_for_texture<'a>(
     }
 
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
-    if let Some(probe) = probe {
-        let side: u64 = probe.parse().unwrap_or(64);
-        command_encoder.set_scissor_rect(metal::MTLScissorRect {
-            x: 600,
-            y: 300,
-            width: side,
-            height: side,
-        });
-    }
     command_encoder.set_viewport(metal::MTLViewport {
         originX: 0.0,
         originY: 0.0,
