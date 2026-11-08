@@ -681,11 +681,16 @@ impl Window {
             Some(edit) => self.rendered_frame.scroll.edit_runs(edit, pre_cut.delta[HITBOXES], paint_cut.delta[OPERATIONS]),
             None => self.rendered_frame.scroll.remap_runs(&mut |hitboxes, operations| {
                 // A run is told apart from the root by whichever of its two places the root has
-                // something in.
+                // something in. A root that has nothing in either is a point, and a run is before or
+                // after it by the vector the run has something in.
                 let place = if !hitboxes_part.is_empty() {
                     single_place(&hitboxes_part, hitboxes)
-                } else {
+                } else if !operations_part.is_empty() {
                     single_place(&operations_part, operations)
+                } else if !hitboxes.is_empty() {
+                    Some(place_in_part(&hitboxes_part, hitboxes))
+                } else {
+                    Some(place_in_part(&operations_part, operations))
                 };
                 match place {
                     None | Some(Place::Inside) => false,
