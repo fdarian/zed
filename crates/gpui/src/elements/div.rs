@@ -3219,17 +3219,7 @@ impl Interactivity {
         self.content_size = content_size;
         self.projection_scale = window.take_projection_scale();
 
-        let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
-        if let Some(layout_id) = self.layout_id {
-            if let Some(binding) = self.layout_probe.as_mut() {
-                window.note_publication();
-                binding.sample = Some(binding.probe.prepainted(binding.key, binding.flags, bounds, layout_id, window, cx));
-            }
-            for listener in prepaint_layout_listeners {
-                window.note_publication();
-                listener(bounds, layout_id, window, cx);
-            }
-        }
+        self.run_prepaint_listeners(bounds, window, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         window.with_inspector_state(
@@ -3345,17 +3335,7 @@ impl Interactivity {
     ) -> R {
         self.content_size = content_size;
 
-        let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
-        if let Some(layout_id) = self.layout_id {
-            if let Some(binding) = self.layout_probe.as_mut() {
-                window.note_publication();
-                binding.sample = Some(binding.probe.prepainted(binding.key, binding.flags, bounds, layout_id, window, cx));
-            }
-            for listener in prepaint_layout_listeners {
-                window.note_publication();
-                listener(bounds, layout_id, window, cx);
-            }
-        }
+        self.run_prepaint_listeners(bounds, window, cx);
 
         // A culled element is not hit, but a focused one keeps its place in the focus path.
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
@@ -3436,6 +3416,21 @@ impl Interactivity {
                 }
             });
         });
+    }
+
+    /// What prepaint reports to the layout probe and the `on_prepainted_layout` listeners of an element.
+    pub(crate) fn run_prepaint_listeners(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let prepaint_layout_listeners = std::mem::take(&mut self.prepaint_layout_listeners);
+        if let Some(layout_id) = self.layout_id {
+            if let Some(binding) = self.layout_probe.as_mut() {
+                window.note_publication();
+                binding.sample = Some(binding.probe.prepainted(binding.key, binding.flags, bounds, layout_id, window, cx));
+            }
+            for listener in prepaint_layout_listeners {
+                window.note_publication();
+                listener(bounds, layout_id, window, cx);
+            }
+        }
     }
 
     /// What paint reports to the `on_painted` and `on_painted_layout` listeners of an element,

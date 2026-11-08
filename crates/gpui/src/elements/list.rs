@@ -2084,13 +2084,7 @@ impl Element for List {
         drop(state_guard);
         // After the rows: they are built here, not before layout, and a listener that asks whether
         // what they were built from still holds (a container query) has to see what they read.
-        let prepaint_layout_listeners = std::mem::take(&mut self.interactivity.prepaint_layout_listeners);
-        if let Some(layout_id) = self.interactivity.layout_id {
-            for listener in prepaint_layout_listeners {
-                window.note_publication();
-                listener(bounds, layout_id, window, cx);
-            }
-        }
+        self.interactivity.run_prepaint_listeners(bounds, window, cx);
         if window.publishes_from_prepaint() {
             self.interactivity
                 .publish_layout(bounds, style.visibility.unwrap_or(window.visibility()), window);
@@ -3753,6 +3747,59 @@ mod test {
             "a write past the end is held to the range"
         );
     }
+    struct CountingProbe(Cell<(u32, u32)>);
+    impl gpui::LayoutProbe for CountingProbe {
+        fn prepainted(
+            &self,
+            _: u64,
+            _: u8,
+            bounds: Bounds<Pixels>,
+            _: gpui::LayoutId,
+            _: &mut Window,
+            _: &mut gpui::App,
+        ) -> gpui::LayoutSample {
+            let (prepainted, painted) = self.0.get();
+            self.0.set((prepainted + 1, painted));
+            gpui::LayoutSample {
+                border_box: bounds,
+                content: bounds.size,
+                scale: 1.,
+                culled: false,
+                to_window: gpui::TransformationMatrix::unit(),
+                faces_away: false,
+            }
+        }
+
+        fn painted(&self, _: u64, _: u8, _: gpui::LayoutSample, _: Bounds<Pixels>, _: gpui::LayoutId, _: &mut Window, _: &mut gpui::App) {
+            let (prepainted, painted) = self.0.get();
+            self.0.set((prepainted, painted + 1));
+        }
+    }
+
+    /// A list reports to a layout probe as it does to the listeners of `on_prepainted_layout` and
+    /// `on_painted_layout`, which it runs itself and not through a `Div`.
+    #[gpui::test]
+    fn test_a_list_reports_to_a_layout_probe(cx: &mut TestAppContext) {
+        struct ProbedList(ListState, Rc<CountingProbe>);
+        impl Render for ProbedList {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let probe: Rc<dyn gpui::LayoutProbe> = self.1.clone();
+                list(self.0.clone(), |_, _, _| div().h(px(20.)).w_full().into_any())
+                    .layout_probe(probe, 1, 0)
+                    .w(px(100.))
+                    .h(px(60.))
+            }
+        }
+        let cx = cx.add_empty_window();
+        let probe = Rc::new(CountingProbe(Cell::new((0, 0))));
+        let state = ListState::new(5, crate::ListAlignment::Top, px(300.));
+        cx.draw(point(px(0.), px(0.)), size(px(200.), px(100.)), |_, cx| {
+            cx.new(|_| ProbedList(state.clone(), probe.clone())).into_any_element()
+        });
+        let (prepainted, painted) = probe.0.get();
+        assert!(prepainted >= 1 && prepainted == painted, "{prepainted} prepainted, {painted} painted");
+    }
+
     struct FractionalRows(ListState, Rc<RefCell<Vec<Bounds<Pixels>>>>);
     impl Render for FractionalRows {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
