@@ -36,6 +36,11 @@ name = "window_resize"
 path = "tests/window_resize.rs"
 harness = false
 
+[[test]]
+name = "pump_window_updates"
+path = "tests/pump_window_updates.rs"
+harness = false
+
 [features]
 default = ["gpui/default"]
 test-support = ["gpui/test-support", "gpui_apple/test-support"]

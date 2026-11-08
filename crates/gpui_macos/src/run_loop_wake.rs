@@ -124,9 +124,10 @@ pub fn set_run_loop_wake_hook(hook: Option<WakeHook>) {
 pub fn run_loop_pumped() {
     let watch = WATCH.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(watch) = watch.as_ref() {
-        for port in watch.ports {
-            unsafe { kevent_change(watch.kqueue, port as usize, EVFILT_MACHPORT, EV_ENABLE, 0) };
-        }
+        let enable = watch
+            .ports
+            .map(|port| kevent_change(port as usize, EVFILT_MACHPORT, EV_ENABLE, 0));
+        unsafe { kevent_changes(watch.kqueue, &enable) };
     }
 }
 
@@ -141,16 +142,21 @@ fn start(hook: WakeHook) -> Watch {
         std::io::Error::last_os_error()
     );
     unsafe {
-        kevent_change(kqueue, SHUTDOWN_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0);
-        for port in ports {
-            kevent_change(
-                kqueue,
-                port as usize,
-                EVFILT_MACHPORT,
-                EV_ADD | EV_ENABLE | EV_DISPATCH,
-                0,
-            );
-        }
+        kevent_changes(
+            kqueue,
+            &[kevent_change(SHUTDOWN_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0)],
+        );
+        kevent_changes(
+            kqueue,
+            &ports.map(|port| {
+                kevent_change(
+                    port as usize,
+                    EVFILT_MACHPORT,
+                    EV_ADD | EV_ENABLE | EV_DISPATCH,
+                    0,
+                )
+            }),
+        );
     }
     let thread = std::thread::Builder::new()
         .name("gpui run loop wake".into())
@@ -167,7 +173,10 @@ fn start(hook: WakeHook) -> Watch {
 fn stop(watch: Watch) {
     unsafe {
         unobserve_event_thread(watch.event_thread_observer);
-        kevent_change(watch.kqueue, SHUTDOWN_IDENT, EVFILT_USER, 0, NOTE_TRIGGER);
+        kevent_changes(
+            watch.kqueue,
+            &[kevent_change(SHUTDOWN_IDENT, EVFILT_USER, 0, NOTE_TRIGGER)],
+        );
     }
     watch
         .thread
@@ -234,30 +243,45 @@ fn watch_ports(kqueue: i32, hook: WakeHook) {
     }
 }
 
-/// Registers or changes one knote, and panics if the kernel rejects it.
-unsafe fn kevent_change(kqueue: i32, ident: usize, filter: i16, flags: u16, fflags: u32) {
-    let change = libc::kevent {
+fn kevent_change(ident: usize, filter: i16, flags: u16, fflags: u32) -> libc::kevent {
+    libc::kevent {
         ident,
         filter,
         flags: flags | EV_RECEIPT,
         fflags,
         data: 0,
         udata: ptr::null_mut(),
+    }
+}
+
+/// Applies the changes to the knotes in one `kevent` call (`run_loop_pumped` runs on every tick,
+/// and a call per knote was a syscall more), and panics if the kernel rejects one.
+unsafe fn kevent_changes<const N: usize>(kqueue: i32, changes: &[libc::kevent; N]) {
+    let mut receipts: [libc::kevent; N] = unsafe { mem::zeroed() };
+    let received = unsafe {
+        libc::kevent(
+            kqueue,
+            changes.as_ptr(),
+            N as i32,
+            receipts.as_mut_ptr(),
+            N as i32,
+            ptr::null(),
+        )
     };
-    let mut receipt: libc::kevent = unsafe { mem::zeroed() };
-    let received = unsafe { libc::kevent(kqueue, &change, 1, &mut receipt, 1, ptr::null()) };
     assert!(
         received >= 0,
-        "kevent change (ident {ident}, filter {filter}) failed: {}",
+        "kevent change failed: {}",
         std::io::Error::last_os_error()
     );
-    // `libc::kevent` is a packed struct: read the fields by value.
-    let receipt_flags = receipt.flags;
-    let receipt_data = receipt.data;
-    assert!(
-        received != 1 || receipt_flags & EV_ERROR == 0 || receipt_data == 0,
-        "kevent change (ident {ident}, filter {filter}) rejected, errno {receipt_data}"
-    );
+    for receipt in &receipts[..received as usize] {
+        // `libc::kevent` is a packed struct: read the fields by value.
+        let (ident, filter, flags, data) =
+            (receipt.ident, receipt.filter, receipt.flags, receipt.data);
+        assert!(
+            flags & EV_ERROR == 0 || data == 0,
+            "kevent change (ident {ident}, filter {filter}) rejected, errno {data}"
+        );
+    }
 }
 
 /// Observes `kCFRunLoopBeforeWaiting` on NSEventThread, which comes after the source callout that

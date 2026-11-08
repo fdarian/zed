@@ -632,7 +632,8 @@ fn assert_main_thread(operation: &str) {
     );
 }
 
-unsafe fn pump_app_nonblocking() {
+#[doc(hidden)]
+pub unsafe fn pump_app_nonblocking() {
     unsafe {
         // NSApplication::run sleeps until the next display-link wake, which
         // blocks embedded hosts. Drain only work that is ready now.
@@ -657,7 +658,9 @@ unsafe fn pump_app_nonblocking() {
             // update cycle nothing to commit, and no timer is armed.
             let _: () = msg_send![class!(CATransaction), flush];
         }
-        let _: () = msg_send![app, updateWindows];
+        // No `updateWindows` here: `sendEvent:` sets `windowsNeedUpdate`, which installs a run loop
+        // observer that updates the windows once, in the next pass of the loop (the polls below,
+        // as in `[NSApplication run]`). Calling it as well made three updates per event.
 
         // A run that returns after one source also receives the run loop's wake message, so the
         // sources that are still signalled would wait for a message that is gone.

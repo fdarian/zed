@@ -67,7 +67,7 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use display::{MacDisplay, MacScreen};
-pub use platform::MacPlatform;
+pub use platform::{MacPlatform, pump_app_nonblocking};
 #[cfg(any(test, feature = "test-support"))]
 pub use window::overlay_drawn_frames;
 #[cfg(any(test, feature = "test-support"))]

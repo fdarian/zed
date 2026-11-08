@@ -388,7 +388,6 @@ fn pump_app() -> Vec<u64> {
                 let _: () = msg_send![app, sendEvent: event];
             }
         }
-        let _: () = msg_send![app, updateWindows];
     }
     pump_main_run_loop();
     types
