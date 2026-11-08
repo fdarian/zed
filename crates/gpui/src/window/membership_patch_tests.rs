@@ -52,6 +52,9 @@ struct Shared {
     kids: Cell<usize>,
     /// How many boxes with a background of their own each row holds, the height of the row between them.
     row_kids: Cell<usize>,
+    /// How many small boxes with a background each row holds, which wrap inside it: a row with many primitives
+    /// that are not on top of one another.
+    small_kids: Cell<usize>,
     /// The key of the unit, which moves when what it holds does.
     version: Cell<u64>,
     patch_unit: Cell<bool>,
@@ -82,6 +85,7 @@ impl Shared {
             deferred: Cell::new(None),
             kids: Cell::new(3),
             row_kids: Cell::new(0),
+            small_kids: Cell::new(0),
             version: Cell::new(0),
             patch_unit: Cell::new(false),
             patch_row: Cell::new(None),
@@ -126,6 +130,9 @@ impl Shared {
                 .tab_stop(true)
                 .on_key_down(move |event, _, _| keys.log.borrow_mut().push(format!("row {ix} key {}", event.keystroke.key)));
         }
+        if self.small_kids.get() > 0 {
+            row = row.flex().flex_wrap().content_start().overflow_hidden();
+        }
         let kids = self.row_kids.get();
         if kids > 0 {
             row = row.child(format!("Row {ix}"));
@@ -133,6 +140,10 @@ impl Shared {
         for kid in 0..kids {
             let color = if self.green.borrow().contains(&ix) { red() } else { green() };
             row = row.child(div().id(("part", ix * 100 + kid)).w_full().h(px((height(ix) + extra) / kids as f32)).bg(color));
+        }
+        for kid in 0..self.small_kids.get() {
+            let color = if kid % 2 == 0 { red() } else { green() };
+            row = row.child(div().id(("small", ix * 100 + kid)).w(px(9.)).h(px(5.)).bg(color));
         }
         if self.deferred.get() == Some(ix) {
             row = row.child(deferred(div().id(("tip", ix)).w(px(10.)).h(px(10.)).bg(red())));
@@ -1348,4 +1359,52 @@ fn a_wheel_after_a_programmatic_write_goes_on_from_the_write(cx: &mut TestAppCon
         fixture.draw(cx);
     }
     pair.same(cx, "a wheel after a write");
+}
+
+/// A translate in a scene of about 2000 primitives, one row coming in and one leaving per step.
+/// `GPUI_BENCH_ROUNDS` sets how many rounds of 20 steps are timed (default 5).
+/// `cargo test -p gpui --release --features test-support --lib -- --ignored --nocapture translate_scene_bench`
+#[gpui::test]
+#[ignore]
+fn translate_scene_bench(cx: &mut TestAppContext) {
+    let rounds: usize = std::env::var("GPUI_BENCH_ROUNDS").ok().and_then(|rounds| rounds.parse().ok()).unwrap_or(5);
+    let shared = Shared::with_overdraw(cx, true, 0., 5000.);
+    shared.small_kids.set(60);
+    let fixture = Fixture::open(cx, true, shared);
+    let (primitives, operations) = fixture.with_window(cx, |window, _| {
+        let scene = &window.rendered_frame.scene;
+        (scene.quads.len() + scene.monochrome_sprites.len(), scene.paint_operations.len())
+    });
+    for (name, step) in [("a row in and a row out", true), ("no row in or out", false)] {
+        let before = fixture.counters(cx);
+        let mut total = std::time::Duration::ZERO;
+        let mut steps = 0;
+        for round in 0..=rounds {
+            for ix in 0..20 {
+                // Down for ten steps and up for ten, so that the rows stay within the list.
+                let down = ix < 10;
+                let start_row = fixture.rows(cx).start;
+                let by = match (step, down) {
+                    (true, true) => top(start_row + 1) + 1. - fixture.scrolled(),
+                    (true, false) => top(start_row) - 1. - fixture.scrolled(),
+                    (false, down) => if down { 1. } else { -1. },
+                };
+                let start = std::time::Instant::now();
+                fixture.wheel(cx, by);
+                if round > 0 {
+                    total += start.elapsed();
+                    steps += 1;
+                }
+            }
+        }
+        let counters = fixture.counters(cx);
+        println!(
+            "translate_scene_bench: {name}: {:?} per step, {primitives} primitives, {operations} operations; frames {} patched {} membership {} whole {}",
+            total / steps,
+            counters.frames - before.frames,
+            counters.patched - before.patched,
+            counters.membership_frames - before.membership_frames,
+            fixture.built_whole(cx),
+        );
+    }
 }
