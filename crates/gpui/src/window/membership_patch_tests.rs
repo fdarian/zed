@@ -1673,3 +1673,55 @@ fn translate_scene_bench(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// A scroll down a row at a time over rows whose sizes the list has not measured, in a scene of about
+/// 2000 primitives: each step brings a row in and measures the next one in the overdraw, by layout or from
+/// the size declared for it. `GPUI_BENCH_STEPS` sets how many steps are timed (default 100).
+/// `cargo test -p gpui --release --features test-support --lib -- --ignored --nocapture exact_size_scroll_bench`
+#[gpui::test]
+#[ignore]
+fn exact_size_scroll_bench(cx: &mut TestAppContext) {
+    let steps: usize = std::env::var("GPUI_BENCH_STEPS").ok().and_then(|steps| steps.parse().ok()).unwrap_or(100);
+    let open = |cx: &mut TestAppContext, declared: bool| {
+        let shared = Shared::with_overdraw(cx, false, 512., 5000.);
+        shared.small_kids.set(60);
+        if declared {
+            let sized = shared.clone();
+            sized.state.set_exact_item_size(|ix, width| Some(size(width?, px(height(ix)))));
+        }
+        Fixture::open(cx, true, shared)
+    };
+    // Alternating, so that the machine's state is the same for both.
+    let mut results = Vec::new();
+    for _ in 0..3 {
+        for declared in [false, true] {
+            let fixture = open(cx, declared);
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..steps {
+                let by = top(fixture.rows(cx).start + 1) + 1. - fixture.scrolled();
+                let start = std::time::Instant::now();
+                fixture.wheel(cx, by);
+                total += start.elapsed();
+            }
+            let counters = fixture.counters(cx);
+            let measured = fixture.shared.state.measure_counters();
+            println!(
+                "exact_size_scroll_bench: declared {declared}: {:?} per step; frames {} patched {} membership {} whole {}; measured by layout {} by declared size {}; rows asked {}",
+                total / steps as u32,
+                counters.frames,
+                counters.patched,
+                counters.membership_frames,
+                fixture.built_whole(cx),
+                measured.by_layout,
+                measured.by_exact_size,
+                fixture.shared.asked.borrow().len(),
+            );
+            results.push((declared, total / steps as u32));
+        }
+    }
+    for declared in [false, true] {
+        let mut times: Vec<_> = results.iter().filter(|result| result.0 == declared).map(|result| result.1).collect();
+        times.sort();
+        println!("exact_size_scroll_bench: declared {declared}: median {:?} per step", times[times.len() / 2]);
+    }
+}

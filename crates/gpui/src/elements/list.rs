@@ -1704,7 +1704,10 @@ impl StateInner {
                                         offset_in_item = Pixels::ZERO;
                                         break;
                                     };
-                                    let size = prev_item.size().or_else(|| self.declared_size(cursor.start().0, Some(content_width))).unwrap_or_else(|| {
+                                    let size = prev_item
+                                        .size()
+                                        .or_else(|| self.declared_size(cursor.start().0, Some(content_width)))
+                                        .unwrap_or_else(|| {
                                         let mut element = render_item(cursor.start().0, window, cx);
                                         let item_available_size =
                                             size(content_width.into(), AvailableSpace::MinContent);
@@ -1732,7 +1735,10 @@ impl StateInner {
                                 cursor.prev();
                                 let Some(item) = cursor.item() else { break };
 
-                                let size = item.size().or_else(|| self.declared_size(cursor.start().0, Some(content_width))).unwrap_or_else(|| {
+                                let size = item
+                                    .size()
+                                    .or_else(|| self.declared_size(cursor.start().0, Some(content_width)))
+                                    .unwrap_or_else(|| {
                                     let mut item = render_item(cursor.start().0, window, cx);
                                     let item_available_size =
                                         size(content_width.into(), AvailableSpace::MinContent);
