@@ -475,6 +475,9 @@ struct PreparedStep {
     /// whether the root published anything.
     effects: u16,
     published: bool,
+    /// Whether the prepaint of this root alone set the window's focus into the frame: the scratch frame holds
+    /// one focus for all the roots of a patch, so by the time a root is finished it says what any of them set.
+    holds_focus: bool,
     /// The entities the layout and prepaint of the root read.
     accessed: FxHashSet<EntityId>,
     /// A root recorded to be put elsewhere is prepainted and painted in its region.
@@ -1596,7 +1599,10 @@ impl Window {
         if let Some(relocation) = region {
             self.begin_relocation(relocation, false);
         }
+        let focus_before = self.next_frame.focus.take();
         unit.element.prepaint(self, cx);
+        let holds_focus = self.next_frame.focus.is_some();
+        self.next_frame.focus = focus_before.or(self.next_frame.focus);
         let relocation = ambient.map(|_| self.end_relocation().0);
         self.root_escape = outside;
         let hitbox_ids = self.patch.hitbox_ids.take().expect("a patch gives the hitboxes ids");
@@ -1626,6 +1632,7 @@ impl Window {
             hitbox_ids,
             effects: effects.reasons(&after_prepaint),
             published: effects.published(&after_prepaint),
+            holds_focus,
             accessed: FxHashSet::default(),
             relocated,
         })
@@ -1701,11 +1708,11 @@ impl Window {
         let hitboxes_match = !hitbox_ids.overrun
             && hitbox_ids.taken == hitbox_ids.ids.len()
             && self.hitboxes_are(&source.hitboxes.hitboxes, prepaint_start.hitboxes_index..prepaint_end.hitboxes_index, relaid);
-        let registrations_match = self.registrations_are(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end);
+        let registrations_match = self.registrations_are(source, step.holds_focus, &prepaint_start..&prepaint_end, &paint_start..&paint_end);
         let regional = region.is_some();
         if relaid && !(hitboxes_match && registrations_match && self.operations_are(&scratch, &rendered)) {
             // The root has other things than it had, which replace what the frame has of it.
-            if !self.focus_is_recorded(source) {
+            if !self.focus_is_recorded(source, step.holds_focus) {
                 return Err(PatchDecline::Registrations);
             }
             let operations = self.next_frame.scene.paint_operations[scratch.clone()].to_vec();
@@ -1965,7 +1972,7 @@ impl Window {
     /// Whether the root holds the focus now exactly when its recording did. The focus is the
     /// window's: a root that holds the focused element finds it again, as the recording did, and one
     /// that gains or loses it is not the recording.
-    fn focus_is_recorded(&self, source: &PatchSource) -> bool {
+    fn focus_is_recorded(&self, source: &PatchSource, holds_focus: bool) -> bool {
         let recorded_prepaint = &source.prepaint;
         let recorded_focus = self.focus.is_some_and(|focus| {
             self.rendered_frame.dispatch_tree.range_has_focus(
@@ -1973,7 +1980,7 @@ impl Window {
                 focus,
             )
         });
-        self.next_frame.focus.is_some() == recorded_focus
+        holds_focus == recorded_focus
     }
 
     /// What the pointer hits is the question that a frame built whole answers between prepaint and
@@ -2002,6 +2009,7 @@ impl Window {
     fn registrations_are(
         &self,
         source: &PatchSource,
+        holds_focus: bool,
         prepaint: Range<&PrepaintStateIndex>,
         paint: Range<&PaintIndex>,
     ) -> bool {
@@ -2016,7 +2024,7 @@ impl Window {
             (paint.end.root_key_listeners_index - paint.start.root_key_listeners_index, recorded_paint.end.root_key_listeners_index - recorded_paint.start.root_key_listeners_index),
             (paint.end.input_handlers_index - paint.start.input_handlers_index, recorded_paint.end.input_handlers_index - recorded_paint.start.input_handlers_index),
         ];
-        if !self.focus_is_recorded(source) || counts.iter().any(|(painted, recorded)| painted != recorded) {
+        if !self.focus_is_recorded(source, holds_focus) || counts.iter().any(|(painted, recorded)| painted != recorded) {
             return false;
         }
         let cursors = &frame.cursor_styles[paint.start.cursor_styles_index..paint.end.cursor_styles_index];

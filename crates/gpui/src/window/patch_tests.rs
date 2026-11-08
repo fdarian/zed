@@ -11,6 +11,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const UNIT: &str = "unit";
+/// A second patchable root, with nothing in it that takes the focus.
+const BYSTANDER: &str = "bystander";
 
 /// What the test changes between frames, and the patcher reads.
 #[derive(Default)]
@@ -164,6 +166,10 @@ fn unit_element(
     unit.into_any_element()
 }
 
+fn bystander_element(tick: u32) -> AnyElement {
+    div().id(BYSTANDER).w(px(100.)).h(px(30.)).flex_none().bg(color(tick)).into_any_element()
+}
+
 fn unit(tick: u32, lift: Lift, page_opacity: Option<f32>, animated: bool, focus: Option<FocusHandle>) -> Retained {
     let lifted = lift != Lift::No;
     let opacity = lifted.then(|| page_opacity.unwrap_or_else(|| fade(tick)));
@@ -240,6 +246,8 @@ struct Page {
     around: Around,
     /// The page clips to less than the box around it, which a box placed against that one escapes.
     narrow: bool,
+    /// A second patchable root ahead of the unit, which the patcher builds with it.
+    bystander: bool,
 }
 
 impl Page {
@@ -269,6 +277,10 @@ impl Render for Page {
             content.style().position = Some(Position::Static);
         }
         let tall = if self.scroll.is_some() { 30. } else { 1. };
+        if self.bystander {
+            let tick = self.knobs.tick.get();
+            content = content.child(retained(BYSTANDER, 5_000 + tick as u64, move |_, _| bystander_element(tick)).patchable());
+        }
         // In a scroller the unit is first, so that scrolling moves it.
         if self.scroll.is_some() {
             content = content.child(self.unit_child());
@@ -331,6 +343,8 @@ struct Options {
     /// The box in the unit has the focus.
     focused: bool,
     narrow: bool,
+    /// The page has a second patchable root, which the patcher builds in the same patch as the unit.
+    bystander: bool,
 }
 
 impl Fixture {
@@ -348,7 +362,7 @@ impl Fixture {
         let window = cx.open_window(size(px(400.), px(2000.)), {
             let knobs = knobs.clone();
             let scroll = scroll.clone();
-            move |_, _| Page { rows, knobs, plain: options.plain, scroll, lift: options.lift, around: options.around, narrow: options.narrow }
+            move |_, _| Page { rows, knobs, plain: options.plain, scroll, lift: options.lift, around: options.around, narrow: options.narrow, bystander: options.bystander }
         });
         let window = AnyWindowHandle::from(window);
         cx.update_window(window, |_, window, cx| {
@@ -368,10 +382,16 @@ impl Fixture {
             window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
                 let tick = if knobs.wrong_color.get() { knobs.tick.get() + 7 } else { knobs.tick.get() };
                 let width = knobs.width.get().unwrap_or(100.);
-                let names = knobs.ids.borrow().clone().unwrap_or_else(|| vec![UNIT]);
+                let names = knobs.ids.borrow().clone().unwrap_or_else(|| match options.bystander {
+                    true => vec![BYSTANDER, UNIT],
+                    false => vec![UNIT],
+                });
                 let units = names
                     .into_iter()
                     .map(|name| {
+                        if name == BYSTANDER {
+                            return (ElementId::from(name), bystander_element(tick));
+                        }
                         let opacity = knobs.opacity.get().or_else(|| lifted.then(|| fade(tick)));
                         let focus = knobs.focus.borrow().clone();
                         let mut element =
@@ -599,6 +619,28 @@ fn a_unit_that_holds_the_focused_element_is_patched_and_one_that_stops_holding_i
     assert_same(&patched, &page.snapshot(cx), "the focused unit");
 
     // The patcher builds the unit as if it did not track the focus: it is not the recording.
+    *page.knobs.focus.borrow_mut() = None;
+    page.tick(cx);
+    assert_eq!(page.patches(cx).declines(PatchDecline::Registrations), 1);
+}
+
+#[gpui::test]
+fn a_unit_without_the_focus_is_patched_in_a_patch_whose_other_unit_holds_it(cx: &mut TestAppContext) {
+    let page = Fixture::with(cx, 10, Options { focused: true, bystander: true, ..Default::default() });
+    page.tick(cx);
+    let before = page.patches(cx);
+    for _ in 0..4 {
+        page.tick(cx);
+    }
+    let after = page.patches(cx);
+    assert_eq!(after.patched_frames - before.patched_frames, 4);
+    assert_eq!(after.patched_units - before.patched_units, 8);
+    assert_eq!(after.total_declines(), 0);
+    let patched = page.snapshot(cx);
+    page.draw_whole(cx);
+    assert_same(&patched, &page.snapshot(cx), "a patch of a unit with the focus and one without");
+
+    // The unit that held the focus when it was recorded still declines when the patcher builds it without.
     *page.knobs.focus.borrow_mut() = None;
     page.tick(cx);
     assert_eq!(page.patches(cx).declines(PatchDecline::Registrations), 1);
