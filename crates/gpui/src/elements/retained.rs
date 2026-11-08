@@ -100,6 +100,7 @@ pub fn retained(
         patchable: false,
         relayout: false,
         ignores_text_color: false,
+        global_id: None,
     }
 }
 
@@ -170,6 +171,9 @@ pub struct Retained {
     patchable: bool,
     relayout: bool,
     ignores_text_color: bool,
+    /// The element's id path, built by the first phase that asks: the element is drawn under
+    /// the same id stack in layout, prepaint and paint.
+    global_id: Option<GlobalElementId>,
 }
 
 /// The colour a subtree that [ignores the text colour](Retained::ignoring_text_color) is built,
@@ -315,8 +319,10 @@ impl Retained {
 
     /// Where the state of the element is kept, which is what the id of an element on the stack
     /// would give it.
-    fn global_id(&self, window: &mut Window) -> GlobalElementId {
-        window.with_global_id(self.id.clone(), |global_id, _| global_id.clone())
+    fn global_id(&mut self, window: &mut Window) -> GlobalElementId {
+        self.global_id
+            .get_or_insert_with(|| window.with_global_id(self.id.clone(), |global_id, _| global_id.clone()))
+            .clone()
     }
 
     fn build(&mut self) -> Build {
@@ -347,9 +353,9 @@ pub(crate) struct RetainedState {
     owner: Rc<StateOwner>,
     /// Every entity the subtree read, so that a frame that does not build it still observes them.
     accessed_entities: FxHashSet<crate::EntityId>,
-    recorded: Option<Recorded>,
+    recorded: Option<Box<Recorded>>,
     /// What the last pass that only laid out built of the subtree, see [`LayoutRecord`].
-    layout: Option<LayoutRecord>,
+    layout: Option<Box<LayoutRecord>>,
 }
 
 /// What a pass that only lays out built of a subtree, for the next one to skip it with. It is not a
@@ -462,7 +468,7 @@ impl RetainedState {
         let paint = recorded.paint.as_ref()?;
         let rendered = window.rendered_serial();
         let publishes = recorded.patch.as_ref().is_some_and(|patch| patch.publishes);
-        let regional = recorded.relocation.as_ref().is_some_and(Relocation::regional);
+        let regional = recorded.relocation.as_ref().is_some_and(|relocation| relocation.regional());
         // A recording that is put elsewhere than it was recorded is a source for a patch only when the patch
         // can paint it in its region and put what it paints where the frame has the root.
         (recorded.patch.is_some()
@@ -678,7 +684,7 @@ pub enum RetainedPrepaint {
         /// How the subtree is painted to be put elsewhere, if it was prepainted that way: what
         /// it captured in prepaint is cut from the region, and is painted in a scene of its own
         /// whether or not the recording is kept.
-        relocation: Option<Relocation>,
+        relocation: Option<Box<Relocation>>,
     },
 }
 
@@ -867,13 +873,13 @@ impl Retained {
                 relocation,
             } => {
                 let relocation = relocation.take();
-                let regional = relocation.as_ref().is_some_and(Relocation::regional);
+                let regional = relocation.as_ref().is_some_and(|relocation| relocation.regional());
                 let moves = relocation.as_ref().is_some_and(|relocation| !relocation.direct);
                 let relocating = relocation.is_some();
                 let origin = record.then(|| self.recorded_origin(global_id, window));
                 let mark = origin.as_ref().map(|origin| window.begin_paint_recording(origin));
                 if let Some(relocation) = relocation {
-                    window.begin_relocation(relocation, true);
+                    window.begin_relocation(*relocation, true);
                 }
                 let patchable = self.patchable;
                 let accessed_entities = if *record {
@@ -1003,6 +1009,8 @@ impl Retained {
         window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             // The map keeps the state under the id it was first stored with, not `global_id`.
             let id = state.as_ref().map_or_else(|| global_id.clone(), |state| state.id.clone());
+            // Prepaint and paint look the state up by this id, which the map compares by pointer.
+            self.global_id = Some(id.clone());
             let owner = state.as_ref().map_or_else(StateOwner::new, |state| state.owner.clone());
             if let Some(mut state) = state
                 && state.key == key
@@ -1224,7 +1232,7 @@ impl Retained {
             let layout = LayoutRecord::begin(key, root, accessed_entities, window);
             let state = match state {
                 Some(mut state) => {
-                    state.layout = Some(layout);
+                    state.layout = Some(Box::new(layout));
                     state
                 }
                 None => RetainedState {
@@ -1235,7 +1243,7 @@ impl Retained {
                     owner: StateOwner::new(),
                     accessed_entities: Default::default(),
                     recorded: None,
-                    layout: Some(layout),
+                    layout: Some(Box::new(layout)),
                 },
             };
             ((), state)
@@ -1627,7 +1635,7 @@ impl Retained {
         if let Some(accessed_entities) = layout_accessed {
             window.with_element_state(global_id, |state: Option<RetainedState>, window| {
                 let mut state = state.expect("a skipped subtree has its state");
-                state.layout = Some(LayoutRecord::begin(self.key, built_root, accessed_entities, window));
+                state.layout = Some(Box::new(LayoutRecord::begin(self.key, built_root, accessed_entities, window)));
                 ((), state)
             });
             return self.prepaint_with_layout_record(global_id, key, element, unreusable, window, cx);
@@ -1663,7 +1671,7 @@ impl Retained {
         window: &mut Window,
         cx: &mut App,
         prepaint: impl FnOnce(&mut Window, &mut App),
-    ) -> (bool, Option<Relocation>) {
+    ) -> (bool, Option<Box<Relocation>>) {
         let publishes = self.on_replay.is_some();
         // A root that is recorded to be put elsewhere is patched where it was recorded (`Recorded::patch`
         // is only handed to a patch while the root is at its recorded place), and one that is placed by a
@@ -1691,7 +1699,7 @@ impl Retained {
         let ((), accessed_entities) = window.with_state_owner(&owner, |window| {
             window.detect_observed_entities(cx, |window, cx| prepaint(window, cx))
         });
-        let relocation = relocating.then(|| window.end_relocation().0);
+        let relocation = relocating.then(|| Box::new(window.end_relocation().0));
         let recording = window.finish_prepaint_recording(mark, surroundings.as_ref());
         window.root_escape = outside;
         let record = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
@@ -1719,7 +1727,7 @@ impl Retained {
                         window.retained.relocated_inside += 1;
                     }
                     let origin = prepaint.origin.clone();
-                    state.recorded = Some(Recorded {
+                    state.recorded = Some(Box::new(Recorded {
                         generation: window.layout_generation(root),
                         key,
                         prepaint,
@@ -1731,7 +1739,7 @@ impl Retained {
                         lift_base: None,
                         patch,
                         root_escapes: root_escape.is_some(),
-                    });
+                    }));
                     window.note_retained_recording((state.id.clone(), TypeId::of::<RetainedState>()), origin);
                     true
                 }
@@ -1891,6 +1899,17 @@ mod tests {
     pub(super) fn counters(window: AnyWindowHandle, cx: &mut TestAppContext) -> RetainedCounters {
         cx.update_window(window, |_, window, _| window.retained_counters())
             .unwrap()
+    }
+
+    /// The map of element states moves a state by value out of its box and back at each of the three
+    /// phases of every root, and a prepaint state moves through the drawable, so a recording kept
+    /// inline costs a copy of itself at each: with `Recorded`, `LayoutRecord` and `Relocation` inline
+    /// (4 KB a state) a recording frame paid ~135k instructions a row of seven roots for the moves.
+    #[test]
+    fn what_a_root_moves_by_value_stays_small() {
+        assert!(std::mem::size_of::<RetainedState>() <= 256, "{}", std::mem::size_of::<RetainedState>());
+        assert!(std::mem::size_of::<RetainedPrepaint>() <= 128, "{}", std::mem::size_of::<RetainedPrepaint>());
+        assert!(std::mem::size_of::<RetainedLayout>() <= 128, "{}", std::mem::size_of::<RetainedLayout>());
     }
 
     /// A card with a labelled, focusable, clickable button and some text.
