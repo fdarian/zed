@@ -91,7 +91,7 @@ pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub use scroll_patch::{
     ScrollApplyDecline, ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason, ScrollThumbMiss, ScrollThumbMoved,
-    ScrollThumbPlan,
+    ScrollThumbPlan, ScrollThumbRepaint, ScrollThumbRepainter, ScrollThumbRepaints,
 };
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame, RecordingRewrite};
 pub(crate) use patch_splice::{FIELDS, Positions, RowPart};
@@ -5421,6 +5421,7 @@ impl Window {
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.retained.rendered_serial += 1;
         self.patch.recordings_stale = false;
+        self.patch.thumb_vanished = false;
         self.patch.discarded.clear();
         self.next_frame.clear();
         self.settle_scroll_patch();

@@ -49,6 +49,14 @@
 //! bounds the way the owner would paint it (snapped to the device pixel, placed by the offset the
 //! painted one had) and written over the operation, and the second tells the owner the bar moved.
 //! The hitbox of the bar is its track, which a scroll does not move.
+//!
+//! **A thumb that fades with no scroll.** A bar that only changes the alpha of its thumb (the end of its
+//! hold, a step of its fade) paints a frame of its own, though the rows have not moved, and a frame
+//! built whole after a translate puts the rows from recordings made where they were: the rows are
+//! relocated, and a patch of one is declined. The owner says, for each bar it noted, what the thumb is
+//! painted as now ([`ScrollThumbRepainter`]), [`Window::plan_scroll_thumb_repaints`] asks every bar before
+//! anything is written, and [`Window::repaint_scroll_thumbs`] writes the new color over the operation of
+//! the thumb in the frame shown, in place when the scene allows. Nothing else of the frame is touched.
 
 use super::*;
 use super::patch::Surroundings;
@@ -447,13 +455,45 @@ pub type ScrollThumbPlan = Rc<dyn Fn(&Window, Option<Bounds<Pixels>>) -> Result<
 /// have taken from the new position.
 pub type ScrollThumbMoved = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// What the thumb of a bar is painted as, where it is, when only its color differs from the frame
+/// shown.
+pub struct ScrollThumbRepaint {
+    /// The color the owner would paint the thumb with: nothing else of the quad is taken from it.
+    pub background: Background,
+    /// Runs once the thumb is written: what the owner's prepaint and paint would have taken from the
+    /// new color.
+    pub done: Box<dyn FnOnce(&mut Window, &mut App)>,
+}
+
+/// What the owner says of a bar when no scroll moved the rows: the color its thumb is painted with now,
+/// if it is not the one it is drawn with, or why the thumb cannot be repainted alone. The second
+/// argument is where the thumb is drawn now, as for [`ScrollThumbPlan`]. A bar whose thumb would move,
+/// grow or shrink, or whose track differs, says so as a miss.
+pub type ScrollThumbRepainter =
+    Rc<dyn Fn(&Window, Option<Bounds<Pixels>>) -> Result<Option<ScrollThumbRepaint>, ScrollThumbMiss>>;
+
+/// The thumbs of the frame shown with the color each is repainted with, worked out and not yet written.
+pub struct ScrollThumbRepaints {
+    writes: Vec<(usize, Quad)>,
+    /// A thumb is written with no color at all: the frame built whole paints none there.
+    vanishes: bool,
+    done: Vec<Box<dyn FnOnce(&mut Window, &mut App)>>,
+}
+
+impl ScrollThumbRepaints {
+    /// Whether no thumb differs from the frame shown.
+    pub fn is_empty(&self) -> bool {
+        self.writes.is_empty() && self.done.is_empty()
+    }
+}
+
 /// What a bar painted for its thumb in the frame shown.
 #[derive(Clone, Copy)]
 enum ThumbPaint {
     /// Nothing: the bar was not shown, or has no thumb.
     Nothing,
-    /// The quad at this operation, painted at these bounds.
-    Quad { op: usize, bounds: Bounds<Pixels> },
+    /// The quad at this operation, painted at these bounds under this element opacity.
+    Quad { op: usize, bounds: Bounds<Pixels>, opacity: f32 },
     /// Something that is not one quad that can be written over.
     Untracked,
 }
@@ -464,6 +504,7 @@ struct ScrollThumb {
     paint: ThumbPaint,
     plan: ScrollThumbPlan,
     moved: ScrollThumbMoved,
+    repaint: ScrollThumbRepainter,
 }
 
 /// A thumb of the frame shown with where the scroll puts it.
@@ -592,9 +633,9 @@ impl ScrollFrame {
     /// goes nowhere is one that cannot be put elsewhere.
     pub(crate) fn remap_thumbs(&mut self, operation: &mut dyn FnMut(usize) -> Option<usize>) {
         for thumb in &mut self.thumbs {
-            let ThumbPaint::Quad { op, bounds } = thumb.paint else { continue };
+            let ThumbPaint::Quad { op, bounds, opacity } = thumb.paint else { continue };
             thumb.paint = match operation(op) {
-                Some(op) => ThumbPaint::Quad { op, bounds },
+                Some(op) => ThumbPaint::Quad { op, bounds, opacity },
                 None => ThumbPaint::Untracked,
             };
         }
@@ -939,7 +980,11 @@ impl Window {
     /// Paints the thumb of a bar over `list` (`None` when the bar paints none: it is not shown, or
     /// the content fits) and notes the bar for a frame that moves the rows without building it.
     /// `plan` says, once the list is scrolled and before the frame is built, where the thumb goes
-    /// or why it cannot go there, and `moved` runs after the rows were moved with the thumb. A
+    /// or why it cannot go there, and `moved` runs after the rows were moved with the thumb.
+    /// `repaint` says, with no scroll, whether the thumb is to be painted another color (see
+    /// [`Window::plan_scroll_thumb_repaints`]). Returns whether the frame being built notes the bar: a
+    /// window whose scroll patch is off, or a pass that only lays out, does not, and then nothing
+    /// repaints the thumb. A
     /// bar that does not note itself is not known to a translate, which would leave its thumb
     /// where it was: a list whose bar is painted that way is declined for by the owner (see
     /// [`Window::set_scroll_patch_gate`]).
@@ -949,14 +994,16 @@ impl Window {
         thumb: Option<PaintQuad>,
         plan: ScrollThumbPlan,
         moved: ScrollThumbMoved,
-    ) {
+        repaint: ScrollThumbRepainter,
+    ) -> bool {
         let first = self.next_frame.scene.len();
+        let opacity = self.element_opacity();
         let bounds = thumb.as_ref().map(|quad| quad.bounds);
         if let Some(quad) = thumb {
             self.paint_quad(quad);
         }
         if !self.scroll_patch_records() {
-            return;
+            return false;
         }
         let end = self.next_frame.scene.len();
         let one_quad = end == first + 1
@@ -965,10 +1012,87 @@ impl Window {
             && !self.is_recording_any_relocation();
         let paint = match bounds {
             _ if end == first && !self.is_recording_any_relocation() => ThumbPaint::Nothing,
-            Some(bounds) if one_quad => ThumbPaint::Quad { op: first, bounds },
+            Some(bounds) if one_quad => ThumbPaint::Quad { op: first, bounds, opacity },
             _ => ThumbPaint::Untracked,
         };
-        self.next_frame.scroll.thumbs.push(ScrollThumb { list: list.scroller_id(), paint, plan, moved });
+        self.next_frame.scroll.thumbs.push(ScrollThumb { list: list.scroller_id(), paint, plan, moved, repaint });
+        true
+    }
+
+    /// What each bar noted in the frame shown says of its thumb when no scroll moved the rows, worked
+    /// out and not written: the quad each thumb that changes is painted as now, over the one in the
+    /// frame shown. A bar that says it cannot be repainted alone (its thumb would move, grow or appear,
+    /// or it was not noted as one quad) is the miss, and nothing is written. Changes nothing.
+    pub fn plan_scroll_thumb_repaints(&self) -> Result<ScrollThumbRepaints, ScrollThumbMiss> {
+        let frame = &self.rendered_frame;
+        let mut repaints = ScrollThumbRepaints { writes: Vec::new(), vanishes: false, done: Vec::new() };
+        for (index, thumb) in frame.scroll.thumbs.iter().enumerate() {
+            let (drawn, quad) = match thumb.paint {
+                ThumbPaint::Untracked => return Err(ScrollThumbMiss::Track),
+                ThumbPaint::Nothing => (None, None),
+                ThumbPaint::Quad { op, bounds, opacity } => {
+                    let PaintOperation::Quad(old) = &frame.scene.paint_operations[op] else {
+                        return Err(ScrollThumbMiss::Track);
+                    };
+                    (Some(bounds), Some((op, *old, opacity)))
+                }
+            };
+            let Some(repaint) = (thumb.repaint)(self, drawn)? else { continue };
+            let Some((_, old, opacity)) = quad else {
+                return Err(ScrollThumbMiss::Appear);
+            };
+            repaints.vanishes |= repaint.background.is_transparent();
+            let background = repaint.background.opacity(opacity).scale_gradient(self.scale_factor);
+            repaints.writes.push((index, Quad { background, ..old }));
+            repaints.done.push(repaint.done);
+        }
+        Ok(repaints)
+    }
+
+    /// Writes what [`Window::plan_scroll_thumb_repaints`] worked out over the operations of the thumbs in
+    /// the frame shown, makes the scene again only if the primitives cannot be written where they are,
+    /// and tells each owner. The frame is presented.
+    pub fn repaint_scroll_thumbs(&mut self, repaints: ScrollThumbRepaints, cx: &mut App) {
+        let ScrollThumbRepaints { writes, vanishes, done } = repaints;
+        if !writes.is_empty() {
+            let edits: Vec<(usize, PaintOperation)> = writes
+                .into_iter()
+                .map(|(index, quad)| {
+                    let ThumbPaint::Quad { op, .. } = self.rendered_frame.scroll.thumbs[index].paint else {
+                        unreachable!("a thumb that is repainted has the quad it painted")
+                    };
+                    (op, PaintOperation::Quad(quad))
+                })
+                .collect();
+            self.patch.counters.thumb_repaints += edits.len() as u64;
+            let scene = &mut self.rendered_frame.scene;
+            let mut written = 0;
+            if scene.patch_in_place(edits.iter().map(|(op, new)| (*op, new)), &mut written) {
+                self.patch.counters.in_place_primitives += written;
+            } else {
+                for (op, new) in &edits {
+                    scene.paint_operations[*op].clone_from(new);
+                }
+                if self.patch.translate_follows {
+                    self.patch.scene_deferred = true;
+                } else {
+                    scene.rebuild_from_operations();
+                    self.patch.counters.scene_rebuilds += 1;
+                }
+            }
+            self.patch.thumb_vanished |= vanishes;
+            let vanished = self.patch.thumb_vanished;
+            if let Some(trace) = &mut self.patch.trace {
+                trace.thumb_vanished = vanished;
+                if trace.in_place_scene.is_some() {
+                    trace.in_place_scene = Some(self.rendered_frame.scene.describe_primitives());
+                }
+            }
+            self.needs_present.set(true);
+        }
+        for done in done {
+            done(self, cx);
+        }
     }
 
     /// Classifies the frame about to be drawn if a list scrolled since the last one, and counts it.
@@ -1493,7 +1617,7 @@ impl Window {
         let mut thumbs = Vec::with_capacity(prediction.thumbs.len());
         for (index, bounds) in &prediction.thumbs {
             let quad = match (bounds, shown.thumbs[*index].paint) {
-                (Some(bounds), ThumbPaint::Quad { op, bounds: painted }) => {
+                (Some(bounds), ThumbPaint::Quad { op, bounds: painted, .. }) => {
                     let PaintOperation::Quad(old) = &self.rendered_frame.scene.paint_operations[op] else {
                         return Err(ScrollApplyDecline::Thumb);
                     };
@@ -1892,10 +2016,10 @@ impl Window {
         for movement in thumbs {
             let thumb = &mut self.rendered_frame.scroll.thumbs[movement.thumb];
             if let Some((quad, bounds)) = movement.quad {
-                let ThumbPaint::Quad { op, .. } = thumb.paint else {
+                let ThumbPaint::Quad { op, opacity, .. } = thumb.paint else {
                     unreachable!("a thumb that moves has the quad it painted")
                 };
-                thumb.paint = ThumbPaint::Quad { op, bounds };
+                thumb.paint = ThumbPaint::Quad { op, bounds, opacity };
                 self.rendered_frame.scene.paint_operations[op] = PaintOperation::Quad(quad);
             }
             bars.push(thumb.moved.clone());

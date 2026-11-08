@@ -150,6 +150,10 @@ pub struct PatchCounters {
     /// Primitives that patched frames wrote over their place in the scene, which a patch that
     /// changes nothing but how an operation paints does instead of making the scene again.
     pub in_place_primitives: u64,
+    /// Thumbs of a list's scrollbar that a frame repainted in the color the owner gives them now, with
+    /// no scroll and no build (a step of the fade of the bar): see
+    /// [`Window::repaint_scroll_thumbs`].
+    pub thumb_repaints: u64,
     /// Retained roots that patched frames repainted after laying them out again, see
     /// [`Retained::patchable_relayout`](crate::Retained::patchable_relayout).
     pub relayout_patches: u64,
@@ -206,16 +210,20 @@ pub(crate) struct PatchWindow {
     patcher: Option<FramePatcher>,
     /// A tick was requested for the next draw, see [`Window::request_tick`].
     pub(crate) tick: bool,
-    counters: PatchCounters,
+    pub(super) counters: PatchCounters,
     /// The ids the hitboxes inserted by a patch are given, in order, while one prepaints.
     pub(crate) hitbox_ids: Option<RecordedHitboxIds>,
     outcome: Option<PatchOutcome>,
-    trace: Option<PatchTrace>,
+    pub(super) trace: Option<PatchTrace>,
     /// A patch repainted a root that is recorded to be put elsewhere and could not make its recording
     /// the paint it left (see [`RecordingRewrite::relocation`]), so the recording is of the paint before:
     /// a scroll translate, which puts rows where their recordings paint them, would show it. Until a frame
     /// is built whole.
     pub(crate) recordings_stale: bool,
+    /// A thumb faded away in place: the frame shown holds a quad with no color where a frame built whole paints
+    /// none, so the draw orders after it are one more than that frame's. Until a frame is built whole its scene
+    /// is not compared with one that is (the pictures are).
+    pub(crate) thumb_vanished: bool,
     /// The patch being drawn is followed in the same draw by the translate of a list scroll, which makes
     /// the scene again from the operations: whatever the patch would make of it is of no use.
     pub(crate) translate_follows: bool,
@@ -286,7 +294,9 @@ pub(crate) struct PatchTrace {
     counters: RetainedCounters,
     redraw_requests: u32,
     /// The scene's primitives with their draw orders, when the patch wrote them in place.
-    in_place_scene: Option<String>,
+    pub(super) in_place_scene: Option<String>,
+    /// A thumb had faded away in place by the time of the patch, see `PatchWindow::thumb_vanished`.
+    pub(super) thumb_vanished: bool,
 }
 
 pub(crate) enum PatchedFrame {
@@ -721,7 +731,7 @@ impl Window {
                 ));
             }
         }
-        if let Some(patched) = &trace.in_place_scene {
+        if let Some(patched) = trace.in_place_scene.as_ref().filter(|_| !trace.thumb_vanished) {
             let built = self.rendered_frame.scene.describe_primitives();
             if *patched != built {
                 differences.push(format!(
@@ -1150,6 +1160,7 @@ impl Window {
                 counters: self.retained.counters,
                 redraw_requests: self.retained.redraw_requests,
                 in_place_scene: None,
+                thumb_vanished: self.patch.thumb_vanished,
             });
         }
         let mut splices = Vec::new();

@@ -31,6 +31,8 @@ struct Bar {
     rotated: Rc<Cell<bool>>,
     /// How many frames that moved the rows told the bar.
     moved: Rc<Cell<u32>>,
+    /// How many repaints of the thumb were written and told the bar.
+    repainted: Rc<Cell<u32>>,
 }
 
 impl Bar {
@@ -42,6 +44,7 @@ impl Bar {
             lie: Rc::default(),
             rotated: Rc::default(),
             moved: Rc::default(),
+            repainted: Rc::default(),
         }
     }
 
@@ -133,11 +136,28 @@ impl Render for Page {
                         });
                         let told = bar.moved.clone();
                         let moved = Rc::new(move |_: &mut Window, _: &mut crate::App| told.set(told.get() + 1));
+                        let (repaint_bar, told) = (bar.clone(), bar.repainted.clone());
+                        let repaint = Rc::new(move |_: &Window, _: Option<Bounds<crate::Pixels>>| {
+                            let target = repaint_bar.alpha.get();
+                            if target == painted.0 {
+                                return Ok(None);
+                            }
+                            if painted.0 <= 0. || repaint_bar.length.get() != painted.1 || repaint_bar.track.get() != painted.2 {
+                                return Err(ScrollThumbMiss::Appear);
+                            }
+                            let mut color = crate::black();
+                            color.a = target;
+                            let told = told.clone();
+                            Ok(Some(crate::ScrollThumbRepaint {
+                                background: color.into(),
+                                done: Box::new(move |_, _| told.set(told.get() + 1)),
+                            }))
+                        });
                         if bar.rotated.get() {
                             let turn = crate::TransformationMatrix::unit().rotate(crate::radians(0.1));
-                            window.with_transform(turn, |window| window.paint_scroll_thumb(&state, thumb, plan, moved));
+                            window.with_transform(turn, |window| { window.paint_scroll_thumb(&state, thumb, plan, moved, repaint); });
                         } else {
-                            window.paint_scroll_thumb(&state, thumb, plan, moved);
+                            window.paint_scroll_thumb(&state, thumb, plan, moved, repaint);
                         }
                     })
                     .into_any_element(),
@@ -944,4 +964,71 @@ fn a_thumb_painted_under_a_transform_is_one_that_cannot_be_moved(cx: &mut TestAp
     let counters = fixture.counters(cx);
     only(&counters, ScrollPatchReason::Thumb);
     assert_eq!(counters.held_cause(ScrollPatchCause::ThumbTrack), 1, "{counters:?}");
+}
+
+/// Plans and writes the repaint of the thumbs of the frame shown, as a tick does.
+fn repaint_thumbs(fixture: &Fixture, cx: &mut TestAppContext) -> Result<(), ScrollThumbMiss> {
+    cx.update_window(fixture.window, |_, window, cx| {
+        let repaints = window.plan_scroll_thumb_repaints()?;
+        window.repaint_scroll_thumbs(repaints, cx);
+        Ok(())
+    })
+    .unwrap()
+}
+
+#[gpui::test]
+fn a_thumb_repainted_with_no_scroll_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    let bar = Bar::new();
+    let fixture = Fixture::with_bar(cx, &bar);
+    let before = fixture.with_window(cx, shown);
+    for alpha in [0.75, 0.25, 0.1] {
+        bar.alpha.set(alpha);
+        // The bar of the frame shown has the alpha it was built with, so the next step is from that frame again.
+        repaint_thumbs(&fixture, cx).unwrap();
+        let repainted = fixture.with_window(cx, shown);
+        assert_ne!(repainted, before);
+
+        let built = Bar::new();
+        built.alpha.set(alpha);
+        let whole = Fixture::with_bar(cx, &built);
+        let expected = whole.with_window(cx, shown);
+        assert!(
+            repainted == expected,
+            "alpha {alpha}\n{}",
+            super::retained::first_difference(&repainted, &expected)
+        );
+    }
+    assert_eq!(bar.repainted.get(), 3, "the owner is told once for each repaint");
+    assert!(fixture.with_window(cx, |window| window.patch_counters().thumb_repaints) >= 3);
+    assert_eq!(fixture.counters(cx).frames, 0, "no scroll was classified: nothing was built");
+}
+
+#[gpui::test]
+fn a_thumb_that_is_the_same_writes_nothing_and_tells_no_one(cx: &mut TestAppContext) {
+    let bar = Bar::new();
+    let fixture = Fixture::with_bar(cx, &bar);
+    let before = fixture.with_window(cx, shown);
+    repaint_thumbs(&fixture, cx).unwrap();
+    assert_eq!(fixture.with_window(cx, shown), before);
+    assert_eq!(bar.repainted.get(), 0);
+    assert_eq!(fixture.with_window(cx, |window| window.patch_counters().thumb_repaints), 0);
+}
+
+#[gpui::test]
+fn a_bar_that_says_it_cannot_be_repainted_alone_writes_nothing(cx: &mut TestAppContext) {
+    let bar = Bar::new();
+    let fixture = Fixture::with_bar(cx, &bar);
+    let before = fixture.with_window(cx, shown);
+    bar.alpha.set(0.5);
+    bar.length.set(30.);
+    assert_eq!(repaint_thumbs(&fixture, cx), Err(ScrollThumbMiss::Appear));
+    assert_eq!(fixture.with_window(cx, shown), before);
+    assert_eq!(bar.repainted.get(), 0);
+
+    // A thumb painted under a rotation is not one quad that can be written over.
+    let turned = Bar::new();
+    turned.rotated.set(true);
+    let fixture = Fixture::with_bar(cx, &turned);
+    turned.alpha.set(0.5);
+    assert_eq!(repaint_thumbs(&fixture, cx), Err(ScrollThumbMiss::Track));
 }
