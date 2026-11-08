@@ -739,7 +739,10 @@ impl Window {
     /// moving the hover from the one to the other would restyle something or emit an event (see
     /// [`ScrollPatchReason::Hover`]). Asked only when [`ScrollPatchReason::HitboxChain`] holds and
     /// the window hit tests like the DOM ([`Window::set_dom_hit_testing`]); without it every such
-    /// change is a hover change.
+    /// change is a hover change. An owner that draws a hover that only paints answers no and paints it
+    /// by the patch it asks for after the frame (`Window::request_tick`): a row a translate moved is patched
+    /// where it stands, and the frame is what one built whole shows, since that one replays the rows
+    /// recorded before the hover as well.
     pub fn set_scroll_patch_hover(
         &mut self,
         hover: Option<Rc<dyn Fn(&Window, &[GlobalElementId], &[GlobalElementId]) -> bool>>,

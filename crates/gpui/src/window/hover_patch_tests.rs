@@ -5,7 +5,7 @@
 
 use crate::{
     AppContext as _, AnyElement, AnyWindowHandle, App, Context, ElementId, InteractiveElement, IntoElement, ListAlignment, ListState,
-    ParentElement, PatchDecline, Render, ScrollDelta, ScrollWheelEvent, Styled, TestAppContext, Window, div, list,
+    ParentElement, PatchDecline, Render, ScrollDelta, ScrollPatchReason, ScrollWheelEvent, Styled, TestAppContext, Window, div, list,
     point, px, retained, size,
 };
 use std::cell::{Cell, RefCell};
@@ -281,4 +281,126 @@ fn a_patched_row_keeps_a_scroll_from_putting_back_the_paint_before(cx: &mut Test
     let translated = fixture.scene(cx);
     fixture.whole(cx, Some(1));
     assert_eq!(translated, fixture.scene(cx), "the rows moved show the paint of the patch");
+}
+
+/// A pointer that stays at one place while a wheel moves the rows under it, as the owner of the window
+/// follows it: the owner does not mind which row has the hover when it only paints (it says so to the
+/// classifier), and paints it with the patch it asks for after the frame that moved the rows.
+struct Pointed {
+    fixture: Fixture,
+    hot: Option<usize>,
+    scrolled: f32,
+}
+
+const POINTER_Y: f32 = 28.;
+
+impl Pointed {
+    fn new(cx: &mut TestAppContext, translates: bool) -> Self {
+        let fixture = Fixture::new(cx);
+        cx.update_window(fixture.window, |_, window, cx| {
+            window.set_scroll_patch(translates);
+            window.set_scroll_patch_hover(Some(Rc::new(|_, _, _| false)));
+            let moved = crate::MouseMoveEvent { position: point(px(10.), px(POINTER_Y)), ..Default::default() };
+            window.dispatch_event(crate::PlatformInput::MouseMove(moved), cx);
+        })
+        .unwrap();
+        fixture.draw(cx);
+        fixture.draw(cx);
+        let mut pointed = Self { fixture, hot: None, scrolled: 0. };
+        pointed.follow_pointer(cx, translates);
+        pointed
+    }
+
+    fn row_under_pointer(&self) -> usize {
+        ((POINTER_Y + self.scrolled) / ROW) as usize
+    }
+
+    /// Paints the hover on the row the pointer is over, as the owner does after a frame: by a patch if the frame has
+    /// the rows where one can be made, by a frame built whole if not.
+    fn follow_pointer(&mut self, cx: &mut TestAppContext, patches: bool) {
+        let under = self.row_under_pointer();
+        if self.hot == Some(under) {
+            return;
+        }
+        let before = self.fixture.patched(cx).patched_frames;
+        if patches {
+            if let Some(hot) = self.hot {
+                self.fixture.patch(cx, &[hot], false);
+            }
+            self.fixture.patch(cx, &[under], true);
+        }
+        let patched = self.fixture.patched(cx).patched_frames - before;
+        let wanted = u64::from(self.hot.is_some()) + 1;
+        if !patches || patched != wanted {
+            self.fixture.whole(cx, Some(under));
+        }
+        self.hot = Some(under);
+    }
+
+    fn wheel(&mut self, cx: &mut TestAppContext, by: f32) {
+        self.scrolled += by;
+        cx.update_window(self.fixture.window, |_, window, cx| {
+            let event = ScrollWheelEvent {
+                position: point(px(10.), px(POINTER_Y)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
+                ..Default::default()
+            };
+            window.dispatch_event(crate::PlatformInput::ScrollWheel(event), cx);
+        })
+        .unwrap();
+    }
+
+    fn counters(&self, cx: &mut TestAppContext) -> crate::ScrollPatchCounters {
+        cx.update_window(self.fixture.window, |_, window, _| window.scroll_patch_counters()).unwrap()
+    }
+}
+
+#[gpui::test]
+fn a_hover_the_owner_paints_with_a_patch_after_a_translate_is_what_a_frame_built_whole_paints(cx: &mut TestAppContext) {
+    let mut translated = Pointed::new(cx, true);
+    let mut whole = Pointed::new(cx, false);
+    // Down across the border of the rows 1 and 2 at 32 and back up over it.
+    for by in [5., 5., 5., 5., 5., 5., 5., 5., -5., -5., -5., -5., -5., -5., -5., -5.] {
+        translated.wheel(cx, by);
+        whole.wheel(cx, by);
+        translated.follow_pointer(cx, true);
+        whole.follow_pointer(cx, false);
+        assert_eq!(translated.fixture.scene(cx), whole.fixture.scene(cx), "scrolled to {}", translated.scrolled);
+    }
+    let counters = translated.counters(cx);
+    // The rows of the list have no sizes measured but the ones in view, so one step that brings a row in is built whole.
+    assert_eq!((counters.frames, counters.eligible, counters.mispredicted), (16, 15, 0), "{counters:?}");
+    assert_eq!(counters.reasons(ScrollPatchReason::Membership), 1, "{counters:?}");
+    assert_eq!(counters.reasons(ScrollPatchReason::Hover), 0, "{counters:?}");
+    assert!(counters.held(ScrollPatchReason::HitboxChain) >= 3, "the hover changed at the borders the pointer crossed: {counters:?}");
+    let patched = translated.fixture.patched(cx);
+    // What a patch declines is a row the frame built whole put elsewhere than it recorded it, after the step that was
+    // built whole; the owner builds the hover then.
+    assert_eq!(patched.declines(PatchDecline::Relocated), patched.total_declines(), "{patched:?}");
+    assert!(patched.patched_frames >= 6, "the rows a translate moved are patched where they stand: {patched:?}");
+}
+
+#[gpui::test]
+fn fifty_random_steps_under_a_still_pointer_paint_what_frames_built_whole_paint(cx: &mut TestAppContext) {
+    let mut translated = Pointed::new(cx, true);
+    let mut whole = Pointed::new(cx, false);
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    for step in 0..50 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        // Within what the rows recorded cover, so that every step is a translate.
+        let by = ((seed % 19) as f32 - 9.).clamp(-translated.scrolled, 90. - translated.scrolled);
+        translated.wheel(cx, by);
+        whole.wheel(cx, by);
+        translated.follow_pointer(cx, true);
+        whole.follow_pointer(cx, false);
+        assert_eq!(translated.fixture.scene(cx), whole.fixture.scene(cx), "step {step}, scrolled to {}", translated.scrolled);
+    }
+    let counters = translated.counters(cx);
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    let held: u64 = ScrollPatchReason::ALL.iter().map(|reason| counters.reasons(*reason)).sum();
+    assert_eq!(counters.reasons(ScrollPatchReason::Hover), 0, "{counters:?}");
+    assert_eq!(counters.frames, counters.eligible + held, "{counters:?}");
+    assert!(counters.eligible > 30, "{counters:?}");
 }
