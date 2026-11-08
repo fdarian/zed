@@ -261,10 +261,19 @@ impl RecordedHitboxIds {
     }
 }
 
+/// What a root that a patch painted left in the frame.
+struct TracedUnit {
+    id: GlobalElementId,
+    operations: Vec<PaintOperation>,
+    /// The operations were painted in the region of the recording: they hold the boxes that the clip around the root
+    /// culls, which a frame built at the place of the root leaves out.
+    regional: bool,
+}
+
 /// What the operations of the roots that a patch painted were, for the frame built whole after it
 /// to be compared with.
 pub(crate) struct PatchTrace {
-    units: Vec<(GlobalElementId, Vec<PaintOperation>)>,
+    units: Vec<TracedUnit>,
     /// The counters when the patch was made, for what the frame built whole did to the recordings.
     counters: RetainedCounters,
     redraw_requests: u32,
@@ -502,6 +511,9 @@ struct UnitRun {
     places: Places,
     /// Where the unit's scrollers are in the scratch scene and in the rendered one.
     scrollers: (Range<usize>, Range<usize>),
+    /// The unit was painted in the region its recording was made in, so what it painted holds the operations of boxes that
+    /// a build at the place it is put in culls.
+    regional: bool,
     /// The unit laid out again.
     relaid: bool,
     /// What replaces the part of the rendered frame the root held, when it registered or painted
@@ -666,7 +678,8 @@ impl Window {
     pub(crate) fn verify_patch(&mut self, trace: PatchTrace) {
         self.retained.counters.verified += 1;
         let mut differences = Vec::new();
-        for (id, patched) in &trace.units {
+        for unit in &trace.units {
+            let (id, patched) = (&unit.id, &unit.operations);
             let range = self
                 .peek_element_state(id, |state: &RetainedState| state.scene_range())
                 .flatten();
@@ -678,6 +691,16 @@ impl Window {
                 continue;
             };
             let built = &self.rendered_frame.scene.paint_operations[range];
+            if unit.regional {
+                // The frame built whole at the place of the root leaves out what the clip around it culls, where the
+                // patch painted the region and the replay at the place puts those operations in the log as clipped
+                // away. What they draw is the same, which the scene compared below says.
+                let (patched, built) = (Scene::describe_drawn_operations(patched), Scene::describe_drawn_operations(built));
+                if patched != built {
+                    differences.push(format!("{id:?}\n{}", super::retained::first_difference(&patched, &built)));
+                }
+                continue;
+            }
             let differs = built.len() != patched.len()
                 || built.iter().zip(patched).any(|(built, patched)| built.differs_from(patched));
             if differs {
@@ -1107,7 +1130,11 @@ impl Window {
                 units: resolved
                     .iter()
                     .zip(&runs)
-                    .map(|(unit, run)| (unit.unit.id.clone(), operations[run.scratch.clone()].to_vec()))
+                    .map(|(unit, run)| TracedUnit {
+                        id: unit.unit.id.clone(),
+                        operations: operations[run.scratch.clone()].to_vec(),
+                        regional: run.regional,
+                    })
                     .collect(),
                 counters: self.retained.counters,
                 redraw_requests: self.retained.redraw_requests,
@@ -1657,6 +1684,7 @@ impl Window {
             && hitbox_ids.taken == hitbox_ids.ids.len()
             && self.hitboxes_are(&source.hitboxes.hitboxes, prepaint_start.hitboxes_index..prepaint_end.hitboxes_index, relaid);
         let registrations_match = self.registrations_are(source, &prepaint_start..&prepaint_end, &paint_start..&paint_end);
+        let regional = region.is_some();
         if relaid && !(hitboxes_match && registrations_match && self.operations_are(&scratch, &rendered)) {
             // The root has other things than it had, which replace what the frame has of it.
             if !self.focus_is_recorded(source) {
@@ -1685,7 +1713,7 @@ impl Window {
                 prepaint_start.scrollers_index..prepaint_end.scrollers_index,
                 source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
             );
-            return Ok(UnitRun { scratch, rendered, changed: Vec::new(), places, scrollers, relaid, splice: Some(splice), rewrite });
+            return Ok(UnitRun { scratch, rendered, changed: Vec::new(), places, scrollers, regional, relaid, splice: Some(splice), rewrite });
         }
         if !hitboxes_match {
             return Err(PatchDecline::Hitboxes);
@@ -1740,7 +1768,7 @@ impl Window {
                 })
             })
         };
-        Ok(UnitRun { scratch, rendered, changed, places, scrollers, relaid, splice: None, rewrite })
+        Ok(UnitRun { scratch, rendered, changed, places, scrollers, regional, relaid, splice: None, rewrite })
     }
 
     /// What the scratch frame got for the unit that its recording holds by value.

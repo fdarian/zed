@@ -5,7 +5,7 @@
 
 use crate::{
     AppContext as _, AnyElement, AnyWindowHandle, App, Context, ElementId, InteractiveElement, IntoElement, ListAlignment, ListState,
-    ParentElement, PatchDecline, Render, ScrollDelta, ScrollPatchReason, ScrollWheelEvent, Styled, TestAppContext, Window, div, list,
+    ParentElement, PatchDecline, Render, ScrollDelta, ScrollPatchReason, ScrollWheelEvent, StatefulInteractiveElement as _, Styled, TestAppContext, Window, div, list,
     point, px, retained, size,
 };
 use std::cell::{Cell, RefCell};
@@ -403,4 +403,299 @@ fn fifty_random_steps_under_a_still_pointer_paint_what_frames_built_whole_paint(
     assert_eq!(counters.reasons(ScrollPatchReason::Hover), 0, "{counters:?}");
     assert_eq!(counters.frames, counters.eligible + held, "{counters:?}");
     assert!(counters.eligible > 30, "{counters:?}");
+}
+
+const TALL: f32 = 60.;
+const SCROLLER: f32 = 300.;
+
+/// Rows of a plain scroller (not a list): a hover background, an avatar and a line of text, each a relocatable
+/// root that a frame built whole puts where the scroll left it.
+struct Feed {
+    window: AnyWindowHandle,
+    scroll: crate::ScrollHandle,
+    hot: Rc<Cell<Option<usize>>>,
+    patch: Rc<RefCell<Vec<usize>>>,
+    /// Another one builds every row again.
+    epoch: Rc<Cell<u64>>,
+}
+
+fn tall_row(ix: usize, hot: bool) -> AnyElement {
+    div()
+        .id(("row", ix))
+        .w_full()
+        .h(px(TALL))
+        .flex()
+        .flex_row()
+        .gap(px(4.))
+        .bg(if hot { crate::red() } else { crate::blue() })
+        .child(div().size(px(40.)).flex_none().bg(crate::green()).cullable(crate::Edges::all(px(0.))))
+        .child(div().child(format!("row {ix}")).cullable(crate::Edges::all(px(0.))))
+        .into_any_element()
+}
+
+struct FeedPage {
+    scroll: crate::ScrollHandle,
+    hot: Rc<Cell<Option<usize>>>,
+    epoch: Rc<Cell<u64>>,
+}
+
+impl Render for FeedPage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let hot = self.hot.get();
+        let epoch = self.epoch.get();
+        div().size_full().child(div().h(px(10.)).w_full()).child(
+            div()
+                .id("scroller")
+                .w(px(200.))
+                .h(px(SCROLLER))
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .children((0..50).map(move |ix| {
+                    let hot = hot == Some(ix);
+                    retained(("row", ix), epoch * 10 + u64::from(hot), move |_, _| tall_row(ix, hot))
+                        .relocatable(px(100.))
+                        .patchable()
+                })),
+        )
+    }
+}
+
+impl Feed {
+    fn new(cx: &mut TestAppContext) -> Self {
+        let scroll = crate::ScrollHandle::new();
+        let hot = Rc::new(Cell::new(None));
+        let patch = Rc::new(RefCell::new(Vec::new()));
+        let epoch = Rc::new(Cell::new(0));
+        let page = FeedPage { scroll: scroll.clone(), hot: hot.clone(), epoch: epoch.clone() };
+        let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(400.)), move |_, _| page));
+        let watched = (hot.clone(), patch.clone());
+        cx.update_window(window, |_, window, _| {
+            window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                let units = watched
+                    .1
+                    .borrow()
+                    .iter()
+                    .map(|&ix| (ElementId::from(("row", ix)), tall_row(ix, watched.0.get() == Some(ix))))
+                    .collect();
+                window.repaint_in_place(units, cx, |_, _| true).is_ok()
+            })));
+        })
+        .unwrap();
+        let feed = Self { window, scroll, hot, patch, epoch };
+        feed.draw(cx);
+        feed.draw(cx);
+        feed
+    }
+
+    fn draw(&self, cx: &mut TestAppContext) {
+        cx.update_window(self.window, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    }
+
+    /// A wheel to `offset`, and the frame it draws: the rows are replayed from their recordings where the scroll
+    /// puts them.
+    fn scroll_to(&self, cx: &mut TestAppContext, offset: f32) {
+        let by = offset + f32::from(self.scroll.offset().y);
+        cx.update_window(self.window, |_, window, cx| {
+            let event = ScrollWheelEvent {
+                position: point(px(10.), px(250.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
+                ..Default::default()
+            };
+            window.dispatch_event(crate::PlatformInput::ScrollWheel(event), cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    /// The tick that repaints `row` in place with the hover on it or not.
+    fn patch(&self, cx: &mut TestAppContext, row: usize, hot: bool) {
+        self.hot.set(hot.then_some(row));
+        *self.patch.borrow_mut() = vec![row];
+        cx.update_window(self.window, |_, window, cx| {
+            window.request_tick();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn whole(&self, cx: &mut TestAppContext, hot: Option<usize>) {
+        self.hot.set(hot);
+        cx.update_window(self.window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn scene(&self, cx: &mut TestAppContext) -> String {
+        cx.update_window(self.window, |_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            format!("{}\n{}", scene.describe_drawn(), scene.describe_primitives())
+        })
+        .unwrap()
+    }
+
+    fn patched(&self, cx: &mut TestAppContext) -> crate::PatchCounters {
+        cx.update_window(self.window, |_, window, _| window.patch_counters()).unwrap()
+    }
+}
+
+#[gpui::test]
+fn a_patch_of_a_row_the_scroll_left_partly_above_the_clip_is_what_a_frame_built_whole_builds_under_the_verifier(cx: &mut TestAppContext) {
+    let feed = Feed::new(cx);
+    let mut patches = 0;
+    // A row at 180 to 240 is above the clip but for a part of it at these offsets: its avatar and its text are culled
+    // by a build of the frame at the place, and painted by a patch in the region that was recorded.
+    for offset in [224., 230., 233., 241., 247.5, 250., 262.] {
+        feed.scroll_to(cx, offset);
+        feed.epoch.set(feed.epoch.get() + 1);
+        feed.whole(cx, None);
+        cx.update_window(feed.window, |_, window, _| window.set_retention_verifier(Some(Rc::new(|_| String::new())))).unwrap();
+        let first = (offset / TALL) as usize;
+        for row in first..first + 2 {
+            for hot in [true, false] {
+                feed.patch(cx, row, hot);
+                patches += 1;
+                assert_eq!(feed.patched(cx).patched_frames, patches, "{:?}", feed.patched(cx));
+                let patched = feed.scene(cx);
+                let mismatches = cx.update_window(feed.window, |_, window, _| window.retention_mismatches().to_vec()).unwrap();
+                assert_eq!(mismatches, Vec::<String>::new(), "offset {offset}, row {row}, hot {hot}");
+                feed.whole(cx, hot.then_some(row));
+                let built = feed.scene(cx);
+                assert_eq!(patched, built, "offset {offset}, row {row}, hot {hot}\n{}", super::retained::first_difference(&patched, &built));
+            }
+        }
+    }
+    let verified = cx.update_window(feed.window, |_, window, _| window.retained_counters().verified).unwrap();
+    assert!(verified >= patches, "{verified} frames were compared with a frame built whole after {patches} patches");
+}
+
+/// The rows of a list that scrolls, which have an avatar and a line of text.
+struct TallList {
+    window: AnyWindowHandle,
+    hot: Rc<Cell<Option<usize>>>,
+    patch: Rc<RefCell<Vec<usize>>>,
+}
+
+struct TallPage {
+    state: ListState,
+    hot: Rc<Cell<Option<usize>>>,
+}
+
+impl Render for TallPage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let hot = self.hot.clone();
+        div().size_full().child(div().h(px(10.)).w_full()).child(
+            list(self.state.clone(), move |ix, _, _| {
+                let hot = hot.get() == Some(ix);
+                retained(("row", ix), u64::from(hot), move |_, _| tall_row(ix, hot))
+                    .relocatable(px(100.))
+                    .patchable()
+                    .into_any_element()
+            })
+            .w(px(200.))
+            .h(px(SCROLLER)),
+        )
+    }
+}
+
+impl TallList {
+    fn new(cx: &mut TestAppContext, translates: bool) -> Self {
+        let hot = Rc::new(Cell::new(None));
+        let patch = Rc::new(RefCell::new(Vec::new()));
+        let state = ListState::new(50, ListAlignment::Top, px(0.)).with_uniform_item_height(px(TALL));
+        let page = TallPage { state, hot: hot.clone() };
+        let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(400.)), move |_, _| page));
+        let watched = (hot.clone(), patch.clone());
+        cx.update_window(window, |_, window, _| {
+            window.set_dom_hit_testing(true);
+            window.set_scroll_patch(translates);
+            window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
+            window.set_frame_patcher(translates.then(|| Rc::new(move |window: &mut Window, cx: &mut App| {
+                let units = watched
+                    .1
+                    .borrow()
+                    .iter()
+                    .map(|&ix| (ElementId::from(("row", ix)), tall_row(ix, watched.0.get() == Some(ix))))
+                    .collect();
+                window.repaint_in_place(units, cx, |_, _| true).is_ok()
+            }) as Rc<dyn Fn(&mut Window, &mut App) -> bool>));
+        })
+        .unwrap();
+        let list = Self { window, hot, patch };
+        list.draw(cx);
+        list.draw(cx);
+        list
+    }
+
+    fn draw(&self, cx: &mut TestAppContext) {
+        cx.update_window(self.window, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    }
+
+    fn wheel(&self, cx: &mut TestAppContext, by: f32) {
+        cx.update_window(self.window, |_, window, cx| {
+            let event = ScrollWheelEvent {
+                position: point(px(10.), px(250.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
+                ..Default::default()
+            };
+            window.dispatch_event(crate::PlatformInput::ScrollWheel(event), cx);
+        })
+        .unwrap();
+        self.draw(cx);
+    }
+
+    fn patch(&self, cx: &mut TestAppContext, row: usize, hot: bool) {
+        self.hot.set(hot.then_some(row));
+        *self.patch.borrow_mut() = vec![row];
+        cx.update_window(self.window, |_, window, cx| {
+            window.request_tick();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn whole(&self, cx: &mut TestAppContext, hot: Option<usize>) {
+        self.hot.set(hot);
+        cx.update_window(self.window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+
+    fn scene(&self, cx: &mut TestAppContext) -> String {
+        cx.update_window(self.window, |_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            format!("{}\n{}", scene.describe_drawn(), scene.describe_primitives())
+        })
+        .unwrap()
+    }
+}
+
+#[gpui::test]
+fn a_patch_of_a_row_a_translate_left_partly_above_the_clip_leaves_the_scene_a_frame_built_whole_has(cx: &mut TestAppContext) {
+    let translated = TallList::new(cx, true);
+    let whole = TallList::new(cx, false);
+    cx.update_window(translated.window, |_, window, _| window.set_retention_verifier(Some(Rc::new(|_| String::new())))).unwrap();
+    let mut scrolled = 0.;
+    let mut hot: Option<usize> = None;
+    for to in [30., 60., 90., 120., 150., 180., 200., 224., 230., 233., 227., 229.] {
+        translated.wheel(cx, to - scrolled);
+        whole.wheel(cx, to - scrolled);
+        scrolled = to;
+        let row = (to / TALL) as usize;
+        if let Some(old) = hot {
+            translated.patch(cx, old, false);
+        }
+        translated.patch(cx, row, true);
+        whole.whole(cx, Some(row));
+        hot = Some(row);
+        let (patched, built) = (translated.scene(cx), whole.scene(cx));
+        assert_eq!(patched, built, "scrolled to {to}\n{}", super::retained::first_difference(&patched, &built));
+    }
+    let mismatches = cx.update_window(translated.window, |_, window, _| window.retention_mismatches().to_vec()).unwrap();
+    assert_eq!(mismatches, Vec::<String>::new());
+    let counters = cx.update_window(translated.window, |_, window, _| window.patch_counters()).unwrap();
+    assert!(counters.patched_frames >= 12, "{counters:?}");
 }

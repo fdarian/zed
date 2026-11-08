@@ -1115,14 +1115,23 @@ impl Scene {
         self.describe_operations_with(0..self.paint_operations.len(), false, false)
     }
 
+    /// [`Scene::describe_drawn`] of `operations`.
+    pub(crate) fn describe_drawn_operations(operations: &[PaintOperation]) -> String {
+        Self::describe_operation_slice(operations, false, false)
+    }
+
     fn describe_operations_with(&self, range: Range<usize>, marks: bool, loose: bool) -> String {
+        Self::describe_operation_slice(self.paint_operations.get(range).unwrap_or_default(), marks, loose)
+    }
+
+    fn describe_operation_slice(operations: &[PaintOperation], marks: bool, loose: bool) -> String {
         use std::fmt::Write as _;
 
         let mut out = String::new();
         // Whether each open layer is a clipped away one, which an element that is culled does not
         // paint at all.
         let mut layers: Vec<bool> = Vec::new();
-        for operation in self.paint_operations.get(range).unwrap_or_default() {
+        for operation in operations {
             if !marks && matches!(operation, PaintOperation::Replaced { .. } | PaintOperation::EndReplaced) {
                 continue;
             }
