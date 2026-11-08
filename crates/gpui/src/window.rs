@@ -929,6 +929,12 @@ pub(crate) struct CursorStyleRequest {
     pub(crate) style: CursorStyle,
 }
 
+/// The hitboxes at `range` of a frame, for [`Frame::hit_test_replacing`] to take as `with`.
+pub(crate) struct HitboxReplacement<'a> {
+    pub(crate) range: Range<usize>,
+    pub(crate) with: &'a [Hitbox],
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct HitTest {
     pub(crate) ids: SmallVec<[HitboxId; 8]>,
@@ -1857,24 +1863,35 @@ impl Frame {
         self.hit_test_over(position, dom_hit_testing, self.hitboxes.len(), self.clip_index(), hitbox_at)
     }
 
-    /// [`Self::hit_test`] of the frame with the hitboxes at `range` taken out and `replacement`
-    /// put in their place, which is what a patch that splices a root has: the frame it paints in
-    /// is hit tested before the rendered frame has the new hitboxes.
+    /// [`Self::hit_test`] of the frame with the hitboxes at each range of `replacements` taken out
+    /// and the replacement put in their place, which is what a patch that splices roots has: the
+    /// frame it paints in is hit tested before the rendered frame has the new hitboxes. The ranges
+    /// are in order and do not overlap.
     pub(crate) fn hit_test_replacing(
         &self,
         position: Point<Pixels>,
         dom_hit_testing: bool,
-        range: Range<usize>,
-        replacement: &[Hitbox],
+        replacements: &[HitboxReplacement],
     ) -> HitTest {
-        let len = self.hitboxes.len() - range.len() + replacement.len();
+        // Where each replacement starts among the hitboxes after the earlier ones are replaced, and
+        // how far the hitboxes after it are from where the frame has them.
+        let mut placed = Vec::with_capacity(replacements.len());
+        let mut shift = 0isize;
+        for replacement in replacements {
+            let start = (replacement.range.start as isize + shift) as usize;
+            shift += replacement.with.len() as isize - replacement.range.len() as isize;
+            placed.push((start, shift));
+        }
+        let len = (self.hitboxes.len() as isize + shift) as usize;
         let hitbox_at = |ix: usize| {
-            if ix < range.start {
-                &self.hitboxes[ix]
-            } else if ix < range.start + replacement.len() {
-                &replacement[ix - range.start]
-            } else {
-                &self.hitboxes[ix - replacement.len() + range.len()]
+            let before = placed.partition_point(|(start, _)| *start <= ix);
+            let Some(at) = before.checked_sub(1) else {
+                return &self.hitboxes[ix];
+            };
+            let (start, shift) = placed[at];
+            match replacements[at].with.get(ix - start) {
+                Some(hitbox) => hitbox,
+                None => &self.hitboxes[(ix as isize - shift) as usize],
             }
         };
         let clips = ClipIndex::over(len, hitbox_at);

@@ -1324,6 +1324,7 @@ impl Window {
         cx: &mut App,
     ) -> Result<(Vec<UnitRun>, Vec<ScrollRangeMove>), PatchDecline> {
         let units = &mut prepared.units;
+        self.refresh_hit_test_for_roots(units, &prepared.steps);
         let mut runs = Vec::with_capacity(units.len());
         for (unit, step) in units.iter_mut().zip(prepared.steps.iter_mut()) {
             let around = unit.unit.clone();
@@ -1662,9 +1663,6 @@ impl Window {
         let (prepaint_start, prepaint_end) = (step.prepaint.start.clone(), step.prepaint.end.clone());
         let before_paint = self.effects();
         let scene_start = self.next_frame.scene.len();
-        if relaid {
-            self.refresh_hit_test_for_root(source, &prepaint_start..&prepaint_end);
-        }
 
         self.invalidator.set_phase(DrawPhase::Paint);
         let paint_start = self.paint_index();
@@ -1986,22 +1984,41 @@ impl Window {
     /// What the pointer hits is the question that a frame built whole answers between prepaint and
     /// paint, with the hitboxes it has made: an element reads whether it is hovered when it paints. The
     /// hitboxes of a root that laid out again are not the ones the rendered frame has, so this asks
-    /// the rendered frame with the root's part replaced.
-    fn refresh_hit_test_for_root(&mut self, source: &PatchSource, prepaint: Range<&PrepaintStateIndex>) {
+    /// the rendered frame with the parts of those roots replaced, all of them before any root paints:
+    /// a root reads the hitboxes of the roots beside it as they are after the patch.
+    fn refresh_hit_test_for_roots(&mut self, units: &[ResolvedUnit], steps: &[PreparedStep]) {
         if self.pointer_outside {
             return;
         }
-        let range = source.prepaint.start.hitboxes_index..source.prepaint.end.hitboxes_index;
-        let recorded = &source.hitboxes.hitboxes;
-        let holds_recorded = self.rendered_frame.hitboxes.get(range.clone()).is_some_and(|held| {
-            held.len() == recorded.len() && held.iter().zip(recorded).all(|(held, recorded)| held.id == recorded.id)
-        });
-        if !holds_recorded {
+        let mut replacements = Vec::new();
+        for (unit, step) in units.iter().zip(steps) {
+            if !step.relaid {
+                continue;
+            }
+            let source = &unit.source;
+            let range = source.prepaint.start.hitboxes_index..source.prepaint.end.hitboxes_index;
+            let recorded = &source.hitboxes.hitboxes;
+            let holds_recorded = self.rendered_frame.hitboxes.get(range.clone()).is_some_and(|held| {
+                held.len() == recorded.len() && held.iter().zip(recorded).all(|(held, recorded)| held.id == recorded.id)
+            });
+            if !holds_recorded {
+                return;
+            }
+            let new = &self.next_frame.hitboxes[step.prepaint.start.hitboxes_index..step.prepaint.end.hitboxes_index];
+            replacements.push(HitboxReplacement { range, with: new });
+        }
+        if replacements.is_empty() {
             return;
         }
-        let new = &self.next_frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index];
-        let hit_test = self.rendered_frame.hit_test_replacing(self.mouse_position, self.dom_hit_testing, range, new);
-        self.mouse_hit_test = hit_test;
+        replacements.sort_by_key(|replacement| replacement.range.start);
+        // A root held by another is part of the part that one replaces.
+        let mut end = 0;
+        replacements.retain(|replacement| {
+            let apart = replacement.range.start >= end;
+            end = end.max(replacement.range.end);
+            apart
+        });
+        self.mouse_hit_test = self.rendered_frame.hit_test_replacing(self.mouse_position, self.dom_hit_testing, &replacements);
     }
 
     /// Whether what prepaint and paint registered outside the scene is what the recording

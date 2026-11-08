@@ -972,3 +972,151 @@ fn the_verifier_finds_no_difference_in_a_patch_of_a_root_in_place_and_a_root_spl
     assert_eq!(page.patches(cx).patched_units, 6, "{:?}", page.state.seen.borrow());
     assert!(mismatches.is_empty(), "{mismatches:?}");
 }
+
+const LOWER: &str = "lower";
+const UPPER: &str = "upper";
+
+/// Two roots that overlap at the pointer, the upper one painted over the lower: in the patch the
+/// lower root keeps its box under the pointer and the upper root moves a box that occludes into it.
+struct Overlap {
+    covering: Cell<bool>,
+    height: Cell<f32>,
+    log: RefCell<Vec<String>>,
+}
+
+impl Overlap {
+    fn lower(self: &Rc<Self>) -> AnyElement {
+        let down = self.clone();
+        div()
+            .id(LOWER)
+            .w(px(60.))
+            .h(px(100.))
+            .flex_none()
+            .child(
+                div()
+                    .id("lower-box")
+                    .w(px(60.))
+                    .h(px(self.height.get()))
+                    .bg(red())
+                    .hover(|style| style.bg(green()))
+                    .on_mouse_down(MouseButton::Left, move |_, _, _| down.log.borrow_mut().push("lower".to_owned())),
+            )
+            .into_any_element()
+    }
+
+    fn upper(self: &Rc<Self>) -> AnyElement {
+        let down = self.clone();
+        let margin = if self.covering.get() { 0. } else { 60. };
+        div()
+            .id(UPPER)
+            .mt(px(-100.))
+            .w(px(60.))
+            .h(px(100.))
+            .flex_none()
+            .child(
+                div()
+                    .id("upper-box")
+                    .mt(px(margin))
+                    .w(px(60.))
+                    .h(px(30.))
+                    .occlude()
+                    .bg(blue())
+                    .hover(|style| style.bg(green()))
+                    .on_mouse_down(MouseButton::Left, move |_, _, _| down.log.borrow_mut().push("upper".to_owned())),
+            )
+            .into_any_element()
+    }
+}
+
+struct OverlapPage(Rc<Overlap>);
+
+impl Render for OverlapPage {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (lower, upper) = (self.0.clone(), self.0.clone());
+        div()
+            .id("page")
+            .flex()
+            .flex_col()
+            .w(px(400.))
+            .h(px(400.))
+            .child(retained(LOWER, 1, move |_, _| lower.lower()).patchable_relayout())
+            .child(retained(UPPER, 2, move |_, _| upper.upper()).patchable_relayout())
+            .into_any_element()
+    }
+}
+
+struct OverlapFixture {
+    window: AnyWindowHandle,
+    state: Rc<Overlap>,
+}
+
+impl OverlapFixture {
+    fn new(cx: &mut TestAppContext, upper_first: bool) -> Self {
+        let state = Rc::new(Overlap { covering: Cell::new(false), height: Cell::new(40.), log: RefCell::new(Vec::new()) });
+        let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(400.)), {
+            let state = state.clone();
+            move |_, _| OverlapPage(state)
+        }));
+        cx.update_window(window, |_, window, cx| {
+            window.set_dom_hit_testing(true);
+            window.set_contained_patches(true);
+            let patched = state.clone();
+            window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                let mut units = vec![(ElementId::from(LOWER), patched.lower()), (ElementId::from(UPPER), patched.upper())];
+                if upper_first {
+                    units.reverse();
+                }
+                window.repaint_in_place(units, cx, |_, _| true).is_ok()
+            })));
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(point(px(10.), px(20.)), cx);
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            window.present_cached_frame();
+        })
+        .unwrap();
+        Self { window, state }
+    }
+
+    /// What the pointer hits, how the frame paints it and which box a click reaches.
+    fn observe(&self, cx: &mut TestAppContext) -> (Vec<String>, String, Vec<String>) {
+        let state = self.state.clone();
+        cx.update_window(self.window, |_, window, cx| {
+            let hits: Vec<String> = window.mouse_hit_test.ids.iter().map(|id| name_of(window, *id)).collect();
+            let frame = frame_text(window);
+            state.log.borrow_mut().clear();
+            Fixture::click(window, point(px(10.), px(20.)), cx);
+            let clicked = state.log.borrow().clone();
+            (hits, frame, clicked)
+        })
+        .unwrap()
+    }
+}
+
+#[gpui::test]
+fn two_roots_that_lay_out_again_in_one_patch_hit_test_the_pointer_as_a_frame_built_whole_does(cx: &mut TestAppContext) {
+    for upper_first in [false, true] {
+        let page = OverlapFixture::new(cx, upper_first);
+        page.state.covering.set(true);
+        page.state.height.set(41.);
+        cx.update_window(page.window, |_, window, cx| {
+            window.request_tick();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let patches = cx.update_window(page.window, |_, window, _| window.patch_counters()).unwrap();
+        assert_eq!((patches.patched_frames, patches.patched_units, patches.relayout_patches), (1, 2, 2), "{upper_first}");
+        assert_eq!(patches.total_declines(), 0, "{upper_first}");
+        let patched = page.observe(cx);
+        cx.update_window(page.window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let whole = page.observe(cx);
+        assert_eq!(patched.0, whole.0, "upper first {upper_first}: what the pointer hits");
+        assert_same(&patched.1, &whole.1, "the frame");
+        assert_eq!(patched.2, whole.2, "upper first {upper_first}: the box a click reaches");
+    }
+}
