@@ -1841,16 +1841,30 @@ fn sort_items<T>(items: &mut [T], key: impl Fn(&T) -> u128, placed: Option<Place
             }
         }
     }
-    // Moves each item to where `gather` says, a cycle at a time, with no second vector of items.
+    // Moves each item to where `gather` says, a cycle at a time, with no second vector of items: the
+    // first of a cycle is held aside while the others are moved one place, and goes in the place left.
     for first in 0..gather.len() {
         let mut to = first;
-        loop {
-            let from = (mem::replace(&mut gather[to], to as u128) & INDEX) as usize;
-            if from == first {
-                break;
+        let mut from = (mem::replace(&mut gather[to], to as u128) & INDEX) as usize;
+        if from == first {
+            continue;
+        }
+        let items = items.as_mut_ptr();
+        // SAFETY: `gather` holds each index once, so the cycle is a loop of distinct places of `items`,
+        // each read once and written once: `from` is read before it is written (it is the next `to`), the
+        // value of `first` is read before the first write, and written where the cycle ends. Nothing in
+        // between can panic, so no item is dropped or left twice.
+        unsafe {
+            let held = std::ptr::read(items.add(first));
+            loop {
+                std::ptr::copy_nonoverlapping(items.add(from), items.add(to), 1);
+                to = from;
+                from = (mem::replace(&mut gather[to], to as u128) & INDEX) as usize;
+                if from == first {
+                    break;
+                }
             }
-            items.swap(to, from);
-            to = from;
+            std::ptr::write(items.add(to), held);
         }
     }
 }
@@ -3653,6 +3667,41 @@ mod tests {
     use crate::{
         AtlasTextureKind, GroupEffect, ResolvedFilter, TileId, TransformationMatrix, red, size,
     };
+
+    /// `sort_items` is a stable sort by key, for items that own memory, and notes where each went.
+    #[test]
+    fn sort_items_is_a_stable_sort_that_says_where_each_item_went() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for length in [0usize, 1, 2, 3, 7, 64, 500] {
+            for keys in [1u64, 3, 40, 100_000] {
+                let items: Vec<(u64, String)> =
+                    (0..length).map(|index| (next(keys), format!("item {index}"))).collect();
+                let mut expected = items.clone();
+                expected.sort_by_key(|item| item.0);
+
+                let mut sorted = items.clone();
+                let operations: Vec<u32> = (0..length as u32).collect();
+                let mut slots = vec![OpSlot::Nothing; length];
+                let placed = Placed { inserted: &operations, kind: PrimitiveKind::Quad, slots: &mut slots };
+                sort_items(&mut sorted, |item| item.0 as u128, Some(placed));
+                assert_eq!(sorted, expected, "{length} items with {keys} keys");
+                for (index, item) in items.iter().enumerate() {
+                    let OpSlot::At(PrimitiveKind::Quad, to) = slots[index] else { panic!("{:?}", slots[index]) };
+                    assert_eq!(sorted[to as usize], *item);
+                }
+
+                let mut unplaced = items.clone();
+                sort_items(&mut unplaced, |item| item.0 as u128, None);
+                assert_eq!(unplaced, expected);
+            }
+        }
+    }
 
     const WINDOW: f32 = 400.;
 
