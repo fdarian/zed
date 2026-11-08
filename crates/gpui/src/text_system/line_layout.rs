@@ -2118,6 +2118,14 @@ pub struct TextCounters {
     /// Lookups that found neither but a layout the window shaped some frames ago, which the
     /// per-window shape store kept. They are not shapes.
     pub shape_cache_hits: u64,
+    /// Wrapped layouts that computed the marks of their text (its advances, kerns and soft hyphens),
+    /// which take a platform call for each distinct glyph.
+    pub snap_computations: u64,
+    /// Wrapped layouts that took the marks of their text from those another width computed.
+    pub snap_cache_hits: u64,
+    /// The lists of line ends that Blink reshapes that were computed, one for a text that some width
+    /// of it breaks lines at: the part of the marks that takes a call for each distinct letter.
+    pub end_reshape_computations: u64,
 }
 
 #[derive(Default)]
@@ -2126,6 +2134,9 @@ struct AtomicTextCounters {
     wrapped_layouts: AtomicU64,
     hits: AtomicU64,
     shape_cache_hits: AtomicU64,
+    snap_computations: AtomicU64,
+    snap_cache_hits: AtomicU64,
+    end_reshape_computations: AtomicU64,
 }
 
 impl AtomicTextCounters {
@@ -2252,6 +2263,9 @@ impl LineLayoutCache {
             wrapped_layouts: self.counters.wrapped_layouts.load(Ordering::Relaxed),
             hits: self.counters.hits.load(Ordering::Relaxed),
             shape_cache_hits: self.counters.shape_cache_hits.load(Ordering::Relaxed),
+            snap_computations: self.counters.snap_computations.load(Ordering::Relaxed),
+            snap_cache_hits: self.counters.snap_cache_hits.load(Ordering::Relaxed),
+            end_reshape_computations: self.counters.end_reshape_computations.load(Ordering::Relaxed),
         }
     }
 
@@ -2462,16 +2476,35 @@ impl LineLayoutCache {
                 || wrap_width.is_some()
                 || options.hang_trailing_spaces
                 || !insets.is_empty();
-            let marks = self.snap_marks(&shaped_layout, text.as_ref(), runs, item_starts);
+            // What the marks read of the layout: the shaped line, and the items of the text.
+            let snap_key = CacheKeyRef {
+                text: text.as_ref(),
+                font_size,
+                runs,
+                item_starts,
+                wrap_width: None,
+                max_lines: None,
+                force_width: None,
+                options: TextLayoutOptions {
+                    strut_font: options.strut_font,
+                    nowrap: options.nowrap,
+                    ..TextLayoutOptions::default()
+                },
+                insets: &[],
+                inline,
+                line_height,
+                scale_bits: scale_factor.to_bits(),
+            };
+            let snap = self.snap_entry(&snap_key, &text, &shaped_layout);
             let marks = match wrap_width {
                 Some(wrap_width) if !options.min_content => self.with_end_reshapes(
-                    marks,
+                    &snap,
                     &shaped_layout,
                     text.as_ref(),
                     crate::util::fit_layout_units(wrap_width, scale_factor),
                     tab_stop.is_some() || !insets.is_empty(),
                 ),
-                _ => marks,
+                _ => snap.marks().clone(),
             };
             let (unwrapped_layout, computation) = if needs_pass {
                 let computation = shaped_layout.compute_styled_wrap_boundaries(

@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, mem::size_of, sync::Arc};
 use collections::FxHashMap;
 
 use super::{
-    AsCacheKeyRef, CacheKey, FontRun, GlyphInset, InlineSpec, LineLayout, PlacedBox, ShapedGlyph,
+    AsCacheKeyRef, snap::SnapEntry, CacheKey, FontRun, GlyphInset, InlineSpec, LineLayout, PlacedBox, ShapedGlyph,
     ShapedRun, TextInset, WrapBoundary, WrappedLineLayout,
 };
 use crate::{Hyphen, Pixels};
@@ -24,6 +24,7 @@ const ENTRY_OVERHEAD_BYTES: usize = 96;
 pub(super) struct ShapeStore {
     lines: Recency<LineLayout>,
     wrapped_lines: Recency<WrappedLineLayout>,
+    snaps: Recency<SnapEntry>,
     bytes: usize,
     budget: usize,
     /// Orders the uses of both maps, so that the one used longest ago is found across them.
@@ -38,6 +39,7 @@ impl ShapeStore {
         Self {
             lines: Recency::default(),
             wrapped_lines: Recency::default(),
+            snaps: Recency::default(),
             bytes: 0,
             budget,
             clock: 0,
@@ -47,7 +49,7 @@ impl ShapeStore {
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.lines.entries.len() + self.wrapped_lines.entries.len()
+        self.lines.entries.len() + self.wrapped_lines.entries.len() + self.snaps.entries.len()
     }
 
     #[cfg(test)]
@@ -73,6 +75,32 @@ impl ShapeStore {
         self.forget_if_fonts_changed(font_generation);
         let stamp = self.tick();
         self.wrapped_lines.touch(key, stamp)
+    }
+
+    pub fn snap(
+        &mut self,
+        key: &dyn AsCacheKeyRef,
+        font_generation: u64,
+    ) -> Option<(Arc<CacheKey>, Arc<SnapEntry>)> {
+        self.forget_if_fonts_changed(font_generation);
+        let stamp = self.tick();
+        self.snaps.touch(key, stamp)
+    }
+
+    pub fn keep_snap(
+        &mut self,
+        key: &Arc<CacheKey>,
+        entry: &Arc<SnapEntry>,
+        font_generation: u64,
+    ) {
+        self.forget_if_fonts_changed(font_generation);
+        let stamp = self.tick();
+        if self.snaps.touch(&**key, stamp).is_none() {
+            let bytes = estimated_bytes(key) + entry.estimated_bytes();
+            self.bytes += bytes;
+            self.bytes -= self.snaps.insert(key.clone(), entry.clone(), bytes, stamp);
+            self.evict();
+        }
     }
 
     /// Keeps `layout` as the most recently used, which is also how a layout that the frame
@@ -121,19 +149,26 @@ impl ShapeStore {
             self.font_generation = font_generation;
             self.lines = Recency::default();
             self.wrapped_lines = Recency::default();
+            self.snaps = Recency::default();
             self.bytes = 0;
         }
     }
 
     fn evict(&mut self) {
         while self.bytes > self.budget {
-            let line_stamp = self.lines.oldest_stamp();
-            let wrapped_stamp = self.wrapped_lines.oldest_stamp();
-            let freed = match (line_stamp, wrapped_stamp) {
-                (Some(line), Some(wrapped)) if line < wrapped => self.lines.pop_oldest(),
-                (Some(_), None) => self.lines.pop_oldest(),
-                (_, Some(_)) => self.wrapped_lines.pop_oldest(),
-                (None, None) => return,
+            let oldest = [
+                (self.lines.oldest_stamp(), 0),
+                (self.wrapped_lines.oldest_stamp(), 1),
+                (self.snaps.oldest_stamp(), 2),
+            ]
+            .into_iter()
+            .filter_map(|(stamp, map)| Some((stamp?, map)))
+            .min();
+            let freed = match oldest {
+                Some((_, 0)) => self.lines.pop_oldest(),
+                Some((_, 1)) => self.wrapped_lines.pop_oldest(),
+                Some(_) => self.snaps.pop_oldest(),
+                None => return,
             };
             self.bytes -= freed;
         }
@@ -307,6 +342,25 @@ mod tests {
         let mut store = ShapeStore::new(SHAPE_STORE_BUDGET_BYTES);
         store.keep_line(&a, &layout(), 0);
         assert!(store.line(&*a, 1).is_none());
+        assert_eq!((store.len(), store.bytes()), (0, 0));
+    }
+
+    #[test]
+    fn a_snap_entry_ages_with_the_layouts_and_goes_with_the_fonts() {
+        let (a, b, c) = (key("a"), key("b"), key("c"));
+        let snap_bytes = estimated_bytes(&a) + SnapEntry::empty().estimated_bytes();
+        let mut store = ShapeStore::new(snap_bytes + entry_bytes(&b));
+        store.keep_snap(&a, &SnapEntry::empty(), 0);
+        store.keep_line(&b, &layout(), 0);
+        assert_eq!(store.len(), 2);
+        // The snap entry is the one used longest ago.
+        store.keep_line(&c, &layout(), 0);
+        assert!(store.snap(&*a, 0).is_none());
+        assert!(store.line(&*c, 0).is_some());
+
+        store.keep_snap(&a, &SnapEntry::empty(), 0);
+        assert!(store.snap(&*a, 0).is_some());
+        assert!(store.snap(&*a, 1).is_none());
         assert_eq!((store.len(), store.bytes()), (0, 0));
     }
 }

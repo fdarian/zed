@@ -2420,6 +2420,9 @@ mod line_wrapper_pool_tests {
 #[cfg(test)]
 mod layout_unit_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+mod snap_cache_tests;
+
 #[cfg(test)]
 mod line_box_tests {
     use super::*;

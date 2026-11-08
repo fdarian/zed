@@ -25,13 +25,14 @@
 //! CoreText puts the glyphs, which the glyphs are painted at and which carry the noise of an `f32`
 //! (and the next float up of the font size that keeps CoreText from forming ligatures).
 
-use super::{LineLayout, LineLayoutCache};
+use super::{AtomicTextCounters, CacheKey, CacheKeyRef, LineLayout, LineLayoutCache};
+use crate::SharedString;
 use super::ShapedRun;
 use crate::{FontId, FontRun, GlyphId, Halt, Pixels, px, util::{LAYOUT_UNIT, ceil_layout_units}};
 use collections::FxHashMap;
 use gpui_util::ResultExt as _;
 use smallvec::SmallVec;
-use std::ops::Range;
+use std::{mem::size_of, ops::Range, sync::{Arc, OnceLock}};
 
 /// The hyphen Blink adds to a line that breaks at a soft hyphen: a glyph of its own after the text
 /// of the row, in the style of the text before the break. It is not part of the text, so no index
@@ -69,18 +70,53 @@ pub struct SnapMarks {
     item_starts: SmallVec<[usize; 4]>,
     /// The glyphs that follow a kern of a font with no GPOS table, with the part of the kern that
     /// HarfBuzz leaves out of the advance before them. Ascending by glyph.
-    kern_shares: Vec<(usize, Pixels)>,
+    kern_shares: Arc<[(usize, Pixels)]>,
     /// The glyphs that follow a soft hyphen, with the hyphen Blink adds to a line that breaks
     /// before one. Ascending by glyph.
-    hyphens: Vec<(usize, Hyphen)>,
+    hyphens: Arc<[(usize, Hyphen)]>,
     /// The glyphs a line can end before, between two kerned letters, with how Blink's reshaping of
     /// the end of the line changes it. Ascending by glyph. Empty for a line that fits whole, for
     /// the min-content of a text, and until [`Self::with_end_reshapes`].
-    end_reshapes: Vec<(usize, EndReshape)>,
+    end_reshapes: Arc<[(usize, EndReshape)]>,
     /// Blink's sum of the advances before every glyph and then before the end of the line, in 1/65536
     /// of a device pixel, with the CoreText positions the glyphs were shaped at. Empty for a line
     /// measured by its positions.
-    measure: Measure,
+    measure: Arc<Measure>,
+}
+
+/// The [`SnapMarks`] of a text that do not depend on the width it is laid out at, kept by the window
+/// beside its shaped lines.
+pub(super) struct SnapEntry {
+    /// With no end reshapes.
+    marks: SnapMarks,
+    /// What [`LineLayoutCache::with_end_reshapes`] found, for the first width that needed it.
+    end_reshapes: OnceLock<Arc<[(usize, EndReshape)]>>,
+}
+
+impl SnapEntry {
+    #[cfg(test)]
+    pub(super) fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            marks: SnapMarks::default(),
+            end_reshapes: OnceLock::new(),
+        })
+    }
+
+    /// The marks of a line that no end of is reshaped.
+    pub(super) fn marks(&self) -> &SnapMarks {
+        &self.marks
+    }
+
+    /// What the entry takes of the shape store, counting the end reshapes it may be given later as
+    /// one for each glyph, the most it can hold.
+    pub(super) fn estimated_bytes(&self) -> usize {
+        let glyphs = self.marks.measure.x.len();
+        size_of::<Self>()
+            + size_of::<Measure>()
+            + glyphs * (size_of::<Pixels>() + size_of::<i64>() + size_of::<(usize, EndReshape)>())
+            + self.marks.kern_shares.len() * size_of::<(usize, Pixels)>()
+            + self.marks.hyphens.len() * size_of::<(usize, Hyphen)>()
+    }
 }
 
 /// What Blink does to a line that ends before a glyph, between it and a letter that kerns with it
@@ -418,35 +454,81 @@ impl LineLayoutCache {
         }
         SnapMarks {
             item_starts,
-            kern_shares: self.kern_shares(shaped),
-            hyphens: self.hyphens(shaped, text),
-            end_reshapes: Vec::new(),
-            measure: self.measure(shaped),
+            kern_shares: self.kern_shares(shaped).into(),
+            hyphens: self.hyphens(shaped, text).into(),
+            end_reshapes: Arc::default(),
+            measure: Arc::new(self.measure(shaped)),
         }
     }
 
-    /// `marks` of `shaped`, which is wrapped to `fit` layout units, with the line ends Blink would
-    /// reshape. They take a platform call for each distinct letter of the line, so a line that
-    /// fits whole, and is never cut, goes without; a text laid out for its min-content width goes
-    /// without too, which Blink measures from the positions of its glyphs
-    /// (`LineBreaker::HandleTextForFastMinContent`). `moved` is whether tab stops or insets move the
-    /// glyphs of `shaped`, which then may be wider than they are shaped.
+    /// The [`SnapEntry`] of the text that `key` names (which says nothing of the width it is laid
+    /// out at), made from `shaped` if the window has none: a text is laid out at several widths and
+    /// each of them has the same marks, which take a platform call for each distinct glyph.
+    pub(super) fn snap_entry(
+        &self,
+        key: &CacheKeyRef<'_>,
+        text: &SharedString,
+        shaped: &LineLayout,
+    ) -> Arc<SnapEntry> {
+        let font_generation = self.font_generation();
+        let cached = self.shape_store.lock().snap(key, font_generation);
+        if let Some((_, entry)) = cached {
+            AtomicTextCounters::add(&self.counters.snap_cache_hits);
+            return entry;
+        }
+        AtomicTextCounters::add(&self.counters.snap_computations);
+        let entry = Arc::new(SnapEntry {
+            marks: self.snap_marks(shaped, text, key.runs, key.item_starts),
+            end_reshapes: OnceLock::new(),
+        });
+        let owned = Arc::new(CacheKey {
+            text: text.clone(),
+            font_size: key.font_size,
+            runs: SmallVec::from(key.runs),
+            item_starts: key.item_starts.into(),
+            wrap_width: key.wrap_width,
+            max_lines: key.max_lines,
+            force_width: key.force_width,
+            options: key.options,
+            insets: key.insets.into(),
+            inline: key.inline.into(),
+            line_height: key.line_height,
+            scale_bits: key.scale_bits,
+        });
+        self.shape_store.lock().keep_snap(&owned, &entry, font_generation);
+        entry
+    }
+
+    /// The marks of `entry`, which is of `shaped` wrapped to `fit` layout units, with the line
+    /// ends Blink would reshape. They take a platform call for each distinct letter of the line, so a
+    /// line that fits whole, and is never cut, goes without; a text laid out for its min-content
+    /// width goes without too, which Blink measures from the positions of its glyphs
+    /// (`LineBreaker::HandleTextForFastMinContent`). `moved` is whether tab stops or insets move
+    /// the glyphs of `shaped`, which then may be wider than they are shaped.
     pub(super) fn with_end_reshapes(
         &self,
-        mut marks: SnapMarks,
+        entry: &SnapEntry,
         shaped: &LineLayout,
         text: &str,
         fit: i64,
         moved: bool,
     ) -> SnapMarks {
-        let x = glyph_positions(shaped);
+        let marks = &entry.marks;
+        let x = &marks.measure.x;
         let glyph_count = x.len() - 1;
         let fits_whole = !moved
             && marks.fit_units(|glyph| x[glyph], glyph_count, shaped.scale_factor, 0, glyph_count) <= fit;
-        if !fits_whole {
-            marks.end_reshapes = self.end_reshapes(shaped, text, &marks.item_starts, &x);
+        if fits_whole {
+            return marks.clone();
         }
-        marks
+        let end_reshapes = entry.end_reshapes.get_or_init(|| {
+            AtomicTextCounters::add(&self.counters.end_reshape_computations);
+            self.end_reshapes(shaped, text, &marks.item_starts, x).into()
+        });
+        SnapMarks {
+            end_reshapes: end_reshapes.clone(),
+            ..marks.clone()
+        }
     }
 
     /// The [`EndReshape`] of every glyph of `shaped` that a line can end before, between two
@@ -680,9 +762,9 @@ mod tests {
         SnapMarks {
             item_starts: item_starts.iter().copied().collect(),
             kern_shares: kern_shares.iter().map(|(ix, share)| (*ix, px(*share))).collect(),
-            hyphens: Vec::new(),
-            end_reshapes: Vec::new(),
-            measure: Measure::default(),
+            hyphens: Arc::default(),
+            end_reshapes: Arc::default(),
+            measure: Arc::default(),
         }
     }
 
@@ -914,7 +996,7 @@ mod tests {
         let glyph = DeviceAdvance { nominal: Some(advance), font_unit: 1. / 64. };
         let sums = measure_sums(&positions, vec![glyph; count], scale_factor);
         let measure = Measure { sums, x: positions.clone() };
-        (positions, SnapMarks { measure, ..SnapMarks::default() })
+        (positions, SnapMarks { measure: measure.into(), ..SnapMarks::default() })
     }
 
     #[test]
