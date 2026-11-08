@@ -5277,10 +5277,19 @@ impl Window {
         let mut clock_ticked = ticked;
         let mut patch_drawn = false;
         if ticked {
-            match self.patch_frame(cx) {
+            // A list scroll noted before the draw is applied by the translate after the patch (or the
+            // whole frame, when it declines), which both make the scene again.
+            self.patch.translate_follows = self.scroll_patch.scrolled.is_some();
+            let outcome = self.patch_frame(cx);
+            self.patch.translate_follows = false;
+            let scene_deferred = mem::take(&mut self.patch.scene_deferred);
+            match outcome {
                 PatchedFrame::Declined => {}
                 PatchedFrame::Patched => {
                     if self.scroll_patch.scrolled.is_none() {
+                        if scene_deferred {
+                            self.rendered_frame.scene.rebuild_from_operations();
+                        }
                         #[cfg(feature = "profiler")]
                         {
                             let draw_duration = self

@@ -573,8 +573,11 @@ impl Window {
     /// Puts what the scratch frame got for the roots in the place of what the rendered frame has
     /// of them, last root first so that the places of the others are the ones their recordings
     /// give.
-    pub(super) fn splice(&mut self, splices: Vec<Splice>) {
-        self.splice_last_first(splices, true);
+    ///
+    /// The scene is made again from the log unless `rebuild_scene` is false: a draw that follows the patch with
+    /// the translate of a list scroll makes it again once, from the log the two of them leave.
+    pub(super) fn splice(&mut self, splices: Vec<Splice>, rebuild_scene: bool) {
+        self.splice_last_first(splices, rebuild_scene);
     }
 
     /// [`Window::splice`] for the rows of a list that come and go: the splices were all planned against

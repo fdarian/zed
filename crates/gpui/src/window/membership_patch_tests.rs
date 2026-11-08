@@ -55,6 +55,8 @@ struct Shared {
     /// How many small boxes with a background each row holds, which wrap inside it: a row with many primitives
     /// that are not on top of one another.
     small_kids: Cell<usize>,
+    /// The page has boxes painted before the list, after it and lifted above it, each over some of the rows.
+    layers: Cell<bool>,
     /// The key of the unit, which moves when what it holds does.
     version: Cell<u64>,
     patch_unit: Cell<bool>,
@@ -86,6 +88,7 @@ impl Shared {
             kids: Cell::new(3),
             row_kids: Cell::new(0),
             small_kids: Cell::new(0),
+            layers: Cell::new(false),
             version: Cell::new(0),
             patch_unit: Cell::new(false),
             patch_row: Cell::new(None),
@@ -191,15 +194,19 @@ impl Render for Page {
         })
         .w(px(LIST_W))
         .h(px(LIST_H));
-        div()
-            .id("page")
-            .w(px(400.))
-            .h(px(LIST_TOP + LIST_H + 20.))
-            .flex()
-            .flex_col()
-            .child(unit)
-            .child(rows)
-            .child(div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green()))
+        let mut page = div().id("page").w(px(400.)).h(px(LIST_TOP + LIST_H + 20.)).flex().flex_col();
+        if shared.layers.get() {
+            // Under the list, and over its top rows only: what a row is ordered against depends on where the row is.
+            page = page.child(div().id("under").absolute().top(px(LIST_TOP + 40.)).left(px(0.)).w(px(LIST_W)).h(px(90.)).bg(blue()));
+        }
+        page = page.child(unit).child(rows).child(div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green()));
+        if shared.layers.get() {
+            page = page
+                .child(div().id("over").absolute().top(px(LIST_TOP + 200.)).left(px(20.)).w(px(60.)).h(px(70.)).bg(red()))
+                .child(div().id("over-small").absolute().top(px(LIST_TOP + 420.)).left(px(90.)).w(px(20.)).h(px(20.)).bg(blue()))
+                .child(deferred(div().id("lifted").absolute().top(px(LIST_TOP + 120.)).left(px(10.)).w(px(40.)).h(px(130.)).bg(green())));
+        }
+        page
     }
 }
 
@@ -520,6 +527,17 @@ impl Pair {
             translated: Fixture::estimated(cx, true, overdraw, overscan),
             built: Fixture::estimated(cx, false, overdraw, overscan),
         }
+    }
+
+    /// Rows with text and parts, under, over and below a lifted box, which a row is ordered against by where it is.
+    fn layered(cx: &mut TestAppContext) -> Self {
+        let open = |cx: &mut TestAppContext, patch: bool| {
+            let shared = Shared::with_overdraw(cx, true, 0., 5000.);
+            shared.layers.set(true);
+            shared.row_kids.set(2);
+            Fixture::open(cx, patch, shared)
+        };
+        Self { translated: open(cx, true), built: open(cx, false) }
     }
 
     fn with_overscan(cx: &mut TestAppContext, overscan: f32) -> Self {
@@ -1149,6 +1167,8 @@ fn a_restyle_with_a_scroll_that_cannot_be_a_translate_is_the_patch_and_a_frame_b
     let counters = pair.translated.counters(cx);
     assert_eq!((counters.frames, counters.patched, counters.composed), (1, 0, 0), "{counters:?}");
     assert_eq!(counters.held_cause(ScrollPatchCause::Disjoint), 1, "{counters:?}");
+    let patches = pair.translated.with_window(cx, |window, _| window.patch_counters());
+    assert_eq!((patches.patched_frames, patches.scene_rebuilds), (1, 0), "the frame built whole replaced the scene: {patches:?}");
     pair.same(cx, "the frame built whole after a patch");
     // And the translate that follows is made from it.
     let to = pair.translated.bringing_in_below(cx, 1);
@@ -1361,6 +1381,72 @@ fn a_wheel_after_a_programmatic_write_goes_on_from_the_write(cx: &mut TestAppCon
     pair.same(cx, "a wheel after a write");
 }
 
+#[gpui::test]
+fn translates_with_boxes_under_over_and_lifted_above_the_list_are_the_frames_built_whole(cx: &mut TestAppContext) {
+    let pair = Pair::layered(cx);
+    pair.same(cx, "before any scroll");
+    let serial = pair.translated.built_whole(cx);
+    let mut frames = 0;
+    // Down by one and two rows at a time, so that every row is under the boxes and over them on its way.
+    for step in 0..16 {
+        let to = pair.translated.bringing_in_below(cx, 1 + step % 2);
+        pair.scroll_to(cx, to);
+        frames += 1;
+        pair.same(cx, &format!("down, step {step}"));
+    }
+    // By a few pixels, where no row comes in or leaves.
+    for step in 0..10 {
+        pair.wheel(cx, 7.5 + step as f32);
+        frames += 1;
+        pair.same(cx, &format!("by pixels, step {step}"));
+    }
+    for step in 0..14 {
+        let to = pair.translated.bringing_in_above(cx, 1 + step % 2);
+        pair.scroll_to(cx, to);
+        frames += 1;
+        pair.same(cx, &format!("up, step {step}"));
+    }
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (frames, frames), "{counters:?}");
+    assert_eq!(pair.translated.built_whole(cx), serial, "a frame was built whole");
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    no_declines(&counters);
+    assert!(counters.membership_frames >= 20, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_patch_and_a_translate_in_one_draw_make_the_scene_once_and_are_the_frame_built_whole(cx: &mut TestAppContext) {
+    for layers in [false, true] {
+        let pair = match layers {
+            true => Pair::layered(cx),
+            false => Pair::new(cx),
+        };
+        // A translate leaves the scene with no slots, so the patch after it cannot write over the primitives.
+        let first = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, first);
+        pair.same(cx, "after a first scroll");
+        let before = pair.translated.with_window(cx, |window, _| window.patch_counters());
+        let serial = pair.translated.built_whole(cx);
+        for step in 0..12 {
+            let row = visible_row(&pair.translated, cx, 1 + step % 4);
+            let to = match step % 3 {
+                0 => pair.translated.bringing_in_below(cx, 1),
+                1 => pair.translated.scrolled() + 3.,
+                _ => pair.translated.bringing_in_above(cx, 1),
+            };
+            let green = !pair.translated.shared.green.borrow().contains(&row);
+            pair.restyle_and_scroll(cx, &[row], green, Some(to));
+            pair.same(cx, &format!("layers {layers}, step {step}"));
+        }
+        let after = pair.translated.with_window(cx, |window, _| window.patch_counters());
+        assert_eq!(pair.translated.built_whole(cx), serial, "a frame was built whole");
+        assert_eq!(after.patched_frames - before.patched_frames, 12, "{after:?}");
+        assert_eq!(after.deferred_scene_rebuilds - before.deferred_scene_rebuilds, 12, "{after:?}");
+        assert_eq!(after.scene_rebuilds, before.scene_rebuilds, "the translate made the scene again, not the patch: {after:?}");
+        assert_eq!(pair.translated.counters(cx).composed, 12);
+    }
+}
+
 /// A translate in a scene of about 2000 primitives, one row coming in and one leaving per step.
 /// `GPUI_BENCH_ROUNDS` sets how many rounds of 20 steps are timed (default 5).
 /// `cargo test -p gpui --release --features test-support --lib -- --ignored --nocapture translate_scene_bench`
@@ -1375,7 +1461,8 @@ fn translate_scene_bench(cx: &mut TestAppContext) {
         let scene = &window.rendered_frame.scene;
         (scene.quads.len() + scene.monochrome_sprites.len(), scene.paint_operations.len())
     });
-    for (name, step) in [("a row in and a row out", true), ("no row in or out", false)] {
+    for (name, step) in [("a row in and a row out", true), ("no row in or out", false), ("a restyled row and a row in and out", true)] {
+        let restyles = name.starts_with("a restyled");
         let before = fixture.counters(cx);
         let mut total = std::time::Duration::ZERO;
         let mut steps = 0;
@@ -1390,7 +1477,30 @@ fn translate_scene_bench(cx: &mut TestAppContext) {
                     (false, down) => if down { 1. } else { -1. },
                 };
                 let start = std::time::Instant::now();
-                fixture.wheel(cx, by);
+                match restyles {
+                    false => fixture.wheel(cx, by),
+                    true => {
+                        // One update that ticks and writes the offset, as a commit that scrolls does.
+                        let row = start_row + 2;
+                        let shared = fixture.shared.clone();
+                        let green = !shared.green.borrow().contains(&row);
+                        match green {
+                            true => shared.green.borrow_mut().insert(row),
+                            false => shared.green.borrow_mut().remove(&row),
+                        };
+                        shared.patch_row.set(Some(row));
+                        let (state, view) = (shared.state.clone(), fixture.view);
+                        let to = fixture.scrolled() + by;
+                        cx.update_window(fixture.window, move |_, window, cx| {
+                            window.request_tick();
+                            state.set_offset_from_scrollbar(point(px(0.), px(-to)));
+                            window.note_list_scrolled(view);
+                            window.draw(cx).clear(cx);
+                        })
+                        .unwrap();
+                        shared.patch_row.set(None);
+                    }
+                }
                 if round > 0 {
                     total += start.elapsed();
                     steps += 1;
@@ -1398,13 +1508,17 @@ fn translate_scene_bench(cx: &mut TestAppContext) {
             }
         }
         let counters = fixture.counters(cx);
+        let patches = fixture.with_window(cx, |window, _| window.patch_counters());
         println!(
-            "translate_scene_bench: {name}: {:?} per step, {primitives} primitives, {operations} operations; frames {} patched {} membership {} whole {}",
+            "translate_scene_bench: {name}: {:?} per step, {primitives} primitives, {operations} operations; frames {} patched {} membership {} whole {}; patch frames {} scene rebuilds {} deferred {}",
             total / steps,
             counters.frames - before.frames,
             counters.patched - before.patched,
             counters.membership_frames - before.membership_frames,
             fixture.built_whole(cx),
+            patches.patched_frames,
+            patches.scene_rebuilds,
+            patches.deferred_scene_rebuilds,
         );
     }
 }

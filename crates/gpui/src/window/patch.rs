@@ -144,6 +144,9 @@ pub struct PatchCounters {
     /// Patched frames that made the scene again from its operations, the primitives and their
     /// draw orders of the whole frame, because a changed operation moved or changed kind.
     pub scene_rebuilds: u64,
+    /// Patched frames that left the scene to the translate that follows them in the same draw, which
+    /// makes it again from the operations they wrote.
+    pub deferred_scene_rebuilds: u64,
     /// Primitives that patched frames wrote over their place in the scene, which a patch that
     /// changes nothing but how an operation paints does instead of making the scene again.
     pub in_place_primitives: u64,
@@ -213,6 +216,11 @@ pub(crate) struct PatchWindow {
     /// a scroll translate, which puts rows where their recordings paint them, would show it. Until a frame
     /// is built whole.
     pub(crate) recordings_stale: bool,
+    /// The patch being drawn is followed in the same draw by the translate of a list scroll, which makes
+    /// the scene again from the operations: whatever the patch would make of it is of no use.
+    pub(crate) translate_follows: bool,
+    /// A patch left the scene as it was because `translate_follows`.
+    pub(crate) scene_deferred: bool,
     /// A root that says so may lay out again in a patch, see [`Window::set_contained_patches`].
     contained: bool,
     /// The patch that [`Window::prepare_patch`] made, which the draw finishes.
@@ -1154,13 +1162,14 @@ impl Window {
             }
         }
         let mut wrote_in_place = false;
+        let translate_follows = self.patch.translate_follows;
         if changed {
             let edits = runs.iter().flat_map(|run| {
                 let painted = &operations[run.scratch.clone()];
                 run.changed.iter().map(move |offset| (run.rendered.start + offset, &painted[*offset]))
             });
             let mut written = 0;
-            if self.retained.verifier.is_some() {
+            if self.retained.verifier.is_some() && !translate_follows {
                 self.rendered_frame.scene.track_slots();
             }
             if self.rendered_frame.scene.patch_in_place(edits, &mut written) {
@@ -1173,8 +1182,16 @@ impl Window {
                         slot.clone_from(painted);
                     }
                 }
-                self.rendered_frame.scene.rebuild_from_operations();
-                self.patch.counters.scene_rebuilds += 1;
+                match translate_follows {
+                    true => {
+                        self.patch.counters.deferred_scene_rebuilds += 1;
+                        self.patch.scene_deferred = true;
+                    }
+                    false => {
+                        self.rendered_frame.scene.rebuild_from_operations();
+                        self.patch.counters.scene_rebuilds += 1;
+                    }
+                }
             }
         }
         for run in &runs {
@@ -1195,11 +1212,12 @@ impl Window {
         }
         let spliced = !splices.is_empty();
         if spliced {
-            self.splice(splices);
+            self.patch.scene_deferred |= translate_follows;
+            self.splice(splices, !translate_follows);
         }
         // Described once a splice has made the scene again, which it does with other draw orders than the
         // ones the in-place writes left.
-        if wrote_in_place && let Some(trace) = &mut self.patch.trace {
+        if wrote_in_place && !translate_follows && let Some(trace) = &mut self.patch.trace {
             trace.in_place_scene = Some(self.rendered_frame.scene.describe_primitives());
         }
         // The recordings are rewritten once the roots are where the patch put them in the vectors.
