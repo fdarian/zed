@@ -7,7 +7,7 @@
 use crate::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Context, ElementId, FocusHandle, InteractiveElement, IntoElement,
     ListAlignment, ListState, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, PatchCounters, PatchDecline,
-    PlatformInput, Point, Render, ScrollDelta, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div,
+    PlatformInput, Point, Render, ScrollDelta, ScrollPatchCause, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div,
     green, list, point, px, red, retained, size,
 };
 use std::cell::{Cell, RefCell};
@@ -52,6 +52,10 @@ struct State {
     seen: RefCell<Vec<Result<(), PatchDecline>>>,
     /// A list of rows after the unit, for the test of the translate.
     list: Option<ListState>,
+    /// The list is before the header instead of after the footer.
+    list_first: Cell<bool>,
+    /// The unit paints nothing and registers no hitbox, listener or dispatch node while it holds no box.
+    bare: Cell<bool>,
 }
 
 impl State {
@@ -74,6 +78,8 @@ impl State {
             log: RefCell::new(Vec::new()),
             seen: RefCell::new(Vec::new()),
             list: list.then(|| ListState::new(100, ListAlignment::Top, px(0.)).with_uniform_item_height(px(30.))),
+            list_first: Cell::new(false),
+            bare: Cell::new(false),
         })
     }
 
@@ -114,8 +120,11 @@ impl State {
     }
 
     fn unit(self: &Rc<Self>) -> AnyElement {
-        let mut unit = div().id(UNIT).w(px(120.)).h(px(100.)).flex_none().overflow_hidden().bg(blue());
-        if self.key_context.get() {
+        let mut unit = div().id(UNIT).w(px(120.)).h(px(100.)).flex_none().overflow_hidden();
+        if !self.bare.get() {
+            unit = unit.bg(blue());
+        }
+        if self.key_context.get() && !self.bare.get() {
             let keys = self.clone();
             unit = unit
                 .key_context("Unit")
@@ -154,19 +163,8 @@ impl Render for Page {
         let unit = retained(UNIT, key, move |_, _| build.unit()).patchable_relayout();
         let sibling_state = state.clone();
         let sibling = retained(SIBLING, 2_000, move |_, _| sibling_state.sibling()).patchable();
-        let mut page = div()
-            .id("page")
-            .key_context("Page")
-            .w(px(400.))
-            .h(px(400.))
-            .flex()
-            .flex_col()
-            .child(div().id("header").w(px(60.)).h(px(20.)).flex_none().bg(green()))
-            .child(unit)
-            .child(sibling)
-            .child(div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green()));
-        if let Some(rows) = &state.list {
-            let rows = list(rows.clone(), move |index, _, _| {
+        let rows = state.list.as_ref().map(|rows| {
+            list(rows.clone(), move |index, _, _| {
                 retained(("row", index), 3_000, move |_, _| {
                     div().id(("row", index)).w_full().h(px(30.)).bg(blue()).always_hitbox().into_any_element()
                 })
@@ -174,7 +172,19 @@ impl Render for Page {
                 .into_any_element()
             })
             .w(px(100.))
-            .h(px(100.));
+            .h(px(100.))
+        });
+        let (first, last) = if state.list_first.get() { (rows, None) } else { (None, rows) };
+        let mut page = div().id("page").key_context("Page").w(px(400.)).h(px(400.)).flex().flex_col();
+        if let Some(rows) = first {
+            page = page.child(rows);
+        }
+        let mut page = page
+            .child(div().id("header").w(px(60.)).h(px(20.)).flex_none().bg(green()))
+            .child(unit)
+            .child(sibling)
+            .child(div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green()));
+        if let Some(rows) = last {
             page = page.child(rows);
         }
         page.into_any_element()
@@ -647,6 +657,55 @@ fn the_rows_of_a_list_after_a_spliced_root_are_translated_as_the_frame_built_who
     assert!(counters.patched >= 1, "the rows are translated after the splice: {counters:?}");
     assert_eq!(counters.mispredicted, 0, "{counters:?}");
     assert_same(&same_window(&shown.frame), &same_window(&built.frame), "the rows translated after a splice");
+}
+
+#[gpui::test]
+fn a_root_that_held_nothing_and_gains_boxes_leaves_the_runs_of_the_lists_around_it(cx: &mut TestAppContext) {
+    for list_first in [false, true] {
+        let at = if list_first { (10., 50.) } else { (10., 170.) };
+        let run = |cx: &mut TestAppContext, patch: bool| {
+            let state = State::new(cx, 0, true);
+            state.bare.set(true);
+            state.list_first.set(list_first);
+            state.patch_unit.set(patch);
+            let page = Fixture::new(cx, state);
+            cx.update_window(page.window, |_, window, _| window.set_scroll_patch(patch)).unwrap();
+            // The runs are recorded with the pointer over the rows, and the wheel is the first frame after the splice.
+            cx.update_window(page.window, |_, window, cx| window.simulate_mouse_move(point(px(at.0), px(at.1)), cx)).unwrap();
+            page.draw_plain(cx);
+            page.draw_plain(cx);
+            page.state.bare.set(false);
+            page.state.change(3);
+            page.tick(cx);
+            if !patch {
+                page.draw_whole(cx);
+            }
+            for by in [5., 5., 7.] {
+                cx.update_window(page.window, |_, window, cx| {
+                    let event = ScrollWheelEvent {
+                        position: point(px(at.0), px(at.1)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
+                        ..Default::default()
+                    };
+                    window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+                })
+                .unwrap();
+            }
+            let counters = cx.update_window(page.window, |_, window, _| window.scroll_patch_counters()).unwrap();
+            if !patch {
+                page.draw_whole(cx);
+            }
+            let shown = page.observe(cx);
+            (page, shown, counters)
+        };
+        let (patched, shown, counters) = run(cx, true);
+        let (_, built, _) = run(cx, false);
+        assert_eq!(patched.patches(cx).relayout_patches, 1, "list_first {list_first}: {:?}", patched.state.seen.borrow());
+        assert!(counters.patched >= 1, "list_first {list_first}: the rows are translated after the splice: {counters:?}");
+        assert_eq!(counters.held_cause(ScrollPatchCause::NoRun), 0, "list_first {list_first}: {counters:?}");
+        assert_eq!(counters.mispredicted, 0, "list_first {list_first}: {counters:?}");
+        assert_same(&same_window(&shown.frame), &same_window(&built.frame), "the rows translated after a splice of a root that was empty");
+    }
 }
 
 /// A page patched by `ticks` and one that is built whole for the same state, to compare what they show.
