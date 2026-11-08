@@ -105,9 +105,25 @@ impl ListState {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let available_item_space = size(AvailableSpace::Definite(content_width), AvailableSpace::MinContent);
+        let mut layout = |ix: usize| render_item(ix, window, cx).layout_as_root_unsnapped(available_item_space, window, cx);
         self.0
             .borrow_mut()
-            .measure_overdraw(available_height, padding, content_width, render_item, window, cx)
+            .measure_overdraw(available_height, padding, content_width, Some(&mut layout));
+    }
+
+    /// [`Self::measure_overdraw`] for the rows whose size the owner declares, with nothing rendered.
+    /// Returns whether that was all it took: `false` leaves the list as it was, for a row in the overdraw
+    /// that only a layout can measure.
+    pub(crate) fn measure_declared_overdraw(
+        &self,
+        available_height: Pixels,
+        padding: &Edges<Pixels>,
+        content_width: Pixels,
+    ) -> bool {
+        self.0
+            .borrow_mut()
+            .measure_overdraw(available_height, padding, content_width, None)
     }
 
     /// The size row `ix` was measured at, and how far its top is below the top of the first row.
@@ -167,27 +183,33 @@ impl StateInner {
     }
 
     /// The walk of `layout_items` over the rows in the overdraw: the trailing ones from the first row that
-    /// shows, then the leading ones, each measured the way `layout_items` measures it.
+    /// shows, then the leading ones, each measured the way `layout_items` measures it: at the size the
+    /// owner declares, or by `layout`. Without `layout` it returns `false`, having changed nothing, when a
+    /// row needs one.
     fn measure_overdraw(
         &mut self,
         available_height: Pixels,
         padding: &Edges<Pixels>,
         content_width: Pixels,
-        render_item: &mut RenderItemFn,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+        mut layout: Option<&mut dyn FnMut(usize) -> Size<Pixels>>,
+    ) -> bool {
         let scroll_top = self.logical_scroll_top();
         if self.pending_scroll.is_some()
             || self.follow_state.is_following()
             || self.reset
             || scroll_top.offset_in_item < px(0.)
         {
-            return;
+            return true;
         }
-        let available_item_space = size(AvailableSpace::Definite(content_width), AvailableSpace::MinContent);
-        let mut measure = |ix: usize, window: &mut Window, cx: &mut App| {
-            render_item(ix, window, cx).layout_as_root_unsnapped(available_item_space, window, cx)
+        let mut counters = ListMeasureCounters::default();
+        let mut measure = |this: &Self, counters: &mut ListMeasureCounters, ix: usize| -> Option<Size<Pixels>> {
+            if let Some(declared) = this.declared_size(ix, Some(content_width)) {
+                counters.by_exact_size += 1;
+                return Some(declared);
+            }
+            let size = layout.as_mut()?(ix);
+            counters.by_layout += 1;
+            Some(size)
         };
 
         let old_items = self.items.clone();
@@ -210,10 +232,21 @@ impl StateInner {
             }
             let size = match item.size() {
                 Some(size) => size,
-                None if visible_height < available_height => return,
+                // A row that shows is measured by the layout that builds it, unless the owner says.
+                None if visible_height < available_height => match self.declared_size(item_index, Some(content_width)) {
+                    Some(declared) => {
+                        counters.by_exact_size += 1;
+                        measured_any = true;
+                        declared
+                    }
+                    None => return true,
+                },
                 None => {
                     measured_any = true;
-                    measure(item_index, window, cx)
+                    match measure(self, &mut counters, item_index) {
+                        Some(size) => size,
+                        None => return false,
+                    }
                 }
             };
             rendered_height += size.height;
@@ -236,7 +269,10 @@ impl StateInner {
                     Some(size) => size,
                     None => {
                         measured_any = true;
-                        measure(cursor.start().0, window, cx)
+                        match measure(self, &mut counters, cursor.start().0) {
+                            Some(size) => size,
+                            None => return false,
+                        }
                     }
                 };
                 leading_overdraw += size.height;
@@ -245,7 +281,7 @@ impl StateInner {
             }
         }
         if !measured_any {
-            return;
+            return true;
         }
 
         let mut cursor = old_items.cursor::<Count>(());
@@ -255,6 +291,9 @@ impl StateInner {
         cursor.seek(&Count(end), Bias::Right);
         new_items.append(cursor.suffix(), ());
         self.items = new_items;
+        self.measure_counters.by_layout += counters.by_layout;
+        self.measure_counters.by_exact_size += counters.by_exact_size;
+        true
     }
 
     /// The walk of `layout_items` over the rows it already has measured, with nothing built.

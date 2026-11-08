@@ -1447,6 +1447,157 @@ fn a_patch_and_a_translate_in_one_draw_make_the_scene_once_and_are_the_frame_bui
     }
 }
 
+/// A list whose owner declares what its rows measure, as a list of rows with a definite height does:
+/// compared with a window of the same list that measures them by layout.
+mod exact_sizes {
+    use super::*;
+
+    const OVERDRAW: f32 = 512.;
+
+    /// The size of a row as its style fixes it.
+    fn declare(shared: &Rc<Shared>) {
+        let declared = shared.clone();
+        shared.state.set_exact_item_size(move |ix, width| {
+            Some(size(width?, px(height(ix) + if declared.taller.get() == Some(ix) { 10. } else { 0. })))
+        });
+    }
+
+    /// A pair where the translating window has the sizes declared and the other lays them out.
+    fn pair(cx: &mut TestAppContext, measure_all: bool, overscan: f32) -> Pair {
+        let open = |cx: &mut TestAppContext, patch: bool| {
+            let shared = Shared::with_overdraw(cx, measure_all, OVERDRAW, overscan);
+            if patch {
+                declare(&shared);
+            }
+            Fixture::open(cx, patch, shared)
+        };
+        Pair { translated: open(cx, true), built: open(cx, false) }
+    }
+
+    /// The rows the window shows at some point of the test, which are the rows that may be rendered when the
+    /// sizes are declared.
+    fn shown_ever(fixture: &Fixture, cx: &mut TestAppContext, shown: &mut BTreeSet<usize>) {
+        shown.extend(fixture.rows(cx));
+    }
+
+    #[gpui::test]
+    fn wheels_and_writes_over_rows_with_declared_sizes_are_the_frames_of_rows_measured_by_layout(cx: &mut TestAppContext) {
+        let pair = pair(cx, false, 5000.);
+        pair.same(cx, "before any scroll");
+        let serial = pair.translated.built_whole(cx);
+        let mut shown = BTreeSet::new();
+        shown_ever(&pair.translated, cx, &mut shown);
+
+        let mut frames = 0;
+        for step in 0..30 {
+            pair.wheel(cx, 150.);
+            frames += 1;
+            shown_ever(&pair.translated, cx, &mut shown);
+            pair.same(cx, &format!("down, step {step}"));
+        }
+        for step in 0..8 {
+            let to = pair.translated.bringing_in_below(cx, 1 + step % 3);
+            for fixture in [&pair.translated, &pair.built] {
+                fixture.write_offset(cx, to);
+            }
+            frames += 1;
+            shown_ever(&pair.translated, cx, &mut shown);
+            pair.same(cx, &format!("written down, step {step}"));
+        }
+        for step in 0..38 {
+            pair.wheel(cx, -150.);
+            frames += 1;
+            shown_ever(&pair.translated, cx, &mut shown);
+            pair.same(cx, &format!("up, step {step}"));
+        }
+        assert_eq!(pair.translated.rows(cx).start, 0);
+
+        let counters = pair.translated.counters(cx);
+        assert!(counters.frames >= frames - 8, "{counters:?}");
+        assert_eq!(counters.patched, counters.frames, "{counters:?}");
+        assert_eq!(pair.translated.built_whole(cx), serial, "a frame was built whole");
+        assert_eq!(counters.held_cause(ScrollPatchCause::UnmeasuredOverdraw), 0, "{counters:?}");
+        no_declines(&counters);
+
+        let asked = pair.translated.shared.asked.borrow();
+        assert!(asked.iter().all(|ix| shown.contains(ix)), "a row that never showed was rendered: {asked:?}");
+        let laid_out = pair.built.shared.asked.borrow();
+        assert!(laid_out.iter().any(|ix| !shown.contains(ix)), "the window that lays rows out measures rows that do not show");
+
+        let declared = pair.translated.shared.state.measure_counters();
+        let measured = pair.built.shared.state.measure_counters();
+        assert_eq!((declared.by_layout, declared.exact_size_mismatches), (0, 0), "{declared:?}");
+        assert!(declared.by_exact_size > 100, "{declared:?}");
+        assert_eq!((measured.by_exact_size, measured.by_layout > 100), (0, true), "{measured:?}");
+    }
+
+    #[gpui::test]
+    fn a_list_that_measures_all_its_rows_renders_none_that_do_not_show_when_sizes_are_declared(cx: &mut TestAppContext) {
+        let pair = pair(cx, true, 5000.);
+        pair.same(cx, "before any scroll");
+        let shown: BTreeSet<usize> = pair.translated.rows(cx).collect();
+        let asked = pair.translated.shared.asked.borrow().iter().copied().collect::<BTreeSet<_>>();
+        assert!(asked.is_subset(&shown), "{asked:?} against {shown:?}");
+        assert_eq!(pair.built.shared.asked.borrow().iter().copied().collect::<BTreeSet<_>>().len(), ROWS);
+
+        let state = &pair.translated.shared.state;
+        assert_eq!(f32::from(state.max_offset_for_scrollbar().y), top(ROWS) - LIST_H);
+        for ix in 0..ROWS {
+            assert_eq!(state.measured_row(ix).map(|(size, _)| f32::from(size.height)), Some(height(ix)), "row {ix}");
+        }
+        for step in 0..6 {
+            pair.wheel(cx, 200.);
+            pair.same(cx, &format!("step {step}"));
+        }
+    }
+
+    #[gpui::test]
+    fn the_extent_and_the_wheel_clamp_with_declared_sizes_are_what_layout_leaves(cx: &mut TestAppContext) {
+        let pair = pair(cx, false, 5000.);
+        for step in 0..120 {
+            pair.wheel(cx, 400.);
+            pair.same(cx, &format!("step {step}"));
+        }
+        assert_eq!(pair.translated.rows(cx).end, ROWS);
+        assert_eq!(pair.translated.scrolled(), pair.built.scrolled());
+        assert_eq!(f32::from(pair.translated.shared.state.max_offset_for_scrollbar().y), top(ROWS) - LIST_H);
+    }
+
+    #[gpui::test]
+    fn a_row_remeasured_or_spliced_is_declared_again_without_being_rendered(cx: &mut TestAppContext) {
+        let pair = pair(cx, false, 5000.);
+        for _ in 0..12 {
+            pair.wheel(cx, 150.);
+        }
+        let state = pair.translated.shared.state.clone();
+        let below = pair.translated.rows(cx).end + 2;
+        assert!(state.measured_row(below).is_some(), "a row in the overdraw is measured at its declared height");
+        let asked = pair.translated.shared.asked.borrow().len();
+        for invalidate in [0, 1] {
+            match invalidate {
+                0 => state.remeasure_items(below..below + 1),
+                _ => state.splice(below..below + 1, 1),
+            }
+            assert!(state.measured_row(below).is_none());
+            pair.translated.write_offset(cx, pair.translated.scrolled() + 1.);
+            assert_eq!(state.measured_row(below).map(|(size, _)| f32::from(size.height)), Some(height(below)));
+        }
+        let asked = pair.translated.shared.asked.borrow()[asked..].to_vec();
+        assert!(!asked.contains(&below), "{asked:?}");
+    }
+
+    #[gpui::test]
+    #[should_panic(expected = "its owner declared")]
+    fn a_row_that_shows_at_another_size_than_declared_is_the_owners_bug(cx: &mut TestAppContext) {
+        let pair = pair(cx, false, 5000.);
+        // The owner declares row 2 shorter than the builder makes it.
+        let shared = pair.translated.shared.clone();
+        shared.state.set_exact_item_size(|ix, width| Some(size(width?, px(height(ix) - if ix == 2 { 4. } else { 0. }))));
+        shared.state.remeasure_items(0..ROWS);
+        pair.translated.draw_whole(cx);
+    }
+}
+
 /// A translate in a scene of about 2000 primitives, one row coming in and one leaving per step.
 /// `GPUI_BENCH_ROUNDS` sets how many rounds of 20 steps are timed (default 5).
 /// `cargo test -p gpui --release --features test-support --lib -- --ignored --nocapture translate_scene_bench`

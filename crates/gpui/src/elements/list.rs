@@ -110,7 +110,28 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    exact_size: Option<Rc<ExactSizeFn>>,
+    measure_counters: ListMeasureCounters,
 }
+
+/// What the owner of a list says a row measures, see [`ListState::set_exact_item_size`].
+type ExactSizeFn = dyn Fn(usize, Option<Pixels>) -> Option<Size<Pixels>>;
+
+/// Where the sizes of the rows a list measured came from, see [`ListState::measure_counters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ListMeasureCounters {
+    /// Rows with no measured size that were rendered and laid out to find it.
+    pub by_layout: u64,
+    /// Rows with no measured size whose size the owner declared. Rows that show are laid out to be
+    /// painted anyway; the rest are not rendered.
+    pub by_exact_size: u64,
+    /// Rows that show whose laid out size is not the size the owner declared for them.
+    pub exact_size_mismatches: u64,
+}
+
+/// How far a laid out row may be from the size declared for it before the declaration is wrong:
+/// what float arithmetic of two ways to the same size leaves.
+const EXACT_SIZE_TOLERANCE: f32 = 1e-3;
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
 ///
@@ -402,6 +423,8 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            exact_size: None,
+            measure_counters: ListMeasureCounters::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -424,6 +447,35 @@ impl ListState {
     pub fn with_uniform_item_height(self, height: Pixels) -> Self {
         self.apply_uniform_item_height(height);
         self
+    }
+
+    /// Lets the owner of the list say what a row measures, when its style leaves no doubt of it. A row
+    /// with no measured size that `size` answers for counts as measured at that size, without being
+    /// rendered or laid out, wherever the list measures a row it does not show (the overdraw, the walk
+    /// to a scroll position, [`Self::measure_all`]), so the extent of the list, the clamp of a wheel and
+    /// the thumb are what rows measured by layout leave. A row that shows is still rendered and laid
+    /// out to be painted; if its size is not the declared one the declaration is wrong, which
+    /// panics in debug builds, and the laid out size is used.
+    ///
+    /// `size` gets the row and the width the rows are laid out at (`None` when the list sizes itself
+    /// to its widest row), and answers `None` for a row it cannot say. It runs while the list is
+    /// borrowed and must not touch the list. A size already measured is kept: call
+    /// [`Self::remeasure_items`] for the rows whose declaration changes, as for rows whose content does.
+    pub fn set_exact_item_size(
+        &self,
+        size: impl Fn(usize, Option<Pixels>) -> Option<Size<Pixels>> + 'static,
+    ) {
+        self.0.borrow_mut().exact_size = Some(Rc::new(size));
+    }
+
+    /// Stops declaring sizes, see [`Self::set_exact_item_size`].
+    pub fn clear_exact_item_size(&self) {
+        self.0.borrow_mut().exact_size = None;
+    }
+
+    /// How the rows the list has measured were measured so far.
+    pub fn measure_counters(&self) -> ListMeasureCounters {
+        self.0.borrow().measure_counters
     }
 
     /// Reset this instantiation of the list state.
@@ -1189,6 +1241,59 @@ impl StateInner {
         start.height + logical_scroll_top.offset_in_item
     }
 
+    fn declared_size(&self, ix: usize, available_width: Option<Pixels>) -> Option<Size<Pixels>> {
+        self.exact_size.as_ref()?(ix, available_width)
+    }
+
+    /// The size of a row that does not show and has none measured: what the owner declares for it, or
+    /// what it lays out at.
+    fn measure_unshown(
+        &mut self,
+        ix: usize,
+        available_width: Option<Pixels>,
+        available_item_space: Size<AvailableSpace>,
+        render_item: &mut RenderItemFn,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        if let Some(declared) = self.declared_size(ix, available_width) {
+            self.measure_counters.by_exact_size += 1;
+            return declared;
+        }
+        self.measure_counters.by_layout += 1;
+        render_item(ix, window, cx).layout_as_root_unsnapped(available_item_space, window, cx)
+    }
+
+    /// Counts a row that shows and was laid out to be painted, and checks it against what the owner
+    /// declares for it. `unmeasured` is whether that layout is what measured it.
+    fn note_laid_out(
+        &mut self,
+        ix: usize,
+        available_width: Option<Pixels>,
+        laid_out: Size<Pixels>,
+        unmeasured: bool,
+    ) {
+        let declared = self.declared_size(ix, available_width);
+        let agrees = declared.is_none_or(|declared| {
+            (declared.width - laid_out.width).abs().0 <= EXACT_SIZE_TOLERANCE
+                && (declared.height - laid_out.height).abs().0 <= EXACT_SIZE_TOLERANCE
+        });
+        if !agrees {
+            self.measure_counters.exact_size_mismatches += 1;
+            debug_assert!(
+                false,
+                "row {ix} of a list laid out at {laid_out:?}, but its owner declared {declared:?}"
+            );
+        }
+        if unmeasured {
+            if declared.is_some() && agrees {
+                self.measure_counters.by_exact_size += 1;
+            } else {
+                self.measure_counters.by_layout += 1;
+            }
+        }
+    }
+
     fn layout_all_items(
         &mut self,
         available_width: Pixels,
@@ -1208,7 +1313,8 @@ impl StateInner {
             }
         }
 
-        let mut cursor = self.items.cursor::<Count>(());
+        let items = self.items.clone();
+        let cursor = items.cursor::<Count>(());
         let available_item_space = size(
             AvailableSpace::Definite(available_width),
             AvailableSpace::MinContent,
@@ -1217,10 +1323,17 @@ impl StateInner {
         let mut measured_items = Vec::default();
 
         for (ix, item) in cursor.enumerate() {
-            let size = item.size().unwrap_or_else(|| {
-                let mut element = render_item(ix, window, cx);
-                element.layout_as_root_unsnapped(available_item_space, window, cx)
-            });
+            let size = match item.size() {
+                Some(size) => size,
+                None => self.measure_unshown(
+                    ix,
+                    Some(available_width),
+                    available_item_space,
+                    render_item,
+                    window,
+                    cx,
+                ),
+            };
 
             measured_items.push(ListItem::Measured {
                 size,
@@ -1276,10 +1389,17 @@ impl StateInner {
                 let Some(item) = cursor.item() else {
                     break;
                 };
-                let size = item.size().unwrap_or_else(|| {
-                    let mut element = render_item(cursor.start().0, window, cx);
-                    element.layout_as_root_unsnapped(available_item_space, window, cx)
-                });
+                let size = match item.size() {
+                    Some(size) => size,
+                    None => self.measure_unshown(
+                        cursor.start().0,
+                        available_width,
+                        available_item_space,
+                        render_item,
+                        window,
+                        cx,
+                    ),
+                };
                 scroll_top.item_ix = cursor.start().0;
                 scroll_top.offset_in_item += size.height;
             }
@@ -1309,11 +1429,22 @@ impl StateInner {
             // Use the previously cached height and focus handle if available
             let mut size = item.size();
 
+            // A row past the end of the viewport that the owner can size is not rendered.
+            if size.is_none()
+                && visible_height >= available_height
+                && item_index != scroll_top.item_ix
+                && let Some(declared) = self.declared_size(item_index, available_width)
+            {
+                self.measure_counters.by_exact_size += 1;
+                size = Some(declared);
+            }
+
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
             if visible_height < available_height || size.is_none() {
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root_unsnapped(available_item_space, window, cx);
                 size = Some(element_size);
+                self.note_laid_out(item_index, available_width, element_size, item.size().is_none());
 
                 // If there's a pending scroll adjustment for the scroll-top
                 // item, apply it.
@@ -1376,6 +1507,7 @@ impl StateInner {
                     let item_index = cursor.start().0;
                     let mut element = render_item(item_index, window, cx);
                     let element_size = element.layout_as_root_unsnapped(available_item_space, window, cx);
+                    self.note_laid_out(item_index, available_width, element_size, item.size().is_none());
                     let focus_handle = item.focus_handle();
                     rendered_height += element_size.height;
                     measured_items.push_front(ListItem::Measured {
@@ -1424,8 +1556,14 @@ impl StateInner {
                 let size = if let ListItem::Measured { size, .. } = item {
                     *size
                 } else {
-                    let mut element = render_item(cursor.start().0, window, cx);
-                    element.layout_as_root_unsnapped(available_item_space, window, cx)
+                    self.measure_unshown(
+                        cursor.start().0,
+                        available_width,
+                        available_item_space,
+                        render_item,
+                        window,
+                        cx,
+                    )
                 };
 
                 leading_overdraw += size.height;
@@ -1566,7 +1704,7 @@ impl StateInner {
                                         offset_in_item = Pixels::ZERO;
                                         break;
                                     };
-                                    let size = prev_item.size().unwrap_or_else(|| {
+                                    let size = prev_item.size().or_else(|| self.declared_size(cursor.start().0, Some(content_width))).unwrap_or_else(|| {
                                         let mut element = render_item(cursor.start().0, window, cx);
                                         let item_available_size =
                                             size(content_width.into(), AvailableSpace::MinContent);
@@ -1594,7 +1732,7 @@ impl StateInner {
                                 cursor.prev();
                                 let Some(item) = cursor.item() else { break };
 
-                                let size = item.size().unwrap_or_else(|| {
+                                let size = item.size().or_else(|| self.declared_size(cursor.start().0, Some(content_width))).unwrap_or_else(|| {
                                     let mut item = render_item(cursor.start().0, window, cx);
                                     let item_available_size =
                                         size(content_width.into(), AvailableSpace::MinContent);

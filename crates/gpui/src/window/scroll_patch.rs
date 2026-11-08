@@ -1056,6 +1056,9 @@ impl Window {
             (list.state.clone(), entry.render_item.clone(), entry.prepaint.clone(), entry.content_width);
         let (height, padding) = (list.viewport.size.height, list.padding);
         let before = state.scrolled();
+        if state.measure_declared_overdraw(height, &padding, content_width) {
+            return state.scrolled() - before;
+        }
 
         // What `build_row_group` does around rows it builds: the rows are laid out inside what holds them.
         self.requested_autoscroll = None;
