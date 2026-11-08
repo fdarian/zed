@@ -1684,9 +1684,10 @@ impl PaintOperation {
         }
         // Most operations of a root are glyphs, quads and markers that are as they were, and are known to be by
         // their fields: formatting two of them costs a hundred thousand instructions, a root of a hundred
-        // operations several million. What the fields do not call equal is told apart by the debug form.
-        if self.has_equal_fields(other) {
-            return false;
+        // operations several million. A kind whose fields are all compared says so either way, and the debug form
+        // tells apart only the kinds that are not.
+        if let Some(equal) = self.fields_equal(other) {
+            return !equal;
         }
         match (self, other) {
             (PaintOperation::NativeSurface(left), PaintOperation::NativeSurface(right)) => {
@@ -1698,48 +1699,55 @@ impl PaintOperation {
 }
 
 impl PaintOperation {
-    /// Whether the operations are of a kind whose fields are compared here and all of them are equal.
-    /// False for any other kind, and for fields that are not equal; the debug form decides those.
-    fn has_equal_fields(&self, other: &PaintOperation) -> bool {
+    /// Whether the fields of the operations are equal, for a kind whose fields are all compared here: `None` for any
+    /// other kind, which the debug form decides. A field that is not equal to itself (a NaN) makes the operations
+    /// differ, which at worst has a patch write an operation again.
+    fn fields_equal(&self, other: &PaintOperation) -> Option<bool> {
         match (self, other) {
             (PaintOperation::Primitive(Primitive::MonochromeSprite(a)), PaintOperation::Primitive(Primitive::MonochromeSprite(b))) => {
-                a.order == b.order
-                    && a.pad == b.pad
-                    && a.bounds == b.bounds
-                    && a.content_mask == b.content_mask
-                    && a.color == b.color
-                    && a.tile == b.tile
-                    && a.transformation == b.transformation
-                    && a.local_clip == b.local_clip
-                    && a.clip_transformation == b.clip_transformation
+                // Every field of `MonochromeSprite`, in the order it declares them.
+                Some(
+                    a.order == b.order
+                        && a.pad == b.pad
+                        && a.bounds == b.bounds
+                        && a.content_mask == b.content_mask
+                        && a.color == b.color
+                        && a.tile == b.tile
+                        && a.transformation == b.transformation
+                        && a.local_clip == b.local_clip
+                        && a.clip_transformation == b.clip_transformation,
+                )
             }
             (PaintOperation::Quad(a), PaintOperation::Quad(b)) => {
-                a.order == b.order
-                    && a.border_styles == b.border_styles
-                    && a.bounds == b.bounds
-                    && a.content_mask == b.content_mask
-                    && a.background == b.background
-                    && a.border_colors == b.border_colors
-                    && a.border_inner_colors == b.border_inner_colors
-                    && a.corner_radii == b.corner_radii
-                    && a.corner_radii_y == b.corner_radii_y
-                    && a.border_widths == b.border_widths
-                    && a.background_tile == b.background_tile
-                    && a.transformation == b.transformation
-                    && a.local_clip == b.local_clip
+                // Every field of `Quad`, in the order it declares them.
+                Some(
+                    a.order == b.order
+                        && a.border_styles == b.border_styles
+                        && a.bounds == b.bounds
+                        && a.content_mask == b.content_mask
+                        && a.background == b.background
+                        && a.border_colors == b.border_colors
+                        && a.border_inner_colors == b.border_inner_colors
+                        && a.corner_radii == b.corner_radii
+                        && a.corner_radii_y == b.corner_radii_y
+                        && a.border_widths == b.border_widths
+                        && a.background_tile == b.background_tile
+                        && a.transformation == b.transformation
+                        && a.local_clip == b.local_clip,
+                )
             }
-            (PaintOperation::StartLayer(a), PaintOperation::StartLayer(b)) => a == b,
-            (PaintOperation::WidenGroups(a), PaintOperation::WidenGroups(b)) => a == b,
+            (PaintOperation::StartLayer(a), PaintOperation::StartLayer(b)) => Some(a == b),
+            (PaintOperation::WidenGroups(a), PaintOperation::WidenGroups(b)) => Some(a == b),
             // Whether the mask was cut from masks inside the subtree is how a recording is put elsewhere. A recording that
             // is put elsewhere has it, and a build at its own place does not: both paint the same, and a patch keeps the
             // recording's.
-            (PaintOperation::Replaced { .. }, PaintOperation::Replaced { .. }) => true,
+            (PaintOperation::Replaced { .. }, PaintOperation::Replaced { .. }) => Some(true),
             (PaintOperation::EndLayer, PaintOperation::EndLayer)
             | (PaintOperation::EndGroup, PaintOperation::EndGroup)
             | (PaintOperation::StartTextClip, PaintOperation::StartTextClip)
             | (PaintOperation::EndTextClip, PaintOperation::EndTextClip)
-            | (PaintOperation::EndReplaced, PaintOperation::EndReplaced) => true,
-            _ => false,
+            | (PaintOperation::EndReplaced, PaintOperation::EndReplaced) => Some(true),
+            _ => None,
         }
     }
 }
@@ -5055,6 +5063,72 @@ mod tests {
         assert!(same.differs_from(&PaintOperation::Quad(quad(0., 0., 10., 11.))));
         assert!(same.differs_from(&PaintOperation::Quad(Quad { background: crate::blue().into(), ..quad(0., 0., 10., 10.) })));
         assert!(same.differs_from(&PaintOperation::EndLayer));
+    }
+
+    /// What `differs_from` says without the debug form, which is `fields_equal` having an answer.
+    fn told_by_fields(left: &PaintOperation, right: &PaintOperation) -> Option<bool> {
+        left.fields_equal(right).map(|equal| !equal)
+    }
+
+    #[test]
+    fn a_quad_or_a_sprite_that_differs_in_any_one_field_differs_without_the_debug_form() {
+        let base = quad(0., 0., 10., 10.);
+        let moved = ScaledPixels(3.);
+        let quads = [
+            Quad { order: 1, ..base },
+            Quad { border_styles: Edges { top: BorderStyle::Dashed, ..Edges::default() }, ..base },
+            Quad { bounds: bounds(0., 0., 10., 11.), ..base },
+            Quad { content_mask: ContentMask { bounds: bounds(0., 0., 5., 5.), ..mask() }, ..base },
+            Quad { background: crate::blue().into(), ..base },
+            Quad { border_colors: Edges::all(crate::blue()), ..base },
+            Quad { border_inner_colors: Edges::all(crate::blue()), ..base },
+            Quad { corner_radii: Corners::all(moved), ..base },
+            Quad { corner_radii_y: Corners::all(moved), ..base },
+            Quad { border_widths: Edges::all(moved), ..base },
+            Quad { background_tile: BackgroundTile { width: 4., ..BackgroundTile::default() }, ..base },
+            Quad { transformation: TransformationMatrix::unit().translate(Point { x: moved, y: moved }), ..base },
+            Quad { local_clip: ContentMask { bounds: bounds(0., 0., 5., 5.), ..mask() }, ..base },
+        ];
+        let base = PaintOperation::Quad(base);
+        assert_eq!(told_by_fields(&base, &base), Some(false));
+        for (field, changed) in quads.into_iter().enumerate() {
+            let changed = PaintOperation::Quad(changed);
+            assert_eq!(told_by_fields(&base, &changed), Some(true), "quad field {field}");
+            assert!(base.differs_from(&changed) && changed.differs_from(&base), "quad field {field}");
+        }
+
+        let base = glyph(0., 0.);
+        let other_tile = AtlasTile { tile_id: TileId(9), ..base.tile };
+        let unit_moved = TransformationMatrix::unit().translate(Point { x: moved, y: moved });
+        let sprites = [
+            MonochromeSprite { order: 1, ..base },
+            MonochromeSprite { pad: 1, ..base },
+            MonochromeSprite { bounds: bounds(0., 0., 9., 8.), ..base },
+            MonochromeSprite { content_mask: ContentMask { bounds: bounds(0., 0., 5., 5.), ..mask() }, ..base },
+            MonochromeSprite { color: crate::blue(), ..base },
+            MonochromeSprite { tile: other_tile, ..base },
+            MonochromeSprite { transformation: unit_moved, ..base },
+            MonochromeSprite { local_clip: ContentMask { bounds: bounds(0., 0., 5., 5.), ..mask() }, ..base },
+            MonochromeSprite { clip_transformation: unit_moved, ..base },
+        ];
+        let base = PaintOperation::Primitive(Primitive::MonochromeSprite(base));
+        assert_eq!(told_by_fields(&base, &base), Some(false));
+        for (field, changed) in sprites.into_iter().enumerate() {
+            let changed = PaintOperation::Primitive(Primitive::MonochromeSprite(changed));
+            assert_eq!(told_by_fields(&base, &changed), Some(true), "sprite field {field}");
+            assert!(base.differs_from(&changed) && changed.differs_from(&base), "sprite field {field}");
+        }
+
+        let (layer, other_layer) = (PaintOperation::StartLayer(bounds(0., 0., 4., 4.)), PaintOperation::StartLayer(bounds(0., 0., 4., 5.)));
+        assert_eq!(told_by_fields(&layer, &layer), Some(false));
+        assert_eq!(told_by_fields(&layer, &other_layer), Some(true));
+        let (widen, other_widen) = (PaintOperation::WidenGroups(mask()), PaintOperation::WidenGroups(ContentMask { bounds: bounds(0., 0., 5., 5.), ..mask() }));
+        assert_eq!(told_by_fields(&widen, &widen), Some(false));
+        assert_eq!(told_by_fields(&widen, &other_widen), Some(true));
+
+        // A kind with no arm is left to the debug form.
+        let pending = PaintOperation::PendingGlyph(pending_glyph(0., 0., mask()));
+        assert_eq!(told_by_fields(&pending, &pending), None);
     }
 
     #[test]
