@@ -835,11 +835,17 @@ fn the_verifier_finds_no_difference_in_what_a_frame_replays_of_a_recording_a_pat
 /// had more or fewer of them moves where the paint states of the roots before it are.
 mod several_roots {
     use super::*;
-    use crate::GlobalElementId;
     use crate::elements::RetainedState;
+    use crate::{Div, GlobalElementId, Stateful};
     use std::any::TypeId;
 
     const ROOTS: [&str; 3] = ["first", "second", "third"];
+
+    /// A div keeps an element state only when something reads it, and these tests are about the states a frame
+    /// accesses, so every element here has a hover style, which does.
+    fn stateful(id: impl Into<ElementId>) -> Stateful<Div> {
+        div().id(id).hover(|style| style)
+    }
 
     struct Roots {
         kids: [Cell<usize>; 3],
@@ -850,9 +856,9 @@ mod several_roots {
     impl Roots {
         fn unit(&self, root: usize) -> AnyElement {
             let name = ROOTS[root];
-            let mut unit = div().id(name).w(px(120.)).h(px(60.)).flex_none().overflow_hidden().bg(blue());
+            let mut unit = stateful(name).w(px(120.)).h(px(60.)).flex_none().overflow_hidden().bg(blue());
             for index in 0..self.kids[root].get() {
-                unit = unit.child(div().id((name, index)).h(px(8.)).flex_none().bg(if index % 2 == 0 { red() } else { green() }));
+                unit = unit.child(stateful((name, index)).h(px(8.)).flex_none().bg(if index % 2 == 0 { red() } else { green() }));
             }
             unit.into_any_element()
         }
@@ -862,18 +868,17 @@ mod several_roots {
 
     impl Render for Rooted {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            let mut page = div()
-                .id("page")
+            let mut page = stateful("page")
                 .w(px(400.))
                 .h(px(400.))
                 .flex()
                 .flex_col()
-                .child(div().id("header").w(px(60.)).h(px(20.)).flex_none().bg(green()));
+                .child(stateful("header").w(px(60.)).h(px(20.)).flex_none().bg(green()));
             for root in 0..ROOTS.len() {
                 let state = self.0.clone();
                 page = page.child(retained(ROOTS[root], 1_000 + self.0.version.get(), move |_, _| state.unit(root)).patchable_relayout());
             }
-            page.child(div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green())).into_any_element()
+            page.child(stateful("footer").w(px(60.)).h(px(20.)).flex_none().bg(green())).into_any_element()
         }
     }
 

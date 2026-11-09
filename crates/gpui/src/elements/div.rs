@@ -3077,7 +3077,7 @@ impl Interactivity {
         );
 
         window.with_optional_element_state::<InteractiveElementState, _>(
-            global_id,
+            self.state_id(global_id),
             |element_state, window| {
                 let mut element_state =
                     element_state.map(|element_state| element_state.unwrap_or_default());
@@ -3238,7 +3238,7 @@ impl Interactivity {
         }
         self.report_a11y_focus(global_id, window);
         window.with_optional_element_state::<InteractiveElementState, _>(
-            global_id,
+            self.state_id(global_id),
             |element_state, window| {
                 let mut element_state =
                     element_state.map(|element_state| element_state.unwrap_or_default());
@@ -3416,6 +3416,40 @@ impl Interactivity {
                 }
             });
         });
+    }
+
+    /// The id the element state is kept under, `None` when nothing on this element reads it.
+    ///
+    /// An element without an id never has an `InteractiveElementState` and every reader of it
+    /// handles that, so a Div with an id and none of the features below behaves the same without
+    /// one, and skips three element-state map round trips per frame. Each clause is a reader of a
+    /// field of the state:
+    /// - `focusable`: `focus_handle`, when no handle is tracked.
+    /// - `overflow: scroll`: `scroll_offset` and `ongoing_scroll`. A tracked scroll handle owns
+    ///   its own and reads no state.
+    /// - a click, aux-click or drag listener: `pending_mouse_down`, `pending_keyboard_down`,
+    ///   `clicked_state`.
+    /// - an active or group active style: `clicked_state`, kept by the paint listeners.
+    /// - a hover or group hover style: `hover_state`.
+    /// - a hover listener: `hover_listener_state` and `pending_mouse_down`.
+    /// - a tooltip: `active_tooltip` and `pending_mouse_down`.
+    ///
+    /// Must be the same in request layout, prepaint and paint: `paint_mouse_listeners` drains
+    /// listeners, so it reads this before it does. Add a clause for every new reader of the state.
+    fn state_id<'a>(&self, global_id: Option<&'a GlobalElementId>) -> Option<&'a GlobalElementId> {
+        let needs_state = self.focusable
+            || self.base_style.overflow.x == Some(Overflow::Scroll)
+            || self.base_style.overflow.y == Some(Overflow::Scroll)
+            || !self.click_listeners.is_empty()
+            || !self.aux_click_listeners.is_empty()
+            || self.drag_listener.is_some()
+            || self.active_style.is_some()
+            || self.group_active_style.is_some()
+            || self.hover_style.is_some()
+            || self.group_hover_style.is_some()
+            || self.hover_listener.is_some()
+            || self.tooltip_builder.is_some();
+        if needs_state { global_id } else { None }
     }
 
     /// What prepaint reports to the layout probe and the `on_prepainted_layout` listeners of an element.
@@ -3661,7 +3695,7 @@ impl Interactivity {
         self.projection_scale = window.take_projection_scale();
         self.hovered = hitbox.map(|hitbox| hitbox.is_hovered(window));
         window.with_optional_element_state::<InteractiveElementState, _>(
-            global_id,
+            self.state_id(global_id),
             |element_state, window| {
                 let mut element_state =
                     element_state.map(|element_state| element_state.unwrap_or_default());
@@ -12718,5 +12752,244 @@ mod tests {
             // Row 2 starts at 80, so rows 3 and 4 are the ones at or past the clip.
             assert_eq!(hit, 0);
         }
+    }
+
+    struct ElementStateProbeView {
+        build: Rc<dyn Fn() -> AnyElement>,
+    }
+
+    impl Render for ElementStateProbeView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child((self.build)())
+        }
+    }
+
+    /// How many `InteractiveElementState`s a frame of one element with the id "target" keeps.
+    fn interactive_states_kept(cx: &mut TestAppContext, build: impl Fn() -> AnyElement + 'static) -> usize {
+        let window = cx.add_window({
+            let build: Rc<dyn Fn() -> AnyElement> = Rc::new(build);
+            move |_, _| ElementStateProbeView { build }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            window
+                .element_states
+                .keys()
+                .filter(|(_, state_type)| *state_type == TypeId::of::<InteractiveElementState>())
+                .count()
+        })
+        .unwrap()
+    }
+
+    fn target() -> Stateful<Div> {
+        div().id("target").size(px(20.))
+    }
+
+    #[gpui::test]
+    fn a_plain_div_with_an_id_keeps_no_interactive_state(cx: &mut TestAppContext) {
+        assert_eq!(
+            interactive_states_kept(cx, || target().into_any_element()),
+            0
+        );
+        assert_eq!(
+            interactive_states_kept(cx, || target()
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .on_mouse_move(|_, _, _| {})
+                .child("text")
+                .into_any_element()),
+            0,
+            "mouse listeners, children and an id read no state",
+        );
+        assert_eq!(
+            interactive_states_kept(cx, || target()
+                .track_scroll(&ScrollHandle::new())
+                .into_any_element()),
+            0,
+            "a tracked scroll handle owns the offset",
+        );
+    }
+
+    #[gpui::test]
+    fn an_element_without_an_id_keeps_no_interactive_state(cx: &mut TestAppContext) {
+        assert_eq!(
+            interactive_states_kept(cx, || div().size(px(20.)).into_any_element()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    fn every_feature_that_reads_the_interactive_state_keeps_it(cx: &mut TestAppContext) {
+        let cases: Vec<(&str, Box<dyn Fn() -> AnyElement>)> = vec![
+            (
+                "click",
+                Box::new(|| target().on_click(|_, _, _| {}).into_any_element()),
+            ),
+            (
+                "aux click",
+                Box::new(|| target().on_aux_click(|_, _, _| {}).into_any_element()),
+            ),
+            (
+                "drag",
+                Box::new(|| {
+                    target()
+                        .on_drag(1usize, |_, _, _, cx| cx.new(|_| TestTooltipView))
+                        .into_any_element()
+                }),
+            ),
+            (
+                "hover style",
+                Box::new(|| target().hover(|style| style.opacity(0.5)).into_any_element()),
+            ),
+            (
+                "group hover style",
+                Box::new(|| {
+                    target()
+                        .group_hover("g", |style| style.opacity(0.5))
+                        .into_any_element()
+                }),
+            ),
+            (
+                "active style",
+                Box::new(|| target().active(|style| style.opacity(0.5)).into_any_element()),
+            ),
+            (
+                "group active style",
+                Box::new(|| {
+                    target()
+                        .group_active("g", |style| style.opacity(0.5))
+                        .into_any_element()
+                }),
+            ),
+            (
+                "hover listener",
+                Box::new(|| target().on_hover(|_, _, _| {}).into_any_element()),
+            ),
+            (
+                "tooltip",
+                Box::new(|| {
+                    target()
+                        .tooltip(|_, cx| cx.new(|_| TestTooltipView).into())
+                        .into_any_element()
+                }),
+            ),
+            (
+                "overflow scroll",
+                Box::new(|| target().overflow_scroll().into_any_element()),
+            ),
+            (
+                "overflow y scroll",
+                Box::new(|| target().overflow_y_scroll().into_any_element()),
+            ),
+            (
+                "tracked scroll handle with overflow scroll",
+                Box::new(|| {
+                    target()
+                        .overflow_scroll()
+                        .track_scroll(&ScrollHandle::new())
+                        .into_any_element()
+                }),
+            ),
+            (
+                "focusable",
+                Box::new(|| target().focusable().into_any_element()),
+            ),
+            (
+                "tab index",
+                Box::new(|| target().tab_index(0).into_any_element()),
+            ),
+        ];
+        for (feature, build) in cases {
+            assert_eq!(
+                interactive_states_kept(cx, move || build()),
+                1,
+                "a div with {feature} keeps its interactive state",
+            );
+        }
+    }
+
+    struct ToggledClickTestView {
+        clickable: Rc<Cell<bool>>,
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for ToggledClickTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            div().size_full().child(
+                target()
+                    .when(self.clickable.get(), |this| {
+                        this.on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+                    }),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a_click_listener_added_after_a_plain_frame_gets_its_state(cx: &mut TestAppContext) {
+        let clickable = Rc::new(Cell::new(false));
+        let clicks = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let clickable = clickable.clone();
+            let clicks = clicks.clone();
+            move |_, _| ToggledClickTestView { clickable, clicks }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        let mouse_position = point(px(5.), px(5.));
+        let click = |cx: &mut TestAppContext| {
+            cx.update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: mouse_position,
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position: mouse_position,
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(mouse_position, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        click(cx);
+        assert_eq!(clicks.get(), 0);
+
+        clickable.set(true);
+        cx.update_window(any_window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        click(cx);
+        assert_eq!(clicks.get(), 1);
+
+        clickable.set(false);
+        cx.update_window(any_window, |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        click(cx);
+        assert_eq!(clicks.get(), 1);
     }
 }
