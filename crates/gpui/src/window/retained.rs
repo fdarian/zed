@@ -1609,7 +1609,9 @@ impl Window {
         &self.retained.mismatches
     }
 
-    pub(crate) fn note_publication(&mut self) {
+    /// Notes that what is being run publishes a box or a layout reading, so that a recording that
+    /// holds it counts as one that publishes. For an element that prepaints its descendants itself.
+    pub fn note_publication(&mut self) {
         self.retained.publications = self.retained.publications.wrapping_add(1);
     }
 

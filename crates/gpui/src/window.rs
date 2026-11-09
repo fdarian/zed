@@ -1547,8 +1547,9 @@ struct LiftList {
     next_ordinal: u32,
 }
 
-/// Where an element being lifted started, see [`Window::begin_lift`].
-pub(crate) struct LiftTicket {
+/// Where an element being lifted started, see [`Window::begin_lift`]. For an element that prepaints its
+/// descendants itself.
+pub struct LiftTicket {
     ordinal: u32,
     hitboxes_start: usize,
 }
@@ -5030,7 +5031,8 @@ impl Window {
     }
 
     /// Whether the child whose layout node is `layout_id`, with border box `bounds`, lies
-    /// outside the content mask for good: its box and the scrollable overflow of what is below
+    /// outside the content mask for good: for an element that prepaints its descendants itself, as a
+    /// `Div` does for each child. Its box and the scrollable overflow of what is below
     /// it, inflated by `outset` (and a pixel, for snapping), do not touch the mask.
     ///
     /// A mask with no area is touched by nothing. Content that escapes the mask is not held to it:
@@ -5040,7 +5042,7 @@ impl Window {
     /// Not while the pointer is captured by an element, which has to keep its hitbox. An
     /// accessibility tree does not stop it: a culled subtree still pushes its nodes, as clipped
     /// content stays in the tree.
-    pub(crate) fn lies_outside_the_mask(
+    pub fn lies_outside_the_mask(
         &mut self,
         layout_id: LayoutId,
         bounds: Bounds<Pixels>,
@@ -6962,8 +6964,9 @@ impl Window {
 
     /// [`Window::with_exact_content_mask`] unless `escape_inside`, otherwise
     /// [`Window::with_content_mask`]: the paint of an element's `overflow` clip, `escape_inside`
-    /// being whether prepaint found a box inside it that escapes the clip.
-    pub(crate) fn with_overflow_clip<R>(
+    /// being whether prepaint found a box inside it that escapes the clip. For an element that
+    /// paints its descendants itself.
+    pub fn with_overflow_clip<R>(
         &mut self,
         mask: Option<ContentMask<Pixels>>,
         escape_inside: bool,
@@ -7003,8 +7006,8 @@ impl Window {
 
     /// A number that changes whenever a box prepainted after the last reading escaped the clip it
     /// is in, so a clip that reads it before and after prepainting its children knows whether one
-    /// of them did.
-    pub(crate) fn escapes_prepainted(&self) -> u32 {
+    /// of them did. For an element that prepaints its descendants itself.
+    pub fn escapes_prepainted(&self) -> u32 {
         self.escapes_prepainted
     }
 
@@ -7081,8 +7084,10 @@ impl Window {
 
     /// [`Self::with_positioned_frame`] for an element that may also have layout containment
     /// (`contains_fixed`), which makes the frame the one that `position: fixed` descendants are
-    /// placed in.
-    pub(crate) fn with_frame<R>(
+    /// placed in. For an element that prepaints its descendants itself: it wraps the prepaint of its
+    /// children in this when it is positioned (not `Position::Static`) or contains fixed boxes, as a
+    /// `Div` does.
+    pub fn with_frame<R>(
         &mut self,
         contains_fixed: bool,
         f: impl FnOnce(&mut Self) -> R,
@@ -7122,8 +7127,9 @@ impl Window {
         }
     }
 
-    /// Whether a positioned element prepainted now is handed over to a stacking context.
-    pub(crate) fn lifting(&self) -> bool {
+    /// Whether a positioned element prepainted now is handed over to a stacking context. For an
+    /// element that prepaints its descendants itself.
+    pub fn lifting(&self) -> bool {
         matches!(self.lift_lists.last(), Some(Some(_)))
     }
 
@@ -7202,8 +7208,9 @@ impl Window {
     }
 
     /// Call before prepainting an element whose parent will hand it to the stacking context, so
-    /// that it counts in tree order before the elements inside it.
-    pub(crate) fn begin_lift(&mut self) -> LiftTicket {
+    /// that it counts in tree order before the elements inside it. For an element that prepaints
+    /// its descendants itself.
+    pub fn begin_lift(&mut self) -> LiftTicket {
         self.invalidator.debug_assert_prepaint();
         let list = match self.lift_lists.last_mut() {
             Some(Some(list)) => list,
@@ -7221,8 +7228,9 @@ impl Window {
 
     /// Hands the prepainted `element` to the stacking context with its hitboxes, and returns the
     /// ordinal its parent identifies it by. Call where the element was prepainted: what is
-    /// captured here is what its parent's children are painted with.
-    pub(crate) fn finish_lift(&mut self, ticket: LiftTicket, z: i32, element: AnyElement) -> u32 {
+    /// captured here is what its parent's children are painted with. For an element that prepaints
+    /// its descendants itself.
+    pub fn finish_lift(&mut self, ticket: LiftTicket, z: i32, element: AnyElement) -> u32 {
         self.invalidator.debug_assert_prepaint();
         self.lifts_open -= 1;
         let hitboxes = self.next_frame.hitboxes.split_off(ticket.hitboxes_start);
@@ -7266,8 +7274,8 @@ impl Window {
     }
 
     /// Notes that the parent painting now skips the lifted element `ordinal`, which is where it
-    /// belongs in tab order.
-    pub(crate) fn mark_lifted(&mut self, ordinal: u32) {
+    /// belongs in tab order. For an element that paints its descendants itself.
+    pub fn mark_lifted(&mut self, ordinal: u32) {
         self.invalidator.debug_assert_paint();
         let position = self.next_frame.tab_stops.paint_index();
         let lifted = self
