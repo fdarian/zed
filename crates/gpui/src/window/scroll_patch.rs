@@ -1067,10 +1067,8 @@ impl Window {
             self.patch.counters.thumb_repaints += edits.len() as u64;
             let scene = &mut self.rendered_frame.scene;
             self.damage.begin(scene);
-            if self.damage.enabled() {
-                for (op, new) in &edits {
-                    self.damage.add_change(&scene.paint_operations[*op], new);
-                }
+            for (op, new) in &edits {
+                self.damage.add_change(&scene.paint_operations[*op], new);
             }
             let mut written = 0;
             if scene.patch_in_place(edits.iter().map(|(op, new)| (*op, new)), &mut written) {

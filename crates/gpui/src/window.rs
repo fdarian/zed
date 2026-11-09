@@ -4249,7 +4249,7 @@ impl Window {
     }
 
     /// The picture the platform keeps for a window that draws only what changed
-    /// ([`Window::set_partial_redraw`]): what the frames drawn in part added up to. It is what
+    /// (see [`crate::window::damage`]): what the frames drawn in part added up to. It is what
     /// [`Window::render_to_image`] draws when the damage was right.
     #[cfg(any(test, feature = "test-support"))]
     pub fn shown_picture(&self) -> anyhow::Result<Option<image::RgbaImage>> {

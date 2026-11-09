@@ -1189,10 +1189,8 @@ impl Window {
                 self.damage.end(&self.rendered_frame.scene);
             }
             self.damage.begin(&self.rendered_frame.scene);
-            if self.damage.enabled() {
-                for (at, new) in edits.clone() {
-                    self.damage.add_change(&self.rendered_frame.scene.paint_operations[at], new);
-                }
+            for (at, new) in edits.clone() {
+                self.damage.add_change(&self.rendered_frame.scene.paint_operations[at], new);
             }
             if self.rendered_frame.scene.patch_in_place(edits, &mut written) {
                 self.patch.counters.in_place_primitives += written;

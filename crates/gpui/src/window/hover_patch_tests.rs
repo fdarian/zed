@@ -27,6 +27,37 @@ pub(super) struct Knobs {
     painted: Cell<bool>,
     /// Whether a row that is not hot has a fully transparent background that is kept.
     transparent: Cell<bool>,
+    /// The effect group painted over the rows, if any.
+    pub(super) group: Cell<Option<GroupKind>>,
+}
+
+/// An element that is an effect group, over rows 0 and 1 of the list.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum GroupKind {
+    Opacity,
+    Blur,
+    BackdropBlur,
+    DropShadow,
+}
+
+fn group_element(kind: GroupKind) -> AnyElement {
+    let mut group = div().id("group").absolute().left(px(20.)).top(px(10.)).w(px(40.)).h(px(40.)).bg(crate::green());
+    match kind {
+        GroupKind::Opacity => group = group.opacity(0.5),
+        GroupKind::Blur => group.style().filter = Some(vec![crate::FilterFunction::Blur(px(2.))]),
+        GroupKind::BackdropBlur => {
+            group.style().backdrop_filter = Some(vec![crate::FilterFunction::Blur(px(3.))]);
+            group = group.bg(crate::transparent_black());
+        }
+        GroupKind::DropShadow => {
+            group.style().filter = Some(vec![crate::FilterFunction::DropShadow { offset: point(px(4.), px(4.)), blur: px(2.), color: crate::black() }])
+        }
+    }
+    // Two children, or an opacity group of one primitive is that primitive faded and not a group.
+    group
+        .child(div().w(px(30.)).h(px(30.)).bg(crate::red()))
+        .child(div().absolute().left(px(10.)).top(px(10.)).w(px(30.)).h(px(30.)).bg(crate::blue()))
+        .into_any_element()
 }
 
 fn row_element(ix: usize, hot: bool, transparent: bool) -> AnyElement {
@@ -50,6 +81,7 @@ impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let knobs = self.knobs.clone();
         let transparent = knobs.transparent.get();
+        let group = knobs.group.get().map(group_element);
         div().size_full().child(
             list(self.state.clone(), move |ix, _, _| {
                 let hot = knobs.hot.get() == Some(ix);
@@ -61,6 +93,7 @@ impl Render for Page {
             .w(px(100.))
             .h(px(LIST)),
         )
+        .children(group)
     }
 }
 
@@ -75,14 +108,28 @@ impl Fixture {
     }
 
     fn with_transparent(cx: &mut TestAppContext, transparent: bool) -> Self {
+        Self::build(cx, transparent, None)
+    }
+
+    /// The list with an effect group of `kind` over its first rows.
+    pub(super) fn with_group(cx: &mut TestAppContext, kind: GroupKind) -> Self {
+        Self::build(cx, false, Some(kind))
+    }
+
+    fn build(cx: &mut TestAppContext, transparent: bool, group: Option<GroupKind>) -> Self {
         let knobs = Rc::new(Knobs::default());
         knobs.key.set(1);
         knobs.transparent.set(transparent);
+        knobs.group.set(group);
         let state = ListState::new(100, ListAlignment::Top, px(0.)).with_uniform_item_height(px(ROW));
         let page = Page { knobs: knobs.clone(), state };
         let window = AnyWindowHandle::from(cx.open_window(size(px(400.), px(300.)), move |_, _| page));
         cx.update_window(window, |_, window, _| {
             window.set_dom_hit_testing(true);
+            if group.is_some() {
+                // The test platform draws no effects, and a Metal window has groups.
+                window.force_effect_groups();
+            }
             window.set_scroll_patch(true);
             window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
             let knobs = knobs.clone();

@@ -3,7 +3,7 @@
 //! window when little changed.
 
 use super::DamageDraw;
-use super::hover_patch_tests::Fixture;
+use super::hover_patch_tests::{Fixture, GroupKind};
 use crate::{AppContext as _, Bounds, DevicePixels, TestAppContext};
 
 fn present(fixture: &Fixture, cx: &mut TestAppContext) {
@@ -14,18 +14,13 @@ fn draws(fixture: &Fixture, cx: &mut TestAppContext) -> Vec<DamageDraw> {
     cx.update_window(fixture.window, |_, window, _| window.platform_window.as_test().unwrap().damage_draws()).unwrap()
 }
 
-fn plain_draws(fixture: &Fixture, cx: &mut TestAppContext) -> usize {
-    cx.update_window(fixture.window, |_, window, _| window.platform_window.as_test().unwrap().plain_draw_count()).unwrap()
-}
-
-fn partial(cx: &mut TestAppContext, enabled: bool, fixture: &Fixture) {
-    cx.update_window(fixture.window, |_, window, _| window.set_partial_redraw(enabled)).unwrap();
-}
-
-/// A fixture whose window draws part of the picture, with the first frame shown whole.
+/// A fixture with the first frame shown whole.
 fn shown(cx: &mut TestAppContext) -> Fixture {
     let fixture = Fixture::new(cx);
-    partial(cx, true, &fixture);
+    shown_fixture(cx, fixture)
+}
+
+fn shown_fixture(cx: &mut TestAppContext, fixture: Fixture) -> Fixture {
     fixture.draw(cx);
     present(&fixture, cx);
     fixture
@@ -143,13 +138,27 @@ fn a_rebuild_of_the_scene_that_no_one_said_is_drawn_whole(cx: &mut TestAppContex
     assert!(assert_covers_the_difference(&draws(&fixture, cx)).is_some());
 }
 
+/// An effect group reads and writes the pixels around it, so a frame that has one is drawn whole, and a patch of a
+/// row under it or beside it is no exception: the damage is all of the window and the frame after the group
+/// is gone (a rebuild) is whole too.
 #[gpui::test]
-fn a_window_that_does_not_ask_draws_plainly(cx: &mut TestAppContext) {
-    let fixture = shown(cx);
-    partial(cx, false, &fixture);
-    let (plain, partial_draws) = (plain_draws(&fixture, cx), draws(&fixture, cx).len());
-    fixture.patch(cx, &[1], true);
-    present(&fixture, cx);
-    assert_eq!(plain_draws(&fixture, cx), plain + 1);
-    assert_eq!(draws(&fixture, cx).len(), partial_draws);
+fn a_frame_with_an_effect_group_is_drawn_whole_whatever_is_patched(cx: &mut TestAppContext) {
+    for kind in [GroupKind::Opacity, GroupKind::Blur, GroupKind::BackdropBlur, GroupKind::DropShadow] {
+        let fixture = Fixture::with_group(cx, kind);
+        let fixture = shown_fixture(cx, fixture);
+        let has_group = |cx: &mut TestAppContext| {
+            cx.update_window(fixture.window, |_, window, _| !window.rendered_frame.scene.groups.is_empty()).unwrap()
+        };
+        assert!(has_group(cx), "{kind:?} makes an effect group");
+        // Row 0 is under the group, row 3 is beside it.
+        for rows in [[0], [3]] {
+            fixture.patch(cx, &rows, true);
+            present(&fixture, cx);
+            let draws = draws(&fixture, cx);
+            assert_eq!(draws.last().unwrap().damage, None, "{kind:?}: a patch of {rows:?} is drawn whole");
+            fixture.patch(cx, &rows, false);
+            present(&fixture, cx);
+            assert_eq!(self::draws(&fixture, cx).last().unwrap().damage, None, "{kind:?}: the patch of {rows:?} back is drawn whole");
+        }
+    }
 }

@@ -385,12 +385,18 @@ impl MetalRenderer {
     /// and every frame copies it to the drawable. The scene must not have an effect group, a native
     /// surface or a surface, and the window must be opaque; a scene that does is drawn whole.
     pub fn draw_with_damage(&mut self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
-        let drawn_whole = !self.opaque || !scene.groups.is_empty() || !scene.surfaces.is_empty();
-        if drawn_whole {
-            self.draw_orders(scene, OrderRange::ALL);
-        } else {
+        if self.draws_in_part(scene) {
             self.draw_frame(scene, OrderRange::ALL, Some(damage));
+        } else {
+            self.draw_orders(scene, OrderRange::ALL);
         }
+    }
+
+    /// Whether `scene` can go through the persistent target: an effect group reads and writes the
+    /// pixels around it, a surface is not a box, and a transparent window is composited over what is
+    /// behind it, which the target's black clear is not.
+    fn draws_in_part(&self, scene: &Scene) -> bool {
+        self.opaque && scene.groups.is_empty() && scene.surfaces.is_empty()
     }
 
     /// `damage` is `Some` for a frame that goes through the persistent target.
@@ -608,8 +614,8 @@ impl MetalRenderer {
     }
 
     /// Draws `scene` as [`MetalRenderer::draw_with_damage`] does (through the persistent target, in part
-    /// when `damage` is given and the target holds the frame before) onto a texture of its own, and
-    /// returns what that holds.
+    /// when `damage` is given and the target holds the frame before; whole when the scene or the window
+    /// is not for it) onto a texture of its own, and returns what that holds.
     #[cfg(any(test, feature = "test-support"))]
     pub fn render_scene_partial_to_image(
         &mut self,
@@ -625,7 +631,14 @@ impl MetalRenderer {
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
         texture_descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
         let destination = self.device.new_texture(&texture_descriptor);
-        let command_buffer = self.render_frame_in(scene, OrderRange::ALL, &destination, size, Some(damage))?;
+        let damage = match self.draws_in_part(scene) {
+            true => Some(damage),
+            false => {
+                self.partial.valid = false;
+                None
+            }
+        };
+        let command_buffer = self.render_frame_in(scene, OrderRange::ALL, &destination, size, damage)?;
         if !self.shared.is_unified_memory {
             let blit = command_buffer.new_blit_command_encoder();
             blit.synchronize_resource(&destination);
@@ -3722,6 +3735,111 @@ mod tests {
         let drawn = partial.render_scene_partial_to_image(&next, damage(30, 30, 4, 4), window).unwrap();
         let whole = MetalHeadlessRenderer::new().render_scene_to_image(&next, window).unwrap();
         assert!(drawn != whole);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Effect {
+        Opacity,
+        Blur,
+        BackdropBlur,
+        DropShadow,
+    }
+
+    /// The frame of `frame` with an effect group of `effect` over the middle, when `with_group`.
+    fn frame_with_group(effect: Effect, red_at: f32, with_group: bool) -> Scene {
+        let mut scene = groups_scene();
+        scene.insert_primitive(translucent(full_bounds(), gpui::hsla(0.6, 0.5, 0.4, 1.), 0.));
+        scene.insert_primitive(translucent(area(red_at, 4., 12., 12.), gpui::hsla(0., 1., 0.5, 0.7), 3.));
+        scene.insert_primitive(translucent(area(4., 26., 10., 10.), gpui::hsla(0.3, 1., 0.5, 0.8), 2.));
+        if with_group {
+            let region = area(12., 12., 20., 20.);
+            let effect = match effect {
+                Effect::Opacity => GroupEffect { opacity: 0.5, ..GroupEffect::default() },
+                Effect::Blur => filtered(vec![gpui::FilterFunction::Blur(px(2.))]),
+                Effect::BackdropBlur => GroupEffect {
+                    backdrop_filters: vec![gpui::FilterFunction::Blur(px(3.)).resolve(1.)],
+                    reference: region,
+                    ..GroupEffect::default()
+                },
+                Effect::DropShadow => filtered(vec![gpui::FilterFunction::DropShadow {
+                    offset: point(px(3.), px(3.)),
+                    blur: px(2.),
+                    color: gpui::black(),
+                }]),
+            };
+            scene.start_group(effect, window_mask(), None);
+            scene.insert_primitive(translucent(region, gpui::hsla(0.8, 1., 0.5, 0.9), 2.));
+            scene.insert_primitive(translucent(area(20., 20., 10., 10.), gpui::hsla(0.1, 1., 0.5, 0.9), 0.));
+            scene.end_group();
+        }
+        scene.finish();
+        scene
+    }
+
+    /// Asserts that every frame drawn through `partial` with the damage a patch gives is the frame drawn whole.
+    fn assert_parity(
+        partial: &mut MetalRenderer,
+        whole: &mut MetalRenderer,
+        frames: &[(Scene, Option<Bounds<DevicePixels>>)],
+        what: &str,
+    ) {
+        let window = size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32));
+        for (index, (scene, damage)) in frames.iter().enumerate() {
+            let drawn = partial.render_scene_partial_to_image(scene, *damage, window).expect("the frame is drawn");
+            let expected = whole.render_scene_to_image(scene, window).expect("the frame is drawn whole");
+            assert!(drawn == expected, "{what}: frame {index} drawn with {damage:?} is not the frame drawn whole");
+        }
+    }
+
+    #[test]
+    fn a_patch_next_to_or_under_an_effect_group_is_the_frame_drawn_whole() {
+        // The red quad (x 6..18 then 8..20, y 4..16) is under the group's top left, the green one (x 4..14, y 26..36)
+        // beside it. A patch gives the damage of what it changed; the frame with a group is drawn whole anyway,
+        // and the frames around it must not be drawn on a picture it left stale.
+        for effect in [Effect::Opacity, Effect::Blur, Effect::BackdropBlur, Effect::DropShadow] {
+            let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            let mut whole = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+            let frames = [
+                (frame_with_group(effect, 6., false), None),
+                // The group comes in over the quads, a rebuild the damage says nothing of that is tight.
+                (frame_with_group(effect, 6., true), damage(10, 10, 24, 24)),
+                // A patch under the group.
+                (frame_with_group(effect, 8., true), damage(4, 2, 18, 16)),
+                // And one beside it.
+                (frame_with_group(effect, 8., true), damage(2, 24, 14, 14)),
+                // The group goes, and the picture it left is not one a part can be drawn on.
+                (frame_with_group(effect, 8., false), damage(10, 10, 24, 24)),
+                // A patch of a frame without a group is drawn in part again.
+                (frame_with_group(effect, 6., false), damage(4, 2, 18, 16)),
+                (frame_with_group(effect, 6., false), damage(0, 0, 0, 0)),
+            ];
+            assert_parity(&mut partial, &mut whole, &frames, &format!("{effect:?}"));
+        }
+    }
+
+    #[test]
+    fn a_transparent_window_is_drawn_whole_and_not_on_a_target_that_is_black() {
+        let transparent = || {
+            MetalRenderer::new_internal(
+                MetalRenderer::create_device(),
+                None,
+                false,
+                Arc::new(Mutex::new(InstanceBufferPool::default())),
+            )
+        };
+        let (mut partial, mut whole) = (transparent(), transparent());
+        let frames = [
+            (frame_with_group(Effect::Opacity, 6., false), None),
+            (frame_with_group(Effect::Opacity, 8., false), damage(4, 2, 18, 16)),
+            (frame_with_group(Effect::Opacity, 8., true), damage(10, 10, 24, 24)),
+            (frame_with_group(Effect::Opacity, 6., false), damage(4, 2, 18, 16)),
+        ];
+        assert_parity(&mut partial, &mut whole, &frames, "a transparent window");
+        // Nothing is painted in the corner, which shows what is behind the window.
+        let corner = partial
+            .render_scene_partial_to_image(&scene_of(&[]), damage(0, 0, 4, 4), size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)))
+            .unwrap();
+        assert_eq!(corner.get_pixel(0, 0).0[3], 0, "the window is transparent where nothing is drawn");
     }
 
     /// The headless target is opaque and cleared to black, so "nothing was drawn" is black.

@@ -1,6 +1,6 @@
 //! The damage of a picture: the part of what a window shows that differs from the scene the platform
-//! drew last, so that a platform that can may draw that part and keep the rest (see
-//! [`Window::set_partial_redraw`]).
+//! drew last, so that a platform that can (Metal) draws that part and keeps the rest. Every window
+//! has it, and there is no switch.
 //!
 //! The rendered scene is the picture. A frame built whole replaces it, so it damages all of it. A
 //! patch, a scroll translate and a repaint of a scrollbar's thumb write over the scene they follow,
@@ -30,7 +30,6 @@ enum Damage {
 }
 
 pub(crate) struct DamageLedger {
-    enabled: bool,
     damage: Damage,
     /// The revision of the rendered scene that every change up to is in `damage`.
     accounted: u64,
@@ -38,24 +37,13 @@ pub(crate) struct DamageLedger {
 
 impl DamageLedger {
     pub(crate) fn new() -> Self {
-        Self { enabled: false, damage: Damage::Full, accounted: 0 }
-    }
-
-    pub(crate) fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    pub(crate) fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-        self.damage = Damage::Full;
+        Self { damage: Damage::Full, accounted: 0 }
     }
 
     /// A frame built whole is the rendered scene now: all of the picture differs from the last.
     pub(crate) fn frame_built(&mut self, scene: &Scene) {
-        if self.enabled {
-            self.damage = Damage::Full;
-            self.accounted = scene.revision();
-        }
+        self.damage = Damage::Full;
+        self.accounted = scene.revision();
     }
 
     /// The picture changes in a way that no scene says (an image the atlas holds was written over).
@@ -66,7 +54,7 @@ impl DamageLedger {
     /// Called before a change to the rendered scene: a rebuild that was not accounted for makes the
     /// damage all of the picture.
     pub(crate) fn begin(&mut self, scene: &Scene) {
-        if self.enabled && self.accounted != scene.revision() {
+        if self.accounted != scene.revision() {
             self.damage = Damage::Full;
         }
     }
@@ -96,30 +84,23 @@ impl DamageLedger {
 
     /// An operation that is written over another: what the first painted and what the second paints.
     pub(crate) fn add_change(&mut self, old: &PaintOperation, new: &PaintOperation) {
-        if self.enabled {
-            self.add_extent(old.extent(), true);
-            self.add_extent(new.extent(), true);
-        }
+        self.add_extent(old.extent(), true);
+        self.add_extent(new.extent(), true);
     }
 
     /// Operations that are put in the place of others, which is where all of them were and are.
     pub(crate) fn add_operations(&mut self, operations: &[PaintOperation]) {
-        if self.enabled {
-            for operation in operations {
-                if self.damage == Damage::Full {
-                    return;
-                }
-                self.add_extent(operation.extent(), false);
+        for operation in operations {
+            if self.damage == Damage::Full {
+                return;
             }
+            self.add_extent(operation.extent(), false);
         }
     }
 
     /// The damage the platform is to draw, in device pixels inside a viewport of `viewport` (`None`
     /// is all of it, an empty rectangle none of it), and the damage that is left, which is none.
     pub(crate) fn take(&mut self, scene: &Scene, viewport: Size<DevicePixels>) -> Option<Bounds<DevicePixels>> {
-        if !self.enabled {
-            return None;
-        }
         let damage = std::mem::replace(&mut self.damage, Damage::Area(None));
         if self.accounted != scene.revision() || scene.has_unboxed_content() {
             self.accounted = scene.revision();
@@ -148,23 +129,6 @@ fn to_device(area: Bounds<ScaledPixels>, viewport: Size<DevicePixels>) -> Bounds
 }
 
 impl crate::Window {
-    /// Draws only the part of the window that a frame changed, when the platform can: the rest of the
-    /// picture is the one it drew before. A patch, a scroll translate and the repaint of a scrollbar's
-    /// thumb say what they changed; every other frame is drawn whole. The platforms that cannot draw
-    /// part of a window ignore it. Off by default, for it changes the pictures the GPU is asked for
-    /// and not the picture that shows.
-    pub fn set_partial_redraw(&mut self, enabled: bool) {
-        if self.damage.enabled() != enabled {
-            self.damage.set_enabled(enabled);
-            self.refresh();
-        }
-    }
-
-    /// Whether [`Window::set_partial_redraw`] is on.
-    pub fn partial_redraw(&self) -> bool {
-        self.damage.enabled()
-    }
-
     /// The damage of the scene shown, taken for a presentation; see [`DamageLedger::take`].
     pub(crate) fn take_damage(&mut self) -> Option<Bounds<DevicePixels>> {
         let viewport = size(

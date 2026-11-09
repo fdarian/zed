@@ -266,7 +266,7 @@ impl TestWindow {
         self.0.lock().damage_draws.clone()
     }
 
-    /// How many frames were drawn with `draw`, which a window without native surfaces does.
+    /// How many frames were drawn without composition, which a window without native surfaces does.
     pub fn plain_draw_count(&self) -> usize {
         self.0.lock().plain_draws
     }
@@ -625,7 +625,10 @@ impl PlatformWindow for TestWindow {
     }
 
     fn draw_with_damage(&self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
-        self.0.lock().damage_draws.push(crate::window::DamageDraw::record(scene, damage));
+        let mut state = self.0.lock();
+        state.plain_draws += 1;
+        state.damage_draws.push(crate::window::DamageDraw::record(scene, damage));
+        drop(state);
         self.draw_scene(scene);
     }
 

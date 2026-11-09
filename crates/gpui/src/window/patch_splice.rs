@@ -797,10 +797,8 @@ impl Window {
         }
         frame.hitboxes_changed();
         self.damage.begin(&frame.scene);
-        if self.damage.enabled() {
-            self.damage.add_operations(&frame.scene.paint_operations[paint.start.scene_index..paint.end.scene_index]);
-            self.damage.add_operations(&splice.operations);
-        }
+        self.damage.add_operations(&frame.scene.paint_operations[paint.start.scene_index..paint.end.scene_index]);
+        self.damage.add_operations(&splice.operations);
         match rebuild_scene {
             true => frame.scene.splice_operations(paint.start.scene_index..paint.end.scene_index, splice.operations),
             false => {

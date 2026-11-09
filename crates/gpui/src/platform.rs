@@ -892,10 +892,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
-    /// Like [`PlatformWindow::draw`] for a window that asked to draw only what changed (see
-    /// [`Window::set_partial_redraw`]): `damage` is the part of the window, in device pixels, in which
-    /// `scene` can differ from the scene that was drawn before, and `None` is all of it. A platform
-    /// that cannot draw part of a window draws all of it.
+    /// Like [`PlatformWindow::draw`] for a window that lets the platform draw only what changed
+    /// (every window does, see [`crate::window::damage`]): `damage` is the part of the window, in
+    /// device pixels, in which `scene` can differ from the scene that was drawn before, and `None` is
+    /// all of it. A platform that cannot draw part of a window draws all of it.
     fn draw_with_damage(&self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
         let _ = damage;
         self.draw(scene);
