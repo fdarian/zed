@@ -2248,6 +2248,8 @@ pub struct Window {
     /// Asked at the start of a draw whether the frame is to be preceded by a layout pass: see
     /// [`Window::set_commit_survey`].
     commit_survey: Option<Rc<dyn Fn(&Window) -> bool>>,
+    /// See [`Window::set_frame_steps`].
+    frame_steps: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     /// A layout pass is running, so a view must not read or write the frame caches.
     pub(crate) measuring: bool,
     /// The pass running is one that does not paint: see [`Window::draw_if_dirty`].
@@ -3008,6 +3010,7 @@ impl Window {
             dispatch_serial: 0,
             measured_at: None,
             commit_survey: None,
+            frame_steps: None,
             measuring: false,
             layout_only: false,
             layout_passes: 0,
@@ -5314,10 +5317,23 @@ impl Window {
         self.commit_survey = wants;
     }
 
+    /// Lets the owner of the window run its steps of "update the rendering" before a draw: `steps`
+    /// runs first in every [`Window::draw`], before the commit survey, so what it changes (a scroll
+    /// offset, the tree an event handler edits) is what that draw builds and paints. It does not run
+    /// in a layout pass, nor in a draw nested in another one. None by default.
+    pub fn set_frame_steps(&mut self, steps: Option<Rc<dyn Fn(&mut Window, &mut App)>>) {
+        self.frame_steps = steps;
+    }
+
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        if !draw_in_progress()
+            && let Some(steps) = self.frame_steps.clone()
+        {
+            steps(self, cx);
+        }
         if !draw_in_progress()
             && self.invalidator.is_dirty()
             && self.commit_survey.clone().is_some_and(|wants| wants(self))
