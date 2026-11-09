@@ -415,6 +415,11 @@ impl Window {
         if !(self.frame_holds(id, old_pre, old_paint, &source.hitboxes.hitboxes, &source.tab_stops) && scratch_deferred) {
             return Err(PatchDecline::Splice);
         }
+        // The thumbs are repainted from the plan made before the splice, which cannot write one that goes with the
+        // part: the frame is built whole.
+        if self.rendered_frame.scroll.holds_thumb_in(&(old_paint.start.scene_index..old_paint.end.scene_index)) {
+            return Err(PatchDecline::Splice);
+        }
         let nodes = old_pre.start.dispatch_tree_index..old_pre.end.dispatch_tree_index;
         let nodes_parent = match nodes.is_empty() {
             true => dispatch_parent,

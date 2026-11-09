@@ -629,6 +629,11 @@ impl ScrollFrame {
         }
     }
 
+    /// Whether a thumb is painted by one of the operations in `operations`.
+    pub(crate) fn holds_thumb_in(&self, operations: &Range<usize>) -> bool {
+        self.thumbs.iter().any(|thumb| matches!(thumb.paint, ThumbPaint::Quad { op, .. } if operations.contains(&op)))
+    }
+
     /// Moves the operation of each thumb: `operation` says where the one it has went, and a thumb that
     /// goes nowhere is one that cannot be put elsewhere.
     pub(crate) fn remap_thumbs(&mut self, operation: &mut dyn FnMut(usize) -> Option<usize>) {
@@ -1027,17 +1032,21 @@ impl Window {
         let frame = &self.rendered_frame;
         let mut repaints = ScrollThumbRepaints { writes: Vec::new(), vanishes: false, done: Vec::new() };
         for (index, thumb) in frame.scroll.thumbs.iter().enumerate() {
+            // A thumb that is not one quad that can be written over only fails the plan if it changed:
+            // the frame is built whole as long as one is shown otherwise.
             let (drawn, quad) = match thumb.paint {
-                ThumbPaint::Untracked => return Err(ScrollThumbMiss::Track),
                 ThumbPaint::Nothing => (None, None),
-                ThumbPaint::Quad { op, bounds, opacity } => {
-                    let PaintOperation::Quad(old) = &frame.scene.paint_operations[op] else {
-                        return Err(ScrollThumbMiss::Track);
-                    };
-                    (Some(bounds), Some((op, *old, opacity)))
-                }
+                ThumbPaint::Untracked => (None, None),
+                ThumbPaint::Quad { op, bounds, opacity } => match frame.scene.paint_operations.get(op) {
+                    Some(PaintOperation::Quad(old)) => (Some(bounds), Some((op, *old, opacity))),
+                    _ => (None, None),
+                },
             };
+            let writable = matches!(thumb.paint, ThumbPaint::Nothing) || quad.is_some();
             let Some(repaint) = (thumb.repaint)(self, drawn)? else { continue };
+            if !writable {
+                return Err(ScrollThumbMiss::Track);
+            }
             let Some((_, old, opacity)) = quad else {
                 return Err(ScrollThumbMiss::Appear);
             };
@@ -1055,13 +1064,13 @@ impl Window {
     pub fn repaint_scroll_thumbs(&mut self, repaints: ScrollThumbRepaints, cx: &mut App) {
         let ScrollThumbRepaints { writes, vanishes, done } = repaints;
         if !writes.is_empty() {
+            // `plan_splice` declines a patch that replaces the operation of a thumb, so a thumb here still
+            // has its quad; one that does not is left as it is.
             let edits: Vec<(usize, PaintOperation)> = writes
                 .into_iter()
-                .map(|(index, quad)| {
-                    let ThumbPaint::Quad { op, .. } = self.rendered_frame.scroll.thumbs[index].paint else {
-                        unreachable!("a thumb that is repainted has the quad it painted")
-                    };
-                    (op, PaintOperation::Quad(quad))
+                .filter_map(|(index, quad)| match self.rendered_frame.scroll.thumbs[index].paint {
+                    ThumbPaint::Quad { op, .. } => Some((op, PaintOperation::Quad(quad))),
+                    ThumbPaint::Nothing | ThumbPaint::Untracked => None,
                 })
                 .collect();
             self.patch.counters.thumb_repaints += edits.len() as u64;

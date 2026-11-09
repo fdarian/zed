@@ -1015,6 +1015,21 @@ fn a_thumb_that_is_the_same_writes_nothing_and_tells_no_one(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn a_thumb_that_cannot_be_tracked_and_did_not_change_does_not_fail_the_plan(cx: &mut TestAppContext) {
+    let bar = Bar::new();
+    bar.rotated.set(true);
+    let fixture = Fixture::with_bar(cx, &bar);
+    let before = fixture.with_window(cx, shown);
+    repaint_thumbs(&fixture, cx).unwrap();
+    assert_eq!(fixture.with_window(cx, shown), before);
+    assert_eq!(bar.repainted.get(), 0);
+
+    bar.alpha.set(0.5);
+    assert_eq!(repaint_thumbs(&fixture, cx), Err(ScrollThumbMiss::Track));
+    assert_eq!(bar.repainted.get(), 0);
+}
+
+#[gpui::test]
 fn a_bar_that_says_it_cannot_be_repainted_alone_writes_nothing(cx: &mut TestAppContext) {
     let bar = Bar::new();
     let fixture = Fixture::with_bar(cx, &bar);
