@@ -28,7 +28,7 @@ use crate::{
     scroll_routing, size,
     sticky::{self, StickyInsets},
     tab_stop::PaintedChild,
-    window::{LiftedElement, StateOwner, WindowRegion},
+    window::{StackingLifts, StateOwner, WindowRegion},
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -2005,7 +2005,7 @@ pub fn div() -> Div {
         paint_ranks: None,
         document_order: None,
         stacking_context: false,
-        lifted: Vec::new(),
+        lifted: StackingLifts::default(),
         lifted_children: SmallVec::new(),
         children_lifting: false,
     }
@@ -2023,7 +2023,7 @@ pub struct Div {
     stacking_context: bool,
     /// The positioned descendants this stacking context was handed, in paint order. Set by
     /// prepaint, painted and emptied by paint.
-    lifted: Vec<LiftedElement>,
+    lifted: StackingLifts,
     /// The children that were handed to a stacking context after their prepaint, with the ordinal
     /// the context knows them by. Their place in `children` holds a placeholder.
     lifted_children: SmallVec<[(usize, u32); 2]>,
@@ -2601,10 +2601,7 @@ impl Div {
                     window.with_element_offset(scroll_offset, |window| {
                         sticky::within(scrollport, containing_block, || {
                             let mut prepaint_children_in_context = |window: &mut Window| {
-                                let children_hitboxes_start = window.next_frame.hitboxes.len();
-                                if self.stacking_context {
-                                    window.begin_stacking_context();
-                                }
+                                let context = self.stacking_context.then(|| window.begin_stacking_context());
                                 let lifting = window.lifting();
                                 self.children_lifting = lifting;
                                 if let Some(order_fn) = &self.prepaint_order_fn {
@@ -2648,9 +2645,8 @@ impl Div {
                                         );
                                     }
                                 }
-                                if self.stacking_context {
-                                    self.lifted =
-                                        window.end_stacking_context(children_hitboxes_start);
+                                if let Some(context) = context {
+                                    self.lifted = window.end_stacking_context(context);
                                 }
                             };
                             // A hidden element paints nothing of its own, so nothing is lifted out of
@@ -2742,53 +2738,37 @@ impl Div {
                     }
 
                     let mut lifted = mem::take(&mut self.lifted);
-                    let first_above = lifted.partition_point(|entry| entry.z < 0);
-                    let context_node = window.next_frame.dispatch_tree.active_node_id();
-                    if is_context {
-                        window.begin_lift_paint();
-                    }
-                    for entry in &mut lifted[..first_above] {
-                        window.paint_lifted(entry, context_node.unwrap(), cx);
-                    }
-
-                    let in_flow_start = window.next_frame.tab_stops.paint_index();
-                    // Tab stops register while painting, so they follow the paint order and are
-                    // put back in document order afterwards.
-                    let reorders_tab_stops = paint_order.is_some() || document_order.is_some();
-                    let mut painted = Vec::new();
-                    for position in 0..self.children.len() {
-                        let idx = paint_order.as_ref().map_or(position, |order| order[position]);
-                        let log_start = window.next_frame.tab_stops.paint_index();
-                        let markers_start = window.lift_marker_count();
-                        if let Some((_, ordinal)) = self
-                            .lifted_children
-                            .iter()
-                            .find(|(lifted, _)| *lifted == idx)
-                        {
-                            window.mark_lifted(*ordinal);
-                        } else {
-                            self.children[idx].paint(window, cx);
+                    window.paint_stacking_context(&mut lifted, is_context, cx, |window, cx, in_flow_start| {
+                        // Tab stops register while painting, so they follow the paint order and are
+                        // put back in document order afterwards.
+                        let reorders_tab_stops = paint_order.is_some() || document_order.is_some();
+                        let mut painted = Vec::new();
+                        for position in 0..self.children.len() {
+                            let idx = paint_order.as_ref().map_or(position, |order| order[position]);
+                            let log_start = window.next_frame.tab_stops.paint_index();
+                            let markers_start = window.lift_marker_count();
+                            if let Some((_, ordinal)) = self
+                                .lifted_children
+                                .iter()
+                                .find(|(lifted, _)| *lifted == idx)
+                            {
+                                window.mark_lifted(*ordinal);
+                            } else {
+                                self.children[idx].paint(window, cx);
+                            }
+                            if reorders_tab_stops {
+                                painted.push(PaintedChild {
+                                    document: document_order
+                                        .as_ref()
+                                        .and_then(|positions| positions.get(idx).copied())
+                                        .unwrap_or(idx as u32),
+                                    log: log_start..window.next_frame.tab_stops.paint_index(),
+                                    markers: markers_start..window.lift_marker_count(),
+                                });
+                            }
                         }
-                        if reorders_tab_stops {
-                            painted.push(PaintedChild {
-                                document: document_order
-                                    .as_ref()
-                                    .and_then(|positions| positions.get(idx).copied())
-                                    .unwrap_or(idx as u32),
-                                log: log_start..window.next_frame.tab_stops.paint_index(),
-                                markers: markers_start..window.lift_marker_count(),
-                            });
-                        }
-                    }
-                    window.restore_children_tab_order(in_flow_start, &painted);
-                    let in_flow = in_flow_start..window.next_frame.tab_stops.paint_index();
-
-                    for entry in &mut lifted[first_above..] {
-                        window.paint_lifted(entry, context_node.unwrap(), cx);
-                    }
-                    if is_context {
-                        window.end_lift_paint(in_flow);
-                    }
+                        window.restore_children_tab_order(in_flow_start, &painted);
+                    });
                     if let Some(painter) = overlay_painter {
                         painter(bounds, window, cx);
                     }

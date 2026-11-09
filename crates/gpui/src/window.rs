@@ -1547,6 +1547,24 @@ struct LiftList {
     next_ordinal: u32,
 }
 
+/// The elements a stacking context was handed in prepaint, in paint order: what
+/// [`Window::end_stacking_context`] returns and [`Window::paint_stacking_context`] paints. For an element that is a
+/// stacking context and prepaints its descendants itself.
+#[derive(Default)]
+pub struct StackingLifts(Vec<LiftedElement>);
+
+impl StackingLifts {
+    /// Forgets what was handed over, for an element that is prepainted again.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Where a stacking context started, see [`Window::begin_stacking_context`].
+pub struct StackingContextTicket {
+    children_hitboxes_start: usize,
+}
+
 /// Where an element being lifted started, see [`Window::begin_lift`]. For an element that prepaints its
 /// descendants itself.
 pub struct LiftTicket {
@@ -7196,22 +7214,24 @@ impl Window {
         result
     }
 
-    /// Starts the stacking context whose children are about to be prepainted. Pair with
-    /// [`Window::end_stacking_context`].
-    pub(crate) fn begin_stacking_context(&mut self) {
+    /// Starts the stacking context whose children are about to be prepainted, after the hitbox of the element
+    /// itself is inserted. Pair with [`Window::end_stacking_context`]. For an element that is a stacking context
+    /// and prepaints its descendants itself.
+    pub fn begin_stacking_context(&mut self) -> StackingContextTicket {
         self.invalidator.debug_assert_prepaint();
+        let children_hitboxes_start = self.next_frame.hitboxes.len();
         self.lift_lists.push(Some(LiftList::default()));
+        StackingContextTicket { children_hitboxes_start }
     }
 
     /// Ends the context started last and returns its lifted elements in paint order. Their
     /// hitboxes go where hit testing must find them: those below the in-flow content right
-    /// after `children_hitboxes_start`, the hitboxes of everything the context prepainted, and
-    /// those above it at the end.
-    pub(crate) fn end_stacking_context(
-        &mut self,
-        children_hitboxes_start: usize,
-    ) -> Vec<LiftedElement> {
+    /// after the hitboxes the context had when it began, the hitboxes of everything the context
+    /// prepainted, and those above it at the end. For an element that is a stacking context and
+    /// prepaints its descendants itself.
+    pub fn end_stacking_context(&mut self, ticket: StackingContextTicket) -> StackingLifts {
         self.invalidator.debug_assert_prepaint();
+        let children_hitboxes_start = ticket.children_hitboxes_start;
         let mut entries = match self.lift_lists.pop() {
             Some(Some(list)) => list.entries,
             _ => panic!("end_stacking_context without begin_stacking_context"),
@@ -7228,7 +7248,7 @@ impl Window {
         }
         hitboxes.splice(children_hitboxes_start..children_hitboxes_start, below);
         self.next_frame.hitboxes_changed();
-        entries
+        StackingLifts(entries)
     }
 
     /// Call before prepainting an element whose parent will hand it to the stacking context, so
@@ -7337,6 +7357,40 @@ impl Window {
             .expect("end_lift_paint without begin_lift_paint");
         lifted.in_flow = Some(in_flow);
         self.next_frame.tab_stops.restore_lifted_order(&lifted);
+    }
+
+    /// Paints the content of a stacking context: the elements it was handed with a negative `z-index`, then
+    /// `in_flow` (the in-flow children, with the tab stop position they start at), then the rest. `is_context` is
+    /// whether the element is a stacking context, which also puts the tab stops of the lifted elements where they
+    /// belong; an element that is not one has nothing lifted. For an element that is a stacking context and paints
+    /// its descendants itself.
+    pub fn paint_stacking_context(
+        &mut self,
+        lifts: &mut StackingLifts,
+        is_context: bool,
+        cx: &mut App,
+        in_flow: impl FnOnce(&mut Self, &mut App, usize),
+    ) {
+        let lifted = &mut lifts.0;
+        let first_above = lifted.partition_point(|entry| entry.z < 0);
+        let context_node = self.next_frame.dispatch_tree.active_node_id();
+        if is_context {
+            self.begin_lift_paint();
+        }
+        for entry in &mut lifted[..first_above] {
+            self.paint_lifted(entry, context_node.unwrap(), cx);
+        }
+
+        let in_flow_start = self.next_frame.tab_stops.paint_index();
+        in_flow(self, cx, in_flow_start);
+        let in_flow = in_flow_start..self.next_frame.tab_stops.paint_index();
+
+        for entry in &mut lifted[first_above..] {
+            self.paint_lifted(entry, context_node.unwrap(), cx);
+        }
+        if is_context {
+            self.end_lift_paint(in_flow);
+        }
     }
 
     /// Paints an element that was lifted out of the tree as it would have been painted from its
