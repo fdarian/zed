@@ -329,12 +329,17 @@ pub struct GlobalElementId {
 
 impl GlobalElementId {
     pub(crate) fn new(ids: &[ElementId]) -> Self {
-        let mut hasher = FxHasher::default();
-        ids.hash(&mut hasher);
         Self {
             ids: Arc::from(ids),
-            hash: hasher.finish(),
+            hash: Self::scope_hash_of(ids),
         }
+    }
+
+    /// [`Self::scope_hash`] of the id that `ids` is the path of, without making it.
+    pub(crate) fn scope_hash_of(ids: &[ElementId]) -> u64 {
+        let mut hasher = FxHasher::default();
+        ids.hash(&mut hasher);
+        hasher.finish()
     }
 }
 

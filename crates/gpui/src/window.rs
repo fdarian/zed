@@ -4605,6 +4605,30 @@ impl Window {
         result
     }
 
+    /// [`Self::with_id`], and the layout requests `f` makes are numbered under the scope of the element
+    /// that `element_id` names, as the requests of an element with an id are when it lays out and
+    /// prepaints. The layout engine keeps a node from frame to frame by the scope and the number of its
+    /// request, so a node whose id does not move keeps its node when the nodes around it come and go; an
+    /// element that lays out descendants that have no element of their own calls this for each of them,
+    /// or they take the numbers of their siblings and move onto each other's nodes (scroll anchoring
+    /// follows a node, and a retained node keeps its results).
+    #[inline]
+    pub fn with_layout_scope_of<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.element_id_stack.push(element_id.into());
+        let outer_scope = mem::replace(
+            &mut self.layout_scope,
+            crate::GlobalElementId::scope_hash_of(&self.element_id_stack),
+        );
+        let result = f(self);
+        self.layout_scope = outer_scope;
+        self.element_id_stack.pop();
+        result
+    }
+
     /// Executes the provided function with the specified rem size.
     ///
     /// This method must only be called as part of element drawing.
