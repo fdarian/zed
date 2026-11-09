@@ -1082,6 +1082,17 @@ impl Style {
         self.contain_layout || self.contain_positioned
     }
 
+    /// Lays the box out as `hidden` on each axis in `no_scrollbar` that is `scroll`: an axis that only
+    /// code scrolls reserves no room for a scrollbar.
+    pub fn lay_out_without_scrollbars(&mut self, no_scrollbar: Point<bool>) {
+        if no_scrollbar.x && self.overflow.x == Overflow::Scroll {
+            self.overflow.x = Overflow::Hidden;
+        }
+        if no_scrollbar.y && self.overflow.y == Overflow::Scroll {
+            self.overflow.y = Overflow::Hidden;
+        }
+    }
+
     /// Returns true if the style is visible and the background is opaque.
     pub fn has_opaque_background(&self) -> bool {
         self.background

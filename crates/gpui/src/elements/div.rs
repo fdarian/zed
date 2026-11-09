@@ -2321,12 +2321,7 @@ impl Element for Div {
                 |mut style, window, cx| {
                     // Layout reserves room for a scrollbar on every axis that scrolls, so an axis
                     // without one is laid out as hidden.
-                    if no_scrollbar.x && style.overflow.x == Overflow::Scroll {
-                        style.overflow.x = Overflow::Hidden;
-                    }
-                    if no_scrollbar.y && style.overflow.y == Overflow::Scroll {
-                        style.overflow.y = Overflow::Hidden;
-                    }
+                    style.lay_out_without_scrollbars(no_scrollbar);
                     window.with_text_style(style.text_style().cloned(), |window| {
                         let mut request_children = |window: &mut Window| {
                             self.children
@@ -2486,17 +2481,12 @@ impl Div {
         let content_size = if request_layout.child_layout_ids.is_empty() {
             bounds.size
         } else if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
-            let mut state = scroll_handle.0.borrow_mut();
-            state.child_bounds = Vec::with_capacity(request_layout.child_layout_ids.len());
-            for child_layout_id in &request_layout.child_layout_ids {
-                let child_bounds = window.layout_bounds(*child_layout_id);
-                child_min = child_min.min(&child_bounds.origin);
-                child_max = child_max.max(&child_bounds.bottom_right());
-                state.child_bounds.push(child_bounds);
-            }
-            let child_bounds = state.child_bounds.clone();
-            drop(state);
-            note_scroll_children(scroll_handle, child_bounds, window);
+            (child_min, child_max) = record_child_bounds(
+                scroll_handle,
+                &request_layout.child_layout_ids,
+                bounds.origin,
+                window,
+            );
             (child_max - child_min).into()
         } else {
             for child_layout_id in &request_layout.child_layout_ids {
@@ -2512,23 +2502,17 @@ impl Div {
         };
         // A scroller's range reaches the descendants that overflow its children, not only the
         // children. Elements that do not scroll never read where the content ends.
-        if self.interactivity.scroll_offset.is_some() {
-            child_max = window
-                .layout_scrollable_overflow_end(request_layout.layout_id)
-                .map_or(bounds.origin, |end| end.max(&bounds.origin));
-            self.interactivity.scrollbar_size =
-                window.layout_scrollbar_size(request_layout.layout_id);
+        let measured = self
+            .interactivity
+            .scroll_offset
+            .is_some()
+            .then(|| measure_scroller(request_layout.layout_id, bounds, window));
+        if let Some(measured) = measured {
+            child_max = measured.content_far_corner;
+            self.interactivity.scrollbar_size = measured.scrollbar_size;
         }
         self.interactivity.content_end = Some(child_max - bounds.origin);
-        self.interactivity.scroll_extent = if self.interactivity.scroll_offset.is_some() {
-            Some(ScrollExtent::measure(
-                request_layout.layout_id,
-                self.interactivity.scrollbar_size,
-                window,
-            ))
-        } else {
-            None
-        };
+        self.interactivity.scroll_extent = measured.map(|measured| measured.extent);
 
         if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
             scroll_handle.scroll_to_active_item();
@@ -2924,6 +2908,219 @@ pub(crate) struct ScrollerRecord {
     pub(crate) user_scroll: Point<bool>,
 }
 
+/// What a scroller's prepaint reads to place its content: the clamp of its offset, and what it
+/// tells the handle and the frame about it.
+struct ScrollerInputs<'a> {
+    scroll_offset: &'a Rc<RefCell<Point<Pixels>>>,
+    handle: Option<&'a ScrollHandle>,
+    layout_id: Option<LayoutId>,
+    extent: Option<ScrollExtent>,
+    content_size: Size<Pixels>,
+    scrollbar_size: Size<Pixels>,
+    programmatic_scroll_only: Point<bool>,
+}
+
+/// Clamps the offset of a scroller to its range, lets scroll anchoring step it, records the scroller
+/// for the patches of the frame and updates the handle. Returns where the children sit: the offset
+/// snapped to a device pixel. This is what `Interactivity::clamp_scroll_position` does and what
+/// [`ScrollerFrame::clamp_scroll_position`] hands to an element that is not a `Div`.
+fn clamp_scroll(
+    inputs: ScrollerInputs<'_>,
+    bounds: Bounds<Pixels>,
+    style: &Style,
+    window: &mut Window,
+) -> Point<Pixels> {
+    fn round_to_two_decimals(pixels: Pixels) -> Pixels {
+        const ROUNDING_FACTOR: f32 = 100.0;
+        (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
+    }
+
+    let scroll_offset = inputs.scroll_offset;
+    let mut scroll_to_bottom = false;
+    let mut tracked_scroll_handle = inputs.handle.map(|handle| handle.0.borrow_mut());
+    if let Some(mut scroll_handle_state) = tracked_scroll_handle.as_deref_mut() {
+        scroll_handle_state.overflow = style.overflow;
+        scroll_to_bottom = mem::take(&mut scroll_handle_state.scroll_to_bottom);
+        scroll_handle_state
+            .anchoring
+            .note_offset(*scroll_offset.borrow(), scroll_to_bottom);
+    }
+
+    let rem_size = window.rem_size();
+    let padding = style.padding.to_pixels(bounds.size.into(), rem_size);
+    let border = style.border_widths.to_pixels(rem_size);
+    let user_scroll = point(
+        style.overflow.x == Overflow::Scroll && !inputs.programmatic_scroll_only.x,
+        style.overflow.y == Overflow::Scroll && !inputs.programmatic_scroll_only.y,
+    );
+    let scroll_max = match inputs.extent {
+        Some(extent) => extent.max_offset(window.scale_factor()),
+        // A scroller that is not a `Div` (a list) knows only the size of its content.
+        None => {
+            let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
+            let far_edge: Point<Pixels> = (inputs.content_size + padding_size).into();
+            // The floating point values produced by Taffy and ours often vary
+            // slightly after ~5 decimal places. This can lead to cases where after
+            // subtracting these, the container becomes scrollable for less than
+            // 0.00000x pixels. As we generally don't benefit from a precision that
+            // high for the maximum scroll, we round the scroll max to 2 decimal
+            // places here.
+            (far_edge - Point::from(bounds.size - inputs.scrollbar_size))
+                .map(round_to_two_decimals)
+                .max(&Default::default())
+        }
+    };
+    // Clamp scroll offset in case scroll max is smaller now (e.g., if children
+    // were removed or the bounds became larger).
+    let mut scroll_offset = scroll_offset.borrow_mut();
+
+    scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
+    if scroll_to_bottom {
+        scroll_offset.y = -scroll_max.y;
+    } else {
+        scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
+    }
+
+    if let Some(scroll_handle_state) = tracked_scroll_handle.as_deref_mut()
+        && let (Some(layout_id), Some(extent)) = (inputs.layout_id, inputs.extent)
+    {
+        scroll_handle_state.anchoring.step(
+            &Scroller {
+                layout_id,
+                client: extent.client,
+                max_offset_y: scroll_max.y,
+                enabled: style.overflow_anchor != OverflowAnchor::None,
+            },
+            &mut *scroll_offset,
+            window,
+        );
+    }
+    if let (Some(layout_id), Some(extent)) = (inputs.layout_id, inputs.extent) {
+        window.record_scroller(ScrollerRecord {
+            layout_id,
+            extent,
+            offset: inputs.scroll_offset.clone(),
+            handle: inputs.handle.cloned(),
+            user_scroll,
+        });
+    }
+    if let Some(mut scroll_handle_state) = tracked_scroll_handle {
+        scroll_handle_state.max_offset = scroll_max;
+        scroll_handle_state.scale_factor = Some(window.scale_factor());
+        scroll_handle_state.bounds = bounds;
+        scroll_handle_state.user_scroll = user_scroll;
+        scroll_handle_state.scrollbar_size = inputs.scrollbar_size;
+        scroll_handle_state.padding_box = Bounds::new(
+            point(bounds.origin.x + border.left, bounds.origin.y + border.top),
+            size(
+                bounds.size.width - border.left - border.right - inputs.scrollbar_size.width,
+                bounds.size.height - border.top - border.bottom - inputs.scrollbar_size.height,
+            ),
+        );
+    }
+    if let Some(handle) = inputs.handle {
+        note_scroll_bounds(handle, window);
+    }
+
+    // A scroller that is scrolled puts its children where its own offset says, which the
+    // subtree around it cannot move.
+    if !scroll_offset.is_zero() {
+        window.note_nested_scroll();
+    }
+    // The children sit where the position that reads back puts them. A wheel or a trackpad
+    // leaves the offset between device pixels, which `pixel_snap` would round toward zero.
+    snap_scroll_offset(*scroll_offset, window.scale_factor())
+}
+
+/// Records the boxes of the children of a scroller in its handle, and returns the near and far
+/// corners of the boxes, the far one at least `origin`.
+fn record_child_bounds(
+    handle: &ScrollHandle,
+    child_layout_ids: &[LayoutId],
+    origin: Point<Pixels>,
+    window: &mut Window,
+) -> (Point<Pixels>, Point<Pixels>) {
+    let mut child_min = point(Pixels::MAX, Pixels::MAX);
+    let mut child_max = origin;
+    let mut state = handle.0.borrow_mut();
+    state.child_bounds = Vec::with_capacity(child_layout_ids.len());
+    for child_layout_id in child_layout_ids {
+        let child_bounds = window.layout_bounds(*child_layout_id);
+        child_min = child_min.min(&child_bounds.origin);
+        child_max = child_max.max(&child_bounds.bottom_right());
+        state.child_bounds.push(child_bounds);
+    }
+    let child_bounds = state.child_bounds.clone();
+    drop(state);
+    note_scroll_children(handle, child_bounds, window);
+    (child_min, child_max)
+}
+
+/// What a scroller reads of its layout in prepaint.
+#[derive(Clone, Copy)]
+struct ScrollerMeasure {
+    /// Where the scrollable overflow ends (see `Interactivity::content_end`), at least the origin of the box.
+    content_far_corner: Point<Pixels>,
+    scrollbar_size: Size<Pixels>,
+    extent: ScrollExtent,
+}
+
+fn measure_scroller(layout_id: LayoutId, bounds: Bounds<Pixels>, window: &mut Window) -> ScrollerMeasure {
+    // A scroller's range reaches the descendants that overflow its children, not only the
+    // children. Elements that do not scroll never read where the content ends.
+    let content_far_corner = window
+        .layout_scrollable_overflow_end(layout_id)
+        .map_or(bounds.origin, |end| end.max(&bounds.origin));
+    let scrollbar_size = window.layout_scrollbar_size(layout_id);
+    ScrollerMeasure {
+        content_far_corner,
+        scrollbar_size,
+        extent: ScrollExtent::measure(layout_id, scrollbar_size, window),
+    }
+}
+
+/// What the prepaint of a scroller measured of its layout: [`ScrollHandle::begin_scroller_prepaint`]
+/// makes it, and [`ScrollerFrame::clamp_scroll_position`] places the children with it.
+pub struct ScrollerFrame {
+    layout_id: LayoutId,
+    bounds: Bounds<Pixels>,
+    content_size: Size<Pixels>,
+    measured: ScrollerMeasure,
+}
+
+impl ScrollerFrame {
+    /// Clamps the scroll offset of `handle` to the range of the scroller, lets scroll anchoring move it, and
+    /// publishes the range, the box and the scrollport to the handle and the offset to the patches of the frame.
+    /// Returns the offset to put the children at (see [`Window::with_element_offset`]). `style` is the style of the
+    /// box as it is painted, and `programmatic_scroll_only` which axes only code scrolls.
+    ///
+    /// This is what a `Div` that tracks `handle` does where it prepaints its children, for an element that lays
+    /// out its descendants itself.
+    pub fn clamp_scroll_position(
+        &self,
+        handle: &ScrollHandle,
+        style: &Style,
+        programmatic_scroll_only: Point<bool>,
+        window: &mut Window,
+    ) -> Point<Pixels> {
+        let offset = handle.0.borrow().offset.clone();
+        clamp_scroll(
+            ScrollerInputs {
+                scroll_offset: &offset,
+                handle: Some(handle),
+                layout_id: Some(self.layout_id),
+                extent: Some(self.measured.extent),
+                content_size: self.content_size,
+                scrollbar_size: self.measured.scrollbar_size,
+                programmatic_scroll_only,
+            },
+            self.bounds,
+            style,
+            window,
+        )
+    }
+}
+
 /// The interactivity struct. Powers all of the general-purpose
 /// interactivity in the `Div` element.
 #[derive(Default)]
@@ -3142,9 +3339,7 @@ impl Interactivity {
                 );
                 let layout_id = f(style, window, cx);
                 if let Some((handle, enabled)) = anchoring {
-                    window
-                        .layout_engine_mut()
-                        .note_anchor_scroller(layout_id, enabled, handle);
+                    handle.note_scroller_layout(layout_id, enabled, window);
                 }
                 self.layout_id = Some(layout_id);
                 (layout_id, element_state)
@@ -3526,117 +3721,22 @@ impl Interactivity {
         window: &mut Window,
         _cx: &mut App,
     ) -> Point<Pixels> {
-        fn round_to_two_decimals(pixels: Pixels) -> Pixels {
-            const ROUNDING_FACTOR: f32 = 100.0;
-            (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
-        }
-
-        if let Some(scroll_offset) = self.scroll_offset.as_ref() {
-            let mut scroll_to_bottom = false;
-            let mut tracked_scroll_handle = self
-                .tracked_scroll_handle
-                .as_ref()
-                .map(|handle| handle.0.borrow_mut());
-            if let Some(mut scroll_handle_state) = tracked_scroll_handle.as_deref_mut() {
-                scroll_handle_state.overflow = style.overflow;
-                scroll_to_bottom = mem::take(&mut scroll_handle_state.scroll_to_bottom);
-                scroll_handle_state
-                    .anchoring
-                    .note_offset(*scroll_offset.borrow(), scroll_to_bottom);
-            }
-
-            let rem_size = window.rem_size();
-            let padding = style.padding.to_pixels(bounds.size.into(), rem_size);
-            let border = style.border_widths.to_pixels(rem_size);
-            let user_scroll = point(
-                style.overflow.x == Overflow::Scroll && !self.programmatic_scroll_only.x,
-                style.overflow.y == Overflow::Scroll && !self.programmatic_scroll_only.y,
-            );
-            let scroll_max = match self.scroll_extent {
-                Some(extent) => extent.max_offset(window.scale_factor()),
-                // A scroller that is not a `Div` (a list) knows only the size of its content.
-                None => {
-                    let padding_size =
-                        size(padding.left + padding.right, padding.top + padding.bottom);
-                    let far_edge: Point<Pixels> = (self.content_size + padding_size).into();
-                    // The floating point values produced by Taffy and ours often vary
-                    // slightly after ~5 decimal places. This can lead to cases where after
-                    // subtracting these, the container becomes scrollable for less than
-                    // 0.00000x pixels. As we generally don't benefit from a precision that
-                    // high for the maximum scroll, we round the scroll max to 2 decimal
-                    // places here.
-                    (far_edge - Point::from(bounds.size - self.scrollbar_size))
-                        .map(round_to_two_decimals)
-                        .max(&Default::default())
-                }
-            };
-            // Clamp scroll offset in case scroll max is smaller now (e.g., if children
-            // were removed or the bounds became larger).
-            let mut scroll_offset = scroll_offset.borrow_mut();
-
-            scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
-            if scroll_to_bottom {
-                scroll_offset.y = -scroll_max.y;
-            } else {
-                scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
-            }
-
-            if let Some(scroll_handle_state) = tracked_scroll_handle.as_deref_mut()
-                && let (Some(layout_id), Some(extent)) = (self.layout_id, self.scroll_extent)
-            {
-                scroll_handle_state.anchoring.step(
-                    &Scroller {
-                        layout_id,
-                        client: extent.client,
-                        max_offset_y: scroll_max.y,
-                        enabled: style.overflow_anchor != OverflowAnchor::None,
-                    },
-                    &mut *scroll_offset,
-                    window,
-                );
-            }
-            if let (Some(layout_id), Some(extent), Some(offset)) =
-                (self.layout_id, self.scroll_extent, self.scroll_offset.clone())
-            {
-                window.record_scroller(ScrollerRecord {
-                    layout_id,
-                    extent,
-                    offset,
-                    handle: self.tracked_scroll_handle.clone(),
-                    user_scroll,
-                });
-            }
-            if let Some(mut scroll_handle_state) = tracked_scroll_handle {
-                scroll_handle_state.max_offset = scroll_max;
-                scroll_handle_state.scale_factor = Some(window.scale_factor());
-                scroll_handle_state.bounds = bounds;
-                scroll_handle_state.user_scroll = user_scroll;
-                scroll_handle_state.scrollbar_size = self.scrollbar_size;
-                scroll_handle_state.padding_box = Bounds::new(
-                    point(bounds.origin.x + border.left, bounds.origin.y + border.top),
-                    size(
-                        bounds.size.width - border.left - border.right - self.scrollbar_size.width,
-                        bounds.size.height
-                            - border.top
-                            - border.bottom
-                            - self.scrollbar_size.height,
-                    ),
-                );
-            }
-            if let Some(handle) = self.tracked_scroll_handle.as_ref() {
-                note_scroll_bounds(handle, window);
-            }
-
-            // A scroller that is scrolled puts its children where its own offset says, which the
-            // subtree around it cannot move.
-            if !scroll_offset.is_zero() {
-                window.note_nested_scroll();
-            }
-            // The children sit where the position that reads back puts them. A wheel or a trackpad
-            // leaves the offset between device pixels, which `pixel_snap` would round toward zero.
-            snap_scroll_offset(*scroll_offset, window.scale_factor())
-        } else {
-            Point::default()
+        match self.scroll_offset.as_ref() {
+            Some(scroll_offset) => clamp_scroll(
+                ScrollerInputs {
+                    scroll_offset,
+                    handle: self.tracked_scroll_handle.as_ref(),
+                    layout_id: self.layout_id,
+                    extent: self.scroll_extent,
+                    content_size: self.content_size,
+                    scrollbar_size: self.scrollbar_size,
+                    programmatic_scroll_only: self.programmatic_scroll_only,
+                },
+                bounds,
+                style,
+                window,
+            ),
+            None => Point::default(),
         }
     }
 
@@ -5607,6 +5707,41 @@ impl ScrollHandle {
         state
             .anchoring
             .before_layout(engine, layout_id, enabled, offset, jumped, scale_factor);
+    }
+
+    /// Tells layout that the scroller `layout_id`, requested for an element that tracks this handle, may
+    /// anchor its scroll position (`overflow-anchor`: `enabled`). A `Div` does it when it lays out; so must
+    /// an element that lays out its descendants itself and is a scroll container.
+    pub fn note_scroller_layout(&self, layout_id: LayoutId, enabled: bool, window: &mut Window) {
+        window
+            .layout_engine_mut()
+            .note_anchor_scroller(layout_id, enabled, self.clone());
+    }
+
+    /// The prepaint of a scroller that tracks this handle, before its children are prepainted: the boxes of its
+    /// children `child_layout_ids` go to the handle, and the range of the content and the scrollport are read from
+    /// the layout of `layout_id`, whose box is `bounds`. Hand the frame to [`ScrollerFrame::clamp_scroll_position`].
+    pub fn begin_scroller_prepaint(
+        &self,
+        layout_id: LayoutId,
+        bounds: Bounds<Pixels>,
+        child_layout_ids: &[LayoutId],
+        window: &mut Window,
+    ) -> ScrollerFrame {
+        let content_size = if child_layout_ids.is_empty() {
+            bounds.size
+        } else {
+            let (child_min, child_max) = record_child_bounds(self, child_layout_ids, bounds.origin, window);
+            (child_max - child_min).into()
+        };
+        let measured = measure_scroller(layout_id, bounds, window);
+        self.scroll_to_active_item();
+        ScrollerFrame {
+            layout_id,
+            bounds,
+            content_size,
+            measured,
+        }
     }
 
     /// Construct a new scroll handle.
