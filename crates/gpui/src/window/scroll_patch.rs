@@ -1066,6 +1066,12 @@ impl Window {
                 .collect();
             self.patch.counters.thumb_repaints += edits.len() as u64;
             let scene = &mut self.rendered_frame.scene;
+            self.damage.begin(scene);
+            if self.damage.enabled() {
+                for (op, new) in &edits {
+                    self.damage.add_change(&scene.paint_operations[*op], new);
+                }
+            }
             let mut written = 0;
             if scene.patch_in_place(edits.iter().map(|(op, new)| (*op, new)), &mut written) {
                 self.patch.counters.in_place_primitives += written;
@@ -1080,6 +1086,7 @@ impl Window {
                     self.patch.counters.scene_rebuilds += 1;
                 }
             }
+            self.damage.end(scene);
             self.patch.thumb_vanished |= vanishes;
             let vanished = self.patch.thumb_vanished;
             if let Some(trace) = &mut self.patch.trace {
@@ -1955,11 +1962,14 @@ impl Window {
     ) {
         let scale_factor = self.scale_factor;
         let mut roots = Vec::with_capacity(moves.len());
+        self.damage.begin(&self.rendered_frame.scene);
         for movement in moves {
             let frame = &mut self.rendered_frame;
             let run = &mut frame.scroll.runs[movement.run];
+            self.damage.add_operations(&frame.scene.paint_operations[run.ops.clone()]);
             TranslatedOperations::new(&movement.source.operations, movement.total.scale(scale_factor), &movement.clip)
                 .overwrite(&mut frame.scene.paint_operations[run.ops.clone()]);
+            self.damage.add_operations(&frame.scene.paint_operations[run.ops.clone()]);
             let recorded = movement.source.hitboxes.hitboxes.iter();
             for (slot, recorded) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(recorded) {
                 let mut moved = recorded.relocated(movement.total, &run.ambient);
@@ -2020,12 +2030,15 @@ impl Window {
                     unreachable!("a thumb that moves has the quad it painted")
                 };
                 thumb.paint = ThumbPaint::Quad { op, bounds, opacity };
-                self.rendered_frame.scene.paint_operations[op] = PaintOperation::Quad(quad);
+                let written = PaintOperation::Quad(quad);
+                self.damage.add_change(&self.rendered_frame.scene.paint_operations[op], &written);
+                self.rendered_frame.scene.paint_operations[op] = written;
             }
             bars.push(thumb.moved.clone());
         }
         let frame = &mut self.rendered_frame;
         frame.scene.rebuild_moved();
+        self.damage.end(&frame.scene);
         frame.hitboxes_changed();
         if let Some(list) = frame.scroll.lists.iter_mut().find(|list| list.id == prediction.list) {
             list.scrolled = prediction.scrolled;

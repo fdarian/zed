@@ -8,7 +8,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, MAX_GROUP_EXTENT,
-    MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point, PrimitiveBatch,
+    MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point, PrimitiveBatch, Quad,
     ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size, TransformationMatrix,
     filter_margin, point, size,
 };
@@ -145,6 +145,25 @@ pub struct MetalRenderer {
     /// How many frames `draw_orders` took a drawable for, for tests.
     #[cfg(any(test, feature = "test-support"))]
     drawn_frames: usize,
+    partial: PartialRedraw,
+}
+
+/// What [`MetalRenderer::draw_with_damage`] keeps between frames, so that a frame that changes part
+/// of the window draws that part: the picture is a texture of its own, and the drawable gets a copy
+/// of it, since which drawable a frame gets is not the one the picture was drawn on.
+#[derive(Default)]
+struct PartialRedraw {
+    /// The picture of the last scene drawn, as large as the window.
+    target: Option<metal::Texture>,
+    /// Whether `target` holds the picture of the scene drawn last. A frame that did not go through it
+    /// (a whole draw, one that failed) leaves it stale.
+    valid: bool,
+    /// While a damaged frame is encoded: the scissor, as x, y, width and height, of every pass that
+    /// draws into the target.
+    scissor: Cell<Option<[u64; 4]>>,
+    /// Whether the first pass of the damaged frame has yet to paint the scissor over, which a pass
+    /// that loads what the target holds cannot clear.
+    clear_pending: Cell<bool>,
 }
 
 #[repr(C)]
@@ -262,6 +281,7 @@ impl MetalRenderer {
             headless_render_target: None,
             #[cfg(any(test, feature = "test-support"))]
             drawn_frames: 0,
+            partial: PartialRedraw::default(),
         }
     }
 
@@ -355,6 +375,31 @@ impl MetalRenderer {
 
     /// Draws the primitives and groups of `scene` whose order is in `orders`, clearing the rest.
     pub fn draw_orders(&mut self, scene: &Scene, orders: OrderRange) {
+        // The picture is not the persistent target's now.
+        self.partial.valid = false;
+        self.draw_frame(scene, orders, None);
+    }
+
+    /// Draws `scene`, which differs from the scene drawn before only inside `damage` (`None`: anywhere):
+    /// the picture is kept in a texture of its own, a damaged frame draws only the damaged part of it
+    /// and every frame copies it to the drawable. The scene must not have an effect group, a native
+    /// surface or a surface, and the window must be opaque; a scene that does is drawn whole.
+    pub fn draw_with_damage(&mut self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
+        let drawn_whole = !self.opaque || !scene.groups.is_empty() || !scene.surfaces.is_empty();
+        if drawn_whole {
+            self.draw_orders(scene, OrderRange::ALL);
+        } else {
+            self.draw_frame(scene, OrderRange::ALL, Some(damage));
+        }
+    }
+
+    /// `damage` is `Some` for a frame that goes through the persistent target.
+    fn draw_frame(
+        &mut self,
+        scene: &Scene,
+        orders: OrderRange,
+        damage: Option<Option<Bounds<DevicePixels>>>,
+    ) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
@@ -370,9 +415,11 @@ impl MetalRenderer {
             (viewport_size.height.ceil() as i32).into(),
         );
         let stats = render_stats_enabled().then(std::time::Instant::now);
+        let gpu_log_started = gpui::frame_kind::enabled().then(std::time::Instant::now);
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
+            self.partial.valid = false;
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
@@ -392,9 +439,10 @@ impl MetalRenderer {
         });
 
         let command_buffer =
-            match self.render_frame_in(scene, orders, drawable.texture(), viewport_size) {
+            match self.render_frame_in(scene, orders, drawable.texture(), viewport_size, damage) {
                 Ok(command_buffer) => command_buffer,
                 Err(error) => {
+                    self.partial.valid = false;
                     log::error!("failed to render: {error:#}");
                     return;
                 }
@@ -409,6 +457,23 @@ impl MetalRenderer {
         });
 
         log_presented_time(&drawable);
+        if let Some(started) = gpu_log_started {
+            let label = match damage {
+                None => "damage=off".to_string(),
+                Some(None) => "damage=full".to_string(),
+                Some(Some(area)) => format!(
+                    "damage={}x{}+{}+{}",
+                    area.size.width.0, area.size.height.0, area.origin.x.0, area.origin.y.0
+                ),
+            };
+            log_gpu_time(
+                &command_buffer,
+                gpui::frame_kind::kind(),
+                viewport_size,
+                started.elapsed().as_secs_f64() * 1e3,
+                &label,
+            );
+        }
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
@@ -436,7 +501,7 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
-        self.render_frame_in(scene, OrderRange::ALL, texture, viewport_size)
+        self.render_frame_in(scene, OrderRange::ALL, texture, viewport_size, None)
     }
 
     fn render_frame_in(
@@ -445,14 +510,21 @@ impl MetalRenderer {
         orders: OrderRange,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        damage: Option<Option<Bounds<DevicePixels>>>,
     ) -> Result<metal::CommandBuffer> {
         let mut writer = InstanceBufferWriter::new(
             &self.device,
             &self.instance_buffer_pool,
             self.shared.is_unified_memory,
         );
-        let command_buffer =
-            self.draw_primitives_to_texture(scene, orders, &mut writer, texture, viewport_size);
+        let command_buffer = match damage {
+            None => {
+                self.draw_primitives_to_texture(scene, orders, &mut writer, texture, viewport_size)
+            }
+            Some(damage) => {
+                self.draw_through_target(scene, damage, &mut writer, texture, viewport_size)
+            }
+        };
         self.texture_pool.end_frame();
         let command_buffer = command_buffer?;
 
@@ -499,6 +571,71 @@ impl MetalRenderer {
         read_texture_to_image(drawable.texture())
     }
 
+    /// The picture of the persistent target, which frames drawn with damage keep (`None` if they
+    /// keep none, or the last frame left it stale).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shown_picture(&mut self) -> Result<Option<RgbaImage>> {
+        let Some(target) = self.partial.target.as_ref().filter(|_| self.partial.valid) else {
+            return Ok(None);
+        };
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(target.width());
+        descriptor.set_height(target.height());
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        let readable = self.device.new_texture(&descriptor);
+        let command_buffer = self.shared.command_queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            target,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize {
+                width: target.width(),
+                height: target.height(),
+                depth: 1,
+            },
+            &readable,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        read_texture_to_image(&readable).map(Some)
+    }
+
+    /// Draws `scene` as [`MetalRenderer::draw_with_damage`] does (through the persistent target, in part
+    /// when `damage` is given and the target holds the frame before) onto a texture of its own, and
+    /// returns what that holds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_scene_partial_to_image(
+        &mut self,
+        scene: &Scene,
+        damage: Option<Bounds<DevicePixels>>,
+        size: Size<DevicePixels>,
+    ) -> Result<RgbaImage> {
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.0 as u64);
+        texture_descriptor.set_height(size.height.0 as u64);
+        texture_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+        let destination = self.device.new_texture(&texture_descriptor);
+        let command_buffer = self.render_frame_in(scene, OrderRange::ALL, &destination, size, Some(damage))?;
+        if !self.shared.is_unified_memory {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.synchronize_resource(&destination);
+            blit.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        read_texture_to_image(&destination)
+    }
+
     /// Renders a scene to an image without requiring a window or CAMetalLayer.
     ///
     /// This is the primary method for headless rendering. It creates an offscreen
@@ -538,7 +675,7 @@ impl MetalRenderer {
         texture_descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
         let target_texture = self.device.new_texture(&texture_descriptor);
 
-        let command_buffer = self.render_frame_in(scene, orders, &target_texture, size)?;
+        let command_buffer = self.render_frame_in(scene, orders, &target_texture, size, None)?;
 
         // On discrete GPUs (non-unified memory), Managed textures require an
         // explicit blit synchronize before the CPU can read back the rendered
@@ -596,6 +733,135 @@ impl MetalRenderer {
         // the CPU doesn't block on the GPU.
         command_buffer.commit();
         Ok(())
+    }
+
+    /// Opens a pass that draws into the target of the frame being encoded. In a damaged frame the
+    /// pass keeps what the target holds and draws only inside the scissor, and the first of them
+    /// paints the scissor black first: what the scene paints there is all of what shows, as after a
+    /// clear.
+    fn open_target_encoder<'a>(
+        &self,
+        command_buffer: &'a metal::CommandBufferRef,
+        texture: &'a metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        clear_color: Option<metal::MTLClearColor>,
+        writer: &mut InstanceBufferWriter,
+    ) -> Result<&'a metal::RenderCommandEncoderRef> {
+        let encoder =
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color);
+        if self.group_depth.get() != 0 {
+            return Ok(encoder);
+        }
+        let Some([x, y, width, height]) = self.partial.scissor.get() else {
+            return Ok(encoder);
+        };
+        encoder.set_scissor_rect(metal::MTLScissorRect {
+            x,
+            y,
+            width,
+            height,
+        });
+        if self.partial.clear_pending.replace(false) {
+            let area = Bounds {
+                origin: point(ScaledPixels(x as f32), ScaledPixels(y as f32)),
+                size: size(ScaledPixels(width as f32), ScaledPixels(height as f32)),
+            };
+            let black = Quad {
+                bounds: area,
+                content_mask: ContentMask {
+                    bounds: area,
+                    corner_radii: gpui::Corners::default(),
+                    corner_radii_y: gpui::Corners::default(),
+                },
+                background: gpui::black().into(),
+                ..Quad::default()
+            };
+            let binding = writer.write(&[black])?;
+            self.draw_quad_instances(&binding, 0..1, viewport_size, encoder);
+        }
+        Ok(encoder)
+    }
+
+    /// Draws `scene` into the persistent target and copies that to `texture`. With `damage` (the part
+    /// of the scene that differs from the picture the target holds) only that part is drawn.
+    fn draw_through_target(
+        &mut self,
+        scene: &Scene,
+        damage: Option<Bounds<DevicePixels>>,
+        writer: &mut InstanceBufferWriter,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<metal::CommandBuffer> {
+        let command_queue = self.shared.command_queue.clone();
+        let command_buffer = command_queue.new_command_buffer();
+        self.update_path_intermediate_textures(viewport_size);
+        let path_intermediate = self.shared.path_intermediate();
+        let (width, height) = (viewport_size.width.0 as u64, viewport_size.height.0 as u64);
+        let target = match self.partial.target.take() {
+            Some(target) if target.width() == width && target.height() == height => target,
+            _ => {
+                self.partial.valid = false;
+                let descriptor = metal::TextureDescriptor::new();
+                descriptor.set_width(width);
+                descriptor.set_height(height);
+                descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                descriptor.set_usage(
+                    metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+                );
+                self.device.new_texture(&descriptor)
+            }
+        };
+        let scissor = damage.filter(|_| self.partial.valid).map(|damage| {
+            let left = damage.origin.x.0.clamp(0, viewport_size.width.0);
+            let top = damage.origin.y.0.clamp(0, viewport_size.height.0);
+            let right = (damage.origin.x.0 + damage.size.width.0).clamp(left, viewport_size.width.0);
+            let bottom =
+                (damage.origin.y.0 + damage.size.height.0).clamp(top, viewport_size.height.0);
+            [left as u64, top as u64, (right - left) as u64, (bottom - top) as u64]
+        });
+        // Until the frame is encoded the target holds neither the picture before nor the one after.
+        self.partial.valid = false;
+        match scissor {
+            Some([_, _, 0, _] | [_, _, _, 0]) => {}
+            Some(rect) => {
+                self.partial.scissor.set(Some(rect));
+                self.partial.clear_pending.set(true);
+                let encoded = self.encode_scene(
+                    scene,
+                    OrderRange::ALL,
+                    command_buffer,
+                    &target,
+                    viewport_size,
+                    None,
+                    writer,
+                    path_intermediate,
+                    false,
+                );
+                self.partial.scissor.set(None);
+                self.partial.clear_pending.set(false);
+                encoded?;
+            }
+            None => {
+                let clear_color = metal::MTLClearColor::new(0., 0., 0., 1.);
+                self.encode_scene(
+                    scene,
+                    OrderRange::ALL,
+                    command_buffer,
+                    &target,
+                    viewport_size,
+                    Some(clear_color),
+                    writer,
+                    path_intermediate,
+                    false,
+                )?;
+            }
+        }
+        self.copy_pass(command_buffer, &target, texture);
+        self.partial.target = Some(target);
+        self.partial.valid = true;
+        self.shared.sprite_atlas.track_submission(command_buffer);
+        Ok(command_buffer.to_owned())
     }
 
     fn draw_primitives_to_texture(
@@ -700,7 +966,7 @@ impl MetalRenderer {
     ) -> Result<()> {
         // Nothing to draw, which an overlay above a native surface often is: clear and be done.
         if scene.batches_in(orders).next().is_none() {
-            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color)
+            self.open_target_encoder(command_buffer, texture, viewport_size, clear_color, writer)?
                 .end_encoding();
             return Ok(());
         }
@@ -722,8 +988,13 @@ impl MetalRenderer {
         let mut groups = GroupQueue::new(scene.groups.len(), group_indices(scene, orders));
         self.prepare_groups(scene, &mut groups, command_buffer, writer)?;
 
-        let mut command_encoder =
-            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color);
+        let mut command_encoder = self.open_target_encoder(
+            command_buffer,
+            texture,
+            viewport_size,
+            clear_color,
+            writer,
+        )?;
 
         for batch in scene.batches_in(orders) {
             match batch {
@@ -748,12 +1019,13 @@ impl MetalRenderer {
                         command_buffer,
                     )?;
 
-                    command_encoder = new_command_encoder_for_texture(
+                    command_encoder = self.open_target_encoder(
                         command_buffer,
                         texture,
                         viewport_size,
                         None,
-                    );
+                        writer,
+                    )?;
 
                     if did_draw {
                         if let Err(error) = self.draw_paths_from_intermediate(
@@ -799,12 +1071,13 @@ impl MetalRenderer {
                         if groups.is_waiting(index) {
                             command_encoder.end_encoding();
                             self.prepare_groups(scene, &mut groups, command_buffer, writer)?;
-                            command_encoder = new_command_encoder_for_texture(
+                            command_encoder = self.open_target_encoder(
                                 command_buffer,
                                 texture,
                                 viewport_size,
                                 None,
-                            );
+                                writer,
+                            )?;
                         }
                         let group = &scene.groups[index];
                         let prepared = groups.take(index);
@@ -820,12 +1093,13 @@ impl MetalRenderer {
                                 texture,
                                 viewport_size,
                             );
-                            command_encoder = new_command_encoder_for_texture(
+                            command_encoder = self.open_target_encoder(
                                 command_buffer,
                                 texture,
                                 viewport_size,
                                 None,
-                            );
+                                writer,
+                            )?;
                             if let Err(error) = result {
                                 command_encoder.end_encoding();
                                 return Err(error);
@@ -3219,6 +3493,54 @@ pub fn render_stats_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("GPUIX_RENDER_STATS").is_some())
 }
 
+/// Debug only: when `GPUI_GPU_TIMES` names a file, appends one line per presented frame when the GPU
+/// is done with it: the frame's kind (`gpui::frame_kind`), the drawable's size, the CPU time that
+/// encoded and committed it, the GPU's busy time (`GPUEndTime - GPUStartTime`) and the GPU's start
+/// time on the `mach_absolute_time` clock in seconds, which is what a phase timeline can be cut by.
+fn log_gpu_time(
+    command_buffer: &metal::CommandBufferRef,
+    kind: &'static str,
+    viewport_size: Size<DevicePixels>,
+    encode_ms: f64,
+    damage: &str,
+) {
+    use std::io::Write as _;
+    use std::sync::OnceLock;
+
+    static LOG: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    let Some(log) = LOG
+        .get_or_init(|| {
+            let path = std::env::var_os("GPUI_GPU_TIMES")?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(std::sync::Mutex::new(file))
+        })
+        .as_ref()
+    else {
+        return;
+    };
+    let damage = damage.to_owned();
+    let handler = ConcreteBlock::new(move |finished: &metal::CommandBufferRef| {
+        let gpu_start: f64 = unsafe { msg_send![finished, GPUStartTime] };
+        let gpu_end: f64 = unsafe { msg_send![finished, GPUEndTime] };
+        if let Ok(mut file) = log.lock() {
+            writeln!(
+                file,
+                "{gpu_start:.6} {kind} {}x{} encode_ms={encode_ms:.3} gpu_ms={:.3} {damage}",
+                viewport_size.width.0,
+                viewport_size.height.0,
+                (gpu_end - gpu_start) * 1e3,
+            )
+            .ok();
+        }
+    });
+    let handler = handler.copy();
+    command_buffer.add_completed_handler(&handler);
+}
+
 /// Debug only: when `GPUIX_PRESENT_LOG` names a file, appends the
 /// `MTLDrawable.presentedTime` (seconds, CACurrentMediaTime clock) of every
 /// frame that reaches the screen, one per line. Off unless the variable is set.
@@ -3307,6 +3629,99 @@ mod tests {
             border_widths: Edges::all(ScaledPixels(border_width)),
             ..Quad::default()
         }
+    }
+
+    fn translucent(bounds: Bounds<ScaledPixels>, color: Hsla, radius: f32) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask {
+                bounds: full_bounds(),
+                corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
+            },
+            background: color.into(),
+            corner_radii: Corners::all(ScaledPixels(radius)),
+            ..Quad::default()
+        }
+    }
+
+    fn area(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn damage(x: i32, y: i32, width: i32, height: i32) -> Option<Bounds<DevicePixels>> {
+        Some(Bounds {
+            origin: point(DevicePixels(x), DevicePixels(y)),
+            size: size(DevicePixels(width), DevicePixels(height)),
+        })
+    }
+
+    fn scene_of(quads: &[Quad]) -> Scene {
+        let mut scene = Scene::default();
+        for quad in quads {
+            scene.insert_primitive(*quad);
+        }
+        scene.finish();
+        scene
+    }
+
+    /// A background and quads over it: the one that changes between the frames, translucent ones over and
+    /// under it, and one that is only in some frames.
+    fn frame(red_at: f32, green_alpha: f32, with_extra: bool) -> Scene {
+        let mut quads = vec![
+            translucent(full_bounds(), gpui::hsla(0.6, 0.5, 0.4, 1.), 0.),
+            translucent(area(4., 4., 30., 30.), gpui::hsla(0.3, 1., 0.5, green_alpha), 6.),
+            translucent(area(red_at, 10., 14., 14.), gpui::hsla(0., 1., 0.5, 0.7), 4.),
+            translucent(area(20., 20., 18., 18.), gpui::hsla(0.8, 1., 0.5, 0.5), 0.),
+        ];
+        if with_extra {
+            quads.push(translucent(area(8., 30., 12., 8.), gpui::hsla(0.1, 1., 0.5, 0.6), 2.));
+        }
+        scene_of(&quads)
+    }
+
+    #[test]
+    fn frames_drawn_in_part_are_the_pictures_of_frames_drawn_whole() {
+        let window = size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32));
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        // What changes between a frame and the next, and the damage that says so.
+        let frames: [(Scene, Option<Bounds<DevicePixels>>); 7] = [
+            (frame(6., 0.5, false), None),
+            // The red quad moves: where it was and where it is.
+            (frame(12., 0.5, false), damage(5, 9, 24, 16)),
+            // The green one fades, and what is under and over it is drawn again with it.
+            (frame(12., 0.9, false), damage(3, 3, 32, 32)),
+            // A quad comes in.
+            (frame(12., 0.9, true), damage(7, 29, 14, 10)),
+            // And goes out.
+            (frame(12., 0.9, false), damage(7, 29, 14, 10)),
+            // Nothing changed.
+            (frame(12., 0.9, false), damage(0, 0, 0, 0)),
+            // All of it.
+            (frame(20., 0.2, true), None),
+        ];
+        for (index, (scene, damage)) in frames.iter().enumerate() {
+            let drawn = partial.render_scene_partial_to_image(scene, *damage, window).expect("the frame is drawn");
+            let whole = MetalHeadlessRenderer::new()
+                .render_scene_to_image(scene, window)
+                .expect("the frame is drawn whole");
+            assert!(drawn == whole, "frame {index} drawn in part ({damage:?}) is not the frame drawn whole");
+        }
+    }
+
+    #[test]
+    fn a_damage_that_is_too_small_shows() {
+        // The test of the test: a damage that leaves out what changed is not the frame drawn whole.
+        let window = size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32));
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        partial.render_scene_partial_to_image(&frame(6., 0.5, false), None, window).unwrap();
+        let next = frame(12., 0.5, false);
+        let drawn = partial.render_scene_partial_to_image(&next, damage(30, 30, 4, 4), window).unwrap();
+        let whole = MetalHeadlessRenderer::new().render_scene_to_image(&next, window).unwrap();
+        assert!(drawn != whole);
     }
 
     /// The headless target is opaque and cleared to black, so "nothing was drawn" is black.

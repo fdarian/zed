@@ -22,6 +22,7 @@ mod collapsed_borders;
 mod composition;
 mod color;
 mod effects;
+pub mod frame_kind;
 mod mask_border;
 /// The default colors used by GPUI.
 pub mod colors;
