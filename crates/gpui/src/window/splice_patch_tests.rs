@@ -36,6 +36,8 @@ struct State {
     /// The key of the unit stays what it was, so that a frame replays the recording it left.
     key_stays: Cell<bool>,
     kid_height: Cell<f32>,
+    /// What the first box is taller than the others, which moves the boxes after it and none of their own sizes.
+    first_extra: Cell<f32>,
     kid_green: Cell<bool>,
     sibling_green: Cell<bool>,
     /// The unit has a key context and a key listener of its own, so that it always has a dispatch node.
@@ -61,6 +63,8 @@ struct State {
     /// The unit is inside a scroller, which `scroll` moves: a frame after it replays the unit `delta` away from where it was recorded.
     scrolled: Cell<bool>,
     scroll: ScrollHandle,
+    /// The scroller keeps the CSS default `overflow-anchor: auto`, where the other tests of it turn anchoring off.
+    anchoring: Cell<bool>,
     /// The third box has a tooltip, which a recording cannot be put elsewhere with.
     tooltip: Cell<bool>,
 }
@@ -73,6 +77,7 @@ impl State {
             version: Cell::new(0),
             key_stays: Cell::new(false),
             kid_height: Cell::new(12.),
+            first_extra: Cell::new(0.),
             kid_green: Cell::new(false),
             sibling_green: Cell::new(false),
             key_context: Cell::new(true),
@@ -90,6 +95,7 @@ impl State {
             relocatable: Cell::new(false),
             scrolled: Cell::new(false),
             scroll: ScrollHandle::new(),
+            anchoring: Cell::new(false),
             tooltip: Cell::new(true),
         })
     }
@@ -103,7 +109,7 @@ impl State {
         let down = self.clone();
         let mut kid = div()
             .id(("kid", index))
-            .h(px(self.kid_height.get()))
+            .h(px(self.kid_height.get() + if index == 0 { self.first_extra.get() } else { 0. }))
             .flex_none()
             .bg(if self.kid_green.get() { green() } else { red() })
             .hover(|style| style.bg(green()))
@@ -176,17 +182,19 @@ impl Render for Page {
             unit = unit.relocatable(px(100.));
         }
         let unit = if state.scrolled.get() {
-            div()
+            let mut scroller = div()
                 .id("scroller")
                 .w(px(200.))
                 .h(px(80.))
                 .flex_none()
                 .overflow_y_scroll()
-                .track_scroll(&state.scroll)
-                // A patch that lays a box in view out again would be followed by an anchoring step the frame built whole has none of.
-                .overflow_anchor(OverflowAnchor::None)
+                .track_scroll(&state.scroll);
+            if !state.anchoring.get() {
+                scroller = scroller.overflow_anchor(OverflowAnchor::None);
+            }
+            scroller
                 .child(unit)
-                .child(div().h(px(60.)).flex_none())
+                .child(div().h(px(if state.anchoring.get() { 200. } else { 60. })).flex_none())
                 .into_any_element()
         } else {
             unit.into_any_element()
@@ -759,12 +767,18 @@ impl Pair {
     }
 
     fn with_page(cx: &mut TestAppContext, kids: usize, key_stays: bool, relocatable: bool, scrolled: bool, list: bool) -> Self {
+        Self::with_anchoring(cx, kids, key_stays, relocatable, scrolled, list, false)
+    }
+
+    fn with_anchoring(cx: &mut TestAppContext, kids: usize, key_stays: bool, relocatable: bool, scrolled: bool, list: bool, anchoring: bool) -> Self {
         let state = State::new(cx, kids, list);
+        state.anchoring.set(anchoring);
         state.relocatable.set(relocatable);
         state.scrolled.set(scrolled);
         state.tooltip.set(!scrolled);
         let patched = Fixture::new(cx, state);
         let reference = State::new(cx, kids, list);
+        reference.anchoring.set(anchoring);
         reference.relocatable.set(relocatable);
         reference.scrolled.set(scrolled);
         reference.tooltip.set(!scrolled);
@@ -1398,5 +1412,62 @@ fn two_roots_that_lay_out_again_in_one_patch_hit_test_the_pointer_as_a_frame_bui
         assert_eq!(patched.0, whole.0, "upper first {upper_first}: what the pointer hits");
         assert_same(&patched.1, &whole.1, "the frame");
         assert_eq!(patched.2, whole.2, "upper first {upper_first}: the box a click reaches");
+    }
+}
+
+/// The scroller keeps `overflow-anchor: auto`: what a patch of a row shows, and where the scroller is left, is what a frame
+/// built whole shows. A box in view that the root holds is the anchor at 24 (the third box), and an edit that moves it or
+/// restyles it is declined (a frame built whole scrolls the scroller, or drops the anchor); where the anchor is the root
+/// itself (40, whose boxes are above the view), outside it (110, the root is above the view), or the edit leaves it be, the
+/// edit is a patch.
+#[gpui::test]
+fn a_relayout_patch_in_a_scroller_that_anchors_leaves_the_offset_and_the_frame_a_frame_built_whole_does(cx: &mut TestAppContext) {
+    let edits: [(&str, Box<dyn Fn(&State)>); 5] = [
+        ("taller boxes", Box::new(|state: &State| state.kid_height.set(14.))),
+        ("more boxes", Box::new(|state: &State| state.kids.set(7))),
+        ("fewer boxes", Box::new(|state: &State| state.kids.set(2))),
+        ("taller first box", Box::new(|state: &State| state.first_extra.set(8.))),
+        ("shorter first box", Box::new(|state: &State| state.first_extra.set(-6.))),
+    ];
+    for top in [0., 24., 40., 70., 110.] {
+        for (what, change) in &edits {
+            let pair = Pair::with_anchoring(cx, 3, true, true, true, false, true);
+            pair.scroll_to(cx, top);
+            pair.assert_same(cx, "scrolled");
+            pair.set(change);
+            pair.patched.tick(cx);
+            let seen = pair.patched.state.seen.borrow().clone();
+            let moves_anchor = top == 24. && matches!(*what, "taller boxes" | "taller first box" | "shorter first box");
+            let expected = if moves_anchor { vec![Err(PatchDecline::NotContained)] } else { vec![Ok(())] };
+            assert_eq!(seen, expected, "{what} at {top}");
+            pair.assert_same(cx, &format!("{what} at {top}"));
+            assert_eq!(
+                pair.patched.state.scroll.offset().y,
+                pair.whole.state.scroll.offset().y,
+                "{what} at {top}: the offset"
+            );
+        }
+    }
+}
+
+/// An edit that is declined for the anchor is followed by the frame built whole, which finds the styles the patch set and
+/// no restyle: the anchor is dropped as in a frame built whole from the page before, not compensated for.
+#[gpui::test]
+fn patches_that_move_the_anchor_and_frames_after_them_leave_the_offset_a_frame_built_whole_does(cx: &mut TestAppContext) {
+    let pair = Pair::with_anchoring(cx, 3, true, true, true, false, true);
+    pair.scroll_to(cx, 24.);
+    for (what, change) in [
+        ("taller first box", Box::new(|state: &State| state.first_extra.set(8.)) as Box<dyn Fn(&State)>),
+        ("taller boxes", Box::new(|state: &State| state.kid_height.set(14.))),
+        ("shorter first box", Box::new(|state: &State| state.first_extra.set(-6.))),
+        ("fewer boxes", Box::new(|state: &State| state.kids.set(2))),
+    ] {
+        pair.set(change);
+        pair.patched.tick(cx);
+        pair.assert_same(cx, what);
+        pair.wheel(cx, 3.);
+        pair.patched.draw_plain(cx);
+        pair.assert_same(cx, &format!("{what}, wheeled"));
+        assert_eq!(pair.patched.state.scroll.offset().y, pair.whole.state.scroll.offset().y, "{what}: the offset");
     }
 }

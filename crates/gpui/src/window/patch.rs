@@ -69,7 +69,8 @@ pub enum PatchDecline {
     /// The new element asks for a layout the frame cannot keep.
     UnstableLayout,
     /// The root laid out again, and its box is not the one it had or a node outside it is laid out
-    /// differently: the patch would not be the frame built whole.
+    /// differently, or the anchor of a scroller around it moved and the scroller would be scrolled
+    /// (or lose its anchor): the patch would not be the frame built whole.
     NotContained,
     /// The root registered other things than it did, and the rendered frame does not hold what it
     /// recorded where it recorded it (a stacking context moved its hitboxes or tab stops), or two
@@ -1272,6 +1273,7 @@ impl Window {
             // A frame built whole ends by asking the platform for the cursor the pointer is over.
             self.reset_cursor_style(cx);
         }
+        self.layout_engine_mut().release_anchor_restyles();
         Ok(PatchOutcome { units: runs_len, changed: changed || spliced, scroll_extents })
     }
 
@@ -1912,15 +1914,23 @@ impl Window {
         while node != window_root.id {
             node = self.layout_engine().layout_parent(node).ok_or(PatchDecline::LayoutMismatch)?;
         }
+        // A scroller around the root picks its anchor before this layout, as it does before the layout of a frame built whole.
+        let scale_factor = self.scale_factor();
+        let scrollers = self.layout_engine().anchoring_scrollers_above(root);
+        self.layout_engine_mut().pick_anchors_of(&scrollers, scale_factor);
         let unmeasured = self.layout_engine().unmeasured_leaves();
         self.stretch_layout_root(window_root.id, window_root.size);
         self.compute_layout_tracking_changes(window_root.id, window_root.size.into(), cx);
         let contained = self.layout_engine_mut().changes_stay_inside(root);
+        self.layout_engine_mut().hold_anchor_restyles();
         // A leaf that layout measures and has no measure function would have been laid out empty.
         if self.layout_engine().unmeasured_leaves() != unmeasured {
             return Err(PatchDecline::LayoutMismatch);
         }
-        if !contained {
+        // Nothing outside the root moved, but the anchor of a scroller around it may be inside the root: a frame built whole
+        // scrolls the scroller by what moved it (or drops the anchor) after the layout, in the prepaint of the scroller, which a
+        // patch of the root does not run.
+        if !contained || self.layout_engine_mut().anchoring_would_act(&scrollers, scale_factor) {
             return Err(PatchDecline::NotContained);
         }
         Ok(())

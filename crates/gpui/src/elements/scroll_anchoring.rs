@@ -136,6 +136,36 @@ impl ScrollAnchoring {
         self.left_offset = *offset;
     }
 
+    /// Whether [`Self::step`] would scroll the scroller or drop its anchor for the layout the engine holds, at
+    /// `offset`. A layout that changes only boxes inside one root, which a patch lays out, can move the anchor
+    /// without the scroller being prepainted to compensate for it.
+    pub(crate) fn would_act(
+        &self,
+        engine: &mut TaffyLayoutEngine,
+        layout_id: LayoutId,
+        enabled: bool,
+        offset: Point<Pixels>,
+        scale_factor: f32,
+    ) -> bool {
+        let Some(anchor) = self.anchor else {
+            return false;
+        };
+        if !enabled {
+            return false;
+        }
+        let scroller = Scroller {
+            layout_id,
+            client: self.client,
+            max_offset_y: Pixels::ZERO,
+            enabled,
+        };
+        let view = Scrollport::of(engine, &scroller, scale_factor);
+        !matches!(
+            self.compensation(engine, &view, &scroller, anchor, offset),
+            Compensation::None
+        )
+    }
+
     fn compensation(
         &self,
         engine: &mut TaffyLayoutEngine,

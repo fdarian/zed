@@ -5643,6 +5643,19 @@ impl ScrollHandle {
             .before_layout(engine, layout_id, enabled, offset, jumped, scale_factor);
     }
 
+    /// See [`ScrollAnchoring::would_act`].
+    pub(crate) fn anchoring_would_act(
+        &self,
+        engine: &mut crate::taffy::TaffyLayoutEngine,
+        layout_id: LayoutId,
+        enabled: bool,
+        scale_factor: f32,
+    ) -> bool {
+        let state = self.0.borrow();
+        let offset = *state.offset.borrow();
+        state.anchoring.would_act(engine, layout_id, enabled, offset, scale_factor)
+    }
+
     /// Construct a new scroll handle.
     pub fn new() -> Self {
         Self(Rc::default())

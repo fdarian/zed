@@ -265,6 +265,9 @@ struct NodeMeta {
     /// anchoring does not follow (its insets, margin, padding, size, position), so the layout
     /// that moves the anchor must not be compensated for. Dropped by [`TaffyLayoutEngine::end_pass`].
     anchor_restyled: bool,
+    /// The node is a scroller that anchors (`overflow-anchor` is `auto` or `none` on a tracked scroll container) as the request
+    /// that made this meta said, with the handle that holds its anchor. A patch that lays out a root inside it asks the handle.
+    anchoring: Option<(bool, crate::ScrollHandle)>,
     /// The node's `transform`, which is no concern of layout: it moves what is painted, and the
     /// extents below count the boxes where it puts them. Nothing but an extent reads it, so a
     /// change of it is no change of layout, only of the extents (see `transform_changes`).
@@ -394,6 +397,8 @@ pub struct TaffyLayoutEngine {
     unstable_requests: u64,
     /// The nodes with `NodeMeta::anchor_restyled` set in the pass under way.
     anchor_restyled_nodes: Vec<LayoutId>,
+    /// The end of the pass keeps the flags of `anchor_restyled_nodes`, see [`Self::hold_anchor_restyles`].
+    hold_anchor_restyles: bool,
     /// The scrollers that asked for layout in the pass and have not picked their anchor yet.
     anchor_scrollers: Vec<AnchorScroller>,
     /// Times taffy asked for the size of a leaf that layout measures and found no measure function
@@ -402,7 +407,7 @@ pub struct TaffyLayoutEngine {
 }
 
 /// A scroll container that anchors, as the pass under way found it.
-struct AnchorScroller {
+pub(crate) struct AnchorScroller {
     layout_id: LayoutId,
     enabled: bool,
     handle: crate::ScrollHandle,
@@ -514,6 +519,7 @@ impl TaffyLayoutEngine {
             probed: Vec::new(),
             unstable_requests: 0,
             anchor_restyled_nodes: Vec::new(),
+            hold_anchor_restyles: false,
             anchor_scrollers: Vec::new(),
             unmeasured_leaves: 0,
         }
@@ -721,14 +727,35 @@ impl TaffyLayoutEngine {
         clear_shrinking(&mut self.natural_widths);
         clear_shrinking(&mut self.escapable_nodes);
         clear_shrinking(&mut self.ordinals);
+        if !std::mem::take(&mut self.hold_anchor_restyles) {
+            self.clear_anchor_restyles();
+        }
+        self.anchor_scrollers.clear();
+        self.pass += 1;
+        self.counters.passes += 1;
+    }
+
+    fn clear_anchor_restyles(&mut self) {
         for id in std::mem::take(&mut self.anchor_restyled_nodes) {
             if let Some(meta) = self.meta.get_mut(&id) {
                 meta.anchor_restyled = false;
             }
         }
-        self.anchor_scrollers.clear();
-        self.pass += 1;
-        self.counters.passes += 1;
+    }
+
+    /// The pass that ends next keeps what it flagged for scroll anchoring. A patch lays out roots in a pass of its own and,
+    /// when it declines, a frame built whole follows from the styles that pass already set: that frame does not see the
+    /// restyle (its requests find the styles as they are), so it would compensate a layout move that a frame built whole
+    /// from the page before would drop the anchor for. The flags are dropped by the end of the next pass that does not hold
+    /// them, or by [`Self::release_anchor_restyles`] when the patch is kept.
+    pub(crate) fn hold_anchor_restyles(&mut self) {
+        self.hold_anchor_restyles = true;
+    }
+
+    /// A patch that was kept left no frame to follow it: what it flagged is no restyle of the next one.
+    pub(crate) fn release_anchor_restyles(&mut self) {
+        self.hold_anchor_restyles = false;
+        self.clear_anchor_restyles();
     }
 
     /// Ends a pass and frees the nodes that nothing needs anymore, along with their calcs: the
@@ -1612,6 +1639,7 @@ impl TaffyLayoutEngine {
         enabled: bool,
         handle: crate::ScrollHandle,
     ) {
+        self.meta_mut(layout_id).anchoring = Some((enabled, handle.clone()));
         self.anchor_scrollers.push(AnchorScroller {
             layout_id,
             enabled,
@@ -1633,6 +1661,49 @@ impl TaffyLayoutEngine {
         // What was asked of the boxes above is of the boxes before the layout.
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
+    }
+
+    /// The scrollers that anchor above `root`, from the nearest, as the frame before asked for them.
+    pub(crate) fn anchoring_scrollers_above(&self, root: LayoutId) -> Vec<AnchorScroller> {
+        let mut scrollers = Vec::new();
+        let mut node = root;
+        while let Some(parent) = self.layout_parent(node) {
+            if let Some((enabled, handle)) = self.meta.get(&parent).and_then(|meta| meta.anchoring.clone()) {
+                scrollers.push(AnchorScroller {
+                    layout_id: parent,
+                    enabled,
+                    handle,
+                });
+            }
+            node = parent;
+        }
+        scrollers
+    }
+
+    /// What [`Self::pick_scroll_anchors`] does for the scrollers a patch's root is in, which are not
+    /// requested in the pass of a patch: they pick before the layout that the patch computes, from the boxes
+    /// of the layout before it, as they do in a frame built whole.
+    pub(crate) fn pick_anchors_of(&mut self, scrollers: &[AnchorScroller], scale_factor: f32) {
+        if scrollers.is_empty() {
+            return;
+        }
+        for scroller in scrollers {
+            scroller
+                .handle
+                .pick_anchor(self, scroller.layout_id, scroller.enabled, scale_factor);
+        }
+        self.absolute_layout_bounds.clear();
+        self.absolute_outer_origins.clear();
+    }
+
+    /// Whether the step of any of the scrollers would scroll it, or drop its anchor, for the layout that was
+    /// computed: what a frame built whole does after the layout, which a patch does not run.
+    pub(crate) fn anchoring_would_act(&mut self, scrollers: &[AnchorScroller], scale_factor: f32) -> bool {
+        scrollers.iter().any(|scroller| {
+            scroller
+                .handle
+                .anchoring_would_act(self, scroller.layout_id, scroller.enabled, scale_factor)
+        })
     }
 
     /// A root that a frame before had under a parent which this pass did not ask for is not under
