@@ -899,6 +899,11 @@ impl RecordedHitboxes {
             .collect();
         Self { hitboxes, roots }
     }
+
+    /// Whether the hitbox at `position` hangs off the hitbox enclosing the subtree.
+    pub(crate) fn is_root(&self, position: usize) -> bool {
+        self.roots.binary_search(&position).is_ok()
+    }
 }
 
 /// Where the stacking context that elements are handed to stood when a recording began.
@@ -2182,6 +2187,22 @@ impl Window {
     pub(super) fn relocate_hitboxes_in_place(&mut self, range: Range<usize>, surroundings: &ContentMask<Pixels>) {
         for hitbox in &mut self.next_frame.hitboxes[range] {
             *hitbox = hitbox.relocated(Point::default(), surroundings);
+        }
+        self.next_frame.hitboxes_changed();
+    }
+
+    /// Puts the hitboxes `range` of the frame being built, which prepaint made in the region of a subtree, where
+    /// the frame has them: `delta` from `region` (their bounds as the region holds them), and cut by the content
+    /// mask `surroundings`.
+    pub(super) fn place_hitboxes_from_region(
+        &mut self,
+        range: Range<usize>,
+        region: &[Hitbox],
+        delta: Point<Pixels>,
+        surroundings: &ContentMask<Pixels>,
+    ) {
+        for (hitbox, held) in self.next_frame.hitboxes[range].iter_mut().zip(region) {
+            *hitbox = held.relocated(delta, surroundings);
         }
         self.next_frame.hitboxes_changed();
     }

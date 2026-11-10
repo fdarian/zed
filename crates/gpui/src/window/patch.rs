@@ -333,6 +333,18 @@ impl PatchUnit {
     pub(crate) fn name(&self) -> &ElementId {
         &self.name
     }
+
+    /// Notes that a frame replayed the root, under the dispatch node and hitbox that are open now: a patch
+    /// hangs what it puts in the frame off them.
+    pub(crate) fn replayed_under(&self, window: &Window) {
+        self.dispatch_parent.set(window.next_frame.dispatch_tree.active_node_id());
+        self.prepaint.hitbox_parent.set(window.hitbox_parent_stack.last().copied());
+    }
+
+    /// Whether the root may lay out again in a patch (`Retained::patchable_relayout`).
+    pub(crate) fn relayouts(&self) -> bool {
+        self.relayout
+    }
 }
 
 /// Where the paint of a root happens, relative to its prepaint.
@@ -356,7 +368,9 @@ pub(super) struct Surroundings {
     transforms: Vec<AmbientTransform>,
     positioned_frame: Option<PositionedFrame>,
     image_cache: Option<AnyImageCache>,
-    hitbox_parent: Option<HitboxId>,
+    /// The hitbox around the root in the frame it was last built or replayed in: the enclosing hitbox is inserted
+    /// again, with another id, by every frame that prepaints its element, so a replay says which it is now.
+    hitbox_parent: Cell<Option<HitboxId>>,
     /// For each list of lifted elements open around the root, whether it is a stacking context.
     stacking_contexts: Vec<bool>,
     lifts_open: usize,
@@ -847,7 +861,7 @@ impl Window {
             transforms: self.transform_stack.clone(),
             positioned_frame: self.positioned_frames.last().copied(),
             image_cache: self.image_cache_stack.last().cloned(),
-            hitbox_parent: self.hitbox_parent_stack.last().copied(),
+            hitbox_parent: Cell::new(self.hitbox_parent_stack.last().copied()),
             stacking_contexts: self.lift_lists.iter().map(Option::is_some).collect(),
             lifts_open: self.lifts_open,
         })
@@ -1503,7 +1517,7 @@ impl Window {
             exact_clips: mem::replace(&mut self.exact_clips, unit.exact_clips.clone()),
             lift_lists: mem::replace(&mut self.lift_lists, lift_lists),
             lifts_open: mem::replace(&mut self.lifts_open, unit.lifts_open),
-            hitbox_parent_stack: mem::replace(&mut self.hitbox_parent_stack, unit.hitbox_parent.into_iter().collect()),
+            hitbox_parent_stack: mem::replace(&mut self.hitbox_parent_stack, unit.hitbox_parent.get().into_iter().collect()),
             positioned_frames: mem::replace(&mut self.positioned_frames, unit.positioned_frame.into_iter().collect()),
             layout_scope: mem::replace(&mut self.layout_scope, layout_scope),
             pushed_image_cache: unit.image_cache.is_some(),
@@ -1596,15 +1610,12 @@ impl Window {
         }
 
         // A root recorded to be put elsewhere is prepainted and painted in its region, as a frame built whole
-        // records it, so that the recording can be made what that frame records. One that lays out again is only
-        // where its recording is (a root put elsewhere is declined below), so what it paints is the region's at
-        // delta zero and its recording is rewritten from the patch like a root that does not lay out.
+        // records it, so that the recording can be made what that frame records. The region is where the root was
+        // recorded, whether or not a scroll moved it since: what the patch paints there is put in the frame `delta`
+        // away, as a replay puts the recording, and a root that lays out again has its recording rewritten from the
+        // patch, region and all, so that the next replay or translate moves it from where it was recorded as before.
         let region = match (&source.relocation, &around.placement) {
-            (Some(relocation), Placement::InPlace)
-                if (!relaid || source.delta.is_zero()) && self.content_mask() == relocation.ambient =>
-            {
-                Some(relocation.reopened())
-            }
+            (Some(relocation), Placement::InPlace) if self.content_mask() == relocation.ambient => Some(relocation.reopened()),
             _ => None,
         };
         if region.is_none() && !source.delta.is_zero() {
@@ -1639,13 +1650,28 @@ impl Window {
         }
 
         let after_prepaint = self.effects().without_root_escapes(&effects);
+        let moved = !source.delta.is_zero();
+        // What the frame does not move with the root: a box a frame outside it places, and a scroller of its own, whose
+        // offset and extent the patch would have to move.
+        if moved && prepaint_start.scrollers_index != prepaint_end.scrollers_index {
+            return Err(PatchDecline::Relocated);
+        }
         let relocated = relocation.zip(ambient).map(|(relocation, ambient)| {
             let range = prepaint_start.hitboxes_index..prepaint_end.hitboxes_index;
             let hitboxes = self.next_frame.hitboxes[range.clone()].to_vec();
-            self.relocate_hitboxes_in_place(range, &ambient);
+            // A root that lays out again has the hitboxes it has now where the frame has them, as the splice puts them
+            // there; one that does not has its recorded ones moved by the places it is put in.
+            let delta = if relaid { source.delta } else { Point::default() };
+            if !(moved && hitboxes.iter().any(|hitbox| hitbox.unclipped)) {
+                self.place_hitboxes_from_region(range, &hitboxes, delta, &ambient);
+            }
             RelocatedStep { relocation, hitboxes, blockers: effects.blockers(&after_prepaint) }
         });
-        if !source.delta.is_zero() && relocated.as_ref().is_some_and(|step| step.hitboxes.iter().any(|hitbox| hitbox.unclipped)) {
+        if moved
+            && relocated
+                .as_ref()
+                .is_some_and(|step| step.hitboxes.iter().any(|hitbox| hitbox.unclipped) || step.relocation.info.fits(source.delta, &step.relocation.ambient).is_err())
+        {
             return Err(PatchDecline::Relocated);
         }
         Ok(PreparedStep {
@@ -1727,7 +1753,7 @@ impl Window {
         let rendered = source.paint.start.scene_index..source.paint.end.scene_index;
         let hitboxes_match = !hitbox_ids.overrun
             && hitbox_ids.taken == hitbox_ids.ids.len()
-            && self.hitboxes_are(&source.hitboxes.hitboxes, prepaint_start.hitboxes_index..prepaint_end.hitboxes_index, relaid);
+            && self.hitboxes_are(&source.hitboxes, prepaint_start.hitboxes_index..prepaint_end.hitboxes_index, relaid);
         let registrations_match = self.registrations_are(source, step.holds_focus, &prepaint_start..&prepaint_end, &paint_start..&paint_end);
         let regional = region.is_some();
         if relaid && !(hitboxes_match && registrations_match && self.operations_are(&scratch, &rendered)) {
@@ -1863,7 +1889,7 @@ impl Window {
         let hitboxes = hitboxes.unwrap_or_else(|| frame.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec());
         RecordingRewrite {
             publications,
-            hitboxes: RecordedHitboxes::new(hitboxes, unit.prepaint.hitbox_parent),
+            hitboxes: RecordedHitboxes::new(hitboxes, unit.prepaint.hitbox_parent.get()),
             tab_stops: frame.tab_stops.insertion_history[paint.start.tab_handle_index..paint.end.tab_handle_index].into(),
             relocation: None,
             prepaint_lengths: None,
@@ -2004,12 +2030,15 @@ impl Window {
     }
 
     /// Whether the hitboxes the scratch frame got in `range` are `recorded`, field by field. After a
-    /// layout of the root, the boxes may be elsewhere and of another size.
-    fn hitboxes_are(&self, recorded: &[Hitbox], range: Range<usize>, relaid: bool) -> bool {
+    /// layout of the root, the boxes may be elsewhere and of another size. The hitbox around the root
+    /// is the one of the frame that replayed it last, not the one it was recorded under.
+    fn hitboxes_are(&self, recorded: &RecordedHitboxes, range: Range<usize>, relaid: bool) -> bool {
         let inserted = &self.next_frame.hitboxes[range];
-        inserted.len() == recorded.len()
-            && inserted.iter().zip(recorded).all(|(inserted, recorded)| {
-                if relaid { inserted.same_apart_from_place(recorded) } else { inserted.same_as(recorded) }
+        inserted.len() == recorded.hitboxes.len()
+            && inserted.iter().zip(&recorded.hitboxes).enumerate().all(|(position, (inserted, held))| {
+                let parent_matches = recorded.is_root(position) || inserted.parent == held.parent;
+                parent_matches
+                    && if relaid { inserted.same_apart_from_place(held) } else { inserted.same_as(held) }
             })
     }
 
@@ -2134,12 +2163,11 @@ impl Hitbox {
 
     /// Whether `other` is the hitbox but for its bounds and what follows from them: a box that
     /// laid out again is elsewhere and of another size, with other rounded corners and another
-    /// clip path.
+    /// clip path. The parent is the caller's to compare.
     fn same_apart_from_place(&self, other: &Hitbox) -> bool {
         self.id == other.id
             && self.behavior == other.behavior
             && self.identity == other.identity
-            && self.parent == other.parent
             && self.unclipped == other.unclipped
             && self.clip.is_some() == other.clip.is_some()
             && self.exact_clips.as_ref().map(|clips| clips.depth()) == other.exact_clips.as_ref().map(|clips| clips.depth())

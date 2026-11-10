@@ -6,8 +6,8 @@
 
 use crate::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Context, ElementId, FocusHandle, InteractiveElement, IntoElement,
-    ListAlignment, ListState, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, PatchCounters, PatchDecline,
-    PlatformInput, Point, Render, ScrollDelta, ScrollPatchCause, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div,
+    ListAlignment, ListState, Modifiers, OverflowAnchor, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, PatchCounters, PatchDecline,
+    PlatformInput, Point, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div,
     green, list, point, px, red, retained, size,
 };
 use std::cell::{Cell, RefCell};
@@ -58,6 +58,11 @@ struct State {
     bare: Cell<bool>,
     /// The unit is recorded to be put elsewhere, as the row of a scroller is.
     relocatable: Cell<bool>,
+    /// The unit is inside a scroller, which `scroll` moves: a frame after it replays the unit `delta` away from where it was recorded.
+    scrolled: Cell<bool>,
+    scroll: ScrollHandle,
+    /// The third box has a tooltip, which a recording cannot be put elsewhere with.
+    tooltip: Cell<bool>,
 }
 
 impl State {
@@ -83,6 +88,9 @@ impl State {
             list_first: Cell::new(false),
             bare: Cell::new(false),
             relocatable: Cell::new(false),
+            scrolled: Cell::new(false),
+            scroll: ScrollHandle::new(),
+            tooltip: Cell::new(true),
         })
     }
 
@@ -101,7 +109,7 @@ impl State {
             .hover(|style| style.bg(green()))
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_, _, _| down.log.borrow_mut().push(format!("down {index}")));
-        if index == 2 {
+        if index == 2 && self.tooltip.get() {
             kid = kid.tooltip(|_, cx| cx.new(|_| Tip).into());
         }
         if let Some(handle) = [1, 4].iter().position(|at| *at == index).map(|slot| &self.focusable[slot]) {
@@ -167,6 +175,22 @@ impl Render for Page {
         if state.relocatable.get() {
             unit = unit.relocatable(px(100.));
         }
+        let unit = if state.scrolled.get() {
+            div()
+                .id("scroller")
+                .w(px(200.))
+                .h(px(80.))
+                .flex_none()
+                .overflow_y_scroll()
+                .track_scroll(&state.scroll)
+                // A patch that lays a box in view out again would be followed by an anchoring step the frame built whole has none of.
+                .overflow_anchor(OverflowAnchor::None)
+                .child(unit)
+                .child(div().h(px(60.)).flex_none())
+                .into_any_element()
+        } else {
+            unit.into_any_element()
+        };
         let sibling_state = state.clone();
         let sibling = retained(SIBLING, 2_000, move |_, _| sibling_state.sibling()).patchable();
         let rows = state.list.as_ref().map(|rows| {
@@ -726,17 +750,79 @@ impl Pair {
     }
 
     fn with_unit(cx: &mut TestAppContext, kids: usize, key_stays: bool, relocatable: bool) -> Self {
-        let state = State::new(cx, kids, false);
+        Self::with_page(cx, kids, key_stays, relocatable, false, false)
+    }
+
+    /// The unit is a relocatable root inside a scroller, and a frame that replays it can put it elsewhere than it was recorded.
+    fn scrolled(cx: &mut TestAppContext, kids: usize, list: bool) -> Self {
+        Self::with_page(cx, kids, true, true, true, list)
+    }
+
+    fn with_page(cx: &mut TestAppContext, kids: usize, key_stays: bool, relocatable: bool, scrolled: bool, list: bool) -> Self {
+        let state = State::new(cx, kids, list);
         state.relocatable.set(relocatable);
+        state.scrolled.set(scrolled);
+        state.tooltip.set(!scrolled);
         let patched = Fixture::new(cx, state);
-        let reference = State::new(cx, kids, false);
+        let reference = State::new(cx, kids, list);
         reference.relocatable.set(relocatable);
+        reference.scrolled.set(scrolled);
+        reference.tooltip.set(!scrolled);
         reference.patch_unit.set(false);
         let whole = Fixture::new(cx, reference);
         for state in [&patched.state, &whole.state] {
             state.key_stays.set(key_stays);
         }
+        if scrolled {
+            for fixture in [&patched, &whole] {
+                cx.update_window(fixture.window, |_, window, cx| window.simulate_mouse_move(point(px(150.), px(60.)), cx)).unwrap();
+                fixture.draw_whole(cx);
+            }
+        }
         Self { patched, whole }
+    }
+
+    /// Moves the scroller of both pages to `top` with a wheel and draws the patched one, which puts the unit where it was
+    /// not recorded.
+    fn scroll_to(&self, cx: &mut TestAppContext, top: f32) {
+        let now = -self.patched.state.scroll.offset().y.0;
+        self.wheel(cx, top - now);
+        self.patched.draw_plain(cx);
+    }
+
+    /// A wheel over the unit's scroller beside the unit (the recording holds the hover it was made with, so the pointer stays off
+    /// it), in the patched page and the other.
+    fn wheel(&self, cx: &mut TestAppContext, by: f32) {
+        for fixture in [&self.patched, &self.whole] {
+            cx.update_window(fixture.window, |_, window, cx| {
+                let event = ScrollWheelEvent {
+                    position: point(px(150.), px(60.)),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
+                    ..Default::default()
+                };
+                window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+            })
+            .unwrap();
+        }
+    }
+
+    fn relocations(&self, cx: &mut TestAppContext) -> u64 {
+        cx.update_window(self.patched.window, |_, window, _| window.retained_counters().relocations).unwrap()
+    }
+
+    /// A change that the patch lays out again, which the unit patches and whose recording it rewrites.
+    #[track_caller]
+    fn patch_step(&self, cx: &mut TestAppContext, what: &str, change: impl Fn(&State)) {
+        let before = self.patched.patches(cx);
+        self.set(change);
+        self.patched.tick(cx);
+        let after = self.patched.patches(cx);
+        let seen = self.patched.state.seen.borrow();
+        assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{what}: {seen:?}");
+        assert_eq!(after.rewritten_recordings, before.rewritten_recordings + 1, "{what}: {seen:?}");
+        assert_eq!(after.total_declines(), 0, "{what}: {seen:?}");
+        drop(seen);
+        self.assert_same(cx, what);
     }
 
     fn set(&self, change: impl Fn(&State)) {
@@ -833,6 +919,73 @@ fn a_relayout_patch_that_changes_why_a_root_cannot_be_put_elsewhere_does_not_rew
     assert_eq!(after.total_declines(), 0, "{seen:?}");
     drop(seen);
     pair.assert_same(cx, "without the box with the tooltip");
+}
+
+#[gpui::test]
+fn a_relayout_patch_of_a_relocatable_root_that_a_scroll_moved_patches_and_rewrites_it(cx: &mut TestAppContext) {
+    let pair = Pair::scrolled(cx, 3, false);
+    let moved = pair.relocations(cx);
+    pair.scroll_to(cx, 24.);
+    assert!(pair.relocations(cx) > moved, "the frame after the scroll replays the unit away from where it was recorded");
+    pair.assert_same(cx, "replayed away from where it was recorded");
+    let steps: [(&str, Box<dyn Fn(&State)>); 3] = [
+        ("same shape", Box::new(|state: &State| state.kid_height.set(14.))),
+        ("more children", Box::new(|state: &State| state.kids.set(7))),
+        ("fewer children", Box::new(|state: &State| state.kids.set(4))),
+    ];
+    for (what, change) in steps {
+        pair.patch_step(cx, what, change);
+    }
+    // A frame after the patches replays the rewritten recording the same distance away, and the patch goes on from it.
+    let replays = pair.patched.replays(cx);
+    pair.patched.draw_plain(cx);
+    assert!(pair.patched.replays(cx) > replays, "the unit is replayed from the recording the patches left");
+    pair.assert_same(cx, "replayed after three patches of a moved root");
+    pair.patch_step(cx, "patched after a replay", |state| state.kids.set(5));
+}
+
+#[gpui::test]
+fn scrolls_and_relayout_patches_of_a_relocatable_root_alternate_and_each_frame_is_the_one_built_whole(cx: &mut TestAppContext) {
+    let pair = Pair::scrolled(cx, 3, false);
+    let tops = [24., 10., 0., 31., 31., 7.];
+    for (step, top) in tops.into_iter().enumerate() {
+        pair.scroll_to(cx, top);
+        pair.assert_same(cx, &format!("scrolled to {top} (step {step})"));
+        let kids = 3 + (step * 2 + 1) % 5;
+        pair.patch_step(cx, &format!("patched at {top} (step {step})"), move |state| {
+            state.kids.set(kids);
+            state.kid_height.set(12. + (step % 3) as f32);
+        });
+        // A scroll that follows the patch moves the rewritten recording.
+        pair.scroll_to(cx, top + 5.);
+        pair.assert_same(cx, &format!("scrolled again after a patch at {top} (step {step})"));
+    }
+}
+
+#[gpui::test]
+fn a_wheel_on_the_scroller_of_a_patched_root_and_the_rows_of_a_list_around_it_translate_as_the_frame_built_whole_is(cx: &mut TestAppContext) {
+    let pair = Pair::scrolled(cx, 3, true);
+    for (step, by) in [(0, 9.), (1, 5.), (2, 7.)] {
+        pair.wheel(cx, by);
+        pair.patched.draw_plain(cx);
+        pair.patch_step(cx, &format!("patched after a wheel (step {step})"), move |state| state.kids.set(4 + step));
+        // The rows of the list are put where the scroll moves them from their recordings, which the patches of the unit
+        // left in the frame as a frame built whole does.
+        for fixture in [&pair.patched, &pair.whole] {
+            cx.update_window(fixture.window, |_, window, cx| {
+                let event = ScrollWheelEvent {
+                    position: point(px(10.), px(170.)),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(-6.))),
+                    ..Default::default()
+                };
+                window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+            })
+            .unwrap();
+        }
+        let counters = cx.update_window(pair.patched.window, |_, window, _| window.scroll_patch_counters()).unwrap();
+        assert_eq!(counters.mispredicted, 0, "{counters:?}");
+        pair.assert_same(cx, &format!("rows moved after a patch of the moved unit (step {step})"));
+    }
 }
 
 #[gpui::test]

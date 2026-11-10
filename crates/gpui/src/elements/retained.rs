@@ -1324,10 +1324,13 @@ impl Retained {
                 window.retained.relocated_inside += 1;
             }
             if let Some(unit) = &recorded.patch {
-                // A recording put elsewhere than it was made is no source for a patch, which
-                // paints it where its surroundings were captured.
-                if delta.is_zero() && exact {
-                    unit.dispatch_parent.set(window.next_frame.dispatch_tree.active_node_id());
+                // A patch paints a recording where its surroundings were captured and puts what it paints `delta`
+                // away. That is only done for a root that lays out again (the patch rewrites its recording), and
+                // where the content mask around is the one it was recorded under.
+                let moved_and_patchable = unit.relayouts()
+                    && recorded.relocation.as_ref().is_some_and(|relocation| relocation.regional() && relocation.ambient == ambient);
+                if (delta.is_zero() && exact) || moved_and_patchable {
+                    unit.replayed_under(window);
                     window.register_patch_unit(&id, unit);
                 } else {
                     window.note_relocated_patch_unit(&id);
