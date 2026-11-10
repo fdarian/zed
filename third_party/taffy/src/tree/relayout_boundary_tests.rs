@@ -150,14 +150,60 @@ fn the_nodes_above_a_boundary_keep_their_results_and_know_that_something_changed
     }
     // The leaf waits for its own layout, and the subject, which answers what its parent asked or does not, for it.
     assert!(taffy.dirty(shape.leaf).unwrap());
+
+    // The leaf does not answer as it did, so the change goes up to the subject, which does.
+    lay_out(&mut taffy, shape.root);
     for (node, before) in shape.above().into_iter().zip(before) {
         assert_ne!(taffy.dirty_generation(node).unwrap(), before.0);
         assert_ne!(taffy.layout_generation(node).unwrap(), before.1);
     }
-
-    lay_out(&mut taffy, shape.root);
     assert!(!taffy.dirty(shape.subject).unwrap());
     assert!(!taffy.dirty(shape.leaf).unwrap());
+}
+
+#[test]
+fn the_nodes_above_a_node_that_answers_as_it_did_keep_their_layout_generations() {
+    let mut taffy = new_tree();
+    let shape = shape(
+        &mut taffy,
+        block(),
+        Style { size: Size { width: length(100.0), height: length(100.0) }, ..clip_box() },
+        Size { width: 60.0, height: 10.0 },
+    );
+    // The block around the leaf has a size of its own and clips (and has a child, so it is no formatting context of its
+    // own in a block, and no static boundary): what its content is measured as is of no concern to anything above it.
+    let inner = Style {
+        size: Size { width: length(80.0), height: length(80.0) },
+        overflow: Point { x: Overflow::Clip, y: Overflow::Clip },
+        ..block()
+    };
+    taffy.set_style(shape.inner, inner).unwrap();
+    taffy.set_style(shape.leaf, Style { size: Size { width: length(60.0), height: length(10.0) }, ..block() }).unwrap();
+    lay_out(&mut taffy, shape.root);
+    let before: Vec<_> = shape
+        .nodes()
+        .into_iter()
+        .map(|node| (taffy.dirty_generation(node).unwrap(), taffy.layout_generation(node).unwrap()))
+        .collect();
+    taffy.set_node_context(shape.leaf, Some(Size { width: 140.0, height: 90.0 })).unwrap();
+    lay_out(&mut taffy, shape.root);
+    for (node, before) in shape.above().into_iter().zip(before.iter()) {
+        // What an intrinsic width is kept by moves, the boxes and extents it does not.
+        assert_ne!(taffy.dirty_generation(node).unwrap(), before.0);
+        assert_eq!(
+            taffy.layout_generation(node).unwrap(),
+            before.1,
+            "{node:?}: {} item relayouts, {} boundary relayouts, {} fallbacks",
+            taffy.item_relayouts(),
+            taffy.boundary_relayouts(),
+            taffy.boundary_fallbacks()
+        );
+    }
+    // The leaf shows more of its content than it did, which the block around it clips: the box of the leaf is where it
+    // was, so nothing above it is another one.
+    assert_eq!(taffy.item_relayouts(), 2);
+    assert_eq!(taffy.boundary_relayouts(), 0);
+    assert_eq!(taffy.boundary_fallbacks(), 0);
 }
 
 #[test]

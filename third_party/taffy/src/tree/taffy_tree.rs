@@ -342,6 +342,10 @@ pub(crate) struct Probe {
     measured: Vec<(LayoutInput, LayoutOutput)>,
     /// The last placement (`RunMode::PerformLayout`), which the layout of the node in its parent is the result of.
     placed: SavedLayout,
+    /// Whether what changed under the node is no more than the context of a measured leaf: no style, no child list. A
+    /// change of that kind that leaves the answers of the node as they were leaves every box and extent above it as it
+    /// was (see [`TaffyTree::mark_dirty_chain`]).
+    content_only: bool,
 }
 
 /// Where a walk up from a change ended.
@@ -830,7 +834,7 @@ where
             }
             self.taffy.item_relayouts += 1;
             if !unchanged {
-                match self.taffy.mark_dirty_chain(parent, true, Some(root)) {
+                match self.taffy.mark_dirty_chain(parent, true, Some(root), probe.content_only) {
                     // The parent is one that answers as it did too, perhaps: the change went one level up.
                     Ended::AtNodeThatMayAnswerAsItDid(next) => {
                         if let Some(depth) = self.taffy.depth_under(next, root) {
@@ -1373,6 +1377,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
     #[inline]
     pub fn set_node_context(&mut self, node: NodeId, measure: Option<NodeContext>) -> TaffyResult<()> {
         let key = node.into();
+        let content_only = self.nodes[key].has_context && measure.is_some();
         if let Some(measure) = measure {
             self.nodes[key].has_context = true;
             self.node_context_data.insert(key, measure);
@@ -1381,7 +1386,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
             self.node_context_data.remove(key);
         }
 
-        self.mark_dirty_below(node, true);
+        self.mark_dirty_chain(node, true, None, content_only);
 
         Ok(())
     }
@@ -1662,14 +1667,27 @@ impl<NodeContext> TaffyTree<NodeContext> {
     ///
     /// fdarian fork patch.
     fn mark_dirty_below(&mut self, node: NodeId, node_is_boundary_candidate: bool) {
-        self.mark_dirty_chain(node, node_is_boundary_candidate, None);
+        self.mark_dirty_chain(node, node_is_boundary_candidate, None, false);
     }
 
     /// [`Self::mark_dirty_below`], for the layout of the subtree of `root` that is going on: the chain goes to `root`
     /// and on to the root of the tree when it did not end before.
     ///
+    /// `content_only`: the change is to the context of a measured leaf and to nothing else. The nodes above a node
+    /// that may answer as it did then keep their `layout_generation`, which the extents, scroll reaches and retained
+    /// layouts are kept by: they read the boxes, and a box that comes out another one moves the generation of every
+    /// ancestor when it is set (`differs_box`). A change to a style or a child list can change what they read (an
+    /// `overflow`, an `escapable`, a box that is gone) without any box being set, so it moves them. Both kinds move
+    /// `dirty_generation`, which an intrinsic width resolved from the content under a node is kept by.
+    ///
     /// fdarian fork patch.
-    fn mark_dirty_chain(&mut self, node: NodeId, node_is_boundary_candidate: bool, root: Option<NodeId>) -> Ended {
+    fn mark_dirty_chain(
+        &mut self,
+        node: NodeId,
+        node_is_boundary_candidate: bool,
+        root: Option<NodeId>,
+        content_only: bool,
+    ) -> Ended {
         let mut current = Some(node);
         let mut candidate = node_is_boundary_candidate;
         while let Some(node) = current {
@@ -1686,28 +1704,38 @@ impl<NodeContext> TaffyTree<NodeContext> {
                 self.soft_stop(node)
             };
             self.nodes[key].mark_dirty();
-            let soft = match stop {
+            let soft = !matches!(stop, Stop::Static);
+            match stop {
                 Stop::No => {
                     candidate = true;
                     current = self.parents[key];
                     continue;
                 }
-                Stop::Static => false,
-                Stop::Capture(probe) => {
+                Stop::Static => {}
+                Stop::Capture(mut probe) => {
+                    probe.content_only = content_only;
                     self.nodes[key].pending_probe = Some(probe);
-                    true
                 }
-                Stop::Waiting => true,
-            };
+                Stop::Waiting => {
+                    let probe = self.nodes[key].pending_probe.as_mut().expect("a node that waits has its probe");
+                    probe.content_only &= content_only;
+                }
+            }
             if !std::mem::replace(&mut self.nodes[key].pending_relayout, true) {
                 self.pending_boundaries.push(node);
             }
-            // The caches above stay, but a layout read from them has to know that something changed below.
+            // The caches above stay, but a layout read from them has to know that something changed below. A node that
+            // may answer as it did with a change to a context only leaves their `layout_generation` as it is (see above),
+            // and a box that comes out another one moves it when it is set: laying the nodes above it out again asked a
+            // scroller of 10k rows to walk its extent for a text that stayed in its box.
+            let keeps_layout_generation = soft && content_only;
             let mut ancestor = self.parents[key];
             while let Some(node) = ancestor {
                 let data = &mut self.nodes[node.into()];
                 data.dirty_generation += 1;
-                data.layout_generation += 1;
+                if !keeps_layout_generation {
+                    data.layout_generation += 1;
+                }
                 ancestor = self.parents[node.into()];
             }
             return if soft { Ended::AtNodeThatMayAnswerAsItDid(node) } else { Ended::AtStaticBoundary };
@@ -1778,7 +1806,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
             return Stop::No;
         };
         match data.cache.measured_questions() {
-            Some(measured) => Stop::Capture(Box::new(Probe { measured, placed: saved })),
+            Some(measured) => Stop::Capture(Box::new(Probe { measured, placed: saved, content_only: false })),
             None => Stop::No,
         }
     }
