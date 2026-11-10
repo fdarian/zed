@@ -2,7 +2,7 @@
 
 #![allow(clippy::unusual_byte_groupings)]
 
-use crate::geometry::Size;
+use crate::geometry::{Line, Size};
 use crate::style::AvailableSpace;
 use crate::tree::{CollapsibleMarginSet, LayoutInput, LayoutOutput, RunMode, SizingMode};
 use crate::RequestedAxis;
@@ -97,6 +97,48 @@ const KNOWN_HEIGHT: u8 = 1 << 6;
 /// Whether the known height is not one the children of the node resolve a percentage against (`height_from_containment`).
 const HEIGHT_INDEFINITE: u8 = 1 << 7;
 
+impl CacheKey {
+    /// An input that has this key: what a node was asked when the entry was stored, as far as the key tells.
+    ///
+    /// A dimension that was known has no available space in the key (a known dimension is the space the node has), so it
+    /// is available as that.
+    ///
+    /// fdarian fork patch: relayout boundaries.
+    fn input(&self, run_mode: RunMode) -> LayoutInput {
+        let flag = |bit: u8| self.modes & bit != 0;
+        let option = |bits: u32| (bits != INFINITY_BITS).then(|| f32::from_bits(bits));
+        let kd_available = |bits: u32, known: bool| {
+            if known {
+                let value = f32::from_bits(bits);
+                (Some(value), AvailableSpace::Definite(value))
+            } else if bits == NEG_INFINITY_BITS {
+                (None, AvailableSpace::MinContent)
+            } else if bits == INFINITY_BITS {
+                (None, AvailableSpace::MaxContent)
+            } else {
+                (None, AvailableSpace::Definite(-f32::from_bits(bits)))
+            }
+        };
+        let (known_width, available_width) = kd_available((self.kd_available_space >> 32) as u32, flag(KNOWN_WIDTH));
+        let (known_height, available_height) = kd_available(self.kd_available_space as u32, flag(KNOWN_HEIGHT));
+        let axis = match (flag(AXIS_HORIZONTAL), flag(AXIS_VERTICAL)) {
+            (true, false) => RequestedAxis::Horizontal,
+            (false, true) => RequestedAxis::Vertical,
+            _ => RequestedAxis::Both,
+        };
+        LayoutInput {
+            run_mode,
+            sizing_mode: if flag(MODE_CONTENT_SIZE) { SizingMode::ContentSize } else { SizingMode::InherentSize },
+            axis,
+            known_dimensions: Size { width: known_width, height: known_height },
+            parent_size: Size { width: option((self.parent_size >> 32) as u32), height: option(self.parent_size as u32) },
+            available_space: Size { width: available_width, height: available_height },
+            vertical_margins_are_collapsible: Line { start: flag(MODE_COLLAPSIBLE_START), end: flag(MODE_COLLAPSIBLE_END) },
+            height_from_containment: flag(HEIGHT_INDEFINITE),
+        }
+    }
+}
+
 impl From<&LayoutInput> for CacheKey {
     fn from(input: &LayoutInput) -> Self {
         let axis = match input.axis {
@@ -181,6 +223,11 @@ pub struct Cache {
     measure_hand: usize,
     /// Tracks if all cache entries are empty
     is_empty: bool,
+    /// Whether a size measurement was evicted since the cache was cleared, so that it does not hold every question that was
+    /// asked of the node (see [`Cache::measured_questions`]).
+    ///
+    /// fdarian fork patch: relayout boundaries.
+    measure_evicted: bool,
 }
 
 impl Default for Cache {
@@ -198,6 +245,7 @@ impl Cache {
             measure_referenced: [false; CACHE_SIZE],
             measure_hand: 0,
             is_empty: true,
+            measure_evicted: false,
         }
     }
 
@@ -244,6 +292,7 @@ impl Cache {
             let index = self.measure_hand;
             self.measure_hand = (index + 1) % CACHE_SIZE;
             if !self.measure_referenced[index] {
+                self.measure_evicted = true;
                 return index;
             }
             self.measure_referenced[index] = false;
@@ -260,7 +309,26 @@ impl Cache {
         self.measure_entries = [None; CACHE_SIZE];
         self.measure_referenced = [false; CACHE_SIZE];
         self.measure_hand = 0;
+        self.measure_evicted = false;
         ClearState::Cleared
+    }
+
+    /// Every size measurement the cache holds, as the question that was asked and the answer given, or `None` when one
+    /// was evicted and the list is not all the node was asked since the cache was cleared. A parent that kept its results
+    /// when the node changed is right as long as the node answers each of these as it did.
+    ///
+    /// fdarian fork patch: relayout boundaries.
+    pub(crate) fn measured_questions(&self) -> Option<Vec<(LayoutInput, LayoutOutput)>> {
+        if self.measure_evicted {
+            return None;
+        }
+        Some(
+            self.measure_entries
+                .iter()
+                .flatten()
+                .map(|entry| (entry.key.input(RunMode::ComputeSize), entry.content.output()))
+                .collect(),
+        )
     }
 
     /// Whether the node was laid out (`RunMode::PerformLayout`) since the cache was cleared. Entries of size
@@ -269,6 +337,13 @@ impl Cache {
     /// fdarian fork patch.
     pub fn has_final_layout(&self) -> bool {
         self.final_layout_entry.is_some()
+    }
+
+    /// Forgets the final layout of the node, that the layout below it may not be the result of anymore.
+    ///
+    /// fdarian fork patch: relayout boundaries.
+    pub(crate) fn forget_final_layout(&mut self) {
+        self.final_layout_entry = None;
     }
 
     /// Returns true if all cache entries are None, else false
@@ -333,6 +408,46 @@ mod tests {
                 assert!(cache.get(&LayoutInput { run_mode: sizes, ..other }).is_none(), "{other:?}");
             }
         }
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn the_questions_of_a_cache_are_asked_again_with_the_keys_they_were_stored_with() {
+        let known = input();
+        let open = LayoutInput {
+            known_dimensions: Size::NONE,
+            parent_size: Size { width: None, height: Some(-12.5) },
+            available_space: Size { width: AvailableSpace::MinContent, height: AvailableSpace::Definite(80.0) },
+            axis: RequestedAxis::Horizontal,
+            sizing_mode: SizingMode::ContentSize,
+            vertical_margins_are_collapsible: Line { start: true, end: false },
+            height_from_containment: true,
+            ..known
+        };
+        let mut cache = Cache::new();
+        for asked in [known, open] {
+            cache.store(&asked, LayoutOutput::from_outer_size(Size { width: 1.0, height: 2.0 }));
+        }
+        let questions = cache.measured_questions().unwrap();
+        assert_eq!(questions.len(), 2);
+        for (question, answer) in questions {
+            assert_eq!(answer.size, Size { width: 1.0, height: 2.0 });
+            assert_eq!(CacheKey::from(&question), CacheKey::from(&if question.axis == known.axis { known } else { open }));
+            assert!(cache.get(&question).is_some());
+        }
+    }
+
+    // fdarian fork patch.
+    #[test]
+    fn a_cache_that_evicted_a_measurement_does_not_list_its_questions() {
+        let mut cache = Cache::new();
+        for width in 0..(CACHE_SIZE + 1) {
+            let asked = LayoutInput { known_dimensions: Size { width: Some(width as f32), height: None }, ..input() };
+            cache.store(&asked, LayoutOutput::from_outer_size(Size { width: 1.0, height: 2.0 }));
+        }
+        assert!(cache.measured_questions().is_none());
+        cache.clear();
+        assert_eq!(cache.measured_questions().unwrap().len(), 0);
     }
 
     // fdarian fork patch.

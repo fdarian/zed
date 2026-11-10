@@ -148,7 +148,7 @@ fn the_nodes_above_a_boundary_keep_their_results_and_know_that_something_changed
     for node in shape.above() {
         assert!(!taffy.dirty(node).unwrap(), "the cache of {node:?} is kept");
     }
-    assert!(taffy.dirty(shape.subject).unwrap());
+    // The leaf waits for its own layout, and the subject, which answers what its parent asked or does not, for it.
     assert!(taffy.dirty(shape.leaf).unwrap());
     for (node, before) in shape.above().into_iter().zip(before) {
         assert_ne!(taffy.dirty_generation(node).unwrap(), before.0);
@@ -261,7 +261,9 @@ fn a_change_to_the_style_of_a_boundary_lays_out_the_nodes_above_it() {
     style.size.width = length(150.0);
     style.padding = Rect { left: length(4.0), right: length(4.0), top: length(4.0), bottom: length(4.0) };
     taffy.set_style(shape.subject, style.clone()).unwrap();
-    assert!(taffy.dirty(shape.root).unwrap());
+    // The parent reads the style of the subject, so it is the one that is laid out again.
+    assert!(taffy.dirty(shape.subject).unwrap());
+    assert!(taffy.dirty(shape.parent).unwrap());
     lay_out(&mut taffy, shape.root);
 
     let mut fresh = new_tree();
@@ -320,9 +322,10 @@ fn a_boundary_that_is_not_under_the_root_laid_out_stays_pending() {
 
     taffy.set_node_context(shape.leaf, Some(Size { width: 90.0, height: 40.0 })).unwrap();
     lay_out(&mut taffy, shape.cousin);
-    assert!(taffy.dirty(shape.subject).unwrap());
-    assert_eq!(taffy.boundary_relayouts(), 0);
+    assert!(taffy.dirty(shape.leaf).unwrap());
+    assert_eq!(taffy.boundary_relayouts() + taffy.item_relayouts(), 0);
     lay_out(&mut taffy, shape.root);
+    assert!(!taffy.dirty(shape.leaf).unwrap());
     assert!(!taffy.dirty(shape.subject).unwrap());
     assert_eq!(taffy.boundary_relayouts(), 1);
 }
@@ -355,6 +358,282 @@ fn turning_boundaries_off_dirties_the_chain_to_the_root() {
     lay_out(&mut taffy, shape.root);
     taffy.set_node_context(shape.leaf, Some(Size { width: 90.0, height: 40.0 })).unwrap();
     assert!(taffy.dirty(shape.root).unwrap());
+}
+
+// Nodes that keep the results of their parent while they answer what the parent asked, in a flex, block or grid
+// parent: root > parent > ROWS x (row > inner > leaf). A parent that lays its items out again runs its algorithm once and
+// finds the other rows in their caches, so what tells it from one that did not is a run more than the chain of the item.
+
+const ROWS: usize = 20;
+
+struct Scene {
+    description: Description,
+    taffy: Tree,
+    root: NodeId,
+}
+
+fn flex_column() -> Style {
+    Style { display: Display::Flex, flex_direction: FlexDirection::Column, ..Default::default() }
+}
+
+fn one_column_grid() -> Style {
+    use crate::style::GridTemplateComponent;
+    Style {
+        display: Display::Grid,
+        grid_template_columns: vec![GridTemplateComponent::Single(crate::style_helpers::fr(1.0f32))],
+        ..Default::default()
+    }
+}
+
+/// A row of the height of 20 that clips: what its content does is no concern of its parent.
+fn fixed_row() -> Style {
+    Style {
+        size: Size { width: auto(), height: length(20.0) },
+        overflow: Point { x: Overflow::Hidden, y: Overflow::Hidden },
+        flex_shrink: 0.0,
+        ..block()
+    }
+}
+
+/// A leaf of a width and a height of its own, as a label in a box of its size: what it is measured as does not matter.
+fn fixed_leaf() -> Style {
+    Style { size: Size { width: length(60.0), height: length(30.0) }, ..block() }
+}
+
+/// A leaf of a width of its own and a height that follows what it is measured as.
+fn tall_leaf() -> Style {
+    Style { size: Size { width: length(60.0), height: auto() }, ..block() }
+}
+
+/// A row as tall as what it holds.
+fn open_row() -> Style {
+    Style { flex_shrink: 0.0, ..block() }
+}
+
+fn scene(root_style: Style, parent_style: Style, row_style: Style) -> Scene {
+    scene_with_leaf(root_style, parent_style, row_style, Size { width: 60.0, height: 10.0 }, block())
+}
+
+/// `leaf_style` is the style of the leaf of every row, `leaf` what it is measured as.
+fn scene_with_leaf(
+    root_style: Style,
+    parent_style: Style,
+    row_style: Style,
+    leaf: Size<f32>,
+    leaf_style: Style,
+) -> Scene {
+    let row = |_: usize| Description {
+        style: row_style.clone(),
+        context: None,
+        children: vec![Description {
+            style: block(),
+            context: None,
+            children: vec![Description {
+                style: leaf_style.clone(),
+                context: Some(leaf),
+                children: Vec::new(),
+            }],
+        }],
+    };
+    let description = Description {
+        style: root_style,
+        context: None,
+        children: vec![Description {
+            style: parent_style,
+            context: None,
+            children: (0..ROWS).map(row).collect(),
+        }],
+    };
+    let mut taffy = new_tree();
+    let root = build(&mut taffy, &description);
+    lay_out(&mut taffy, root);
+    Scene { description, taffy, root }
+}
+
+impl Scene {
+    fn parent(&self) -> NodeId {
+        node_at(&self.taffy, self.root, &[0])
+    }
+
+    fn row(&self, index: usize) -> NodeId {
+        node_at(&self.taffy, self.root, &[0, index])
+    }
+
+    fn leaf_path(index: usize) -> [usize; 4] {
+        [0, index, 0, 0]
+    }
+
+    fn set_leaf(&mut self, index: usize, size: Size<f32>) {
+        let path = Self::leaf_path(index);
+        let leaf = node_at(&self.taffy, self.root, &path);
+        description_at(&mut self.description, &path).context = Some(size);
+        self.taffy.set_node_context(leaf, Some(size)).unwrap();
+    }
+
+    fn set_style(&mut self, path: &[usize], style: Style) {
+        let node = node_at(&self.taffy, self.root, path);
+        description_at(&mut self.description, path).style = style.clone();
+        self.taffy.set_style(node, style).unwrap();
+    }
+
+    /// Lays the tree out and returns the nodes it laid out, after checking that the layout is the one of a tree built
+    /// new from the description.
+    fn lay_out(&mut self) -> u64 {
+        let before = self.taffy.layout_runs();
+        lay_out(&mut self.taffy, self.root);
+        let laid_out = self.taffy.layout_runs() - before;
+        let mut fresh = new_tree();
+        let fresh_root = build(&mut fresh, &self.description);
+        lay_out(&mut fresh, fresh_root);
+        if let Some(difference) = difference(&self.taffy, self.root, &fresh, fresh_root, &mut Vec::new()) {
+            panic!("not the layout of a new tree\n{difference}");
+        }
+        laid_out
+    }
+}
+
+fn parents() -> [(&'static str, Style); 3] {
+    [("a flex column", flex_column()), ("a block", block()), ("a grid", one_column_grid())]
+}
+
+#[test]
+fn a_change_inside_an_item_that_answers_as_it_did_lays_out_its_subtree_and_not_its_parent() {
+    for (name, parent) in parents() {
+        let mut scene =
+            scene_with_leaf(block(), parent, fixed_row(), Size { width: 60.0, height: 30.0 }, fixed_leaf());
+        // What the leaf is measured as changes, the box it is in does not.
+        scene.set_leaf(7, Size { width: 90.0, height: 50.0 });
+        assert!(!scene.taffy.dirty(scene.parent()).unwrap(), "{name}: the parent keeps its results");
+        for index in 0..ROWS {
+            assert!(!scene.taffy.dirty(scene.row(index)).unwrap(), "{name}: the row {index} is not touched");
+        }
+        let laid_out = scene.lay_out();
+        assert!(laid_out <= 3, "{name}: {laid_out} nodes laid out");
+        assert!(scene.taffy.item_relayouts() >= 1, "{name}");
+        assert_eq!(scene.taffy.boundary_fallbacks(), 0, "{name}");
+    }
+}
+
+#[test]
+fn a_change_that_climbs_to_the_row_stops_there_when_the_row_answers_as_it_did() {
+    // A flex column also asks for the height the content of an item would have (to find its automatic minimum), which a
+    // taller leaf changes, so only a block and a grid keep their results.
+    for (name, parent) in [("a block", block()), ("a grid", one_column_grid())] {
+        let mut scene =
+            scene_with_leaf(block(), parent, fixed_row(), Size { width: 60.0, height: 30.0 }, tall_leaf());
+        scene.set_leaf(7, Size { width: 90.0, height: 40.0 });
+        let laid_out = scene.lay_out();
+        // The leaf, the block around it and the row.
+        assert_eq!(laid_out, 3, "{name}");
+        assert_eq!(scene.taffy.boundary_fallbacks(), 0, "{name}");
+    }
+    let mut scene =
+        scene_with_leaf(block(), flex_column(), fixed_row(), Size { width: 60.0, height: 30.0 }, tall_leaf());
+    scene.set_leaf(7, Size { width: 90.0, height: 40.0 });
+    assert!(scene.lay_out() >= 4);
+}
+
+#[test]
+fn a_change_that_the_parent_reads_from_the_item_lays_the_parent_out_again() {
+    for (name, parent) in parents() {
+        let mut scene = scene(block(), parent, open_row());
+        // The row is as tall as the leaf now.
+        scene.set_leaf(7, Size { width: 60.0, height: 40.0 });
+        let laid_out = scene.lay_out();
+        assert!(laid_out >= 4, "{name}: {laid_out} nodes laid out");
+        assert_eq!(scene.taffy.layout(scene.row(7)).unwrap().size.height, 40.0, "{name}");
+        assert_eq!(scene.taffy.layout(scene.row(8)).unwrap().location.y, 7.0 * 10.0 + 40.0, "{name}");
+    }
+}
+
+#[test]
+fn a_change_to_the_style_of_an_item_lays_the_parent_out_again() {
+    for (name, parent) in parents() {
+        let mut scene = scene(block(), parent, fixed_row());
+        // Nothing the row answers is different, but the parent reads its margin and its flex properties itself.
+        let mut style = fixed_row();
+        style.margin = Rect { left: length(8.0), right: zero(), top: length(6.0), bottom: zero() };
+        style.flex_grow = 1.0;
+        scene.set_style(&[0, 7], style);
+        let laid_out = scene.lay_out();
+        assert!(laid_out >= 4, "{name}: {laid_out} nodes laid out");
+        assert_eq!(scene.taffy.layout(scene.row(7)).unwrap().location.x, 8.0, "{name}");
+    }
+}
+
+#[test]
+fn a_change_to_the_style_of_a_node_inside_an_item_stops_at_the_item() {
+    for (name, parent) in parents() {
+        let mut scene =
+            scene_with_leaf(block(), parent, fixed_row(), Size { width: 60.0, height: 30.0 }, fixed_leaf());
+        // A style that is no other box: only what the row asks of it, and answers, could say what changed.
+        scene.set_style(&[0, 7, 0], Style { flex_grow: 1.0, ..block() });
+        let laid_out = scene.lay_out();
+        assert!(laid_out <= 3, "{name}: {laid_out} nodes laid out");
+    }
+}
+
+#[test]
+fn a_margin_that_collapses_through_an_item_is_one_of_its_answers() {
+    let mut scene = scene(block(), block(), open_row());
+    let mut leaf = block();
+    leaf.margin = Rect { left: zero(), right: zero(), top: length(12.0), bottom: zero() };
+    scene.set_style(&Scene::leaf_path(7), leaf.clone());
+    scene.lay_out();
+    leaf.margin.top = length(30.0);
+    scene.set_style(&Scene::leaf_path(7), leaf);
+    let laid_out = scene.lay_out();
+    assert!(laid_out >= 4, "{laid_out} nodes laid out");
+}
+
+#[test]
+fn a_stretched_item_whose_max_content_width_changes_lays_out_a_container_that_is_as_wide_as_its_items() {
+    // An absolute flex column has no width of its own: it is as wide as its widest item, and the items stretch to it.
+    let parent = Style {
+        position: Position::Absolute,
+        inset: Rect { left: length(0.0), right: auto(), top: length(0.0), bottom: auto() },
+        ..flex_column()
+    };
+    let mut scene = scene(block(), parent, open_row());
+    assert_eq!(scene.taffy.layout(scene.parent()).unwrap().size.width, 60.0);
+    scene.set_leaf(7, Size { width: 140.0, height: 10.0 });
+    let laid_out = scene.lay_out();
+    assert!(laid_out >= 4, "{laid_out} nodes laid out");
+    assert_eq!(scene.taffy.layout(scene.parent()).unwrap().size.width, 140.0);
+    assert_eq!(scene.taffy.layout(scene.row(3)).unwrap().size.width, 140.0);
+}
+
+#[test]
+fn a_baseline_aligned_item_is_laid_out_with_its_parent() {
+    let parent = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        align_items: Some(AlignItems::BASELINE),
+        ..Default::default()
+    };
+    let mut scene = scene(block(), parent, fixed_row());
+    scene.set_leaf(7, Size { width: 90.0, height: 40.0 });
+    scene.lay_out();
+}
+
+#[test]
+fn a_tree_with_a_float_keeps_the_chain_to_the_root_for_the_items_of_a_block() {
+    let mut scene = scene(block(), block(), fixed_row());
+    scene.set_style(&[0, 3], Style { float: crate::Float::Left, ..fixed_row() });
+    scene.lay_out();
+    scene.set_leaf(7, Size { width: 90.0, height: 40.0 });
+    let laid_out = scene.lay_out();
+    assert!(laid_out >= 4, "{laid_out} nodes laid out");
+}
+
+#[test]
+fn turning_boundaries_off_lays_the_parent_of_an_item_out_again() {
+    let mut scene = scene(block(), flex_column(), fixed_row());
+    scene.taffy.set_relayout_boundaries(false);
+    scene.set_leaf(7, Size { width: 90.0, height: 40.0 });
+    assert!(scene.taffy.dirty(scene.parent()).unwrap());
+    let laid_out = scene.lay_out();
+    assert!(laid_out >= 4, "{laid_out} nodes laid out");
 }
 
 // A differential fuzz: random trees, random edits, and after every edit the layout of the tree that lives through

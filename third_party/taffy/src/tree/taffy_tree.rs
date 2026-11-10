@@ -6,10 +6,11 @@ use slotmap::SparseSecondaryMap as SecondaryMap;
 use slotmap::{DefaultKey, SlotMap};
 
 #[cfg(feature = "block_layout")]
-use crate::block::BlockContext;
+use crate::block::{BlockContext, BlockFormattingContext};
 use crate::geometry::Size;
 use crate::style::{
-    AvailableSpace, CompactLength, Dimension, Display, LengthPercentageAuto, Overflow, Position, Style, TableRole,
+    AlignSelf, AvailableSpace, CompactLength, Dimension, Display, LengthPercentageAuto, Overflow, Position, Style,
+    TableRole,
 };
 use crate::sys::DefaultCheapStr;
 use crate::tree::{
@@ -272,6 +273,13 @@ struct NodeData {
     /// fdarian fork patch: relayout boundaries.
     pub(crate) pending_relayout: bool,
 
+    /// What the parent had from this node before a change below it cleared the cache, when the node is waiting in
+    /// [`TaffyTree::pending_boundaries`] as one that is a boundary for as long as it answers as it did (see
+    /// [`TaffyTree::mark_dirty_below`]). Static boundaries have none.
+    ///
+    /// fdarian fork patch: relayout boundaries.
+    pub(crate) pending_probe: Option<Box<Probe>>,
+
     /// The computation result from layout algorithm
     #[cfg(feature = "detailed_layout_info")]
     pub(crate) detailed_layout_info: DetailedLayoutInfo,
@@ -290,6 +298,7 @@ impl NodeData {
             reached: 0,
             saved_layout: None,
             pending_relayout: false,
+            pending_probe: None,
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             has_context: false,
@@ -320,6 +329,40 @@ impl NodeData {
 pub(crate) struct SavedLayout {
     pub(crate) input: LayoutInput,
     pub(crate) output: LayoutOutput,
+}
+
+/// Every question the parent of a node asked it that the node's cache held, and the answers: what the parent's
+/// results rest on. The node is laid out again with each, and the parent keeps its results when the answers are
+/// the same.
+///
+/// fdarian fork patch: relayout boundaries.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Probe {
+    /// The size measurements (`RunMode::ComputeSize`).
+    measured: Vec<(LayoutInput, LayoutOutput)>,
+    /// The last placement (`RunMode::PerformLayout`), which the layout of the node in its parent is the result of.
+    placed: SavedLayout,
+}
+
+/// Where a walk up from a change ended.
+enum Ended {
+    /// At a node that is laid out again only if it answers what its parent asked as it did.
+    AtNodeThatMayAnswerAsItDid(NodeId),
+    /// At a relayout boundary that is one whatever the node answers.
+    AtStaticBoundary,
+    /// At the root, or the root of the layout that is going on.
+    AtRoot,
+}
+
+/// What a walk up from a change to the root stops for.
+enum Stop {
+    No,
+    /// A relayout boundary that is one whatever the node answers.
+    Static,
+    /// A node that keeps its parent's results as long as it answers what `Probe` holds, which was not taken yet.
+    Capture(Box<Probe>),
+    /// The same, for a node that is waiting already with its `Probe`.
+    Waiting,
 }
 
 /// An entire tree of UI nodes. The entry point to Taffy's high-level API.
@@ -378,6 +421,19 @@ pub struct TaffyTree<NodeContext = ()> {
     ///
     /// fdarian fork patch.
     boundary_fallbacks: u64,
+
+    /// How many nodes that keep the results of their parent if they answer as they did were laid out again on their
+    /// own (see [`TaffyTree::soft_stop`]).
+    ///
+    /// fdarian fork patch.
+    item_relayouts: u64,
+
+    /// Whether a node with a `float` or a `clear` style was ever in the tree. A float is placed by what the block
+    /// formatting context around it holds and not by what the parent asked, so a node of a block whose layout is
+    /// laid out again alone could come to another place.
+    ///
+    /// fdarian fork patch: relayout boundaries.
+    floats_seen: bool,
 
     /// Bumped whenever a node's stored layout changes in size, location, border, padding or scrollbar size: see
     /// [`TaffyTree::box_generation`]. Never reset, not even by [`TaffyTree::clear`].
@@ -565,7 +621,8 @@ where
             debug_log_node!(inputs);
 
             // Dispatch to a layout algorithm based on the node's display style and whether the node has children or not.
-            match (display_mode, has_children) {
+            let runs_before = tree.taffy.layout_runs;
+            let computed = match (display_mode, has_children) {
                 (Display::None, _) => compute_hidden_layout(tree, node_id),
                 #[cfg(feature = "block_layout")]
                 // fdarian fork patch: a box with size or layout containment is a container, which lays
@@ -596,7 +653,15 @@ where
                     };
                     compute_leaf_layout(inputs, style, resolve_linear_calc, measure_function)
                 }
+            };
+            // fdarian fork patch: relayout boundaries. A measurement that placed a node under this one (a flex or grid
+            // container does, to find the baseline of its items) wrote the layout of what is under that node as the
+            // measurement asked, not as the last placement of this node did, so that placement no longer is what the
+            // layout below it is the result of: a later placement with its input would be taken from the cache.
+            if inputs.run_mode == RunMode::ComputeSize && tree.taffy.layout_runs != runs_before {
+                tree.taffy.nodes[node_id.into()].cache.forget_final_layout();
             }
+            computed
         });
         // fdarian fork patch: a scroll container's baseline is clamped to its border box, wherever a parent
         // takes it from (Blink's `LogicalBoxFragment::FirstBaseline`, logical_box_fragment.h).
@@ -689,6 +754,121 @@ where
         }
         self.taffy.pending_boundaries.extend(waiting);
     }
+}
+
+impl<NodeContext, MeasureFunction> TaffyView<'_, NodeContext, MeasureFunction>
+where
+    MeasureFunction:
+        FnMut(Size<Option<f32>>, Size<AvailableSpace>, NodeId, Option<&mut NodeContext>, &Style, RunMode) -> MeasuredLeaf,
+{
+    /// Lays out again, under every question its parent asked it, each node under `root` that a change below cleared the
+    /// cache of and that keeps the results of its parent if it answers as it did (see [`TaffyTree::soft_stop`]), the
+    /// one deepest first. It runs before the layout from `root`, which would ask the parent new questions of a node that
+    /// holds a change its other results do not know of.
+    ///
+    /// A node that answers otherwise lets its parent have the change: it is the one to be laid out again, with its
+    /// own questions, or the chain goes on to `root`.
+    ///
+    /// fdarian fork patch.
+    fn lay_out_changed_nodes(&mut self, root: NodeId) {
+        let mut kept = Vec::new();
+        let mut ready: Vec<(usize, NodeId)> = Vec::new();
+        for node in std::mem::take(&mut self.taffy.pending_boundaries) {
+            let Some(data) = self.taffy.nodes.get_mut(node.into()) else {
+                continue;
+            };
+            if data.pending_probe.is_none() {
+                kept.push(node);
+            } else if data.cache.has_final_layout() || data.saved_layout.is_none() {
+                data.pending_relayout = false;
+                data.pending_probe = None;
+            } else {
+                match self.taffy.depth_under(node, root) {
+                    Some(depth) => ready.push((depth, node)),
+                    None => kept.push(node),
+                }
+            }
+        }
+        self.taffy.pending_boundaries = kept;
+
+        while let Some(index) = (0..ready.len()).max_by_key(|index| ready[*index].0) {
+            let (_, node) = ready.swap_remove(index);
+            let key = node.into();
+            let data = &mut self.taffy.nodes[key];
+            data.pending_relayout = false;
+            let Some(probe) = data.pending_probe.take() else { continue };
+            // A parent that was cleared since is laid out again by a layout that asks the node anew: a layout of the node
+            // under the old questions would leave a result in its cache that such a layout could take for the answer to
+            // another (a flex container that measures its items by their baseline places them with a layout of their
+            // own, in a measurement too, which writes the layout of what is under them).
+            // A node that has no parent anymore is laid out as a root of its own, from the cache it has now.
+            let Some(parent) = self.taffy.parents[key] else { continue };
+            let parent_was_cleared = node != root && !self.taffy.nodes[parent.into()].cache.has_final_layout();
+            if self.taffy.nodes[key].cache.has_final_layout() || parent_was_cleared {
+                continue;
+            }
+
+            let mut unchanged = true;
+            for (input, before) in &probe.measured {
+                let after = self.compute_again(node, *input);
+                if !measured_answer_is_unchanged(before, &after) {
+                    unchanged = false;
+                    break;
+                }
+            }
+            if unchanged {
+                // Last, as a parent does it: the measurements and then the placement, which the layout under the node
+                // is the result of.
+                let output = self.compute_again(node, probe.placed.input);
+                unchanged = boundary_answer_is_unchanged(&probe.placed.output, &output, &self.taffy.nodes[key].style);
+                #[cfg(feature = "content_size")]
+                if unchanged && output.content_size != probe.placed.output.content_size {
+                    let mut layout = self.taffy.nodes[key].unrounded_layout;
+                    layout.content_size = output.content_size;
+                    self.set_unrounded_layout(node, &layout);
+                }
+            }
+            self.taffy.item_relayouts += 1;
+            if !unchanged {
+                match self.taffy.mark_dirty_chain(parent, true, Some(root)) {
+                    // The parent is one that answers as it did too, perhaps: the change went one level up.
+                    Ended::AtNodeThatMayAnswerAsItDid(next) => {
+                        if let Some(depth) = self.taffy.depth_under(next, root) {
+                            ready.push((depth, next));
+                        }
+                    }
+                    Ended::AtStaticBoundary => {}
+                    Ended::AtRoot => self.taffy.boundary_fallbacks += 1,
+                }
+            }
+        }
+        let nodes = &self.taffy.nodes;
+        self.taffy.pending_boundaries.retain(|node| nodes.get((*node).into()).is_some_and(|data| data.pending_relayout));
+    }
+
+    /// Lays `node` out as its parent did when it asked `input`: a block in whose formatting context it is (its top and
+    /// bottom margins may collapse with its parent's) is given a context of one, which is all there is to it while no
+    /// float is in the tree.
+    fn compute_again(&mut self, node: NodeId, input: LayoutInput) -> LayoutOutput {
+        #[cfg(feature = "block_layout")]
+        if input.vertical_margins_are_collapsible.start || input.vertical_margins_are_collapsible.end {
+            let mut formatting_context = BlockFormattingContext::new();
+            let mut root = formatting_context.root_block_context();
+            let mut context = root.sub_context(0.0, [0.0, 0.0]);
+            return self.compute_child_layout(node, input, Some(&mut context));
+        }
+        LayoutPartialTree::compute_child_layout(self, node, input)
+    }
+}
+
+/// Whether a node, laid out again for a size measurement, answers what its parent has read from it.
+///
+/// fdarian fork patch.
+fn measured_answer_is_unchanged(before: &LayoutOutput, after: &LayoutOutput) -> bool {
+    before.size == after.size
+        && before.top_margin == after.top_margin
+        && before.bottom_margin == after.bottom_margin
+        && before.margins_can_collapse_through == after.margins_can_collapse_through
 }
 
 /// Whether a boundary, laid out again, answers what its parent has read from it: its size, its baselines and
@@ -1003,6 +1183,8 @@ impl<NodeContext> TaffyTree<NodeContext> {
             relayout_boundaries: true,
             boundary_relayouts: 0,
             boundary_fallbacks: 0,
+            floats_seen: false,
+            item_relayouts: 0,
             box_generation: 0,
             layout_changes: None,
         }
@@ -1039,6 +1221,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
 
     /// Creates and adds a new unattached leaf node to the tree, and returns the node of the new node
     pub fn new_leaf(&mut self, layout: Style) -> TaffyResult<NodeId> {
+        self.note_floats(&layout);
         let id = self.nodes.insert(NodeData::new(layout));
         let _ = self.children.insert(new_vec_with_capacity(0));
         let _ = self.parents.insert(None);
@@ -1050,6 +1233,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
     ///
     /// Creates and adds a new leaf node with a supplied context
     pub fn new_leaf_with_context(&mut self, layout: Style, context: NodeContext) -> TaffyResult<NodeId> {
+        self.note_floats(&layout);
         let mut data = NodeData::new(layout);
         data.has_context = true;
 
@@ -1064,6 +1248,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
 
     /// Creates and adds a new node, which may have any number of `children`
     pub fn new_with_children(&mut self, layout: Style, children: &[NodeId]) -> TaffyResult<NodeId> {
+        self.note_floats(&layout);
         let id = NodeId::from(self.nodes.insert(NodeData::new(layout)));
 
         for child in children {
@@ -1410,9 +1595,19 @@ impl<NodeContext> TaffyTree<NodeContext> {
         if self.nodes[node.into()].style == style {
             return Ok(());
         }
+        self.note_floats(&style);
         self.nodes[node.into()].style = style;
         self.mark_dirty(node)?;
         Ok(())
+    }
+
+    fn note_floats(&mut self, style: &Style) {
+        #[cfg(feature = "float_layout")]
+        if style.float != crate::Float::None || style.clear != crate::Clear::None {
+            self.floats_seen = true;
+        }
+        #[cfg(not(feature = "float_layout"))]
+        let _ = style;
     }
 
     /// Gets the [`Style`] of the provided `node`
@@ -1462,31 +1657,129 @@ impl<NodeContext> TaffyTree<NodeContext> {
     }
 
     /// [`Self::mark_dirty`] for a change to what is inside `node`, or to the context it is measured by. The chain of
-    /// ancestors ends at the first relayout boundary (see [`Self::is_relayout_boundary`]), `node` included.
+    /// ancestors ends at the first node that is a boundary for the change (see [`Self::is_relayout_boundary`] and
+    /// [`Self::soft_stop`]), `node` included.
     ///
     /// fdarian fork patch.
     fn mark_dirty_below(&mut self, node: NodeId, node_is_boundary_candidate: bool) {
+        self.mark_dirty_chain(node, node_is_boundary_candidate, None);
+    }
+
+    /// [`Self::mark_dirty_below`], for the layout of the subtree of `root` that is going on: the chain goes to `root`
+    /// and on to the root of the tree when it did not end before.
+    ///
+    /// fdarian fork patch.
+    fn mark_dirty_chain(&mut self, node: NodeId, node_is_boundary_candidate: bool, root: Option<NodeId>) -> Ended {
         let mut current = Some(node);
         let mut candidate = node_is_boundary_candidate;
         while let Some(node) = current {
             let key = node.into();
-            self.nodes[key].mark_dirty();
-            if candidate && self.is_relayout_boundary(node) {
-                if !std::mem::replace(&mut self.nodes[key].pending_relayout, true) {
-                    self.pending_boundaries.push(node);
-                }
-                // The caches above stay, but a layout read from them has to know that something changed below.
-                let mut ancestor = self.parents[key];
-                while let Some(node) = ancestor {
-                    let data = &mut self.nodes[node.into()];
-                    data.dirty_generation += 1;
-                    data.layout_generation += 1;
-                    ancestor = self.parents[node.into()];
-                }
-                return;
+            if root == Some(node) {
+                self.mark_dirty_to_root(node);
+                return Ended::AtRoot;
             }
-            candidate = true;
-            current = self.parents[key];
+            let stop = if !candidate {
+                Stop::No
+            } else if self.is_relayout_boundary(node) {
+                Stop::Static
+            } else {
+                self.soft_stop(node)
+            };
+            self.nodes[key].mark_dirty();
+            let soft = match stop {
+                Stop::No => {
+                    candidate = true;
+                    current = self.parents[key];
+                    continue;
+                }
+                Stop::Static => false,
+                Stop::Capture(probe) => {
+                    self.nodes[key].pending_probe = Some(probe);
+                    true
+                }
+                Stop::Waiting => true,
+            };
+            if !std::mem::replace(&mut self.nodes[key].pending_relayout, true) {
+                self.pending_boundaries.push(node);
+            }
+            // The caches above stay, but a layout read from them has to know that something changed below.
+            let mut ancestor = self.parents[key];
+            while let Some(node) = ancestor {
+                let data = &mut self.nodes[node.into()];
+                data.dirty_generation += 1;
+                data.layout_generation += 1;
+                ancestor = self.parents[node.into()];
+            }
+            return if soft { Ended::AtNodeThatMayAnswerAsItDid(node) } else { Ended::AtStaticBoundary };
+        }
+        Ended::AtRoot
+    }
+
+    /// Whether `node`, that a change below cleared the cache of, can keep the results of its parent as long as it
+    /// answers every question its parent asked it as it did: the parent reads nothing else from it, so the layout of
+    /// the parent is the same, and nothing above it was affected.
+    ///
+    /// All of these hold:
+    /// - the parent has its layout and `node` had its own, which is the placement the parent asked for last;
+    /// - the parent is a block, a flex container or a grid (a table asks for the same cell again and again), and
+    ///   `node` is none of a table, a cell, or a flex or grid item that is aligned by its baseline, which its parent
+    ///   places with a layout of its own before the one that is final;
+    /// - the cache of `node` holds all the measurements it answered since it was cleared (see
+    ///   [`Cache::measured_questions`]), so that the list of what the parent asked is not missing any;
+    /// - with a float anywhere in the tree, no block is the parent: the floats a block holds are passed between its
+    ///   children and not asked of them.
+    ///
+    /// The change is to the inside of `node` only: a change to its own style may be to what its parent reads from it
+    /// besides the answers (`flex-grow`, a margin, `position`), and [`Self::mark_dirty`] does not take it for a stop.
+    ///
+    /// fdarian fork patch.
+    fn soft_stop(&self, node: NodeId) -> Stop {
+        let data = &self.nodes[node.into()];
+        let Some(parent) = self.parents[node.into()] else {
+            return Stop::No;
+        };
+        if !self.relayout_boundaries || data.saved_layout.is_none() {
+            return Stop::No;
+        }
+        let parent_data = &self.nodes[parent.into()];
+        if !parent_data.cache.has_final_layout() {
+            return Stop::No;
+        }
+        let style = &data.style;
+        if style.table_role != TableRole::None || style.item_is_table {
+            return Stop::No;
+        }
+        let parent_style = &parent_data.style;
+        let is_baseline_aligned = style.align_self.or(parent_style.align_items) == Some(AlignSelf::BASELINE);
+        match parent_style.display {
+            #[cfg(feature = "block_layout")]
+            Display::Block | Display::FlowRoot if self.floats_seen => return Stop::No,
+            #[cfg(feature = "block_layout")]
+            Display::Block | Display::FlowRoot => {}
+            #[cfg(feature = "flexbox")]
+            Display::Flex if is_baseline_aligned => return Stop::No,
+            #[cfg(feature = "grid")]
+            Display::Grid if is_baseline_aligned => return Stop::No,
+            #[cfg(feature = "flexbox")]
+            Display::Flex => {}
+            #[cfg(feature = "grid")]
+            Display::Grid => {}
+            _ => return Stop::No,
+        }
+        #[cfg(not(any(feature = "flexbox", feature = "grid")))]
+        let _ = is_baseline_aligned;
+        if data.pending_relayout {
+            return if data.pending_probe.is_some() { Stop::Waiting } else { Stop::No };
+        }
+        if !data.cache.has_final_layout() {
+            return Stop::No;
+        }
+        let Some(saved) = data.saved_layout else {
+            return Stop::No;
+        };
+        match data.cache.measured_questions() {
+            Some(measured) => Stop::Capture(Box::new(Probe { measured, placed: saved })),
+            None => Stop::No,
         }
     }
 
@@ -1606,6 +1899,15 @@ impl<NodeContext> TaffyTree<NodeContext> {
     #[inline]
     pub fn boundary_relayouts(&self) -> u64 {
         self.boundary_relayouts
+    }
+
+    /// How many nodes that keep the results of their parent while they answer what it asked as they did were laid out
+    /// again on their own, whether they did answer so or not.
+    ///
+    /// fdarian fork patch.
+    #[inline]
+    pub fn item_relayouts(&self) -> u64 {
+        self.item_relayouts
     }
 
     /// How many of the boundary relayouts gave another answer than the one the ancestors had, and so were followed by
@@ -1757,6 +2059,7 @@ impl<NodeContext> TaffyTree<NodeContext> {
     {
         let use_rounding = self.config.use_rounding;
         let mut taffy_view = TaffyView { taffy: self, measure_function };
+        taffy_view.lay_out_changed_nodes(node_id);
         compute_root_layout_with_parent_size(&mut taffy_view, node_id, available_space, parent_size);
         taffy_view.lay_out_pending_boundaries(node_id, available_space, parent_size);
         if use_rounding {
