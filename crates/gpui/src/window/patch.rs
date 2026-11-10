@@ -1596,9 +1596,13 @@ impl Window {
         }
 
         // A root recorded to be put elsewhere is prepainted and painted in its region, as a frame built whole
-        // records it, so that the recording can be made what that frame records.
+        // records it, so that the recording can be made what that frame records. One that lays out again is only
+        // where its recording is (a root put elsewhere is declined below), so what it paints is the region's at
+        // delta zero and its recording is rewritten from the patch like a root that does not lay out.
         let region = match (&source.relocation, &around.placement) {
-            (Some(relocation), Placement::InPlace) if !relaid && self.content_mask() == relocation.ambient => {
+            (Some(relocation), Placement::InPlace)
+                if (!relaid || source.delta.is_zero()) && self.content_mask() == relocation.ambient =>
+            {
                 Some(relocation.reopened())
             }
             _ => None,
@@ -1732,7 +1736,22 @@ impl Window {
                 return Err(PatchDecline::Registrations);
             }
             let operations = self.next_frame.scene.paint_operations[scratch.clone()].to_vec();
-            let rewrites = source.rewritable && (!published || source.publishes);
+            let mut rewrite = match region {
+                Some((step, operations)) => self.relocated_rewrite(
+                    source,
+                    &around,
+                    step,
+                    operations,
+                    &before_paint,
+                    &patched,
+                    publications,
+                    &prepaint_start..&prepaint_end,
+                    &paint_start..&paint_end,
+                ),
+                None => (source.rewritable && (!published || source.publishes)).then(|| {
+                    self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications, None)
+                }),
+            };
             let splice = self.plan_splice(
                 source,
                 &around.id,
@@ -1740,15 +1759,12 @@ impl Window {
                 &prepaint_start..&prepaint_end,
                 &paint_start..&paint_end,
                 operations,
-                rewrites,
+                rewrite.is_some(),
             )?;
-            let rewrite = rewrites.then(|| {
-                let mut rewrite =
-                    self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications, None);
+            if let Some(rewrite) = &mut rewrite {
                 rewrite.prepaint_lengths = Some(prepaint_lengths(&prepaint_start, &prepaint_end));
                 rewrite.paint_lengths = Some(paint_lengths(&paint_start, &paint_end));
-                rewrite
-            });
+            }
             let places = Places { hitboxes: Vec::new(), listener_spaces: Vec::new(), listeners: 0..0, registrations: None };
             let scrollers = (
                 prepaint_start.scrollers_index..prepaint_end.scrollers_index,
@@ -1789,27 +1805,49 @@ impl Window {
             prepaint_start.scrollers_index..prepaint_end.scrollers_index,
             source.prepaint.start.scrollers_index..source.prepaint.end.scrollers_index,
         );
-        let rewrite = if relaid {
-            (source.rewritable && (!published || source.publishes))
-                .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications, None))
-        } else {
-            region.and_then(|(step, operations)| {
-                let blockers = step.blockers | before_paint.blockers(&patched);
-                let movable = step.relocation.info.fits(Point::default(), &step.relocation.ambient).is_ok();
-                (source.relocated_rewritable && blockers == source.blockers && movable && (!published || source.publishes)).then(|| {
-                    let mut rewrite = self.recording_rewrite(
-                        &around,
-                        &prepaint_start..&prepaint_end,
-                        &paint_start..&paint_end,
-                        publications,
-                        Some(step.hitboxes),
-                    );
-                    rewrite.relocation = Some(RelocatedRewrite { relocation: step.relocation, operations });
-                    rewrite
-                })
-            })
+        let rewrite = match region {
+            Some((step, operations)) => self.relocated_rewrite(
+                source,
+                &around,
+                step,
+                operations,
+                &before_paint,
+                &patched,
+                publications,
+                &prepaint_start..&prepaint_end,
+                &paint_start..&paint_end,
+            ),
+            None if relaid => (source.rewritable && (!published || source.publishes))
+                .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications, None)),
+            None => None,
         };
         Ok(UnitRun { scratch, rendered, changed, places, scrollers, regional, relaid, splice: None, rewrite })
+    }
+
+    /// The recording a root recorded to be put elsewhere has after a patch that painted it again in its region, if
+    /// it is the one a frame built whole would record: the same reasons not to be put elsewhere, and a region that
+    /// still holds the root where it is.
+    #[allow(clippy::too_many_arguments)]
+    fn relocated_rewrite(
+        &self,
+        source: &PatchSource,
+        unit: &PatchUnit,
+        step: RelocatedStep,
+        operations: Rc<[PaintOperation]>,
+        before_paint: &super::retained::Effects,
+        patched: &super::retained::Effects,
+        publications: (bool, bool),
+        prepaint: Range<&PrepaintStateIndex>,
+        paint: Range<&PaintIndex>,
+    ) -> Option<RecordingRewrite> {
+        let published = publications.0 || publications.1;
+        let blockers = step.blockers | before_paint.blockers(patched);
+        let movable = step.relocation.info.fits(Point::default(), &step.relocation.ambient).is_ok();
+        (source.relocated_rewritable && blockers == source.blockers && movable && (!published || source.publishes)).then(|| {
+            let mut rewrite = self.recording_rewrite(unit, prepaint, paint, publications, Some(step.hitboxes));
+            rewrite.relocation = Some(RelocatedRewrite { relocation: step.relocation, operations });
+            rewrite
+        })
     }
 
     /// What the scratch frame got for the unit that its recording holds by value.

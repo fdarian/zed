@@ -56,6 +56,8 @@ struct State {
     list_first: Cell<bool>,
     /// The unit paints nothing and registers no hitbox, listener or dispatch node while it holds no box.
     bare: Cell<bool>,
+    /// The unit is recorded to be put elsewhere, as the row of a scroller is.
+    relocatable: Cell<bool>,
 }
 
 impl State {
@@ -80,6 +82,7 @@ impl State {
             list: list.then(|| ListState::new(100, ListAlignment::Top, px(0.)).with_uniform_item_height(px(30.))),
             list_first: Cell::new(false),
             bare: Cell::new(false),
+            relocatable: Cell::new(false),
         })
     }
 
@@ -160,7 +163,10 @@ impl Render for Page {
         let state = self.0.clone();
         let build = state.clone();
         let key = if state.key_stays.get() { 1_000 } else { 1_000 + state.version.get() };
-        let unit = retained(UNIT, key, move |_, _| build.unit()).patchable_relayout();
+        let mut unit = retained(UNIT, key, move |_, _| build.unit()).patchable_relayout();
+        if state.relocatable.get() {
+            unit = unit.relocatable(px(100.));
+        }
         let sibling_state = state.clone();
         let sibling = retained(SIBLING, 2_000, move |_, _| sibling_state.sibling()).patchable();
         let rows = state.list.as_ref().map(|rows| {
@@ -716,9 +722,15 @@ struct Pair {
 
 impl Pair {
     fn new(cx: &mut TestAppContext, kids: usize, key_stays: bool) -> Self {
+        Self::with_unit(cx, kids, key_stays, false)
+    }
+
+    fn with_unit(cx: &mut TestAppContext, kids: usize, key_stays: bool, relocatable: bool) -> Self {
         let state = State::new(cx, kids, false);
+        state.relocatable.set(relocatable);
         let patched = Fixture::new(cx, state);
         let reference = State::new(cx, kids, false);
+        reference.relocatable.set(relocatable);
         reference.patch_unit.set(false);
         let whole = Fixture::new(cx, reference);
         for state in [&patched.state, &whole.state] {
@@ -770,6 +782,57 @@ fn three_relayout_patches_of_a_root_in_a_row_are_all_patched_and_each_frame_is_t
         drop(seen);
         pair.assert_same(cx, what);
     }
+}
+
+#[gpui::test]
+fn three_relayout_patches_of_a_root_recorded_to_be_put_elsewhere_are_all_patched_and_a_frame_after_them_replays_it(cx: &mut TestAppContext) {
+    let pair = Pair::with_unit(cx, 3, true, true);
+    let steps: [(&str, Box<dyn Fn(&State)>); 3] = [
+        ("same shape", Box::new(|state: &State| state.kid_height.set(14.))),
+        ("more children", Box::new(|state: &State| state.kids.set(7))),
+        ("fewer children", Box::new(|state: &State| state.kids.set(4))),
+    ];
+    for (what, change) in steps {
+        let before = pair.patched.patches(cx);
+        pair.set(change);
+        pair.patched.tick(cx);
+        let after = pair.patched.patches(cx);
+        let seen = pair.patched.state.seen.borrow();
+        assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{what}: {seen:?}");
+        assert_eq!(after.rewritten_recordings, before.rewritten_recordings + 1, "{what}: {seen:?}");
+        assert_eq!(after.total_declines(), 0, "{what}: {seen:?}");
+        drop(seen);
+        pair.assert_same(cx, what);
+    }
+    let replays = pair.patched.replays(cx);
+    pair.patched.draw_plain(cx);
+    assert!(pair.patched.replays(cx) > replays, "the unit is replayed from the recording the patches left");
+    pair.assert_same(cx, "replayed after three patches");
+    // And patched again from the recording the replay left.
+    let before = pair.patched.patches(cx);
+    pair.set(|state| state.kids.set(5));
+    pair.patched.tick(cx);
+    let after = pair.patched.patches(cx);
+    assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{:?}", pair.patched.state.seen.borrow());
+    pair.assert_same(cx, "patched after a replay");
+}
+
+/// The tooltip of the third box is one of the reasons the recording of the root cannot be put elsewhere, which a patch
+/// that takes the box away changes: the recording is not rewritten (it would have to say it can be moved), and the root
+/// is built whole by the next frame.
+#[gpui::test]
+fn a_relayout_patch_that_changes_why_a_root_cannot_be_put_elsewhere_does_not_rewrite_its_recording(cx: &mut TestAppContext) {
+    let pair = Pair::with_unit(cx, 3, true, true);
+    let before = pair.patched.patches(cx);
+    pair.set(|state| state.kids.set(2));
+    pair.patched.tick(cx);
+    let after = pair.patched.patches(cx);
+    let seen = pair.patched.state.seen.borrow();
+    assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{seen:?}");
+    assert_eq!(after.rewritten_recordings, before.rewritten_recordings, "{seen:?}");
+    assert_eq!(after.total_declines(), 0, "{seen:?}");
+    drop(seen);
+    pair.assert_same(cx, "without the box with the tooltip");
 }
 
 #[gpui::test]
