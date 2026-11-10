@@ -5321,8 +5321,29 @@ impl Window {
     /// runs first in every [`Window::draw`], before the commit survey, so what it changes (a scroll
     /// offset, the tree an event handler edits) is what that draw builds and paints. It does not run
     /// in a layout pass, nor in a draw nested in another one. None by default.
+    ///
+    /// Nesting is judged by the arena of a draw that is running, which the steps run before: a draw
+    /// that the steps themselves cause (a handler they call reads layout, and that read draws) is
+    /// not nested in another one, so it runs `steps` again. A steps function that calls into code
+    /// which can draw has to guard against its own re-entry.
+    ///
+    /// Every draw runs them, not only the one that answers a frame request: an owner that wants
+    /// them once per frame asks [`Window::drawing_for_frame_request`] and
+    /// [`Window::has_pending_draw`].
     pub fn set_frame_steps(&mut self, steps: Option<Rc<dyn Fn(&mut Window, &mut App)>>) {
         self.frame_steps = steps;
+    }
+
+    /// Whether the draw that is running answers the platform's frame request (the display link),
+    /// as opposed to one an update, a read or a test makes outside a frame.
+    pub fn drawing_for_frame_request(&self) -> bool {
+        self.drawing_for_frame_request
+    }
+
+    /// Whether something invalidated the window since its last draw, so that the frame request
+    /// being served will draw.
+    pub fn has_pending_draw(&self) -> bool {
+        self.invalidator.is_dirty()
     }
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
