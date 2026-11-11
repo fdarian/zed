@@ -187,6 +187,9 @@ pub struct PatchOutcome {
     /// The scrollers around the roots whose scrollable overflow the transforms that ticked
     /// changed, without anything visible changing: their handles have the new range.
     pub scroll_extents: Vec<ScrollExtentChange>,
+    /// The roots whose recording the patch rewrote (a root laid out again, or moved, that keeps a recording the
+    /// next patch can start from): a root not listed has none until a frame is built whole.
+    pub rewritten: Vec<ElementId>,
 }
 
 /// A scroller whose scrollable overflow a patch changed.
@@ -1038,7 +1041,7 @@ impl Window {
         }
         let resolved = self.resolve_units(units, &mut earlier)?;
         if resolved.is_empty() {
-            return Ok(PatchOutcome { units: 0, changed: false, scroll_extents: Vec::new() });
+            return Ok(PatchOutcome { units: 0, changed: false, scroll_extents: Vec::new(), rewritten: Vec::new() });
         }
         let prepared = self.prepare_resolved(resolved, cx)?;
         self.finish_patch(prepared, cx, accept)
@@ -1258,6 +1261,7 @@ impl Window {
         }
         // The recordings are rewritten once the roots are where the patch put them in the vectors.
         self.patch.counters.rewritten_recordings += rewrites.len() as u64;
+        let rewritten: Vec<ElementId> = rewrites.iter().filter_map(|(id, ..)| id.ids.last().cloned()).collect();
         for (id, root, rewrite) in rewrites {
             let generation = self.layout_generation(root);
             self.update_element_state(&id, |state: &mut RetainedState| state.rewrite_recording(generation, rewrite));
@@ -1274,7 +1278,7 @@ impl Window {
             self.reset_cursor_style(cx);
         }
         self.layout_engine_mut().release_anchor_restyles();
-        Ok(PatchOutcome { units: runs_len, changed: changed || spliced, scroll_extents })
+        Ok(PatchOutcome { units: runs_len, changed: changed || spliced, scroll_extents, rewritten })
     }
 
     /// Makes the scratch frame a clean one to draw the roots into.
