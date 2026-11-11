@@ -1780,6 +1780,11 @@ impl Window {
                     self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications, None)
                 }),
             };
+            // The handles the root holds outside the frame are moved by `delta` when the recording is rewritten, and by
+            // nothing else: without the rewrite they would be left where the root was recorded.
+            if regional && rewrite.is_none() && !source.delta.is_zero() {
+                return Err(PatchDecline::Relocated);
+            }
             let splice = self.plan_splice(
                 source,
                 &around.id,
@@ -1849,6 +1854,9 @@ impl Window {
                 .then(|| self.recording_rewrite(&around, &prepaint_start..&prepaint_end, &paint_start..&paint_end, publications, None)),
             None => None,
         };
+        if regional && rewrite.is_none() && !source.delta.is_zero() {
+            return Err(PatchDecline::Relocated);
+        }
         Ok(UnitRun { scratch, rendered, changed, places, scrollers, regional, relaid, splice: None, rewrite })
     }
 

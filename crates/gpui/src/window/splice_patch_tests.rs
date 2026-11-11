@@ -958,6 +958,27 @@ fn a_relayout_patch_of_a_relocatable_root_that_a_scroll_moved_patches_and_rewrit
     pair.patch_step(cx, "patched after a replay", |state| state.kids.set(5));
 }
 
+/// A root a scroll moved whose patch would not rewrite its recording (the box with the tooltip is a reason it cannot be put
+/// elsewhere) leaves the handles it holds outside the frame where it was recorded, `delta` from where it is: the patch is
+/// declined, and the frame built whole is what is shown.
+#[gpui::test]
+fn a_relayout_patch_of_a_root_a_scroll_moved_that_cannot_rewrite_its_recording_is_declined(cx: &mut TestAppContext) {
+    let pair = Pair::scrolled(cx, 3, false);
+    pair.scroll_to(cx, 24.);
+    let before = pair.patched.patches(cx);
+    pair.set(|state| {
+        state.tooltip.set(true);
+        state.kids.set(7);
+    });
+    pair.patched.tick(cx);
+    let after = pair.patched.patches(cx);
+    let seen = pair.patched.state.seen.borrow();
+    assert_eq!(after.relayout_patches, before.relayout_patches, "{seen:?}");
+    assert_eq!(after.declines(PatchDecline::Relocated), before.declines(PatchDecline::Relocated) + 1, "{seen:?}");
+    drop(seen);
+    pair.assert_same(cx, "a moved root that cannot be rewritten, built whole");
+}
+
 #[gpui::test]
 fn scrolls_and_relayout_patches_of_a_relocatable_root_alternate_and_each_frame_is_the_one_built_whole(cx: &mut TestAppContext) {
     let pair = Pair::scrolled(cx, 3, false);
