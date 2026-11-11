@@ -662,6 +662,73 @@ fn a_baseline_aligned_item_is_laid_out_with_its_parent() {
     scene.lay_out();
 }
 
+/// Two items of a grid that are aligned by their baseline, each a block around a row of a fixed height that holds a
+/// text: the baseline of an item is the one of its text, two blocks below the grid. The grid asks the item for it in a
+/// layout of its own, under a question the placement of the text never has (the item is as wide as its content), and the text reports another baseline
+/// there when its context changes, with no change to its size or to its baseline when placed.
+#[test]
+fn a_baseline_read_by_a_grandparent_is_not_held_by_a_node_that_answers_as_it_did() {
+    use crate::style::{AlignSelf, GridTemplateComponent};
+    use crate::MeasuredLeaf;
+
+    // The size, the baseline of the text where it is placed and its baseline when the grid measures it by its content.
+    type Text = (Size<f32>, f32, f32);
+    let measure = |_: Size<Option<f32>>, available: Size<AvailableSpace>, _: NodeId, context: Option<&mut Text>, _: &Style| {
+        let text = context.copied().unwrap();
+        let baseline = match available.width {
+            AvailableSpace::Definite(width) if width < 100.0 => text.2,
+            _ => text.1,
+        };
+        MeasuredLeaf { size: text.0, first_baseline: Some(baseline) }
+    };
+    let text_of = |measured_by_content: f32| (Size { width: 40.0, height: 10.0 }, 4.0, measured_by_content);
+    let build = |measured_by_content: f32| {
+        let mut taffy = TaffyTree::<Text>::new();
+        taffy.disable_rounding();
+        let mut items = Vec::new();
+        let mut texts = Vec::new();
+        for item_baseline in [measured_by_content, 6.0] {
+            let text = taffy.new_leaf_with_context(Style { size: Size::auto(), ..block() }, text_of(item_baseline)).unwrap();
+            let row = taffy
+                .new_with_children(Style { size: Size { width: auto(), height: length(20.0) }, ..block() }, &[text])
+                .unwrap();
+            let item =
+                taffy.new_with_children(Style { align_self: Some(AlignSelf::BASELINE), ..block() }, &[row]).unwrap();
+            items.push(item);
+            texts.push(text);
+        }
+        let grid = taffy
+            .new_with_children(
+                Style {
+                    display: Display::Grid,
+                    grid_template_columns: vec![
+                        GridTemplateComponent::Single(crate::style_helpers::fr(1.0f32)),
+                        GridTemplateComponent::Single(crate::style_helpers::fr(1.0f32)),
+                    ],
+                    ..Default::default()
+                },
+                &items,
+            )
+            .unwrap();
+        let root = taffy.new_with_children(block(), &[grid]).unwrap();
+        (taffy, root, items, texts)
+    };
+    let lay_out = |taffy: &mut TaffyTree<Text>, root: NodeId| {
+        taffy.compute_layout_with_leaf_measure(root, space(), measure).unwrap();
+    };
+
+    let (mut taffy, root, items, texts) = build(2.0);
+    lay_out(&mut taffy, root);
+    taffy.set_node_context(texts[0], Some(text_of(8.0))).unwrap();
+    lay_out(&mut taffy, root);
+
+    let (mut fresh, fresh_root, fresh_items, _) = build(8.0);
+    lay_out(&mut fresh, fresh_root);
+    for (item, fresh_item) in items.into_iter().zip(fresh_items) {
+        assert_eq!(taffy.unrounded_layout(item), fresh.unrounded_layout(fresh_item));
+    }
+}
+
 #[test]
 fn a_tree_with_a_float_keeps_the_chain_to_the_root_for_the_items_of_a_block() {
     let mut scene = scene(block(), block(), fixed_row());

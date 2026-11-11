@@ -1796,6 +1796,9 @@ impl<NodeContext> TaffyTree<NodeContext> {
         }
         #[cfg(not(any(feature = "flexbox", feature = "grid")))]
         let _ = is_baseline_aligned;
+        if self.baseline_is_read_above(node) {
+            return Stop::No;
+        }
         if data.pending_relayout {
             return if data.pending_probe.is_some() { Stop::Waiting } else { Stop::No };
         }
@@ -1809,6 +1812,39 @@ impl<NodeContext> TaffyTree<NodeContext> {
             Some(measured) => Stop::Capture(Box::new(Probe { measured, placed: saved, content_only: false })),
             None => Stop::No,
         }
+    }
+
+    /// Whether an ancestor of `node` is placed by a baseline: a flex or grid item aligned by its baseline reports the
+    /// first baseline of what it holds, so its container reads the baseline of `node` through it, and a table reads
+    /// those of its cells. A node that answers as it did compares sizes and margins, not baselines (see
+    /// [`measured_answer_is_unchanged`]), so it cannot stop a change that moves one of them. Any ancestor counts, not
+    /// only those the baseline travels through: the compute root is not known when the chain is walked.
+    ///
+    /// fdarian fork patch.
+    fn baseline_is_read_above(&self, node: NodeId) -> bool {
+        let mut current = node;
+        while let Some(parent) = self.parents[current.into()] {
+            let style = &self.nodes[parent.into()].style;
+            if style.table_role != TableRole::None || style.item_is_table {
+                return true;
+            }
+            let Some(grandparent) = self.parents[parent.into()] else {
+                return false;
+            };
+            let grandparent_style = &self.nodes[grandparent.into()].style;
+            let aligned_by_baseline = style.align_self.or(grandparent_style.align_items) == Some(AlignSelf::BASELINE);
+            match grandparent_style.display {
+                #[cfg(feature = "flexbox")]
+                Display::Flex if aligned_by_baseline => return true,
+                #[cfg(feature = "grid")]
+                Display::Grid if aligned_by_baseline => return true,
+                _ => {}
+            }
+            #[cfg(not(any(feature = "flexbox", feature = "grid")))]
+            let _ = aligned_by_baseline;
+            current = parent;
+        }
+        false
     }
 
     /// [`Self::mark_dirty`] all the way up, whatever the nodes on the way are.
