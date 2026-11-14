@@ -8270,6 +8270,10 @@ mod tests {
                 wheel(window, cx, -10.);
                 assert_eq!(handle.offset().y, px(-20.));
                 assert!(
+                    window.scroll_metrics_are_current(),
+                    "a wheel keeps the metrics current"
+                );
+                assert!(
                     !window.draw_if_scroll_metrics_dirty(cx),
                     "a wheel lays nothing out for a metrics read"
                 );
@@ -8281,6 +8285,10 @@ mod tests {
                 cx.notify(view_id);
                 wheel(window, cx, -10.);
                 assert_eq!(handle.offset().y, px(-30.));
+                assert!(
+                    !window.scroll_metrics_are_current(),
+                    "a wheel does not make stale metrics current"
+                );
                 assert!(
                     window.draw_if_scroll_metrics_dirty(cx),
                     "a wheel after a content change is on stale metrics"

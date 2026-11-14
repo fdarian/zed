@@ -4963,11 +4963,20 @@ impl Window {
     pub fn draw_if_scroll_metrics_dirty(&mut self, cx: &mut App) -> bool {
         if !self.invalidator.is_dirty()
             || draw_in_progress()
-            || self.invalidator.scroll_metrics_are_current()
+            || self.scroll_metrics_are_current()
         {
             return false;
         }
         self.layout_pass(cx, false, false)
+    }
+
+    /// Whether every invalidation since the last layout was paint-only or a scroll offset write
+    /// (see [`App::notify_scroll_only`]), so the size and extent of every scroller are those of the
+    /// last layout: what [`Window::draw_if_scroll_metrics_dirty`] checks before it lays out. A
+    /// caller that writes a scroll offset asks it to know whether the offset can be clamped to the
+    /// extent now, instead of keeping its own record of the layout.
+    pub fn scroll_metrics_are_current(&self) -> bool {
+        self.invalidator.scroll_metrics_are_current()
     }
 
     /// Draws now if the window has pending changes, for a caller that needs what a frame
