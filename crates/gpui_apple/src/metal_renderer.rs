@@ -3262,11 +3262,14 @@ impl<'a> QuadRuns<'a> {
     }
 
     fn is_small(&self, range: &Range<usize>) -> bool {
-        let area: f32 = self.runs.quads[range.clone()]
-            .iter()
-            .map(clipped_area)
-            .sum();
-        area < self.fold_area
+        let mut area = 0.;
+        for quad in &self.runs.quads[range.clone()] {
+            area += clipped_area(quad);
+            if area >= self.fold_area {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -7888,7 +7891,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_run_that_is_large_or_at_the_edge_of_a_batch_is_not_folded() {
+    fn the_fold_rule_by_area_and_position() {
         let at = |runs: &[Quad]| quad_runs(&scene_of(runs), PLAIN_RUN_FOLD_AREA);
         let full = |x| cell(x, true);
         let small = |x| cell(x, false);
