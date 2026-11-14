@@ -7,10 +7,10 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, MAX_GROUP_EXTENT,
-    MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point, PrimitiveBatch, Quad,
-    ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size, TransformationMatrix,
-    filter_margin, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, IsZero,
+    MAX_GROUP_EXTENT, MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point,
+    PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
+    TransformationMatrix, filter_margin, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -145,6 +145,14 @@ pub struct MetalRenderer {
     /// How many frames `draw_orders` took a drawable for, for tests.
     #[cfg(any(test, feature = "test-support"))]
     drawn_frames: usize,
+    /// Draws every quad, the partial-redraw clear quad included, with the full quad pipeline, as
+    /// the reference for the plain pipeline's tests.
+    #[cfg(test)]
+    full_quads_only: bool,
+    /// `PLAIN_RUN_FOLD_AREA` for the tests: 0 folds nothing, so the scenes of the other tests,
+    /// which are far smaller than it, still draw their plain quads with the plain pipeline.
+    #[cfg(test)]
+    plain_run_fold_area: f32,
     partial: PartialRedraw,
 }
 
@@ -281,6 +289,10 @@ impl MetalRenderer {
             headless_render_target: None,
             #[cfg(any(test, feature = "test-support"))]
             drawn_frames: 0,
+            #[cfg(test)]
+            full_quads_only: false,
+            #[cfg(test)]
+            plain_run_fold_area: 0.,
             partial: PartialRedraw::default(),
         }
     }
@@ -790,7 +802,13 @@ impl MetalRenderer {
                 ..Quad::default()
             };
             let binding = writer.write(&[black])?;
-            self.draw_quad_instances(&binding, 0..1, viewport_size, encoder);
+            self.draw_quad_instances(
+                self.clear_quad_pipeline(),
+                &binding,
+                0..1,
+                viewport_size,
+                encoder,
+            );
         }
         Ok(encoder)
     }
@@ -1014,9 +1032,13 @@ impl MetalRenderer {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, &instance_bindings, viewport_size, command_encoder)
                 }
-                PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(range, &instance_bindings, viewport_size, command_encoder)
-                }
+                PrimitiveBatch::Quads(range) => self.draw_quads(
+                    &scene.quads,
+                    range,
+                    &instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
@@ -1253,21 +1275,49 @@ impl MetalRenderer {
 
     fn draw_quads(
         &self,
-        quads: Range<usize>,
+        quads: &[Quad],
+        range: Range<usize>,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
-        self.draw_quad_instances(
-            &instance_bindings.quads,
-            quads,
-            viewport_size,
-            command_encoder,
-        );
+        if range.is_empty() {
+            return;
+        }
+        let pipelines = self.pipelines();
+        self.bind_quads(&instance_bindings.quads, viewport_size, command_encoder);
+        #[cfg(test)]
+        if self.full_quads_only {
+            return draw_bound_quads(&pipelines.quads, range, command_encoder);
+        }
+        for run in QuadRuns::new(quads, range, self.plain_run_fold_area()) {
+            let pipeline = if run.plain {
+                &pipelines.plain_quads
+            } else {
+                &pipelines.quads
+            };
+            draw_bound_quads(pipeline, run.range, command_encoder);
+        }
+    }
+
+    fn plain_run_fold_area(&self) -> f32 {
+        #[cfg(test)]
+        return self.plain_run_fold_area;
+        #[cfg(not(test))]
+        return PLAIN_RUN_FOLD_AREA;
+    }
+
+    fn clear_quad_pipeline(&self) -> &metal::RenderPipelineState {
+        #[cfg(test)]
+        if self.full_quads_only {
+            return &self.pipelines().quads;
+        }
+        &self.pipelines().plain_quads
     }
 
     fn draw_quad_instances(
         &self,
+        pipeline: &metal::RenderPipelineState,
         binding: &InstanceBinding,
         quads: Range<usize>,
         viewport_size: Size<DevicePixels>,
@@ -1276,8 +1326,16 @@ impl MetalRenderer {
         if quads.is_empty() {
             return;
         }
+        self.bind_quads(binding, viewport_size, command_encoder);
+        draw_bound_quads(pipeline, quads, command_encoder);
+    }
 
-        command_encoder.set_render_pipeline_state(&self.pipelines().quads);
+    fn bind_quads(
+        &self,
+        binding: &InstanceBinding,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.shared.unit_vertices),
@@ -1297,14 +1355,6 @@ impl MetalRenderer {
             QuadInputIndex::ViewportSize as u64,
             mem::size_of_val(&viewport_size) as u64,
             &viewport_size as *const Size<DevicePixels> as *const _,
-        );
-
-        command_encoder.draw_primitives_instanced_base_instance(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            6,
-            quads.len() as u64,
-            quads.start as u64,
         );
     }
 
@@ -2037,7 +2087,13 @@ impl MetalRenderer {
         );
         let previous_depth = self.group_depth.replace(1);
         for (layer, (quads, sprites)) in layers.iter().zip(&bindings) {
-            self.draw_quad_instances(quads, 0..layer.quads.len(), texture_size, encoder);
+            self.draw_quad_instances(
+                &self.pipelines().quads,
+                quads,
+                0..layer.quads.len(),
+                texture_size,
+                encoder,
+            );
             let mut start = 0;
             while start < layer.sprites.len() {
                 let texture_id = layer.sprites[start].tile.texture_id;
@@ -2750,6 +2806,7 @@ pub(crate) struct Pipelines {
     path_sprites: metal::RenderPipelineState,
     shadows: metal::RenderPipelineState,
     pub(crate) quads: metal::RenderPipelineState,
+    plain_quads: metal::RenderPipelineState,
     underlines: metal::RenderPipelineState,
     monochrome_sprites: metal::RenderPipelineState,
     polychrome_sprites: metal::RenderPipelineState,
@@ -2786,6 +2843,7 @@ impl Pipelines {
             ),
             shadows: pipeline("shadows", "shadow_vertex", "shadow_fragment"),
             quads: pipeline("quads", "quad_vertex", "quad_fragment"),
+            plain_quads: pipeline("plain_quads", "quad_vertex", "plain_quad_fragment"),
             underlines: pipeline("underlines", "underline_vertex", "underline_fragment"),
             monochrome_sprites: pipeline(
                 "monochrome_sprites",
@@ -3127,6 +3185,151 @@ fn read_texture_to_image(texture: &metal::TextureRef) -> Result<RgbaImage> {
     }
 
     RgbaImage::from_raw(width, height, pixels).context("failed to create RgbaImage from pixel data")
+}
+
+/// A plain run between two full runs and clipped to less than this many device pixels squared is
+/// drawn with the full pipeline, which merges the three into one draw: a grid of small cells that
+/// alternate between plain and not would otherwise be a pipeline switch and a draw per cell, and
+/// the light fragment saves too little on a small run to pay for that. The pixels are the same
+/// either way.
+const PLAIN_RUN_FOLD_AREA: f32 = 16_384.;
+
+struct QuadRun {
+    plain: bool,
+    range: Range<usize>,
+}
+
+struct MaximalRuns<'a> {
+    quads: &'a [Quad],
+    next: usize,
+    end: usize,
+    /// Whether `quads[next]` is plain, when it was tested as the quad that ended the last run.
+    next_is_plain: Option<bool>,
+}
+
+impl Iterator for MaximalRuns<'_> {
+    type Item = QuadRun;
+
+    fn next(&mut self) -> Option<QuadRun> {
+        if self.next >= self.end {
+            return None;
+        }
+        let start = self.next;
+        let plain = self
+            .next_is_plain
+            .take()
+            .unwrap_or_else(|| is_plain_quad(&self.quads[start]));
+        let mut end = start + 1;
+        while end < self.end {
+            let is_plain = is_plain_quad(&self.quads[end]);
+            if is_plain != plain {
+                self.next_is_plain = Some(is_plain);
+                break;
+            }
+            end += 1;
+        }
+        self.next = end;
+        Some(QuadRun {
+            plain,
+            range: start..end,
+        })
+    }
+}
+
+/// Splits a range of quads into the runs that are drawn with one pipeline each, in paint order:
+/// the maximal runs, except that a plain run between two full runs and under `fold_area` pixels
+/// is folded into them. A plain run at either end of the range, or a large one, keeps the plain
+/// pipeline.
+struct QuadRuns<'a> {
+    runs: MaximalRuns<'a>,
+    /// A plain run that was looked at for folding and kept, to be returned next.
+    kept: Option<QuadRun>,
+    fold_area: f32,
+}
+
+impl<'a> QuadRuns<'a> {
+    fn new(quads: &'a [Quad], range: Range<usize>, fold_area: f32) -> Self {
+        Self {
+            runs: MaximalRuns {
+                quads,
+                next: range.start,
+                end: range.end,
+                next_is_plain: None,
+            },
+            kept: None,
+            fold_area,
+        }
+    }
+
+    fn is_small(&self, range: &Range<usize>) -> bool {
+        let area: f32 = self.runs.quads[range.clone()]
+            .iter()
+            .map(clipped_area)
+            .sum();
+        area < self.fold_area
+    }
+}
+
+impl Iterator for QuadRuns<'_> {
+    type Item = QuadRun;
+
+    fn next(&mut self) -> Option<QuadRun> {
+        let mut run = self.kept.take().or_else(|| self.runs.next())?;
+        if run.plain {
+            return Some(run);
+        }
+        while let Some(plain) = self.runs.next() {
+            if self.is_small(&plain.range) {
+                if let Some(full) = self.runs.next() {
+                    run.range.end = full.range.end;
+                    continue;
+                }
+            }
+            self.kept = Some(plain);
+            break;
+        }
+        Some(run)
+    }
+}
+
+fn clipped_area(quad: &Quad) -> f32 {
+    let clipped = quad.bounds.intersect(&quad.content_mask.bounds);
+    clipped.size.width.0 * clipped.size.height.0
+}
+
+// Only catches a change of size: whatever `quad_fragment` reads of a `Quad` has to be checked
+// against `is_plain_quad` (and `plain_quad_fragment`) whenever it changes, a new field or a new
+// meaning of an old one, and this number moved after.
+const _: () = assert!(std::mem::size_of::<Quad>() == 536);
+
+/// A quad `quad_fragment` draws as its solid background alone: no border, no rounded corner, no
+/// background tile, a solid background, the unit transformation (which also leaves `local_clip`
+/// unread) and a content mask without rounded corners (so its coverage is 1). Keep in step with
+/// `plain_quad_fragment`.
+fn is_plain_quad(quad: &Quad) -> bool {
+    !quad.border_widths.any(|width| !width.is_zero())
+        && quad.corner_radii.is_zero()
+        && quad.corner_radii_y.is_zero()
+        && quad.content_mask.corner_radii.is_zero()
+        && quad.content_mask.corner_radii_y.is_zero()
+        && quad.background_tile.width <= 0.0
+        && quad.background.as_solid().is_some()
+        && quad.transformation == TransformationMatrix::unit()
+}
+
+fn draw_bound_quads(
+    pipeline: &metal::RenderPipelineState,
+    quads: Range<usize>,
+    command_encoder: &metal::RenderCommandEncoderRef,
+) {
+    command_encoder.set_render_pipeline_state(pipeline);
+    command_encoder.draw_primitives_instanced_base_instance(
+        metal::MTLPrimitiveType::Triangle,
+        0,
+        6,
+        quads.len() as u64,
+        quads.start as u64,
+    );
 }
 
 fn build_pipeline_state(
@@ -3592,7 +3795,9 @@ fn log_presented_time(drawable: &metal::MetalDrawableRef) {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstanceBufferPool, MetalHeadlessRenderer, MetalRenderer};
+    use super::{
+        InstanceBufferPool, MetalHeadlessRenderer, MetalRenderer, PLAIN_RUN_FOLD_AREA, QuadRuns,
+    };
     use gpui::{
         Background, BackgroundBox, BackgroundBoxes, BackgroundImage, BackgroundLayer,
         BackgroundPosition, BackgroundRepeat, BackgroundSize, Bounds, ColorSpace, ContentMask,
@@ -3602,6 +3807,7 @@ mod tests {
         StopPosition, point, px, size,
     };
     use gpui::{MaskComposite, MaskLayer, MaskMode};
+    use image::RgbaImage;
     use parking_lot::Mutex;
     use std::sync::Arc;
 
@@ -7475,6 +7681,247 @@ mod tests {
         assert!(
             (overlap - 191).abs() <= 2,
             "two half layers cover three quarters (source-over), not all: {overlap}"
+        );
+    }
+
+    fn plain_scene_quad(
+        bounds: Bounds<ScaledPixels>,
+        mask: Bounds<ScaledPixels>,
+        color: Hsla,
+    ) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask {
+                bounds: mask,
+                corner_radii: Corners::default(),
+                corner_radii_y: Corners::default(),
+            },
+            background: color.into(),
+            ..Quad::default()
+        }
+    }
+
+    fn quad_runs(scene: &Scene, fold_area: f32) -> Vec<(bool, std::ops::Range<usize>)> {
+        scene
+            .batches()
+            .filter_map(|batch| match batch {
+                gpui::PrimitiveBatch::Quads(range) => Some(range),
+                _ => None,
+            })
+            .flat_map(|range| QuadRuns::new(&scene.quads, range, fold_area))
+            .map(|run| (run.plain, run.range))
+            .collect()
+    }
+
+    fn render_quads(scene: &Scene, fold_area: f32, full_quads_only: bool) -> RgbaImage {
+        let mut renderer = MetalHeadlessRenderer::new();
+        renderer.renderer.full_quads_only = full_quads_only;
+        renderer.renderer.plain_run_fold_area = fold_area;
+        renderer
+            .render_scene_to_image(
+                scene,
+                size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
+            )
+            .expect("scene should render")
+    }
+
+    /// Plain quads of every kind of edge and colour, with rounded, bordered, gradient, moved and
+    /// rounded-mask quads between them.
+    fn plain_and_full_quads() -> Vec<Quad> {
+        let red = gpui::hsla(0., 1., 0.5, 1.);
+        let blue = gpui::hsla(0.62, 0.8, 0.45, 1.);
+        let mut quads = vec![
+            plain_scene_quad(full_bounds(), full_bounds(), gpui::hsla(0.6, 0.5, 0.4, 1.)),
+            plain_scene_quad(
+                area(3.3, 2.7, 20.4, 15.2),
+                area(5.5, 4.25, 12.5, 14.75),
+                gpui::hsla(0.3, 1., 0.5, 1.),
+            ),
+            plain_scene_quad(
+                area(10.5, 10.5, 15., 12.5),
+                full_bounds(),
+                gpui::hsla(0.9, 0.7, 0.5, 0.4),
+            ),
+            plain_scene_quad(
+                area(7.25, 20.75, 20.5, 9.5),
+                area(9., 22., 30., 5.5),
+                gpui::hsla(0.1, 1., 0.5, 0.65),
+            ),
+            plain_scene_quad(
+                area(30., 4., 6., 30.),
+                area(31.5, 0., 3., 40.),
+                gpui::hsla(1., 0.5, 0.5, 1.),
+            ),
+            plain_scene_quad(
+                area(2., 30., 8., 8.),
+                full_bounds(),
+                gpui::hsla(0.5, 0.5, 0.5, 0.),
+            ),
+        ];
+        let rounded = translucent(area(6., 6., 14., 14.), gpui::hsla(0.8, 1., 0.5, 0.8), 5.);
+        let mut bordered = quad(red, Edges::all(blue), 2.);
+        bordered.bounds = area(12., 12., 18., 14.);
+        let mut gradient = plain_scene_quad(
+            area(14., 2., 22., 12.),
+            full_bounds(),
+            gpui::hsla(0., 0., 0., 1.),
+        );
+        gradient.background = gpui::linear_gradient(
+            30.,
+            gpui::linear_color_stop(red, 0.),
+            gpui::linear_color_stop(blue, 1.),
+        );
+        let mut moved = plain_scene_quad(area(4., 24., 12., 12.), full_bounds(), blue);
+        moved.transformation = gpui::TransformationMatrix::affine([[1., 0.], [0., 1.]], [0.4, 0.3]);
+        let mut rounded_mask =
+            plain_scene_quad(area(18., 18., 20., 20.), area(20., 20., 15., 15.), red);
+        rounded_mask.content_mask.corner_radii = Corners::all(ScaledPixels(6.));
+        quads.splice(2..2, [rounded, bordered]);
+        quads.splice(6..6, [gradient, moved]);
+        quads.push(rounded_mask);
+        quads.push(plain_scene_quad(
+            area(1.5, 1.5, 36.5, 3.5),
+            full_bounds(),
+            gpui::hsla(0.45, 0.9, 0.5, 1.),
+        ));
+        quads
+    }
+
+    fn plain_and_full_runs() -> Vec<(bool, std::ops::Range<usize>)> {
+        vec![
+            (true, 0..2),
+            (false, 2..4),
+            (true, 4..6),
+            (false, 6..8),
+            (true, 8..10),
+            (false, 10..11),
+            (true, 11..12),
+        ]
+    }
+
+    #[test]
+    fn the_plain_quad_pipeline_draws_the_pixels_of_the_full_one() {
+        let scene = scene_of(&plain_and_full_quads());
+        assert_eq!(quad_runs(&scene, 0.), plain_and_full_runs());
+
+        assert!(
+            render_quads(&scene, 0., false) == render_quads(&scene, 0., true),
+            "the plain quad pipeline differs from the full one"
+        );
+    }
+
+    #[test]
+    fn plain_quads_in_an_effect_group_draw_the_pixels_of_the_full_pipeline() {
+        let mut scene = groups_scene();
+        let quads = plain_and_full_quads();
+        scene.insert_primitive(quads[0]);
+        group(
+            &mut scene,
+            GroupEffect {
+                opacity: 0.5,
+                ..GroupEffect::default()
+            },
+            &quads[1..],
+        );
+        scene.insert_primitive(plain_scene_quad(
+            area(20., 2., 10., 6.),
+            full_bounds(),
+            gpui::hsla(0.2, 1., 0.5, 1.),
+        ));
+        scene.finish();
+        assert_eq!(scene.groups.len(), 1);
+        let group_runs = quad_runs(&scene.groups[0].scene, 0.);
+        assert!(
+            group_runs.iter().any(|run| run.0) && group_runs.iter().any(|run| !run.0),
+            "the group's own scene draws both pipelines: {group_runs:?}"
+        );
+
+        assert!(
+            render_quads(&scene, 0., false) == render_quads(&scene, 0., true),
+            "plain quads in a group differ from the full pipeline's"
+        );
+    }
+
+    fn cell(x: f32, rounded: bool) -> Quad {
+        let bounds = area(x, 20., 10., 10.);
+        let mut quad = plain_scene_quad(bounds, bounds, gpui::hsla(x / 100., 1., 0.5, 1.));
+        if rounded {
+            quad.corner_radii = Corners::all(ScaledPixels(2.));
+        }
+        quad
+    }
+
+    fn fill(color: Hsla) -> Quad {
+        let bounds = area(0., 0., 300., 300.);
+        plain_scene_quad(bounds, bounds, color)
+    }
+
+    #[test]
+    fn a_small_plain_run_between_full_runs_is_folded_into_them() {
+        // Small cells alternating plain and not: the first is at the edge of the batch and stays
+        // plain, the rest are one draw.
+        let cells: Vec<Quad> = (0..8).map(|n| cell(n as f32 * 12., n % 2 == 1)).collect();
+        let scene = scene_of(&cells);
+        assert_eq!(
+            quad_runs(&scene, PLAIN_RUN_FOLD_AREA),
+            [(true, 0..1), (false, 1..8)]
+        );
+        assert_eq!(
+            quad_runs(&scene, 0.).len(),
+            8,
+            "without the fold every cell is a run"
+        );
+        assert!(
+            render_quads(&scene, PLAIN_RUN_FOLD_AREA, false) == render_quads(&scene, 0., false),
+            "the fold changes pixels"
+        );
+
+        // Large fills keep the plain pipeline (the first with the plain cell next to it, one run),
+        // and the cells between them are one full run.
+        let mut quads = vec![fill(gpui::hsla(0.6, 0.5, 0.4, 1.))];
+        quads.extend(cells.iter().copied());
+        quads.push(fill(gpui::hsla(0.3, 0.5, 0.4, 1.)));
+        assert_eq!(
+            quad_runs(&scene_of(&quads), PLAIN_RUN_FOLD_AREA),
+            [(true, 0..2), (false, 2..9), (true, 9..10)]
+        );
+    }
+
+    #[test]
+    fn a_plain_run_that_is_large_or_at_the_edge_of_a_batch_is_not_folded() {
+        let at = |runs: &[Quad]| quad_runs(&scene_of(runs), PLAIN_RUN_FOLD_AREA);
+        let full = |x| cell(x, true);
+        let small = |x| cell(x, false);
+        assert_eq!(at(&[small(0.), full(12.)]), [(true, 0..1), (false, 1..2)]);
+        assert_eq!(at(&[full(0.), small(12.)]), [(false, 0..1), (true, 1..2)]);
+        assert_eq!(
+            at(&[full(0.), fill(gpui::hsla(0.6, 0.5, 0.4, 1.)), full(12.)]),
+            [(false, 0..1), (true, 1..2), (false, 2..3)],
+            "a large run between full ones keeps the light pipeline"
+        );
+
+        // Its area is what is inside the content mask.
+        let mut masked = fill(gpui::hsla(0.6, 0.5, 0.4, 1.));
+        masked.content_mask.bounds = area(0., 0., 10., 10.);
+        assert_eq!(
+            at(&[full(0.), masked, full(12.)]),
+            [(false, 0..3)],
+            "a large quad clipped to a small area is folded"
+        );
+
+        // Two plain quads next to each other are one run, whose area is their sum.
+        let half = |x| {
+            let bounds = area(x, 0., 100., 100.);
+            plain_scene_quad(bounds, bounds, gpui::hsla(0.5, 0.5, 0.5, 1.))
+        };
+        assert_eq!(
+            at(&[full(0.), half(0.), half(100.), full(12.)]),
+            [(false, 0..1), (true, 1..3), (false, 3..4)]
+        );
+        assert_eq!(
+            at(&[full(0.), half(0.), full(12.)]),
+            [(false, 0..3)],
+            "one of the two is under the area"
         );
     }
 }

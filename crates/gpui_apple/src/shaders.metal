@@ -169,6 +169,17 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// The fragment stage for a quad with no border, no rounded corner, no background tile, a solid
+// background, no transformation and a content mask without rounded corners, paired with
+// `quad_vertex`. `quad_fragment` takes its fast path for such a quad and returns
+// `background_solid * float4(1.0, 1.0, 1.0, mask_alpha)` with `mask_alpha` and its tile alpha both 1
+// (the mask's rectangle is enforced by the clip distances), which is `background_solid`; this
+// returns it without fetching the quad. The host picks the quads (`is_plain_quad` in
+// metal_renderer.rs); keep the two in step.
+fragment float4 plain_quad_fragment(QuadFragmentInput input [[stage_in]]) {
+  return input.background_solid;
+}
+
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]]) {
