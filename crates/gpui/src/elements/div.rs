@@ -4617,7 +4617,10 @@ impl Interactivity {
                     && new_scroll_offset != old_scroll_offset
                 {
                     *scroll_offset.borrow_mut() = new_scroll_offset;
-                    cx.notify(current_view);
+                    // `claim` clamped every axis it moved to `max_offset`, the extent of the
+                    // last layout, so no size or extent changed: a wheel is a scroll write,
+                    // and a read of `scrollTop` after it needs no layout pass.
+                    cx.notify_scroll_only(current_view);
                 }
             });
             return;
@@ -8199,6 +8202,92 @@ mod tests {
             wheel_by(&window, cx, 50., 50., -450., TouchPhase::Started);
             assert_eq!(scrollers.inner.offset().y, px(-400.));
             assert_eq!(scrollers.outer.offset().y, px(0.));
+        }
+
+        struct ScrollerPage {
+            handle: ScrollHandle,
+            content_height: Rc<Cell<f32>>,
+        }
+
+        impl Render for ScrollerPage {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut scroller = div()
+                    .id("scroller")
+                    .always_hitbox()
+                    .w(px(100.))
+                    .h(px(100.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.handle)
+                    .child(div().id("content").h(px(self.content_height.get())));
+                scroller.style().allow_concurrent_scroll = Some(true);
+                root().child(scroller)
+            }
+        }
+
+        /// A wheel on a routed scroller is a scroll write, as in a browser: a read of the scroll
+        /// metrics after it lays nothing out, a read of bounds does, and a wheel that comes after
+        /// a content change is on stale metrics and still lays out for them.
+        #[gpui::test]
+        fn a_wheel_on_a_scroller_leaves_the_scroll_metrics_current(cx: &mut TestAppContext) {
+            let handle = ScrollHandle::new();
+            let content_height = Rc::new(Cell::new(500.));
+            let page = cx.open_window(size(px(800.), px(600.)), {
+                let handle = handle.clone();
+                let content_height = content_height.clone();
+                move |_, _| ScrollerPage {
+                    handle,
+                    content_height,
+                }
+            });
+            let window = AnyWindowHandle::from(page);
+            cx.update_window(window, |_, window, cx| {
+                window.set_dom_hit_testing(true);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            move_to(&window, cx, 50., 50.);
+            let view_id = cx
+                .update_window(window, |view, _, _| view.entity_id())
+                .unwrap();
+
+            let wheel = |window: &mut Window, cx: &mut App, dy: f32| {
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position: point(px(50.), px(50.)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                        modifiers: Default::default(),
+                        touch_phase: TouchPhase::Moved,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            };
+
+            cx.update_window(window, |_, window, cx| {
+                let passes = window.layout_pass_count();
+
+                wheel(window, cx, -10.);
+                wheel(window, cx, -10.);
+                assert_eq!(handle.offset().y, px(-20.));
+                assert!(
+                    !window.draw_if_scroll_metrics_dirty(cx),
+                    "a wheel lays nothing out for a metrics read"
+                );
+                assert_eq!(window.layout_pass_count(), passes);
+                assert!(window.draw_if_dirty(cx), "the boxes moved with the offset");
+                assert_eq!(window.layout_pass_count(), passes + 1);
+
+                content_height.set(800.);
+                cx.notify(view_id);
+                wheel(window, cx, -10.);
+                assert_eq!(handle.offset().y, px(-30.));
+                assert!(
+                    window.draw_if_scroll_metrics_dirty(cx),
+                    "a wheel after a content change is on stale metrics"
+                );
+                assert_eq!(handle.max_offset().y, px(700.));
+            })
+            .unwrap();
         }
 
         #[gpui::test]
