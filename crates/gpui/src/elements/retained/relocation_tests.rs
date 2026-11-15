@@ -80,6 +80,10 @@ enum Kind {
     Escaping,
     /// Has a box placed by the viewport.
     Fixed,
+    /// Is a TanStack Virtual row: absolute at the top left of a positioned container that holds
+    /// every row, moved down by a `transform`, so that it forms a stacking context of its own,
+    /// with a box lifted inside that context.
+    Lifted,
     /// Has a retained subtree of its own, which is built every frame the row is.
     Retained,
     /// Has a view that caches what it draws.
@@ -321,6 +325,38 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> 
             });
             row = row.child(text).child(placed);
         }
+        Kind::Lifted => {
+            let mut row = row
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .stacking_context()
+                .transform(crate::ElementTransform {
+                    functions: vec![crate::TransformFunction::Translate(
+                        crate::TransformLength::pixels(0.),
+                        crate::TransformLength::pixels(index as f32 * spec.height),
+                    )],
+                    origin: (crate::TransformLength::pixels(0.), crate::TransformLength::pixels(0.)),
+                    origin_z: 0.,
+                    animating: false,
+                })
+                .child(text);
+            row.style().position = Some(Position::Absolute);
+            return row
+                .child(
+                    div()
+                        .id(("lifted-child", index))
+                        .always_hitbox()
+                        .absolute()
+                        .z_index(1)
+                        .top(px(6.))
+                        .left(px(120.))
+                        .w(px(50.))
+                        .h(px(10.))
+                        .bg(crate::black()),
+                )
+                .into_any_element();
+        }
         Kind::ClipPath => {
             let none = crate::LengthPercentage::Length(px(0.));
             row.style().clip_path = Some(crate::ClipPathValue::Shape(crate::ClipPath {
@@ -383,7 +419,7 @@ fn page(
                 _ => {}
             }
             // A positioned box is the child of a stacking context where there is one.
-            if matches!(spec.kind, Kind::Positioned | Kind::Absolute) {
+            if matches!(spec.kind, Kind::Positioned | Kind::Absolute | Kind::Lifted) {
                 row = row.lift_z(0);
             }
             row.into_any_element()
@@ -406,7 +442,22 @@ fn page(
     // A positioned page is the frame around the scroller, which does not scroll with the rows.
     let page = div().id("page").size_full();
     let page = if framed { page.relative() } else { page };
-    page.child(scroller.children(rows)).into_any_element()
+    // TanStack Virtual puts every row in one positioned container, as high as the rows are.
+    let scroller = if specs.first().is_some_and(|spec| spec.kind == Kind::Lifted) {
+        let height = specs.iter().map(|spec| spec.height).sum::<f32>();
+        scroller.child(
+            div()
+                .id("container")
+                .relative()
+                .flex_none()
+                .w(px(VIEW_WIDTH))
+                .h(px(height))
+                .children(rows),
+        )
+    } else {
+        scroller.children(rows)
+    };
+    page.child(scroller).into_any_element()
 }
 
 struct Pair {
@@ -867,6 +918,32 @@ fn a_scroll_by_whole_pixels_replays_the_rows_it_keeps() {
     assert_eq!(after.builds, before.builds, "no row is built for a scroll within the overscan");
     assert!(after.relocations >= before.relocations + 6, "{after:?}");
     assert_eq!(after.relocation_misses(RelocationMiss::Place), 0);
+}
+
+#[test]
+fn a_lifted_row_that_forms_a_context_and_holds_a_lifted_box_is_replayed_where_a_scroll_puts_it() {
+    let cx = &mut app();
+    let pair = Pair::new(cx, rows(30, 40., Kind::Lifted), 1., false);
+    pair.assert_same(cx, "the first frame");
+    pair.draw(cx);
+    pair.assert_same(cx, "the second frame");
+    let before = pair.counters(cx);
+    scroll_through(&pair, cx, &[10.]);
+    let after = pair.counters(cx);
+    assert_eq!(after.builds, before.builds, "no row is built for a scroll within the overscan: {after:?}");
+    assert!(after.relocations >= before.relocations + 5, "{after:?}");
+    assert_eq!(after.relocation_misses(RelocationMiss::Place), 0);
+
+    // Row 3 is at 120 and the scroll has moved it to 110: its lifted box is at 116 to 126, and
+    // row 2, which is at 70 to 110, is not under that point.
+    let chain = cx
+        .update_window(pair.retained, |_, window, _| window.hit_chain_at(point(px(130.), px(120.))))
+        .unwrap();
+    let chain = chain.iter().map(|entry| format!("{}", entry.0)).collect::<Vec<_>>().join(" > ");
+    assert!(chain.contains("lifted-child-3"), "{chain}");
+
+    scroll_through(&pair, cx, &[11., 40., 45.5, 90., 25., 0.]);
+    assert_eq!(pair.counters(cx).mismatches, 0);
 }
 
 #[test]
