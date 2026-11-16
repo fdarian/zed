@@ -5,6 +5,8 @@
 
 // Submodules
 mod cache;
+#[cfg(feature = "taffy_tree")]
+mod input_norm;
 mod layout;
 mod node;
 pub mod traits;

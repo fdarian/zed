@@ -1158,7 +1158,7 @@ fn edit(random: &mut Random, taffy: &mut Tree, root: NodeId, description: &mut D
     }
 }
 
-struct Run {
+pub(super) struct Run {
     relayouts: u64,
     fallbacks: u64,
     steps: u64,
@@ -1171,6 +1171,11 @@ struct Run {
 /// escape it to the block formatting context around it, so a tree with floats that lives through edits is not a
 /// new tree whether or not it has boundaries.
 fn run_seed(seed: u64, steps: usize) -> Run {
+    run_seed_with(seed, steps, false)
+}
+
+/// With `unnormalized`, the new tree is laid out with input normalization off.
+pub(super) fn run_seed_with(seed: u64, steps: usize, unnormalized: bool) -> Run {
     let mut random = Random::new(seed);
     let mut description = random_description(&mut random, 5);
     // The root is a block that is as wide as the space, as the root of a window is.
@@ -1217,7 +1222,12 @@ fn run_seed(seed: u64, steps: usize) -> Run {
 
         let mut fresh = new_tree();
         let fresh_root = build(&mut fresh, &description);
-        fresh.compute_layout_with_measure(fresh_root, available, measure).unwrap();
+        let lay_out_fresh = |fresh: &mut Tree| fresh.compute_layout_with_measure(fresh_root, available, measure).unwrap();
+        if unnormalized {
+            crate::tree::input_norm::unnormalized(|| lay_out_fresh(&mut fresh));
+        } else {
+            lay_out_fresh(&mut fresh);
+        }
         if let Some(difference) = difference(&taffy, root, &fresh, fresh_root, &mut Vec::new()) {
             panic!(
                 "seed {seed}, step {step}, after {:?}: not the layout of a new tree\n{difference}",

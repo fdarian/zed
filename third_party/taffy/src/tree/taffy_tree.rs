@@ -233,6 +233,11 @@ struct NodeData {
     /// Whether the node has context data associated with it or not
     pub(crate) has_context: bool,
 
+    /// Whether the style resolves a percentage or calc against the parent width or height, see `input_norm`. Set with
+    /// the style.
+    pub(crate) reads_parent_width: bool,
+    pub(crate) reads_parent_height: bool,
+
     /// The cached results of the layout computation
     pub(crate) cache: Cache,
 
@@ -288,9 +293,12 @@ struct NodeData {
 impl NodeData {
     /// Create the data for a new node
     #[must_use]
-    pub const fn new(style: Style) -> Self {
+    pub fn new(style: Style) -> Self {
+        let (reads_parent_width, reads_parent_height) = super::input_norm::parent_reads(&style);
         Self {
             style,
+            reads_parent_width,
+            reads_parent_height,
             cache: Cache::new(),
             dirty_generation: 0,
             layout_generation: 0,
@@ -603,6 +611,14 @@ where
         //
         // If there was no cache match and a new result needs to be computed then that result will be added to the cache
         let original_inputs = inputs;
+        // fdarian fork patch: input normalization. `SavedLayout` below keeps what the parent asked, which is what a
+        // relayout boundary is asked again with, and that is normalized here again.
+        let inputs = {
+            let node = &self.taffy.nodes[node_id.into()];
+            let block_container = matches!(node.style.display, Display::Block | Display::FlowRoot)
+                && !self.taffy.children[node_id.into()].is_empty();
+            super::input_norm::normalize(node.reads_parent_width, node.reads_parent_height, block_container, inputs)
+        };
         let mut output = compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
             match inputs.run_mode {
                 RunMode::PerformLayout => tree.taffy.layout_runs += 1,
@@ -1601,6 +1617,9 @@ impl<NodeContext> TaffyTree<NodeContext> {
             return Ok(());
         }
         self.note_floats(&style);
+        let (reads_parent_width, reads_parent_height) = super::input_norm::parent_reads(&style);
+        self.nodes[node.into()].reads_parent_width = reads_parent_width;
+        self.nodes[node.into()].reads_parent_height = reads_parent_height;
         self.nodes[node.into()].style = style;
         self.mark_dirty(node)?;
         Ok(())
