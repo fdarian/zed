@@ -17,6 +17,7 @@ use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 const VIEW_WIDTH: f32 = 300.;
 const VIEW_HEIGHT: f32 = 220.;
 const OVERSCAN: f32 = 100.;
+const CARD_MARGIN: f32 = 30.;
 
 type BuildScene = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
@@ -470,17 +471,22 @@ fn page(
                 .children(rows),
         )
     } else if rounding == Rounding::Card {
-        scroller.child(
-            div()
-                .id("card")
-                .flex_none()
-                .flex()
-                .flex_col()
-                .w(px(VIEW_WIDTH))
-                .rounded_xl()
-                .overflow_hidden()
-                .children(rows),
-        )
+        // Room above and below, so that the scroller does not cut the corners of the card where it is at an end. The room below
+        // is a box of its own: a margin after the last child is not scrollable overflow.
+        scroller
+            .child(
+                div()
+                    .id("card")
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .w(px(VIEW_WIDTH))
+                    .mt(px(CARD_MARGIN))
+                    .rounded_xl()
+                    .overflow_hidden()
+                    .children(rows),
+            )
+            .child(div().id("below-the-card").flex_none().h(px(CARD_MARGIN)))
     } else {
         scroller.children(rows)
     };
@@ -1243,23 +1249,27 @@ fn a_rounded_scroller_moves_the_rows_that_are_clear_of_its_corners() {
 #[test]
 fn rows_in_a_rounded_card_that_scrolls_with_them_are_moved_where_they_are_clear_of_its_corners() {
     let cx = &mut app();
-    // 12 rows of 40 make a card of 480 in a viewport of 220: its bottom corners come into view at
-    // the end of the scroll.
+    // 12 rows of 40 make a card of 480 with 30 above and below it, in a viewport of 220. Its top corners are in view and
+    // uncut by the scroller up to an offset of 30, and its bottom ones from 290 to the end of the scroll at 320; between,
+    // the scroller cuts it by a straight edge, which is no corner.
     let pair = Pair::build_rounded(cx, rows(12, 40., Kind::Button), 1., Rounding::Card, false);
     pair.assert_same(cx, "the first frame");
     pair.draw(cx);
-    let before = pair.counters(cx);
-    scroll_through(&pair, cx, &[1., 2., 5., 30., 31., 100., 101., 250., 251., 255., 256., 258., 260.]);
-    let after = pair.counters(cx);
-    assert!(
-        after.relocations - before.relocations > 20,
-        "the rows of the card were moved while it was cut by the viewport and then while its corners showed: {after:?}"
-    );
-    assert!(
-        after.non_relocatable(NonRelocatable::Clip) > before.non_relocatable(NonRelocatable::Clip),
-        "the rows at the bottom corners of the card were built: {after:?}"
-    );
-    assert_eq!(after.mismatches, 0);
+    let near_the_top = [1., 2., 5., 10., 18., 29., 12., 3., 0.];
+    let near_the_bottom = [290., 291., 300., 305., 310., 320., 315., 292., 300.];
+    for (name, offsets) in [("with its top corners in view", &near_the_top[..]), ("in the middle", &[100., 101., 150., 151., 200., 240., 280., 289.][..]), ("with its bottom corners in view", &near_the_bottom[..])] {
+        let before = pair.counters(cx);
+        scroll_through(&pair, cx, offsets);
+        let after = pair.counters(cx);
+        assert!(after.relocations > before.relocations, "{name}: rows of the card were moved: {after:?}");
+        if name != "in the middle" {
+            assert!(
+                after.non_relocatable(NonRelocatable::Clip) > before.non_relocatable(NonRelocatable::Clip),
+                "{name}: the rows at the corners of the card were built: {after:?}"
+            );
+        }
+    }
+    assert_eq!(pair.counters(cx).mismatches, 0);
 }
 
 #[test]
