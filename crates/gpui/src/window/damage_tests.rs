@@ -30,6 +30,11 @@ fn shown_fixture(cx: &mut TestAppContext, fixture: Fixture) -> Fixture {
 #[track_caller]
 fn assert_covers_the_difference(draws: &[DamageDraw]) -> Option<Bounds<DevicePixels>> {
     let [.., before, last] = draws else { panic!("two frames were shown") };
+    // Rows that a shift moves are in the frames of both, at places the copy moves them between.
+    if last.damage.as_ref().is_some_and(|damage| damage.shift.is_some()) {
+        super::scroll_patch_tests::shift::assert_the_shift_explains_the_difference(before, last);
+        return last.damage.as_ref().map(FrameDamage::bounds);
+    }
     for area in last.changed_areas(before) {
         assert!(last.covers(&area), "{area:?} changed and the damage is {:?}", last.damage);
     }

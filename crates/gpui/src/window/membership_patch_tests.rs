@@ -1778,3 +1778,37 @@ fn exact_size_scroll_bench(cx: &mut TestAppContext) {
         println!("exact_size_scroll_bench: declared {declared}: median {:?} per step", times[times.len() / 2]);
     }
 }
+
+/// What a translate that builds rows and takes rows out tells the platform: a shift of the list, with the rows that come
+/// in drawn where they are built (see [`super::scroll_patch`]).
+#[gpui::test]
+fn rows_that_come_and_go_are_drawn_over_a_shift_of_the_list(cx: &mut TestAppContext) {
+    use super::scroll_patch_tests::shift::assert_the_shift_explains_the_difference;
+    let fixture = Fixture::new(cx, true);
+    let present = |cx: &mut TestAppContext| fixture.with_window(cx, |window, _| window.present());
+    let draws = |cx: &mut TestAppContext| {
+        fixture.with_window(cx, |window, _| window.platform_window.as_test().unwrap().damage_draws())
+    };
+    present(cx);
+    let (mut explained, mut membership) = (0, 0);
+    for step in 0..14 {
+        // Down by a row and a bit, and then up.
+        let to = if step < 8 { fixture.bringing_in_below(cx, 1) } else { fixture.bringing_in_above(cx, 1) };
+        let before = fixture.counters(cx);
+        fixture.scroll_to(cx, to);
+        present(cx);
+        let after = fixture.counters(cx);
+        if after.patched == before.patched {
+            continue;
+        }
+        let draws = draws(cx);
+        let [.., previous, last] = draws.as_slice() else { panic!("two frames were presented") };
+        assert!(after.shifted > before.shifted, "step {step}: the translate has a shift: {after:?} {:?}", last.damage);
+        assert_the_shift_explains_the_difference(previous, last);
+        explained += 1;
+        membership += after.membership_frames - before.membership_frames;
+    }
+    let counters = fixture.counters(cx);
+    assert!(explained >= 10 && membership >= 10, "{explained} {membership} {counters:?}");
+    assert!(counters.rows_built >= 10 && counters.rows_removed >= 1, "{counters:?}");
+}

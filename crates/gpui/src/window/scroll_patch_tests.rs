@@ -69,13 +69,34 @@ struct Page {
     /// The key of the rows: another one builds them again.
     key: Rc<Cell<u64>>,
     focus: Rc<RefCell<Option<FocusHandle>>>,
+    /// What the page is painted over, behind the list.
+    backdrop: Backdrop,
+}
+
+#[derive(Clone, Copy)]
+enum Backdrop {
+    None,
+    /// One color around the whole list: the same wherever the rows are.
+    Solid,
+    /// A gradient: it does not move with the rows.
+    Gradient,
 }
 
 impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let page = self.clone();
         let bar = self.bar.clone().map(|bar| (bar, self.state.clone()));
-        div().size_full().child({
+        let page_background = div().size_full();
+        let page_background = match self.backdrop {
+            Backdrop::None => page_background,
+            Backdrop::Solid => page_background.bg(crate::hsla(0.6, 0.3, 0.3, 1.)),
+            Backdrop::Gradient => page_background.bg(crate::linear_gradient(
+                90.,
+                crate::linear_color_stop(crate::red(), 0.),
+                crate::linear_color_stop(crate::green(), 1.),
+            )),
+        };
+        page_background.child({
             let rows = list(self.state.clone(), move |ix, _, _| {
                 let hitboxes = page.hitboxes;
                 let key = page.key.get();
@@ -185,6 +206,17 @@ impl Fixture {
     }
 
     fn open(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool, nested: bool, bar: Option<Bar>) -> Self {
+        Self::open_over(cx, overscan, hitboxes, nested, bar, Backdrop::None)
+    }
+
+    fn open_over(
+        cx: &mut TestAppContext,
+        overscan: Option<f32>,
+        hitboxes: bool,
+        nested: bool,
+        bar: Option<Bar>,
+        backdrop: Backdrop,
+    ) -> Self {
         let state = ListState::new(100, ListAlignment::Top, px(0.)).with_uniform_item_height(px(ROW));
         let page = Page {
             bar,
@@ -194,6 +226,7 @@ impl Fixture {
             nested,
             key: Rc::new(Cell::new(1)),
             focus: Rc::default(),
+            backdrop,
         };
         let view = page.clone();
         let window = cx.open_window(size(px(400.), px(300.)), move |_, _| view);
@@ -990,4 +1023,136 @@ fn a_bar_that_says_it_cannot_be_repainted_alone_writes_nothing(cx: &mut TestAppC
     let fixture = Fixture::with_bar(cx, &turned);
     turned.alpha.set(0.5);
     assert_eq!(repaint_thumbs(&fixture, cx), Err(ScrollThumbMiss::Track));
+}
+
+/// The shift that the last frame presented told its platform, and the primitives it drew and the one before drew.
+pub(crate) mod shift {
+    use super::*;
+    use crate::window::DamageDraw;
+    use crate::{DevicePixels, FrameDamage, ScaledPixels};
+
+    fn present(fixture: &Fixture, cx: &mut TestAppContext) {
+        fixture.with_window(cx, |window| window.present());
+    }
+
+    fn draws(fixture: &Fixture, cx: &mut TestAppContext) -> Vec<DamageDraw> {
+        fixture.with_window(cx, |window| window.platform_window.as_test().unwrap().damage_draws())
+    }
+
+    fn scale(fixture: &Fixture, cx: &mut TestAppContext) -> i32 {
+        fixture.with_window(cx, |window| window.scale_factor() as i32)
+    }
+
+    fn device(x: i32, y: i32, width: i32, height: i32) -> Bounds<DevicePixels> {
+        Bounds { origin: point(DevicePixels(x), DevicePixels(y)), size: size(DevicePixels(width), DevicePixels(height)) }
+    }
+
+    /// A frame scrolled by `by` and presented, with the frame shown before it presented first.
+    fn scrolled(fixture: &Fixture, cx: &mut TestAppContext, by: f32) -> (DamageDraw, DamageDraw) {
+        // The pointer is put where the wheel is first, which draws a frame of its own that is presented before the translate.
+        fixture.point_at(cx, 10., 12.);
+        present(fixture, cx);
+        fixture.scroll_once(cx, 10., 12., by);
+        present(fixture, cx);
+        let draws = draws(fixture, cx);
+        let [.., before, last] = draws.as_slice() else { panic!("two frames were presented") };
+        (before.clone(), last.clone())
+    }
+
+    fn rects(damage: &FrameDamage) -> Vec<Bounds<DevicePixels>> {
+        damage.rects.iter().copied().collect()
+    }
+
+    fn inside(area: &Bounds<DevicePixels>, within: &Bounds<DevicePixels>) -> bool {
+        area.origin.x >= within.origin.x
+            && area.origin.y >= within.origin.y
+            && area.origin.x + area.size.width <= within.origin.x + within.size.width
+            && area.origin.y + area.size.height <= within.origin.y + within.size.height
+    }
+
+    fn moved(area: &Bounds<ScaledPixels>, by: f32) -> Bounds<ScaledPixels> {
+        Bounds { origin: area.origin + point(ScaledPixels(0.), ScaledPixels(by)), size: area.size }
+    }
+
+    /// Every primitive that is in only one of the two frames is either a row that the shift moves (what it has in the copy
+    /// is what a primitive of the frame before had, moved) or inside what is drawn over the copy. A primitive of the frame
+    /// before that is gone is one the shift moves out of the copy, or is drawn over where it was.
+    #[track_caller]
+    pub(crate) fn assert_the_shift_explains_the_difference(before: &DamageDraw, last: &DamageDraw) {
+        let damage = last.damage.as_ref().expect("the frame is drawn in part");
+        let shift = damage.shift.expect("the frame has a shift");
+        let by = shift.by.y.0 as f32;
+        let new: Vec<_> = last.primitives.iter().filter(|new| !before.primitives.iter().any(|old| old.0 == new.0)).collect();
+        let old: Vec<_> = before.primitives.iter().filter(|old| !last.primitives.iter().any(|new| new.0 == old.0)).collect();
+        let scaled = |area: Bounds<DevicePixels>| Bounds {
+            origin: point(ScaledPixels(area.origin.x.0 as f32), ScaledPixels(area.origin.y.0 as f32)),
+            size: size(ScaledPixels(area.size.width.0 as f32), ScaledPixels(area.size.height.0 as f32)),
+        };
+        // What the copy holds, and where its pixels come from.
+        let kept = scaled(shift.kept());
+        for (_, area) in &new {
+            let here = area.intersect(&kept);
+            let a_row_that_moved = here.is_empty() || old.iter().any(|(_, was)| moved(was, by).intersect(&kept) == here);
+            assert!(a_row_that_moved || last.covers(area), "{area:?} is new and neither moved nor drawn: {damage:?}");
+        }
+        for (_, area) in &old {
+            let there = moved(area, by).intersect(&kept);
+            let a_row_that_moved = there.is_empty() || new.iter().any(|(_, now)| now.intersect(&kept) == there);
+            let here = area.intersect(&scaled(shift.region));
+            assert!(
+                a_row_that_moved || here.is_empty() || last.covers(&here),
+                "{area:?} is gone and neither moved nor drawn over where it was: {damage:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_translate_shifts_the_list_and_draws_the_strip_that_scrolled_in_and_the_thumb(cx: &mut TestAppContext) {
+        let fixture = Fixture::open_over(cx, Some(100.), false, false, Some(Bar::new()), Backdrop::Solid);
+        let scale = scale(&fixture, cx);
+        let (before, last) = scrolled(&fixture, cx, 12.);
+        let counters = fixture.counters(cx);
+        assert_eq!((counters.patched, counters.membership_frames, counters.shifted), (1, 0, 1), "{counters:?}");
+        let damage = last.damage.clone().expect("a translate is drawn in part");
+        let shift = damage.shift.expect("a translate is a shift");
+        assert_eq!(shift.region, device(0, 0, 100 * scale, 100 * scale), "the clip of the list");
+        assert_eq!(shift.by.x, DevicePixels(0));
+        assert_eq!(shift.by.y, DevicePixels(-12 * scale));
+        let strip = device(0, 88 * scale, 100 * scale, 12 * scale);
+        let rects = rects(&damage);
+        assert!(rects.contains(&strip), "the strip that scrolled in, with no margin: {rects:?}");
+        // What else is drawn is the thumb, which is written, and where the copy moves the old one to: not a row, and not the backdrop,
+        // which is one color around the whole list.
+        let thumb = device(90 * scale, 0, 10 * scale, 40 * scale);
+        for rect in rects.iter().filter(|rect| **rect != strip) {
+            assert!(inside(rect, &thumb), "{rect:?} is not the thumb's: {rects:?}");
+        }
+        assert_the_shift_explains_the_difference(&before, &last);
+    }
+
+    #[gpui::test]
+    fn a_backdrop_that_does_not_move_with_the_rows_is_drawn_and_the_shift_is_given_up(cx: &mut TestAppContext) {
+        let fixture = Fixture::open_over(cx, Some(100.), false, false, Some(Bar::new()), Backdrop::Gradient);
+        let scale = scale(&fixture, cx);
+        let (_, last) = scrolled(&fixture, cx, 12.);
+        assert_eq!(fixture.counters(cx).patched, 1);
+        let damage = last.damage.expect("a translate is drawn in part");
+        assert_eq!(damage.shift, None, "all of the list is the gradient's to draw, which a copy would not leave right");
+        assert!(rects(&damage).iter().any(|rect| inside(&device(0, 0, 100 * scale, 100 * scale), rect)), "{damage:?}");
+        assert_eq!(fixture.counters(cx).shifted, 0);
+    }
+
+    #[gpui::test]
+    fn a_translate_with_the_shift_off_draws_the_rows_where_they_were_and_are(cx: &mut TestAppContext) {
+        let fixture = Fixture::open_over(cx, Some(100.), false, false, Some(Bar::new()), Backdrop::Solid);
+        fixture.with_window(cx, |window| window.set_scroll_shift(false));
+        let scale = scale(&fixture, cx);
+        let (_, last) = scrolled(&fixture, cx, 12.);
+        assert_eq!(fixture.counters(cx).patched, 1);
+        let damage = last.damage.expect("a translate is drawn in part");
+        assert_eq!(damage.shift, None);
+        let [whole] = rects(&damage)[..] else { panic!("one rectangle: {damage:?}") };
+        assert!(inside(&device(0, 0, 100 * scale, 100 * scale), &whole), "{whole:?}");
+        assert_eq!(fixture.counters(cx).shifted, 0);
+    }
 }
