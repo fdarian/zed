@@ -16,9 +16,11 @@ use std::{
     },
 };
 
+mod glyph_advances;
 mod shape_store;
 mod snap;
 
+use self::glyph_advances::GlyphAdvances;
 use self::shape_store::{SHAPE_STORE_BUDGET_BYTES, ShapeStore};
 pub use self::snap::Hyphen;
 pub(super) use self::snap::SnapMarks;
@@ -2153,6 +2155,9 @@ pub(crate) struct LineLayoutCache {
     /// Behind the frame caches: what was shaped, for as long as the budget allows. Locked after
     /// the frame caches, and never while taking them.
     shape_store: Mutex<ShapeStore>,
+    /// What the platform said about a glyph, for lines shaped later. A leaf lock: nothing is
+    /// locked while it is held, and the platform's write lock is never taken under it.
+    glyph_advances: Mutex<GlyphAdvances>,
     font_generation: Arc<AtomicU64>,
     /// The device pixels to a pixel of the window's display, as `f32` bits: what lines are
     /// shaped for, and part of the key of every layout.
@@ -2237,6 +2242,7 @@ impl LineLayoutCache {
             platform_text_system,
             counters: AtomicTextCounters::default(),
             shape_store: Mutex::new(ShapeStore::new(SHAPE_STORE_BUDGET_BYTES)),
+            glyph_advances: Mutex::default(),
             font_generation,
             scale_factor: AtomicU32::new(1f32.to_bits()),
         }
@@ -2255,6 +2261,12 @@ impl LineLayoutCache {
 
     fn font_generation(&self) -> u64 {
         self.font_generation.load(Ordering::Relaxed)
+    }
+
+    fn glyph_advances(&self) -> parking_lot::MutexGuard<'_, GlyphAdvances> {
+        let mut advances = self.glyph_advances.lock();
+        advances.forget_if_fonts_changed(self.font_generation());
+        advances
     }
 
     pub fn counters(&self) -> TextCounters {

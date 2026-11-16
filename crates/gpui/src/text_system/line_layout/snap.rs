@@ -543,13 +543,11 @@ impl LineLayoutCache {
         let scale_factor = shaped.scale_factor;
         let scale = f64::from(scale_factor);
         let mut reshapes = Vec::new();
-        let mut advances: FxHashMap<(FontId, GlyphId, u32), Option<f64>> = FxHashMap::default();
-        let mut alones: FxHashMap<(FontId, GlyphId, char, u32), f64> = FxHashMap::default();
+        let mut advances = self.glyph_advances();
         let mut glyph_ix = 0;
         for run in &shaped.runs {
             let metrics = self.platform_text_system.font_metrics(run.font_id);
             let font_unit = f64::from(run.font_size.0) / f64::from(metrics.units_per_em) * scale;
-            let size = run.font_size.0.to_bits();
             for (pair_ix, pair) in run.glyphs.windows(2).enumerate() {
                 let after = glyph_ix + pair_ix + 1;
                 let (before, next) = (&pair[0], &pair[1]);
@@ -588,17 +586,23 @@ impl LineLayoutCache {
                 if letter.is_whitespace() || follows.is_none_or(char::is_whitespace) {
                     continue;
                 }
-                let Some(nominal) = *advances.entry((run.font_id, before.id, size)).or_insert_with(|| {
-                    self.platform_text_system
-                        .glyph_advance(run.font_id, before.id, run.font_size, scale_factor)
-                        .log_err()
-                        .map(|advance| advance * scale)
-                }) else {
+                let Some(nominal) = advances
+                    .nominal(&*self.platform_text_system, run.font_id, before.id, run.font_size, scale_factor)
+                    .map(|advance| advance * scale)
+                else {
                     continue;
                 };
-                let alone = *alones.entry((run.font_id, before.id, letter, size)).or_insert_with(|| {
-                    self.alone_advance(run, before.id, letter, nominal, scale_factor)
-                });
+                let alone = match advances.alone(run.font_id, before.id, letter, run.font_size, scale_factor) {
+                    Some(alone) => alone,
+                    None => {
+                        // `alone_advance` can take the platform's write lock to lay the letter out.
+                        drop(advances);
+                        let alone = self.alone_advance(run, before.id, letter, nominal, scale_factor);
+                        advances = self.glyph_advances();
+                        advances.insert_alone(run.font_id, before.id, letter, run.font_size, scale_factor, alone);
+                        alone
+                    }
+                };
                 let kern = kern_advance((f64::from(x[after].0) - f64::from(x[after - 1].0)) * scale - nominal, font_unit);
                 // A font with a `kern` table gives the glyph before a kern half of it.
                 let kerned = kern != 0;
@@ -642,19 +646,19 @@ impl LineLayoutCache {
     fn measure(&self, shaped: &LineLayout) -> Measure {
         let x = glyph_positions(shaped);
         let scale = f64::from(shaped.scale_factor);
-        // A line has few distinct glyphs and a call for each is a platform call.
-        let mut advances: FxHashMap<(FontId, GlyphId, u32), Option<f64>> = FxHashMap::default();
+        let mut advances = self.glyph_advances();
         let mut glyphs = Vec::with_capacity(x.len() - 1);
         for run in &shaped.runs {
             let units_per_em = f64::from(self.platform_text_system.font_metrics(run.font_id).units_per_em);
             let font_unit = f64::from(run.font_size.0) / units_per_em * scale;
             for glyph in &run.glyphs {
-                let key = (run.font_id, glyph.id, run.font_size.0.to_bits());
-                let nominal = *advances.entry(key).or_insert_with(|| {
-                    self.platform_text_system
-                        .glyph_advance(run.font_id, glyph.id, run.font_size, shaped.scale_factor)
-                        .log_err()
-                });
+                let nominal = advances.nominal(
+                    &*self.platform_text_system,
+                    run.font_id,
+                    glyph.id,
+                    run.font_size,
+                    shaped.scale_factor,
+                );
                 glyphs.push(DeviceAdvance {
                     nominal: nominal.map(|nominal| nominal * scale),
                     font_unit,
@@ -719,17 +723,20 @@ impl LineLayoutCache {
         let scale_factor = shaped.scale_factor;
         let scale = f64::from(scale_factor);
         let mut shares = Vec::new();
+        let mut advances = self.glyph_advances();
         let mut glyph_ix = 0;
         for run in &shaped.runs {
             let metrics = self.platform_text_system.font_metrics(run.font_id);
             if metrics.legacy_kerning {
                 let font_unit = f64::from(run.font_size.0) / f64::from(metrics.units_per_em) * scale;
                 for (pair_ix, pair) in run.glyphs.windows(2).enumerate() {
-                    let Some(nominal) = self
-                        .platform_text_system
-                        .glyph_advance(run.font_id, pair[0].id, run.font_size, scale_factor)
-                        .log_err()
-                    else {
+                    let Some(nominal) = advances.nominal(
+                        &*self.platform_text_system,
+                        run.font_id,
+                        pair[0].id,
+                        run.font_size,
+                        scale_factor,
+                    ) else {
                         continue;
                     };
                     let kern = (f64::from(pair[1].position.x.0) - f64::from(pair[0].position.x.0) - nominal) * scale;
