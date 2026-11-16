@@ -7,7 +7,7 @@ use crate::style::{
     LengthPercentageAuto, Overflow, Position, Style, TextAlign,
 };
 use crate::style_helpers::{auto, length, percent, zero};
-use crate::tree::{NodeId, TaffyTree};
+use crate::tree::{Calc, NodeId, TaffyTree};
 
 type Tree = TaffyTree<Size<f32>>;
 
@@ -25,6 +25,23 @@ fn measure(
     });
     let lines = if width > 0.0 { (content.width / width).ceil().max(1.0) } else { 1.0 };
     Size { width, height: known.height.unwrap_or(content.height * lines) }
+}
+
+/// A measure function whose height follows a definite available height, as a scroll container's or a virtual list's
+/// does, so that an available height a node is asked with can change its answer. The fuzz uses it; the tests that count
+/// relayouts keep `measure`, whose answers are the same in every height.
+fn measure_by_height(
+    known: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+    node: NodeId,
+    context: Option<&mut Size<f32>>,
+    style: &Style,
+) -> Size<f32> {
+    let answer = measure(known, available, node, context, style);
+    match (known.height, available.height) {
+        (None, AvailableSpace::Definite(space)) => Size { width: answer.width, height: answer.height.min(space) },
+        _ => answer,
+    }
 }
 
 fn space() -> Size<AvailableSpace> {
@@ -790,9 +807,19 @@ struct Description {
     children: Vec<Description>,
 }
 
+/// `calc()` lengths of a length and a share of the basis, which the tree resolves as it does a percentage.
+static CALCS: [Calc; 3] = [Calc::linear(10.0, 0.25), Calc::linear(2.0, 0.05), Calc::linear(0.0, 0.5)];
+
+fn calc_pointer(random: &mut Random) -> *const () {
+    let calc: &Calc = &CALCS[random.below(CALCS.len())];
+    calc as *const Calc as *const ()
+}
+
 fn dimension(random: &mut Random, auto_odds: usize) -> Dimension {
     if random.one_in(auto_odds) {
         auto()
+    } else if random.one_in(10) {
+        Dimension::calc(calc_pointer(random))
     } else if random.one_in(4) {
         percent(random.pick(&[0.25, 0.5, 1.0]))
     } else {
@@ -801,7 +828,9 @@ fn dimension(random: &mut Random, auto_odds: usize) -> Dimension {
 }
 
 fn length_percentage(random: &mut Random) -> LengthPercentage {
-    if random.one_in(6) {
+    if random.one_in(12) {
+        LengthPercentage::calc(calc_pointer(random))
+    } else if random.one_in(6) {
         percent(random.pick(&[0.05, 0.1]))
     } else if random.one_in(2) {
         zero()
@@ -813,6 +842,8 @@ fn length_percentage(random: &mut Random) -> LengthPercentage {
 fn length_percentage_auto(random: &mut Random) -> LengthPercentageAuto {
     if random.one_in(5) {
         auto()
+    } else if random.one_in(12) {
+        LengthPercentageAuto::calc(calc_pointer(random))
     } else if random.one_in(6) {
         percent(random.pick(&[0.05, 0.1]))
     } else {
@@ -1193,7 +1224,7 @@ pub(super) fn run_seed_with(seed: u64, steps: usize, unnormalized: bool) -> Run 
 
     let mut taffy = new_tree();
     let root = build(&mut taffy, &description);
-    lay_out(&mut taffy, root);
+    taffy.compute_layout_with_measure(root, space(), measure_by_height).unwrap();
 
     let mut log = Vec::new();
     for step in 0..steps {
@@ -1213,16 +1244,16 @@ pub(super) fn run_seed_with(seed: u64, steps: usize, unnormalized: bool) -> Run 
             let path = all[random.below(all.len())].clone();
             let node = node_at(&taffy, root, &path);
             if node != root {
-                taffy.compute_layout_with_measure(node, space(), measure).unwrap();
+                taffy.compute_layout_with_measure(node, space(), measure_by_height).unwrap();
                 // The layout of a root is placed at its own origin: the style it is given back is a change.
                 taffy.mark_dirty(node).unwrap();
             }
         }
-        taffy.compute_layout_with_measure(root, available, measure).unwrap();
+        taffy.compute_layout_with_measure(root, available, measure_by_height).unwrap();
 
         let mut fresh = new_tree();
         let fresh_root = build(&mut fresh, &description);
-        let lay_out_fresh = |fresh: &mut Tree| fresh.compute_layout_with_measure(fresh_root, available, measure).unwrap();
+        let lay_out_fresh = |fresh: &mut Tree| fresh.compute_layout_with_measure(fresh_root, available, measure_by_height).unwrap();
         if unnormalized {
             crate::tree::input_norm::unnormalized(|| lay_out_fresh(&mut fresh));
         } else {

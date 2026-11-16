@@ -354,6 +354,10 @@ pub(crate) struct Probe {
     /// change of that kind that leaves the answers of the node as they were leaves every box and extent above it as it
     /// was (see [`TaffyTree::mark_dirty_chain`]).
     content_only: bool,
+    /// Whether the node was a block container when `measured` was taken. The keys of its measurements hold the
+    /// available height `input_norm` gave a block container (the block rule ignores it), which is not what its parent
+    /// asked: a node that is not one anymore, a leaf that is measured, would be asked what nobody asked.
+    block_container: bool,
 }
 
 /// Where a walk up from a change ended.
@@ -612,12 +616,19 @@ where
         // If there was no cache match and a new result needs to be computed then that result will be added to the cache
         let original_inputs = inputs;
         // fdarian fork patch: input normalization. `SavedLayout` below keeps what the parent asked, which is what a
-        // relayout boundary is asked again with, and that is normalized here again.
-        let inputs = {
+        // relayout boundary is asked again with, and that is normalized here again. Not in a tree that has had a float:
+        // the float context a block passes to its children is no part of the cache key, and the parent size changing
+        // was what made a node recompute how it avoids them.
+        let inputs = if self.taffy.floats_seen {
+            inputs
+        } else {
             let node = &self.taffy.nodes[node_id.into()];
-            let block_container = matches!(node.style.display, Display::Block | Display::FlowRoot)
-                && !self.taffy.children[node_id.into()].is_empty();
-            super::input_norm::normalize(node.reads_parent_width, node.reads_parent_height, block_container, inputs)
+            super::input_norm::normalize(
+                node.reads_parent_width,
+                node.reads_parent_height,
+                self.taffy.is_block_container(node_id),
+                inputs,
+            )
         };
         let mut output = compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
             match inputs.run_mode {
@@ -828,8 +839,11 @@ where
                 continue;
             }
 
-            let mut unchanged = true;
+            let mut unchanged = probe.block_container == self.taffy.is_block_container(node);
             for (input, before) in &probe.measured {
+                if !unchanged {
+                    break;
+                }
                 let after = self.compute_again(node, *input);
                 if !measured_answer_is_unchanged(before, &after) {
                     unchanged = false;
@@ -1625,6 +1639,13 @@ impl<NodeContext> TaffyTree<NodeContext> {
         Ok(())
     }
 
+    /// Whether the node lays its children out in a block flow, which is the one case `input_norm` normalizes the
+    /// available height for.
+    fn is_block_container(&self, node: NodeId) -> bool {
+        matches!(self.nodes[node.into()].style.display, Display::Block | Display::FlowRoot)
+            && !self.children[node.into()].is_empty()
+    }
+
     fn note_floats(&mut self, style: &Style) {
         #[cfg(feature = "float_layout")]
         if style.float != crate::Float::None || style.clear != crate::Clear::None {
@@ -1828,7 +1849,12 @@ impl<NodeContext> TaffyTree<NodeContext> {
             return Stop::No;
         };
         match data.cache.measured_questions() {
-            Some(measured) => Stop::Capture(Box::new(Probe { measured, placed: saved, content_only: false })),
+            Some(measured) => Stop::Capture(Box::new(Probe {
+                measured,
+                placed: saved,
+                content_only: false,
+                block_container: self.is_block_container(node),
+            })),
             None => Stop::No,
         }
     }

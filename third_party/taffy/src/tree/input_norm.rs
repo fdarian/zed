@@ -85,9 +85,10 @@ mod tests {
 
     use crate::MeasuredLeaf;
     use crate::geometry::Size;
-    use crate::style::{AvailableSpace, Display, FlexDirection, Style};
+    use crate::style::{AlignItems, AvailableSpace, Display, FlexDirection, Style};
     use crate::style_helpers::{length, percent};
     use crate::tree::relayout_boundary_tests::run_seed_with;
+    use crate::tree::input_norm::unnormalized;
     use crate::tree::{NodeId, TaffyTree};
 
     type Tree = TaffyTree<()>;
@@ -444,6 +445,296 @@ mod tests {
             },
         );
         assert_eq!(taffy.unrounded_layout(subject).size.width, 75.0);
+    }
+
+    /// Lays the tree out with a measure function whose height is the available height, at most the leaf's own.
+    fn lay_out_clamped(taffy: &mut TaffyTree<f32>, root: NodeId) {
+        taffy
+            .compute_layout_with_measure(
+                root,
+                Size {
+                    width: AvailableSpace::Definite(500.0),
+                    height: AvailableSpace::Definite(500.0),
+                },
+                |known, available, _, context, _| {
+                    let content = context.copied().unwrap_or(0.0);
+                    Size {
+                        width: known.width.unwrap_or(40.0),
+                        height: known.height.unwrap_or(match available.height {
+                            AvailableSpace::Definite(space) => content.min(space),
+                            _ => content,
+                        }),
+                    }
+                },
+            )
+            .unwrap();
+    }
+
+    /// A container that is `height` high, around a block that is measured by the height it is given (its context is
+    /// the most it is high) and holds a block of `tall` height.
+    fn measured_block_in(
+        taffy: &mut TaffyTree<f32>,
+        container: &Style,
+        content: f32,
+        tall: f32,
+    ) -> (NodeId, NodeId, NodeId) {
+        let tall = taffy
+            .new_leaf(Style {
+                display: Display::Block,
+                size: Size {
+                    width: length(40.0),
+                    height: length(tall),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let measured = taffy
+            .new_leaf_with_context(
+                Style {
+                    display: Display::Block,
+                    ..Default::default()
+                },
+                content,
+            )
+            .unwrap();
+        taffy.add_child(measured, tall).unwrap();
+        let row = taffy.new_with_children(container.clone(), &[measured]).unwrap();
+        (row, measured, tall)
+    }
+
+    /// The containers a block that lost its last child is laid out in: the difference to a tree built without the
+    /// child is what the layout of the container and of the block are.
+    fn containers() -> Vec<(String, Style)> {
+        let mut found = Vec::new();
+        for (name, display, direction) in [
+            ("flex row", Display::Flex, FlexDirection::Row),
+            ("flex column", Display::Flex, FlexDirection::Column),
+            ("grid", Display::Grid, FlexDirection::Row),
+            ("block", Display::Block, FlexDirection::Row),
+        ] {
+            for height in [40.0, 100.0, 300.0] {
+                for align in [None, Some(AlignItems::FLEX_START)] {
+                    found.push((
+                        format!("{name}, {height} high, {align:?}"),
+                        Style {
+                            display,
+                            flex_direction: direction,
+                            align_items: align,
+                            size: Size {
+                                width: length(200.0),
+                                height: length(height),
+                            },
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_block_that_lost_its_last_child_is_laid_out_as_a_tree_built_without_it() {
+        let mut differences = Vec::new();
+        for (name, container) in containers() {
+            for content in [100.0, 300.0] {
+                for tall in [100.0, 300.0] {
+                    let mut taffy = TaffyTree::<f32>::new();
+                    let (row, measured, child) = measured_block_in(&mut taffy, &container, content, tall);
+                    lay_out_clamped(&mut taffy, row);
+                    taffy.remove_child(measured, child).unwrap();
+                    lay_out_clamped(&mut taffy, row);
+
+                    let mut fresh = TaffyTree::<f32>::new();
+                    let (fresh_row, fresh_measured, fresh_child) =
+                        measured_block_in(&mut fresh, &container, content, tall);
+                    fresh.remove_child(fresh_measured, fresh_child).unwrap();
+                    unnormalized(|| lay_out_clamped(&mut fresh, fresh_row));
+                    for (node, fresh_node) in [(row, fresh_row), (measured, fresh_measured)] {
+                        if taffy.unrounded_layout(node).size != fresh.unrounded_layout(fresh_node).size {
+                            differences.push(format!(
+                                "{name}, content {content}, child {tall}: {:?} and not {:?}",
+                                taffy.unrounded_layout(node).size,
+                                fresh.unrounded_layout(fresh_node).size
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(differences.is_empty(), "{differences:#?}");
+    }
+
+    fn layouts(taffy: &Tree, node: NodeId, found: &mut Vec<(Size<f32>, crate::geometry::Point<f32>)>) {
+        let layout = taffy.unrounded_layout(node);
+        found.push((layout.size, layout.location));
+        for child in taffy.children(node).unwrap() {
+            layouts(taffy, child, found);
+        }
+    }
+
+    fn at_width(taffy: &mut Tree, root: NodeId, width: f32) -> Vec<(Size<f32>, crate::geometry::Point<f32>)> {
+        taffy
+            .compute_layout(
+                root,
+                Size {
+                    width: AvailableSpace::Definite(width),
+                    height: AvailableSpace::MaxContent,
+                },
+            )
+            .unwrap();
+        let mut found = Vec::new();
+        layouts(taffy, root, &mut found);
+        found
+    }
+
+    /// A block holding a right float 100 wide and a block 350 wide with a flow-root in it, which goes around the float
+    /// when the block is narrow enough for them to meet.
+    #[cfg(feature = "float_layout")]
+    fn float_and_flow_root(taffy: &mut Tree) -> (NodeId, NodeId) {
+        let flow_root = taffy
+            .new_leaf(Style {
+                display: Display::FlowRoot,
+                size: Size {
+                    width: crate::style_helpers::auto(),
+                    height: length(20.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let wide = taffy
+            .new_with_children(
+                Style {
+                    display: Display::Block,
+                    size: Size {
+                        width: length(350.0),
+                        height: crate::style_helpers::auto(),
+                    },
+                    ..Default::default()
+                },
+                &[flow_root],
+            )
+            .unwrap();
+        let float = taffy
+            .new_leaf(Style {
+                display: Display::Block,
+                float: crate::Float::Right,
+                size: Size {
+                    width: length(100.0),
+                    height: length(100.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        let parent = taffy
+            .new_with_children(
+                Style {
+                    display: Display::Block,
+                    ..Default::default()
+                },
+                &[float, wide],
+            )
+            .unwrap();
+        (parent, flow_root)
+    }
+
+    #[cfg(feature = "float_layout")]
+    #[test]
+    fn a_tree_with_a_float_is_not_normalized_and_a_wider_parent_moves_the_flow_root_off_the_float() {
+        let mut taffy = Tree::new();
+        let (parent, flow_root) = float_and_flow_root(&mut taffy);
+        let narrow = at_width(&mut taffy, parent, 400.0);
+        assert_eq!(taffy.unrounded_layout(flow_root).size.width, 300.0);
+        let wide = at_width(&mut taffy, parent, 500.0);
+        assert_eq!(taffy.unrounded_layout(flow_root).size.width, 350.0);
+
+        let mut fresh = Tree::new();
+        let (fresh_parent, _) = float_and_flow_root(&mut fresh);
+        assert_eq!(unnormalized(|| at_width(&mut fresh, fresh_parent, 500.0)), wide);
+        let mut fresh_narrow = Tree::new();
+        let (fresh_narrow_parent, _) = float_and_flow_root(&mut fresh_narrow);
+        assert_eq!(unnormalized(|| at_width(&mut fresh_narrow, fresh_narrow_parent, 400.0)), narrow);
+    }
+
+    /// A table of two rows whose cells are blocks with children, some of which resolve a percentage.
+    fn table_of_blocks(taffy: &mut Tree) -> NodeId {
+        let cell = |taffy: &mut Tree, share: f32| {
+            let half = taffy
+                .new_leaf(Style {
+                    display: Display::Block,
+                    size: Size {
+                        width: percent(share),
+                        height: length(20.0),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let fixed = node(
+                taffy,
+                Style {
+                    display: Display::Block,
+                    ..Default::default()
+                },
+            );
+            taffy
+                .new_with_children(
+                    Style {
+                        display: Display::Block,
+                        table_role: crate::TableRole::CELL,
+                        ..Default::default()
+                    },
+                    &[half, fixed],
+                )
+                .unwrap()
+        };
+        let row = |taffy: &mut Tree, shares: [f32; 2]| {
+            let cells = [cell(taffy, shares[0]), cell(taffy, shares[1])];
+            taffy
+                .new_with_children(
+                    Style {
+                        display: Display::Block,
+                        table_role: crate::TableRole::Row,
+                        ..Default::default()
+                    },
+                    &cells,
+                )
+                .unwrap()
+        };
+        let rows = [row(taffy, [0.5, 0.25]), row(taffy, [1.0, 0.75])];
+        let body = taffy
+            .new_with_children(
+                Style {
+                    display: Display::Block,
+                    table_role: crate::TableRole::RowGroup(crate::RowGroupKind::Body),
+                    ..Default::default()
+                },
+                &rows,
+            )
+            .unwrap();
+        taffy
+            .new_with_children(
+                Style {
+                    display: Display::Table,
+                    ..Default::default()
+                },
+                &[body],
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_table_of_blocks_is_laid_out_as_an_unnormalized_one_is_under_each_width() {
+        let mut taffy = Tree::new();
+        let table = table_of_blocks(&mut taffy);
+        for width in [300.0, 500.0, 300.0, 420.0] {
+            let mut fresh = Tree::new();
+            let fresh_table = table_of_blocks(&mut fresh);
+            assert_eq!(
+                at_width(&mut taffy, table, width),
+                unnormalized(|| at_width(&mut fresh, fresh_table, width)),
+                "{width}"
+            );
+        }
     }
 
     fn seeds() -> u64 {
