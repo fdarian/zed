@@ -34,6 +34,8 @@ use std::{
 pub(crate) type PointF = gpui::Point<f32>;
 
 mod device_state;
+#[cfg(test)]
+mod partial_bench;
 use device_state::DeviceState;
 
 // Use 4x MSAA, all devices support it.
