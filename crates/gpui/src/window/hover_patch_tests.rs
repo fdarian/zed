@@ -27,6 +27,8 @@ pub(super) struct Knobs {
     painted: Cell<bool>,
     /// Whether a row that is not hot has a fully transparent background that is kept.
     transparent: Cell<bool>,
+    /// Whether a row has a box with an overflow other than visible, a scroller of its own.
+    scroller: Cell<bool>,
     /// The effect group painted over the rows, if any.
     pub(super) group: Cell<Option<GroupKind>>,
 }
@@ -60,8 +62,11 @@ fn group_element(kind: GroupKind) -> AnyElement {
         .into_any_element()
 }
 
-fn row_element(ix: usize, hot: bool, transparent: bool) -> AnyElement {
+fn row_element(ix: usize, hot: bool, transparent: bool, scroller: bool) -> AnyElement {
     let mut row = div().id(("row", ix)).w_full().h(px(ROW)).always_hitbox();
+    if scroller {
+        row = row.child(div().id(("scroller", ix)).w(px(10.)).h(px(10.)).overflow_y_scroll().bg(crate::green()));
+    }
     if transparent {
         row.style().keep_transparent_background = Some(true);
         row = row.bg(if hot { crate::red() } else { crate::transparent_black() });
@@ -81,11 +86,12 @@ impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let knobs = self.knobs.clone();
         let transparent = knobs.transparent.get();
+        let scroller = knobs.scroller.get();
         let group = knobs.group.get().map(group_element);
         div().size_full().child(
             list(self.state.clone(), move |ix, _, _| {
                 let hot = knobs.hot.get() == Some(ix);
-                retained(("row", ix), knobs.key.get() * 1_000 + u64::from(hot), move |_, _| row_element(ix, hot, transparent))
+                retained(("row", ix), knobs.key.get() * 1_000 + u64::from(hot), move |_, _| row_element(ix, hot, transparent, scroller))
                     .relocatable(px(100.))
                     .patchable()
                     .into_any_element()
@@ -108,16 +114,22 @@ impl Fixture {
     }
 
     fn with_transparent(cx: &mut TestAppContext, transparent: bool) -> Self {
-        Self::build(cx, transparent, None)
+        Self::build(cx, transparent, None, false)
+    }
+
+    /// The list whose rows have a scroller of their own.
+    fn with_scroller(cx: &mut TestAppContext) -> Self {
+        Self::build(cx, false, None, true)
     }
 
     /// The list with an effect group of `kind` over its first rows.
     pub(super) fn with_group(cx: &mut TestAppContext, kind: GroupKind) -> Self {
-        Self::build(cx, false, Some(kind))
+        Self::build(cx, false, Some(kind), false)
     }
 
-    fn build(cx: &mut TestAppContext, transparent: bool, group: Option<GroupKind>) -> Self {
+    fn build(cx: &mut TestAppContext, transparent: bool, group: Option<GroupKind>, scroller: bool) -> Self {
         let knobs = Rc::new(Knobs::default());
+        knobs.scroller.set(scroller);
         knobs.key.set(1);
         knobs.transparent.set(transparent);
         knobs.group.set(group);
@@ -138,7 +150,7 @@ impl Fixture {
                     .patch
                     .borrow()
                     .iter()
-                    .map(|&ix| (ElementId::from(("row", ix)), row_element(ix, knobs.painted.get(), knobs.transparent.get())))
+                    .map(|&ix| (ElementId::from(("row", ix)), row_element(ix, knobs.painted.get(), knobs.transparent.get(), knobs.scroller.get())))
                     .collect();
                 window.repaint_in_place(units, cx, |_, _| true).is_ok()
             })));
@@ -293,6 +305,26 @@ fn a_row_a_frame_built_whole_put_elsewhere_than_it_was_recorded_is_patched_in_it
     let patched = fixture.scene(cx);
     fixture.whole(cx, Some(1));
     assert_eq!(patched, fixture.scene(cx), "the patch wrote what the frame paints, 5 from the recording");
+}
+
+#[gpui::test]
+fn a_row_with_a_scroller_of_its_own_a_frame_built_whole_put_elsewhere_is_declined_as_relocated(cx: &mut TestAppContext) {
+    let fixture = Fixture::with_scroller(cx);
+    assert!(fixture.can_patch(cx, 1), "the rows are recorded where they are");
+    fixture.wheel(cx, 5.);
+    // A patch would have to move the offset and extent the frame holds of the scroller.
+    assert!(!fixture.can_patch(cx, 1));
+    fixture.patch(cx, &[1], true);
+    let counters = fixture.patched(cx);
+    assert_eq!(counters.patched_frames, 0, "{counters:?}");
+    assert_eq!(counters.declines(PatchDecline::Relocated), 1, "{counters:?}");
+    // Built where it stands, it is patched.
+    fixture.whole(cx, None);
+    fixture.knobs.key.set(2);
+    fixture.whole(cx, None);
+    assert!(fixture.can_patch(cx, 1));
+    fixture.patch(cx, &[1], true);
+    assert_eq!(fixture.patched(cx).patched_frames, 1);
 }
 
 #[gpui::test]

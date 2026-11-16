@@ -2905,6 +2905,11 @@ impl PrepaintRecord {
         self.range = range;
     }
 
+    /// Whether the subtree prepainted a scroller of its own (a box with an overflow other than visible).
+    pub(crate) fn holds_scroller(&self) -> bool {
+        self.range.start.scrollers_index != self.range.end.scrollers_index
+    }
+
     /// The line layouts the prepaint shaped were given back to the text system: a replay carries none.
     pub(crate) fn forget_line_layouts(&mut self) {
         self.range.end.line_layout_index = self.range.start.line_layout_index.clone();
