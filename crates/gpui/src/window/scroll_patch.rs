@@ -37,8 +37,8 @@
 //! of their own at the width the list gives its rows, prepainted where the new position puts each, and painted,
 //! in a frame of scratch; what that left is put in the frame at the head or the tail of the rows, as the
 //! frame built whole has it, with the recording each made and a run. A row of another height than the list
-//! measured, one that does what a recording cannot repeat, one under the pointer and a frame that does not
-//! hold what a row recorded where it recorded it decline the translate.
+//! measured, one that does what a recording cannot repeat and a frame that does not hold what a row recorded
+//! where it recorded it decline the translate.
 //!
 //! **Thumbs.** A list's overlay scrollbar paints a thumb that a scroll moves, so the owner notes
 //! each bar it paints for a list ([`Window::paint_scroll_thumb`]): the quad it painted, as the one
@@ -280,9 +280,6 @@ pub enum ScrollApplyDecline {
     /// What a row that comes in did cannot be repeated by a recording: it asked for a frame, scrolled
     /// something into view, deferred a draw or reported what it laid out to its owner ahead of paint.
     Effects,
-    /// A hitbox of a row that comes in takes the pointer where the pointer is: a frame built whole says
-    /// what that does to the hover.
-    Pointer,
     /// The frame shown does not hold what a row recorded where it recorded it (a stacking context moved
     /// it), or the rows to take out do not follow one another.
     Splice,
@@ -290,7 +287,7 @@ pub enum ScrollApplyDecline {
 
 impl ScrollApplyDecline {
     /// Every reason.
-    pub const ALL: [ScrollApplyDecline; 11] = [
+    pub const ALL: [ScrollApplyDecline; 10] = [
         ScrollApplyDecline::Recording,
         ScrollApplyDecline::Operations,
         ScrollApplyDecline::Hitboxes,
@@ -300,7 +297,6 @@ impl ScrollApplyDecline {
         ScrollApplyDecline::Row,
         ScrollApplyDecline::Height,
         ScrollApplyDecline::Effects,
-        ScrollApplyDecline::Pointer,
         ScrollApplyDecline::Splice,
     ];
 
@@ -1710,7 +1706,6 @@ impl Window {
             clip,
             content_width,
             point(rows_origin.x, rows_origin.y - scrolled),
-            &prediction.rebuilds,
             cx,
         );
         // What the rows cached in the scratch frame is not where the frame shown has it.
@@ -1738,7 +1733,6 @@ impl Window {
         clip: ContentMask<Pixels>,
         content_width: Pixels,
         origin: Point<Pixels>,
-        rebuilds: &[usize],
         cx: &mut App,
     ) -> Result<RowsBuilt, ScrollApplyDecline> {
         let prepaint_start = self.prepaint_index();
@@ -1773,19 +1767,6 @@ impl Window {
                 return Err(ScrollApplyDecline::Row);
             }
         }
-        // A row that stays has the hitboxes it had.
-        let mouse = self.mouse_position;
-        let rebuilt_hitboxes: Vec<Range<usize>> =
-            runs.iter().filter(|run| rebuilds.contains(&run.row)).map(|run| run.hitboxes.clone()).collect();
-        let under_pointer = self.next_frame.hitboxes.iter().enumerate().any(|(ix, hitbox)| {
-            hitbox.behavior != HitboxBehavior::PassThrough
-                && hitbox.contains_point(mouse)
-                && !rebuilt_hitboxes.iter().any(|range| range.contains(&ix))
-        });
-        if under_pointer {
-            return Err(ScrollApplyDecline::Pointer);
-        }
-
         let (hitboxes_at, operations_at) = (group.at.0[HITBOXES], group.at.1[OPERATIONS]);
         for run in &mut runs {
             run.hitboxes = run.hitboxes.start + hitboxes_at..run.hitboxes.end + hitboxes_at;

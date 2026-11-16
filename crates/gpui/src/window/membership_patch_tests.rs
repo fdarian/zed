@@ -742,7 +742,7 @@ fn a_row_that_defers_a_draw_declines_and_is_drawn_whole(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn a_row_that_comes_in_under_the_pointer_is_drawn_whole_and_says_why(cx: &mut TestAppContext) {
+fn a_row_that_comes_in_under_a_still_pointer_is_still_a_translate(cx: &mut TestAppContext) {
     let pair = Pair::new(cx);
     // The rows come in at the bottom, where the pointer is.
     for fixture in [&pair.translated, &pair.built] {
@@ -764,7 +764,8 @@ fn a_row_that_comes_in_under_the_pointer_is_drawn_whole_and_says_why(cx: &mut Te
     }
     let counters = pair.translated.counters(cx);
     assert_eq!(counters.frames - before.frames, 1, "{counters:?}");
-    assert_eq!(counters.apply_declines(ScrollApplyDecline::Pointer), 1, "{counters:?}");
+    assert_eq!(counters.patched - before.patched, 1, "{counters:?}");
+    no_declines(&counters);
     pair.same(cx, "a row under the pointer");
 }
 
@@ -1377,7 +1378,6 @@ mod overdraw {
             pair.same(cx, &format!("step {step}"));
         }
         let counters = pair.translated.counters(cx);
-        assert_eq!(counters.apply_declines(ScrollApplyDecline::Pointer), 0, "{counters:?}");
         assert!(counters.rows_rebuilt >= 1, "{counters:?}");
         // What a click reaches in the rows built again is what it reaches in a frame built whole.
         assert_eq!(pair.translated.clicks(cx), pair.built.clicks(cx));
