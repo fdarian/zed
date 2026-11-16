@@ -1325,10 +1325,13 @@ impl Retained {
             }
             if let Some(unit) = &recorded.patch {
                 // A patch paints a recording where its surroundings were captured and puts what it paints `delta`
-                // away. That is only done for a root that lays out again (the patch rewrites its recording), and
-                // where the content mask around is the one it was recorded under.
-                let moved_and_patchable = unit.relayouts()
-                    && recorded.relocation.as_ref().is_some_and(|relocation| relocation.regional() && relocation.ambient == ambient);
+                // away, and rewrites the recording with what it painted there, so a scroll translate that follows
+                // moves the new paint: a root in a region of its own, under the content mask it was recorded under,
+                // is in the state a translate leaves it in (`RetainedState::scrolled_to`).
+                let moved_and_patchable = recorded
+                    .relocation
+                    .as_ref()
+                    .is_some_and(|relocation| relocation.regional() && relocation.ambient == ambient);
                 if (delta.is_zero() && exact) || moved_and_patchable {
                     unit.replayed_under(window);
                     window.register_patch_unit(&id, unit);

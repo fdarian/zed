@@ -282,16 +282,56 @@ fn two_rows_in_one_patch_write_their_primitives_in_place(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn a_row_put_elsewhere_than_it_was_recorded_is_declined_as_relocated(cx: &mut TestAppContext) {
+fn a_row_a_frame_built_whole_put_elsewhere_than_it_was_recorded_is_patched_in_its_region(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx);
     // The list scrolls by 5: the rows are replayed 5 from their recordings.
     fixture.wheel(cx, 5.);
-    assert!(!fixture.can_patch(cx, 1));
+    assert!(fixture.can_patch(cx, 1));
     fixture.patch(cx, &[1], true);
     let counters = fixture.patched(cx);
-    assert_eq!(counters.patched_frames, 0, "{counters:?}");
-    assert_eq!(counters.declines(PatchDecline::Relocated), 1, "{counters:?}");
-    assert_eq!(counters.declines(PatchDecline::UnknownUnit), 0, "{counters:?}");
+    assert_eq!((counters.patched_frames, counters.total_declines()), (1, 0), "{counters:?}");
+    let patched = fixture.scene(cx);
+    fixture.whole(cx, Some(1));
+    assert_eq!(patched, fixture.scene(cx), "the patch wrote what the frame paints, 5 from the recording");
+}
+
+#[gpui::test]
+fn a_row_moved_by_a_frame_built_whole_then_patched_then_translated_shows_the_paint_of_the_patch(cx: &mut TestAppContext) {
+    let moved = Fixture::new(cx);
+    let built = Fixture::new(cx);
+    let eligible = |cx: &mut TestAppContext| {
+        cx.update_window(moved.window, |_, window, _| window.scroll_patch_counters().eligible).unwrap()
+    };
+    let mut scrolled = 0.;
+    let mut painted: Option<usize> = None;
+    let mut steps = (0, 0);
+    for (by, hot) in [(5., Some(1)), (5., Some(1)), (5., None), (-5., Some(2)), (5., None), (5., Some(2))] {
+        let before = moved.patched(cx);
+        let translates = eligible(cx);
+        moved.wheel(cx, by);
+        built.wheel(cx, by);
+        scrolled += by;
+        let was_translate = eligible(cx) > translates;
+        if was_translate {
+            steps.1 += 1;
+        } else {
+            steps.0 += 1;
+        }
+        // The row the previous patch painted is put back, and the one that has the hover now is painted, on the rows
+        // the wheel just moved: by a frame built whole on the first step, and by a translate after.
+        if let Some(row) = painted.take() {
+            moved.patch(cx, &[row], false);
+        }
+        if let Some(row) = hot {
+            moved.patch(cx, &[row], true);
+            painted = Some(row);
+        }
+        built.whole(cx, hot);
+        let counters = moved.patched(cx);
+        assert_eq!(counters.total_declines(), before.total_declines(), "scrolled to {scrolled}, translate {was_translate}: {counters:?}");
+        assert_eq!(moved.scene(cx), built.scene(cx), "scrolled to {scrolled}, translate {was_translate}");
+    }
+    assert!(steps.0 >= 1 && steps.1 >= 3, "frames built whole and translates both moved the rows: {steps:?}");
 }
 
 #[gpui::test]

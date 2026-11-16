@@ -344,11 +344,6 @@ impl PatchUnit {
         self.dispatch_parent.set(window.next_frame.dispatch_tree.active_node_id());
         self.prepaint.hitbox_parent.set(window.hitbox_parent_stack.last().copied());
     }
-
-    /// Whether the root may lay out again in a patch (`Retained::patchable_relayout`).
-    pub(crate) fn relayouts(&self) -> bool {
-        self.relayout
-    }
 }
 
 /// Where the paint of a root happens, relative to its prepaint.
