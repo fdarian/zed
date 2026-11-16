@@ -7,7 +7,7 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, IsZero,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, FrameDamage, IsZero,
     MAX_GROUP_EXTENT, MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point,
     PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
     TransformationMatrix, filter_margin, point, size,
@@ -26,7 +26,7 @@ use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
 use std::{
-    cell::Cell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr,
+    cell::{Cell, RefCell}, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr,
     rc::Rc, slice, sync::Arc,
 };
 
@@ -166,12 +166,19 @@ struct PartialRedraw {
     /// Whether `target` holds the picture of the scene drawn last. A frame that did not go through it
     /// (a whole draw, one that failed) leaves it stale.
     valid: bool,
-    /// While a damaged frame is encoded: the scissor, as x, y, width and height, of every pass that
-    /// draws into the target.
-    scissor: Cell<Option<[u64; 4]>>,
-    /// Whether the first pass of the damaged frame has yet to paint the scissor over, which a pass
+    /// While a damaged frame is encoded: the scissors, as x, y, width and height, that every draw
+    /// into the target is repeated in, one after the other inside the pass. They do not overlap, so
+    /// the order of the repeats does not matter. None at all is a frame drawn whole.
+    scissors: RefCell<Vec<[u64; 4]>>,
+    /// Whether the first pass of the damaged frame has yet to paint the scissors over, which a pass
     /// that loads what the target holds cannot clear.
     clear_pending: Cell<bool>,
+    /// Pixels of the target set aside while the target is shifted under them: a texture cannot be
+    /// copied onto itself where the source and the destination overlap.
+    scratch: Option<metal::Texture>,
+    /// The shift the last frame took the copy of, and how many rectangles it drew, for `GPUI_GPU_TIMES`.
+    last_shift: Option<gpui::Point<DevicePixels>>,
+    last_rects: usize,
 }
 
 #[repr(C)]
@@ -396,7 +403,7 @@ impl MetalRenderer {
     /// the picture is kept in a texture of its own, a damaged frame draws only the damaged part of it
     /// and every frame copies it to the drawable. The scene must not have an effect group, a native
     /// surface or a surface, and the window must be opaque; a scene that does is drawn whole.
-    pub fn draw_with_damage(&mut self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
+    pub fn draw_with_damage(&mut self, scene: &Scene, damage: Option<FrameDamage>) {
         if self.draws_in_part(scene) {
             self.draw_frame(scene, OrderRange::ALL, Some(damage));
         } else {
@@ -416,7 +423,7 @@ impl MetalRenderer {
         &mut self,
         scene: &Scene,
         orders: OrderRange,
-        damage: Option<Option<Bounds<DevicePixels>>>,
+        damage: Option<Option<FrameDamage>>,
     ) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
@@ -457,7 +464,7 @@ impl MetalRenderer {
         });
 
         let command_buffer =
-            match self.render_frame_in(scene, orders, drawable.texture(), viewport_size, damage) {
+            match self.render_frame_in(scene, orders, drawable.texture(), viewport_size, damage.clone()) {
                 Ok(command_buffer) => command_buffer,
                 Err(error) => {
                     self.partial.valid = false;
@@ -476,13 +483,25 @@ impl MetalRenderer {
 
         log_presented_time(&drawable);
         if let Some(started) = gpu_log_started {
-            let label = match damage {
+            let shift = self.partial.last_shift.take();
+            let label = match &damage {
                 None => "damage=off".to_string(),
                 Some(None) => "damage=full".to_string(),
-                Some(Some(area)) => format!(
-                    "damage={}x{}+{}+{}",
-                    area.size.width.0, area.size.height.0, area.origin.x.0, area.origin.y.0
-                ),
+                Some(Some(damage)) => {
+                    let area = damage.bounds();
+                    let shift = match shift {
+                        Some(by) => format!("{},{}", by.x.0, by.y.0),
+                        None => "none".to_string(),
+                    };
+                    format!(
+                        "damage={}x{}+{}+{} shift={shift} rects={}",
+                        area.size.width.0,
+                        area.size.height.0,
+                        area.origin.x.0,
+                        area.origin.y.0,
+                        self.partial.last_rects
+                    )
+                }
             };
             log_gpu_time(
                 &command_buffer,
@@ -528,7 +547,7 @@ impl MetalRenderer {
         orders: OrderRange,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
-        damage: Option<Option<Bounds<DevicePixels>>>,
+        damage: Option<Option<FrameDamage>>,
     ) -> Result<metal::CommandBuffer> {
         let mut writer = InstanceBufferWriter::new(
             &self.device,
@@ -632,7 +651,7 @@ impl MetalRenderer {
     pub fn render_scene_partial_to_image(
         &mut self,
         scene: &Scene,
-        damage: Option<Bounds<DevicePixels>>,
+        damage: Option<FrameDamage>,
         size: Size<DevicePixels>,
     ) -> Result<RgbaImage> {
         let texture_descriptor = metal::TextureDescriptor::new();
@@ -760,9 +779,27 @@ impl MetalRenderer {
         Ok(())
     }
 
+    /// Runs `draw` once for each scissor of a damaged frame, with that scissor set on `encoder`, or
+    /// once as it is for a frame drawn whole and for what is drawn into an effect group.
+    fn per_scissor(
+        &self,
+        encoder: &metal::RenderCommandEncoderRef,
+        mut draw: impl FnMut(&metal::RenderCommandEncoderRef) -> Result<()>,
+    ) -> Result<()> {
+        let scissors = self.partial.scissors.borrow();
+        if scissors.is_empty() || self.group_depth.get() != 0 {
+            return draw(encoder);
+        }
+        for [x, y, width, height] in scissors.iter() {
+            encoder.set_scissor_rect(metal::MTLScissorRect { x: *x, y: *y, width: *width, height: *height });
+            draw(encoder)?;
+        }
+        Ok(())
+    }
+
     /// Opens a pass that draws into the target of the frame being encoded. In a damaged frame the
-    /// pass keeps what the target holds and draws only inside the scissor, and the first of them
-    /// paints the scissor black first: what the scene paints there is all of what shows, as after a
+    /// pass keeps what the target holds and draws only inside the scissors, and the first of them
+    /// paints the scissors black first: what the scene paints there is all of what shows, as after a
     /// clear.
     fn open_target_encoder<'a>(
         &self,
@@ -777,48 +814,96 @@ impl MetalRenderer {
         if self.group_depth.get() != 0 {
             return Ok(encoder);
         }
-        let Some([x, y, width, height]) = self.partial.scissor.get() else {
+        if self.partial.scissors.borrow().is_empty() {
             return Ok(encoder);
-        };
-        encoder.set_scissor_rect(metal::MTLScissorRect {
-            x,
-            y,
-            width,
-            height,
-        });
+        }
         if self.partial.clear_pending.replace(false) {
-            let area = Bounds {
-                origin: point(ScaledPixels(x as f32), ScaledPixels(y as f32)),
-                size: size(ScaledPixels(width as f32), ScaledPixels(height as f32)),
-            };
-            let black = Quad {
-                bounds: area,
-                content_mask: ContentMask {
-                    bounds: area,
-                    corner_radii: gpui::Corners::default(),
-                    corner_radii_y: gpui::Corners::default(),
-                },
-                background: gpui::black().into(),
-                ..Quad::default()
-            };
-            let binding = writer.write(&[black])?;
-            self.draw_quad_instances(
-                self.clear_quad_pipeline(),
-                &binding,
-                0..1,
-                viewport_size,
-                encoder,
-            );
+            let blacks: Vec<Quad> = self
+                .partial
+                .scissors
+                .borrow()
+                .iter()
+                .map(|[x, y, width, height]| {
+                    let area = Bounds {
+                        origin: point(ScaledPixels(*x as f32), ScaledPixels(*y as f32)),
+                        size: size(ScaledPixels(*width as f32), ScaledPixels(*height as f32)),
+                    };
+                    Quad {
+                        bounds: area,
+                        content_mask: ContentMask {
+                            bounds: area,
+                            corner_radii: gpui::Corners::default(),
+                            corner_radii_y: gpui::Corners::default(),
+                        },
+                        background: gpui::black().into(),
+                        ..Quad::default()
+                    }
+                })
+                .collect();
+            let binding = writer.write(&blacks)?;
+            let mut at = 0;
+            self.per_scissor(encoder, |encoder| {
+                self.draw_quad_instances(self.clear_quad_pipeline(), &binding, at..at + 1, viewport_size, encoder);
+                at += 1;
+                Ok(())
+            })?;
         }
         Ok(encoder)
     }
 
+    /// Moves the pixels of `target` that `shift` says are kept: through a scratch texture, since a
+    /// copy within one texture is not defined where the source and the destination overlap.
+    fn blit_shift(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        target: &metal::TextureRef,
+        shift: &gpui::Shift,
+    ) {
+        let kept = shift.kept();
+        if kept.is_empty() {
+            return;
+        }
+        let (width, height) = (kept.size.width.0 as u64, kept.size.height.0 as u64);
+        let scratch_fits = self
+            .partial
+            .scratch
+            .as_ref()
+            .is_some_and(|scratch| scratch.width() >= width && scratch.height() >= height);
+        if !scratch_fits {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(width);
+            descriptor.set_height(height);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            self.partial.scratch = Some(self.device.new_texture(&descriptor));
+        }
+        let scratch = self.partial.scratch.as_ref().expect("the scratch was just made");
+        let origin = |x: i32, y: i32| metal::MTLOrigin { x: x as u64, y: y as u64, z: 0 };
+        let extent = metal::MTLSize { width, height, depth: 1 };
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            target,
+            0,
+            0,
+            origin(kept.origin.x.0 - shift.by.x.0, kept.origin.y.0 - shift.by.y.0),
+            extent,
+            scratch,
+            0,
+            0,
+            origin(0, 0),
+        );
+        blit.copy_from_texture(scratch, 0, 0, origin(0, 0), extent, target, 0, 0, origin(kept.origin.x.0, kept.origin.y.0));
+        blit.end_encoding();
+        self.partial.last_shift = Some(shift.by);
+    }
+
     /// Draws `scene` into the persistent target and copies that to `texture`. With `damage` (the part
-    /// of the scene that differs from the picture the target holds) only that part is drawn.
+    /// of the scene that differs from the picture the target holds) only that part is drawn: the
+    /// pixels it says moved are copied into place first, and its rectangles are drawn over them.
     fn draw_through_target(
         &mut self,
         scene: &Scene,
-        damage: Option<Bounds<DevicePixels>>,
+        damage: Option<FrameDamage>,
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
@@ -843,20 +928,32 @@ impl MetalRenderer {
                 self.device.new_texture(&descriptor)
             }
         };
-        let scissor = damage.filter(|_| self.partial.valid).map(|damage| {
-            let left = damage.origin.x.0.clamp(0, viewport_size.width.0);
-            let top = damage.origin.y.0.clamp(0, viewport_size.height.0);
-            let right = (damage.origin.x.0 + damage.size.width.0).clamp(left, viewport_size.width.0);
-            let bottom =
-                (damage.origin.y.0 + damage.size.height.0).clamp(top, viewport_size.height.0);
-            [left as u64, top as u64, (right - left) as u64, (bottom - top) as u64]
+        let damage = damage.filter(|_| self.partial.valid);
+        self.partial.last_shift = None;
+        self.partial.last_rects = damage.as_ref().map_or(0, |damage| damage.rects.len());
+        if let Some(shift) = damage.as_ref().and_then(|damage| damage.shift) {
+            self.blit_shift(command_buffer, &target, &shift);
+        }
+        let scissors = damage.map(|damage| {
+            damage
+                .rects
+                .iter()
+                .filter_map(|area| {
+                    let left = area.origin.x.0.clamp(0, viewport_size.width.0);
+                    let top = area.origin.y.0.clamp(0, viewport_size.height.0);
+                    let right = (area.origin.x.0 + area.size.width.0).clamp(left, viewport_size.width.0);
+                    let bottom = (area.origin.y.0 + area.size.height.0).clamp(top, viewport_size.height.0);
+                    (right > left && bottom > top)
+                        .then_some([left as u64, top as u64, (right - left) as u64, (bottom - top) as u64])
+                })
+                .collect::<Vec<_>>()
         });
         // Until the frame is encoded the target holds neither the picture before nor the one after.
         self.partial.valid = false;
-        match scissor {
-            Some([_, _, 0, _] | [_, _, _, 0]) => {}
-            Some(rect) => {
-                self.partial.scissor.set(Some(rect));
+        match scissors {
+            Some(scissors) if scissors.is_empty() => {}
+            Some(scissors) => {
+                *self.partial.scissors.borrow_mut() = scissors;
                 self.partial.clear_pending.set(true);
                 let encoded = self.encode_scene(
                     scene,
@@ -869,7 +966,7 @@ impl MetalRenderer {
                     path_intermediate,
                     false,
                 );
-                self.partial.scissor.set(None);
+                self.partial.scissors.borrow_mut().clear();
                 self.partial.clear_pending.set(false);
                 encoded?;
             }
@@ -1029,16 +1126,14 @@ impl MetalRenderer {
 
         for batch in scene.batches_in(orders) {
             match batch {
-                PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, &instance_bindings, viewport_size, command_encoder)
-                }
-                PrimitiveBatch::Quads(range) => self.draw_quads(
-                    &scene.quads,
-                    range,
-                    &instance_bindings,
-                    viewport_size,
-                    command_encoder,
-                ),
+                PrimitiveBatch::Shadows(range) => self.per_scissor(command_encoder, |encoder| {
+                    self.draw_shadows(range.clone(), &instance_bindings, viewport_size, encoder);
+                    Ok(())
+                })?,
+                PrimitiveBatch::Quads(range) => self.per_scissor(command_encoder, |encoder| {
+                    self.draw_quads(&scene.quads, range.clone(), &instance_bindings, viewport_size, encoder);
+                    Ok(())
+                })?,
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
@@ -1063,37 +1158,36 @@ impl MetalRenderer {
                     )?;
 
                     if did_draw {
-                        if let Err(error) = self.draw_paths_from_intermediate(
-                            paths,
-                            intermediate,
-                            writer,
-                            viewport_size,
-                            command_encoder,
-                        ) {
+                        if let Err(error) = self.per_scissor(command_encoder, |encoder| {
+                            self.draw_paths_from_intermediate(
+                                paths,
+                                intermediate,
+                                writer,
+                                viewport_size,
+                                encoder,
+                            )
+                        }) {
                             command_encoder.end_encoding();
                             return Err(error);
                         }
                     }
                 }
-                PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, &instance_bindings, viewport_size, command_encoder)
+                PrimitiveBatch::Underlines(range) => self.per_scissor(command_encoder, |encoder| {
+                    self.draw_underlines(range.clone(), &instance_bindings, viewport_size, encoder);
+                    Ok(())
+                })?,
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                    self.per_scissor(command_encoder, |encoder| {
+                        self.draw_monochrome_sprites(texture_id, range.clone(), &instance_bindings, viewport_size, encoder);
+                        Ok(())
+                    })?
                 }
-                PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                    .draw_monochrome_sprites(
-                        texture_id,
-                        range,
-                        &instance_bindings,
-                        viewport_size,
-                        command_encoder,
-                    ),
-                PrimitiveBatch::PolychromeSprites { texture_id, range } => self
-                    .draw_polychrome_sprites(
-                        texture_id,
-                        range,
-                        &instance_bindings,
-                        viewport_size,
-                        command_encoder,
-                    ),
+                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                    self.per_scissor(command_encoder, |encoder| {
+                        self.draw_polychrome_sprites(texture_id, range.clone(), &instance_bindings, viewport_size, encoder);
+                        Ok(())
+                    })?
+                }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range.clone()],
                     range.start,
@@ -3806,7 +3900,7 @@ mod tests {
         BackgroundPosition, BackgroundRepeat, BackgroundSize, Bounds, ColorSpace, ContentMask,
         CornerRadii, Corners, DevicePixels, Edges, Gradient, GradientItem, GradientShape,
         GradientStop, GroupEffect, Hsla, LengthPercentage, LinearDirection,
-        PlatformHeadlessRenderer, Quad, RadialShape, RadialSize, RepeatStyle, ScaledPixels, Scene,
+        FrameDamage, PlatformHeadlessRenderer, Point, Quad, RadialShape, Size, RadialSize, RepeatStyle, ScaledPixels, Scene,
         StopPosition, point, px, size,
     };
     use gpui::{MaskComposite, MaskLayer, MaskMode};
@@ -3874,11 +3968,11 @@ mod tests {
         }
     }
 
-    fn damage(x: i32, y: i32, width: i32, height: i32) -> Option<Bounds<DevicePixels>> {
-        Some(Bounds {
+    fn damage(x: i32, y: i32, width: i32, height: i32) -> Option<FrameDamage> {
+        Some(FrameDamage::rect(Bounds {
             origin: point(DevicePixels(x), DevicePixels(y)),
             size: size(DevicePixels(width), DevicePixels(height)),
-        })
+        }))
     }
 
     fn scene_of(quads: &[Quad]) -> Scene {
@@ -3910,7 +4004,7 @@ mod tests {
         let window = size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32));
         let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
         // What changes between a frame and the next, and the damage that says so.
-        let frames: [(Scene, Option<Bounds<DevicePixels>>); 7] = [
+        let frames: [(Scene, Option<FrameDamage>); 7] = [
             (frame(6., 0.5, false), None),
             // The red quad moves: where it was and where it is.
             (frame(12., 0.5, false), damage(5, 9, 24, 16)),
@@ -3926,7 +4020,7 @@ mod tests {
             (frame(20., 0.2, true), None),
         ];
         for (index, (scene, damage)) in frames.iter().enumerate() {
-            let drawn = partial.render_scene_partial_to_image(scene, *damage, window).expect("the frame is drawn");
+            let drawn = partial.render_scene_partial_to_image(scene, damage.clone(), window).expect("the frame is drawn");
             let whole = MetalHeadlessRenderer::new()
                 .render_scene_to_image(scene, window)
                 .expect("the frame is drawn whole");
@@ -3944,6 +4038,266 @@ mod tests {
         let drawn = partial.render_scene_partial_to_image(&next, damage(30, 30, 4, 4), window).unwrap();
         let whole = MetalHeadlessRenderer::new().render_scene_to_image(&next, window).unwrap();
         assert!(drawn != whole);
+    }
+
+    /// What is behind the rows of the list the shift tests scroll.
+    #[derive(Clone, Copy)]
+    enum Backdrop {
+        /// A solid color: the same wherever the rows are, which is what a copy may keep.
+        Solid,
+        /// A gradient the rows scroll over: it does not move with them.
+        Gradient,
+    }
+
+    /// The window of the shift tests, which a margin of the damage is small in.
+    const LIST_WINDOW: f32 = 96.;
+
+    fn masked(bounds: Bounds<ScaledPixels>, background: impl Into<Background>, mask: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds: mask, corner_radii: Corners::default(), corner_radii_y: Corners::default() },
+            background: background.into(),
+            ..Quad::default()
+        }
+    }
+
+    /// A list of rows (8 apart, 6 tall, the color of a row is a function of its number) scrolled by `offset` inside `clip`,
+    /// over the page and a backdrop, with a thumb in front when `thumb` has its top, and the row `recolor` of another color.
+    fn list_frame(
+        offset: i32,
+        clip: Bounds<ScaledPixels>,
+        backdrop: Backdrop,
+        thumb: Option<f32>,
+        recolor: Option<i32>,
+    ) -> Scene {
+        let page = area(0., 0., LIST_WINDOW, LIST_WINDOW);
+        let mut quads = vec![masked(page, gpui::hsla(0.6, 0.2, 0.2, 1.), page)];
+        quads.push(masked(
+            clip,
+            match backdrop {
+                Backdrop::Solid => gpui::hsla(0.55, 0.3, 0.3, 1.).into(),
+                Backdrop::Gradient => gpui::linear_gradient(
+                    0.,
+                    gpui::linear_color_stop(gpui::hsla(0.1, 0.9, 0.5, 1.), 0.),
+                    gpui::linear_color_stop(gpui::hsla(0.7, 0.9, 0.5, 1.), 1.),
+                ),
+            },
+            clip,
+        ));
+        for row in -6..14 {
+            let hue = if recolor == Some(row) { 0.95 } else { row.rem_euclid(7) as f32 / 7. };
+            let top = 16. + 8. * row as f32 + offset as f32;
+            quads.push(masked(area(8., top, 68., 6.), gpui::hsla(hue, 0.8, 0.5, 1.), clip));
+        }
+        if let Some(top) = thumb {
+            quads.push(masked(area(64., top, 2., 6.), gpui::hsla(0.15, 1., 0.5, 1.), page));
+        }
+        scene_of(&quads)
+    }
+
+    fn window() -> Size<DevicePixels> {
+        size(DevicePixels(LIST_WINDOW as i32), DevicePixels(LIST_WINDOW as i32))
+    }
+
+    fn by(y: i32) -> Point<DevicePixels> {
+        point(DevicePixels(0), DevicePixels(y))
+    }
+
+    /// x 12..72, y 16..80.
+    fn list_clip() -> Bounds<ScaledPixels> {
+        area(12., 16., 60., 64.)
+    }
+
+    /// Draws each frame through one renderer with its damage and asserts the picture is the frame drawn whole, and that
+    /// a frame took the copy of the shift expected of it: or it proves nothing about the copy.
+    fn assert_shifts_are_the_frames_drawn_whole(
+        what: &str,
+        frames: &[(Scene, Option<FrameDamage>, Option<Point<DevicePixels>>)],
+    ) {
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        for (index, (scene, damage, expect)) in frames.iter().enumerate() {
+            let drawn = partial.render_scene_partial_to_image(scene, damage.clone(), window()).expect("the frame is drawn");
+            let whole = MetalHeadlessRenderer::new().render_scene_to_image(scene, window()).expect("the frame is drawn whole");
+            assert!(drawn == whole, "{what}: frame {index} drawn with {damage:?} is not the frame drawn whole");
+            assert_eq!(partial.partial.last_shift, *expect, "{what}: frame {index} {damage:?}");
+        }
+    }
+
+    fn shift_damage(clip: Bounds<ScaledPixels>, by: Point<DevicePixels>, residual: &[Bounds<ScaledPixels>]) -> Option<FrameDamage> {
+        let mut steps = gpui::DamageSteps::default();
+        steps.shift(clip, by);
+        for area in residual {
+            steps.area(*area);
+        }
+        Some(steps.finish(window()))
+    }
+
+    #[test]
+    fn rows_scrolled_over_a_solid_backdrop_are_copied_and_the_frame_is_drawn_whole() {
+        let clip = list_clip();
+        let step = |from: i32, to: i32| {
+            let by = by(to - from);
+            (list_frame(to, clip, Backdrop::Solid, None, None), shift_damage(clip, by, &[]), Some(by))
+        };
+        let frames = [
+            (list_frame(0, clip, Backdrop::Solid, None, None), None, None),
+            step(0, 6),
+            step(6, 12),
+            step(12, 4),
+            step(4, -4),
+            step(-4, -12),
+            step(-12, 0),
+        ];
+        assert_shifts_are_the_frames_drawn_whole("solid backdrop", &frames);
+    }
+
+    #[test]
+    fn a_thumb_in_front_of_the_rows_is_drawn_where_it_was_and_where_it_is() {
+        let clip = list_clip();
+        // The thumb is not a row: it does not move with them, and the copy puts its old pixels where the rows go.
+        let thumb_of = |offset: i32| 30. + 0.5 * offset as f32;
+        let step = |from: i32, to: i32| {
+            let by = by(to - from);
+            let (was, is) = (area(64., thumb_of(from), 2., 6.), area(64., thumb_of(to), 2., 6.));
+            let moved = area(64., thumb_of(from) + (to - from) as f32, 2., 6.);
+            (list_frame(to, clip, Backdrop::Solid, Some(thumb_of(to)), None), shift_damage(clip, by, &[was, is, moved]), Some(by))
+        };
+        let frames = [
+            (list_frame(0, clip, Backdrop::Solid, Some(thumb_of(0)), None), None, None),
+            step(0, 6),
+            step(6, 12),
+            step(12, 6),
+            step(6, -2),
+        ];
+        assert_shifts_are_the_frames_drawn_whole("a thumb", &frames);
+    }
+
+    #[test]
+    fn a_thumb_that_is_not_drawn_again_shows() {
+        // The test of the test: the copy moves the thumb's old pixels with the rows.
+        let clip = list_clip();
+        let first = list_frame(0, clip, Backdrop::Solid, Some(30.), None);
+        let next = list_frame(6, clip, Backdrop::Solid, Some(33.), None);
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        partial.render_scene_partial_to_image(&first, None, window()).unwrap();
+        let drawn = partial.render_scene_partial_to_image(&next, shift_damage(clip, by(6), &[]), window()).unwrap();
+        let whole = MetalHeadlessRenderer::new().render_scene_to_image(&next, window()).unwrap();
+        assert!(drawn != whole);
+    }
+
+    #[test]
+    fn a_backdrop_that_does_not_scroll_is_in_the_residual_or_it_shows() {
+        let clip = list_clip();
+        let first = list_frame(0, clip, Backdrop::Gradient, None, None);
+        let next = list_frame(6, clip, Backdrop::Gradient, None, None);
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        partial.render_scene_partial_to_image(&first, None, window()).unwrap();
+        let whole = MetalHeadlessRenderer::new().render_scene_to_image(&next, window()).unwrap();
+        // The copy moves the gradient, which is not what is in the frame.
+        let drawn = partial.render_scene_partial_to_image(&next, shift_damage(clip, by(6), &[]), window()).unwrap();
+        assert!(drawn != whole, "the copy is not right under a backdrop that stays");
+        // With the backdrop in the residual, all of the region is drawn and the ledger does not shift at all.
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        partial.render_scene_partial_to_image(&first, None, window()).unwrap();
+        let damage = shift_damage(clip, by(6), &[clip]);
+        assert_eq!(damage.as_ref().unwrap().shift, None);
+        let drawn = partial.render_scene_partial_to_image(&next, damage, window()).unwrap();
+        assert!(drawn == whole);
+    }
+
+    #[test]
+    fn a_clip_with_fractional_edges_copies_only_the_pixels_it_covers_whole() {
+        let clip = area(12.5, 16.5, 60., 64.);
+        // The region is x 13..72, y 17..80; the pixels the clip covers in part are the ring around it, drawn with the
+        // strip that scrolled in, in rectangles apart from each other.
+        let region = Bounds { origin: point(DevicePixels(13), DevicePixels(17)), size: size(DevicePixels(59), DevicePixels(63)) };
+        let rect = |x: i32, y: i32, right: i32, bottom: i32| Bounds {
+            origin: point(DevicePixels(x), DevicePixels(y)),
+            size: size(DevicePixels(right - x), DevicePixels(bottom - y)),
+        };
+        let step = |from: i32, to: i32| {
+            let by = by(to - from);
+            let moved = to - from;
+            let (strip, ring, kept_top, kept_bottom) = if moved > 0 {
+                (rect(12, 16, 73, 17 + moved), rect(12, 80, 73, 81), 17 + moved, 80)
+            } else {
+                (rect(12, 80 + moved, 73, 81), rect(12, 16, 73, 17), 17, 80 + moved)
+            };
+            let damage = FrameDamage::from_parts(
+                Some(gpui::Shift { region, by }),
+                &[strip, ring, rect(12, kept_top, 13, kept_bottom), rect(72, kept_top, 73, kept_bottom)],
+            );
+            (list_frame(to, clip, Backdrop::Solid, None, None), Some(damage), Some(by))
+        };
+        let frames = [(list_frame(0, clip, Backdrop::Solid, None, None), None, None), step(0, 6), step(6, 0), step(0, -6)];
+        assert_shifts_are_the_frames_drawn_whole("a fractional clip", &frames);
+    }
+
+    #[test]
+    fn a_ring_of_a_fractional_clip_that_is_not_drawn_shows() {
+        // The test of the test: the copy leaves the pixels the clip covers in part as the picture before had them.
+        let clip = area(12.5, 16.5, 60., 64.);
+        let region = Bounds { origin: point(DevicePixels(13), DevicePixels(17)), size: size(DevicePixels(59), DevicePixels(63)) };
+        let strip = Bounds { origin: point(DevicePixels(12), DevicePixels(16)), size: size(DevicePixels(61), DevicePixels(7)) };
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        partial.render_scene_partial_to_image(&list_frame(0, clip, Backdrop::Solid, None, None), None, window()).unwrap();
+        let next = list_frame(6, clip, Backdrop::Solid, None, None);
+        let damage = FrameDamage::from_parts(Some(gpui::Shift { region, by: by(6) }), &[strip]);
+        let drawn = partial.render_scene_partial_to_image(&next, Some(damage), window()).unwrap();
+        let whole = MetalHeadlessRenderer::new().render_scene_to_image(&next, window()).unwrap();
+        assert!(drawn != whole);
+    }
+
+    #[test]
+    fn two_shifts_before_one_presentation_are_one_copy() {
+        let clip = list_clip();
+        let mut steps = gpui::DamageSteps::default();
+        steps.shift(clip, by(6)).shift(clip, by(2));
+        let twice = Some(steps.finish(window()));
+        let mut back = gpui::DamageSteps::default();
+        back.shift(clip, by(6)).shift(clip, by(-4));
+        let frames = [
+            (list_frame(0, clip, Backdrop::Solid, None, None), None, None),
+            // Two scrolls, one frame shown.
+            (list_frame(8, clip, Backdrop::Solid, None, None), twice, Some(by(8))),
+            (list_frame(10, clip, Backdrop::Solid, None, None), shift_damage(clip, by(2), &[]), Some(by(2))),
+            // Down, then back up by less.
+            (list_frame(12, clip, Backdrop::Solid, None, None), Some(back.finish(window())), Some(by(2))),
+        ];
+        assert_shifts_are_the_frames_drawn_whole("two shifts", &frames);
+    }
+
+    #[test]
+    fn a_shift_after_a_patch_moves_what_the_patch_wrote_wrong() {
+        let clip = list_clip();
+        // The patch recolors row 1 (y 24..30 at offset 0) and the list scrolls before the frame is shown, so
+        // the row is at 30..36 when it is shown, and the copy of the old one there is wrong.
+        let mut steps = gpui::DamageSteps::default();
+        steps.area(area(14., 24., 44., 6.)).shift(clip, by(6));
+        let frames = [
+            (list_frame(0, clip, Backdrop::Solid, None, None), None, None),
+            (list_frame(6, clip, Backdrop::Solid, None, Some(1)), Some(steps.finish(window())), Some(by(6))),
+            // The patch back as a frame of its own, and then a shift.
+            (list_frame(6, clip, Backdrop::Solid, None, None), damage(12, 30, 60, 8), None),
+            (list_frame(0, clip, Backdrop::Solid, None, None), shift_damage(clip, by(-6), &[]), Some(by(-6))),
+        ];
+        assert_shifts_are_the_frames_drawn_whole("a patch then a shift", &frames);
+    }
+
+    #[test]
+    fn a_shift_after_a_frame_that_was_not_drawn_through_the_target_draws_all_of_it() {
+        // The target of a frame drawn whole is not the picture before: the copy has nothing to move.
+        let clip = list_clip();
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        partial.render_scene_partial_to_image(&list_frame(0, clip, Backdrop::Solid, None, None), None, window()).unwrap();
+        let with_group = frame_with_group(Effect::Opacity, 6., true);
+        assert!(!with_group.groups.is_empty());
+        partial.render_scene_partial_to_image(&with_group, None, window()).unwrap();
+        let next = list_frame(6, clip, Backdrop::Solid, None, None);
+        let drawn = partial.render_scene_partial_to_image(&next, shift_damage(clip, by(6), &[]), window()).unwrap();
+        let whole = MetalHeadlessRenderer::new().render_scene_to_image(&next, window()).unwrap();
+        assert!(drawn == whole);
+        assert_eq!(partial.partial.last_shift, None);
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -3989,12 +4343,12 @@ mod tests {
     fn assert_parity(
         partial: &mut MetalRenderer,
         whole: &mut MetalRenderer,
-        frames: &[(Scene, Option<Bounds<DevicePixels>>)],
+        frames: &[(Scene, Option<FrameDamage>)],
         what: &str,
     ) {
         let window = size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32));
         for (index, (scene, damage)) in frames.iter().enumerate() {
-            let drawn = partial.render_scene_partial_to_image(scene, *damage, window).expect("the frame is drawn");
+            let drawn = partial.render_scene_partial_to_image(scene, damage.clone(), window).expect("the frame is drawn");
             let expected = whole.render_scene_to_image(scene, window).expect("the frame is drawn whole");
             assert!(drawn == expected, "{what}: frame {index} drawn with {damage:?} is not the frame drawn whole");
         }

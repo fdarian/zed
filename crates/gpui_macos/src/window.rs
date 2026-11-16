@@ -26,7 +26,7 @@ use cocoa::{
 };
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, DevicePixels, ExternalDragPayload,
+    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, DragOperation, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NativeKey,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
@@ -2140,7 +2140,7 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
-    fn draw_with_damage(&self, scene: &gpui::Scene, damage: Option<Bounds<DevicePixels>>) {
+    fn draw_with_damage(&self, scene: &gpui::Scene, damage: Option<gpui::FrameDamage>) {
         let mut this = self.0.lock();
         this.renderer.draw_with_damage(scene, damage);
     }
