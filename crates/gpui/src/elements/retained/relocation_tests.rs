@@ -410,9 +410,11 @@ fn page(
             })
             .relocatable(px(OVERSCAN));
             // A box placed by something else than the row is outside the extent its owner can
-            // vouch for, so such a row is not culled.
+            // vouch for, so such a row is not culled. The most that a row draws past its box is the
+            // shadow of a card: the shader draws it out to three times its blur radius of 6, and it is
+            // 4 down.
             if !matches!(spec.kind, Kind::Positioned | Kind::Escaping | Kind::Fixed) {
-                row = row.cull_outset(Some(Edges::all(px(12.))));
+                row = row.cull_outset(Some(Edges::all(px(24.))));
             }
             match spec.kind {
                 Kind::Reports => {
@@ -821,8 +823,9 @@ macro_rules! cut {
 cut!(Quad, Underline, MonochromeSprite, SubpixelSprite, PolychromeSprite, Path<ScaledPixels>);
 
 impl Cut for Shadow {
+    // The shader draws a shadow out to three times its blur radius.
     fn reach(&self) -> Bounds<ScaledPixels> {
-        self.bounds.dilate(self.blur_radius)
+        self.bounds.dilate(self.blur_radius * 3.)
     }
     fn mask(&mut self) -> &mut ContentMask<ScaledPixels> {
         &mut self.content_mask
