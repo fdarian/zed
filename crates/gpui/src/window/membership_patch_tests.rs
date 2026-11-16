@@ -918,6 +918,11 @@ impl Pair {
     /// Restyles the rows `rows` (green or back) and writes the offset `to` in one draw of the window that patches.
     /// `to` of `None` restyles without scrolling.
     fn restyle_and_scroll(&self, cx: &mut TestAppContext, rows: &[usize], green: bool, to: Option<f32>) {
+        self.restyle_and_scroll_with_view(cx, rows, green, to, false)
+    }
+
+    /// As [`Pair::restyle_and_scroll`]; `notify_list` queues the view of the list, as the notify of a wheel event does.
+    fn restyle_and_scroll_with_view(&self, cx: &mut TestAppContext, rows: &[usize], green: bool, to: Option<f32>, notify_list: bool) {
         for fixture in [&self.translated, &self.built] {
             for row in rows {
                 let mut set = fixture.shared.green.borrow_mut();
@@ -935,6 +940,9 @@ impl Pair {
             if let Some(to) = to {
                 state.set_offset_from_scrollbar(point(px(0.), px(-to)));
                 window.note_list_scrolled(view);
+                if notify_list {
+                    window.invalidator.queue_view(view);
+                }
             }
             window.draw(cx).clear(cx);
         })
@@ -980,6 +988,53 @@ fn a_restyle_and_a_scroll_in_one_draw_are_a_patch_then_a_translate(cx: &mut Test
     assert_eq!(pair.translated.shared.seen.borrow().last(), Some(&Ok(())));
     no_declines(&counters);
     pair.same(cx, "a restyle and a scroll of 2 pixels");
+}
+
+#[gpui::test]
+fn a_restyle_and_a_scroll_that_notified_the_list_are_still_a_patch_then_a_translate(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    let first = pair.translated.bringing_in_below(cx, 1);
+    pair.scroll_to(cx, first);
+    pair.same(cx, "after a first scroll");
+    let row = visible_row(&pair.translated, cx, 3);
+    let before = pair.translated.counters(cx);
+    let serial = pair.translated.built_whole(cx);
+
+    let to = pair.translated.scrolled() + 2.;
+    pair.restyle_and_scroll_with_view(cx, &[row], true, Some(to), true);
+
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.patched - before.patched, counters.composed), (1, 1), "{counters:?}");
+    assert_eq!(pair.translated.built_whole(cx), serial, "no frame was built whole");
+    let patches = pair.translated.with_window(cx, |window, _| window.patch_counters());
+    assert_eq!((patches.patched_frames, patches.total_declines()), (1, 0), "{patches:?}");
+    assert!(!pair.translated.with_window(cx, |window, _| window.invalidator.has_views()), "the translate drew the list's view");
+    no_declines(&counters);
+    pair.same(cx, "a restyle and a scroll of 2 pixels, with the list notified");
+}
+
+#[gpui::test]
+fn a_view_besides_the_scrolled_list_declines_the_patch_that_would_precede_the_translate(cx: &mut TestAppContext) {
+    let pair = Pair::new(cx);
+    let first = pair.translated.bringing_in_below(cx, 1);
+    pair.scroll_to(cx, first);
+    let row = visible_row(&pair.translated, cx, 3);
+    pair.translated.shared.green.borrow_mut().insert(row);
+    pair.translated.shared.patch_row.set(Some(row));
+    let (state, view) = (pair.translated.shared.state.clone(), pair.translated.view);
+    let to = pair.translated.scrolled() + 2.;
+    pair.translated.with_window(cx, move |window, cx| {
+        let other = cx.new(|_| ()).entity_id();
+        window.request_tick();
+        state.set_offset_from_scrollbar(point(px(0.), px(-to)));
+        window.note_list_scrolled(view);
+        window.invalidator.queue_view(view);
+        window.invalidator.queue_view(other);
+        window.draw(cx).clear(cx);
+    });
+    let patches = pair.translated.with_window(cx, |window, _| window.patch_counters());
+    assert_eq!((patches.patched_frames, patches.declines(PatchDecline::PendingView)), (0, 1), "{patches:?}");
+    assert_eq!(pair.translated.counters(cx).composed, 0);
 }
 
 #[gpui::test]

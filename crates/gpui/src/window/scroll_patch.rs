@@ -1406,6 +1406,15 @@ impl Window {
         hover(self, &identities(&self.mouse_hit_test.chain), &identities(&after.chain))
     }
 
+    /// Whether the only view queued to render is the one the list that scrolled since the last draw notified. A
+    /// patch drawn with it queued is followed by the translate of that scroll in the same draw
+    /// ([`PatchWindow::translate_follows`]), which draws the view; a patch declines for any other queued view
+    /// ([`PatchDecline::PendingView`]).
+    pub(crate) fn only_the_scrolled_list_is_queued(&self) -> bool {
+        self.scroll_patch.enabled
+            && self.scroll_patch.scrolled.is_some_and(|list| self.invalidator.has_views() && !self.views_other_than(list))
+    }
+
     /// Whether a view other than `view` is queued to render.
     fn views_other_than(&self, view: EntityId) -> bool {
         let views = self.invalidator.take_views();

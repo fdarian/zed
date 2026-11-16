@@ -678,7 +678,7 @@ impl Window {
         if cx.mode.skip_drawing() || self.layout_only || self.measuring || self.dispatch_depth.get() > 0 {
             return PatchedFrame::Declined;
         }
-        if self.invalidator.has_views() {
+        if self.invalidator.has_views() && !self.only_the_scrolled_list_is_queued() {
             self.patch.counters.declines[PatchDecline::PendingView.index()] += 1;
             return PatchedFrame::Declined;
         }
@@ -954,7 +954,7 @@ impl Window {
         cx: &mut App,
         build: impl FnOnce(&mut Window, &mut App) -> Vec<(ElementId, AnyElement)>,
     ) -> Result<PreparedPatch, PatchDecline> {
-        if self.invalidator.has_views() {
+        if self.invalidator.has_views() && !self.only_the_scrolled_list_is_queued() {
             return Err(PatchDecline::PendingView);
         }
         if self.refreshing {
