@@ -1652,9 +1652,9 @@ impl Window {
 
         let after_prepaint = self.effects().without_root_escapes(&effects);
         let moved = !source.delta.is_zero();
-        // What the frame does not move with the root: a box a frame outside it places, and a scroller of its own, whose
-        // offset and extent the patch would have to move.
-        if moved && prepaint_start.scrollers_index != prepaint_end.scrollers_index {
+        // What the frame does not move with the root: a box a frame outside it places, and a scroller of its own that the
+        // user scrolls or that is scrolled (see `ScrollerRecord::blocks_moved_patch`).
+        if moved && self.scrollers_block_a_move(prepaint_start.scrollers_index..prepaint_end.scrollers_index) {
             return Err(PatchDecline::Relocated);
         }
         let relocated = relocation.zip(ambient).map(|(relocation, ambient)| {

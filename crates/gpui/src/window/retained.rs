@@ -5,6 +5,7 @@
 use super::*;
 use crate::scene::{PaintOperation, PrimitiveCount, ReplayClip};
 use crate::LayoutCounters;
+use crate::elements::ScrollerRecord;
 use super::patch_splice::FIELDS;
 use std::cell::{Cell, RefCell};
 
@@ -2644,6 +2645,12 @@ impl Window {
         self.retained.relocation.is_some() || !self.retained.layout_recordings.is_empty()
     }
 
+    /// Whether one of the scrollers the frame being built recorded in `range` blocks a patch of the subtree
+    /// around it from being put elsewhere, see [`ScrollerRecord::blocks_moved_patch`].
+    pub(crate) fn scrollers_block_a_move(&self, range: Range<usize>) -> bool {
+        self.next_frame.scrollers[range].iter().any(ScrollerRecord::blocks_moved_patch)
+    }
+
     pub(crate) fn note_nested_scroll(&self) {
         self.retained.nested_scrolls.set(self.retained.nested_scrolls.get().wrapping_add(1));
     }
@@ -2905,9 +2912,11 @@ impl PrepaintRecord {
         self.range = range;
     }
 
-    /// Whether the subtree prepainted a scroller of its own (a box with an overflow other than visible).
-    pub(crate) fn holds_scroller(&self) -> bool {
-        self.range.start.scrollers_index != self.range.end.scrollers_index
+    /// Whether the subtree prepainted a scroller of its own that a patch of it cannot leave to the frame after
+    /// the subtree was put elsewhere: one the user scrolls, or one that is scrolled (see
+    /// [`ScrollerRecord::blocks_moved_patch`]). `window` is the one that holds the prepaint in the frame being built.
+    pub(crate) fn holds_scroller_blocking_a_move(&self, window: &Window) -> bool {
+        window.scrollers_block_a_move(self.range.start.scrollers_index..self.range.end.scrollers_index)
     }
 
     /// The line layouts the prepaint shaped were given back to the text system: a replay carries none.

@@ -1328,9 +1328,10 @@ impl Retained {
                 // away, and rewrites the recording with what it painted there, so a scroll translate that follows
                 // moves the new paint: a root in a region of its own, under the content mask it was recorded under,
                 // is in the state a translate leaves it in (`RetainedState::scrolled_to`). A scroller of its own in
-                // the root is not put away by a patch (it would have to move the offset and extent the frame holds
-                // of it), which declines it `Relocated` after building it: it is noted as relocated here instead.
-                let moved_and_patchable = !recorded.prepaint.holds_scroller()
+                // the root that the user scrolls, or that is scrolled, is not put away by a patch, which declines it
+                // `Relocated` after building it: it is noted as relocated here instead. One that only code scrolls,
+                // and has not, is: the patch rewrites the handle it holds with the recording.
+                let moved_and_patchable = !recorded.prepaint.holds_scroller_blocking_a_move(window)
                     && recorded
                         .relocation
                         .as_ref()

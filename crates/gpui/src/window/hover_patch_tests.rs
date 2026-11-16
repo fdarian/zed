@@ -4,11 +4,12 @@
 //! and built again by the patcher with the colour the pointer is giving them.
 
 use crate::{
-    AppContext as _, AnyElement, AnyWindowHandle, App, Context, ElementId, InteractiveElement, IntoElement, ListAlignment, ListState,
+    ScrollHandle, AppContext as _, AnyElement, AnyWindowHandle, App, Context, ElementId, InteractiveElement, IntoElement, ListAlignment, ListState,
     ParentElement, PatchDecline, Render, ScrollDelta, ScrollPatchReason, ScrollWheelEvent, StatefulInteractiveElement as _, Styled, TestAppContext, Window, div, list,
     point, px, retained, size,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 const ROW: f32 = 30.;
@@ -27,10 +28,23 @@ pub(super) struct Knobs {
     painted: Cell<bool>,
     /// Whether a row that is not hot has a fully transparent background that is kept.
     transparent: Cell<bool>,
-    /// Whether a row has a box with an overflow other than visible, a scroller of its own.
-    scroller: Cell<bool>,
+    /// The scroller a row has in a box of its own, if any.
+    scroller: Cell<RowScroller>,
+    /// The scroll handles of the rows whose box is a scroller that only code scrolls, by row.
+    handles: RefCell<HashMap<usize, ScrollHandle>>,
     /// The effect group painted over the rows, if any.
     pub(super) group: Cell<Option<GroupKind>>,
+}
+
+/// A scroller a row holds, a box with an overflow other than visible.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum RowScroller {
+    #[default]
+    None,
+    /// The wheel scrolls it: `overflow: scroll`.
+    User,
+    /// Only code scrolls it, as `overflow: hidden` is made in Ghia: tracked by a handle, with content to scroll.
+    Hidden,
 }
 
 /// An element that is an effect group, over rows 0 and 1 of the list.
@@ -62,10 +76,25 @@ fn group_element(kind: GroupKind) -> AnyElement {
         .into_any_element()
 }
 
-fn row_element(ix: usize, hot: bool, transparent: bool, scroller: bool) -> AnyElement {
+fn row_element(ix: usize, hot: bool, knobs: &Knobs) -> AnyElement {
+    let transparent = knobs.transparent.get();
     let mut row = div().id(("row", ix)).w_full().h(px(ROW)).always_hitbox();
-    if scroller {
-        row = row.child(div().id(("scroller", ix)).w(px(10.)).h(px(10.)).overflow_y_scroll().bg(crate::green()));
+    match knobs.scroller.get() {
+        RowScroller::None => {}
+        RowScroller::User => row = row.child(div().id(("scroller", ix)).w(px(10.)).h(px(10.)).overflow_y_scroll().bg(crate::green())),
+        RowScroller::Hidden => {
+            let handle = knobs.handles.borrow_mut().entry(ix).or_default().clone();
+            row = row.child(
+                div()
+                    .id(("scroller", ix))
+                    .w(px(10.))
+                    .h(px(10.))
+                    .overflow_y_scroll()
+                    .programmatic_scroll_only(false, true)
+                    .track_scroll(&handle)
+                    .child(div().w(px(10.)).h(px(30.)).bg(crate::green())),
+            );
+        }
     }
     if transparent {
         row.style().keep_transparent_background = Some(true);
@@ -85,13 +114,14 @@ struct Page {
 impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let knobs = self.knobs.clone();
-        let transparent = knobs.transparent.get();
-        let scroller = knobs.scroller.get();
         let group = knobs.group.get().map(group_element);
         div().size_full().child(
             list(self.state.clone(), move |ix, _, _| {
                 let hot = knobs.hot.get() == Some(ix);
-                retained(("row", ix), knobs.key.get() * 1_000 + u64::from(hot), move |_, _| row_element(ix, hot, transparent, scroller))
+                retained(("row", ix), knobs.key.get() * 1_000 + u64::from(hot), {
+                    let knobs = knobs.clone();
+                    move |_, _| row_element(ix, hot, &knobs)
+                })
                     .relocatable(px(100.))
                     .patchable()
                     .into_any_element()
@@ -114,20 +144,20 @@ impl Fixture {
     }
 
     fn with_transparent(cx: &mut TestAppContext, transparent: bool) -> Self {
-        Self::build(cx, transparent, None, false)
+        Self::build(cx, transparent, None, RowScroller::None)
     }
 
     /// The list whose rows have a scroller of their own.
-    fn with_scroller(cx: &mut TestAppContext) -> Self {
-        Self::build(cx, false, None, true)
+    fn with_scroller(cx: &mut TestAppContext, scroller: RowScroller) -> Self {
+        Self::build(cx, false, None, scroller)
     }
 
     /// The list with an effect group of `kind` over its first rows.
     pub(super) fn with_group(cx: &mut TestAppContext, kind: GroupKind) -> Self {
-        Self::build(cx, false, Some(kind), false)
+        Self::build(cx, false, Some(kind), RowScroller::None)
     }
 
-    fn build(cx: &mut TestAppContext, transparent: bool, group: Option<GroupKind>, scroller: bool) -> Self {
+    fn build(cx: &mut TestAppContext, transparent: bool, group: Option<GroupKind>, scroller: RowScroller) -> Self {
         let knobs = Rc::new(Knobs::default());
         knobs.scroller.set(scroller);
         knobs.key.set(1);
@@ -150,7 +180,7 @@ impl Fixture {
                     .patch
                     .borrow()
                     .iter()
-                    .map(|&ix| (ElementId::from(("row", ix)), row_element(ix, knobs.painted.get(), knobs.transparent.get(), knobs.scroller.get())))
+                    .map(|&ix| (ElementId::from(("row", ix)), row_element(ix, knobs.painted.get(), &knobs)))
                     .collect();
                 window.repaint_in_place(units, cx, |_, _| true).is_ok()
             })));
@@ -309,7 +339,7 @@ fn a_row_a_frame_built_whole_put_elsewhere_than_it_was_recorded_is_patched_in_it
 
 #[gpui::test]
 fn a_row_with_a_scroller_of_its_own_a_frame_built_whole_put_elsewhere_is_declined_as_relocated(cx: &mut TestAppContext) {
-    let fixture = Fixture::with_scroller(cx);
+    let fixture = Fixture::with_scroller(cx, RowScroller::User);
     assert!(fixture.can_patch(cx, 1), "the rows are recorded where they are");
     fixture.wheel(cx, 5.);
     // A patch would have to move the offset and extent the frame holds of the scroller.
@@ -325,6 +355,85 @@ fn a_row_with_a_scroller_of_its_own_a_frame_built_whole_put_elsewhere_is_decline
     assert!(fixture.can_patch(cx, 1));
     fixture.patch(cx, &[1], true);
     assert_eq!(fixture.patched(cx).patched_frames, 1);
+}
+
+impl Fixture {
+    /// What the scroll handle of the scroller in `row` says of where the box and its children are.
+    fn scroller_geometry(&self, cx: &mut TestAppContext, row: usize) -> (crate::Bounds<crate::Pixels>, crate::Bounds<crate::Pixels>, Option<crate::Bounds<crate::Pixels>>) {
+        let handle = self.knobs.handles.borrow()[&row].clone();
+        cx.update_window(self.window, |_, _, _| (handle.bounds(), handle.padding_box(), handle.bounds_for_item(0))).unwrap()
+    }
+
+    /// Where the scroller in `row` is, with the list scrolled by `scrolled`: the handle says it is there, and so
+    /// does its first child.
+    fn assert_scroller_is_at(&self, cx: &mut TestAppContext, row: usize, scrolled: f32, context: &str) {
+        let top = px(row as f32 * ROW - scrolled);
+        let (bounds, padding_box, child) = self.scroller_geometry(cx, row);
+        let expected = crate::Bounds::new(point(px(0.), top), size(px(10.), px(10.)));
+        assert_eq!(bounds, expected, "row {row}, {context}");
+        assert_eq!(padding_box, expected, "row {row}, {context}");
+        assert_eq!(child, Some(crate::Bounds::new(point(px(0.), top), size(px(10.), px(30.)))), "row {row}, {context}");
+    }
+}
+
+#[gpui::test]
+fn a_row_with_a_box_only_code_scrolls_moved_by_a_frame_built_whole_is_patched_and_translated_with_its_handle_in_place(cx: &mut TestAppContext) {
+    let moved = Fixture::with_scroller(cx, RowScroller::Hidden);
+    let built = Fixture::with_scroller(cx, RowScroller::Hidden);
+    let eligible = |cx: &mut TestAppContext| {
+        cx.update_window(moved.window, |_, window, _| window.scroll_patch_counters().eligible).unwrap()
+    };
+    let mut scrolled = 0.;
+    let mut painted: Option<usize> = None;
+    let mut steps = (0, 0);
+    for (by, hot) in [(5., Some(1)), (5., Some(1)), (5., None), (-5., Some(2)), (5., None), (5., Some(2))] {
+        let before = moved.patched(cx);
+        let translates = eligible(cx);
+        moved.wheel(cx, by);
+        built.wheel(cx, by);
+        scrolled += by;
+        let was_translate = eligible(cx) > translates;
+        if was_translate {
+            steps.1 += 1;
+        } else {
+            steps.0 += 1;
+        }
+        let context = format!("scrolled to {scrolled}, translate {was_translate}");
+        for row in 0..4 {
+            moved.assert_scroller_is_at(cx, row, scrolled, &format!("after the wheel, {context}"));
+        }
+        if let Some(row) = painted.take() {
+            moved.patch(cx, &[row], false);
+        }
+        if let Some(row) = hot {
+            assert!(moved.can_patch(cx, row), "{context}");
+            moved.patch(cx, &[row], true);
+            painted = Some(row);
+        }
+        built.whole(cx, hot);
+        let counters = moved.patched(cx);
+        assert_eq!(counters.total_declines(), before.total_declines(), "{context}: {counters:?}");
+        assert_eq!(moved.scene(cx), built.scene(cx), "{context}");
+        for row in 0..4 {
+            moved.assert_scroller_is_at(cx, row, scrolled, &format!("after the patch, {context}"));
+        }
+    }
+    assert!(steps.0 >= 1 && steps.1 >= 3, "frames built whole and translates both moved the rows: {steps:?}");
+    assert!(moved.patched(cx).patched_frames >= 6, "{:?}", moved.patched(cx));
+}
+
+#[gpui::test]
+fn a_row_with_a_box_only_code_scrolls_that_has_been_scrolled_since_it_was_recorded_is_declined_as_relocated(cx: &mut TestAppContext) {
+    let fixture = Fixture::with_scroller(cx, RowScroller::Hidden);
+    fixture.wheel(cx, 5.);
+    assert!(fixture.can_patch(cx, 1), "the box is at its offset of zero");
+    // The offset is written after the frame registered the row, and the patch reads it as the box prepaints.
+    let handle = fixture.knobs.handles.borrow()[&1].clone();
+    handle.set_offset(point(px(0.), px(-5.)));
+    fixture.patch(cx, &[1], true);
+    let counters = fixture.patched(cx);
+    assert_eq!(counters.patched_frames, 0, "{counters:?}");
+    assert_eq!(counters.declines(PatchDecline::Relocated), 1, "{counters:?}");
 }
 
 #[gpui::test]

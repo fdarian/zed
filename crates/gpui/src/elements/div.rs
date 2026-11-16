@@ -2924,6 +2924,18 @@ pub(crate) struct ScrollerRecord {
     pub(crate) user_scroll: Point<bool>,
 }
 
+impl ScrollerRecord {
+    /// Whether a patch of the subtree around the scroller, painted `delta` away from where the frame recorded it,
+    /// has to do something about it. The offset and the extent are relative to the padding box, which moves with
+    /// the subtree, and the bounds the handle holds are moved with the recording (see [`note_scroll_bounds`]), so a
+    /// scroller that only code scrolls, and has not, needs nothing. One the wheel scrolls has a thumb a patch does
+    /// not put, and one that has moved places its children by an offset that `Window::note_nested_scroll` says the
+    /// recording does not move.
+    pub(crate) fn blocks_moved_patch(&self) -> bool {
+        self.user_scroll.x || self.user_scroll.y || !self.offset.borrow().is_zero()
+    }
+}
+
 /// The interactivity struct. Powers all of the general-purpose
 /// interactivity in the `Div` element.
 #[derive(Default)]
