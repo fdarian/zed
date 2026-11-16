@@ -408,6 +408,15 @@ pub(super) struct ScrollRun {
     hook: Option<ReplayHook>,
 }
 
+impl ScrollRun {
+    /// The content mask that cuts the hitboxes of the root where a scroll puts it: the rectangle of
+    /// `ambient`, as a replay and the build the verifier compares with cut by (a root is only put
+    /// where it is clear of the corners of `ambient`, see `Window::clears_rounded_corners`).
+    fn surroundings(&self) -> ContentMask<Pixels> {
+        ContentMask::from_bounds(self.ambient.bounds)
+    }
+}
+
 /// Why the thumb of a bar cannot be put where a scroll puts it, as the owner says it of the bar
 /// of a list (see [`Window::paint_scroll_thumb`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1880,7 +1889,7 @@ impl Window {
             self.damage.add_operations(&frame.scene.paint_operations[run.ops.clone()]);
             let recorded = movement.source.hitboxes.hitboxes.iter();
             for (slot, recorded) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(recorded) {
-                let mut moved = recorded.relocated(movement.total, &run.ambient);
+                let mut moved = recorded.relocated(movement.total, &run.surroundings());
                 moved.parent = slot.parent;
                 *slot = moved;
             }
