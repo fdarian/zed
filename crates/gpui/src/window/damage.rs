@@ -343,7 +343,8 @@ impl Area {
             return None;
         }
         // What is in the region and not kept: what scrolled in, and the part of the clip that is not
-        // a whole pixel.
+        // a whole pixel. These are exact pixel geometry, so unlike the areas of primitives they get
+        // no margin: the margin is for antialiasing around a primitive, and the copy is not one.
         let exposed = [
             IntRect { left: outer.left, top: outer.top, right: outer.right, bottom: kept.top },
             IntRect { left: outer.left, top: kept.bottom, right: outer.right, bottom: outer.bottom },
@@ -354,7 +355,7 @@ impl Area {
             self.residual
                 .iter()
                 .filter_map(|area| IntRect::of_area(*area, window))
-                .chain(exposed.iter().filter(|band| !band.is_empty()).filter_map(|band| band.within(window))),
+                .chain(exposed.iter().copied().filter(|band| !band.is_empty())),
         );
         let drawn: i64 = rects.iter().map(|area| IntRect::of(*area).area()).sum();
         if rects.len() > MAX_RECTS || drawn as f32 > MAX_DRAWN_SHARE * outer.area() as f32 {

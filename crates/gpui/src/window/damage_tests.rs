@@ -218,12 +218,12 @@ mod ledger {
         let damage = take(&mut ledger, &scene).unwrap();
         assert_eq!(damage.shift, Some(Shift { region: device(10, 20, 100, 100), by: by(0, 30) }));
         assert_eq!(damage.shift.unwrap().kept(), device(10, 50, 100, 70));
-        assert_eq!(rects(&damage), [device(8, 18, 104, 34)]);
+        assert_eq!(rects(&damage), [device(10, 20, 100, 30)], "exact pixels of the strip, no margin");
 
         ledger.add_shift(area(10., 20., 100., 100.), by(0, -30));
         let damage = take(&mut ledger, &scene).unwrap();
         assert_eq!(damage.shift.unwrap().kept(), device(10, 20, 100, 70));
-        assert_eq!(rects(&damage), [device(8, 88, 104, 34)]);
+        assert_eq!(rects(&damage), [device(10, 90, 100, 30)]);
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod ledger {
         assert_eq!(rects.len(), 3, "{rects:?}");
         assert!(rects.contains(&device(148, 148, 14, 14)), "where it was: {rects:?}");
         assert!(rects.contains(&device(148, 178, 14, 14)), "where it moves to: {rects:?}");
-        assert!(rects.contains(&device(8, 18, 104, 34)), "the strip: {rects:?}");
+        assert!(rects.contains(&device(10, 20, 100, 30)), "the strip: {rects:?}");
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod ledger {
         let rects = rects(&damage);
         assert_eq!(rects.len(), 2, "{rects:?}");
         assert!(rects.contains(&device(148, 148, 14, 14)), "{rects:?}");
-        assert!(rects.contains(&device(8, 18, 104, 44)), "{rects:?}");
+        assert!(rects.contains(&device(10, 20, 100, 42)), "{rects:?}");
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod ledger {
         assert_eq!(damage.shift, Some(Shift { region: device(10, 20, 100, 100), by: by(0, 40) }));
         let rects = rects(&damage);
         // The strip of the sum, the area of the first shift moved by the second, and the area of the second.
-        assert!(rects.contains(&device(8, 18, 104, 44)), "{rects:?}");
+        assert!(rects.contains(&device(10, 20, 100, 40)), "{rects:?}");
         assert!(rects.contains(&device(148, 158, 14, 14)), "{rects:?}");
         assert!(rects.contains(&device(148, 18, 14, 14)), "{rects:?}");
         assert_eq!(rects.len(), 3, "the area of the first shift is drawn where it moved to and not where it was: {rects:?}");
@@ -356,15 +356,20 @@ mod ledger {
     }
 
     #[test]
-    fn a_clip_that_is_not_whole_pixels_is_drawn_whole_as_the_rectangles_of_its_ring_and_strip_join() {
-        // The pixels the clip covers in part are drawn, which is a ring around the region, and its sides reach
-        // (past the margin) into the strip that scrolled in: all of them overlap, and one rectangle is the whole region.
+    fn a_clip_that_is_not_whole_pixels_keeps_its_shift_and_draws_the_ring_and_the_strip() {
+        // The pixels the clip covers in part (a ring around the region) are drawn with the strip that scrolled in,
+        // all of them exact pixels with no margin, so they are rectangles apart; the rest of the region is copied.
         let scene = Scene::default();
         let mut ledger = ledger(&scene);
         ledger.add_shift(area(10.5, 20.5, 100., 100.), by(0, 30));
         let damage = take(&mut ledger, &scene).unwrap();
-        assert_eq!(damage.shift, None);
-        assert_eq!(rects(&damage), [device(8, 18, 105, 105)]);
+        assert_eq!(damage.shift, Some(Shift { region: device(11, 21, 99, 99), by: by(0, 30) }));
+        assert_eq!(damage.shift.unwrap().kept(), device(11, 51, 99, 69));
+        assert_eq!(
+            rects(&damage),
+            [device(10, 20, 101, 31), device(10, 51, 1, 69), device(110, 51, 1, 69), device(10, 120, 101, 1)],
+            "the strip with the top of the ring, the sides, and the bottom"
+        );
     }
 
     #[test]
@@ -374,7 +379,7 @@ mod ledger {
         ledger.add_shift(area(100., 100., 300., 300.), by(0, -30));
         let damage = take(&mut ledger, &scene).unwrap();
         assert_eq!(damage.shift.unwrap().region, device(100, 100, 100, 100));
-        assert_eq!(rects(&damage), [device(98, 168, 102, 32)]);
+        assert_eq!(rects(&damage), [device(100, 170, 100, 30)]);
     }
 
     #[test]
