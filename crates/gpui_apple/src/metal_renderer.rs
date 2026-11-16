@@ -4273,7 +4273,7 @@ mod tests {
         // The patch recolors row 1 (y 24..30 at offset 0) and the list scrolls before the frame is shown, so
         // the row is at 30..36 when it is shown, and the copy of the old one there is wrong.
         let mut steps = gpui::DamageSteps::default();
-        steps.area(area(14., 24., 44., 6.)).shift(clip, by(6));
+        steps.area(area(12., 24., 60., 6.)).shift(clip, by(6));
         let frames = [
             (list_frame(0, clip, Backdrop::Solid, None, None), None, None),
             (list_frame(6, clip, Backdrop::Solid, None, Some(1)), Some(steps.finish(window())), Some(by(6))),
