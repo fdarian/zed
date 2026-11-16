@@ -128,7 +128,7 @@ pub use executor::*;
 pub use geometry::*;
 pub use grid_template::*;
 pub use gestures::*;
-pub use scroll_routing::OverscrollBehavior;
+pub use scroll_routing::{LATCH_TIMEOUT as WHEEL_LATCH_TIMEOUT, OverscrollBehavior};
 pub use sticky::StickyInsets;
 pub use global::*;
 pub use gpui_macros::{

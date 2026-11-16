@@ -418,7 +418,6 @@ impl Pointed {
         let fixture = Fixture::new(cx);
         cx.update_window(fixture.window, |_, window, cx| {
             window.set_scroll_patch(translates);
-            window.set_scroll_patch_hover(Some(Rc::new(|_, _, _| false)));
             let moved = crate::MouseMoveEvent { position: point(px(10.), px(POINTER_Y)), ..Default::default() };
             window.dispatch_event(crate::PlatformInput::MouseMove(moved), cx);
         })
@@ -491,7 +490,6 @@ fn a_hover_the_owner_paints_with_a_patch_after_a_translate_is_what_a_frame_built
     assert_eq!((counters.frames, counters.eligible, counters.mispredicted), (16, 15, 0), "{counters:?}");
     assert_eq!(counters.reasons(ScrollPatchReason::Membership), 1, "{counters:?}");
     assert_eq!(counters.reasons(ScrollPatchReason::Hover), 0, "{counters:?}");
-    assert!(counters.held(ScrollPatchReason::HitboxChain) >= 3, "the hover changed at the borders the pointer crossed: {counters:?}");
     let patched = translated.fixture.patched(cx);
     // What a patch declines is a row the frame built whole put elsewhere than it recorded it, after the step that was
     // built whole; the owner builds the hover then.

@@ -29,8 +29,9 @@ use crate::{
 /// How long a latched container keeps the wheel once events stop. Momentum events
 /// arrive every frame, so a gap this long is the end of the gesture. It is Chromium's wheel
 /// latching transaction (`MouseWheelPhaseHandler`), which times a wheel without phases out the same
-/// way.
-const LATCH_TIMEOUT: Duration = Duration::from_millis(500);
+/// way. The owner of a window follows the hover under a still pointer once a wheel has been
+/// quiet for this long, as a browser does.
+pub const LATCH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// What a container does with scroll delta it cannot use, like CSS
 /// `overscroll-behavior`.

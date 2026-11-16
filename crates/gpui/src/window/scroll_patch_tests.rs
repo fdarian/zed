@@ -328,88 +328,32 @@ fn a_pointer_that_keeps_its_hitboxes_is_not_a_hover_change(cx: &mut TestAppConte
     assert_eq!((counters.eligible, counters.mispredicted), (1, 0), "{counters:?}");
 }
 
-#[gpui::test]
-fn a_pointer_that_crosses_a_row_is_a_hover_change(cx: &mut TestAppContext) {
-    let fixture = Fixture::new(cx, Some(100.), true);
-    // The row 0 spans 0 to 30: the pointer at 28 is in the row 1 after a scroll by 5.
-    fixture.scroll(cx, 10., 28., 5.);
-    only(&fixture.counters(cx), ScrollPatchReason::Hover);
-}
-
-#[gpui::test]
-fn the_hover_change_is_the_only_reason_when_it_is_counted_apart(cx: &mut TestAppContext) {
-    let fixture = Fixture::new(cx, Some(100.), true);
-    fixture.scroll(cx, 10., 28., 5.);
-    let counters = fixture.counters(cx);
-    assert_eq!(counters.hover_only, 1, "{counters:?}");
-}
-
 /// Names the hitbox ids of a chain by the last segment of their path, topmost first.
 fn named(chain: &[GlobalElementId]) -> Vec<String> {
     chain.iter().map(|id| format!("{:?}", id.last().expect("a hitbox id has a path"))).collect()
 }
 
 #[gpui::test]
-fn a_hitbox_change_the_owner_does_not_mind_is_counted_and_not_a_blocker(cx: &mut TestAppContext) {
+fn a_still_pointer_that_meets_another_row_is_not_a_reason(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), true);
-    let asked = Rc::new(RefCell::new(Vec::new()));
-    let seen = asked.clone();
-    fixture.with_window(cx, move |window| {
-        window.set_scroll_patch_hover(Some(Rc::new(move |_, before, after| {
-            seen.borrow_mut().push((named(before), named(after)));
-            false
-        })))
-    });
-    // The row 0 spans 0 to 30: the pointer at 28 is in the row 1 after a scroll by 5.
+    // The row 0 spans 0 to 30: the pointer at 28 is in the row 1 after a scroll by 5. The hover under a
+    // pointer that did not move is the owner's to follow when the scroll ends, so no frame is held for it.
     fixture.scroll(cx, 10., 28., 5.);
     let counters = fixture.counters(cx);
     assert_eq!((counters.frames, counters.eligible, counters.mispredicted), (1, 1, 0), "{counters:?}");
-    assert_eq!(counters.held(ScrollPatchReason::HitboxChain), 1, "{counters:?}");
     assert_eq!(counters.held(ScrollPatchReason::Hover), 0, "{counters:?}");
-    assert_eq!(counters.reasons(ScrollPatchReason::Hover), 0, "{counters:?}");
-    let asked = asked.borrow();
-    assert_eq!(asked.len(), 1, "{asked:?}");
-    let (before, after) = &asked[0];
-    assert!(before[0].ends_with("0)"), "the row 0 is under the pointer before: {asked:?}");
-    assert!(after[0].ends_with("1)"), "the row 1 is under the pointer after: {asked:?}");
+    assert_eq!(counters.hover_only, 0, "{counters:?}");
 }
 
 #[gpui::test]
-fn a_hitbox_change_the_owner_minds_is_a_hover_change(cx: &mut TestAppContext) {
+fn a_pointer_that_moved_is_a_hover_change_and_the_only_reason_when_it_is_counted_apart(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), true);
-    fixture.with_window(cx, |window| window.set_scroll_patch_hover(Some(Rc::new(|_, _, _| true))));
-    fixture.scroll(cx, 10., 28., 5.);
-    let counters = fixture.counters(cx);
-    assert_eq!(counters.held(ScrollPatchReason::HitboxChain), 1, "{counters:?}");
-    only(&counters, ScrollPatchReason::Hover);
-    assert_eq!(counters.hover_only, 1, "{counters:?}");
-}
-
-#[gpui::test]
-fn the_owner_is_not_asked_when_the_hitboxes_under_the_pointer_are_the_same(cx: &mut TestAppContext) {
-    let fixture = Fixture::new(cx, Some(100.), true);
-    let asked = Rc::new(Cell::new(0));
-    let seen = asked.clone();
-    fixture.with_window(cx, move |window| {
-        window.set_scroll_patch_hover(Some(Rc::new(move |_, _, _| {
-            seen.set(seen.get() + 1);
-            true
-        })))
-    });
-    fixture.scroll(cx, 10., 10., 5.);
-    let counters = fixture.counters(cx);
-    assert_eq!((counters.eligible, asked.get()), (1, 0), "{counters:?}");
-    assert_eq!(counters.held(ScrollPatchReason::HitboxChain), 0, "{counters:?}");
-}
-
-#[gpui::test]
-fn a_pointer_that_moved_is_a_hover_change_whatever_the_owner_says(cx: &mut TestAppContext) {
-    let fixture = Fixture::new(cx, Some(100.), true);
-    fixture.with_window(cx, |window| window.set_scroll_patch_hover(Some(Rc::new(|_, _, _| false))));
     fixture.point_at(cx, 10., 10.);
     // The wheel event is at another place than the pointer was drawn at.
     fixture.wheel_with(cx, 10., 50., 5., |_, _| {});
-    only(&fixture.counters(cx), ScrollPatchReason::Hover);
+    let counters = fixture.counters(cx);
+    only(&counters, ScrollPatchReason::Hover);
+    assert_eq!(counters.hover_only, 1, "{counters:?}");
 }
 
 #[gpui::test]

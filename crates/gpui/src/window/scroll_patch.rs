@@ -79,16 +79,10 @@ pub enum ScrollPatchReason {
     /// out and building the ones that come in: a row has no measured size, or none of the rows stays.
     /// [`ScrollPatchCause`] says which.
     Membership,
-    /// The pointer moved since the frame shown, or the hover chain once the rows are moved would
-    /// restyle something or emit a pointer event: the owner says (see
-    /// [`Window::set_scroll_patch_hover`]). A window whose owner does not say takes every change
-    /// of [`ScrollPatchReason::HitboxChain`] for one.
+    /// The pointer moved since the frame shown. A pointer that did not move is not a reason
+    /// whatever the rows come to be under it: the hover under a still pointer is the owner's to
+    /// follow once the scroll ends, as a browser's is.
     Hover,
-    /// The hitboxes under the pointer are not the same once the rows are moved: one that takes
-    /// the pointer is under it before and not after, or the other way round. Counted in
-    /// [`ScrollPatchCounters::held`] only; the hit test is run again after a translate, so it
-    /// stops a frame only as [`ScrollPatchReason::Hover`].
-    HitboxChain,
     /// A row's recording cannot be put there: what it reads of its surroundings differs in more
     /// than where it is (a scale factor that is not a power of two, an exact clip, a rounded clip
     /// around).
@@ -124,11 +118,10 @@ pub enum ScrollPatchReason {
 
 impl ScrollPatchReason {
     /// Every reason, in the order the checks run.
-    pub const ALL: [ScrollPatchReason; 14] = [
+    pub const ALL: [ScrollPatchReason; 13] = [
         ScrollPatchReason::Edited,
         ScrollPatchReason::Membership,
         ScrollPatchReason::Hover,
-        ScrollPatchReason::HitboxChain,
         ScrollPatchReason::Place,
         ScrollPatchReason::Region,
         ScrollPatchReason::Clip,
@@ -143,11 +136,6 @@ impl ScrollPatchReason {
 
     fn index(self) -> usize {
         self as usize
-    }
-
-    /// Whether a frame it holds for is not a translate. The others are only counted.
-    pub fn blocks(self) -> bool {
-        self != ScrollPatchReason::HitboxChain
     }
 }
 
@@ -292,8 +280,8 @@ pub enum ScrollApplyDecline {
     /// What a row that comes in did cannot be repeated by a recording: it asked for a frame, scrolled
     /// something into view, deferred a draw or reported what it laid out to its owner ahead of paint.
     Effects,
-    /// A hitbox of a row that comes in takes the pointer where the pointer is: the owner is not asked
-    /// what that does to the hover, and a frame built whole says.
+    /// A hitbox of a row that comes in takes the pointer where the pointer is: a frame built whole says
+    /// what that does to the hover.
     Pointer,
     /// The frame shown does not hold what a row recorded where it recorded it (a stacking context moved
     /// it), or the rows to take out do not follow one another.
@@ -332,8 +320,8 @@ pub struct ScrollPatchCounters {
     /// Of the eligible ones, frames whose build was not what the prediction said: a row built
     /// where a recording was to be put, a delta other than the translate, other rows.
     pub mispredicted: u64,
-    /// Of the frames not eligible, those that only the hover stops: they would be eligible with the
-    /// pointer elsewhere.
+    /// Of the frames not eligible, those that only the pointer having moved stops: they would be
+    /// eligible with the pointer where the frame shown had it.
     pub hover_only: u64,
     /// Of the eligible ones, frames drawn by moving the rows of the frame shown.
     pub patched: u64,
@@ -515,9 +503,6 @@ struct ThumbMove {
     quad: Option<(Quad, Bounds<Pixels>)>,
 }
 
-/// A run of the frame shown with where a scroll would put it.
-type PlacedRun<'a> = (&'a ScrollRun, Point<Pixels>, Result<(), ScrollMiss>);
-
 struct OpenList {
     id: ScrollerId,
     start: usize,
@@ -673,17 +658,8 @@ impl Held {
         self.causes |= 1 << cause.index();
     }
 
-    /// The reasons that stop a translate.
-    fn blockers(self) -> u16 {
-        ScrollPatchReason::ALL
-            .into_iter()
-            .filter(|reason| reason.blocks())
-            .fold(0, |mask, reason| mask | (self.reasons & 1 << reason.index()))
-    }
-
     fn first(self) -> Option<ScrollPatchReason> {
-        let blockers = self.blockers();
-        ScrollPatchReason::ALL.into_iter().find(|reason| blockers & 1 << reason.index() != 0)
+        ScrollPatchReason::ALL.into_iter().find(|reason| self.reasons & 1 << reason.index() != 0)
     }
 }
 
@@ -734,7 +710,6 @@ struct Prediction {
 }
 
 pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window, &App) -> Option<ScrollPatchReason>>;
-pub(crate) type ScrollPatchHover = Rc<dyn Fn(&Window, &[GlobalElementId], &[GlobalElementId]) -> bool>;
 pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App)>;
 pub(crate) type ScrollPatchRegistries = Rc<dyn Fn(&Window) -> String>;
 
@@ -748,7 +723,6 @@ pub(crate) struct ScrollPatchWindow {
     /// A tick was requested for the draw being classified (taken by [`Window::draw`] before it).
     ticked: bool,
     gate: Option<ScrollPatchGate>,
-    hover: Option<ScrollPatchHover>,
     predicted: Option<Prediction>,
     counters: ScrollPatchCounters,
 }
@@ -779,27 +753,10 @@ impl Window {
         self.scroll_patch.gate = gate;
     }
 
-    /// Lets the owner of the window say whether the pointer meeting other elements would matter to
-    /// it: `before` and `after` are the elements under the pointer in the frame shown and once the
-    /// rows are moved, as the ids of their hitboxes, topmost first, and the answer is whether
-    /// moving the hover from the one to the other would restyle something or emit an event (see
-    /// [`ScrollPatchReason::Hover`]). Asked only when [`ScrollPatchReason::HitboxChain`] holds and
-    /// the window hit tests like the DOM ([`Window::set_dom_hit_testing`]); without it every such
-    /// change is a hover change. An owner that draws a hover that only paints answers no and paints it
-    /// by the patch it asks for after the frame (`Window::request_tick`): a row a translate moved is patched
-    /// where it stands, and the frame is what one built whole shows, since that one replays the rows
-    /// recorded before the hover as well.
-    pub fn set_scroll_patch_hover(
-        &mut self,
-        hover: Option<Rc<dyn Fn(&Window, &[GlobalElementId], &[GlobalElementId]) -> bool>>,
-    ) {
-        self.scroll_patch.hover = hover;
-    }
-
     /// Lets the owner of the window follow a frame that moved the rows in place: `settled` runs
     /// after the draw (as a callback deferred from it), for what the owner does after a frame
-    /// that built the content under the pointer, such as following a hover that the moved rows
-    /// changed.
+    /// that built the content under the pointer, such as following a hover once a scroll that
+    /// ended has moved the rows.
     pub fn set_scroll_patch_settled(&mut self, settled: Option<Rc<dyn Fn(&mut Window, &mut App)>>) {
         self.scroll_patch.settled = settled;
     }
@@ -1132,7 +1089,7 @@ impl Window {
             None => {
                 let reason = verdict.held.first().expect("a frame is rejected for a reason");
                 counters.reasons[reason.index()] += 1;
-                counters.hover_only += u64::from(verdict.held.blockers() == 1 << ScrollPatchReason::Hover.index());
+                counters.hover_only += u64::from(verdict.held.reasons == 1 << ScrollPatchReason::Hover.index());
             }
         }
         for reason in ScrollPatchReason::ALL {
@@ -1284,14 +1241,6 @@ impl Window {
 
         if self.mouse_position != shown.mouse {
             held.reason(Reason::Hover);
-        } else if list.viewport.contains(&self.mouse_position) {
-            let moved = self.moved_hitboxes(shift, &places, &rebuilds);
-            if self.hitbox_chain_changes(&moved) {
-                held.reason(Reason::HitboxChain);
-                if self.hover_changes(&moved) {
-                    held.reason(Reason::Hover);
-                }
-            }
         }
 
         for (run, _, place) in &places {
@@ -1359,51 +1308,6 @@ impl Window {
                 thumbs,
             }),
         }
-    }
-
-    /// The hitboxes of the rows that can be moved, or are built where they are put (`rebuilds`), and take
-    /// the pointer, as they are once the rows move by `shift`, with their index in the frame shown, in order.
-    fn moved_hitboxes(&self, shift: Point<Pixels>, places: &[PlacedRun], rebuilds: &[usize]) -> Vec<(usize, Hitbox)> {
-        let hitboxes = &self.rendered_frame.hitboxes;
-        let moved: Vec<(usize, Hitbox)> = places
-            .iter()
-            .filter(|(run, _, place)| place.is_ok() || rebuilds.contains(&run.row))
-            .flat_map(|(run, _, _)| {
-                run.hitboxes.clone().filter_map(|ix| {
-                    (hitboxes[ix].behavior != HitboxBehavior::PassThrough)
-                        .then(|| (ix, hitboxes[ix].relocated(shift, &run.ambient)))
-                })
-            })
-            .collect();
-        // `hover_changes` searches it by index.
-        debug_assert!(moved.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        moved
-    }
-
-    /// Whether a hitbox that takes the pointer is under it before the rows move and not after, or
-    /// the other way round.
-    fn hitbox_chain_changes(&self, moved: &[(usize, Hitbox)]) -> bool {
-        let position = self.mouse_position;
-        moved
-            .iter()
-            .any(|(ix, after)| self.rendered_frame.hitboxes[*ix].contains_point(position) != after.contains_point(position))
-    }
-
-    /// Whether the owner says the hitboxes under the pointer once the rows have moved matter to it,
-    /// against the ones under it in the frame shown. Yes when it cannot be asked.
-    fn hover_changes(&self, moved: &[(usize, Hitbox)]) -> bool {
-        let Some(hover) = self.scroll_patch.hover.as_ref().filter(|_| self.dom_hit_testing) else {
-            return true;
-        };
-        let frame = &self.rendered_frame;
-        let after = frame.dom_hit_test_by(self.mouse_position, |ix| match moved.binary_search_by_key(&ix, |(at, _)| *at) {
-            Ok(found) => &moved[found].1,
-            Err(_) => &frame.hitboxes[ix],
-        });
-        let identities = |chain: &[HitChainLink]| -> Vec<GlobalElementId> {
-            chain.iter().filter_map(|link| link.identity.clone()).collect()
-        };
-        hover(self, &identities(&self.mouse_hit_test.chain), &identities(&after.chain))
     }
 
     /// Whether the only view queued to render is the one the list that scrolled since the last draw notified. A
@@ -1869,7 +1773,7 @@ impl Window {
                 return Err(ScrollApplyDecline::Row);
             }
         }
-        // A row that stays has the hitboxes it had, which the classifier asked the owner about where they are put.
+        // A row that stays has the hitboxes it had.
         let mouse = self.mouse_position;
         let rebuilt_hitboxes: Vec<Range<usize>> =
             runs.iter().filter(|run| rebuilds.contains(&run.row)).map(|run| run.hitboxes.clone()).collect();

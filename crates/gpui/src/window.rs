@@ -2058,12 +2058,6 @@ impl Frame {
         hit_test
     }
 
-    /// [`Self::hit_test`] in the DOM model over the hitboxes `hitbox_at` gives for the indices of the
-    /// frame: the scroll classifier asks what the pointer would hit with some of them moved.
-    pub(crate) fn dom_hit_test_by<'h>(&self, position: Point<Pixels>, hitbox_at: impl Fn(usize) -> &'h Hitbox) -> HitTest {
-        self.dom_hit_test_over(position, self.hitboxes.len(), self.clip_index(), hitbox_at)
-    }
-
     pub(crate) fn focus_path(&self) -> SmallVec<[FocusId; 8]> {
         self.focus
             .map(|focus_id| self.dispatch_tree.focus_path(focus_id))

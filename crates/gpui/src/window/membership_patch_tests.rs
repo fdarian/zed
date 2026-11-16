@@ -241,8 +241,6 @@ impl Fixture {
                 window.set_contained_patches(true);
                 window.set_scroll_patch(patch);
                 window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
-                // The rows have no hover style and no pointer event: where the pointer is among them does not matter.
-                window.set_scroll_patch_hover(Some(Rc::new(|_, _, _| false)));
                 let patched = shared.clone();
                 window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
                     let mut units = Vec::new();
