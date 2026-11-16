@@ -3411,6 +3411,30 @@ impl ContentMask<Pixels> {
             .any(|radius| radius.0 > 0.)
     }
 
+    /// Whether `bounds` is clear of every rounded corner of the mask: it overlaps none of the
+    /// squares, one at each corner with a radius, that the corner's arc is cut out of. A box that
+    /// is clear is cut by straight edges only, whatever the radii say, so that painting under
+    /// this mask and under its bounds alone make the same pixels of it.
+    pub(crate) fn is_clear_of_rounded_corners(&self, bounds: Bounds<Pixels>) -> bool {
+        let radii = self.fitted_radii();
+        let radii_y = radii.explicit_y();
+        let frame = self.bounds;
+        [
+            (radii.x.top_left, radii_y.top_left, frame.origin.x, frame.origin.y),
+            (radii.x.top_right, radii_y.top_right, frame.right() - radii.x.top_right, frame.origin.y),
+            (radii.x.bottom_right, radii_y.bottom_right, frame.right() - radii.x.bottom_right, frame.bottom() - radii_y.bottom_right),
+            (radii.x.bottom_left, radii_y.bottom_left, frame.origin.x, frame.bottom() - radii_y.bottom_left),
+        ]
+        .into_iter()
+        .filter(|(radius_x, radius_y, _, _)| radius_x.0 > 0. || radius_y.0 > 0.)
+        .all(|(radius_x, radius_y, left, top)| {
+            bounds.right() <= left
+                || bounds.left() >= left + radius_x
+                || bounds.bottom() <= top
+                || bounds.top() >= top + radius_y
+        })
+    }
+
     /// Whether `position` is inside the mask grown by [`EXACT_TOLERANCE`], so that a point
     /// computed to lie on the mask's edge counts as inside it. Growing the bounds and every
     /// round corner's radii by the same amount grows the whole shape by that much.

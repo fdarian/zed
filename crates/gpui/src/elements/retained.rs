@@ -754,11 +754,18 @@ impl Element for Retained {
         });
         window.layout_scope = outer_scope;
         if let Some(hitboxes_start) = scroll_run {
+            // Where a scroll puts the root is judged against the rounded corners of what holds it
+            // from here: see `ScrollRun::reach`.
+            let reach = window.content_mask().is_rounded().then(|| {
+                let root = self.root(global_id, window);
+                window.painted_reach(root, bounds, self.cull_outset)
+            });
             window.scroll_patch_end_root_prepaint(
                 global_id,
                 hitboxes_start,
                 matches!(result, RetainedPrepaint::Replayed),
                 self.on_replay.clone(),
+                reach.flatten(),
             );
         }
         // The parent hands this subtree to the stacking context around it once this returns, unless
@@ -1296,6 +1303,7 @@ impl Retained {
         let hook = self.on_replay.clone();
         let id = self.id.clone();
         let ambient = window.content_mask();
+        let clear = self.clears_rounded_corners(global_id, bounds, window);
         let replayed = window.with_element_state(global_id, |state: Option<RetainedState>, window| {
             let mut state = state.expect("a skipped subtree has its state");
             let root = state.root;
@@ -1305,7 +1313,7 @@ impl Retained {
                 return (false, state);
             };
             let exact = recorded.key == key;
-            let Some(delta) = recorded.place(&key, &ambient, window) else {
+            let Some(delta) = recorded.place(&key, &ambient, clear, window) else {
                 return (false, state);
             };
             recorded.delta = delta;
@@ -1377,6 +1385,7 @@ impl Retained {
         let root = self.root(global_id, window);
         let key = window.replay_key(bounds, root);
         let ambient = window.content_mask();
+        let clear = self.clears_rounded_corners(global_id, bounds, window);
         let placed = window
             .peek_element_state(global_id, |state: &RetainedState| {
                 let generation = window.layout_generation(state.root);
@@ -1384,7 +1393,7 @@ impl Retained {
                     .recorded
                     .as_ref()
                     .filter(|recorded| recorded.generation == generation)
-                    .map(|recorded| recorded.peek_place(&key, &ambient))
+                    .map(|recorded| recorded.peek_place(&key, &ambient, clear))
             })
             .expect("a skipped subtree has its state");
         let Some(placed) = placed else {
@@ -1691,14 +1700,14 @@ impl Retained {
                 window.capture_patch_unit(global_id, &self.id, self.lift_z, self.overscan.is_some(), self.relayout, publishes)
             })
             .flatten();
-        let (relocation, unmovable_at_start) = self.plan_relocation(window);
+        let (relocation, unmovable_at_start) = self.plan_relocation(global_id, key.bounds, window);
         if relocation.as_ref().is_some_and(|relocation| !relocation.direct) {
             window.retained.recorded_relocatably += 1;
         }
         let surroundings = relocation
             .as_ref()
             .filter(|relocation| relocation.regional())
-            .map(|relocation| relocation.ambient);
+            .map(|relocation| crate::ContentMask::from_bounds(relocation.ambient.bounds));
         let owner = self.state_owner(global_id, window);
         let mark = window.begin_prepaint_recording(self.on_replay.clone(), owner.clone());
         let relocating = relocation.is_some();
@@ -1768,7 +1777,9 @@ impl Retained {
     /// be put elsewhere, if its owner says they can, and, if they cannot be here, why.
     fn plan_relocation(
         &self,
-        window: &Window,
+        global_id: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
     ) -> (Option<Relocation>, Option<NonRelocatable>) {
         let Some(overscan) = self.overscan else {
             return (None, None);
@@ -1784,8 +1795,21 @@ impl Retained {
         if let Some(reason) = window.relocation_blocker_here() {
             return (None, Some(reason));
         }
+        // The first emission of a recording is a replay too, at no distance: it needs the same.
+        if !self.clears_rounded_corners(global_id, bounds, window) {
+            return (None, Some(NonRelocatable::Clip));
+        }
         let relocation = Relocation::new(window.content_mask(), overscan, window.retained.reference);
         (Some(relocation), None)
+    }
+
+    /// [`Window::clears_rounded_corners`] for this subtree, where it is now.
+    fn clears_rounded_corners(&self, global_id: &GlobalElementId, bounds: Bounds<Pixels>, window: &mut Window) -> bool {
+        if !window.content_mask().is_rounded() {
+            return true;
+        }
+        let root = self.root(global_id, window);
+        window.clears_rounded_corners(root, bounds, self.cull_outset)
     }
 }
 
@@ -1793,10 +1817,14 @@ impl Recorded {
     /// How far from where this was recorded `key` puts the subtree, if it is a place the
     /// recording can be replayed at, and the miss that says otherwise, when it was one worth
     /// counting.
+    ///
+    /// `clear` is whether the subtree stays clear of the rounded corners of `ambient` where `key`
+    /// puts it ([`Window::clears_rounded_corners`]).
     fn peek_place(
         &self,
         key: &ReplayKey,
         ambient: &crate::ContentMask<Pixels>,
+        clear: bool,
     ) -> Result<Point<Pixels>, Option<RelocationMiss>> {
         if self.key == *key {
             return Ok(Point::default());
@@ -1814,6 +1842,9 @@ impl Recorded {
         if relocation.culled {
             return Ok(delta);
         }
+        if !clear {
+            return Err(Some(RelocationMiss::Clip));
+        }
         relocation.info.fits(delta, ambient).map(|()| delta).map_err(Some)
     }
 
@@ -1822,9 +1853,10 @@ impl Recorded {
         &self,
         key: &ReplayKey,
         ambient: &crate::ContentMask<Pixels>,
+        clear: bool,
         window: &mut Window,
     ) -> Option<Point<Pixels>> {
-        match self.peek_place(key, ambient) {
+        match self.peek_place(key, ambient, clear) {
             Ok(delta) => Some(delta),
             Err(miss) => {
                 if let Some(miss) = miss {

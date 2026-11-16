@@ -2028,7 +2028,7 @@ impl Scene {
 /// The four rectangles a quad with no background is drawn as, around its empty interior, so that
 /// the shader does not shade every transparent pixel inside a large outline; none when it is
 /// drawn whole.
-fn border_strips(quad: &Quad) -> Option<[Bounds<ScaledPixels>; 4]> {
+pub(crate) fn border_strips(quad: &Quad) -> Option<[Bounds<ScaledPixels>; 4]> {
     // Without a border there is nothing to cut around: a transparent quad that has none is the
     // background `Style::keep_transparent_background` keeps, and it stays one operation that a
     // patch can write a colour over.

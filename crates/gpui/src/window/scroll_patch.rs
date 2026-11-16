@@ -395,6 +395,10 @@ pub(super) struct ScrollRun {
     /// The content mask around the root in prepaint, and whether an exact clip cut it.
     ambient: ContentMask<Pixels>,
     exact_clips: bool,
+    /// Where the root paints, for a root under a rounded `ambient`, and `None` when that is not
+    /// known or `ambient` is not rounded: a scroll puts the root where it is not clear of the
+    /// corners of `ambient` only if it is built.
+    reach: Option<Bounds<Pixels>>,
     /// The content mask around the root in paint, which cuts its operations: the list's clip is in
     /// it and not in `ambient`.
     paint_mask: ContentMask<Pixels>,
@@ -883,6 +887,7 @@ impl Window {
         hitboxes_start: usize,
         replayed: bool,
         hook: Option<ReplayHook>,
+        reach: Option<Bounds<Pixels>>,
     ) {
         let delta = if replayed {
             let placed = self.peek_element_state(id, |state: &RetainedState| state.placed_by());
@@ -911,6 +916,7 @@ impl Window {
             paint_mask: ambient,
             ambient,
             exact_clips,
+            reach,
             replayed,
             hook,
         });
@@ -1214,7 +1220,8 @@ impl Window {
                 let total = run.delta + shift;
                 let place = self
                     .peek_element_state(&run.id, |state: &RetainedState| {
-                        state.would_place(total, &run.ambient, run.exact_clips)
+                        let reach = run.reach.map(|reach| Bounds::new(reach.origin + shift, reach.size));
+                        state.would_place(total, &run.ambient, run.exact_clips, reach)
                     })
                     .unwrap_or(Err(ScrollMiss::Unrecorded));
                 (run, total, place)
