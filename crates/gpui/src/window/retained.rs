@@ -1538,13 +1538,13 @@ impl Relocation {
     }
 
     /// A recording of the same subtree in the same region, with nothing noted yet: what a patch that
-    /// paints the subtree again records it in.
+    /// paints the subtree again records it in. A `direct` one stays one.
     pub(crate) fn reopened(&self) -> Self {
         Self {
             info: RelocationInfo { region: self.info.region, rounded: Vec::new(), decisions: Vec::new() },
             handles: Vec::new(),
             ambient: self.ambient,
-            direct: false,
+            direct: self.direct,
             culled: false,
             frames_below: 0,
             saved_exact_clips: None,
@@ -1563,7 +1563,7 @@ impl Relocation {
     /// clear of its corners makes the same pixels (see [`Window::clears_rounded_corners`]) but not
     /// the same operations (an outline under a rectangle is four strips, under a rounded mask one
     /// quad).
-    fn flattens_ambient(&self) -> bool {
+    pub(crate) fn flattens_ambient(&self) -> bool {
         self.direct && !self.culled && self.ambient.is_rounded()
     }
 
@@ -2796,8 +2796,7 @@ impl Window {
         debug_assert!(self.retained.relocation.is_none(), "relocatable subtrees do not nest");
         relocation.frames_below = self.positioned_frames.len();
         if relocation.flattens_ambient() {
-            self.content_mask_stack
-                .push(ContentMask::from_bounds(relocation.ambient.bounds));
+            self.content_mask_stack.push(relocation.surroundings());
         }
         if relocation.regional() {
             self.content_mask_stack

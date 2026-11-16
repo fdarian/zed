@@ -494,6 +494,7 @@ impl RetainedState {
                 && (publishes || !(recorded.prepaint.has_publications || paint.has_publications)),
             publishes,
             relocation: recorded.relocation.as_ref().filter(|relocation| relocation.regional()).map(Relocation::reopened),
+            flattened: recorded.relocation.as_ref().filter(|relocation| relocation.flattens_ambient()).map(Relocation::reopened),
             delta: recorded.delta,
             blockers: recorded.prepaint.blockers | paint.blockers,
             relocated_rewritable: regional

@@ -397,6 +397,10 @@ pub(crate) struct PatchSource {
     /// that does not lay the root out again prepaints and paints it in that region and puts the
     /// operations where the frame has them, `delta` from where they were recorded.
     pub(crate) relocation: Option<Relocation>,
+    /// What the root was recorded in by the build that the verifier compares a replay with (`direct`: no region) under a
+    /// rounded content mask, which that build cuts the root by the rectangle of: a patch cuts it the same where it is clear
+    /// of the corners still, see [`Relocation::flattens_ambient`].
+    pub(crate) flattened: Option<Relocation>,
     pub(crate) delta: Point<Pixels>,
     /// The reasons the recording cannot be put elsewhere, as they were recorded: a patch that finds others
     /// leaves the recording as it is and the frame is not one that can be translated until it is built whole.
@@ -508,6 +512,8 @@ struct PreparedStep {
     accessed: FxHashSet<EntityId>,
     /// A root recorded to be put elsewhere is prepainted and painted in its region.
     relocated: Option<RelocatedStep>,
+    /// The content mask that a root recorded `direct` under a rounded one is cut by, where it is clear of the corners.
+    flattened: Option<ContentMask<Pixels>>,
 }
 
 /// What prepaint noted of a root that is recorded in a region of its own, for paint to go on from.
@@ -1631,6 +1637,17 @@ impl Window {
             }
             _ => None,
         };
+        // The build that the verifier compares with cuts a root it recorded without a region by the rectangle of a rounded content
+        // mask that the root is clear of the corners of, and so does the patch, whether or not it lays the root out again.
+        let flattened = source
+            .flattened
+            .as_ref()
+            .filter(|relocation| {
+                relocation.flattens_ambient()
+                    && self.content_mask() == relocation.ambient
+                    && self.clears_rounded_corners(built_root, bounds, around.cull_outset)
+            })
+            .map(Relocation::surroundings);
         if region.is_none() && !source.delta.is_zero() {
             return Err(PatchDecline::Relocated);
         }
@@ -1647,7 +1664,13 @@ impl Window {
             self.begin_relocation(relocation, false);
         }
         let focus_before = self.next_frame.focus.take();
+        if let Some(mask) = &flattened {
+            self.content_mask_stack.push(mask.clone());
+        }
         unit.element.prepaint(self, cx);
+        if flattened.is_some() {
+            self.content_mask_stack.pop();
+        }
         let holds_focus = self.next_frame.focus.is_some();
         self.next_frame.focus = focus_before.or(self.next_frame.focus);
         let relocation = surroundings.map(|_| self.end_relocation().0);
@@ -1697,6 +1720,7 @@ impl Window {
             holds_focus,
             accessed: FxHashSet::default(),
             relocated,
+            flattened,
         })
     }
 
@@ -1737,7 +1761,13 @@ impl Window {
             let relocation = mem::replace(&mut step.relocation, source.relocation.as_ref().expect("a root painted in its region has one").reopened());
             self.begin_relocation(relocation, true);
         }
+        if let Some(mask) = &step.flattened {
+            self.content_mask_stack.push(mask.clone());
+        }
         self.with_every_glyph_painted(|window| unit.element.paint(window, cx));
+        if step.flattened.is_some() {
+            self.content_mask_stack.pop();
+        }
         let region = region.map(|mut step| {
             let (relocation, operations) = self.end_relocation();
             step.relocation = relocation;

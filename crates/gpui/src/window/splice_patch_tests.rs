@@ -1057,6 +1057,35 @@ fn a_relayout_patch_that_grows_a_root_into_a_rounded_corner_paints_it_where_a_fr
     pair.assert_same(cx, "patched into the corner");
 }
 
+/// The frame that checks a patch builds every root as the build a replay is compared with, under the rectangle of a rounded content
+/// mask that the root is clear of the corners of, as a replay cuts it: so the frame under test must cut it so too, or the two
+/// differ in operations (an outline under a rectangle is four strips, under a rounded mask one quad) and the verifier reports
+/// what is no difference in pixels.
+#[gpui::test]
+fn the_verifier_finds_no_difference_in_a_patch_of_a_root_clear_of_a_rounded_corner(cx: &mut TestAppContext) {
+    let pair = Pair::in_rounded_panel(cx, 13);
+    cx.update_window(pair.patched.window, |_, window, _| window.set_retention_verifier(Some(Rc::new(|_| String::new())))).unwrap();
+    pair.patched.settle(cx);
+    for kids in [12, 11, 13] {
+        pair.set(|state| state.kids.set(kids));
+        pair.patched.tick(cx);
+        pair.patched.settle(cx);
+    }
+    // A patch that does not lay the root out again.
+    let patches = pair.patched.patches(cx);
+    pair.set(|state| state.kid_green.set(true));
+    pair.patched.tick(cx);
+    let after = pair.patched.patches(cx);
+    assert_eq!(after.patched_frames, patches.patched_frames + 1, "{:?}", pair.patched.state.seen.borrow());
+    assert_eq!(after.relayout_patches, patches.relayout_patches, "a patch of a color does not lay the root out again");
+    let (verified, mismatches) = cx
+        .update_window(pair.patched.window, |_, window, _| (window.retained_counters().verified, window.retention_mismatches().to_vec()))
+        .unwrap();
+    assert!(verified > 0);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+    assert!(pair.patched.patches(cx).relayout_patches >= 3, "{:?}", pair.patched.state.seen.borrow());
+}
+
 #[gpui::test]
 fn a_relayout_patch_of_a_relocatable_root_that_a_scroll_moved_patches_and_rewrites_it(cx: &mut TestAppContext) {
     let pair = Pair::scrolled(cx, 3, false);
