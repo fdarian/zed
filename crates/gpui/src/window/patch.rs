@@ -322,6 +322,9 @@ pub(crate) struct PatchUnit {
     relocatable: bool,
     /// The root may lay out again in a patch (`Retained::patchable_relayout`).
     relayout: bool,
+    /// What the owner vouches the root draws outside its extent (`Retained::cull_outset`), which
+    /// where it is under a rounded content mask is what keeps it clear of the corners.
+    cull_outset: Option<Edges<Pixels>>,
     /// The root has an `on_replay` listener: its owner republishes what its listeners report whenever
     /// a replay stands for them, so the recording of it may hold publications.
     pub(crate) publishes: bool,
@@ -797,6 +800,7 @@ impl Window {
         lift_z: Option<i32>,
         relocatable: bool,
         relayout: bool,
+        cull_outset: Option<Edges<Pixels>>,
         publishes: bool,
     ) -> Option<Rc<PatchUnit>> {
         let placement = if self.lifts_open == 0 {
@@ -810,6 +814,7 @@ impl Window {
             lift_z,
             relocatable,
             relayout,
+            cull_outset,
             publishes,
             prepaint: self.capture_surroundings()?,
             placement,
@@ -833,6 +838,7 @@ impl Window {
             lift_z: unit.lift_z,
             relocatable: unit.relocatable,
             relayout: unit.relayout,
+            cull_outset: unit.cull_outset,
             publishes: unit.publishes,
             prepaint: unit.prepaint.clone(),
             placement,
@@ -1615,8 +1621,14 @@ impl Window {
         // recorded, whether or not a scroll moved it since: what the patch paints there is put in the frame `delta`
         // away, as a replay puts the recording, and a root that lays out again has its recording rewritten from the
         // patch, region and all, so that the next replay or translate moves it from where it was recorded as before.
+        // A patch that laid the root out again may have grown it into a corner of a rounded content mask, which a
+        // region would paint it clear of: the root is then painted where it is, as a frame built whole builds it.
         let region = match (&source.relocation, &around.placement) {
-            (Some(relocation), Placement::InPlace) if self.content_mask() == relocation.ambient => Some(relocation.reopened()),
+            (Some(relocation), Placement::InPlace)
+                if self.content_mask() == relocation.ambient && self.clears_rounded_corners(built_root, bounds, around.cull_outset) =>
+            {
+                Some(relocation.reopened())
+            }
             _ => None,
         };
         if region.is_none() && !source.delta.is_zero() {
@@ -1630,7 +1642,7 @@ impl Window {
         });
         let prepaint_start = self.prepaint_index();
         let outside = mem::replace(&mut self.root_escape, (unit.element.escapes_to() == Some(Escape::ContainingBlock)).then_some(built_root));
-        let ambient = region.as_ref().map(|relocation| relocation.ambient);
+        let surroundings = region.as_ref().map(Relocation::surroundings);
         if let Some(relocation) = region {
             self.begin_relocation(relocation, false);
         }
@@ -1638,7 +1650,7 @@ impl Window {
         unit.element.prepaint(self, cx);
         let holds_focus = self.next_frame.focus.is_some();
         self.next_frame.focus = focus_before.or(self.next_frame.focus);
-        let relocation = ambient.map(|_| self.end_relocation().0);
+        let relocation = surroundings.map(|_| self.end_relocation().0);
         self.root_escape = outside;
         let hitbox_ids = self.patch.hitbox_ids.take().expect("a patch gives the hitboxes ids");
         self.publish_prepared(prepaint_start.layout_publications_index, cx);
@@ -1657,14 +1669,14 @@ impl Window {
         if moved && self.scrollers_block_a_move(prepaint_start.scrollers_index..prepaint_end.scrollers_index) {
             return Err(PatchDecline::Relocated);
         }
-        let relocated = relocation.zip(ambient).map(|(relocation, ambient)| {
+        let relocated = relocation.zip(surroundings).map(|(relocation, surroundings)| {
             let range = prepaint_start.hitboxes_index..prepaint_end.hitboxes_index;
             let hitboxes = self.next_frame.hitboxes[range.clone()].to_vec();
             // A root that lays out again has the hitboxes it has now where the frame has them, as the splice puts them
             // there; one that does not has its recorded ones moved by the places it is put in.
             let delta = if relaid { source.delta } else { Point::default() };
             if !(moved && hitboxes.iter().any(|hitbox| hitbox.unclipped)) {
-                self.place_hitboxes_from_region(range, &hitboxes, delta, &ambient);
+                self.place_hitboxes_from_region(range, &hitboxes, delta, &surroundings);
             }
             RelocatedStep { relocation, hitboxes, blockers: effects.blockers(&after_prepaint) }
         });
@@ -1816,7 +1828,7 @@ impl Window {
             // The hitboxes of a root put elsewhere are the recorded ones, `delta` from where they were recorded. At
             // delta zero they are the ones the prepaint relocated in place.
             for ((placed, _), recorded) in places.hitboxes.iter_mut().zip(&step.hitboxes) {
-                let mut moved = recorded.relocated(source.delta, &step.relocation.ambient);
+                let mut moved = recorded.relocated(source.delta, &step.relocation.surroundings());
                 moved.parent = placed.parent;
                 *placed = moved;
             }

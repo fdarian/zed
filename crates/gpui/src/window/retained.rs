@@ -1530,6 +1530,13 @@ impl Relocation {
         }
     }
 
+    /// The content mask that cuts what the subtree puts in the frame where it is put: the rectangle of
+    /// `ambient`, as a replay cuts by (see [`Window::clears_rounded_corners`], which is what lets the
+    /// radii go).
+    pub(crate) fn surroundings(&self) -> ContentMask<Pixels> {
+        ContentMask::from_bounds(self.ambient.bounds)
+    }
+
     /// A recording of the same subtree in the same region, with nothing noted yet: what a patch that
     /// paints the subtree again records it in.
     pub(crate) fn reopened(&self) -> Self {

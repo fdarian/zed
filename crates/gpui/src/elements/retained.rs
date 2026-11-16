@@ -1697,7 +1697,7 @@ impl Retained {
         // block outside it is not recorded, so it has nothing to patch from.
         let patch = (self.patchable && (self.overscan.is_none() || root_escape.is_none()))
             .then(|| {
-                window.capture_patch_unit(global_id, &self.id, self.lift_z, self.overscan.is_some(), self.relayout, publishes)
+                window.capture_patch_unit(global_id, &self.id, self.lift_z, self.overscan.is_some(), self.relayout, self.cull_outset, publishes)
             })
             .flatten();
         let (relocation, unmovable_at_start) = self.plan_relocation(global_id, key.bounds, window);
@@ -1707,7 +1707,7 @@ impl Retained {
         let surroundings = relocation
             .as_ref()
             .filter(|relocation| relocation.regional())
-            .map(|relocation| crate::ContentMask::from_bounds(relocation.ambient.bounds));
+            .map(Relocation::surroundings);
         let owner = self.state_owner(global_id, window);
         let mark = window.begin_prepaint_recording(self.on_replay.clone(), owner.clone());
         let relocating = relocation.is_some();
@@ -1826,6 +1826,11 @@ impl Recorded {
         ambient: &crate::ContentMask<Pixels>,
         clear: bool,
     ) -> Result<Point<Pixels>, Option<RelocationMiss>> {
+        // A recording made in a region was made clear of the corners of the rounded mask around, and the
+        // subtree is not now, whether it is put elsewhere or not.
+        if !clear && self.relocation.as_ref().is_some_and(|relocation| !relocation.culled) {
+            return Err(Some(RelocationMiss::Clip));
+        }
         if self.key == *key {
             return Ok(Point::default());
         }
@@ -1841,9 +1846,6 @@ impl Recorded {
             .expect("a recording that can be moved has its relocation");
         if relocation.culled {
             return Ok(delta);
-        }
-        if !clear {
-            return Err(Some(RelocationMiss::Clip));
         }
         relocation.info.fits(delta, ambient).map(|()| delta).map_err(Some)
     }
