@@ -20,7 +20,7 @@ mod glyph_advances;
 mod shape_store;
 mod snap;
 
-use self::glyph_advances::GlyphAdvances;
+pub(crate) use self::glyph_advances::GlyphAdvances;
 use self::shape_store::{SHAPE_STORE_BUDGET_BYTES, ShapeStore};
 pub use self::snap::Hyphen;
 pub(super) use self::snap::SnapMarks;
@@ -2155,9 +2155,10 @@ pub(crate) struct LineLayoutCache {
     /// Behind the frame caches: what was shaped, for as long as the budget allows. Locked after
     /// the frame caches, and never while taking them.
     shape_store: Mutex<ShapeStore>,
-    /// What the platform said about a glyph, for lines shaped later. A leaf lock: nothing is
-    /// locked while it is held, and the platform's write lock is never taken under it.
-    glyph_advances: Mutex<GlyphAdvances>,
+    /// What the platform said about a glyph, for lines shaped later, shared by every window. A
+    /// leaf lock: the platform's read lock may be taken while it is held (`glyph_advance`,
+    /// `glyph_for_char`), its write lock (`layout_line`) never, and nothing in gpui is locked.
+    glyph_advances: Arc<Mutex<GlyphAdvances>>,
     font_generation: Arc<AtomicU64>,
     /// The device pixels to a pixel of the window's display, as `f32` bits: what lines are
     /// shaped for, and part of the key of every layout.
@@ -2231,10 +2232,11 @@ impl LineLayoutIndex {
 
 impl LineLayoutCache {
     /// `font_generation` counts the times fonts were added to the text system, which empties the
-    /// shape store.
+    /// shape store and `glyph_advances`.
     pub fn new(
         platform_text_system: Arc<dyn PlatformTextSystem>,
         font_generation: Arc<AtomicU64>,
+        glyph_advances: Arc<Mutex<GlyphAdvances>>,
     ) -> Self {
         Self {
             previous_frame: Mutex::default(),
@@ -2242,7 +2244,7 @@ impl LineLayoutCache {
             platform_text_system,
             counters: AtomicTextCounters::default(),
             shape_store: Mutex::new(ShapeStore::new(SHAPE_STORE_BUDGET_BYTES)),
-            glyph_advances: Mutex::default(),
+            glyph_advances,
             font_generation,
             scale_factor: AtomicU32::new(1f32.to_bits()),
         }

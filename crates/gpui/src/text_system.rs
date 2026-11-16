@@ -70,6 +70,8 @@ pub struct TextSystem {
     /// Counts the times fonts were added, which can change what text in a family that did not
     /// resolve before looks like.
     font_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// What the platform said about glyphs, shared by the line layout caches of every window.
+    glyph_advances: Arc<Mutex<GlyphAdvances>>,
 }
 
 impl TextSystem {
@@ -83,6 +85,7 @@ impl TextSystem {
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
             font_generation: Arc::default(),
+            glyph_advances: Arc::default(),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -449,6 +452,7 @@ impl WindowTextSystem {
             line_layout_cache: LineLayoutCache::new(
                 text_system.platform_text_system.clone(),
                 text_system.font_generation.clone(),
+                text_system.glyph_advances.clone(),
             ),
             text_system,
         }

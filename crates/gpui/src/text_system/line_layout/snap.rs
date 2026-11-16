@@ -596,10 +596,13 @@ impl LineLayoutCache {
                     Some(alone) => alone,
                     None => {
                         // `alone_advance` can take the platform's write lock to lay the letter out.
+                        // Fonts may be added while the guard is down, so the value is kept only
+                        // under the generation it was computed for.
+                        let font_generation = advances.font_generation();
                         drop(advances);
                         let alone = self.alone_advance(run, before.id, letter, nominal, scale_factor);
                         advances = self.glyph_advances();
-                        advances.insert_alone(run.font_id, before.id, letter, run.font_size, scale_factor, alone);
+                        advances.insert_alone(font_generation, run.font_id, before.id, letter, run.font_size, scale_factor, alone);
                         alone
                     }
                 };
@@ -1114,6 +1117,7 @@ mod tests {
         let cache = LineLayoutCache::new(
             std::sync::Arc::new(crate::NoopTextSystem::new()),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Default::default(),
         );
         let x = glyph_positions(&layout);
         // The test system has no advances, which the pairs of kerned letters (boundary 1) are made from.
