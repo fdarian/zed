@@ -2,7 +2,7 @@
 //! differs between the scene shown and the one before, whatever way the frame was made, and is not all of the
 //! window when little changed.
 
-use super::DamageDraw;
+use super::{DamageDraw, FrameDamage};
 use super::hover_patch_tests::{Fixture, GroupKind};
 use crate::{AppContext as _, Bounds, DevicePixels, TestAppContext};
 
@@ -33,7 +33,7 @@ fn assert_covers_the_difference(draws: &[DamageDraw]) -> Option<Bounds<DevicePix
     for area in last.changed_areas(before) {
         assert!(last.covers(&area), "{area:?} changed and the damage is {:?}", last.damage);
     }
-    last.damage
+    last.damage.as_ref().map(FrameDamage::bounds)
 }
 
 /// How many device pixels a pixel of the fixture is.
@@ -160,5 +160,229 @@ fn a_frame_with_an_effect_group_is_drawn_whole_whatever_is_patched(cx: &mut Test
             present(&fixture, cx);
             assert_eq!(self::draws(&fixture, cx).last().unwrap().damage, None, "{kind:?}: the patch of {rows:?} back is drawn whole");
         }
+    }
+}
+
+/// The ledger on its own, in a window of 200 by 200 device pixels: what it hands a platform for areas and shifts.
+mod ledger {
+    use super::super::damage::DamageLedger;
+    use crate::{Bounds, DevicePixels, FrameDamage, ScaledPixels, Scene, Shift, point, size};
+
+    const WINDOW: i32 = 200;
+
+    fn area(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds { origin: point(ScaledPixels(x), ScaledPixels(y)), size: size(ScaledPixels(width), ScaledPixels(height)) }
+    }
+
+    fn device(x: i32, y: i32, width: i32, height: i32) -> Bounds<DevicePixels> {
+        Bounds { origin: point(DevicePixels(x), DevicePixels(y)), size: size(DevicePixels(width), DevicePixels(height)) }
+    }
+
+    fn by(x: i32, y: i32) -> crate::Point<DevicePixels> {
+        point(DevicePixels(x), DevicePixels(y))
+    }
+
+    /// A ledger of a frame that was shown and nothing since.
+    fn ledger(scene: &Scene) -> DamageLedger {
+        let mut ledger = DamageLedger::new();
+        ledger.frame_built(scene);
+        assert_eq!(take(&mut ledger, scene), None);
+        ledger
+    }
+
+    fn take(ledger: &mut DamageLedger, scene: &Scene) -> Option<FrameDamage> {
+        ledger.take(scene, size(DevicePixels(WINDOW), DevicePixels(WINDOW)))
+    }
+
+    fn rects(damage: &FrameDamage) -> Vec<Bounds<DevicePixels>> {
+        damage.rects.iter().copied().collect()
+    }
+
+    #[test]
+    fn an_area_is_one_rectangle_past_it_by_the_margin() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_area(area(10., 10., 20., 20.));
+        ledger.add_area(area(60., 60., 10., 10.));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, None);
+        assert_eq!(rects(&damage), [device(8, 8, 64, 64)], "areas with no shift are their bounds, as before");
+        assert_eq!(take(&mut ledger, &scene).unwrap().rects.len(), 0, "taking leaves nothing");
+    }
+
+    #[test]
+    fn a_shift_draws_the_strip_that_scrolled_in_and_keeps_the_rest() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 30));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, Some(Shift { region: device(10, 20, 100, 100), by: by(0, 30) }));
+        assert_eq!(damage.shift.unwrap().kept(), device(10, 50, 100, 70));
+        assert_eq!(rects(&damage), [device(8, 18, 104, 34)]);
+
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, -30));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift.unwrap().kept(), device(10, 20, 100, 70));
+        assert_eq!(rects(&damage), [device(8, 88, 104, 34)]);
+    }
+
+    #[test]
+    fn a_shift_of_nothing_is_no_shift() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 0));
+        assert_eq!(take(&mut ledger, &scene), Some(FrameDamage::rect(Bounds::default())));
+    }
+
+    #[test]
+    fn what_was_wrong_before_a_shift_is_wrong_where_it_moves_to() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_area(area(150., 150., 10., 10.));
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 30));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert!(damage.shift.is_some());
+        let rects = rects(&damage);
+        assert_eq!(rects.len(), 3, "{rects:?}");
+        assert!(rects.contains(&device(148, 148, 14, 14)), "where it was: {rects:?}");
+        assert!(rects.contains(&device(148, 178, 14, 14)), "where it moves to: {rects:?}");
+        assert!(rects.contains(&device(8, 18, 104, 34)), "the strip: {rects:?}");
+    }
+
+    #[test]
+    fn an_area_after_a_shift_is_drawn_in_addition_and_overlapping_ones_are_one() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 30));
+        ledger.add_area(area(150., 150., 10., 10.));
+        // Reaches into the strip: one rectangle with it.
+        ledger.add_area(area(20., 40., 20., 20.));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert!(damage.shift.is_some());
+        let rects = rects(&damage);
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        assert!(rects.contains(&device(148, 148, 14, 14)), "{rects:?}");
+        assert!(rects.contains(&device(8, 18, 104, 44)), "{rects:?}");
+    }
+
+    #[test]
+    fn two_shifts_of_one_region_are_one_shift_by_the_sum() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        let clip = area(10., 20., 100., 100.);
+        ledger.add_shift(clip, by(0, 30));
+        ledger.add_area(area(150., 150., 10., 10.));
+        ledger.add_shift(clip, by(0, 10));
+        ledger.add_area(area(150., 20., 10., 10.));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, Some(Shift { region: device(10, 20, 100, 100), by: by(0, 40) }));
+        let rects = rects(&damage);
+        // The strip of the sum, the area of the first shift moved by the second, and the area of the second.
+        assert!(rects.contains(&device(8, 18, 104, 44)), "{rects:?}");
+        assert!(rects.contains(&device(148, 158, 14, 14)), "{rects:?}");
+        assert!(rects.contains(&device(148, 18, 14, 14)), "{rects:?}");
+        assert_eq!(rects.len(), 3, "the area of the first shift is drawn where it moved to and not where it was: {rects:?}");
+    }
+
+    #[test]
+    fn two_shifts_that_cancel_draw_only_what_was_added() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        let clip = area(10., 20., 100., 100.);
+        ledger.add_shift(clip, by(0, 30));
+        ledger.add_shift(clip, by(0, -30));
+        ledger.add_area(area(150., 150., 10., 10.));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, None);
+        assert_eq!(rects(&damage), [device(148, 148, 14, 14)]);
+    }
+
+    #[test]
+    fn a_shift_of_another_region_gives_up_the_shift() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 30));
+        ledger.add_shift(area(20., 20., 100., 100.), by(0, 30));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, None);
+        assert_eq!(rects(&damage), [device(8, 18, 114, 104)], "the bounds of both regions");
+    }
+
+    #[test]
+    fn a_shift_that_leaves_nothing_to_copy_is_the_area_of_its_clip() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 100));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, None);
+        assert_eq!(rects(&damage), [device(8, 18, 104, 104)]);
+
+        // And a clip with no whole pixel in it.
+        ledger.add_shift(area(10.2, 20.2, 0.5, 100.), by(0, 3));
+        assert_eq!(take(&mut ledger, &scene).unwrap().shift, None);
+    }
+
+    #[test]
+    fn a_shift_that_draws_most_of_its_region_or_too_many_rectangles_gives_up_the_shift() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        // The strip is 70 of the 100 rows and a margin more.
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 70));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, None);
+        assert_eq!(rects(&damage), [device(8, 18, 104, 104)]);
+
+        // Five areas apart from each other and the strip.
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 10));
+        for at in 0..5 {
+            ledger.add_area(area(120. + 12. * at as f32, 150., 4., 4.));
+        }
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, None);
+        assert_eq!(damage.rects.len(), 1);
+        assert!(IntBounds::holds(damage.rects[0], device(8, 18, 104, 104)));
+        assert!(IntBounds::holds(damage.rects[0], device(166, 148, 8, 8)));
+    }
+
+    struct IntBounds;
+
+    impl IntBounds {
+        fn holds(outer: Bounds<DevicePixels>, inner: Bounds<DevicePixels>) -> bool {
+            outer.origin.x <= inner.origin.x
+                && outer.origin.y <= inner.origin.y
+                && outer.origin.x + outer.size.width >= inner.origin.x + inner.size.width
+                && outer.origin.y + outer.size.height >= inner.origin.y + inner.size.height
+        }
+    }
+
+    #[test]
+    fn a_clip_that_is_not_whole_pixels_is_drawn_whole_as_the_rectangles_of_its_ring_and_strip_join() {
+        // The pixels the clip covers in part are drawn, which is a ring around the region, and its sides reach
+        // (past the margin) into the strip that scrolled in: all of them overlap, and one rectangle is the whole region.
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_shift(area(10.5, 20.5, 100., 100.), by(0, 30));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift, None);
+        assert_eq!(rects(&damage), [device(8, 18, 105, 105)]);
+    }
+
+    #[test]
+    fn a_shift_inside_a_window_that_is_smaller_than_its_clip_stays_inside_the_window() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.add_shift(area(100., 100., 300., 300.), by(0, -30));
+        let damage = take(&mut ledger, &scene).unwrap();
+        assert_eq!(damage.shift.unwrap().region, device(100, 100, 100, 100));
+        assert_eq!(rects(&damage), [device(98, 168, 102, 32)]);
+    }
+
+    #[test]
+    fn a_frame_that_is_not_known_stays_unknown_whatever_is_shifted() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        ledger.everything();
+        ledger.add_shift(area(10., 20., 100., 100.), by(0, 30));
+        assert_eq!(take(&mut ledger, &scene), None);
     }
 }

@@ -91,7 +91,8 @@ mod splice_patch_tests;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
 #[cfg(any(test, feature = "test-support"))]
-pub use damage::DamageDraw;
+pub use damage::{DamageDraw, DamageSteps};
+pub use damage::{FrameDamage, Shift};
 pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub use scroll_patch::{

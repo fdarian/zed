@@ -624,7 +624,7 @@ impl PlatformWindow for TestWindow {
         self.draw_scene(scene);
     }
 
-    fn draw_with_damage(&self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
+    fn draw_with_damage(&self, scene: &Scene, damage: Option<crate::FrameDamage>) {
         let mut state = self.0.lock();
         state.plain_draws += 1;
         state.damage_draws.push(crate::window::DamageDraw::record(scene, damage));

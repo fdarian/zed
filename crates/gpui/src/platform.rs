@@ -44,7 +44,7 @@ use crate::{
     LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
     Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
-    ComposedScene, PlatformSurfaceAttachment,
+    ComposedScene, FrameDamage, PlatformSurfaceAttachment,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
@@ -894,9 +894,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
     /// Like [`PlatformWindow::draw`] for a window that lets the platform draw only what changed
     /// (every window does, see [`crate::window::damage`]): `damage` is the part of the window, in
-    /// device pixels, in which `scene` can differ from the scene that was drawn before, and `None` is
-    /// all of it. A platform that cannot draw part of a window draws all of it.
-    fn draw_with_damage(&self, scene: &Scene, damage: Option<Bounds<DevicePixels>>) {
+    /// device pixels, in which `scene` can differ from the scene that was drawn before (rectangles
+    /// to draw, and pixels of the picture before to move into place first if it has a shift), and
+    /// `None` is all of it. A platform that cannot draw part of a window draws all of it.
+    fn draw_with_damage(&self, scene: &Scene, damage: Option<FrameDamage>) {
         let _ = damage;
         self.draw(scene);
     }
