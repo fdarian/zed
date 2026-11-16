@@ -217,6 +217,21 @@ impl Region {
     }
 }
 
+/// [`Region`] as the areas a scroll translate tests operations against.
+pub(crate) struct ShiftRegion {
+    /// The pixels the clip covers whole: where a copy moves pixels.
+    pub(crate) inner: Bounds<ScaledPixels>,
+    /// The pixels the clip covers in part too.
+    pub(crate) outer: Bounds<ScaledPixels>,
+}
+
+impl ShiftRegion {
+    /// None if no whole pixel is inside `clip`.
+    pub(crate) fn of(clip: Bounds<ScaledPixels>) -> Option<Self> {
+        Region::of(clip).map(|region| Self { inner: region.inner.to_scaled(), outer: region.outer.to_scaled() })
+    }
+}
+
 /// A shift of the picture that no presentation has shown yet.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PendingShift {
@@ -444,6 +459,16 @@ impl DamageLedger {
         }
     }
 
+    /// Extents that are put in the place of others, as [`Self::add_operations`] does for their operations.
+    pub(crate) fn add_extents(&mut self, extents: impl IntoIterator<Item = Extent>) {
+        for extent in extents {
+            if self.damage == Damage::Full {
+                return;
+            }
+            self.add_extent(extent, false);
+        }
+    }
+
     /// The damage the platform is to draw, in device pixels inside a viewport of `viewport` (`None`
     /// is all of it), and the damage that is left, which is none.
     pub(crate) fn take(&mut self, scene: &Scene, viewport: Size<DevicePixels>) -> Option<FrameDamage> {
@@ -492,7 +517,9 @@ impl crate::Window {
             DevicePixels((self.viewport_size.width.0 * self.scale_factor).ceil() as i32),
             DevicePixels((self.viewport_size.height.0 * self.scale_factor).ceil() as i32),
         );
-        self.damage.take(&self.rendered_frame.scene, viewport)
+        let damage = self.damage.take(&self.rendered_frame.scene, viewport);
+        self.scroll_patch.note_presented(damage.as_ref());
+        damage
     }
 }
 

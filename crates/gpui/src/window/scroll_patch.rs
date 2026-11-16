@@ -63,9 +63,12 @@ use super::patch::Surroundings;
 use super::patch_splice::{HITBOXES, OPERATIONS, RowPart, Splice};
 use super::retained::Effects;
 use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss, ScrollSource};
-use crate::scene::{PaintOperation, ReplayClip, TranslatedOperations};
+use crate::scene::{Extent, PaintOperation, ReplayClip, TranslatedOperations};
 use crate::scroll_routing::ScrollerId;
 use crate::ListState;
+use shift::ShiftPlan;
+
+mod shift;
 
 /// Why a frame drawn after a list scroll is not a pure translate of the frame shown, the first of
 /// them, in the order the checks run.
@@ -333,6 +336,9 @@ pub struct ScrollPatchCounters {
     pub rows_rebuilt: u64,
     /// The rows those frames took out of the frame because they left.
     pub rows_removed: u64,
+    /// The frames presented with a shift: a platform copied the pixels of the list that stayed and drew the rest
+    /// (see [`crate::FrameDamage`]).
+    pub shifted: u64,
     apply_declines: [u64; ScrollApplyDecline::ALL.len()],
     reasons: [u64; ScrollPatchReason::ALL.len()],
     held: [u64; ScrollPatchReason::ALL.len()],
@@ -712,6 +718,8 @@ pub(crate) type ScrollPatchRegistries = Rc<dyn Fn(&Window) -> String>;
 #[derive(Default)]
 pub(crate) struct ScrollPatchWindow {
     enabled: bool,
+    /// A translate is not reported to the damage as a shift of the list's pixels (see [`shift`]).
+    shift_off: bool,
     settled: Option<ScrollPatchSettled>,
     registries: Option<ScrollPatchRegistries>,
     /// A list scrolled since the last draw, and the view it notified.
@@ -727,6 +735,10 @@ impl ScrollPatchWindow {
     pub(crate) fn note_composed(&mut self, patch_drawn: bool) {
         self.counters.composed += u64::from(patch_drawn);
     }
+
+    pub(crate) fn note_presented(&mut self, damage: Option<&crate::FrameDamage>) {
+        self.counters.shifted += u64::from(damage.is_some_and(|damage| damage.shift.is_some()));
+    }
 }
 
 impl Window {
@@ -736,6 +748,12 @@ impl Window {
         self.scroll_patch.enabled = enabled;
         self.scroll_patch.scrolled = None;
         self.scroll_patch.predicted = None;
+    }
+
+    /// Whether a scroll translate says to the damage that the list's pixels moved, so that a platform copies them,
+    /// or that the rows' old and new places changed, the area a frame without the shift draws.
+    pub fn set_scroll_shift(&mut self, enabled: bool) {
+        self.scroll_patch.shift_off = !enabled;
     }
 
     /// Lets the owner of the window say what only it knows about a frame drawn after a list
@@ -1864,13 +1882,19 @@ impl Window {
         let scale_factor = self.scale_factor;
         let mut roots = Vec::with_capacity(moves.len());
         self.damage.begin(&self.rendered_frame.scene);
+        // What the rows paint before and after, which is the damage unless the translate is a shift of the list's
+        // pixels: then it is told to the ledger as that, with the rest of the scene that is not a copy.
+        let shift = ShiftPlan::new(self, &moves, prediction);
+        let mut moved_extents = Vec::new();
+        let mut moved_ranges = Vec::with_capacity(moves.len());
         for movement in moves {
             let frame = &mut self.rendered_frame;
             let run = &mut frame.scroll.runs[movement.run];
-            self.damage.add_operations(&frame.scene.paint_operations[run.ops.clone()]);
+            moved_extents.extend(frame.scene.paint_operations[run.ops.clone()].iter().map(PaintOperation::extent));
             TranslatedOperations::new(&movement.source.operations, movement.total.scale(scale_factor), &movement.clip)
                 .overwrite(&mut frame.scene.paint_operations[run.ops.clone()]);
-            self.damage.add_operations(&frame.scene.paint_operations[run.ops.clone()]);
+            moved_extents.extend(frame.scene.paint_operations[run.ops.clone()].iter().map(PaintOperation::extent));
+            moved_ranges.push(run.ops.clone());
             let recorded = movement.source.hitboxes.hitboxes.iter();
             for (slot, recorded) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(recorded) {
                 let mut moved = recorded.relocated(movement.total, &run.ambient);
@@ -1879,6 +1903,13 @@ impl Window {
             }
             run.delta = movement.total;
             roots.push((run.id.clone(), movement.total, run.hook.clone()));
+        }
+        let shifted = shift
+            .filter(|shift| shift.holds(&moved_extents))
+            .and_then(|shift| Some((shift.residual(&self.rendered_frame.scene, moved_ranges)?, shift)));
+        match shifted {
+            Some((residual, shift)) => shift.report(&mut self.damage, residual),
+            None => self.damage.add_extents(moved_extents),
         }
 
         let rows_removed = membership.removed as u64;
