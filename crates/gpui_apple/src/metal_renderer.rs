@@ -9,8 +9,8 @@ use cocoa::{
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, FrameDamage, IsZero,
     MAX_GROUP_EXTENT, MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point,
-    PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene, Size,
-    TransformationMatrix, filter_margin, point, size,
+    MonochromeSprite, PolychromeSprite, PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene,
+    Shadow, Size, TransformationMatrix, Underline, filter_margin, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -781,20 +781,22 @@ impl MetalRenderer {
         Ok(())
     }
 
-    /// Runs `draw` once for each scissor of a damaged frame, with that scissor set on `encoder`, or
-    /// once as it is for a frame drawn whole and for what is drawn into an effect group.
+    /// Runs `draw` once for each scissor of a damaged frame, with that scissor set on `encoder` and
+    /// given to `draw`, or once with none as it is for a frame drawn whole and for what is drawn into
+    /// an effect group.
     fn per_scissor(
         &self,
         encoder: &metal::RenderCommandEncoderRef,
-        mut draw: impl FnMut(&metal::RenderCommandEncoderRef) -> Result<()>,
+        mut draw: impl FnMut(&metal::RenderCommandEncoderRef, Option<[u64; 4]>) -> Result<()>,
     ) -> Result<()> {
         let scissors = self.partial.scissors.borrow();
         if scissors.is_empty() || self.group_depth.get() != 0 {
-            return draw(encoder);
+            return draw(encoder, None);
         }
-        for [x, y, width, height] in scissors.iter() {
-            encoder.set_scissor_rect(metal::MTLScissorRect { x: *x, y: *y, width: *width, height: *height });
-            draw(encoder)?;
+        for scissor in scissors.iter() {
+            let [x, y, width, height] = *scissor;
+            encoder.set_scissor_rect(metal::MTLScissorRect { x, y, width, height });
+            draw(encoder, Some(*scissor))?;
         }
         Ok(())
     }
@@ -844,7 +846,7 @@ impl MetalRenderer {
                 .collect();
             let binding = writer.write(&blacks)?;
             let mut at = 0;
-            self.per_scissor(encoder, |encoder| {
+            self.per_scissor(encoder, |encoder, _| {
                 self.draw_quad_instances(self.clear_quad_pipeline(), &binding, at..at + 1, viewport_size, encoder);
                 at += 1;
                 Ok(())
@@ -1128,12 +1130,24 @@ impl MetalRenderer {
 
         for batch in scene.batches_in(orders) {
             match batch {
-                PrimitiveBatch::Shadows(range) => self.per_scissor(command_encoder, |encoder| {
-                    self.draw_shadows(range.clone(), &instance_bindings, viewport_size, encoder);
+                PrimitiveBatch::Shadows(range) => self.per_scissor(command_encoder, |encoder, scissor| {
+                    let Some(shadows) = culled(&scene.shadows[range.clone()], scissor, Shadow::drawn_bounds, |shadow| shadow.content_mask.bounds) else {
+                        self.draw_shadows(range.clone(), &instance_bindings, viewport_size, encoder);
+                        return Ok(());
+                    };
+                    let mut bindings = instance_bindings.clone();
+                    bindings.shadows = writer.write(&shadows)?;
+                    self.draw_shadows(0..shadows.len(), &bindings, viewport_size, encoder);
                     Ok(())
                 })?,
-                PrimitiveBatch::Quads(range) => self.per_scissor(command_encoder, |encoder| {
-                    self.draw_quads(&scene.quads, range.clone(), &instance_bindings, viewport_size, encoder);
+                PrimitiveBatch::Quads(range) => self.per_scissor(command_encoder, |encoder, scissor| {
+                    let Some(quads) = culled(&scene.quads[range.clone()], scissor, Quad::window_bounds, |quad| quad.content_mask.bounds) else {
+                        self.draw_quads(&scene.quads, range.clone(), &instance_bindings, viewport_size, encoder);
+                        return Ok(());
+                    };
+                    let mut bindings = instance_bindings.clone();
+                    bindings.quads = writer.write(&quads)?;
+                    self.draw_quads(&quads, 0..quads.len(), &bindings, viewport_size, encoder);
                     Ok(())
                 })?,
                 PrimitiveBatch::Paths(range) => {
@@ -1160,7 +1174,7 @@ impl MetalRenderer {
                     )?;
 
                     if did_draw {
-                        if let Err(error) = self.per_scissor(command_encoder, |encoder| {
+                        if let Err(error) = self.per_scissor(command_encoder, |encoder, _| {
                             self.draw_paths_from_intermediate(
                                 paths,
                                 intermediate,
@@ -1174,19 +1188,37 @@ impl MetalRenderer {
                         }
                     }
                 }
-                PrimitiveBatch::Underlines(range) => self.per_scissor(command_encoder, |encoder| {
-                    self.draw_underlines(range.clone(), &instance_bindings, viewport_size, encoder);
+                PrimitiveBatch::Underlines(range) => self.per_scissor(command_encoder, |encoder, scissor| {
+                    let Some(underlines) = culled(&scene.underlines[range.clone()], scissor, Underline::window_bounds, |underline| underline.content_mask.bounds) else {
+                        self.draw_underlines(range.clone(), &instance_bindings, viewport_size, encoder);
+                        return Ok(());
+                    };
+                    let mut bindings = instance_bindings.clone();
+                    bindings.underlines = writer.write(&underlines)?;
+                    self.draw_underlines(0..underlines.len(), &bindings, viewport_size, encoder);
                     Ok(())
                 })?,
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                    self.per_scissor(command_encoder, |encoder| {
-                        self.draw_monochrome_sprites(texture_id, range.clone(), &instance_bindings, viewport_size, encoder);
+                    self.per_scissor(command_encoder, |encoder, scissor| {
+                        let Some(sprites) = culled(&scene.monochrome_sprites[range.clone()], scissor, MonochromeSprite::window_bounds, |sprite| sprite.content_mask.bounds) else {
+                            self.draw_monochrome_sprites(texture_id, range.clone(), &instance_bindings, viewport_size, encoder);
+                            return Ok(());
+                        };
+                        let mut bindings = instance_bindings.clone();
+                        bindings.monochrome_sprites = writer.write(&sprites)?;
+                        self.draw_monochrome_sprites(texture_id, 0..sprites.len(), &bindings, viewport_size, encoder);
                         Ok(())
                     })?
                 }
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                    self.per_scissor(command_encoder, |encoder| {
-                        self.draw_polychrome_sprites(texture_id, range.clone(), &instance_bindings, viewport_size, encoder);
+                    self.per_scissor(command_encoder, |encoder, scissor| {
+                        let Some(sprites) = culled(&scene.polychrome_sprites[range.clone()], scissor, PolychromeSprite::window_bounds, |sprite| sprite.content_mask.bounds) else {
+                            self.draw_polychrome_sprites(texture_id, range.clone(), &instance_bindings, viewport_size, encoder);
+                            return Ok(());
+                        };
+                        let mut bindings = instance_bindings.clone();
+                        bindings.polychrome_sprites = writer.write(&sprites)?;
+                        self.draw_polychrome_sprites(texture_id, 0..sprites.len(), &bindings, viewport_size, encoder);
                         Ok(())
                     })?
                 }
@@ -3540,12 +3572,37 @@ fn build_path_rasterization_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+/// The primitives of `items` that draw a pixel inside `scissor` (their drawn bounds under the content mask meet it), in
+/// order, or `None` when there is no scissor and every one is drawn. A path batch is not culled.
+fn culled<T: Clone>(
+    items: &[T],
+    scissor: Option<[u64; 4]>,
+    drawn: impl Fn(&T) -> Bounds<ScaledPixels>,
+    content_mask: impl Fn(&T) -> Bounds<ScaledPixels>,
+) -> Option<Vec<T>> {
+    let [x, y, width, height] = scissor?;
+    let (left, top) = (x as f32, y as f32);
+    let (right, bottom) = (left + width as f32, top + height as f32);
+    Some(
+        items
+            .iter()
+            .filter(|item| {
+                let (drawn, mask) = (drawn(item), content_mask(item));
+                drawn.left().0.max(mask.left().0).max(left) < drawn.right().0.min(mask.right().0).min(right)
+                    && drawn.top().0.max(mask.top().0).max(top) < drawn.bottom().0.min(mask.bottom().0).min(bottom)
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
 #[derive(Clone)]
 struct InstanceBinding {
     buffer: metal::Buffer,
     offset: usize,
 }
 
+#[derive(Clone)]
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
@@ -4028,6 +4085,52 @@ mod tests {
                 .expect("the frame is drawn whole");
             assert!(drawn == whole, "frame {index} drawn in part ({damage:?}) is not the frame drawn whole");
         }
+    }
+
+    /// Sprites, a shadow and a rotated sprite around the damage, inside it, across its edge and far from it: what is
+    /// drawn per scissor is the primitives that meet it, and the frame is the frame drawn whole.
+    #[test]
+    fn primitives_that_meet_a_damage_are_drawn_in_part_and_the_frame_is_the_frame_drawn_whole() {
+        let window = size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32));
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let atlas = partial.sprite_atlas().clone();
+        let tile = gpui::PlatformAtlas::get_or_insert_with(
+            atlas.as_ref(),
+            &gpui::AtlasKey::Svg(gpui::RenderSvgParams {
+                path: "cull-ramp".into(),
+                size: size(DevicePixels(8), DevicePixels(8)),
+            }),
+            &mut || {
+                let bytes: Vec<u8> = (0..64u32).map(|texel| (texel * 4 + 3) as u8).collect();
+                Ok(Some((size(DevicePixels(8), DevicePixels(8)), bytes.into())))
+            },
+        )
+        .expect("the atlas takes the tile")
+        .expect("the tile exists");
+        let scene = |red_at: f32| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(translucent(full_bounds(), gpui::hsla(0.6, 0.5, 0.4, 1.), 0.));
+            let blurred = gpui::Shadow {
+                bounds: area(6., 6., 8., 8.),
+                ..shadow(3., CornerRadii::default())
+            };
+            scene.insert_primitive(blurred);
+            scene.insert_primitive(translucent(area(red_at, 14., 10., 10.), gpui::hsla(0., 1., 0.5, 0.7), 3.));
+            for at in [(2., 2.), (30., 3.), (30., 30.), (26., 26.), (14., 14.), (2., 30.)] {
+                scene.insert_primitive(glyph_sprite(tile.clone(), at, gpui::TransformationMatrix::unit()));
+            }
+            scene.insert_primitive(glyph_sprite(tile.clone(), (16., 16.), rotation_around(45., (20., 20.))));
+            scene.insert_primitive(translucent(area(20., 20., 14., 14.), gpui::hsla(0.8, 1., 0.5, 0.5), 0.));
+            scene.finish();
+            scene
+        };
+        partial.render_scene_partial_to_image(&scene(4.), None, window).expect("the first frame is drawn");
+        let next = scene(14.);
+        let drawn = partial
+            .render_scene_partial_to_image(&next, damage(2, 12, 26, 14), window)
+            .expect("the frame is drawn in part");
+        let whole = partial.render_scene_partial_to_image(&next, None, window).expect("the frame is drawn whole");
+        assert!(drawn == whole, "the frame drawn in part is not the frame drawn whole");
     }
 
     #[test]
