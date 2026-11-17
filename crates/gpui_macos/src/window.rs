@@ -92,7 +92,9 @@ const REFUSES_KEY_IVAR: &str = "refusesKey";
 
 /// How many display-link steps in a row may find nothing to do before the link stops. Every step
 /// is a wake of the embedder, so a window that asked for one frame (a caret toggle) costs this
-/// many wakes after the frame that was asked for; an animation asks again in every step.
+/// many wakes after the frame that was asked for; an animation asks again in every step. A step
+/// that presents only because high-rate input is being sustained (`Window` does that for a second
+/// after the last such input) asks too, so a scroll keeps the link for as long as that lasts.
 const IDLE_STEPS_BEFORE_STOP: u32 = 2;
 
 static mut WINDOW_CLASS: *const Class = ptr::null();

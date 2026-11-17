@@ -2721,9 +2721,10 @@ impl Window {
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
                 // to prevent display underclocking during active input.
+                let high_rate_input = input_rate_tracker.borrow_mut().is_high_rate();
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || high_rate_input;
 
                 if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
@@ -2751,6 +2752,13 @@ impl Window {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
+                    // Presenting can block for most of a frame, and the input that is
+                    // sustaining it is pumped only after this step. Count the step as a
+                    // requested frame, or a platform that stops its frame source after
+                    // idle steps stops it here and restarts it late on the next event.
+                    if high_rate_input {
+                        invalidator.wake_platform();
+                    }
                 }
 
                 handle
@@ -12494,6 +12502,41 @@ mod tests {
         assert!(
             test_window.frame_wake_count() > baseline,
             "scheduling a next-frame callback in an idle window must wake the frame source"
+        );
+    }
+
+    /// A step that presents only because high-rate input is being sustained
+    /// must wake the frame source, or a platform that stops it after idle steps
+    /// stops it in the middle of a scroll. Once the sustain lapses the step is
+    /// idle again.
+    #[gpui::test]
+    fn test_sustained_high_rate_input_presents_and_wakes_frame_source(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        let tracker = window
+            .update(cx, |_, window, _| window.input_rate_tracker.clone())
+            .unwrap();
+        for _ in 0..8 {
+            tracker.borrow_mut().record_input();
+        }
+        assert!(tracker.borrow().is_high_rate());
+
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            test_window.frame_wake_count() > baseline,
+            "a present-only step sustained by high-rate input must wake the frame source"
+        );
+
+        tracker.borrow_mut().sustain_until = scheduler::Instant::now();
+        let baseline = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(
+            test_window.frame_wake_count(),
+            baseline,
+            "a step is idle again once the high-rate sustain lapses"
         );
     }
 
