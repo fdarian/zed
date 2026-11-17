@@ -71,7 +71,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -3368,7 +3368,16 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     }
 }
 
+/// Count of `step` calls, which run on the main thread only; `pump_app_nonblocking` compares it
+/// across a call to learn whether a frame step ran.
+static LINK_STEPS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn link_steps() -> usize {
+    LINK_STEPS.load(Ordering::Relaxed)
+}
+
 extern "C" fn step(view: *mut c_void) {
+    LINK_STEPS.fetch_add(1, Ordering::Relaxed);
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();

@@ -307,7 +307,7 @@ impl MacPlatform {
 
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
-            pump_app_nonblocking();
+            let _ = pump_app_nonblocking();
             pool.drain();
         }
 
@@ -632,14 +632,24 @@ fn assert_main_thread(operation: &str) {
     );
 }
 
+/// Handles what is ready now without blocking and returns whether a display-link frame step ran
+/// during the call. A caller that steps the display links itself after the pump must skip that
+/// step when this returns true: the pump's step was the frame, and a second would draw twice.
+///
+/// At most one step runs per call. Once a frame outlasts a vsync, each step blocks in
+/// `nextDrawable` until the next vsync, the link has queued its next tick by then, and a loop
+/// that kept handling sources would never return: no NSEvent would be dequeued and JS would not
+/// run. After a step the call returns and posts a block so the embedder pumps again; the next call
+/// drains the NSEvents first.
 #[doc(hidden)]
-pub unsafe fn pump_app_nonblocking() {
+pub unsafe fn pump_app_nonblocking() -> bool {
     unsafe {
         // NSApplication::run sleeps until the next display-link wake, which
         // blocks embedded hosts. Drain only work that is ready now.
         let app: id = msg_send![APP_CLASS, sharedApplication];
         let distant_past: id = msg_send![class!(NSDate), distantPast];
         let mode = kCFRunLoopDefaultMode as id;
+        let steps_at_start = crate::link_steps();
 
         for _ in 0..256 {
             let event: id = msg_send![app,
@@ -657,6 +667,15 @@ pub unsafe fn pump_app_nonblocking() {
             // that boundary, which wakes the embedder once more. Committed here, it leaves the
             // update cycle nothing to commit, and no timer is armed.
             let _: () = msg_send![class!(CATransaction), flush];
+            if crate::link_steps() != steps_at_start {
+                break;
+            }
+        }
+        // `nextEventMatchingMask:` runs the run loop itself, so a step can run in it. The call is
+        // then over: the sources below would run the next step.
+        if crate::link_steps() != steps_at_start {
+            DispatchQueue::main().exec_async(|| {});
+            return true;
         }
         // No `updateWindows` here: `sendEvent:` sets `windowsNeedUpdate`, which installs a run loop
         // observer that updates the windows once, in the next pass of the loop (the polls below,
@@ -666,11 +685,15 @@ pub unsafe fn pump_app_nonblocking() {
         // sources that are still signalled would wait for a message that is gone.
         for _ in 0..256 {
             if CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1) != kCFRunLoopRunHandledSource {
-                return;
+                return crate::link_steps() != steps_at_start;
+            }
+            if crate::link_steps() != steps_at_start {
+                break;
             }
         }
-        // Still finding sources to handle: have the embedder pump again.
+        // Still finding sources to handle, or a frame step ran: have the embedder pump again.
         DispatchQueue::main().exec_async(|| {});
+        crate::link_steps() != steps_at_start
     }
 }
 

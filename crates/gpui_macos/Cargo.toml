@@ -41,6 +41,11 @@ name = "pump_window_updates"
 path = "tests/pump_window_updates.rs"
 harness = false
 
+[[test]]
+name = "pump_one_step"
+path = "tests/pump_one_step.rs"
+harness = false
+
 [features]
 default = ["gpui/default"]
 test-support = ["gpui/test-support", "gpui_apple/test-support"]
