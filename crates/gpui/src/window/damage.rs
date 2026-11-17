@@ -303,8 +303,19 @@ impl Area {
                 self.shift = Some(PendingShift { region, by });
             }
             (Some(pending), Some(region)) if pending.region == region => {
-                for area in self.residual.iter_mut() {
-                    *area = Self::translated(area, by);
+                // Only what is inside the region moves with the copy: an area outside it, or reaching out
+                // of it, is wrong where it is as well.
+                let inner = region.inner.to_scaled();
+                let held = std::mem::take(&mut self.residual);
+                for area in held {
+                    let moves = area.left() >= inner.left()
+                        && area.top() >= inner.top()
+                        && area.right() <= inner.right()
+                        && area.bottom() <= inner.bottom();
+                    if !moves {
+                        self.add_apart(area);
+                    }
+                    self.add_apart(Self::translated(&area, by));
                 }
                 self.shift = Some(PendingShift { region, by: (pending.by.0 + by.0, pending.by.1 + by.1) });
             }
@@ -423,7 +434,8 @@ impl DamageLedger {
 
     /// The pixels inside `clip` (a rectangle in device pixels) are the pixels of the picture before
     /// moved by `by`, except where areas are added to the damage after this. Areas added before it
-    /// are in the picture before and move with it. A shift of a region that is not the one a shift
+    /// are in the picture before: those inside `clip` move with it, and any other is wrong where it
+    /// is as well as where it moves to. A shift of a region that is not the one a shift
     /// before it moved, or of one that holds no whole pixel, is the area of its clip.
     pub(crate) fn add_shift(&mut self, clip: Bounds<ScaledPixels>, by: Point<DevicePixels>) {
         if let Damage::Area(damage) = &mut self.damage {

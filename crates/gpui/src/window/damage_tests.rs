@@ -282,11 +282,30 @@ mod ledger {
         let damage = take(&mut ledger, &scene).unwrap();
         assert_eq!(damage.shift, Some(Shift { region: device(10, 20, 100, 100), by: by(0, 40) }));
         let rects = rects(&damage);
-        // The strip of the sum, the area of the first shift moved by the second, and the area of the second.
+        // The strip of the sum, the area of the first shift where it was and moved by the second (it is
+        // outside the region, where nothing is copied), and the area of the second.
         assert!(rects.contains(&device(10, 20, 100, 40)), "{rects:?}");
-        assert!(rects.contains(&device(148, 158, 14, 14)), "{rects:?}");
+        assert!(rects.contains(&device(148, 148, 14, 24)), "where it was and where it moved to, as one: {rects:?}");
         assert!(rects.contains(&device(148, 18, 14, 14)), "{rects:?}");
-        assert_eq!(rects.len(), 3, "the area of the first shift is drawn where it moved to and not where it was: {rects:?}");
+        assert_eq!(rects.len(), 3, "{rects:?}");
+    }
+
+    #[test]
+    fn an_area_inside_the_region_moves_with_a_second_shift_and_one_across_its_edge_is_drawn_where_it_was_too() {
+        let scene = Scene::default();
+        let mut ledger = ledger(&scene);
+        let clip = area(10., 20., 100., 100.);
+        ledger.add_shift(clip, by(0, 30));
+        ledger.add_area(area(20., 60., 10., 10.));
+        // Across the right edge of the region (x 10..110).
+        ledger.add_area(area(105., 80., 20., 10.));
+        ledger.add_shift(clip, by(0, 10));
+        let damage = take(&mut ledger, &scene).unwrap();
+        let rects = rects(&damage);
+        assert!(rects.contains(&device(10, 20, 100, 40)), "the strip: {rects:?}");
+        assert!(rects.contains(&device(18, 68, 14, 14)), "inside: moved only: {rects:?}");
+        assert!(!rects.contains(&device(18, 58, 14, 14)), "inside: not where it was: {rects:?}");
+        assert!(rects.contains(&device(103, 78, 24, 24)), "across the edge: where it was and where it moves to, as one: {rects:?}");
     }
 
     #[test]
