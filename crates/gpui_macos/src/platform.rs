@@ -644,33 +644,18 @@ fn drain_mode() -> id {
     }) as id
 }
 
-/// Handles what is ready now without blocking and returns whether a display-link frame step ran
-/// during the call, which is one main-queue drain and at most one step per window. A caller that
-/// steps the display links itself after the pump must skip that step when this returns true: the
-/// pump's step was the frame, and a second would draw twice.
+/// Dequeues and sends the NSEvents that are queued.
 ///
-/// At most one step runs per call. Once a frame outlasts a vsync, each step blocks in
-/// `nextDrawable` until the next vsync, the link has queued its next tick by then, and a loop
-/// that kept handling sources would run that step too, and every one after it, until the
-/// 256-iteration cap (about 2 s at 120 Hz) with no NSEvent dequeued and no JS run. After a step
-/// the NSEvents that are queued are still dequeued (in a mode with no sources, so nothing else
-/// runs), and the call returns. When a step stopped the link, the call posts a block so the
-/// embedder pumps once more; while a link runs, its next tick wakes the embedder.
-#[doc(hidden)]
-pub unsafe fn pump_app_nonblocking() -> bool {
+/// `nextEventMatchingMask:` runs one pass of the run loop in its mode, and a step can run in it. The
+/// events that pass queued, or that a step's frame callback posted, come after the call that ran
+/// it. So once a step has run since `steps_at_start`, the dequeuing goes on in a mode with no
+/// sources, where nothing else runs: a pass of the default mode would run the next step.
+unsafe fn drain_events(app: id, steps_at_start: usize) {
     unsafe {
-        // NSApplication::run sleeps until the next display-link wake, which
-        // blocks embedded hosts. Drain only work that is ready now.
-        let app: id = msg_send![APP_CLASS, sharedApplication];
         let distant_past: id = msg_send![class!(NSDate), distantPast];
-        let steps_at_start = crate::link_steps();
-        let stops_at_start = crate::link_stops();
-
         for _ in 0..256 {
-            // `nextEventMatchingMask:` runs one pass of the run loop in its mode before it returns
-            // an event that is already queued, and a step can run in that pass. After one, only
-            // the dequeuing is left to do, and a pass of the default mode would run the next step.
-            let mode = if crate::link_steps() != steps_at_start {
+            let stepped = crate::link_steps() != steps_at_start;
+            let mode = if stepped {
                 drain_mode()
             } else {
                 kCFRunLoopDefaultMode as id
@@ -682,6 +667,9 @@ pub unsafe fn pump_app_nonblocking() -> bool {
                 dequeue: YES
             ];
             if event == nil {
+                if !stepped && crate::link_steps() != steps_at_start {
+                    continue;
+                }
                 break;
             }
             let _: () = msg_send![app, sendEvent: event];
@@ -691,6 +679,31 @@ pub unsafe fn pump_app_nonblocking() -> bool {
             // update cycle nothing to commit, and no timer is armed.
             let _: () = msg_send![class!(CATransaction), flush];
         }
+    }
+}
+
+/// Handles what is ready now without blocking and returns whether a display-link frame step ran
+/// during the call, which is one main-queue drain and at most one step per window. A caller that
+/// steps the display links itself after the pump must skip that step when this returns true: the
+/// pump's step was the frame, and a second would draw twice.
+///
+/// At most one step runs per call. Once a frame outlasts a vsync, each step blocks in
+/// `nextDrawable` until the next vsync, the link has queued its next tick by then, and a loop
+/// that kept handling sources would run that step too, and every one after it, until the
+/// 256-iteration cap (about 2 s at 120 Hz) with no NSEvent dequeued and no JS run. After a step
+/// the NSEvents that are queued are still dequeued (see `drain_events`), and the call returns.
+/// When a step stopped the link, the call posts a block so the embedder pumps once more; while a
+/// link runs, its next tick wakes the embedder.
+#[doc(hidden)]
+pub unsafe fn pump_app_nonblocking() -> bool {
+    unsafe {
+        // NSApplication::run sleeps until the next display-link wake, which
+        // blocks embedded hosts. Drain only work that is ready now.
+        let app: id = msg_send![APP_CLASS, sharedApplication];
+        let steps_at_start = crate::link_steps();
+        let stops_at_start = crate::link_stops();
+
+        drain_events(app, steps_at_start);
         // The call is over after a step: the sources below would run the next one.
         if crate::link_steps() != steps_at_start {
             if crate::link_stops() != stops_at_start {
@@ -709,6 +722,7 @@ pub unsafe fn pump_app_nonblocking() -> bool {
                 return crate::link_steps() != steps_at_start;
             }
             if crate::link_steps() != steps_at_start {
+                drain_events(app, steps_at_start);
                 if crate::link_stops() != stops_at_start {
                     DispatchQueue::main().exec_async(|| {});
                 }

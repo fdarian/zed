@@ -23,6 +23,7 @@ use cocoa::{
     base::{id, nil},
     foundation::NSPoint,
 };
+use dispatch2::DispatchQueue;
 use gpui::{App, Application, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, size};
 use gpui_macos::{MacPlatform, pump_app_nonblocking, run_loop_pumped, set_run_loop_wake_hook};
 use objc::{class, msg_send, sel, sel_impl};
@@ -73,8 +74,19 @@ fn rearm_and_wait(timeout: Duration) -> Option<Duration> {
     Some(start.elapsed())
 }
 
-unsafe fn post_application_defined(app: id) {
+/// Queues the events from a main-queue block, so they reach AppKit's queue in the same run loop
+/// pass as the display link's tick, as the events of a real input source do.
+fn post_application_defined_from_the_main_queue() {
+    DispatchQueue::main().exec_async(|| {
+        for _ in 0..EVENTS_PER_PUMP {
+            unsafe { post_application_defined() };
+        }
+    });
+}
+
+unsafe fn post_application_defined() {
     unsafe {
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
         let event: id = msg_send![class!(NSEvent),
             otherEventWithType: EVENT_APPLICATION_DEFINED
             location: NSPoint::new(0.0, 0.0)
@@ -105,7 +117,6 @@ fn main() {
     // The launch, which the first pump completes.
     assert!(platform.pump_events());
 
-    let app: id = unsafe { msg_send![class!(NSApplication), sharedApplication] };
     let monitor = ConcreteBlock::new(|event: id| -> id {
         HANDLED.fetch_add(1, SeqCst);
         event
@@ -117,15 +128,13 @@ fn main() {
             handler: &*monitor]
     };
 
-    // Frames that overrun the vsync, with several events queued at every pump: a pump that ran a
+    // Frames that overrun the vsync, with several events arriving at every pump: a pump that ran a
     // step must still handle all of them, or one event per frame gets through.
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut pumps_with_a_step = 0;
     let mut posted = 0;
     while Instant::now() < deadline {
-        for _ in 0..EVENTS_PER_PUMP {
-            unsafe { post_application_defined(app) };
-        }
+        post_application_defined_from_the_main_queue();
         posted += EVENTS_PER_PUMP;
         let before = frames();
         let stepped = unsafe { pump_app_nonblocking() };
