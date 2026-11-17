@@ -3,12 +3,12 @@
 //! what a window that builds everything shows and answers.
 
 use super::*;
-use crate::scene::border_strips;
+use crate::scene::{Cut, border_strips, without_arcs_if_clear};
 use crate::{
     AnyView, AnyWindowHandle, Bounds, Context, Edges, InteractiveElement, ParentElement, Position, Render,
     RasterizingTextSystem, RetainedCounters, ScrollHandle, StatefulInteractiveElement, StyledText, Styled, TestApp,
     TextLayout, WindowBounds, WindowOptions, div, point, px, size,
-    ContentMask, Corners, MonochromeSprite, Path, PolychromeSprite, Quad, ScaledPixels, Shadow, SubpixelSprite, Underline,
+    ContentMask, Corners, Quad, ScaledPixels,
 };
 use accesskit::Role;
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
@@ -797,62 +797,6 @@ fn probes() -> Vec<(f32, f32)> {
         }
     }
     probes
-}
-
-/// A primitive of the scene, which a replay under a rounded content mask paints under the
-/// rectangle of it.
-trait Cut {
-    /// Where the primitive paints, with what it spreads past its bounds.
-    fn reach(&self) -> Bounds<ScaledPixels>;
-    fn mask(&mut self) -> &mut ContentMask<ScaledPixels>;
-}
-
-macro_rules! cut {
-    ($($primitive:ty),*) => {$(
-        impl Cut for $primitive {
-            fn reach(&self) -> Bounds<ScaledPixels> {
-                self.bounds
-            }
-            fn mask(&mut self) -> &mut ContentMask<ScaledPixels> {
-                &mut self.content_mask
-            }
-        }
-    )*};
-}
-
-cut!(Quad, Underline, MonochromeSprite, SubpixelSprite, PolychromeSprite, Path<ScaledPixels>);
-
-impl Cut for Shadow {
-    // The shader draws a shadow out to three times its blur radius.
-    fn reach(&self) -> Bounds<ScaledPixels> {
-        self.bounds.dilate(self.blur_radius * 3.)
-    }
-    fn mask(&mut self) -> &mut ContentMask<ScaledPixels> {
-        &mut self.content_mask
-    }
-}
-
-/// `mask` without its radii where `reach` is clear of every corner of it: painting under that mask
-/// and under its rectangle make the same pixels, and a replay paints under the rectangle. A
-/// primitive that reaches a corner keeps its radii, so that a replay that put one there shows as a
-/// difference.
-fn without_arcs_if_clear(mask: &mut ContentMask<ScaledPixels>, reach: Bounds<ScaledPixels>) {
-    let pixels = |value: ScaledPixels| px(value.0);
-    let in_pixels = |bounds: Bounds<ScaledPixels>| {
-        Bounds::new(
-            point(pixels(bounds.origin.x), pixels(bounds.origin.y)),
-            size(pixels(bounds.size.width), pixels(bounds.size.height)),
-        )
-    };
-    let rounded = ContentMask {
-        bounds: in_pixels(mask.bounds),
-        corner_radii: mask.corner_radii.map(|radius| pixels(*radius)),
-        corner_radii_y: mask.corner_radii_y.map(|radius| pixels(*radius)),
-    };
-    if rounded.is_rounded() && rounded.is_clear_of_rounded_corners(in_pixels(reach)) {
-        mask.corner_radii = Corners::default();
-        mask.corner_radii_y = Corners::default();
-    }
 }
 
 /// `primitives` as [`without_arcs_if_clear`] has them. What is outside `view` shows nothing and is

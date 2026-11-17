@@ -3135,7 +3135,7 @@ impl PaintRecord {
         let range = self.range_now();
         let mut out = frame
             .scene
-            .describe_operations(range.start.scene_index..range.end.scene_index, loose);
+            .describe_operations_modulo_arcs(range.start.scene_index..range.end.scene_index, loose);
         let reachable = |id: Option<HitboxId>| {
             id.and_then(|id| frame.hitboxes.iter().find(|hitbox| hitbox.id == id))
                 .is_none_or(Hitbox::is_reachable)
@@ -3192,14 +3192,14 @@ impl Window {
         }
         let frame = &self.next_frame;
         let mut out = if relocated {
-            let marked = strip_draw_orders(&frame.scene.describe_operations(0..frame.scene.paint_operations.len(), true));
+            let marked = strip_draw_orders(&frame.scene.describe_operations_modulo_arcs(0..frame.scene.paint_operations.len(), true));
             strip_what_holds_nothing(&marked)
                 .lines()
                 .filter(|line| *line != "replaced" && *line != "end replaced")
                 .map(|line| format!("{line}\n"))
                 .collect()
         } else {
-            strip_draw_orders(&frame.scene.describe_drawn())
+            strip_draw_orders(&frame.scene.describe_drawn_modulo_arcs())
         };
         let name = |id: HitboxId| {
             frame
