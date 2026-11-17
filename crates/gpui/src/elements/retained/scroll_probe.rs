@@ -74,18 +74,21 @@ impl RetainedState {
 
     /// Whether `Recorded::place` would put the root `delta` away from where it was recorded,
     /// under `ambient`, when nothing of its surroundings differs but the offset of the scroller
-    /// around it. `exact_clips` is whether the surroundings are cut by an exact clip.
+    /// around it. `exact_clips` is whether the surroundings are cut by an exact clip, and `reach`
+    /// where the root would paint there (see [`Window::painted_reach`]), which a rounded `ambient`
+    /// needs known.
     pub(crate) fn would_place(
         &self,
         delta: Point<Pixels>,
         ambient: &ContentMask<Pixels>,
         exact_clips: bool,
+        reach: Option<Bounds<Pixels>>,
     ) -> Result<(), ScrollMiss> {
         let recorded = self.recorded.as_ref().ok_or(ScrollMiss::Unrecorded)?;
         if !recorded.movable {
             return Err(ScrollMiss::Unmovable);
         }
-        if exact_clips || ambient.is_rounded() || !recorded.key.relocates_by(delta) {
+        if exact_clips || !recorded.key.relocates_by(delta) {
             return Err(ScrollMiss::Place);
         }
         let relocation = recorded
@@ -94,6 +97,9 @@ impl RetainedState {
             .expect("a recording that can be moved has its relocation");
         if relocation.culled {
             return Ok(());
+        }
+        if ambient.is_rounded() && !reach.is_some_and(|reach| ambient.is_clear_of_rounded_corners(reach)) {
+            return Err(ScrollMiss::Clip);
         }
         relocation.info.fits(delta, ambient).map_err(|miss| match miss {
             RelocationMiss::Place => ScrollMiss::Place,
@@ -115,6 +121,8 @@ pub(crate) enum ScrollMiss {
     Place,
     /// The region the root was recorded in does not cover the content mask around it there.
     Region(UncoveredEdge),
-    /// A rounded clip in the root meets the content mask around it differently there.
+    /// A rounded clip in the root meets the content mask around it differently there, or the root
+    /// reaches a corner square of a rounded content mask around it there, which a replay cuts by
+    /// the rectangle of.
     Clip,
 }

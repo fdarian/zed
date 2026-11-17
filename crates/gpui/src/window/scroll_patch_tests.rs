@@ -66,6 +66,10 @@ struct Page {
     hitboxes: bool,
     /// A relocatable root inside each row, with the overscan of the row.
     nested: bool,
+    /// The list is held by a panel with rounded corners that cuts it.
+    rounded: bool,
+    /// The row as wide as the panel, which reaches its corners when it is near them: the others stop short of them.
+    wide: Option<usize>,
     /// The key of the rows: another one builds them again.
     key: Rc<Cell<u64>>,
     focus: Rc<RefCell<Option<FocusHandle>>>,
@@ -86,6 +90,7 @@ impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let page = self.clone();
         let bar = self.bar.clone().map(|bar| (bar, self.state.clone()));
+        let rounded = self.rounded;
         let page_background = div().size_full();
         let page_background = match self.backdrop {
             Backdrop::None => page_background,
@@ -101,9 +106,13 @@ impl Render for Page {
                 let hitboxes = page.hitboxes;
                 let key = page.key.get();
                 let nested = page.nested.then_some(page.overscan).flatten();
+                let rounded = page.rounded;
+                let wide = page.wide;
                 let focus = (ix == FOCUSED).then(|| page.focus.borrow().clone()).flatten();
                 let mut row = retained(("row", ix), key, move |_, _| {
                     let row = div().id(("row", ix)).w_full().h(px(ROW)).bg(crate::blue());
+                    // Clear of the right corners of the panel that holds the list, whose radius is 12, by more than the pixel a reach is grown by.
+                    let row = if rounded && wide != Some(ix) { row.w(px(72.)) } else { row };
                     let row = match nested {
                         Some(overscan) => row.child(
                             retained(("inner", ix), key, |_, _| div().size_full().into_any_element())
@@ -120,11 +129,16 @@ impl Render for Page {
                 if let Some(overscan) = page.overscan {
                     row = row.relocatable(px(overscan));
                 }
+                // A row under a rounded clip is judged against its corners by the extent its owner vouches for.
+                if page.rounded {
+                    row = row.cull_outset(Some(crate::Edges::all(px(0.))));
+                }
                 row.into_any_element()
             })
             .w(px(100.))
             .h(px(LIST));
             match bar {
+                None if rounded => div().w(px(100.)).h(px(LIST)).rounded_tr_xl().rounded_br_xl().overflow_hidden().child(rows).into_any_element(),
                 None => rows.into_any_element(),
                 Some((bar, state)) => rows
                     .paint_overlay(move |_, window, _| {
@@ -198,22 +212,41 @@ impl Fixture {
     }
 
     fn with_nested(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool, nested: bool) -> Self {
-        Self::open(cx, overscan, hitboxes, nested, None)
+        Self::open(cx, overscan, hitboxes, nested, false, None, None)
+    }
+
+    fn in_rounded_panel(cx: &mut TestAppContext) -> Self {
+        Self::open(cx, Some(100.), true, false, true, None, None)
+    }
+
+    fn in_rounded_panel_with_wide_row(cx: &mut TestAppContext, row: usize) -> Self {
+        Self::open(cx, Some(100.), true, false, true, Some(row), None)
     }
 
     fn with_bar(cx: &mut TestAppContext, bar: &Bar) -> Self {
-        Self::open(cx, Some(100.), true, false, Some(bar.clone()))
+        Self::open(cx, Some(100.), true, false, false, None, Some(bar.clone()))
     }
 
-    fn open(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool, nested: bool, bar: Option<Bar>) -> Self {
-        Self::open_over(cx, overscan, hitboxes, nested, bar, Backdrop::None)
+    fn open(
+        cx: &mut TestAppContext,
+        overscan: Option<f32>,
+        hitboxes: bool,
+        nested: bool,
+        rounded: bool,
+        wide: Option<usize>,
+        bar: Option<Bar>,
+    ) -> Self {
+        Self::open_over(cx, overscan, hitboxes, nested, rounded, wide, bar, Backdrop::None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_over(
         cx: &mut TestAppContext,
         overscan: Option<f32>,
         hitboxes: bool,
         nested: bool,
+        rounded: bool,
+        wide: Option<usize>,
         bar: Option<Bar>,
         backdrop: Backdrop,
     ) -> Self {
@@ -224,6 +257,8 @@ impl Fixture {
             overscan,
             hitboxes,
             nested,
+            rounded,
+            wide,
             key: Rc::new(Cell::new(1)),
             focus: Rc::default(),
             backdrop,
@@ -675,6 +710,113 @@ fn a_translate_is_the_frame_built_whole(cx: &mut TestAppContext) {
     }
 }
 
+/// The frame shown after each of `wheels` over a list in a rounded panel, the translate on or off.
+fn after_wheels_in_a_rounded_panel(cx: &mut TestAppContext, patch: bool, verified: bool, wheels: &[f32]) -> (Vec<String>, crate::ScrollPatchCounters, Vec<String>) {
+    let fixture = Fixture::in_rounded_panel(cx);
+    after_wheels_in_a_panel_of_rows(cx, fixture, patch, verified, wheels)
+}
+
+fn after_wheels_in_a_panel_of_rows(
+    cx: &mut TestAppContext,
+    fixture: Fixture,
+    patch: bool,
+    verified: bool,
+    wheels: &[f32],
+) -> (Vec<String>, crate::ScrollPatchCounters, Vec<String>) {
+    fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+    fixture.point_at(cx, 50., 50.);
+    if verified {
+        fixture.with_window(cx, |window| window.set_retention_verifier(Some(Rc::new(|_| String::new()))));
+    }
+    let frames = wheels
+        .iter()
+        .map(|by| {
+            fixture.scroll(cx, 50., 50., *by);
+            fixture.with_window(cx, shown)
+        })
+        .collect();
+    let mismatches = fixture.with_window(cx, |window| window.retention_mismatches().to_vec());
+    (frames, fixture.counters(cx), mismatches)
+}
+
+#[gpui::test]
+fn a_translate_of_rows_clear_of_the_corners_of_a_rounded_panel_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    // The rows stop short of the corners of the panel, so that they are clear of them wherever they are.
+    let wheels = [5., 5., 7., -3., -4., 6., 2., -15., 1.];
+    let (translated, counters, _) = after_wheels_in_a_rounded_panel(cx, true, false, &wheels);
+    let (built, _, _) = after_wheels_in_a_rounded_panel(cx, false, false, &wheels);
+    assert!(counters.patched >= 4, "{counters:?}");
+    for (frame, (translated, built)) in translated.iter().zip(&built).enumerate() {
+        assert!(
+            translated == built,
+            "frame {frame}, {counters:?}\n{}",
+            super::retained::first_difference(translated, built)
+        );
+    }
+    // A frame that the verifier checks is built whole a second time, and its rows are not recorded to be moved: one wheel.
+    let (_, counters, mismatches) = after_wheels_in_a_rounded_panel(cx, true, true, &[5.]);
+    assert_eq!((counters.eligible, counters.patched), (1, 1), "{counters:?}");
+    assert_eq!(mismatches, Vec::<String>::new(), "{counters:?}");
+}
+
+#[gpui::test]
+fn a_row_that_reaches_a_corner_after_several_translates_is_built_there(cx: &mut TestAppContext) {
+    // The second row is clear of the top right corner of the panel (radius 12) until it has gone up
+    // by 18: seven steps of 3. Each translate is judged from the frame the one before drew, which put
+    // the row where it is, and not from where the row was recorded. A frame is not drawn again after
+    // a translate, so that the next one is from it.
+    let shown_after = |cx: &mut TestAppContext, patch: bool| {
+        let fixture = Fixture::in_rounded_panel_with_wide_row(cx, 1);
+        fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+        let frames: Vec<String> = (0..9)
+            .map(|_| {
+                fixture.scroll_once(cx, 10., 5., 3.);
+                fixture.with_window(cx, shown)
+            })
+            .collect();
+        (frames, fixture.counters(cx))
+    };
+    let (translated, counters) = shown_after(cx, true);
+    let (built, _) = shown_after(cx, false);
+    assert!(counters.patched >= 4, "{counters:?}");
+    for (frame, (translated, built)) in translated.iter().zip(&built).enumerate() {
+        assert!(
+            translated == built,
+            "frame {frame}, {counters:?}\n{}",
+            super::retained::first_difference(translated, built)
+        );
+    }
+}
+
+#[gpui::test]
+fn a_row_built_at_a_corner_is_predicted_under_the_rounded_mask_it_is_built_in(cx: &mut TestAppContext) {
+    // The second row is clear of the corners of the panel at 14 from the top, and a scroll by 4 puts it
+    // at its top corner, where it is built. The pointer is past the arc of the corner (12 from its centre
+    // at 88 across and 12 down), where the rectangle of the mask is and the mask is not: the row built
+    // there does not take the pointer. Predicted under the rectangle it would, which is a hover change
+    // that does not happen.
+    let fixture = Fixture::in_rounded_panel_with_wide_row(cx, 1);
+    fixture.scroll(cx, 10., 5., 16.);
+    fixture.point_at(cx, 99.9, 10.1);
+    let before = fixture.counters(cx);
+    // The wheel has to reach the list, which the corner is outside of, so the pointer is put back after it.
+    cx.update_window(fixture.window, |_, window, cx| {
+        let event = ScrollWheelEvent {
+            position: point(px(50.), px(50.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-4.))),
+            ..Default::default()
+        };
+        window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+        window.mouse_position = point(px(99.9), px(10.1));
+    })
+    .unwrap();
+    fixture.draw(cx);
+    let counters = fixture.counters(cx);
+    assert_eq!(counters.frames, before.frames + 1, "{counters:?}");
+    assert_eq!(counters.reasons(ScrollPatchReason::Hover), before.reasons(ScrollPatchReason::Hover), "{counters:?}");
+    assert_eq!((counters.eligible, counters.mispredicted), (before.eligible + 1, 0), "{counters:?}");
+}
+
 #[gpui::test]
 fn a_translate_keeps_the_recording_of_the_rows_for_the_frame_after(cx: &mut TestAppContext) {
     // A frame built whole after translated ones puts the rows from their recordings, and a
@@ -787,7 +929,7 @@ fn after_wheels_with_bar_at(
     hitboxes: bool,
 ) -> (Vec<String>, crate::ScrollPatchCounters, u32) {
     let bar = Bar::new();
-    let fixture = Fixture::open(cx, Some(100.), hitboxes, false, Some(bar.clone()));
+    let fixture = Fixture::open(cx, Some(100.), hitboxes, false, false, None, Some(bar.clone()));
     fixture.with_window(cx, |window| window.set_scroll_patch(patch));
     let frames = wheels
         .iter()
@@ -1108,7 +1250,7 @@ pub(crate) mod shift {
 
     #[gpui::test]
     fn a_translate_shifts_the_list_and_draws_the_strip_that_scrolled_in_and_the_thumb(cx: &mut TestAppContext) {
-        let fixture = Fixture::open_over(cx, Some(100.), false, false, Some(Bar::new()), Backdrop::Solid);
+        let fixture = Fixture::open_over(cx, Some(100.), false, false, false, None, Some(Bar::new()), Backdrop::Solid);
         let scale = scale(&fixture, cx);
         let (before, last) = scrolled(&fixture, cx, 12.);
         let counters = fixture.counters(cx);
@@ -1132,7 +1274,7 @@ pub(crate) mod shift {
 
     #[gpui::test]
     fn a_backdrop_that_does_not_move_with_the_rows_is_drawn_and_the_shift_is_given_up(cx: &mut TestAppContext) {
-        let fixture = Fixture::open_over(cx, Some(100.), false, false, Some(Bar::new()), Backdrop::Gradient);
+        let fixture = Fixture::open_over(cx, Some(100.), false, false, false, None, Some(Bar::new()), Backdrop::Gradient);
         let scale = scale(&fixture, cx);
         let (_, last) = scrolled(&fixture, cx, 12.);
         assert_eq!(fixture.counters(cx).patched, 1);

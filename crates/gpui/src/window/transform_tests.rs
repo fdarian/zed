@@ -1296,6 +1296,51 @@ mod elements {
         assert_eq!(window.update(|_, window, _| window.culled_subtree_count()) - before, 1);
     }
 
+    /// How many times a relocatable root, `outset` of ink around its 20 by 20 box under `transform`,
+    /// in the middle of a 100 by 100 panel with corners of radius 12, was refused for touching a corner.
+    fn refused_at_a_corner(transform: Option<ElementTransform>, outset: f32) -> u64 {
+        let (_app, mut window) = open(move || {
+            div()
+                .id("panel")
+                .w(px(100.))
+                .h(px(100.))
+                .p(px(40.))
+                .rounded_xl()
+                .overflow_hidden()
+                .child(
+                    crate::retained("root", 1u64, {
+                        let transform = transform.clone();
+                        move |_, _| {
+                        let root = block(20., 20.).bg(red());
+                        match &transform {
+                            Some(transform) => root.transform(transform.clone()).into_any_element(),
+                            None => root.into_any_element(),
+                        }
+                        }
+                    })
+                    .relocatable(px(100.))
+                    .cull_outset(Some(Edges::all(px(outset)))),
+                )
+                .into_any_element()
+        });
+        window.draw();
+        window.update(|_, window, _| window.retained_counters().non_relocatable(crate::NonRelocatable::Clip))
+    }
+
+    #[test]
+    fn the_ink_a_root_draws_past_its_box_is_scaled_by_the_transform_the_root_has_when_it_is_put_under_rounded_corners() {
+        // Its box is 20 square from 40 on, and the corners of the panel (radius 12) are 28 away: 8 of
+        // ink in each direction does not reach them.
+        assert_eq!(refused_at_a_corner(None, 8.), 0);
+        assert_eq!(
+            refused_at_a_corner(Some(about_center(vec![TransformFunction::Scale(1., 1.)])), 8.),
+            0
+        );
+        // Under scale(2) the box grows to 40 square from 30 on and the ink by 2.83 times 8 (the norm of
+        // the matrix, which is how far culling takes a vector to be stretched), which reaches the corners.
+        assert!(refused_at_a_corner(Some(about_center(vec![TransformFunction::Scale(2., 2.)])), 8.) > 0);
+    }
+
     fn hits(window: &mut TestAppWindow<Scene>, x: f32, y: f32) -> Vec<String> {
         window.update(|_, window, _| {
             let hit = window.rendered_frame.hit_test(point(px(x), px(y)), true);

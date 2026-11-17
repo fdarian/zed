@@ -401,6 +401,10 @@ pub(super) struct ScrollRun {
     /// The content mask around the root in prepaint, and whether an exact clip cut it.
     ambient: ContentMask<Pixels>,
     exact_clips: bool,
+    /// Where the root paints, for a root under a rounded `ambient`, and `None` when that is not
+    /// known or `ambient` is not rounded: a scroll puts the root where it is not clear of the
+    /// corners of `ambient` only if it is built.
+    reach: Option<Bounds<Pixels>>,
     /// The content mask around the root in paint, which cuts its operations: the list's clip is in
     /// it and not in `ambient`.
     paint_mask: ContentMask<Pixels>,
@@ -408,6 +412,15 @@ pub(super) struct ScrollRun {
     replayed: bool,
     /// Tells the owner of the root that it moved.
     hook: Option<ReplayHook>,
+}
+
+impl ScrollRun {
+    /// The content mask that cuts the hitboxes of the root where a scroll puts it: the rectangle of
+    /// `ambient`, as a replay and the build the verifier compares with cut by (a root is only put
+    /// where it is clear of the corners of `ambient`, see `Window::clears_rounded_corners`).
+    fn surroundings(&self) -> ContentMask<Pixels> {
+        ContentMask::from_bounds(self.ambient.bounds)
+    }
 }
 
 /// Why the thumb of a bar cannot be put where a scroll puts it, as the owner says it of the bar
@@ -893,6 +906,7 @@ impl Window {
         hitboxes_start: usize,
         replayed: bool,
         hook: Option<ReplayHook>,
+        reach: Option<Bounds<Pixels>>,
     ) {
         let delta = if replayed {
             let placed = self.peek_element_state(id, |state: &RetainedState| state.placed_by());
@@ -921,6 +935,7 @@ impl Window {
             paint_mask: ambient,
             ambient,
             exact_clips,
+            reach,
             replayed,
             hook,
         });
@@ -1224,7 +1239,8 @@ impl Window {
                 let total = run.delta + shift;
                 let place = self
                     .peek_element_state(&run.id, |state: &RetainedState| {
-                        state.would_place(total, &run.ambient, run.exact_clips)
+                        let reach = run.reach.map(|reach| Bounds::new(reach.origin + shift, reach.size));
+                        state.would_place(total, &run.ambient, run.exact_clips, reach)
                     })
                     .unwrap_or(Err(ScrollMiss::Unrecorded));
                 (run, total, place)
@@ -1889,10 +1905,13 @@ impl Window {
             moved_ranges.push(run.ops.clone());
             let recorded = movement.source.hitboxes.hitboxes.iter();
             for (slot, recorded) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(recorded) {
-                let mut moved = recorded.relocated(movement.total, &run.ambient);
+                let mut moved = recorded.relocated(movement.total, &run.surroundings());
                 moved.parent = slot.parent;
                 *slot = moved;
             }
+            // The reach is where the root paints in the frame shown, and the next scroll is judged from this frame.
+            let moved_by = movement.total - run.delta;
+            run.reach = run.reach.map(|reach| Bounds::new(reach.origin + moved_by, reach.size));
             run.delta = movement.total;
             roots.push((run.id.clone(), movement.total, run.hook.clone()));
         }

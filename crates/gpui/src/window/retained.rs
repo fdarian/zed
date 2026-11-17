@@ -1120,7 +1120,7 @@ impl PaintAmbient {
 /// is that but for a whole number of device pixels along, see [`ReplayKey::relocation`].
 #[derive(PartialEq)]
 pub(crate) struct ReplayKey {
-    bounds: Bounds<Pixels>,
+    pub(crate) bounds: Bounds<Pixels>,
     /// The size layout gave the root, before it is snapped. The boxes inside are snapped edge by
     /// edge from the root's origin, so two roots of one snapped box can have inside them boxes of
     /// different snapped sizes.
@@ -1216,15 +1216,14 @@ impl ReplayKey {
     /// [`Relocation::fits`] for what it has to be.
     ///
     /// Needs a scale factor that is a power of two, where a position shifted by a whole number of
-    /// device pixels is exactly the shifted position, and an ambient content mask that has no
-    /// rounded corners and is not cut by an exact clip.
+    /// device pixels is exactly the shifted position, and an ambient content mask that is not cut
+    /// by an exact clip. A rounded ambient is [`Window::clears_rounded_corners`]'s to judge: it
+    /// needs the extent of the subtree, which a key does not hold.
     pub(crate) fn relocation(&self, later: &ReplayKey) -> Option<Point<Pixels>> {
         let power_of_two = self.scale_factor > 0. && self.scale_factor.to_bits() & 0x007f_ffff == 0;
         if !power_of_two
             || !self.exact_clips.is_empty()
             || !later.exact_clips.is_empty()
-            || self.content_mask.is_rounded()
-            || later.content_mask.is_rounded()
             || self.layout_origin != later.layout_origin
             || self.bounds.size != later.bounds.size
             || self.unsnapped_size != later.unsnapped_size
@@ -1269,7 +1268,6 @@ impl ReplayKey {
         let power_of_two = self.scale_factor > 0. && self.scale_factor.to_bits() & 0x007f_ffff == 0;
         power_of_two
             && self.exact_clips.is_empty()
-            && !self.content_mask.is_rounded()
             && !(self.transform.as_ref().is_some_and(AmbientKey::is_general) && !delta.is_zero())
     }
 }
@@ -1532,14 +1530,21 @@ impl Relocation {
         }
     }
 
+    /// The content mask that cuts what the subtree puts in the frame where it is put: the rectangle of
+    /// `ambient`, as a replay cuts by (see [`Window::clears_rounded_corners`], which is what lets the
+    /// radii go).
+    pub(crate) fn surroundings(&self) -> ContentMask<Pixels> {
+        ContentMask::from_bounds(self.ambient.bounds)
+    }
+
     /// A recording of the same subtree in the same region, with nothing noted yet: what a patch that
-    /// paints the subtree again records it in.
+    /// paints the subtree again records it in. A `direct` one stays one.
     pub(crate) fn reopened(&self) -> Self {
         Self {
             info: RelocationInfo { region: self.info.region, rounded: Vec::new(), decisions: Vec::new() },
             handles: Vec::new(),
             ambient: self.ambient,
-            direct: false,
+            direct: self.direct,
             culled: false,
             frames_below: 0,
             saved_exact_clips: None,
@@ -1551,6 +1556,15 @@ impl Relocation {
     /// mask around it.
     pub(crate) fn regional(&self) -> bool {
         !self.direct && !self.culled
+    }
+
+    /// Whether the build that is compared with is made under the rectangle of the content mask
+    /// around, as a replay is: a replay drops the radii of that mask, where a subtree that is
+    /// clear of its corners makes the same pixels (see [`Window::clears_rounded_corners`]) but not
+    /// the same operations (an outline under a rectangle is four strips, under a rounded mask one
+    /// quad).
+    pub(crate) fn flattens_ambient(&self) -> bool {
+        self.direct && !self.culled && self.ambient.is_rounded()
     }
 
     /// Moves what the subtree holds outside the frame to where `delta` from the recording puts it.
@@ -2221,7 +2235,8 @@ impl Window {
     ) -> (Range<PrepaintStateIndex>, Option<u32>) {
         self.invalidator.debug_assert_prepaint();
         let start = self.prepaint_index();
-        let relocated = delta.map(|delta| (delta, self.content_mask()));
+        // The rectangle of the content mask, as a replay of the paint cuts by (see `replay_clip`).
+        let relocated = delta.map(|delta| (delta, ContentMask::from_bounds(self.content_mask().bounds)));
         self.reuse_prepaint_with(record.range_now(), Some((&record.hitboxes, relocated.as_ref())), false);
         if let Some(a11y) = &record.a11y {
             let scale_factor = self.scale_factor;
@@ -2707,16 +2722,63 @@ impl Window {
     }
 
     /// Whether a subtree that is relocatable can be recorded in a region of its own here: the
-    /// content mask around has no rounded corners and is not cut by an exact clip, and the scale
-    /// factor makes device pixels exact.
+    /// content mask around is not cut by an exact clip, and the scale factor makes device pixels
+    /// exact. A rounded content mask is judged by [`Self::clears_rounded_corners`].
     pub(crate) fn relocation_blocker_here(&self) -> Option<NonRelocatable> {
         if let Some(reason) = self.scale_blocker() {
             return Some(reason);
         }
-        if self.exact_clips.is_some() || self.content_mask().is_rounded() {
+        if self.exact_clips.is_some() {
             return Some(NonRelocatable::Clip);
         }
         None
+    }
+
+    /// Whether what the subtree of the layout node `root`, with border box `bounds`, paints here
+    /// stays clear of the rounded corners of the content mask around it, which is what lets a
+    /// recording of it be put under that mask. A replay cuts by the rectangle of the content mask
+    /// and drops its radii (`ReplayClip`): that makes the pixels painting under the rounded mask
+    /// makes exactly when nothing replayed reaches a corner square, and only then. A mask with
+    /// no rounded corner is clear of all.
+    ///
+    /// The reach is the one culling trusts (the box and the scrollable overflow of the subtree
+    /// grown by `outset`, which its owner vouches for): `outset` of `None`, a box placed outside
+    /// what the layout engine can say and a general transform are not clear.
+    pub(crate) fn clears_rounded_corners(
+        &mut self,
+        root: LayoutId,
+        bounds: Bounds<Pixels>,
+        outset: Option<Edges<Pixels>>,
+    ) -> bool {
+        let ambient = self.content_mask();
+        if !ambient.is_rounded() {
+            return true;
+        }
+        self.painted_reach(root, bounds, outset)
+            .is_some_and(|reach| ambient.is_clear_of_rounded_corners(reach))
+    }
+
+    /// Where the subtree of the layout node `root`, with border box `bounds`, paints in the
+    /// window, with what its owner says it draws outside its extent (`outset`) and a pixel for
+    /// snapping: `None` when that is not known.
+    pub(crate) fn painted_reach(
+        &mut self,
+        root: LayoutId,
+        bounds: Bounds<Pixels>,
+        outset: Option<Edges<Pixels>>,
+    ) -> Option<Bounds<Pixels>> {
+        let outset = outset?;
+        if self.transform_stack.last().is_some_and(|ambient| ambient.kind == TransformKind::General) {
+            return None;
+        }
+        let space = self.outset_space(root, bounds)?;
+        let scale_factor = self.scale_factor;
+        let mut extent = self.layout_engine.as_mut()?.painted_extent(root, scale_factor)?;
+        extent.origin += self.pixel_snap_point(self.element_offset());
+        let reach = self
+            .bounds_in_window(space.own_box(bounds))
+            .union(&self.bounds_in_window(extent));
+        Some(space.inflate(reach, outset, px(1.)))
     }
 
     /// [`Self::relocation_blocker_here`] for the scale factor alone, which is all that a culled
@@ -2732,6 +2794,9 @@ impl Window {
     pub(crate) fn begin_relocation(&mut self, mut relocation: Relocation, paint: bool) {
         debug_assert!(self.retained.relocation.is_none(), "relocatable subtrees do not nest");
         relocation.frames_below = self.positioned_frames.len();
+        if relocation.flattens_ambient() {
+            self.content_mask_stack.push(relocation.surroundings());
+        }
         if relocation.regional() {
             self.content_mask_stack
                 .push(ContentMask::from_bounds(relocation.info.region));
@@ -2759,6 +2824,9 @@ impl Window {
             .take()
             .expect("a relocation is ended after it began");
         let mut operations = None;
+        if relocation.flattens_ambient() {
+            self.content_mask_stack.pop();
+        }
         if relocation.regional() {
             self.content_mask_stack.pop();
             self.exact_clips = relocation.saved_exact_clips.take();
@@ -3067,7 +3135,7 @@ impl PaintRecord {
         let range = self.range_now();
         let mut out = frame
             .scene
-            .describe_operations(range.start.scene_index..range.end.scene_index, loose);
+            .describe_operations_modulo_arcs(range.start.scene_index..range.end.scene_index, loose);
         let reachable = |id: Option<HitboxId>| {
             id.and_then(|id| frame.hitboxes.iter().find(|hitbox| hitbox.id == id))
                 .is_none_or(Hitbox::is_reachable)
@@ -3124,14 +3192,14 @@ impl Window {
         }
         let frame = &self.next_frame;
         let mut out = if relocated {
-            let marked = strip_draw_orders(&frame.scene.describe_operations(0..frame.scene.paint_operations.len(), true));
+            let marked = strip_draw_orders(&frame.scene.describe_operations_modulo_arcs(0..frame.scene.paint_operations.len(), true));
             strip_what_holds_nothing(&marked)
                 .lines()
                 .filter(|line| *line != "replaced" && *line != "end replaced")
                 .map(|line| format!("{line}\n"))
                 .collect()
         } else {
-            strip_draw_orders(&frame.scene.describe_drawn())
+            strip_draw_orders(&frame.scene.describe_drawn_modulo_arcs())
         };
         let name = |id: HitboxId| {
             frame

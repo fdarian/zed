@@ -5,11 +5,12 @@
 //! roots recorded after it, the nested ones it held and a scroll translate are right after it.
 
 use crate::{
-    AnyElement, AnyWindowHandle, App, AppContext as _, Context, ElementId, FocusHandle, InteractiveElement, IntoElement,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Context, Edges, ElementId, FocusHandle, InteractiveElement, IntoElement,
     ListAlignment, ListState, Modifiers, OverflowAnchor, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, PatchCounters, PatchDecline,
     PlatformInput, Point, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div,
     green, list, point, px, red, retained, size,
 };
+use crate::NonRelocatable;
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
@@ -17,6 +18,9 @@ use std::rc::Rc;
 const UNIT: &str = "unit";
 const SIBLING: &str = "sibling";
 const NESTED: &str = "nested";
+/// The width of the panel of the test of a rounded corner, and the width of the boxes that overflow the unit in it.
+const PANEL: f32 = 150.;
+const PANEL_HEIGHT: f32 = 160.;
 
 /// Where the pointer rests, over the second box of the unit.
 const POINTER: (f32, f32) = (10., 38.);
@@ -67,6 +71,10 @@ struct State {
     anchoring: Cell<bool>,
     /// The third box has a tooltip, which a recording cannot be put elsewhere with.
     tooltip: Cell<bool>,
+    /// The unit is in a panel whose bottom right corner is rounded, with boxes that go down to the corner and are as wide as
+    /// the unit, or as the panel when `wide` is set: the unit is clear of the corner until they are.
+    panel: Cell<bool>,
+    wide: Cell<bool>,
 }
 
 impl State {
@@ -97,6 +105,8 @@ impl State {
             scroll: ScrollHandle::new(),
             anchoring: Cell::new(false),
             tooltip: Cell::new(true),
+            panel: Cell::new(false),
+            wide: Cell::new(false),
         })
     }
 
@@ -115,6 +125,9 @@ impl State {
             .hover(|style| style.bg(green()))
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_, _, _| down.log.borrow_mut().push(format!("down {index}")));
+        if self.panel.get() {
+            kid = kid.w(px(if self.wide.get() { PANEL } else { 120. }));
+        }
         if index == 2 && self.tooltip.get() {
             kid = kid.tooltip(|_, cx| cx.new(|_| Tip).into());
         }
@@ -137,7 +150,10 @@ impl State {
     }
 
     fn unit(self: &Rc<Self>) -> AnyElement {
-        let mut unit = div().id(UNIT).w(px(120.)).h(px(100.)).flex_none().overflow_hidden();
+        let mut unit = div().id(UNIT).w(px(120.)).h(px(if self.panel.get() { PANEL_HEIGHT } else { 100. })).flex_none();
+        if !self.panel.get() {
+            unit = unit.overflow_hidden();
+        }
         if !self.bare.get() {
             unit = unit.bg(blue());
         }
@@ -181,7 +197,22 @@ impl Render for Page {
         if state.relocatable.get() {
             unit = unit.relocatable(px(100.));
         }
-        let unit = if state.scrolled.get() {
+        if state.panel.get() {
+            unit = unit.cull_outset(Some(Edges::default()));
+        }
+        let unit = if state.panel.get() {
+            // The panel is as wide as the boxes can be, so that what a patch widens them to changes nothing outside the unit.
+            div()
+                .id("panel")
+                .w(px(PANEL))
+                .h(px(PANEL_HEIGHT))
+                .flex_none()
+                .rounded_br_xl()
+                .overflow_hidden()
+                .child(div().id("spacer").w(px(PANEL)).h(px(1.)).flex_none())
+                .child(unit)
+                .into_any_element()
+        } else if state.scrolled.get() {
             let mut scroller = div()
                 .id("scroller")
                 .w(px(200.))
@@ -796,6 +827,25 @@ impl Pair {
         Self { patched, whole }
     }
 
+    /// The unit is a relocatable root in a panel with a rounded bottom right corner, which it is clear of, and that has no
+    /// tooltip to keep its recording from being put elsewhere.
+    fn in_rounded_panel(cx: &mut TestAppContext, kids: usize) -> Self {
+        let configure = |state: &State| {
+            state.relocatable.set(true);
+            state.panel.set(true);
+            state.tooltip.set(false);
+            state.key_stays.set(true);
+        };
+        let state = State::new(cx, kids, false);
+        configure(&state);
+        let patched = Fixture::new(cx, state);
+        let reference = State::new(cx, kids, false);
+        configure(&reference);
+        reference.patch_unit.set(false);
+        let whole = Fixture::new(cx, reference);
+        Self { patched, whole }
+    }
+
     /// Moves the scroller of both pages to `top` with a wheel and draws the patched one, which puts the unit where it was
     /// not recorded.
     fn scroll_to(&self, cx: &mut TestAppContext, top: f32) {
@@ -933,6 +983,107 @@ fn a_relayout_patch_that_changes_why_a_root_cannot_be_put_elsewhere_does_not_rew
     assert_eq!(after.total_declines(), 0, "{seen:?}");
     drop(seen);
     pair.assert_same(cx, "without the box with the tooltip");
+}
+
+/// What the frame shown has of the boxes of the unit that is cut by a rounded content mask: how many hitboxes have one, and
+/// whether every quad of a box as wide as the panel that reaches the corner square is cut by the corner, as it has to be.
+fn cut_by_the_corner(pair: &Pair, cx: &mut TestAppContext) -> (usize, usize, bool) {
+    cx.update_window(pair.patched.window, |_, window, _| {
+        let scale = window.scale_factor();
+        let frame = &window.rendered_frame;
+        let hitboxes = frame.hitboxes.iter().filter(|hitbox| hitbox.describe().contains("kid"));
+        let (count, rounded) = hitboxes.fold((0, 0), |(count, rounded), hitbox| (count + 1, rounded + usize::from(hitbox.content_mask.is_rounded())));
+        // The corner square of the panel: its last 12 pixels each way, with the panel at 20 down the page.
+        let (right, bottom) = (PANEL * scale, (20. + PANEL_HEIGHT) * scale);
+        let reaching: Vec<_> = frame
+            .scene
+            .quads
+            .iter()
+            .filter(|quad| quad.bounds.right().0 >= right - 0.5 && quad.bounds.bottom().0 > bottom - 12. * scale && quad.bounds.right().0 < right + 0.5)
+            .collect();
+        (count, rounded, !reaching.is_empty() && reaching.iter().all(|quad| quad.content_mask.corner_radii.bottom_right.0 > 0.))
+    })
+    .unwrap()
+}
+
+/// The unit is a box of the height of a panel whose corner square is at its bottom right, past its box: its 13 boxes of 12 are as
+/// wide as the unit, which is clear of the square, until a patch widens them to the panel. A patch of it that is clear of the
+/// corner is painted in its region, and its hitboxes are cut as a replay cuts them, by the rectangle of the panel; one that
+/// reaches the corner is painted where it is, under the rounded panel, as a frame built whole paints it: the quads that the
+/// corner cuts are cut by it.
+#[gpui::test]
+fn a_relayout_patch_that_grows_a_root_into_a_rounded_corner_paints_it_where_a_frame_built_whole_does(cx: &mut TestAppContext) {
+    let pair = Pair::in_rounded_panel(cx, 13);
+    let clip = |cx: &mut TestAppContext| {
+        cx.update_window(pair.patched.window, |_, window, _| window.retained_counters().non_relocatable(NonRelocatable::Clip)).unwrap()
+    };
+    assert_eq!(clip(cx), 0, "the unit is clear of the corner and is recorded to be put elsewhere");
+
+    for kids in [12, 11, 13] {
+        let before = pair.patched.patches(cx);
+        pair.set(|state| state.kids.set(kids));
+        pair.patched.tick(cx);
+        let after = pair.patched.patches(cx);
+        let seen = pair.patched.state.seen.borrow();
+        assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{kids}: {seen:?}");
+        assert_eq!(after.rewritten_recordings, before.rewritten_recordings + 1, "{kids}: {seen:?}");
+        assert_eq!(after.total_declines(), 0, "{kids}: {seen:?}");
+        drop(seen);
+        let (hitboxes, rounded, _) = cut_by_the_corner(&pair, cx);
+        assert!(hitboxes > 0, "{kids}");
+        assert_eq!(rounded, 0, "the hitboxes of a unit that is clear of the corner are cut by the rectangle, {kids} boxes");
+    }
+    // The recording the patches left is one a frame replays.
+    let replays = pair.patched.replays(cx);
+    pair.patched.draw_plain(cx);
+    assert!(pair.patched.replays(cx) > replays, "{:?}", pair.patched.state.seen.borrow());
+    assert_eq!(clip(cx), 0);
+    assert_eq!(cut_by_the_corner(&pair, cx).1, 0);
+
+    let before = pair.patched.patches(cx);
+    pair.set(|state| state.wide.set(true));
+    pair.patched.tick(cx);
+    let after = pair.patched.patches(cx);
+    let seen = pair.patched.state.seen.borrow();
+    assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{seen:?}");
+    assert_eq!(after.total_declines(), before.total_declines(), "{seen:?}");
+    // The recording is not rewritten to say it is clear of the corner, and the frame after builds the unit where it is.
+    assert_eq!(after.rewritten_recordings, before.rewritten_recordings, "{seen:?}");
+    drop(seen);
+    assert!(cut_by_the_corner(&pair, cx).2, "the boxes that reach the corner are cut by it");
+    pair.patched.draw_plain(cx);
+    assert!(clip(cx) > 0);
+    assert!(cut_by_the_corner(&pair, cx).2, "and so they are in the frame that builds the unit");
+    pair.assert_same(cx, "patched into the corner");
+}
+
+/// The frame that checks a patch builds every root as the build a replay is compared with, under the rectangle of a rounded content
+/// mask that the root is clear of the corners of, as a replay cuts it: so the frame under test must cut it so too, or the two
+/// differ in operations (an outline under a rectangle is four strips, under a rounded mask one quad) and the verifier reports
+/// what is no difference in pixels.
+#[gpui::test]
+fn the_verifier_finds_no_difference_in_a_patch_of_a_root_clear_of_a_rounded_corner(cx: &mut TestAppContext) {
+    let pair = Pair::in_rounded_panel(cx, 13);
+    cx.update_window(pair.patched.window, |_, window, _| window.set_retention_verifier(Some(Rc::new(|_| String::new())))).unwrap();
+    pair.patched.settle(cx);
+    for kids in [12, 11, 13] {
+        pair.set(|state| state.kids.set(kids));
+        pair.patched.tick(cx);
+        pair.patched.settle(cx);
+    }
+    // A patch that does not lay the root out again.
+    let patches = pair.patched.patches(cx);
+    pair.set(|state| state.kid_green.set(true));
+    pair.patched.tick(cx);
+    let after = pair.patched.patches(cx);
+    assert_eq!(after.patched_frames, patches.patched_frames + 1, "{:?}", pair.patched.state.seen.borrow());
+    assert_eq!(after.relayout_patches, patches.relayout_patches, "a patch of a color does not lay the root out again");
+    let (verified, mismatches) = cx
+        .update_window(pair.patched.window, |_, window, _| (window.retained_counters().verified, window.retention_mismatches().to_vec()))
+        .unwrap();
+    assert!(verified > 0);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+    assert!(pair.patched.patches(cx).relayout_patches >= 3, "{:?}", pair.patched.state.seen.borrow());
 }
 
 #[gpui::test]

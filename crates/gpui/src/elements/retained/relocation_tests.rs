@@ -3,10 +3,12 @@
 //! what a window that builds everything shows and answers.
 
 use super::*;
+use crate::scene::{Cut, border_strips, without_arcs_if_clear};
 use crate::{
     AnyView, AnyWindowHandle, Bounds, Context, Edges, InteractiveElement, ParentElement, Position, Render,
     RasterizingTextSystem, RetainedCounters, ScrollHandle, StatefulInteractiveElement, StyledText, Styled, TestApp,
     TextLayout, WindowBounds, WindowOptions, div, point, px, size,
+    ContentMask, Corners, Quad, ScaledPixels,
 };
 use accesskit::Role;
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
@@ -15,6 +17,7 @@ use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 const VIEW_WIDTH: f32 = 300.;
 const VIEW_HEIGHT: f32 = 220.;
 const OVERSCAN: f32 = 100.;
+const CARD_MARGIN: f32 = 30.;
 
 type BuildScene = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
@@ -375,13 +378,26 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> 
     row.into_any_element()
 }
 
+/// What has rounded corners around the rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rounding {
+    Nothing,
+    /// The scroller.
+    Scroller,
+    /// A panel that the scroller fills to its padding box, so that its content mask has the
+    /// panel's radii where it has the panel's corners.
+    Panel,
+    /// A card in the scroller that holds every row and scrolls with them.
+    Card,
+}
+
 /// A scroller with the rows, retained or not.
 fn page(
     specs: &Rc<Vec<RowSpec>>,
     handles: &Rc<Handles>,
     scroll: &ScrollHandle,
     retained_rows: bool,
-    rounded: bool,
+    rounding: Rounding,
     framed: bool,
     cx: &mut App,
 ) -> AnyElement {
@@ -394,9 +410,11 @@ fn page(
             })
             .relocatable(px(OVERSCAN));
             // A box placed by something else than the row is outside the extent its owner can
-            // vouch for, so such a row is not culled.
+            // vouch for, so such a row is not culled. The most that a row draws past its box is the
+            // shadow of a card: the shader draws it out to three times its blur radius of 6, and it is
+            // 4 down.
             if !matches!(spec.kind, Kind::Positioned | Kind::Escaping | Kind::Fixed) {
-                row = row.cull_outset(Some(Edges::all(px(12.))));
+                row = row.cull_outset(Some(Edges::all(px(24.))));
             }
             match spec.kind {
                 Kind::Reports => {
@@ -436,7 +454,7 @@ fn page(
         .flex_col()
         .overflow_scroll()
         .track_scroll(scroll);
-    if rounded {
+    if rounding == Rounding::Scroller {
         scroller = scroller.rounded_xl();
     }
     // A positioned page is the frame around the scroller, which does not scroll with the rows.
@@ -454,9 +472,36 @@ fn page(
                 .h(px(height))
                 .children(rows),
         )
+    } else if rounding == Rounding::Card {
+        // Room above and below, so that the scroller does not cut the corners of the card where it is at an end. The room below
+        // is a box of its own: a margin after the last child is not scrollable overflow.
+        scroller
+            .child(
+                div()
+                    .id("card")
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .w(px(VIEW_WIDTH))
+                    .mt(px(CARD_MARGIN))
+                    .rounded_xl()
+                    .overflow_hidden()
+                    .children(rows),
+            )
+            .child(div().id("below-the-card").flex_none().h(px(CARD_MARGIN)))
     } else {
         scroller.children(rows)
     };
+    if rounding == Rounding::Panel {
+        let panel = div()
+            .id("panel")
+            .w(px(VIEW_WIDTH))
+            .h(px(VIEW_HEIGHT))
+            .rounded_xl()
+            .overflow_hidden()
+            .child(scroller);
+        return page.child(panel).into_any_element();
+    }
     page.child(scroller).into_any_element()
 }
 
@@ -467,6 +512,8 @@ struct Pair {
     plain_scroll: ScrollHandle,
     handles: Rc<Handles>,
     plain_handles: Rc<Handles>,
+    /// Something around the rows has rounded corners.
+    rounded: bool,
 }
 
 impl Pair {
@@ -475,6 +522,17 @@ impl Pair {
     }
 
     fn build(cx: &mut TestApp, specs: Vec<RowSpec>, scale_factor: f32, rounded: bool, framed: bool) -> Self {
+        let rounding = if rounded { Rounding::Scroller } else { Rounding::Nothing };
+        Self::build_rounded(cx, specs, scale_factor, rounding, framed)
+    }
+
+    fn build_rounded(
+        cx: &mut TestApp,
+        specs: Vec<RowSpec>,
+        scale_factor: f32,
+        rounding: Rounding,
+        framed: bool,
+    ) -> Self {
         let specs = Rc::new(specs);
         let open = |cx: &mut TestApp, retained_rows: bool| {
             let scroll = ScrollHandle::new();
@@ -486,7 +544,7 @@ impl Pair {
                 let specs = specs.clone();
                 let handles = handles.clone();
                 let scroll = scroll.clone();
-                Rc::new(move |_, cx| page(&specs, &handles, &scroll, retained_rows, rounded, framed, cx))
+                Rc::new(move |_, cx| page(&specs, &handles, &scroll, retained_rows, rounding, framed, cx))
             };
             let window = cx.open_window_with_options(
                 WindowOptions {
@@ -518,6 +576,7 @@ impl Pair {
             plain_scroll,
             handles,
             plain_handles,
+            rounded: rounding != Rounding::Nothing,
         };
         pair.draw(cx);
         pair
@@ -544,8 +603,8 @@ impl Pair {
 
     /// Whether the two windows show and answer the same, as a text that says where not.
     fn difference(&self, cx: &mut TestApp) -> Option<String> {
-        let retained = observe(self.retained, &self.handles, &self.scroll, cx);
-        let plain = observe(self.plain, &self.plain_handles, &self.plain_scroll, cx);
+        let retained = observe(self.retained, self.rounded, &self.handles, &self.scroll, cx);
+        let plain = observe(self.plain, self.rounded, &self.plain_handles, &self.plain_scroll, cx);
         for (name, retained, plain) in [
             ("sprites", &retained.sprites, &plain.sprites),
             ("scene", &retained.scene, &plain.scene),
@@ -740,8 +799,72 @@ fn probes() -> Vec<(f32, f32)> {
     probes
 }
 
+/// `primitives` as [`without_arcs_if_clear`] has them. What is outside `view` shows nothing and is
+/// left out: a subtree past its overscan is not painted, where a build inside a clip that the
+/// content mask does not hold (a card cut by its scroller, painted as a group) paints it.
+fn without_arcs_that_cut_nothing<P: Cut>(mut primitives: Vec<P>, view: Bounds<ScaledPixels>) -> Vec<P> {
+    for primitive in &mut primitives {
+        let reach = primitive.reach();
+        without_arcs_if_clear(primitive.mask(), reach);
+    }
+    primitives.retain(|primitive| !primitive.reach().intersect(&view).is_empty());
+    primitives
+}
+
+/// [`without_arcs_that_cut_nothing`] for quads, which are also drawn differently under a rounded
+/// mask: an outline with no background is four strips under a rectangle and one quad under a
+/// rounded mask (`border_strips`), the same pixels where nothing reaches a corner. Both forms
+/// become the strips, and an outline's draw order is dropped: the strips take their own.
+fn canonical_quads(quads: Vec<Quad>, view: Bounds<ScaledPixels>) -> Vec<Quad> {
+    let mut quads: Vec<Quad> = without_arcs_that_cut_nothing(quads, view)
+        .into_iter()
+        .flat_map(|quad| {
+            if !quad.background.is_transparent() || !quad.border_widths.any(|width| width.0 > 0.) {
+                return vec![quad];
+            }
+            let quad = Quad { order: 0, ..quad };
+            let Some(strips) = border_strips(&quad) else {
+                return vec![quad];
+            };
+            strips
+                .into_iter()
+                .filter_map(|strip| {
+                    let bounds = quad.content_mask.bounds.intersect(&strip);
+                    (!bounds.is_empty()).then(|| Quad {
+                        content_mask: ContentMask { bounds, ..quad.content_mask },
+                        ..quad
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    // Quads of one order do not overlap, so the order they are in says nothing.
+    quads.sort_by_cached_key(|quad| (quad.order, format!("{quad:?}")));
+    quads
+}
+
+fn window_view(window: &Window) -> Bounds<ScaledPixels> {
+    let viewport = window.viewport_size().scale(window.scale_factor());
+    Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), viewport)
+}
+
+fn cut<P: Cut>(view: Option<Bounds<ScaledPixels>>, primitives: Vec<P>) -> Vec<P> {
+    match view {
+        Some(view) => without_arcs_that_cut_nothing(primitives, view),
+        None => primitives,
+    }
+}
+
+fn cut_quads(view: Option<Bounds<ScaledPixels>>, quads: Vec<Quad>) -> Vec<Quad> {
+    match view {
+        Some(view) => canonical_quads(quads, view),
+        None => quads,
+    }
+}
+
 fn observe(
     window: AnyWindowHandle,
+    rounded: bool,
     handles: &Handles,
     scroll: &ScrollHandle,
     cx: &mut TestApp,
@@ -749,29 +872,33 @@ fn observe(
     let probes = probes();
     let (scene, a11y, chains) = cx
         .update_window(window, |_, window, _| {
+            let view = rounded.then(|| window_view(window));
             let scene = &window.rendered_frame.scene;
             let scene = format!(
                 "{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{}\n{:#?}\n{:#?}\n{:#?}\n{:#?}",
-                scene.shadows,
-                scene.quads,
-                scene.underlines,
-                scene.monochrome_sprites,
-                scene.subpixel_sprites,
-                scene.polychrome_sprites,
-                scene.paths,
+                cut(view, scene.shadows.clone()),
+                cut_quads(view, scene.quads.clone()),
+                cut(view, scene.underlines.clone()),
+                cut(view, scene.monochrome_sprites.clone()),
+                cut(view, scene.subpixel_sprites.clone()),
+                cut(view, scene.polychrome_sprites.clone()),
+                cut(view, scene.paths.clone()),
                 scene
                     .groups
                     .iter()
-                    .map(|group| format!(
-                        "group {} {:?} {:?} {:?}",
-                        group.order, group.bounds, group.content_mask, group.effect
-                    ))
+                    .map(|group| {
+                        let mut mask = group.content_mask;
+                        if view.is_some() {
+                            without_arcs_if_clear(&mut mask, group.bounds);
+                        }
+                        format!("group {} {:?} {:?} {:?}", group.order, group.bounds, mask, group.effect)
+                    })
                     .collect::<Vec<_>>()
                     .join("\n"),
-                scene.shadows_with_groups(),
-                scene.quads_with_groups(),
-                scene.underlines_with_groups(),
-                scene.polychrome_sprites_with_groups(),
+                cut(view, scene.shadows_with_groups()),
+                cut_quads(view, scene.quads_with_groups()),
+                cut(view, scene.underlines_with_groups()),
+                cut(view, scene.polychrome_sprites_with_groups()),
             );
             let a11y = canonical_a11y(window.a11y.last_tree_update().expect("a11y is on"), &window.a11y.node_bounds);
             let chains = probes
@@ -794,12 +921,27 @@ fn observe(
     let (texts, scrolls) = describe_handles(handles, scroll);
     let hitboxes = cx
         .update_window(window, |_, window, _| {
-            let mut entries = window
-                .rendered_frame
-                .hitboxes
-                .iter()
-                .filter(|hitbox| hitbox.is_reachable())
-                .map(|hitbox| strip_identity_numbers(&hitbox.describe()))
+            let hitboxes = window.rendered_frame.hitboxes.iter().filter(|hitbox| hitbox.is_reachable());
+            // The rounded masks that hitboxes are cut by, which a replay cuts by without their radii
+            // where the hitbox is clear of the corners (see `without_arcs_if_clear`). The exact clips
+            // of a hitbox hold them too.
+            let masks = hitboxes
+                .clone()
+                .map(|hitbox| hitbox.content_mask)
+                .filter(ContentMask::is_rounded)
+                .collect::<Vec<_>>();
+            let mut entries = hitboxes
+                .map(|hitbox| {
+                    let mut description = hitbox.describe();
+                    if rounded {
+                        let reach = hitbox.window_bounds().intersect(&hitbox.content_mask.bounds);
+                        for mask in masks.iter().filter(|mask| mask.is_clear_of_rounded_corners(reach)) {
+                            let flat = ContentMask { corner_radii: Corners::default(), corner_radii_y: Corners::default(), ..*mask };
+                            description = description.replace(&format!("{mask:?}"), &format!("{flat:?}"));
+                        }
+                    }
+                    strip_identity_numbers(&description)
+                })
                 .collect::<Vec<_>>();
             entries.sort();
             entries.join("\n")
@@ -819,9 +961,9 @@ fn observe(
         .unwrap();
     let sprites = cx
         .update_window(window, |_, window, _| {
+            let view = rounded.then(|| window_view(window));
             let scene = &window.rendered_frame.scene;
-            let mut lines = scene
-                .monochrome_sprites
+            let mut lines = cut(view, scene.monochrome_sprites.clone())
                 .iter()
                 .map(|sprite| {
                     format!(
@@ -830,7 +972,7 @@ fn observe(
                     )
                 })
                 .collect::<Vec<_>>();
-            lines.extend(scene.quads.iter().map(|quad| {
+            lines.extend(cut_quads(view, scene.quads.clone()).iter().map(|quad| {
                 format!("quad {} {:?} {:?} {:?}", quad.order, quad.bounds.origin, quad.bounds.size, quad.content_mask.bounds)
             }));
             lines.join("\n")
@@ -1007,7 +1149,7 @@ fn rows_that_come_from_past_the_overscan_are_built() {
 }
 
 #[test]
-fn a_clip_with_rounded_corners_is_no_place_to_move_rows_to() {
+fn rows_clear_of_the_corners_of_a_rounded_clip_are_moved_and_the_rows_that_touch_one_are_built() {
     let cx = &mut app();
     // Few rows, none of which is culled: a culled one is put anywhere that is culled too.
     let pair = Pair::new(cx, mixed(7), 1., true);
@@ -1015,8 +1157,66 @@ fn a_clip_with_rounded_corners_is_no_place_to_move_rows_to() {
     let before = pair.counters(cx);
     scroll_through(&pair, cx, &[3., 12., 40., 41.]);
     let after = pair.counters(cx);
-    assert_eq!(after.relocations, before.relocations);
-    assert!(after.non_relocatable(NonRelocatable::Clip) > 0, "{after:?}");
+    assert!(after.relocations > before.relocations, "{after:?}");
+    assert!(after.non_relocatable(NonRelocatable::Clip) > before.non_relocatable(NonRelocatable::Clip), "{after:?}");
+}
+
+/// Rows in `pair`, which a rounded clip holds, are moved when the scroll puts them clear of its
+/// corners, and are built where they touch one, and show what a build shows.
+fn rows_under_rounded_corners_follow_the_rule(rounding: Rounding) {
+    let cx = &mut app();
+    for scale_factor in [1., 2.] {
+        let pair = Pair::build_rounded(cx, rows(24, 40., Kind::Button), scale_factor, rounding, false);
+        pair.assert_same(cx, "the first frame");
+        pair.draw(cx);
+        pair.assert_same(cx, "the second frame");
+        let before = pair.counters(cx);
+        scroll_through(&pair, cx, &[1., 2., 5., 30., 31.5, 90., 91., 60., 3., 0.]);
+        let after = pair.counters(cx);
+        assert!(
+            after.relocations - before.relocations > 20,
+            "{rounding:?} at {scale_factor}: rows clear of the corners were moved: {after:?}"
+        );
+        let refused = after.non_relocatable(NonRelocatable::Clip) - before.non_relocatable(NonRelocatable::Clip);
+        assert!(refused > 0, "{rounding:?} at {scale_factor}: the rows at the corners were built: {after:?}");
+        assert!(refused < 10 * 6, "{rounding:?} at {scale_factor}: only the rows at the corners were: {after:?}");
+    }
+}
+
+#[test]
+fn a_scroller_that_fills_a_rounded_panel_moves_the_rows_that_are_clear_of_its_corners() {
+    rows_under_rounded_corners_follow_the_rule(Rounding::Panel);
+}
+
+#[test]
+fn a_rounded_scroller_moves_the_rows_that_are_clear_of_its_corners() {
+    rows_under_rounded_corners_follow_the_rule(Rounding::Scroller);
+}
+
+#[test]
+fn rows_in_a_rounded_card_that_scrolls_with_them_are_moved_where_they_are_clear_of_its_corners() {
+    let cx = &mut app();
+    // 12 rows of 40 make a card of 480 with 30 above and below it, in a viewport of 220. Its top corners are in view and
+    // uncut by the scroller up to an offset of 30, and its bottom ones from 290 to the end of the scroll at 320; between,
+    // the scroller cuts it by a straight edge, which is no corner.
+    let pair = Pair::build_rounded(cx, rows(12, 40., Kind::Button), 1., Rounding::Card, false);
+    pair.assert_same(cx, "the first frame");
+    pair.draw(cx);
+    let near_the_top = [1., 2., 5., 10., 18., 29., 12., 3., 0.];
+    let near_the_bottom = [290., 291., 300., 305., 310., 320., 315., 292., 300.];
+    for (name, offsets) in [("with its top corners in view", &near_the_top[..]), ("in the middle", &[100., 101., 150., 151., 200., 240., 280., 289.][..]), ("with its bottom corners in view", &near_the_bottom[..])] {
+        let before = pair.counters(cx);
+        scroll_through(&pair, cx, offsets);
+        let after = pair.counters(cx);
+        assert!(after.relocations > before.relocations, "{name}: rows of the card were moved: {after:?}");
+        if name != "in the middle" {
+            assert!(
+                after.non_relocatable(NonRelocatable::Clip) > before.non_relocatable(NonRelocatable::Clip),
+                "{name}: the rows at the corners of the card were built: {after:?}"
+            );
+        }
+    }
+    assert_eq!(pair.counters(cx).mismatches, 0);
 }
 
 #[test]
@@ -1322,8 +1522,13 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
             .collect();
         let scale_factor = if rng.random_bool(0.5) { 1. } else { 2. };
         let rounded = rng.random_bool(0.25);
+        let rounding = if rounded {
+            [Rounding::Scroller, Rounding::Panel, Rounding::Card][rng.random_range(0..3)]
+        } else {
+            Rounding::Nothing
+        };
         let framed = rng.random_bool(0.5);
-        let pair = Pair::build(cx, specs, scale_factor, rounded, framed);
+        let pair = Pair::build_rounded(cx, specs, scale_factor, rounding, framed);
         if verified {
             cx.update_window(pair.retained, |_, window, _| {
                 window.set_retention_verifier(Some(Rc::new(|_| String::new())));
@@ -1346,7 +1551,7 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
                 assert!(mismatches.is_empty(), "seed {seed} step {step} offset {offset} (scale {scale_factor}): {}", mismatches.join("\n"));
             }
             if let Some(difference) = pair.difference(cx) {
-                panic!("seed {seed} (scale {scale_factor}, rounded {rounded}, framed {framed}) step {step} offset {offset}: {difference}");
+                panic!("seed {seed} (scale {scale_factor}, rounding {rounding:?}, framed {framed}) step {step} offset {offset}: {difference}");
             }
             if rng.random_bool(0.3) {
                 pair.draw(cx);

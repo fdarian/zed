@@ -1120,6 +1120,19 @@ impl Scene {
         self.describe_operations_with(0..self.paint_operations.len(), false, false)
     }
 
+    /// [`Scene::describe_operations`] for the retention verifier, which does not tell a primitive under
+    /// a rounded content mask from the same one under its rectangle where its reach is clear of every
+    /// corner (see [`without_arcs_if_clear`]).
+    pub(crate) fn describe_operations_modulo_arcs(&self, range: Range<usize>, loose: bool) -> String {
+        Self::describe_operation_slice_with(self.paint_operations.get(range).unwrap_or_default(), true, loose, true)
+    }
+
+    /// [`Scene::describe_drawn`] with the arcs that cut nothing left out, as
+    /// [`Scene::describe_operations_modulo_arcs`] does.
+    pub(crate) fn describe_drawn_modulo_arcs(&self) -> String {
+        Self::describe_operation_slice_with(&self.paint_operations, false, false, true)
+    }
+
     /// [`Scene::describe_drawn`] of `operations`.
     pub(crate) fn describe_drawn_operations(operations: &[PaintOperation]) -> String {
         Self::describe_operation_slice(operations, false, false)
@@ -1130,7 +1143,21 @@ impl Scene {
     }
 
     fn describe_operation_slice(operations: &[PaintOperation], marks: bool, loose: bool) -> String {
+        Self::describe_operation_slice_with(operations, marks, loose, false)
+    }
+
+    fn describe_operation_slice_with(operations: &[PaintOperation], marks: bool, loose: bool, modulo_arcs: bool) -> String {
         use std::fmt::Write as _;
+
+        fn text<P: Cut + Clone + Debug>(primitive: &P, modulo_arcs: bool) -> String {
+            if modulo_arcs && primitive.mask_ref().has_arcs() {
+                let mut primitive = primitive.clone();
+                let reach = primitive.reach();
+                without_arcs_if_clear(primitive.mask(), reach);
+                return format!("{primitive:?}");
+            }
+            format!("{primitive:?}")
+        }
 
         let mut out = String::new();
         // Whether each open layer is a clipped away one, which an element that is culled does not
@@ -1153,16 +1180,16 @@ impl Scene {
                 _ => {}
             }
             match operation {
-                PaintOperation::Primitive(Primitive::Shadow(shadow)) => write!(out, "{shadow:?}"),
+                PaintOperation::Primitive(Primitive::Shadow(shadow)) => write!(out, "{}", text(shadow, modulo_arcs)),
                 PaintOperation::Primitive(Primitive::Quad(quad)) | PaintOperation::Quad(quad) => {
-                    write!(out, "{quad:?}")
+                    write!(out, "{}", text(quad, modulo_arcs))
                 }
-                PaintOperation::Primitive(Primitive::Path(path)) => write!(out, "{path:?}"),
-                PaintOperation::Primitive(Primitive::Underline(underline)) => write!(out, "{underline:?}"),
-                PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)) => write!(out, "{sprite:?}"),
-                PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)) => write!(out, "{sprite:?}"),
+                PaintOperation::Primitive(Primitive::Path(path)) => write!(out, "{}", text(path, modulo_arcs)),
+                PaintOperation::Primitive(Primitive::Underline(underline)) => write!(out, "{}", text(underline, modulo_arcs)),
+                PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)) => write!(out, "{}", text(sprite, modulo_arcs)),
+                PaintOperation::Primitive(Primitive::SubpixelSprite(sprite)) => write!(out, "{}", text(sprite, modulo_arcs)),
                 PaintOperation::Primitive(Primitive::PolychromeSprite(sprite)) | PaintOperation::Image(sprite) => {
-                    write!(out, "{sprite:?}")
+                    write!(out, "{}", text(sprite, modulo_arcs))
                 }
                 PaintOperation::Primitive(Primitive::Surface(surface)) => write!(out, "{surface:?}"),
                 PaintOperation::PendingGlyph(glyph) => write!(out, "{glyph:?}"),
@@ -2028,7 +2055,7 @@ impl Scene {
 /// The four rectangles a quad with no background is drawn as, around its empty interior, so that
 /// the shader does not shade every transparent pixel inside a large outline; none when it is
 /// drawn whole.
-fn border_strips(quad: &Quad) -> Option<[Bounds<ScaledPixels>; 4]> {
+pub(crate) fn border_strips(quad: &Quad) -> Option<[Bounds<ScaledPixels>; 4]> {
     // Without a border there is nothing to cut around: a transparent quad that has none is the
     // background `Style::keep_transparent_background` keeps, and it stays one operation that a
     // patch can write a colour over.
@@ -2496,6 +2523,75 @@ impl Iterator for TranslatedOperations<'_> {
     fn next(&mut self) -> Option<PaintOperation> {
         let operation = self.operations.next()?;
         Some(self.translate(operation))
+    }
+}
+
+/// A primitive of the scene, which a replay under a rounded content mask paints under the rectangle of
+/// it.
+pub(crate) trait Cut {
+    /// Where the primitive paints, with what it spreads past its bounds.
+    fn reach(&self) -> Bounds<ScaledPixels>;
+    fn mask(&mut self) -> &mut ContentMask<ScaledPixels>;
+    fn mask_ref(&self) -> &ContentMask<ScaledPixels>;
+}
+
+macro_rules! cut {
+    ($($primitive:ty),*) => {$(
+        impl Cut for $primitive {
+            fn reach(&self) -> Bounds<ScaledPixels> {
+                self.bounds
+            }
+            fn mask(&mut self) -> &mut ContentMask<ScaledPixels> {
+                &mut self.content_mask
+            }
+            fn mask_ref(&self) -> &ContentMask<ScaledPixels> {
+                &self.content_mask
+            }
+        }
+    )*};
+}
+
+cut!(Quad, Underline, MonochromeSprite, SubpixelSprite, PolychromeSprite, Path<ScaledPixels>);
+
+impl Cut for Shadow {
+    // The shader draws a shadow out to three times its blur radius.
+    fn reach(&self) -> Bounds<ScaledPixels> {
+        self.bounds.dilate(self.blur_radius * 3.)
+    }
+    fn mask(&mut self) -> &mut ContentMask<ScaledPixels> {
+        &mut self.content_mask
+    }
+    fn mask_ref(&self) -> &ContentMask<ScaledPixels> {
+        &self.content_mask
+    }
+}
+
+impl ContentMask<ScaledPixels> {
+    fn has_arcs(&self) -> bool {
+        self.corner_radii != Corners::default() || self.corner_radii_y != Corners::default()
+    }
+}
+
+/// `mask` without its radii where `reach` is clear of every corner of it: painting under that mask
+/// and under its rectangle make the same pixels, and a replay paints under the rectangle. A
+/// primitive that reaches a corner keeps its radii, so that a replay that put one there shows as a
+/// difference.
+pub(crate) fn without_arcs_if_clear(mask: &mut ContentMask<ScaledPixels>, reach: Bounds<ScaledPixels>) {
+    let pixels = |value: ScaledPixels| crate::px(value.0);
+    let in_pixels = |bounds: Bounds<ScaledPixels>| {
+        Bounds::new(
+            crate::point(pixels(bounds.origin.x), pixels(bounds.origin.y)),
+            crate::size(pixels(bounds.size.width), pixels(bounds.size.height)),
+        )
+    };
+    let rounded = ContentMask {
+        bounds: in_pixels(mask.bounds),
+        corner_radii: mask.corner_radii.map(|radius| pixels(*radius)),
+        corner_radii_y: mask.corner_radii_y.map(|radius| pixels(*radius)),
+    };
+    if rounded.is_rounded() && rounded.is_clear_of_rounded_corners(in_pixels(reach)) {
+        mask.corner_radii = Corners::default();
+        mask.corner_radii_y = Corners::default();
     }
 }
 
@@ -5321,5 +5417,48 @@ mod tests {
             panic!("an emoji is a polychrome sprite")
         };
         assert_eq!((sprite.bounds, sprite.opacity), (emoji.bounds, 0.5));
+    }
+    /// The content mask of a rounded panel, WINDOW wide, with corners of radius 10.
+    fn rounded_mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            corner_radii: Corners::all(ScaledPixels(10.)),
+            ..mask()
+        }
+    }
+
+    fn verifier_text(primitive: PaintOperation) -> String {
+        Scene::describe_operation_slice_with(&[primitive], false, false, true)
+    }
+
+    #[test]
+    fn the_verifier_text_ignores_a_rounded_mask_only_on_a_primitive_clear_of_its_corners() {
+        let sprite_under = |mask| {
+            let mut sprite = glyph(40., 40.);
+            sprite.content_mask = mask;
+            PaintOperation::Primitive(Primitive::MonochromeSprite(sprite))
+        };
+        let quad_under = |mask| {
+            let mut quad = quad(0., 0., 30., 30.);
+            quad.content_mask = mask;
+            PaintOperation::Primitive(Primitive::Quad(quad))
+        };
+
+        assert_eq!(verifier_text(sprite_under(mask())), verifier_text(sprite_under(rounded_mask())), "a glyph in the middle");
+        assert_ne!(
+            Scene::describe_operation_slice(&[sprite_under(mask())], false, false),
+            Scene::describe_operation_slice(&[sprite_under(rounded_mask())], false, false),
+            "which the text of the operations tells apart"
+        );
+
+        // This quad covers the top left corner square: under the rounded mask the arc cuts it, and not under the rectangle.
+        assert_ne!(verifier_text(quad_under(mask())), verifier_text(quad_under(rounded_mask())), "a quad that reaches a corner");
+
+        let mut narrower = rounded_mask();
+        narrower.bounds = bounds(0., 0., WINDOW - 1., WINDOW);
+        assert_ne!(
+            verifier_text(sprite_under(mask())),
+            verifier_text(sprite_under(narrower)),
+            "masks of other bounds differ whatever their radii"
+        );
     }
 }

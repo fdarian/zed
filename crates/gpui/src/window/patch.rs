@@ -322,6 +322,9 @@ pub(crate) struct PatchUnit {
     relocatable: bool,
     /// The root may lay out again in a patch (`Retained::patchable_relayout`).
     relayout: bool,
+    /// What the owner vouches the root draws outside its extent (`Retained::cull_outset`), which
+    /// where it is under a rounded content mask is what keeps it clear of the corners.
+    cull_outset: Option<Edges<Pixels>>,
     /// The root has an `on_replay` listener: its owner republishes what its listeners report whenever
     /// a replay stands for them, so the recording of it may hold publications.
     pub(crate) publishes: bool,
@@ -394,6 +397,10 @@ pub(crate) struct PatchSource {
     /// that does not lay the root out again prepaints and paints it in that region and puts the
     /// operations where the frame has them, `delta` from where they were recorded.
     pub(crate) relocation: Option<Relocation>,
+    /// What the root was recorded in by the build that the verifier compares a replay with (`direct`: no region) under a
+    /// rounded content mask, which that build cuts the root by the rectangle of: a patch cuts it the same where it is clear
+    /// of the corners still, see [`Relocation::flattens_ambient`].
+    pub(crate) flattened: Option<Relocation>,
     pub(crate) delta: Point<Pixels>,
     /// The reasons the recording cannot be put elsewhere, as they were recorded: a patch that finds others
     /// leaves the recording as it is and the frame is not one that can be translated until it is built whole.
@@ -505,6 +512,8 @@ struct PreparedStep {
     accessed: FxHashSet<EntityId>,
     /// A root recorded to be put elsewhere is prepainted and painted in its region.
     relocated: Option<RelocatedStep>,
+    /// The content mask that a root recorded `direct` under a rounded one is cut by, where it is clear of the corners.
+    flattened: Option<ContentMask<Pixels>>,
 }
 
 /// What prepaint noted of a root that is recorded in a region of its own, for paint to go on from.
@@ -797,6 +806,7 @@ impl Window {
         lift_z: Option<i32>,
         relocatable: bool,
         relayout: bool,
+        cull_outset: Option<Edges<Pixels>>,
         publishes: bool,
     ) -> Option<Rc<PatchUnit>> {
         let placement = if self.lifts_open == 0 {
@@ -810,6 +820,7 @@ impl Window {
             lift_z,
             relocatable,
             relayout,
+            cull_outset,
             publishes,
             prepaint: self.capture_surroundings()?,
             placement,
@@ -833,6 +844,7 @@ impl Window {
             lift_z: unit.lift_z,
             relocatable: unit.relocatable,
             relayout: unit.relayout,
+            cull_outset: unit.cull_outset,
             publishes: unit.publishes,
             prepaint: unit.prepaint.clone(),
             placement,
@@ -1615,10 +1627,27 @@ impl Window {
         // recorded, whether or not a scroll moved it since: what the patch paints there is put in the frame `delta`
         // away, as a replay puts the recording, and a root that lays out again has its recording rewritten from the
         // patch, region and all, so that the next replay or translate moves it from where it was recorded as before.
+        // A patch that laid the root out again may have grown it into a corner of a rounded content mask, which a
+        // region would paint it clear of: the root is then painted where it is, as a frame built whole builds it.
         let region = match (&source.relocation, &around.placement) {
-            (Some(relocation), Placement::InPlace) if self.content_mask() == relocation.ambient => Some(relocation.reopened()),
+            (Some(relocation), Placement::InPlace)
+                if self.content_mask() == relocation.ambient && self.clears_rounded_corners(built_root, bounds, around.cull_outset) =>
+            {
+                Some(relocation.reopened())
+            }
             _ => None,
         };
+        // The build that the verifier compares with cuts a root it recorded without a region by the rectangle of a rounded content
+        // mask that the root is clear of the corners of, and so does the patch, whether or not it lays the root out again.
+        let flattened = source
+            .flattened
+            .as_ref()
+            .filter(|relocation| {
+                relocation.flattens_ambient()
+                    && self.content_mask() == relocation.ambient
+                    && self.clears_rounded_corners(built_root, bounds, around.cull_outset)
+            })
+            .map(Relocation::surroundings);
         if region.is_none() && !source.delta.is_zero() {
             return Err(PatchDecline::Relocated);
         }
@@ -1630,15 +1659,21 @@ impl Window {
         });
         let prepaint_start = self.prepaint_index();
         let outside = mem::replace(&mut self.root_escape, (unit.element.escapes_to() == Some(Escape::ContainingBlock)).then_some(built_root));
-        let ambient = region.as_ref().map(|relocation| relocation.ambient);
+        let surroundings = region.as_ref().map(Relocation::surroundings);
         if let Some(relocation) = region {
             self.begin_relocation(relocation, false);
         }
         let focus_before = self.next_frame.focus.take();
+        if let Some(mask) = &flattened {
+            self.content_mask_stack.push(mask.clone());
+        }
         unit.element.prepaint(self, cx);
+        if flattened.is_some() {
+            self.content_mask_stack.pop();
+        }
         let holds_focus = self.next_frame.focus.is_some();
         self.next_frame.focus = focus_before.or(self.next_frame.focus);
-        let relocation = ambient.map(|_| self.end_relocation().0);
+        let relocation = surroundings.map(|_| self.end_relocation().0);
         self.root_escape = outside;
         let hitbox_ids = self.patch.hitbox_ids.take().expect("a patch gives the hitboxes ids");
         self.publish_prepared(prepaint_start.layout_publications_index, cx);
@@ -1657,14 +1692,14 @@ impl Window {
         if moved && self.scrollers_block_a_move(prepaint_start.scrollers_index..prepaint_end.scrollers_index) {
             return Err(PatchDecline::Relocated);
         }
-        let relocated = relocation.zip(ambient).map(|(relocation, ambient)| {
+        let relocated = relocation.zip(surroundings).map(|(relocation, surroundings)| {
             let range = prepaint_start.hitboxes_index..prepaint_end.hitboxes_index;
             let hitboxes = self.next_frame.hitboxes[range.clone()].to_vec();
             // A root that lays out again has the hitboxes it has now where the frame has them, as the splice puts them
             // there; one that does not has its recorded ones moved by the places it is put in.
             let delta = if relaid { source.delta } else { Point::default() };
             if !(moved && hitboxes.iter().any(|hitbox| hitbox.unclipped)) {
-                self.place_hitboxes_from_region(range, &hitboxes, delta, &ambient);
+                self.place_hitboxes_from_region(range, &hitboxes, delta, &surroundings);
             }
             RelocatedStep { relocation, hitboxes, blockers: effects.blockers(&after_prepaint) }
         });
@@ -1685,6 +1720,7 @@ impl Window {
             holds_focus,
             accessed: FxHashSet::default(),
             relocated,
+            flattened,
         })
     }
 
@@ -1725,7 +1761,13 @@ impl Window {
             let relocation = mem::replace(&mut step.relocation, source.relocation.as_ref().expect("a root painted in its region has one").reopened());
             self.begin_relocation(relocation, true);
         }
+        if let Some(mask) = &step.flattened {
+            self.content_mask_stack.push(mask.clone());
+        }
         self.with_every_glyph_painted(|window| unit.element.paint(window, cx));
+        if step.flattened.is_some() {
+            self.content_mask_stack.pop();
+        }
         let region = region.map(|mut step| {
             let (relocation, operations) = self.end_relocation();
             step.relocation = relocation;
@@ -1816,7 +1858,7 @@ impl Window {
             // The hitboxes of a root put elsewhere are the recorded ones, `delta` from where they were recorded. At
             // delta zero they are the ones the prepaint relocated in place.
             for ((placed, _), recorded) in places.hitboxes.iter_mut().zip(&step.hitboxes) {
-                let mut moved = recorded.relocated(source.delta, &step.relocation.ambient);
+                let mut moved = recorded.relocated(source.delta, &step.relocation.surroundings());
                 moved.parent = placed.parent;
                 *placed = moved;
             }
