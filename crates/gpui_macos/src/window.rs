@@ -73,7 +73,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod composition;
@@ -96,9 +96,13 @@ const REFUSES_KEY_IVAR: &str = "refusesKey";
 /// posts when a step stops the link; an animation asks again in every step.
 const IDLE_STEPS_BEFORE_STOP: u32 = 2;
 
+/// How soon after a window's eager step (`step_started_display_links`) a display-link step is
+/// held back when the screen reports no refresh rate: about half of 120 Hz's period.
+const EAGER_STEP_PACING_FALLBACK: Duration = Duration::from_millis(4);
+
 thread_local! {
-    /// Windows whose link started and has not stepped since: [`step_started_display_links`] gives
-    /// each its first step without waiting for the first vsync.
+    /// Windows whose `first_step_pending` was set, for [`step_started_display_links`] to look at
+    /// without a walk over every window. Whether one is still owed its step is the flag's to say.
     static STARTED_LINKS: RefCell<Vec<Weak<Mutex<MacWindowState>>>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -651,8 +655,15 @@ struct MacWindowState {
     frame_requested: bool,
     /// Consecutive `step`s in which nobody asked for another frame.
     idle_steps: u32,
-    /// The state's own `Arc`, set right after it is built; `start_display_link` lists it in
-    /// `STARTED_LINKS`.
+    /// A frame request started the link (it was stopped) and no frame has been drawn since: the
+    /// window is owed the eager step of `step_started_display_links`. Not set by a link that
+    /// `restart_display_link` or `resubscribe_display_link` brings back, which a frame was drawn
+    /// with or that is only following the window to another display.
+    first_step_pending: bool,
+    /// When `step_started_display_links` last stepped this window: a vsync that merged while that
+    /// frame drew has its step queued right behind it, and `step` lets it go by.
+    last_eager_step: Option<Instant>,
+    /// The state's own `Arc`, set right after it is built; `STARTED_LINKS` holds it.
     self_handle: Weak<Mutex<MacWindowState>>,
     renderer: renderer::Renderer,
     composition: composition::MacComposition,
@@ -839,14 +850,14 @@ impl MacWindowState {
     }
 
     /// Subscribes to the display's link unless this window already is. A window that is not
-    /// visible never starts one.
-    fn start_display_link(&mut self) {
+    /// visible never starts one. Returns whether this call started it.
+    fn start_display_link(&mut self) -> bool {
         if self
             .frame_source
             .as_ref()
             .is_some_and(WindowFrameSource::is_running)
         {
-            return;
+            return false;
         }
         unsafe {
             if !self
@@ -854,31 +865,52 @@ impl MacWindowState {
                 .occlusionState()
                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
             {
-                return;
+                return false;
             }
         }
         let Some(display_id) = display_id_for_screen(unsafe { self.native_window.screen() }) else {
             // AppKit can temporarily report no screen while displays are being reconfigured.
-            return;
+            return false;
         };
         self.idle_steps = 0;
         let data = self.native_view.as_ptr() as *mut c_void;
-        let started = self
-            .frame_source
+        self.frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
             .start(display_id)
             .log_err()
-            .is_some();
-        if started {
-            STARTED_LINKS.with_borrow_mut(|started_links| {
-                if !started_links
-                    .iter()
-                    .any(|listed| listed.ptr_eq(&self.self_handle))
-                {
-                    started_links.push(self.self_handle.clone());
-                }
-            });
+            .is_some()
+    }
+
+    /// `start_display_link` for a link that a frame request or the window becoming visible
+    /// starts: the window is then owed an eager first step (`step_started_display_links`).
+    fn start_display_link_for_first_step(&mut self) {
+        if !self.start_display_link() {
+            return;
         }
+        self.first_step_pending = true;
+        STARTED_LINKS.with_borrow_mut(|started_links| {
+            started_links.retain(|listed| listed.strong_count() > 0);
+            if !started_links
+                .iter()
+                .any(|listed| listed.ptr_eq(&self.self_handle))
+            {
+                started_links.push(self.self_handle.clone());
+            }
+        });
+    }
+
+    /// How soon after an eager step a display-link step is let go by: half of the period of the
+    /// screen's maximum refresh rate, so the vsync that merged before the eager frame was done is
+    /// skipped and the next one is not. The period comes from the screen and not from the link
+    /// (`display_link.rs` keeps its registry private); a screen that reports no rate gets
+    /// `EAGER_STEP_PACING_FALLBACK`.
+    fn eager_step_pacing(&self) -> Duration {
+        let frames_per_second: NSInteger =
+            unsafe { msg_send![self.native_window.screen(), maximumFramesPerSecond] };
+        if frames_per_second <= 0 {
+            return EAGER_STEP_PACING_FALLBACK;
+        }
+        Duration::from_secs_f64(0.5 / frames_per_second as f64)
     }
 
     /// Follows the window to the display it is on now. A stopped link stays stopped: the next
@@ -923,7 +955,7 @@ impl MacWindowState {
 
     fn request_frames(&mut self) {
         self.frame_requested = true;
-        self.start_display_link();
+        self.start_display_link_for_first_step();
     }
 
     fn is_maximized(&self) -> bool {
@@ -1167,6 +1199,8 @@ impl MacWindow {
                 frame_source: None,
                 frame_requested: false,
                 idle_steps: 0,
+                first_step_pending: false,
+                last_eager_step: None,
                 self_handle: Weak::new(),
                 composition: composition::MacComposition::new(renderer_context.clone()),
                 renderer: renderer::new_renderer(
@@ -3109,7 +3143,7 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
         {
             lock.move_traffic_light();
-            lock.start_display_link();
+            lock.start_display_link_for_first_step();
         } else {
             lock.stop_display_link();
         }
@@ -3267,6 +3301,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
                 composition::set_presents_with_transaction(&mut lock, false);
+                lock.first_step_pending = false;
                 lock.restart_display_link(was_running);
             }
         } else {
@@ -3391,6 +3426,8 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
         composition::set_presents_with_transaction(&mut lock, false);
+        // The draw may have asked for a frame while the link was stopped, which owes nothing now.
+        lock.first_step_pending = false;
         lock.restart_display_link(was_running);
     }
 }
@@ -3412,11 +3449,23 @@ pub(crate) fn link_stops() -> usize {
 extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
+    {
+        let mut lock = window_state.lock();
+        if let Some(eager_step) = lock.last_eager_step {
+            if eager_step.elapsed() < lock.eager_step_pacing() {
+                // Not counted as a step: the window keeps its frame request and the next vsync
+                // draws it, a frame period after the eager frame instead of right behind it.
+                return;
+            }
+            lock.last_eager_step = None;
+        }
+    }
     step_window(&window_state);
 }
 
 fn step_window(window_state: &Mutex<MacWindowState>) {
     let mut lock = window_state.lock();
+    lock.first_step_pending = false;
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         LINK_STEPS.fetch_add(1, Ordering::Relaxed);
@@ -3428,27 +3477,43 @@ fn step_window(window_state: &Mutex<MacWindowState>) {
     }
 }
 
-/// Runs the first frame step of every window whose display link started since the last call and
-/// that still has a frame request, instead of leaving it to the link's first vsync, which comes
-/// up to a frame period later. It is the step the link would run, so the frame it draws is
-/// presented now and the link's next step finds the window clean.
+/// Runs the first frame step of every window whose link a frame request (or the window becoming
+/// visible) started since it last drew, and that still has a frame request, instead of leaving it
+/// to the link's first vsync, which comes up to a frame period later. It is the step the link
+/// would run: the frame it draws is presented when gpui presents (`needs_present`) and the link's
+/// next step finds the window clean. The link's vsync that merged while that frame drew is let
+/// go by (`step`), so an animation's next frame is not drawn right behind this one.
 ///
-/// Must run on the main thread, outside any input dispatch (the embedder calls it after its
-/// run-loop pump returns): a step draws.
+/// Must run on the main thread, outside any input dispatch and outside any other call that
+/// drew (the embedder calls it after its run-loop pump returns): a step draws. It has no
+/// autorelease pool of its own to lean on there, so each step has one.
 pub fn step_started_display_links() {
     let started = STARTED_LINKS.take();
     for window_state in started.iter().filter_map(Weak::upgrade) {
         let wants_step = {
-            let lock = window_state.lock();
-            lock.frame_requested
+            let mut lock = window_state.lock();
+            std::mem::take(&mut lock.first_step_pending)
+                && lock.frame_requested
                 && lock
                     .frame_source
                     .as_ref()
                     .is_some_and(WindowFrameSource::is_running)
         };
         if wants_step {
-            step_window(&window_state);
+            unsafe {
+                let pool = NSAutoreleasePool::new(nil);
+                step_window(&window_state);
+                pool.drain();
+            }
+            window_state.lock().last_eager_step = Some(Instant::now());
         }
+    }
+}
+
+/// Forgets the windows [`step_started_display_links`] would step; their links keep running.
+pub fn discard_started_display_links() {
+    for window_state in STARTED_LINKS.take().iter().filter_map(Weak::upgrade) {
+        window_state.lock().first_step_pending = false;
     }
 }
 
@@ -4125,9 +4190,4 @@ mod tests {
             NSDragOperationCopy
         );
     }
-}
-
-/// Forgets the windows [`step_started_display_links`] would step; their links keep running.
-pub fn discard_started_display_links() {
-    STARTED_LINKS.with_borrow_mut(Vec::clear);
 }
