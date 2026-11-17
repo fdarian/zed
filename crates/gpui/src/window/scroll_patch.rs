@@ -336,8 +336,9 @@ pub struct ScrollPatchCounters {
     pub rows_rebuilt: u64,
     /// The rows those frames took out of the frame because they left.
     pub rows_removed: u64,
-    /// The frames presented with a shift: a platform copied the pixels of the list that stayed and drew the rest
-    /// (see [`crate::FrameDamage`]).
+    /// The presentations whose damage carried a shift (see [`crate::FrameDamage`]), not the copies made: a platform
+    /// may draw such a frame whole (a window that is not opaque, a composed window, a target that is not valid, a
+    /// shift that does not fit the target).
     pub shifted: u64,
     apply_declines: [u64; ScrollApplyDecline::ALL.len()],
     reasons: [u64; ScrollPatchReason::ALL.len()],
