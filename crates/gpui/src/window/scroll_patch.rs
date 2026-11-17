@@ -1893,12 +1893,12 @@ impl Window {
                 moved.parent = slot.parent;
                 *slot = moved;
             }
-            run.delta = movement.total;
-            roots.push((run.id.clone(), movement.total, run.hook.clone()));
-        }
             // The reach is where the root paints in the frame shown, and the next scroll is judged from this frame.
             let moved_by = movement.total - run.delta;
             run.reach = run.reach.map(|reach| Bounds::new(reach.origin + moved_by, reach.size));
+            run.delta = movement.total;
+            roots.push((run.id.clone(), movement.total, run.hook.clone()));
+        }
 
         let rows_removed = membership.removed as u64;
         self.scroll_patch.counters.rows_rebuilt += membership.rebuilt as u64;

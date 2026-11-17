@@ -753,6 +753,35 @@ fn a_row_that_reaches_a_corner_after_several_translates_is_built_there(cx: &mut 
 }
 
 #[gpui::test]
+fn a_row_built_at_a_corner_is_predicted_under_the_rounded_mask_it_is_built_in(cx: &mut TestAppContext) {
+    // The second row is clear of the corners of the panel at 14 from the top, and a scroll by 4 puts it
+    // at its top corner, where it is built. The pointer is past the arc of the corner (12 from its centre
+    // at 88 across and 12 down), where the rectangle of the mask is and the mask is not: the row built
+    // there does not take the pointer. Predicted under the rectangle it would, which is a hover change
+    // that does not happen.
+    let fixture = Fixture::in_rounded_panel_with_wide_row(cx, 1);
+    fixture.scroll(cx, 10., 5., 16.);
+    fixture.point_at(cx, 99.9, 10.1);
+    let before = fixture.counters(cx);
+    // The wheel has to reach the list, which the corner is outside of, so the pointer is put back after it.
+    cx.update_window(fixture.window, |_, window, cx| {
+        let event = ScrollWheelEvent {
+            position: point(px(50.), px(50.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-4.))),
+            ..Default::default()
+        };
+        window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+        window.mouse_position = point(px(99.9), px(10.1));
+    })
+    .unwrap();
+    fixture.draw(cx);
+    let counters = fixture.counters(cx);
+    assert_eq!(counters.frames, before.frames + 1, "{counters:?}");
+    assert_eq!(counters.reasons(ScrollPatchReason::Hover), before.reasons(ScrollPatchReason::Hover), "{counters:?}");
+    assert_eq!((counters.eligible, counters.mispredicted), (before.eligible + 1, 0), "{counters:?}");
+}
+
+#[gpui::test]
 fn a_translate_keeps_the_recording_of_the_rows_for_the_frame_after(cx: &mut TestAppContext) {
     // A frame built whole after translated ones puts the rows from their recordings, and a
     // translate after it is from that frame: the two kinds interleave.
