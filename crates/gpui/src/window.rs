@@ -3130,6 +3130,38 @@ impl AmbientTransform {
     }
 }
 
+/// See [`Window::outset_space`].
+pub(crate) struct OutsetSpace {
+    stretch: f32,
+    /// From the own space of the node to the space around it, when it has a transform of its own.
+    own: Option<TransformationMatrix>,
+}
+
+impl OutsetSpace {
+    /// The box of the node in the space around it, where its transform of its own puts it.
+    pub(crate) fn own_box(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        match &self.own {
+            Some(own) => own.bounding_box(bounds),
+            None => bounds,
+        }
+    }
+
+    /// `bounds` (in the window) grown by `outset`, in the own space of the node, by as far as that
+    /// reaches there, and by `slack`.
+    pub(crate) fn inflate(&self, bounds: Bounds<Pixels>, outset: Edges<Pixels>, slack: Pixels) -> Bounds<Pixels> {
+        Bounds::from_corners(
+            point(
+                bounds.origin.x - outset.left * self.stretch - slack,
+                bounds.origin.y - outset.top * self.stretch - slack,
+            ),
+            point(
+                bounds.right() + outset.right * self.stretch + slack,
+                bounds.bottom() + outset.bottom * self.stretch + slack,
+            ),
+        )
+    }
+}
+
 /// See [`Window::enter_space`].
 struct Entered {
     outer: TransformationMatrix,
@@ -3415,6 +3447,10 @@ impl ContentMask<Pixels> {
     /// squares, one at each corner with a radius, that the corner's arc is cut out of. A box that
     /// is clear is cut by straight edges only, whatever the radii say, so that painting under
     /// this mask and under its bounds alone make the same pixels of it.
+    ///
+    /// The squares are the shader's, not the fitted radii of [`Self::contains`]: it reads the raw
+    /// radii of the quadrant a point is in, so a corner reaches at most to the middle of the mask
+    /// on each axis, however large its radius.
     pub(crate) fn is_clear_of_rounded_corners(&self, bounds: Bounds<Pixels>) -> bool {
         let frame = self.bounds;
         let half = Size::new(frame.size.width / 2., frame.size.height / 2.);
@@ -3455,10 +3491,6 @@ impl ContentMask<Pixels> {
                 *radius
             }
         };
-    ///
-    /// The squares are the shader's, not the fitted radii of [`Self::contains`]: it reads the raw
-    /// radii of the quadrant a point is in, so a corner reaches at most to the middle of the mask
-    /// on each axis, however large its radius.
         point_in_rounded_rect(
             position,
             self.bounds.dilate(Pixels(EXACT_TOLERANCE)),
@@ -5087,6 +5119,25 @@ impl Window {
         }
     }
 
+    /// How an outset in the own space of the layout node `layout_id`, with border box `bounds`,
+    /// reaches in the window, which is what culling and [`Self::painted_reach`] trust a subtree to
+    /// stay within: `None` when one number does not bound it, as under perspective or in a plane
+    /// of a 3D rendering context, which is not where a transform of its own puts a box.
+    pub(crate) fn outset_space(&self, layout_id: LayoutId, bounds: Bounds<Pixels>) -> Option<OutsetSpace> {
+        let space = self.layout_engine.as_ref().unwrap().element_space(layout_id, bounds);
+        let (composed, own) = match &space {
+            Some(space) => {
+                let entered = self.enter_space(space);
+                (entered.matrix, Some(entered.step?))
+            }
+            None => (self.transform(), None),
+        };
+        composed.is_affine().then(|| OutsetSpace {
+            stretch: if composed.is_translation() { 1. } else { composed.stretch_bound() },
+            own,
+        })
+    }
+
     /// Whether the child whose layout node is `layout_id`, with border box `bounds`, lies
     /// outside the content mask for good: its box and the scrollable overflow of what is below
     /// it, inflated by `outset` (and a pixel, for snapping), do not touch the mask.
@@ -5107,39 +5158,10 @@ impl Window {
         let mask = self.content_mask().bounds;
         let slack = px(1.);
         let scale_factor = self.scale_factor();
-        let space = self
-            .layout_engine
-            .as_ref()
-            .unwrap()
-            .element_space(layout_id, bounds);
-        // The outset is in the child's own space; this is how far it can reach in the window.
-        let (composed, own_transform) = match &space {
-            Some(space) => {
-                let entered = self.enter_space(space);
-                match entered.step {
-                    Some(step) => (entered.matrix, Some(step)),
-                    // A plane of a 3D rendering context is not where a transform of its own puts a box.
-                    None => return false,
-                }
-            }
-            None => (self.transform(), None),
-        };
-        if !composed.is_affine() {
-            // How far the outset reaches in the window is not bounded by one number under perspective.
+        let Some(space) = self.outset_space(layout_id, bounds) else {
             return false;
-        }
-        let stretch = if composed.is_translation() { 1. } else { composed.stretch_bound() };
-        let inflate = |bounds: Bounds<Pixels>| {
-            let origin = point(
-                bounds.origin.x - outset.left * stretch - slack,
-                bounds.origin.y - outset.top * stretch - slack,
-            );
-            let far = point(
-                bounds.right() + outset.right * stretch + slack,
-                bounds.bottom() + outset.bottom * stretch + slack,
-            );
-            Bounds::from_corners(origin, far)
         };
+        let inflate = |bounds: Bounds<Pixels>| space.inflate(bounds, outset, slack);
         // A mask with no area hides everything, whatever touches its edge: a box wholly below an
         // `overflow: hidden` clip has the clip's mask cut down to a line at its top edge.
         let mask_is_empty = mask.size.width <= px(0.) || mask.size.height <= px(0.);
@@ -5150,11 +5172,7 @@ impl Window {
                 || reach.bottom() < mask.top()
                 || reach.top() > mask.bottom()
         };
-        let box_in_window = self.bounds_in_window(match &own_transform {
-            Some(own) => own.bounding_box(bounds),
-            None => bounds,
-        });
-        let reach = inflate(box_in_window);
+        let reach = inflate(self.bounds_in_window(space.own_box(bounds)));
         // Noted before the capture is looked at: a layout record made while an element holds the
         // capture is skipped after it lets go.
         self.note_cull_reach(reach);
@@ -14893,24 +14911,6 @@ mod tests {
         assert_eq!(merged.y.bottom_left, px(10.));
     }
 
-    fn mask(x: f32, y: f32, width: f32, height: f32, radius: (f32, f32)) -> ContentMask<Pixels> {
-        ContentMask::rounded(
-            Bounds::new(point(px(x), px(y)), size(px(width), px(height))),
-            CornerRadii {
-                x: Corners::all(px(radius.0)),
-                y: Corners::all(px(radius.1)),
-            },
-        )
-    }
-
-    /// How many points of a quarter-pixel grid `intersect` gets wrong against being inside both.
-    fn intersect_mismatches(a: &ContentMask<Pixels>, b: &ContentMask<Pixels>) -> usize {
-        let both = a.intersect(b);
-        let mut wrong = 0;
-        for x in -240..640 {
-            for y in -240..640 {
-                let at = point(px(x as f32 * 0.25 + 0.125), px(y as f32 * 0.25 + 0.125));
-                if both.contains(&at) != (a.contains(&at) && b.contains(&at)) {
     #[test]
     fn corner_squares_follow_the_radii_the_shader_reads_when_they_do_not_fit() {
         // A 100 by 10 box with a top left radius of 12 and a bottom left one of 5. The shader reads
@@ -14935,6 +14935,24 @@ mod tests {
         assert!(mask.is_clear_of_rounded_corners(at(95., 8.)));
     }
 
+    fn mask(x: f32, y: f32, width: f32, height: f32, radius: (f32, f32)) -> ContentMask<Pixels> {
+        ContentMask::rounded(
+            Bounds::new(point(px(x), px(y)), size(px(width), px(height))),
+            CornerRadii {
+                x: Corners::all(px(radius.0)),
+                y: Corners::all(px(radius.1)),
+            },
+        )
+    }
+
+    /// How many points of a quarter-pixel grid `intersect` gets wrong against being inside both.
+    fn intersect_mismatches(a: &ContentMask<Pixels>, b: &ContentMask<Pixels>) -> usize {
+        let both = a.intersect(b);
+        let mut wrong = 0;
+        for x in -240..640 {
+            for y in -240..640 {
+                let at = point(px(x as f32 * 0.25 + 0.125), px(y as f32 * 0.25 + 0.125));
+                if both.contains(&at) != (a.contains(&at) && b.contains(&at)) {
                     wrong += 1;
                 }
             }

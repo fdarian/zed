@@ -2771,15 +2771,14 @@ impl Window {
         if self.transform_stack.last().is_some_and(|ambient| ambient.kind == TransformKind::General) {
             return None;
         }
+        let space = self.outset_space(root, bounds)?;
         let scale_factor = self.scale_factor;
         let mut extent = self.layout_engine.as_mut()?.painted_extent(root, scale_factor)?;
         extent.origin += self.pixel_snap_point(self.element_offset());
-        let slack = px(1.);
-        let reach = self.bounds_in_window(bounds).union(&self.bounds_in_window(extent));
-        Some(Bounds::from_corners(
-            point(reach.left() - outset.left - slack, reach.top() - outset.top - slack),
-            point(reach.right() + outset.right + slack, reach.bottom() + outset.bottom + slack),
-        ))
+        let reach = self
+            .bounds_in_window(space.own_box(bounds))
+            .union(&self.bounds_in_window(extent));
+        Some(space.inflate(reach, outset, px(1.)))
     }
 
     /// [`Self::relocation_blocker_here`] for the scale factor alone, which is all that a culled
