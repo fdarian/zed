@@ -61,7 +61,7 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, CString, c_void},
     mem,
     ops::Range,
@@ -95,6 +95,12 @@ const REFUSES_KEY_IVAR: &str = "refusesKey";
 /// this many wakes after the frame that was asked for, the last of them from the block the pump
 /// posts when a step stops the link; an animation asks again in every step.
 const IDLE_STEPS_BEFORE_STOP: u32 = 2;
+
+thread_local! {
+    /// Windows whose link started and has not stepped since: [`step_started_display_links`] gives
+    /// each its first step without waiting for the first vsync.
+    static STARTED_LINKS: RefCell<Vec<Weak<Mutex<MacWindowState>>>> = const { RefCell::new(Vec::new()) };
+}
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
@@ -645,6 +651,9 @@ struct MacWindowState {
     frame_requested: bool,
     /// Consecutive `step`s in which nobody asked for another frame.
     idle_steps: u32,
+    /// The state's own `Arc`, set right after it is built; `start_display_link` lists it in
+    /// `STARTED_LINKS`.
+    self_handle: Weak<Mutex<MacWindowState>>,
     renderer: renderer::Renderer,
     composition: composition::MacComposition,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -854,10 +863,22 @@ impl MacWindowState {
         };
         self.idle_steps = 0;
         let data = self.native_view.as_ptr() as *mut c_void;
-        self.frame_source
+        let started = self
+            .frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
             .start(display_id)
-            .log_err();
+            .log_err()
+            .is_some();
+        if started {
+            STARTED_LINKS.with_borrow_mut(|started_links| {
+                if !started_links
+                    .iter()
+                    .any(|listed| listed.ptr_eq(&self.self_handle))
+                {
+                    started_links.push(self.self_handle.clone());
+                }
+            });
+        }
     }
 
     /// Follows the window to the display it is on now. A stopped link stays stopped: the next
@@ -1146,6 +1167,7 @@ impl MacWindow {
                 frame_source: None,
                 frame_requested: false,
                 idle_steps: 0,
+                self_handle: Weak::new(),
                 composition: composition::MacComposition::new(renderer_context.clone()),
                 renderer: renderer::new_renderer(
                     renderer_context,
@@ -1195,6 +1217,8 @@ impl MacWindow {
                 accesskit_adapter: None,
                 sheet_parent: None,
             })));
+
+            window.0.lock().self_handle = Arc::downgrade(&window.0);
 
             (*native_window).set_ivar(
                 WINDOW_STATE_IVAR,
@@ -3388,6 +3412,10 @@ pub(crate) fn link_stops() -> usize {
 extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
+    step_window(&window_state);
+}
+
+fn step_window(window_state: &Mutex<MacWindowState>) {
     let mut lock = window_state.lock();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
@@ -3397,6 +3425,30 @@ extern "C" fn step(view: *mut c_void) {
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
         lock.count_step();
+    }
+}
+
+/// Runs the first frame step of every window whose display link started since the last call and
+/// that still has a frame request, instead of leaving it to the link's first vsync, which comes
+/// up to a frame period later. It is the step the link would run, so the frame it draws is
+/// presented now and the link's next step finds the window clean.
+///
+/// Must run on the main thread, outside any input dispatch (the embedder calls it after its
+/// run-loop pump returns): a step draws.
+pub fn step_started_display_links() {
+    let started = STARTED_LINKS.take();
+    for window_state in started.iter().filter_map(Weak::upgrade) {
+        let wants_step = {
+            let lock = window_state.lock();
+            lock.frame_requested
+                && lock
+                    .frame_source
+                    .as_ref()
+                    .is_some_and(WindowFrameSource::is_running)
+        };
+        if wants_step {
+            step_window(&window_state);
+        }
     }
 }
 
@@ -4073,4 +4125,9 @@ mod tests {
             NSDragOperationCopy
         );
     }
+}
+
+/// Forgets the windows [`step_started_display_links`] would step; their links keep running.
+pub fn discard_started_display_links() {
+    STARTED_LINKS.with_borrow_mut(Vec::clear);
 }

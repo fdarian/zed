@@ -73,6 +73,7 @@ pub use window::overlay_drawn_frames;
 #[cfg(any(test, feature = "test-support"))]
 pub use run_loop_wake::post_event_on_event_thread;
 pub use run_loop_wake::{run_loop_pumped, set_run_loop_wake_hook};
+pub use window::{discard_started_display_links, step_started_display_links};
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;
