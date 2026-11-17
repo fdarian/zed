@@ -1141,18 +1141,4 @@ pub(crate) mod shift {
         assert!(rects(&damage).iter().any(|rect| inside(&device(0, 0, 100 * scale, 100 * scale), rect)), "{damage:?}");
         assert_eq!(fixture.counters(cx).shifted, 0);
     }
-
-    #[gpui::test]
-    fn a_translate_with_the_shift_off_draws_the_rows_where_they_were_and_are(cx: &mut TestAppContext) {
-        let fixture = Fixture::open_over(cx, Some(100.), false, false, Some(Bar::new()), Backdrop::Solid);
-        fixture.with_window(cx, |window| window.set_scroll_shift(false));
-        let scale = scale(&fixture, cx);
-        let (_, last) = scrolled(&fixture, cx, 12.);
-        assert_eq!(fixture.counters(cx).patched, 1);
-        let damage = last.damage.expect("a translate is drawn in part");
-        assert_eq!(damage.shift, None);
-        let [whole] = rects(&damage)[..] else { panic!("one rectangle: {damage:?}") };
-        assert!(inside(&device(0, 0, 100 * scale, 100 * scale), &whole), "{whole:?}");
-        assert_eq!(fixture.counters(cx).shifted, 0);
-    }
 }

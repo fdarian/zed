@@ -718,8 +718,6 @@ pub(crate) type ScrollPatchRegistries = Rc<dyn Fn(&Window) -> String>;
 #[derive(Default)]
 pub(crate) struct ScrollPatchWindow {
     enabled: bool,
-    /// A translate is not reported to the damage as a shift of the list's pixels (see [`shift`]).
-    shift_off: bool,
     settled: Option<ScrollPatchSettled>,
     registries: Option<ScrollPatchRegistries>,
     /// A list scrolled since the last draw, and the view it notified.
@@ -748,12 +746,6 @@ impl Window {
         self.scroll_patch.enabled = enabled;
         self.scroll_patch.scrolled = None;
         self.scroll_patch.predicted = None;
-    }
-
-    /// Whether a scroll translate says to the damage that the list's pixels moved, so that a platform copies them,
-    /// or that the rows' old and new places changed, the area a frame without the shift draws.
-    pub fn set_scroll_shift(&mut self, enabled: bool) {
-        self.scroll_patch.shift_off = !enabled;
     }
 
     /// Lets the owner of the window say what only it knows about a frame drawn after a list

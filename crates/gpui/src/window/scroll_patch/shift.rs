@@ -21,9 +21,6 @@ impl ShiftPlan {
     /// The shift of a translate, if it can be one: the rows move inside one clip with square corners (the
     /// pixels at a rounded corner are not the ones that move) by a whole number of device pixels.
     pub(super) fn new(window: &Window, moves: &[ScrollMove], prediction: &Prediction) -> Option<Self> {
-        if window.scroll_patch.shift_off {
-            return None;
-        }
         let runs = &window.rendered_frame.scroll.runs;
         let first = moves.first()?;
         let mask = &runs[first.run].paint_mask;
