@@ -3416,23 +3416,31 @@ impl ContentMask<Pixels> {
     /// is clear is cut by straight edges only, whatever the radii say, so that painting under
     /// this mask and under its bounds alone make the same pixels of it.
     pub(crate) fn is_clear_of_rounded_corners(&self, bounds: Bounds<Pixels>) -> bool {
-        let radii = self.fitted_radii();
-        let radii_y = radii.explicit_y();
         let frame = self.bounds;
-        [
-            (radii.x.top_left, radii_y.top_left, frame.origin.x, frame.origin.y),
-            (radii.x.top_right, radii_y.top_right, frame.right() - radii.x.top_right, frame.origin.y),
-            (radii.x.bottom_right, radii_y.bottom_right, frame.right() - radii.x.bottom_right, frame.bottom() - radii_y.bottom_right),
-            (radii.x.bottom_left, radii_y.bottom_left, frame.origin.x, frame.bottom() - radii_y.bottom_left),
-        ]
-        .into_iter()
-        .filter(|(radius_x, radius_y, _, _)| radius_x.0 > 0. || radius_y.0 > 0.)
-        .all(|(radius_x, radius_y, left, top)| {
-            bounds.right() <= left
-                || bounds.left() >= left + radius_x
-                || bounds.bottom() <= top
-                || bounds.top() >= top + radius_y
-        })
+        let half = Size::new(frame.size.width / 2., frame.size.height / 2.);
+        let radii_y = self.corner_radii_y;
+        // `(horizontal, vertical)` of the corner as the shader reads it, within its quadrant.
+        let reach = |anchor: Anchor| {
+            let horizontal = self.corner_radii.corner(anchor);
+            if horizontal.0 <= 0. {
+                return (Pixels::ZERO, Pixels::ZERO);
+            }
+            let vertical = radii_y.corner(anchor);
+            let vertical = if vertical.0 <= 0. { horizontal } else { vertical };
+            (horizontal.min(half.width), vertical.min(half.height))
+        };
+        [Anchor::TopLeft, Anchor::TopRight, Anchor::BottomRight, Anchor::BottomLeft]
+            .into_iter()
+            .all(|anchor| {
+                let (width, height) = reach(anchor);
+                if width.0 <= 0. || height.0 <= 0. {
+                    return true;
+                }
+                let corner = frame.corner(anchor);
+                let left = if matches!(anchor, Anchor::TopLeft | Anchor::BottomLeft) { corner.x } else { corner.x - width };
+                let top = if matches!(anchor, Anchor::TopLeft | Anchor::TopRight) { corner.y } else { corner.y - height };
+                bounds.right() <= left || bounds.left() >= left + width || bounds.bottom() <= top || bounds.top() >= top + height
+            })
     }
 
     /// Whether `position` is inside the mask grown by [`EXACT_TOLERANCE`], so that a point
@@ -3447,6 +3455,10 @@ impl ContentMask<Pixels> {
                 *radius
             }
         };
+    ///
+    /// The squares are the shader's, not the fitted radii of [`Self::contains`]: it reads the raw
+    /// radii of the quadrant a point is in, so a corner reaches at most to the middle of the mask
+    /// on each axis, however large its radius.
         point_in_rounded_rect(
             position,
             self.bounds.dilate(Pixels(EXACT_TOLERANCE)),
@@ -14899,6 +14911,30 @@ mod tests {
             for y in -240..640 {
                 let at = point(px(x as f32 * 0.25 + 0.125), px(y as f32 * 0.25 + 0.125));
                 if both.contains(&at) != (a.contains(&at) && b.contains(&at)) {
+    #[test]
+    fn corner_squares_follow_the_radii_the_shader_reads_when_they_do_not_fit() {
+        // A 100 by 10 box with a top left radius of 12 and a bottom left one of 5. The shader reads
+        // each radius as it is, within the quadrant of its corner: the top left corner is cut down
+        // to the middle row of the box and the bottom left one is 5 by 5, where fitting the radii
+        // would shrink both to 10/17 of themselves and leave this box out of the bottom left one.
+        let mask = ContentMask::rounded(
+            Bounds::new(point(px(0.), px(0.)), size(px(100.), px(10.))),
+            CornerRadii::from(Corners {
+                top_left: px(12.),
+                top_right: px(0.),
+                bottom_right: px(0.),
+                bottom_left: px(5.),
+            }),
+        );
+        let at = |x: f32, y: f32| Bounds::new(point(px(x), px(y)), size(px(1.), px(0.5)));
+        assert!(!mask.is_clear_of_rounded_corners(at(4., 7.5)));
+        assert!(!mask.is_clear_of_rounded_corners(at(4., 1.)));
+        // Past the squares, and across from them on the square corners.
+        assert!(mask.is_clear_of_rounded_corners(at(6., 7.5)));
+        assert!(mask.is_clear_of_rounded_corners(at(95., 1.)));
+        assert!(mask.is_clear_of_rounded_corners(at(95., 8.)));
+    }
+
                     wrong += 1;
                 }
             }
