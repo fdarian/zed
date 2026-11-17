@@ -1046,6 +1046,68 @@ fn renumber_by_overlap(primitives: &mut [&mut dyn Cut]) {
     }
 }
 
+#[cfg(test)]
+mod renumbering {
+    use super::*;
+
+    struct Piece {
+        order: u32,
+        bounds: Bounds<ScaledPixels>,
+        mask: ContentMask<ScaledPixels>,
+    }
+
+    impl Piece {
+        fn at(order: u32, x: f32, y: f32) -> Self {
+            let bounds = Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(y)),
+                size(ScaledPixels(10.), ScaledPixels(10.)),
+            );
+            let page = Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), size(ScaledPixels(100.), ScaledPixels(100.)));
+            let mask = ContentMask { bounds: page, corner_radii: Corners::default(), corner_radii_y: Corners::default() };
+            Self { order, bounds, mask }
+        }
+    }
+
+    impl Cut for Piece {
+        fn reach(&self) -> Bounds<ScaledPixels> {
+            self.bounds
+        }
+        fn mask(&mut self) -> &mut ContentMask<ScaledPixels> {
+            &mut self.mask
+        }
+        fn mask_ref(&self) -> &ContentMask<ScaledPixels> {
+            &self.mask
+        }
+        fn order(&self) -> u32 {
+            self.order
+        }
+        fn set_order(&mut self, order: u32) {
+            self.order = order;
+        }
+    }
+
+    fn numbered(mut pieces: Vec<Piece>) -> Vec<u32> {
+        renumber_by_overlap(&mut pieces.iter_mut().map(|piece| piece as &mut dyn Cut).collect::<Vec<_>>());
+        pieces.iter().map(|piece| piece.order).collect()
+    }
+
+    #[test]
+    fn orders_say_which_of_two_pieces_that_overlap_is_above_and_nothing_else() {
+        // A gap in the numbers, and a piece that overlaps nothing at another number, are the same page.
+        assert_eq!(
+            numbered(vec![Piece::at(1, 0., 0.), Piece::at(7, 5., 5.), Piece::at(30, 50., 50.)]),
+            numbered(vec![Piece::at(1, 0., 0.), Piece::at(2, 5., 5.), Piece::at(1, 50., 50.)])
+        );
+        // The two that overlap swapped are another page.
+        assert_ne!(
+            numbered(vec![Piece::at(1, 0., 0.), Piece::at(2, 5., 5.)]),
+            numbered(vec![Piece::at(2, 0., 0.), Piece::at(1, 5., 5.)])
+        );
+        // A piece that is above a piece that is above another is above both, through the one between.
+        assert_eq!(numbered(vec![Piece::at(1, 0., 0.), Piece::at(4, 5., 5.), Piece::at(9, 8., 8.)]), [1, 2, 3]);
+    }
+}
+
 fn window_view(window: &Window) -> Bounds<ScaledPixels> {
     let viewport = window.viewport_size().scale(window.scale_factor());
     Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), viewport)
