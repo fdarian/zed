@@ -9,8 +9,8 @@ use crate::{Entity, MouseButton, MouseDownEvent, Modifiers, PlatformInput, point
 use super::tests::{Snapshot, click, counters, draw, layout_only, open, snapshot, tab_order};
 use super::*;
 use crate::{
-    AnyWindowHandle, AppContext as _, InteractiveElement, ParentElement, RetainedCounters, StatefulInteractiveElement, Styled,
-    TestAppContext, div, px,
+    AnyWindowHandle, AppContext as _, InteractiveElement, ParentElement, RetainedCounters, ScrollHandle,
+    StatefulInteractiveElement, Styled, TestAppContext, div, px,
 };
 use std::cell::Cell;
 
@@ -679,41 +679,159 @@ fn a_fragment_that_reports_when_it_is_painted_is_replayed_only_with_a_listener_t
     fragments.replays_as_built(cx);
 }
 
-#[gpui::test]
-fn a_wrapper_with_a_fragment_recorded_in_a_region_of_its_own_is_built_every_frame(cx: &mut TestAppContext) {
-    let window = open(cx, {
-        Rc::new(move |_, _| {
-            div()
-                .id("root")
-                .stacking_context()
-                .size_full()
-                .child(
-                    retained("wrapper", 1, move |_, _| {
+/// A scroller in a stacking context that holds a retained wrapper recorded in a region of its own, with a
+/// fragment the context paints, between two in-flow rows.
+struct ScrolledWrapper {
+    window: AnyWindowHandle,
+    scroll: ScrollHandle,
+    /// The key of the wrapper. A new one builds it.
+    epoch: Rc<Cell<u64>>,
+    clicks: Log,
+}
+
+/// Where the fragment is hit with the scroller at its top, and the points the snapshots probe.
+const SCROLLED_FRAGMENT: (f32, f32) = (30., 82.);
+const SCROLLED_CHAINS: [(f32, f32); 6] = [(30., 82.), (12., 40.), (12., 75.), (30., 60.), (12., 20.), (150., 90.)];
+
+impl ScrolledWrapper {
+    fn new(cx: &mut TestAppContext) -> Self {
+        let scroll = ScrollHandle::new();
+        let epoch = Rc::new(Cell::new(1));
+        let clicks: Log = Rc::default();
+        let window = open(cx, {
+            let scroll = scroll.clone();
+            let epoch = epoch.clone();
+            let clicks = clicks.clone();
+            Rc::new(move |_, _| {
+                let clicks = clicks.clone();
+                div()
+                    .id("root")
+                    .stacking_context()
+                    .size_full()
+                    .child(
                         div()
-                            .id("wrapper")
-                            .w(px(100.))
-                            .h(px(50.))
+                            .id("scroller")
+                            .always_hitbox()
+                            .w(px(200.))
+                            .h(px(120.))
+                            .flex()
+                            .flex_col()
+                            .overflow_scroll()
+                            .track_scroll(&scroll)
+                            .child(div().id("before").always_hitbox().flex_none().w(px(150.)).h(px(40.)).bg(crate::green()))
                             .child(
-                                div()
-                                    .id("fragment")
-                                    .absolute()
-                                    .w(px(20.))
-                                    .h(px(20.))
-                                    .bg(crate::red()),
+                                retained("wrapper", epoch.get(), move |_, _| {
+                                    div()
+                                        .id("wrapper")
+                                        .relative()
+                                        .always_hitbox()
+                                        .flex_none()
+                                        .w(px(100.))
+                                        .h(px(50.))
+                                        .bg(crate::blue())
+                                        .child(
+                                            div()
+                                                .id("fragment")
+                                                .always_hitbox()
+                                                .absolute()
+                                                .left(px(10.))
+                                                .top(px(30.))
+                                                .w(px(50.))
+                                                .h(px(30.))
+                                                .bg(crate::red())
+                                                .child(button("fragment-button", &clicks)),
+                                        )
+                                        .into_any_element()
+                                })
+                                .lift_z(0)
+                                .relocatable(px(60.)),
                             )
-                            .into_any_element()
-                    })
-                    .relocatable(px(20.)),
-                )
-                .into_any_element()
-        })
-    });
-    for _ in 0..4 {
-        draw(window, cx);
+                            .child(div().id("after").always_hitbox().flex_none().w(px(150.)).h(px(200.)).bg(crate::yellow())),
+                    )
+                    .into_any_element()
+            })
+        });
+        let wrapper = Self { window, scroll, epoch, clicks };
+        wrapper.settle(cx);
+        wrapper
     }
-    let end = counters(window, cx);
-    assert_eq!(end.replays, 0, "{end:?}");
-    assert!(end.non_reusable(NonReusable::Lift) > 0, "{end:?}");
+
+    fn settle(&self, cx: &mut TestAppContext) {
+        for _ in 0..3 {
+            draw(self.window, cx);
+        }
+    }
+
+    fn scroll_to(&self, cx: &mut TestAppContext, offset: f32) {
+        self.scroll.set_offset(point(px(0.), px(-offset)));
+        draw(self.window, cx);
+    }
+
+    fn snapshot(&self, cx: &mut TestAppContext) -> Snapshot {
+        snapshot(self.window, cx, &SCROLLED_CHAINS)
+    }
+
+    /// What a frame that builds the wrapper shows at `offset`.
+    fn built_at(&self, cx: &mut TestAppContext, offset: f32) -> Snapshot {
+        self.epoch.set(self.epoch.get() + 1);
+        self.scroll_to(cx, offset);
+        self.snapshot(cx)
+    }
+}
+
+#[gpui::test]
+fn a_wrapper_with_a_fragment_recorded_in_a_region_of_its_own_is_moved_by_a_scroll(cx: &mut TestAppContext) {
+    let scrolled = ScrolledWrapper::new(cx);
+    let start = counters(scrolled.window, cx);
+    assert_eq!(start.non_reusable(NonReusable::Lift), 0, "{start:?}");
+    assert_eq!(start.non_relocatable(NonRelocatable::Hole), 0, "{start:?}");
+
+    for offset in [0., 3., 17., 3., 21.5, 0.] {
+        let before = counters(scrolled.window, cx);
+        scrolled.scroll_to(cx, offset);
+        scrolled.settle(cx);
+        let moved = scrolled.snapshot(cx);
+        let after = counters(scrolled.window, cx);
+        assert_eq!(after.mismatches, 0, "offset {offset}: {after:?}");
+        assert_eq!(after.non_reusable(NonReusable::Lift), 0, "offset {offset}: {after:?}");
+        assert!(after.replays > before.replays, "offset {offset}: {after:?}");
+
+        let built = scrolled.built_at(cx, offset);
+        assert_eq!(moved.scene, built.scene, "offset {offset}");
+        assert_eq!(moved.chains, built.chains, "offset {offset}");
+        assert_eq!(moved.a11y, built.a11y, "offset {offset}");
+    }
+    let end = counters(scrolled.window, cx);
+    assert!(end.relocations > start.relocations, "{end:?}");
+
+    // And the frames that replay are compared with a build of their own.
+    cx.update_window(scrolled.window, |_, window, _| {
+        window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+    })
+    .unwrap();
+    for offset in [5., 6., 40., 41.5, 0.] {
+        scrolled.scroll_to(cx, offset);
+        scrolled.settle(cx);
+    }
+    let verified = counters(scrolled.window, cx);
+    assert!(verified.verified > 0, "{verified:?}");
+    assert_eq!(verified.mismatches, 0, "{verified:?}");
+
+    // The fragment is hit where the scroll puts it, and not where it was recorded.
+    scrolled.scroll_to(cx, 0.);
+    scrolled.settle(cx);
+    scrolled.scroll_to(cx, 10.);
+    let mut at = |y: f32| {
+        cx.update_window(scrolled.window, |_, window, _| window.hit_chain_at(point(px(30.), px(y))))
+            .unwrap()
+            .iter()
+            .map(|(id, _)| format!("{id}"))
+            .collect::<Vec<_>>()
+            .join(" > ")
+    };
+    assert!(at(SCROLLED_FRAGMENT.1 - 10.).contains("fragment"), "{}", at(SCROLLED_FRAGMENT.1 - 10.));
+    assert!(!at(SCROLLED_FRAGMENT.1 + 25.).contains("fragment"), "{}", at(SCROLLED_FRAGMENT.1 + 25.));
+    assert!(scrolled.clicks.borrow().is_empty());
 }
 
 #[gpui::test]

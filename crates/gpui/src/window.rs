@@ -1488,6 +1488,9 @@ pub(crate) struct LiftedElement {
     /// inside the same ones, whichever of them are not around the context.
     transforms: Vec<AmbientTransform>,
     content_mask: ContentMask<Pixels>,
+    /// `content_mask` before a recording in a region cut it by the content mask around the region:
+    /// what a regional cell paints under, since its recording is cut where it is put.
+    uncut_mask: ContentMask<Pixels>,
     /// Whether `content_mask` is cut from the region of the subtree being recorded in one, as the
     /// masks inside the subtree are, and so is cut by the content mask where the recording is put.
     derived_mask: bool,
@@ -7347,10 +7350,16 @@ impl Window {
         self.next_frame.hitboxes_changed();
         let hole = self.retained.pending_hole.take();
         let owners = self.lift_owners(ticket.ordinal);
-        // A recording that is made in a region of its own is not replayed from the frame, and has
-        // no use for the paint of an element it hands to the stacking context.
-        let cell = (hole.is_none() && !owners.is_empty() && self.retained.relocation.is_none())
-            .then(|| Rc::new(PlainPaint::new(self.ambient_lift_ordinal() - (ticket.ordinal + 1))));
+        // A recording in a region of its own keeps what the element paints in the region too (a regional
+        // cell), to put it where the recording is moved. The build a replay is compared with, and a
+        // culled subtree, are not replayed from the frame.
+        let open = self.retained.relocation.as_ref();
+        let recordable = open.is_none_or(Relocation::regional);
+        let cell = (hole.is_none() && !owners.is_empty() && recordable).then(|| {
+            let descendants = self.ambient_lift_ordinal() - (ticket.ordinal + 1);
+            Rc::new(PlainPaint::new(descendants, open.map(Relocation::reopened)))
+        });
+        let content_mask = self.content_mask();
         let entry = LiftedElement {
             content: LiftedContent::Element(element),
             z,
@@ -7358,7 +7367,8 @@ impl Window {
             hitboxes,
             context: PaintContext::capture(self),
             transforms: self.transform_stack.clone(),
-            content_mask: self.content_mask(),
+            content_mask,
+            uncut_mask: content_mask,
             derived_mask: self.content_mask_is_derived(),
             cut: None,
             image_cache: self.image_cache_stack.last().cloned(),
@@ -7456,11 +7466,17 @@ impl Window {
         let rem_size = entry.context.rem_size;
         let visibility = entry.context.visibility;
         let content_mask = entry.content_mask;
+        let uncut_mask = entry.uncut_mask;
         let derived_mask = entry.derived_mask;
-        let outer_cut = entry.cut.map(|cut| self.paint_cut.replace(cut));
+        let cell = entry.cell.as_deref();
+        // A regional cell is painted under masks that nothing cuts: its recording is cut where it
+        // is put.
+        let outer_cut = entry
+            .cut
+            .filter(|_| !cell.is_some_and(PlainPaint::is_regional))
+            .map(|cut| self.paint_cut.replace(cut));
         let image_cache = entry.image_cache.take();
         let content = &mut entry.content;
-        let cell = entry.cell.as_deref();
         let owners = &entry.owners;
         let ordinal = entry.ordinal;
         self.with_rendered_view(current_view, |window| {
@@ -7469,9 +7485,14 @@ impl Window {
                     window.with_image_cache(image_cache, |window| {
                         window.with_replaced_mask(content_mask, derived_mask, |window| match content {
                             LiftedContent::Element(element) => match cell {
-                                Some(cell) => window.record_plain_paint(cell, ordinal, owners, cx, |window, cx| {
-                                    element.paint(window, cx)
-                                }),
+                                Some(cell) => window.record_plain_paint(
+                                    cell,
+                                    ordinal,
+                                    owners,
+                                    (uncut_mask, derived_mask),
+                                    cx,
+                                    |window, cx| element.paint(window, cx),
+                                ),
                                 None => element.paint(window, cx),
                             },
                             LiftedContent::Replay(replay) => {

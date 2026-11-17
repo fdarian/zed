@@ -617,6 +617,9 @@ struct Recorded {
     /// The ordinal the stacking context gave the first element the subtree handed to it, when the
     /// prepaint was last replayed.
     lift_base: Option<u32>,
+    /// Whether the listener of the subtree takes the translation of a replay, see
+    /// [`Retained::on_replay_translated`].
+    translates: bool,
     /// What [`Window::repaint_in_place`] needs of the surroundings, for a patchable subtree whose
     /// recording is plain.
     patch: Option<Rc<PatchUnit>>,
@@ -1757,6 +1760,7 @@ impl Retained {
                         unmovable_at_start,
                         delta: Point::default(),
                         lift_base: None,
+                        translates: self.translates,
                         patch,
                         root_escapes: root_escape.is_some(),
                     }));
@@ -1848,7 +1852,13 @@ impl Recorded {
         if relocation.culled {
             return Ok(delta);
         }
-        relocation.info.fits(delta, ambient).map(|()| delta).map_err(Some)
+        relocation.info.fits(delta, ambient).map_err(Some)?;
+        // What the elements it handed to the stacking context painted is put where the root is, and
+        // only known once the context has painted them.
+        if let Some(lifts) = &self.prepaint.lifts {
+            lifts.fit(delta, ambient, self.translates)?;
+        }
+        Ok(delta)
     }
 
     /// [`Self::peek_place`], counting a miss.
