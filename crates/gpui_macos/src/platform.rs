@@ -632,15 +632,30 @@ fn assert_main_thread(operation: &str) {
     );
 }
 
+/// A run loop mode with no sources. Dequeuing in it returns the events that are already queued
+/// without running a pass of the default mode's sources (the display link's tick among them).
+const DRAIN_MODE: &str = "GPUIPumpDrainMode";
+
+fn drain_mode() -> id {
+    static MODE: OnceLock<usize> = OnceLock::new();
+    *MODE.get_or_init(|| unsafe {
+        let mode: id = NSString::alloc(nil).init_str(DRAIN_MODE);
+        mode as usize
+    }) as id
+}
+
 /// Handles what is ready now without blocking and returns whether a display-link frame step ran
-/// during the call. A caller that steps the display links itself after the pump must skip that
-/// step when this returns true: the pump's step was the frame, and a second would draw twice.
+/// during the call, which is one main-queue drain and at most one step per window. A caller that
+/// steps the display links itself after the pump must skip that step when this returns true: the
+/// pump's step was the frame, and a second would draw twice.
 ///
 /// At most one step runs per call. Once a frame outlasts a vsync, each step blocks in
 /// `nextDrawable` until the next vsync, the link has queued its next tick by then, and a loop
-/// that kept handling sources would never return: no NSEvent would be dequeued and JS would not
-/// run. After a step the call returns and posts a block so the embedder pumps again; the next call
-/// drains the NSEvents first.
+/// that kept handling sources would run that step too, and every one after it, until the
+/// 256-iteration cap (about 2 s at 120 Hz) with no NSEvent dequeued and no JS run. After a step
+/// the NSEvents that are queued are still dequeued (in a mode with no sources, so nothing else
+/// runs), and the call returns. When a step stopped the link, the call posts a block so the
+/// embedder pumps once more; while a link runs, its next tick wakes the embedder.
 #[doc(hidden)]
 pub unsafe fn pump_app_nonblocking() -> bool {
     unsafe {
@@ -648,10 +663,18 @@ pub unsafe fn pump_app_nonblocking() -> bool {
         // blocks embedded hosts. Drain only work that is ready now.
         let app: id = msg_send![APP_CLASS, sharedApplication];
         let distant_past: id = msg_send![class!(NSDate), distantPast];
-        let mode = kCFRunLoopDefaultMode as id;
         let steps_at_start = crate::link_steps();
+        let stops_at_start = crate::link_stops();
 
         for _ in 0..256 {
+            // `nextEventMatchingMask:` runs one pass of the run loop in its mode before it returns
+            // an event that is already queued, and a step can run in that pass. After one, only
+            // the dequeuing is left to do, and a pass of the default mode would run the next step.
+            let mode = if crate::link_steps() != steps_at_start {
+                drain_mode()
+            } else {
+                kCFRunLoopDefaultMode as id
+            };
             let event: id = msg_send![app,
                 nextEventMatchingMask: NSUInteger::MAX
                 untilDate: distant_past
@@ -667,14 +690,12 @@ pub unsafe fn pump_app_nonblocking() -> bool {
             // that boundary, which wakes the embedder once more. Committed here, it leaves the
             // update cycle nothing to commit, and no timer is armed.
             let _: () = msg_send![class!(CATransaction), flush];
-            if crate::link_steps() != steps_at_start {
-                break;
-            }
         }
-        // `nextEventMatchingMask:` runs the run loop itself, so a step can run in it. The call is
-        // then over: the sources below would run the next step.
+        // The call is over after a step: the sources below would run the next one.
         if crate::link_steps() != steps_at_start {
-            DispatchQueue::main().exec_async(|| {});
+            if crate::link_stops() != stops_at_start {
+                DispatchQueue::main().exec_async(|| {});
+            }
             return true;
         }
         // No `updateWindows` here: `sendEvent:` sets `windowsNeedUpdate`, which installs a run loop
@@ -688,12 +709,15 @@ pub unsafe fn pump_app_nonblocking() -> bool {
                 return crate::link_steps() != steps_at_start;
             }
             if crate::link_steps() != steps_at_start {
-                break;
+                if crate::link_stops() != stops_at_start {
+                    DispatchQueue::main().exec_async(|| {});
+                }
+                return true;
             }
         }
-        // Still finding sources to handle, or a frame step ran: have the embedder pump again.
+        // Still finding sources to handle: have the embedder pump again.
         DispatchQueue::main().exec_async(|| {});
-        crate::link_steps() != steps_at_start
+        false
     }
 }
 

@@ -90,9 +90,10 @@ const KEEPS_FRAME_IVAR: &str = "keepsFrame";
 /// can refuse that. Zero (can become key) for every other window.
 const REFUSES_KEY_IVAR: &str = "refusesKey";
 
-/// How many display-link steps in a row may find nothing to do before the link stops. Every step
-/// is a wake of the embedder, so a window that asked for one frame (a caret toggle) costs this
-/// many wakes after the frame that was asked for; an animation asks again in every step.
+/// How many display-link steps in a row may find nothing to do before the link stops. Each tick of
+/// a running link wakes the embedder, so a window that asked for one frame (a caret toggle) costs
+/// this many wakes after the frame that was asked for, the last of them from the block the pump
+/// posts when a step stops the link; an animation asks again in every step.
 const IDLE_STEPS_BEFORE_STOP: u32 = 2;
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
@@ -892,7 +893,9 @@ impl MacWindowState {
         }
         self.idle_steps += 1;
         if self.idle_steps >= IDLE_STEPS_BEFORE_STOP {
-            self.stop_display_link();
+            if self.stop_display_link() {
+                LINK_STOPS.fetch_add(1, Ordering::Relaxed);
+            }
             self.idle_steps = 0;
         }
     }
@@ -3368,21 +3371,27 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     }
 }
 
-/// Count of `step` calls, which run on the main thread only; `pump_app_nonblocking` compares it
-/// across a call to learn whether a frame step ran.
+/// Count of `step` calls that ran a frame callback, and of links that `count_step` stopped. Both
+/// are bumped on the main thread only; `pump_app_nonblocking` compares them across a call to learn
+/// whether a frame step ran and whether it left a link stopped.
 static LINK_STEPS: AtomicUsize = AtomicUsize::new(0);
+static LINK_STOPS: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn link_steps() -> usize {
     LINK_STEPS.load(Ordering::Relaxed)
 }
 
+pub(crate) fn link_stops() -> usize {
+    LINK_STOPS.load(Ordering::Relaxed)
+}
+
 extern "C" fn step(view: *mut c_void) {
-    LINK_STEPS.fetch_add(1, Ordering::Relaxed);
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        LINK_STEPS.fetch_add(1, Ordering::Relaxed);
         drop(lock);
         callback(Default::default());
         let mut lock = window_state.lock();
