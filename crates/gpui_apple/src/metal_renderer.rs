@@ -175,9 +175,6 @@ struct PartialRedraw {
     /// Whether the first pass of the damaged frame has yet to paint the scissors over, which a pass
     /// that loads what the target holds cannot clear.
     clear_pending: Cell<bool>,
-    /// Pixels of the target set aside while the target is shifted under them: a texture cannot be
-    /// copied onto itself where the source and the destination overlap.
-    scratch: Option<metal::Texture>,
     /// The shift the last frame took the copy of, and how many rectangles it drew, for `GPUI_GPU_TIMES`.
     last_shift: Option<gpui::Point<DevicePixels>>,
     last_rects: usize,
@@ -880,20 +877,9 @@ impl MetalRenderer {
             return false;
         }
         let (width, height) = (kept.size.width.0 as u64, kept.size.height.0 as u64);
-        let scratch_fits = self
-            .partial
-            .scratch
-            .as_ref()
-            .is_some_and(|scratch| scratch.width() >= width && scratch.height() >= height);
-        if !scratch_fits {
-            let descriptor = metal::TextureDescriptor::new();
-            descriptor.set_width(width);
-            descriptor.set_height(height);
-            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-            self.partial.scratch = Some(self.device.new_texture(&descriptor));
-        }
-        let scratch = self.partial.scratch.as_ref().expect("the scratch was just made");
+        // The size of the region and not of `kept`: `kept` shrinks and grows with `by` and the pool
+        // gives back only a texture of exactly the size asked for.
+        let scratch = self.acquire_texture(shift.region.size.width.0 as u32, shift.region.size.height.0 as u32);
         let origin = |x: i32, y: i32| metal::MTLOrigin { x: x as u64, y: y as u64, z: 0 };
         let extent = metal::MTLSize { width, height, depth: 1 };
         let blit = command_buffer.new_blit_command_encoder();
@@ -903,13 +889,16 @@ impl MetalRenderer {
             0,
             origin(kept.origin.x.0 - shift.by.x.0, kept.origin.y.0 - shift.by.y.0),
             extent,
-            scratch,
+            &scratch,
             0,
             0,
             origin(0, 0),
         );
-        blit.copy_from_texture(scratch, 0, 0, origin(0, 0), extent, target, 0, 0, origin(kept.origin.x.0, kept.origin.y.0));
+        blit.copy_from_texture(&scratch, 0, 0, origin(0, 0), extent, target, 0, 0, origin(kept.origin.x.0, kept.origin.y.0));
         blit.end_encoding();
+        // The commands that read it are in this command buffer, and the pool's textures are used in
+        // the same way: one that a later command buffer of the queue takes runs after them.
+        self.release_texture(scratch);
         self.partial.last_shift = Some(shift.by);
         true
     }
