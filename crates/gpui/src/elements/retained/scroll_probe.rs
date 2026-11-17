@@ -121,6 +121,8 @@ pub(crate) enum ScrollMiss {
     Place,
     /// The region the root was recorded in does not cover the content mask around it there.
     Region(UncoveredEdge),
-    /// A rounded clip in the root meets the content mask around it differently there.
+    /// A rounded clip in the root meets the content mask around it differently there, or the root
+    /// reaches a corner square of a rounded content mask around it there, which a replay cuts by
+    /// the rectangle of.
     Clip,
 }
