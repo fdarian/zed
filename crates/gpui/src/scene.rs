@@ -2533,6 +2533,8 @@ pub(crate) trait Cut {
     fn reach(&self) -> Bounds<ScaledPixels>;
     fn mask(&mut self) -> &mut ContentMask<ScaledPixels>;
     fn mask_ref(&self) -> &ContentMask<ScaledPixels>;
+    fn order(&self) -> DrawOrder;
+    fn set_order(&mut self, order: DrawOrder);
 }
 
 macro_rules! cut {
@@ -2546,6 +2548,12 @@ macro_rules! cut {
             }
             fn mask_ref(&self) -> &ContentMask<ScaledPixels> {
                 &self.content_mask
+            }
+            fn order(&self) -> DrawOrder {
+                self.order
+            }
+            fn set_order(&mut self, order: DrawOrder) {
+                self.order = order;
             }
         }
     )*};
@@ -2563,6 +2571,12 @@ impl Cut for Shadow {
     }
     fn mask_ref(&self) -> &ContentMask<ScaledPixels> {
         &self.content_mask
+    }
+    fn order(&self) -> DrawOrder {
+        self.order
+    }
+    fn set_order(&mut self, order: DrawOrder) {
+        self.order = order;
     }
 }
 
@@ -2665,7 +2679,7 @@ impl Quad {
 }
 
 impl Shadow {
-    fn translate(&mut self, delta: Point<ScaledPixels>) {
+    pub(crate) fn translate(&mut self, delta: Point<ScaledPixels>) {
         translate_mask(&mut self.content_mask, delta);
         if move_through(&mut self.transformation, delta) {
             return;
@@ -2698,7 +2712,7 @@ impl Shadow {
 const SHADOW_TAIL_SIGMAS: f32 = 3.;
 
 impl Underline {
-    fn translate(&mut self, delta: Point<ScaledPixels>) {
+    pub(crate) fn translate(&mut self, delta: Point<ScaledPixels>) {
         translate_mask(&mut self.content_mask, delta);
         if !move_through(&mut self.transformation, delta) {
             translate_bounds(&mut self.bounds, delta);

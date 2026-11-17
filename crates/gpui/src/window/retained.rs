@@ -109,8 +109,9 @@ pub enum NonRelocatable {
     Scale,
     /// A retained subtree inside is handed to a stacking context outside (see
     /// [`crate::Retained::lift_z`]), which is put where the context says and not where the
-    /// subtree moves; so is a box handed there that is under a transform, or by a recording that
-    /// is not in a region of its own.
+    /// subtree moves. A box handed there is moved with the subtree when it is a plain element
+    /// that is under no transform; under one, the subtree is recorded and replayed where it was
+    /// recorded, and not moved.
     Hole,
 }
 
@@ -147,12 +148,16 @@ pub enum RelocationMiss {
     /// A rounded clip in the subtree meets the content mask around it differently than when it
     /// was recorded.
     Clip,
+    /// A box the subtree handed to a stacking context cannot be put elsewhere with it: what it
+    /// painted was not recorded to be repeated translated (it is under something a replay does not
+    /// move, or the context did not paint it).
+    Lifted,
 }
 
 impl RelocationMiss {
     /// Every reason.
-    pub const ALL: [RelocationMiss; 3] =
-        [RelocationMiss::Place, RelocationMiss::Region, RelocationMiss::Clip];
+    pub const ALL: [RelocationMiss; 4] =
+        [RelocationMiss::Place, RelocationMiss::Region, RelocationMiss::Clip, RelocationMiss::Lifted];
 
     fn index(self) -> usize {
         self as usize
@@ -750,23 +755,21 @@ impl PlainPaint {
     /// Whether the recording that holds the cell can be put `delta` away, under the content mask
     /// `ambient`, with the paint the cell recorded: the paint is repeatable translated, and the
     /// clips in it decide there as they did. `translates` is whether the listener of the recording
-    /// takes the translation. The miss is `None` when the cell was never a candidate.
+    /// takes the translation.
     pub(crate) fn fits(
         &self,
         delta: Point<Pixels>,
         ambient: &ContentMask<Pixels>,
         translates: bool,
-    ) -> Result<(), Option<RelocationMiss>> {
+    ) -> Result<(), RelocationMiss> {
         let relocation = self.relocation.borrow();
-        let Some(relocation) = relocation.as_ref() else {
-            return Err(None);
-        };
+        let relocation = relocation.as_ref().expect("a regional cell has its relocation");
         let recorded = self.recorded.borrow();
         match &recorded.paint {
             Some(paint) if paint.blockers == 0 && (translates || !paint.has_publications) => {
-                relocation.info.fits(delta, ambient).map_err(Some)
+                relocation.info.fits(delta, ambient)
             }
-            _ => Err(None),
+            _ => Err(RelocationMiss::Lifted),
         }
     }
 
@@ -986,11 +989,17 @@ struct LiftStub {
 }
 
 impl LiftStub {
+    /// Whether the paint of the element is recorded in the region of the recording that holds the
+    /// stub, which a replay puts where the recording is.
+    fn is_regional_cell(&self) -> bool {
+        matches!(&self.kind, StubKind::Plain(cell) if cell.is_regional())
+    }
+
     /// Whether a replay of the recording that holds the stub can put the element elsewhere with
-    /// it: its paint is recorded in the region, and nothing the element is painted inside is
-    /// left to the stacking context.
+    /// it: a regional cell, whose transforms (the ones around the context are not the recording's
+    /// to move) are none.
     fn moves_with_its_root(&self) -> bool {
-        self.transforms.is_empty() && matches!(&self.kind, StubKind::Plain(cell) if cell.is_regional())
+        self.transforms.is_empty() && self.is_regional_cell()
     }
 }
 
@@ -1013,13 +1022,19 @@ pub(crate) struct LiftRecord {
 
 impl LiftRecord {
     /// Whether every element handed over is a regional cell: a recording in a region of its own that
-    /// holds only these is put elsewhere with them.
-    fn moves_with_its_root(&self) -> bool {
-        self.stubs.iter().all(LiftStub::moves_with_its_root)
+    /// holds only these is replayed with them where it was recorded.
+    fn is_all_regional_cells(&self) -> bool {
+        self.stubs.iter().all(LiftStub::is_regional_cell)
     }
 
     fn holds_regional_cells(&self) -> bool {
         self.cells().any(|cell| cell.is_regional())
+    }
+
+    /// Whether every element handed over is put elsewhere by a replay of the recording that holds
+    /// it, see [`LiftStub::moves_with_its_root`].
+    fn moves_with_its_root(&self) -> bool {
+        self.stubs.iter().all(LiftStub::moves_with_its_root)
     }
 
     /// Whether each cell's paint can be put `delta` away, see [`PlainPaint::fits`].
@@ -1028,7 +1043,7 @@ impl LiftRecord {
         delta: Point<Pixels>,
         ambient: &ContentMask<Pixels>,
         translates: bool,
-    ) -> Result<(), Option<RelocationMiss>> {
+    ) -> Result<(), RelocationMiss> {
         self.cells()
             .filter(|cell| cell.is_regional())
             .try_for_each(|cell| cell.fits(delta, ambient, translates))
@@ -2105,19 +2120,21 @@ impl Window {
         {
             if let Some(surroundings) = surroundings {
                 // What leaves the region for a stacking context outside is a stub of the recording
-                // if all of it is regional cells, which a replay puts where it moves. The live
-                // entries are cut by the content mask around now, as the rest of the subtree is.
+                // if all of it is regional cells, which a replay hands over again, and puts where it
+                // moves unless one is under a transform (then the record is replayed exactly and
+                // not moved, see the `Hole` blocker below). The live entries are cut by the content
+                // mask around now, as the rest of the subtree is.
                 if let Some(record) = self.lifted_holes_since(lift_mark, stale_parent)
-                    && record.moves_with_its_root()
+                    && record.is_all_regional_cells()
                 {
                     lifts = Some(Rc::new(record));
                     reasons &= !lift_bit;
                 }
                 self.cut_lifted_since(lift_mark, surroundings);
             } else if let Some(record) = self.lifted_holes_since(lift_mark, stale_parent) {
-                // A regional cell was recorded in the region of the root that handed it over, and
-                // is put in the frame by that root's replay: a recording around it would put it where
-                // the root was recorded.
+                // A regional cell was recorded in the region of the root that handed it over, and is
+                // put in the frame by that root's replay, at the distance that root was put: a recording
+                // around it would put it where the root was recorded.
                 if !record.holds_regional_cells() {
                     lifts = Some(Rc::new(record));
                     reasons &= !lift_bit;
@@ -2453,7 +2470,7 @@ impl Window {
                 content_mask,
                 uncut_mask,
                 derived_mask,
-                cut: None,
+                cut: relocated.map(|(_, surroundings)| *surroundings),
                 image_cache: stub.image_cache.clone(),
                 hole,
                 cell,

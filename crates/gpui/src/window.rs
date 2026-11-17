@@ -7469,12 +7469,16 @@ impl Window {
         let uncut_mask = entry.uncut_mask;
         let derived_mask = entry.derived_mask;
         let cell = entry.cell.as_deref();
-        // A regional cell is painted under masks that nothing cuts: its recording is cut where it
-        // is put.
-        let outer_cut = entry
-            .cut
-            .filter(|_| !cell.is_some_and(PlainPaint::is_regional))
-            .map(|cut| self.paint_cut.replace(cut));
+        let regional = cell.is_some_and(PlainPaint::is_regional);
+        // A regional cell is painted under masks that nothing cuts, and what it painted is put
+        // under the content mask around its region and not under the mask of the box it was handed
+        // over under: a box that escapes that box's clip is cut by the clip it escapes to, which
+        // the operations hold, and not by the clip it left.
+        let emitted_mask = match entry.cut {
+            Some(cut) if regional && derived_mask => cut,
+            _ => content_mask,
+        };
+        let outer_cut = entry.cut.filter(|_| !regional).map(|cut| self.paint_cut.replace(cut));
         let image_cache = entry.image_cache.take();
         let content = &mut entry.content;
         let owners = &entry.owners;
@@ -7483,7 +7487,7 @@ impl Window {
             window.with_visibility(visibility, |window| {
                 window.with_rem_size(Some(rem_size), |window| {
                     window.with_image_cache(image_cache, |window| {
-                        window.with_replaced_mask(content_mask, derived_mask, |window| match content {
+                        window.with_replaced_mask(emitted_mask, derived_mask, |window| match content {
                             LiftedContent::Element(element) => match cell {
                                 Some(cell) => window.record_plain_paint(
                                     cell,

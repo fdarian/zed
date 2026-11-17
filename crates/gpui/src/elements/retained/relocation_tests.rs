@@ -8,7 +8,8 @@ use crate::{
     AnyView, AnyWindowHandle, Bounds, Context, Edges, InteractiveElement, ParentElement, Position, Render,
     RasterizingTextSystem, RetainedCounters, ScrollHandle, StatefulInteractiveElement, StyledText, Styled, TestApp,
     TextLayout, WindowBounds, WindowOptions, div, point, px, size,
-    ContentMask, Corners, Quad, ScaledPixels,
+    ContentMask, Corners, MonochromeSprite, Path, PolychromeSprite, Quad, ScaledPixels, Scene, Shadow,
+    SubpixelSprite, Underline,
 };
 use accesskit::Role;
 use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
@@ -97,6 +98,11 @@ enum Kind {
     LiftingClipped,
     /// [`Kind::Lifting`] with a rounded clip inside the box, which its content overflows.
     LiftingRounded,
+    /// [`Kind::Lifting`] under a transform of its own inside the row, which a replay does not move the box with.
+    LiftingTransformed,
+    /// A box that is absolutely positioned in the row, which is under an overflow clip of its own
+    /// inside the row that the box is not cut by, and that the box overflows.
+    LiftingEscaping,
     /// Has a retained subtree of its own, which is built every frame the row is.
     Retained,
     /// Has a view that caches what it draws.
@@ -256,7 +262,7 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> 
                     .bg(crate::black()),
             );
         }
-        Kind::Lifting | Kind::LiftingBehind | Kind::LiftingAbove | Kind::LiftingClipped | Kind::LiftingRounded => {
+        Kind::Lifting | Kind::LiftingBehind | Kind::LiftingAbove | Kind::LiftingClipped | Kind::LiftingRounded | Kind::LiftingTransformed => {
             let z = match spec.kind {
                 Kind::LiftingBehind => -1,
                 Kind::LiftingAbove => 3,
@@ -291,6 +297,21 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> 
             row = row.child(text);
             row = if spec.kind == Kind::LiftingClipped {
                 row.child(div().id(("lifted-clip", index)).overflow_hidden().w(px(150.)).h(px(18.)).child(lifted))
+            } else if spec.kind == Kind::LiftingTransformed {
+                row.child(
+                    div()
+                        .id(("lifted-transform", index))
+                        .transform(crate::ElementTransform {
+                            functions: vec![crate::TransformFunction::Translate(
+                                crate::TransformLength::pixels(3.),
+                                crate::TransformLength::pixels(2.),
+                            )],
+                            origin: (crate::TransformLength::pixels(0.), crate::TransformLength::pixels(0.)),
+                            origin_z: 0.,
+                            animating: false,
+                        })
+                        .child(lifted),
+                )
             } else {
                 row.child(lifted)
             };
@@ -354,6 +375,22 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> 
                             ),
                     ),
             );
+        }
+        Kind::LiftingEscaping => {
+            let mut placed = div()
+                .id(("lifted-box", index))
+                .always_hitbox()
+                .top(px(10.))
+                .left(px(120.))
+                .w(px(60.))
+                .h(px(spec.height * 0.75))
+                .bg(crate::black().opacity(0.5));
+            placed.style().position = Some(Position::AbsoluteInAncestor);
+            // A div is the containing block of what it holds unless it says it is static: the clip is static so that
+            // the box is placed by the row, which the clip does not cut.
+            let mut clip = div().id(("lifted-clip", index)).overflow_hidden().w(px(150.)).h(px(18.)).child(placed);
+            clip.style().position = Some(Position::Static);
+            row = row.relative().unlifted().child(text).child(clip);
         }
         Kind::Positioned | Kind::Escaping | Kind::Fixed => {
             // A div lays out as a containing block unless it says it is static: only a static
@@ -870,22 +907,23 @@ fn probes() -> Vec<(f32, f32)> {
     probes
 }
 
-/// `primitives` as [`without_arcs_if_clear`] has them. What is outside `view` shows nothing and is
-/// left out: a subtree past its overscan is not painted, where a build inside a clip that the
+/// `primitives` as [`without_arcs_if_clear`] has them. What is outside `view`, or cut away by its own
+/// content mask, shows nothing and is left out: a subtree past its overscan is not painted, where a build inside a clip that the
 /// content mask does not hold (a card cut by its scroller, painted as a group) paints it.
 fn without_arcs_that_cut_nothing<P: Cut>(mut primitives: Vec<P>, view: Bounds<ScaledPixels>) -> Vec<P> {
     for primitive in &mut primitives {
         let reach = primitive.reach();
         without_arcs_if_clear(primitive.mask(), reach);
     }
-    primitives.retain(|primitive| !primitive.reach().intersect(&view).is_empty());
+    primitives.retain(|primitive| !primitive.reach().intersect(&primitive.mask_ref().bounds).intersect(&view).is_empty());
     primitives
 }
 
 /// [`without_arcs_that_cut_nothing`] for quads, which are also drawn differently under a rounded
 /// mask: an outline with no background is four strips under a rectangle and one quad under a
 /// rounded mask (`border_strips`), the same pixels where nothing reaches a corner. Both forms
-/// become the strips, and an outline's draw order is dropped: the strips take their own.
+/// become the strips, each with the order of the outline: [`renumber_by_overlap`] then numbers them
+/// by what they overlap, as it numbers the strips a replay drew.
 fn canonical_quads(quads: Vec<Quad>, view: Bounds<ScaledPixels>) -> Vec<Quad> {
     let mut quads: Vec<Quad> = without_arcs_that_cut_nothing(quads, view)
         .into_iter()
@@ -893,7 +931,6 @@ fn canonical_quads(quads: Vec<Quad>, view: Bounds<ScaledPixels>) -> Vec<Quad> {
             if !quad.background.is_transparent() || !quad.border_widths.any(|width| width.0 > 0.) {
                 return vec![quad];
             }
-            let quad = Quad { order: 0, ..quad };
             let Some(strips) = border_strips(&quad) else {
                 return vec![quad];
             };
@@ -912,6 +949,96 @@ fn canonical_quads(quads: Vec<Quad>, view: Bounds<ScaledPixels>) -> Vec<Quad> {
     // Quads of one order do not overlap, so the order they are in says nothing.
     quads.sort_by_cached_key(|quad| (quad.order, format!("{quad:?}")));
     quads
+}
+
+/// The primitives of one scene, as [`observe`] compares them.
+struct Primitives {
+    shadows: Vec<Shadow>,
+    quads: Vec<Quad>,
+    underlines: Vec<Underline>,
+    monochrome_sprites: Vec<MonochromeSprite>,
+    subpixel_sprites: Vec<SubpixelSprite>,
+    polychrome_sprites: Vec<PolychromeSprite>,
+    paths: Vec<Path<ScaledPixels>>,
+}
+
+impl Primitives {
+    /// What `scene` holds. With a `view` (a page with rounded corners) the draw orders say only which of two primitives
+    /// that overlap is above the other (see [`renumber_by_overlap`]): a recording put elsewhere inserts what it holds
+    /// at another place in the sequence, and what the rectangle a replay cuts by lets through is drawn as pieces that
+    /// a build under a rounded mask draws whole, so the numbers differ where nothing shows it.
+    fn of(scene: &Scene, view: Option<Bounds<ScaledPixels>>) -> Self {
+        let mut primitives = Self {
+            shadows: cut(view, scene.shadows.clone()),
+            quads: cut_quads(view, scene.quads.clone()),
+            underlines: cut(view, scene.underlines.clone()),
+            monochrome_sprites: cut(view, scene.monochrome_sprites.clone()),
+            subpixel_sprites: cut(view, scene.subpixel_sprites.clone()),
+            polychrome_sprites: cut(view, scene.polychrome_sprites.clone()),
+            paths: cut(view, scene.paths.clone()),
+        };
+        if view.is_some() {
+            primitives.renumber();
+        }
+        primitives
+    }
+
+    /// [`Self::of`] for `scene` and the groups inside it, in the window of `scene`: the kinds that
+    /// [`Scene::shadows_with_groups`] and the others hold.
+    fn with_groups(scene: &Scene, origin: crate::Point<ScaledPixels>, view: Option<Bounds<ScaledPixels>>) -> Self {
+        let mut own = Self::of(scene, view);
+        if origin != crate::Point::default() {
+            own.shadows.iter_mut().for_each(|shadow| shadow.translate(origin));
+            own.quads.iter_mut().for_each(|quad| quad.translate(origin));
+            own.underlines.iter_mut().for_each(|underline| underline.translate(origin));
+            own.polychrome_sprites.iter_mut().for_each(|sprite| sprite.translate(origin));
+        }
+        for group in &scene.groups {
+            let inside = Self::with_groups(&group.scene, origin + group.bounds.origin, view);
+            own.shadows.extend(inside.shadows);
+            own.quads.extend(inside.quads);
+            own.underlines.extend(inside.underlines);
+            own.polychrome_sprites.extend(inside.polychrome_sprites);
+        }
+        own
+    }
+
+    fn renumber(&mut self) {
+        let mut all: Vec<&mut dyn Cut> = Vec::new();
+        all.extend(self.shadows.iter_mut().map(|primitive| primitive as &mut dyn Cut));
+        all.extend(self.quads.iter_mut().map(|primitive| primitive as &mut dyn Cut));
+        all.extend(self.underlines.iter_mut().map(|primitive| primitive as &mut dyn Cut));
+        all.extend(self.monochrome_sprites.iter_mut().map(|primitive| primitive as &mut dyn Cut));
+        all.extend(self.subpixel_sprites.iter_mut().map(|primitive| primitive as &mut dyn Cut));
+        all.extend(self.polychrome_sprites.iter_mut().map(|primitive| primitive as &mut dyn Cut));
+        all.extend(self.paths.iter_mut().map(|primitive| primitive as &mut dyn Cut));
+        renumber_by_overlap(&mut all);
+        // Quads of one order do not overlap, so the order they are in says nothing.
+        self.quads.sort_by_cached_key(|quad| (quad.order, format!("{quad:?}")));
+    }
+}
+
+/// Gives each primitive the draw order one more than the highest of the primitives it overlaps that are drawn below it
+/// (the first is 1): two primitives that overlap keep their order, and the numbers say nothing else. Primitives of one
+/// order are a layer, and take what is below the layer.
+fn renumber_by_overlap(primitives: &mut [&mut dyn Cut]) {
+    let areas: Vec<Bounds<ScaledPixels>> =
+        primitives.iter().map(|primitive| primitive.reach().intersect(&primitive.mask_ref().bounds)).collect();
+    let mut sequence: Vec<usize> = (0..primitives.len()).collect();
+    sequence.sort_by_key(|index| primitives[*index].order());
+    let mut numbers = vec![0; primitives.len()];
+    for (position, index) in sequence.iter().enumerate() {
+        let order = primitives[*index].order();
+        numbers[*index] = 1 + sequence[..position]
+            .iter()
+            .filter(|below| primitives[**below].order() < order && !areas[**below].intersect(&areas[*index]).is_empty())
+            .map(|below| numbers[*below])
+            .max()
+            .unwrap_or(0);
+    }
+    for (primitive, number) in primitives.iter_mut().zip(numbers) {
+        primitive.set_order(number);
+    }
 }
 
 fn window_view(window: &Window) -> Bounds<ScaledPixels> {
@@ -945,15 +1072,17 @@ fn observe(
         .update_window(window, |_, window, _| {
             let view = rounded.then(|| window_view(window));
             let scene = &window.rendered_frame.scene;
+            let own = Primitives::of(scene, view);
+            let with_groups = Primitives::with_groups(scene, crate::Point::default(), view);
             let scene = format!(
                 "{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{:#?}\n{}\n{:#?}\n{:#?}\n{:#?}\n{:#?}",
-                cut(view, scene.shadows.clone()),
-                cut_quads(view, scene.quads.clone()),
-                cut(view, scene.underlines.clone()),
-                cut(view, scene.monochrome_sprites.clone()),
-                cut(view, scene.subpixel_sprites.clone()),
-                cut(view, scene.polychrome_sprites.clone()),
-                cut(view, scene.paths.clone()),
+                own.shadows,
+                own.quads,
+                own.underlines,
+                own.monochrome_sprites,
+                own.subpixel_sprites,
+                own.polychrome_sprites,
+                own.paths,
                 scene
                     .groups
                     .iter()
@@ -966,10 +1095,10 @@ fn observe(
                     })
                     .collect::<Vec<_>>()
                     .join("\n"),
-                cut(view, scene.shadows_with_groups()),
-                cut_quads(view, scene.quads_with_groups()),
-                cut(view, scene.underlines_with_groups()),
-                cut(view, scene.polychrome_sprites_with_groups()),
+                with_groups.shadows,
+                with_groups.quads,
+                with_groups.underlines,
+                with_groups.polychrome_sprites,
             );
             let a11y = canonical_a11y(window.a11y.last_tree_update().expect("a11y is on"), &window.a11y.node_bounds);
             let chains = probes
@@ -1033,8 +1162,9 @@ fn observe(
     let sprites = cx
         .update_window(window, |_, window, _| {
             let view = rounded.then(|| window_view(window));
-            let scene = &window.rendered_frame.scene;
-            let mut lines = cut(view, scene.monochrome_sprites.clone())
+            let own = Primitives::of(&window.rendered_frame.scene, view);
+            let mut lines = own
+                .monochrome_sprites
                 .iter()
                 .map(|sprite| {
                     format!(
@@ -1043,7 +1173,7 @@ fn observe(
                     )
                 })
                 .collect::<Vec<_>>();
-            lines.extend(cut_quads(view, scene.quads.clone()).iter().map(|quad| {
+            lines.extend(own.quads.iter().map(|quad| {
                 format!("quad {} {:?} {:?} {:?}", quad.order, quad.bounds.origin, quad.bounds.size, quad.content_mask.bounds)
             }));
             lines.join("\n")
@@ -1232,6 +1362,46 @@ fn a_row_that_hands_a_positioned_box_to_the_context_around_the_page_is_moved_whe
 fn a_box_that_a_row_hands_over_from_under_a_clip_inside_it_is_cut_by_the_clip_where_it_is_moved() {
     let (_, _, before, after) = lifting_rows_are_the_rows_a_build_shows(
         rows(30, 40., Kind::LiftingClipped),
+        Rounding::Nothing,
+        1.,
+        &[3., 12., 40., 41., 7.5, 90.25, 0.],
+    );
+    assert!(after.relocations > before.relocations, "{after:?}");
+}
+
+#[test]
+fn rows_that_hand_a_box_over_from_under_a_transform_are_replayed_where_they_were_recorded_and_built_where_a_scroll_puts_them() {
+    let scrolls = [10., 12.5, 40., 0.];
+    let relocations_of = |kind: Kind| {
+        let mut cx = app();
+        let pair = Pair::in_context(&mut cx, rows(30, 40., kind), 1., Rounding::Nothing);
+        pair.assert_same(&mut cx, "the first frame");
+        pair.draw(&mut cx);
+        pair.assert_same(&mut cx, "the second frame");
+        let before = pair.counters(&mut cx);
+        assert_eq!(before.non_reusable(NonReusable::Lift), 0, "{kind:?}: the rows are recorded: {before:?}");
+        pair.draw(&mut cx);
+        pair.assert_same(&mut cx, "a frame that changes nothing");
+        let still = pair.counters(&mut cx);
+        assert!(still.replays > before.replays, "{kind:?}: the rows are replayed where they are: {still:?}");
+        assert_eq!(still.builds, before.builds, "{kind:?}: {still:?}");
+        scroll_through(&pair, &mut cx, &scrolls);
+        let after = pair.counters(&mut cx);
+        assert_eq!(after.mismatches, 0, "{kind:?}: {after:?}");
+        (after.relocations - before.relocations, after.non_relocatable(NonRelocatable::Hole), after.lazy_builds - before.lazy_builds)
+    };
+    let (plain, plain_holes, plain_lazy) = relocations_of(Kind::Lifting);
+    let (transformed, holes, lazy) = relocations_of(Kind::LiftingTransformed);
+    assert_eq!(plain_holes, 0);
+    assert!(holes > 0);
+    assert!(transformed < plain, "a box under a transform is not moved with its row: {transformed} against {plain}");
+    assert!(lazy > plain_lazy + 10, "so its rows are built where the scroll puts them: {lazy} against {plain_lazy}");
+}
+
+#[test]
+fn a_box_that_escapes_a_clip_inside_the_row_is_not_cut_by_it_where_the_row_is_moved() {
+    let (_, _, before, after) = lifting_rows_are_the_rows_a_build_shows(
+        rows(30, 40., Kind::LiftingEscaping),
         Rounding::Nothing,
         1.,
         &[3., 12., 40., 41., 7.5, 90.25, 0.],
@@ -1793,6 +1963,8 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
         Kind::LiftingAbove,
         Kind::LiftingClipped,
         Kind::LiftingRounded,
+        Kind::LiftingEscaping,
+        Kind::LiftingTransformed,
     ];
     let mut relocated = 0;
     let seeds = std::env::var("RELOCATION_FUZZ_SEEDS")
@@ -1828,14 +2000,6 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
         let framed = rng.random_bool(0.5);
         // Most pages are a stacking context, which the boxes that rows position are handed to.
         let stacking = rng.random_bool(0.7);
-        // The border a card draws after its content is one quad under a rounded mask and four strips under
-        // the rectangle a replay cuts by, so a box handed over above the card is ordered against the
-        // whole quad in one and not in the other: the same pixels, another draw order.
-        let split_borders = rounded && stacking;
-        let specs: Vec<RowSpec> = specs
-            .into_iter()
-            .map(|spec| RowSpec { kind: if split_borders && spec.kind == Kind::Card { Kind::Plain } else { spec.kind }, ..spec })
-            .collect();
         let kinds_of_rows = format!("{:?}", specs.iter().map(|spec| (spec.kind, spec.height)).collect::<Vec<_>>());
         let pair = Pair::surrounded(cx, specs, scale_factor, Surroundings { rounding, framed, stacking });
         if verified {

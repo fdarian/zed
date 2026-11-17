@@ -105,6 +105,8 @@ impl RetainedState {
             RelocationMiss::Place => ScrollMiss::Place,
             RelocationMiss::Region => ScrollMiss::Region(relocation.info.uncovered_edge(delta, ambient)),
             RelocationMiss::Clip => ScrollMiss::Clip,
+            // The root's own clip decisions do not say it: the boxes it handed over do.
+            RelocationMiss::Lifted => ScrollMiss::Unmovable,
         })
     }
 }

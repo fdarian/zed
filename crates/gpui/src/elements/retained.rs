@@ -1856,7 +1856,7 @@ impl Recorded {
         // What the elements it handed to the stacking context painted is put where the root is, and
         // only known once the context has painted them.
         if let Some(lifts) = &self.prepaint.lifts {
-            lifts.fit(delta, ambient, self.translates)?;
+            lifts.fit(delta, ambient, self.translates).map_err(Some)?;
         }
         Ok(delta)
     }
