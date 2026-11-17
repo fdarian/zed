@@ -87,6 +87,16 @@ enum Kind {
     /// every row, moved down by a `transform`, so that it forms a stacking context of its own,
     /// with a box lifted inside that context.
     Lifted,
+    /// Has a box placed by its own position (`relative`), which the context around the page paints.
+    Lifting,
+    /// [`Kind::Lifting`], the box painted below the in-flow content of the context.
+    LiftingBehind,
+    /// [`Kind::Lifting`], the box painted above, taller than the row.
+    LiftingAbove,
+    /// [`Kind::Lifting`] under an overflow clip of its own inside the row, which the box overflows.
+    LiftingClipped,
+    /// [`Kind::Lifting`] with a rounded clip inside the box, which its content overflows.
+    LiftingRounded,
     /// Has a retained subtree of its own, which is built every frame the row is.
     Retained,
     /// Has a view that caches what it draws.
@@ -246,6 +256,45 @@ fn row_element(index: usize, spec: RowSpec, handles: &Handles, cx: &mut App) -> 
                     .bg(crate::black()),
             );
         }
+        Kind::Lifting | Kind::LiftingBehind | Kind::LiftingAbove | Kind::LiftingClipped | Kind::LiftingRounded => {
+            let z = match spec.kind {
+                Kind::LiftingBehind => -1,
+                Kind::LiftingAbove => 3,
+                _ => 0,
+            };
+            let height = if spec.kind == Kind::LiftingAbove { spec.height * 1.5 } else { spec.height * 0.6 };
+            let mut lifted = div()
+                .id(("lifted-box", index))
+                .always_hitbox()
+                .relative()
+                .z_index(z)
+                .top(px(2.))
+                .left(px(120.))
+                .w(px(60.))
+                .h(px(height))
+                .bg(crate::black().opacity(0.5))
+                .child(
+                    div()
+                        .id(("lifted-button", index))
+                        .always_hitbox()
+                        .role(Role::Button)
+                        .aria_label(format!("Lifted {index}"))
+                        .w(px(20.))
+                        .h(px(10.))
+                        .bg(crate::blue()),
+                );
+            if spec.kind == Kind::LiftingRounded {
+                lifted = lifted.rounded_xl().overflow_hidden().child(
+                    div().id(("lifted-wide", index)).always_hitbox().w(px(120.)).h(px(height * 2.)).bg(crate::red().opacity(0.4)),
+                );
+            }
+            row = row.child(text);
+            row = if spec.kind == Kind::LiftingClipped {
+                row.child(div().id(("lifted-clip", index)).overflow_hidden().w(px(150.)).h(px(18.)).child(lifted))
+            } else {
+                row.child(lifted)
+            };
+        }
         Kind::Retained => {
             let inner = if handles.retains {
                 retained(("inner-retained-root", index), 1, move |_, _| inner_box(index))
@@ -399,6 +448,7 @@ fn page(
     retained_rows: bool,
     rounding: Rounding,
     framed: bool,
+    stacking: bool,
     cx: &mut App,
 ) -> AnyElement {
     let rows = specs.iter().enumerate().map(|(index, spec)| {
@@ -460,6 +510,8 @@ fn page(
     // A positioned page is the frame around the scroller, which does not scroll with the rows.
     let page = div().id("page").size_full();
     let page = if framed { page.relative() } else { page };
+    // The context the boxes that the rows position are handed to.
+    let page = if stacking { page.stacking_context() } else { page };
     // TanStack Virtual puts every row in one positioned container, as high as the rows are.
     let scroller = if specs.first().is_some_and(|spec| spec.kind == Kind::Lifted) {
         let height = specs.iter().map(|spec| spec.height).sum::<f32>();
@@ -516,6 +568,15 @@ struct Pair {
     rounded: bool,
 }
 
+/// What surrounds the rows of a [`Pair`].
+#[derive(Clone, Copy)]
+struct Surroundings {
+    rounding: Rounding,
+    framed: bool,
+    /// The page is a stacking context, which takes the boxes the rows position.
+    stacking: bool,
+}
+
 impl Pair {
     fn new(cx: &mut TestApp, specs: Vec<RowSpec>, scale_factor: f32, rounded: bool) -> Self {
         Self::build(cx, specs, scale_factor, rounded, false)
@@ -526,6 +587,11 @@ impl Pair {
         Self::build_rounded(cx, specs, scale_factor, rounding, framed)
     }
 
+    /// Rows in a page that is a stacking context.
+    fn in_context(cx: &mut TestApp, specs: Vec<RowSpec>, scale_factor: f32, rounding: Rounding) -> Self {
+        Self::surrounded(cx, specs, scale_factor, Surroundings { rounding, framed: false, stacking: true })
+    }
+
     fn build_rounded(
         cx: &mut TestApp,
         specs: Vec<RowSpec>,
@@ -533,6 +599,11 @@ impl Pair {
         rounding: Rounding,
         framed: bool,
     ) -> Self {
+        Self::surrounded(cx, specs, scale_factor, Surroundings { rounding, framed, stacking: false })
+    }
+
+    fn surrounded(cx: &mut TestApp, specs: Vec<RowSpec>, scale_factor: f32, surroundings: Surroundings) -> Self {
+        let rounding = surroundings.rounding;
         let specs = Rc::new(specs);
         let open = |cx: &mut TestApp, retained_rows: bool| {
             let scroll = ScrollHandle::new();
@@ -544,7 +615,7 @@ impl Pair {
                 let specs = specs.clone();
                 let handles = handles.clone();
                 let scroll = scroll.clone();
-                Rc::new(move |_, cx| page(&specs, &handles, &scroll, retained_rows, rounding, framed, cx))
+                Rc::new(move |_, cx| page(&specs, &handles, &scroll, retained_rows, rounding, surroundings.framed, surroundings.stacking, cx))
             };
             let window = cx.open_window_with_options(
                 WindowOptions {
@@ -1100,6 +1171,223 @@ fn rows_in_a_positioned_page_are_moved_though_the_page_is_not() {
     assert_eq!(after.mismatches, 0);
 }
 
+/// The place down the column `x` that the retained window of `pair` answers with `name` first, if one does.
+fn hit_chain_down_the_row(pair: &Pair, cx: &mut TestApp, x: f32, name: &str) -> Option<f32> {
+    cx.update_window(pair.retained, |_, window, _| {
+        (0..220).map(|y| y as f32 + 0.5).find(|y| {
+            window.hit_chain_at(point(px(x), px(*y))).first().is_some_and(|(id, _)| format!("{id}").ends_with(name))
+        })
+    })
+    .unwrap()
+}
+
+/// Rows of `kind` in a page that is a stacking context, scrolled by `offsets`: a window of the same rows
+/// built whole shows and answers what the moved replays do, and no row is refused for what it hands to
+/// the context. Returns the counters before the scrolls and after.
+fn lifting_rows_are_the_rows_a_build_shows(
+    specs: Vec<RowSpec>,
+    rounding: Rounding,
+    scale_factor: f32,
+    offsets: &[f32],
+) -> (Pair, TestApp, RetainedCounters, RetainedCounters) {
+    let mut cx = app();
+    let pair = Pair::in_context(&mut cx, specs, scale_factor, rounding);
+    pair.assert_same(&mut cx, "the first frame");
+    pair.draw(&mut cx);
+    pair.assert_same(&mut cx, "the second frame");
+    let before = pair.counters(&mut cx);
+    assert_eq!(before.non_reusable(NonReusable::Lift), 0, "{before:?}");
+    scroll_through(&pair, &mut cx, offsets);
+    let after = pair.counters(&mut cx);
+    assert_eq!(after.non_reusable(NonReusable::Lift), 0, "{after:?}");
+    // A row at a corner of a rounded page is built, and a recording that is not in a region holds what it hands over.
+    if rounding == Rounding::Nothing {
+        assert_eq!(after.non_relocatable(NonRelocatable::Hole), 0, "{after:?}");
+    }
+    assert_eq!(after.mismatches, 0, "{after:?}");
+    (pair, cx, before, after)
+}
+
+#[test]
+fn a_row_that_hands_a_positioned_box_to_the_context_around_the_page_is_moved_where_a_scroll_puts_it() {
+    for scale_factor in [1., 2.] {
+        let (pair, mut cx, before, after) =
+            lifting_rows_are_the_rows_a_build_shows(rows(30, 40., Kind::Lifting), Rounding::Nothing, scale_factor, &[10.]);
+        assert_eq!(after.builds, before.builds, "no row is built for a scroll within the overscan: {after:?}");
+        assert!(after.relocations >= before.relocations + 5, "{after:?}");
+        assert_eq!(after.relocation_misses(RelocationMiss::Place), 0);
+
+        // Row 3 is at 120 and the scroll has moved it to 110.
+        assert!(
+            hit_chain_down_the_row(&pair, &mut cx, 160., "lifted-box-3").is_some(),
+            "the box of row 3 is hit in the window that moved it"
+        );
+
+        scroll_through(&pair, &mut cx, &[11., 40., 45.5, 90., 25., 0.3, 17.75, 0.]);
+        assert_eq!(pair.counters(&mut cx).mismatches, 0);
+    }
+}
+
+#[test]
+fn a_box_that_a_row_hands_over_from_under_a_clip_inside_it_is_cut_by_the_clip_where_it_is_moved() {
+    let (_, _, before, after) = lifting_rows_are_the_rows_a_build_shows(
+        rows(30, 40., Kind::LiftingClipped),
+        Rounding::Nothing,
+        1.,
+        &[3., 12., 40., 41., 7.5, 90.25, 0.],
+    );
+    assert!(after.relocations > before.relocations, "{after:?}");
+}
+
+#[test]
+fn boxes_handed_over_below_and_above_the_content_stay_in_their_order_among_the_ones_of_the_other_rows() {
+    let specs = (0..32)
+        .map(|index| RowSpec {
+            kind: [Kind::LiftingBehind, Kind::LiftingAbove, Kind::Lifting, Kind::Plain][index % 4],
+            height: 30.,
+        })
+        .collect();
+    let (_, _, before, after) =
+        lifting_rows_are_the_rows_a_build_shows(specs, Rounding::Nothing, 1., &[4., 15., 33., 34.5, 61., 7., 120., 3., 0.]);
+    assert!(after.relocations > before.relocations, "{after:?}");
+}
+
+#[test]
+fn a_rounded_clip_inside_the_box_a_row_hands_over_decides_again_where_the_row_is_put() {
+    let (_, _, before, after) = lifting_rows_are_the_rows_a_build_shows(
+        rows(24, 40., Kind::LiftingRounded),
+        Rounding::Nothing,
+        1.,
+        &[2., 9., 15.5, 40., 41., 77., 100.25, 36., 0.],
+    );
+    assert!(after.relocations > before.relocations, "{after:?}");
+    assert!(
+        after.relocation_misses(RelocationMiss::Clip) > before.relocation_misses(RelocationMiss::Clip),
+        "a box whose rounded clip meets the edge of the scroller differently is built: {after:?}"
+    );
+}
+
+#[test]
+fn rows_that_hand_a_box_over_in_a_rounded_page_follow_the_rule_of_the_corners() {
+    for rounding in [Rounding::Scroller, Rounding::Panel, Rounding::Card] {
+        let (_, _, before, after) = lifting_rows_are_the_rows_a_build_shows(
+            rows(24, 40., Kind::Lifting),
+            rounding,
+            1.,
+            &[3., 12., 40., 41., 90.25, 0.],
+        );
+        assert!(after.relocations > before.relocations, "{rounding:?}: {after:?}");
+    }
+}
+
+#[test]
+fn rows_that_hand_a_box_over_come_from_past_the_region_built_and_are_moved_again_after() {
+    let cx = &mut app();
+    let pair = Pair::in_context(cx, rows(60, 40., Kind::Lifting), 1., Rounding::Nothing);
+    pair.draw(cx);
+    let before = pair.counters(cx);
+    scroll_through(&pair, cx, &[1000.]);
+    let after = pair.counters(cx);
+    assert!(
+        after.builds + after.lazy_builds > before.builds + before.lazy_builds + 4,
+        "the rows that show now were built: {after:?}"
+    );
+    pair.draw(cx);
+    pair.draw(cx);
+    pair.assert_same(cx, "after replaying them");
+    let settled = pair.counters(cx);
+    scroll_through(&pair, cx, &[1007.]);
+    let moved = pair.counters(cx);
+    assert!(moved.relocations > settled.relocations, "{moved:?}");
+
+    // A scroll by more than the overscan leaves a part of the view that the region of a row does not cover.
+    let pair = Pair::in_context(cx, rows(60, 40., Kind::Lifting), 1., Rounding::Nothing);
+    pair.draw(cx);
+    let before = pair.counters(cx);
+    scroll_through(&pair, cx, &[150.]);
+    let after = pair.counters(cx);
+    assert!(after.relocation_misses(RelocationMiss::Region) > before.relocation_misses(RelocationMiss::Region), "{after:?}");
+}
+
+#[test]
+fn a_replay_that_moved_the_boxes_rows_hand_over_is_the_build_it_is_compared_with() {
+    let cx = &mut app();
+    for scale_factor in [1., 2.] {
+        let specs = (0..40)
+            .map(|index| RowSpec {
+                kind: [Kind::Lifting, Kind::LiftingAbove, Kind::LiftingBehind, Kind::LiftingClipped, Kind::LiftingRounded, Kind::Button][index % 6],
+                height: 36. + (index % 3) as f32 * 8.,
+            })
+            .collect();
+        let pair = Pair::in_context(cx, specs, scale_factor, Rounding::Nothing);
+        cx.update_window(pair.retained, |_, window, _| {
+            window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        })
+        .unwrap();
+        for offset in [4., 21., 57.5, 58., 90.25, 3., 5., 6., 9.5, 10.5, 12., 13.] {
+            pair.scroll_to(cx, offset);
+            pair.assert_same(cx, &format!("scrolled to {offset}"));
+        }
+        let counters = pair.counters(cx);
+        assert!(counters.verified > 0, "{counters:?}");
+        assert!(counters.relocations > 0, "{counters:?}");
+        assert_eq!(pair.mismatches(cx), Vec::<String>::new(), "scale {scale_factor}");
+    }
+}
+
+#[test]
+fn a_pointer_captured_in_the_box_a_row_handed_over_follows_the_row_a_scroll_moves() {
+    let cx = &mut app();
+    let pair = Pair::in_context(cx, rows(30, 40., Kind::Lifting), 1., Rounding::Nothing);
+    pair.draw(cx);
+    let captured_bounds = |window: AnyWindowHandle, cx: &mut TestApp| {
+        cx.update_window(window, |_, window, _| {
+            let captured = window.captured_hitbox().expect("still captured");
+            window
+                .rendered_frame
+                .hitboxes
+                .iter()
+                .find(|hitbox| hitbox.id == captured)
+                .map(|hitbox| hitbox.window_bounds())
+                .expect("by a hitbox of the frame")
+        })
+        .unwrap()
+    };
+    for window in [pair.retained, pair.plain] {
+        cx.update_window(window, |_, window, _| {
+            // The button of row 3, in the box it hands to the context.
+            let y = (100..220)
+                .map(|y| y as f32 + 0.5)
+                .find(|y| {
+                    let chain = window.hit_chain_at(point(px(125.), px(*y)));
+                    chain.first().is_some_and(|(id, _)| format!("{id}").ends_with("lifted-button-3"))
+                })
+                .expect("the button of row 3 is somewhere down the page");
+            let id = window
+                .rendered_frame
+                .hit_test(point(px(125.), px(y)), true)
+                .ids
+                .first()
+                .copied()
+                .expect("the button is hit");
+            window.capture_pointer(id);
+        })
+        .unwrap();
+    }
+    let before = pair.counters(cx);
+    for offset in [10., 11., 37.5, 4.] {
+        pair.scroll_to(cx, offset);
+        assert_eq!(
+            captured_bounds(pair.retained, cx),
+            captured_bounds(pair.plain, cx),
+            "scrolled to {offset}"
+        );
+    }
+    let after = pair.counters(cx);
+    assert!(after.relocations > before.relocations, "{after:?}");
+    pair.assert_same(cx, "after the scrolls");
+}
+
 #[test]
 fn rows_that_are_culled_are_put_where_the_scroll_puts_them_and_stay_culled() {
     let cx = &mut app();
@@ -1499,17 +1787,27 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
         Kind::Positioned,
         Kind::Escaping,
         Kind::Fixed,
+        Kind::Lifting,
+        Kind::Lifting,
+        Kind::LiftingBehind,
+        Kind::LiftingAbove,
+        Kind::LiftingClipped,
+        Kind::LiftingRounded,
     ];
     let mut relocated = 0;
     let seeds = std::env::var("RELOCATION_FUZZ_SEEDS")
         .ok()
         .and_then(|seeds| seeds.parse().ok())
         .unwrap_or(24u64);
-    for seed in 0..seeds {
+    let first = std::env::var("RELOCATION_FUZZ_FIRST")
+        .ok()
+        .and_then(|first| first.parse().ok())
+        .unwrap_or(0u64);
+    for seed in first..first + seeds {
         let mut rng = StdRng::seed_from_u64(seed);
         let count = rng.random_range(12..50);
         let verified = rng.random_bool(0.5);
-        let specs = (0..count)
+        let specs: Vec<RowSpec> = (0..count)
             .map(|_| {
                 let kind = kinds[rng.random_range(0..kinds.len())];
                 RowSpec {
@@ -1528,7 +1826,18 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
             Rounding::Nothing
         };
         let framed = rng.random_bool(0.5);
-        let pair = Pair::build_rounded(cx, specs, scale_factor, rounding, framed);
+        // Most pages are a stacking context, which the boxes that rows position are handed to.
+        let stacking = rng.random_bool(0.7);
+        // The border a card draws after its content is one quad under a rounded mask and four strips under
+        // the rectangle a replay cuts by, so a box handed over above the card is ordered against the
+        // whole quad in one and not in the other: the same pixels, another draw order.
+        let split_borders = rounded && stacking;
+        let specs: Vec<RowSpec> = specs
+            .into_iter()
+            .map(|spec| RowSpec { kind: if split_borders && spec.kind == Kind::Card { Kind::Plain } else { spec.kind }, ..spec })
+            .collect();
+        let kinds_of_rows = format!("{:?}", specs.iter().map(|spec| (spec.kind, spec.height)).collect::<Vec<_>>());
+        let pair = Pair::surrounded(cx, specs, scale_factor, Surroundings { rounding, framed, stacking });
         if verified {
             cx.update_window(pair.retained, |_, window, _| {
                 window.set_retention_verifier(Some(Rc::new(|_| String::new())));
@@ -1551,7 +1860,7 @@ fn random_pages_and_scrolls_show_what_a_build_shows() {
                 assert!(mismatches.is_empty(), "seed {seed} step {step} offset {offset} (scale {scale_factor}): {}", mismatches.join("\n"));
             }
             if let Some(difference) = pair.difference(cx) {
-                panic!("seed {seed} (scale {scale_factor}, rounding {rounding:?}, framed {framed}) step {step} offset {offset}: {difference}");
+                panic!("seed {seed} (scale {scale_factor}, rounding {rounding:?}, framed {framed}, stacking {stacking}) step {step} offset {offset}: {difference}\nrows {kinds_of_rows}");
             }
             if rng.random_bool(0.3) {
                 pair.draw(cx);
