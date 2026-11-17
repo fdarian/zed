@@ -321,6 +321,15 @@ impl MacPlatform {
     ///
     /// Returns `false` after the application receives its termination callback.
     pub fn pump_events(&self) -> bool {
+        self.pump_events_reporting_step().is_some()
+    }
+
+    /// [`Self::pump_events`] that also returns what the pump did. A caller that steps the started
+    /// display links itself must skip that when `stepped` is set: the pump's step was the frame
+    /// (see [`pump_app_nonblocking`]).
+    ///
+    /// Returns `None` once the application has received its termination callback.
+    pub fn pump_events_reporting_step(&self) -> Option<PumpOutcome> {
         assert_main_thread("MacPlatform::pump_events");
 
         let yield_after_key = {
@@ -336,7 +345,7 @@ impl MacPlatform {
                 MacPlatformMode::Embedded(EmbeddedLifecycle::Launched) => {
                     state.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Running);
                 }
-                MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated) => return false,
+                MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated) => return None,
             }
             state.yield_after_key_event
         };
@@ -349,7 +358,7 @@ impl MacPlatform {
         };
         self.0.lock().key_event_pending = outcome.yielded_to_key;
 
-        self.finish_embedded_run()
+        self.finish_embedded_run().then_some(outcome)
     }
 
     fn finish_embedded_run(&self) -> bool {
