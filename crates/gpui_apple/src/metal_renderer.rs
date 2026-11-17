@@ -856,16 +856,28 @@ impl MetalRenderer {
     }
 
     /// Moves the pixels of `target` that `shift` says are kept: through a scratch texture, since a
-    /// copy within one texture is not defined where the source and the destination overlap.
+    /// copy within one texture is not defined where the source and the destination overlap. False,
+    /// with nothing copied, if the pixels kept or the ones they come from are not all in the target:
+    /// the damage's window is its viewport rounded up and a drawable's size is rounded, so the
+    /// region can run a pixel past the target.
     fn blit_shift(
         &mut self,
         command_buffer: &metal::CommandBufferRef,
         target: &metal::TextureRef,
         shift: &gpui::Shift,
-    ) {
+    ) -> bool {
         let kept = shift.kept();
-        if kept.is_empty() {
-            return;
+        let inside = |x: i32, y: i32| {
+            x >= 0
+                && y >= 0
+                && x + kept.size.width.0 <= target.width() as i32
+                && y + kept.size.height.0 <= target.height() as i32
+        };
+        if kept.is_empty()
+            || !inside(kept.origin.x.0, kept.origin.y.0)
+            || !inside(kept.origin.x.0 - shift.by.x.0, kept.origin.y.0 - shift.by.y.0)
+        {
+            return false;
         }
         let (width, height) = (kept.size.width.0 as u64, kept.size.height.0 as u64);
         let scratch_fits = self
@@ -899,6 +911,7 @@ impl MetalRenderer {
         blit.copy_from_texture(scratch, 0, 0, origin(0, 0), extent, target, 0, 0, origin(kept.origin.x.0, kept.origin.y.0));
         blit.end_encoding();
         self.partial.last_shift = Some(shift.by);
+        true
     }
 
     /// Draws `scene` into the persistent target and copies that to `texture`. With `damage` (the part
@@ -932,12 +945,29 @@ impl MetalRenderer {
                 self.device.new_texture(&descriptor)
             }
         };
-        let damage = damage.filter(|_| self.partial.valid);
+        let mut damage = damage.filter(|_| self.partial.valid);
         self.partial.last_shift = None;
-        self.partial.last_rects = damage.as_ref().map_or(0, |damage| damage.rects.len());
         if let Some(shift) = damage.as_ref().and_then(|damage| damage.shift) {
-            self.blit_shift(command_buffer, &target, &shift);
+            if !self.blit_shift(command_buffer, &target, &shift) {
+                // Nothing was copied, so the region is wrong all over: drawn with the rectangles that
+                // hold the rest, in one (the bands the shift exposes are already in `rects`).
+                let damage = damage.as_mut().expect("the damage has a shift");
+                damage.shift = None;
+                let (mut left, mut top) = (shift.region.origin.x.0, shift.region.origin.y.0);
+                let (mut right, mut bottom) = (left + shift.region.size.width.0, top + shift.region.size.height.0);
+                for rect in &damage.rects {
+                    left = left.min(rect.origin.x.0);
+                    top = top.min(rect.origin.y.0);
+                    right = right.max(rect.origin.x.0 + rect.size.width.0);
+                    bottom = bottom.max(rect.origin.y.0 + rect.size.height.0);
+                }
+                *damage = FrameDamage::rect(Bounds {
+                    origin: point(DevicePixels(left), DevicePixels(top)),
+                    size: size(DevicePixels(right - left), DevicePixels(bottom - top)),
+                });
+            }
         }
+        self.partial.last_rects = damage.as_ref().map_or(0, |damage| damage.rects.len());
         let scissors = damage.map(|damage| {
             damage
                 .rects
@@ -4370,6 +4400,37 @@ mod tests {
             (list_frame(12, clip, Backdrop::Solid, None, None), Some(back.finish(window())), Some(by(2))),
         ];
         assert_shifts_are_the_frames_drawn_whole("two shifts", &frames);
+    }
+
+    #[test]
+    fn what_is_wrong_outside_the_region_between_two_shifts_is_drawn_where_it_is() {
+        // The thumb is beside the rows' region: the copy does not move it, and its old pixels stay where they were.
+        let clip = area(12., 16., 40., 64.);
+        let (was, is) = (area(64., 30., 2., 6.), area(64., 40., 2., 6.));
+        let mut steps = gpui::DamageSteps::default();
+        steps.shift(clip, by(6)).area(was).area(is).shift(clip, by(6));
+        let frames = [
+            (list_frame(0, clip, Backdrop::Solid, Some(30.), None), None, None),
+            (list_frame(12, clip, Backdrop::Solid, Some(40.), None), Some(steps.finish(window())), Some(by(12))),
+        ];
+        assert_shifts_are_the_frames_drawn_whole("an area outside the region between two shifts", &frames);
+    }
+
+    #[test]
+    fn a_region_that_runs_past_the_target_is_not_copied_and_the_frame_is_the_one_drawn_whole() {
+        // The region's last row is the target's 97th, which a window that rounds its size up has and a drawable does not.
+        let clip = area(12., 16., 60., 81.);
+        let region = Bounds { origin: point(DevicePixels(12), DevicePixels(16)), size: size(DevicePixels(60), DevicePixels(81)) };
+        let strip = Bounds { origin: point(DevicePixels(12), DevicePixels(16)), size: size(DevicePixels(60), DevicePixels(6)) };
+        let damage = FrameDamage::from_parts(Some(gpui::Shift { region, by: by(6) }), &[strip]);
+        let mut partial = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        partial.render_scene_partial_to_image(&list_frame(0, clip, Backdrop::Solid, None, None), None, window()).unwrap();
+        let next = list_frame(6, clip, Backdrop::Solid, None, None);
+        let drawn = partial.render_scene_partial_to_image(&next, Some(damage), window()).unwrap();
+        let whole = MetalHeadlessRenderer::new().render_scene_to_image(&next, window()).unwrap();
+        assert!(drawn == whole);
+        assert_eq!(partial.partial.last_shift, None);
+        assert_eq!(partial.partial.last_rects, 1);
     }
 
     #[test]
