@@ -68,6 +68,8 @@ struct Page {
     nested: bool,
     /// The list is held by a panel with rounded corners that cuts it.
     rounded: bool,
+    /// The row as wide as the panel, which reaches its corners when it is near them: the others stop short of them.
+    wide: Option<usize>,
     /// The key of the rows: another one builds them again.
     key: Rc<Cell<u64>>,
     focus: Rc<RefCell<Option<FocusHandle>>>,
@@ -84,11 +86,12 @@ impl Render for Page {
                 let key = page.key.get();
                 let nested = page.nested.then_some(page.overscan).flatten();
                 let rounded = page.rounded;
+                let wide = page.wide;
                 let focus = (ix == FOCUSED).then(|| page.focus.borrow().clone()).flatten();
                 let mut row = retained(("row", ix), key, move |_, _| {
                     let row = div().id(("row", ix)).w_full().h(px(ROW)).bg(crate::blue());
                     // Clear of the right corners of the panel that holds the list, whose radius is 12, by more than the pixel a reach is grown by.
-                    let row = if rounded { row.w(px(72.)) } else { row };
+                    let row = if rounded && wide != Some(ix) { row.w(px(72.)) } else { row };
                     let row = match nested {
                         Some(overscan) => row.child(
                             retained(("inner", ix), key, |_, _| div().size_full().into_any_element())
@@ -188,18 +191,30 @@ impl Fixture {
     }
 
     fn with_nested(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool, nested: bool) -> Self {
-        Self::open(cx, overscan, hitboxes, nested, false, None)
+        Self::open(cx, overscan, hitboxes, nested, false, None, None)
     }
 
     fn in_rounded_panel(cx: &mut TestAppContext) -> Self {
-        Self::open(cx, Some(100.), true, false, true, None)
+        Self::open(cx, Some(100.), true, false, true, None, None)
+    }
+
+    fn in_rounded_panel_with_wide_row(cx: &mut TestAppContext, row: usize) -> Self {
+        Self::open(cx, Some(100.), true, false, true, Some(row), None)
     }
 
     fn with_bar(cx: &mut TestAppContext, bar: &Bar) -> Self {
-        Self::open(cx, Some(100.), true, false, false, Some(bar.clone()))
+        Self::open(cx, Some(100.), true, false, false, None, Some(bar.clone()))
     }
 
-    fn open(cx: &mut TestAppContext, overscan: Option<f32>, hitboxes: bool, nested: bool, rounded: bool, bar: Option<Bar>) -> Self {
+    fn open(
+        cx: &mut TestAppContext,
+        overscan: Option<f32>,
+        hitboxes: bool,
+        nested: bool,
+        rounded: bool,
+        wide: Option<usize>,
+        bar: Option<Bar>,
+    ) -> Self {
         let state = ListState::new(100, ListAlignment::Top, px(0.)).with_uniform_item_height(px(ROW));
         let page = Page {
             bar,
@@ -208,6 +223,7 @@ impl Fixture {
             hitboxes,
             nested,
             rounded,
+            wide,
             key: Rc::new(Cell::new(1)),
             focus: Rc::default(),
         };
@@ -661,6 +677,16 @@ fn a_translate_is_the_frame_built_whole(cx: &mut TestAppContext) {
 /// The frame shown after each of `wheels` over a list in a rounded panel, the translate on or off.
 fn after_wheels_in_a_rounded_panel(cx: &mut TestAppContext, patch: bool, verified: bool, wheels: &[f32]) -> (Vec<String>, crate::ScrollPatchCounters, Vec<String>) {
     let fixture = Fixture::in_rounded_panel(cx);
+    after_wheels_in_a_panel_of_rows(cx, fixture, patch, verified, wheels)
+}
+
+fn after_wheels_in_a_panel_of_rows(
+    cx: &mut TestAppContext,
+    fixture: Fixture,
+    patch: bool,
+    verified: bool,
+    wheels: &[f32],
+) -> (Vec<String>, crate::ScrollPatchCounters, Vec<String>) {
     fixture.with_window(cx, |window| window.set_scroll_patch(patch));
     fixture.point_at(cx, 50., 50.);
     if verified {
@@ -695,6 +721,35 @@ fn a_translate_of_rows_clear_of_the_corners_of_a_rounded_panel_is_the_frame_buil
     let (_, counters, mismatches) = after_wheels_in_a_rounded_panel(cx, true, true, &[5.]);
     assert_eq!((counters.eligible, counters.patched), (1, 1), "{counters:?}");
     assert_eq!(mismatches, Vec::<String>::new(), "{counters:?}");
+}
+
+#[gpui::test]
+fn a_row_that_reaches_a_corner_after_several_translates_is_built_there(cx: &mut TestAppContext) {
+    // The second row is clear of the top right corner of the panel (radius 12) until it has gone up
+    // by 18: seven steps of 3. Each translate is judged from the frame the one before drew, which put
+    // the row where it is, and not from where the row was recorded. A frame is not drawn again after
+    // a translate, so that the next one is from it.
+    let shown_after = |cx: &mut TestAppContext, patch: bool| {
+        let fixture = Fixture::in_rounded_panel_with_wide_row(cx, 1);
+        fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+        let frames: Vec<String> = (0..9)
+            .map(|_| {
+                fixture.scroll_once(cx, 10., 5., 3.);
+                fixture.with_window(cx, shown)
+            })
+            .collect();
+        (frames, fixture.counters(cx))
+    };
+    let (translated, counters) = shown_after(cx, true);
+    let (built, _) = shown_after(cx, false);
+    assert!(counters.patched >= 4, "{counters:?}");
+    for (frame, (translated, built)) in translated.iter().zip(&built).enumerate() {
+        assert!(
+            translated == built,
+            "frame {frame}, {counters:?}\n{}",
+            super::retained::first_difference(translated, built)
+        );
+    }
 }
 
 #[gpui::test]
@@ -809,7 +864,7 @@ fn after_wheels_with_bar_at(
     hitboxes: bool,
 ) -> (Vec<String>, crate::ScrollPatchCounters, u32) {
     let bar = Bar::new();
-    let fixture = Fixture::open(cx, Some(100.), hitboxes, false, false, Some(bar.clone()));
+    let fixture = Fixture::open(cx, Some(100.), hitboxes, false, false, None, Some(bar.clone()));
     fixture.with_window(cx, |window| window.set_scroll_patch(patch));
     let frames = wheels
         .iter()
