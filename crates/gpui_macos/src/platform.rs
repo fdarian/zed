@@ -72,6 +72,7 @@ const NSUTF8StringEncoding: NSUInteger = 4;
 const MAC_PLATFORM_IVAR: &str = "platform";
 static mut APP_CLASS: *const Class = ptr::null();
 static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
+static YIELD_AFTER_KEY_EVENT: AtomicBool = AtomicBool::new(false);
 static REGISTERED_MAC_PLATFORM: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 #[ctor(unsafe)]
@@ -280,6 +281,20 @@ impl MacPlatform {
         let platform = Self::new(false);
         platform.0.lock().mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Ready);
         platform
+    }
+
+    /// Makes the pump end after a key event, so the embedder runs once per key event.
+    ///
+    /// An embedder whose event handlers run a JavaScript engine needs a microtask checkpoint
+    /// after each key, as a browser runs one after each task. The pump sends every event that is
+    /// queued in one call, so with several keys queued the handlers of all of them would run
+    /// before the embedder could run a checkpoint. With this on, [`pump_app_nonblocking`] stops
+    /// dequeuing after a key event (`keyDown`, `keyUp` or `flagsChanged`), posts the block that
+    /// has the embedder pump again, and returns without running the run loop's sources. Mouse and
+    /// other events are still dequeued together. Off by default. It is a setting of the process, so
+    /// it takes no instance: an embedder that holds no `MacPlatform` (a test platform) can set it.
+    pub fn set_yield_after_key_event(yield_after: bool) {
+        YIELD_AFTER_KEY_EVENT.store(yield_after, Ordering::Relaxed);
     }
 
     /// Processes pending AppKit work without waiting for new events.
@@ -650,7 +665,10 @@ fn drain_mode() -> id {
 /// events that pass queued, or that a step's frame callback posted, come after the call that ran
 /// it. So once a step has run since `steps_at_start`, the dequeuing goes on in a mode with no
 /// sources, where nothing else runs: a pass of the default mode would run the next step.
-unsafe fn drain_events(app: id, steps_at_start: usize) {
+///
+/// Returns true when it stopped after a key event because of `set_yield_after_key_event`; events
+/// may still be queued then.
+unsafe fn drain_events(app: id, steps_at_start: usize) -> bool {
     unsafe {
         let distant_past: id = msg_send![class!(NSDate), distantPast];
         for _ in 0..256 {
@@ -678,7 +696,20 @@ unsafe fn drain_events(app: id, steps_at_start: usize) {
             // that boundary, which wakes the embedder once more. Committed here, it leaves the
             // update cycle nothing to commit, and no timer is armed.
             let _: () = msg_send![class!(CATransaction), flush];
+            if YIELD_AFTER_KEY_EVENT.load(Ordering::Relaxed) && is_key_event(event) {
+                return true;
+            }
         }
+        false
+    }
+}
+
+unsafe fn is_key_event(event: id) -> bool {
+    unsafe {
+        matches!(
+            event.eventType(),
+            NSEventType::NSKeyDown | NSEventType::NSKeyUp | NSEventType::NSFlagsChanged
+        )
     }
 }
 
@@ -693,7 +724,9 @@ unsafe fn drain_events(app: id, steps_at_start: usize) {
 /// 256-iteration cap (about 2 s at 120 Hz) with no NSEvent dequeued and no JS run. After a step
 /// the NSEvents that are queued are still dequeued (see `drain_events`), and the call returns.
 /// When a step stopped the link, the call posts a block so the embedder pumps once more; while a
-/// link runs, its next tick wakes the embedder.
+/// link runs, its next tick wakes the embedder. With `MacPlatform::set_yield_after_key_event` on,
+/// the call also ends after a key event, with the same block posted and no run loop source
+/// handled; it still returns true when a step ran.
 #[doc(hidden)]
 pub unsafe fn pump_app_nonblocking() -> bool {
     unsafe {
@@ -703,13 +736,17 @@ pub unsafe fn pump_app_nonblocking() -> bool {
         let steps_at_start = crate::link_steps();
         let stops_at_start = crate::link_stops();
 
-        drain_events(app, steps_at_start);
+        let yielded = drain_events(app, steps_at_start);
+        let stepped = crate::link_steps() != steps_at_start;
+        if yielded || (stepped && crate::link_stops() != stops_at_start) {
+            DispatchQueue::main().exec_async(|| {});
+        }
         // The call is over after a step: the sources below would run the next one.
-        if crate::link_steps() != steps_at_start {
-            if crate::link_stops() != stops_at_start {
-                DispatchQueue::main().exec_async(|| {});
-            }
+        if stepped {
             return true;
+        }
+        if yielded {
+            return false;
         }
         // No `updateWindows` here: `sendEvent:` sets `windowsNeedUpdate`, which installs a run loop
         // observer that updates the windows once, in the next pass of the loop (the polls below,
@@ -722,8 +759,8 @@ pub unsafe fn pump_app_nonblocking() -> bool {
                 return crate::link_steps() != steps_at_start;
             }
             if crate::link_steps() != steps_at_start {
-                drain_events(app, steps_at_start);
-                if crate::link_stops() != stops_at_start {
+                let yielded = drain_events(app, steps_at_start);
+                if yielded || crate::link_stops() != stops_at_start {
                     DispatchQueue::main().exec_async(|| {});
                 }
                 return true;

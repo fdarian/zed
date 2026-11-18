@@ -46,6 +46,11 @@ name = "pump_one_step"
 path = "tests/pump_one_step.rs"
 harness = false
 
+[[test]]
+name = "pump_yields_per_key"
+path = "tests/pump_yields_per_key.rs"
+harness = false
+
 [features]
 default = ["gpui/default"]
 test-support = ["gpui/test-support", "gpui_apple/test-support"]
