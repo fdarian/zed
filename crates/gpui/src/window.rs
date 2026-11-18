@@ -7359,6 +7359,10 @@ impl Window {
             let descendants = self.ambient_lift_ordinal() - (ticket.ordinal + 1);
             Rc::new(PlainPaint::new(descendants, open.map(Relocation::reopened)))
         });
+        // The build a replay is compared with keeps no cell, but the owners are still told what the element paints: what
+        // they keep of it outside the frame is compared with what the replay put back, which the build that recorded it made
+        // under their notice. A culled subtree is recorded and compared without it.
+        let told = cell.is_some() || (hole.is_none() && open.is_some_and(|open| open.direct && !open.culled));
         let content_mask = self.content_mask();
         let entry = LiftedElement {
             content: LiftedContent::Element(element),
@@ -7373,7 +7377,7 @@ impl Window {
             cut: None,
             image_cache: self.image_cache_stack.last().cloned(),
             hole,
-            owners: if cell.is_some() { owners } else { SmallVec::new() },
+            owners: if told { owners } else { SmallVec::new() },
             cell,
         };
         match self.lift_lists.last_mut() {

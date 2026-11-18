@@ -156,6 +156,9 @@ struct Handles {
     /// What rows reported of their bounds, and the bounds they reported when they were built.
     reported: Rc<RefCell<BTreeMap<usize, Bounds<crate::Pixels>>>>,
     built_at: Rc<RefCell<BTreeMap<usize, Bounds<crate::Pixels>>>>,
+    /// What the owner of a row keeps of the boxes it handed to the context around the page: the ordinals the build that last
+    /// made the row was told (`RetainedPhase::LiftedBegin`), as a tape of the writes of a row keeps them.
+    lifted: Rc<RefCell<BTreeMap<usize, Vec<u32>>>>,
     /// The offsets of the replays the rows' owner was told of, by phase.
     replays: Rc<RefCell<Vec<(RetainedPhase, crate::Point<crate::Pixels>)>>>,
     /// Whether a row that has a retained subtree of its own retains it: the plain window does not.
@@ -493,7 +496,10 @@ fn page(
         if retained_rows {
             let mut row = retained(("retained-row", index), 1, {
                 let handles = handles.clone();
-                move |_, cx| row_element(index, spec, &handles, cx)
+                move |_, cx| {
+                    handles.lifted.borrow_mut().remove(&index);
+                    row_element(index, spec, &handles, cx)
+                }
             })
             .relocatable(px(OVERSCAN));
             // A box placed by something else than the row is outside the extent its owner can
@@ -520,6 +526,14 @@ fn page(
                 }
                 Kind::ReportsBlind => {
                     row = row.on_replay(|_, _, _| {});
+                }
+                Kind::Lifting | Kind::LiftingBehind | Kind::LiftingAbove => {
+                    let lifted = handles.lifted.clone();
+                    row = row.on_replay_translated(move |phase, _, _, _| {
+                        if let RetainedPhase::LiftedBegin(rel) = phase {
+                            lifted.borrow_mut().entry(index).or_default().push(rel);
+                        }
+                    });
                 }
                 _ => {}
             }
@@ -1570,6 +1584,28 @@ fn a_replay_that_moved_the_boxes_rows_hand_over_is_the_build_it_is_compared_with
         assert!(counters.relocations > 0, "{counters:?}");
         assert_eq!(pair.mismatches(cx), Vec::<String>::new(), "scale {scale_factor}");
     }
+}
+
+#[test]
+fn what_the_owner_of_a_row_keeps_of_the_boxes_it_handed_over_is_the_same_in_the_build_a_replay_is_compared_with() {
+    let cx = &mut app();
+    let kinds = [Kind::Lifting, Kind::LiftingBehind, Kind::LiftingAbove];
+    let specs = (0..30).map(|index| RowSpec { kind: kinds[index % 3], height: 36. + (index % 3) as f32 * 8. }).collect();
+    let pair = Pair::in_context(cx, specs, 1., Rounding::Nothing);
+    let kept = pair.handles.lifted.clone();
+    cx.update_window(pair.retained, |_, window, _| {
+        let kept = kept.clone();
+        window.set_retention_verifier(Some(Rc::new(move |_| format!("{:?}", kept.borrow()))));
+    })
+    .unwrap();
+    for offset in [4., 21., 57.5, 58., 90.25, 3., 5., 6., 9.5, 10.5] {
+        pair.scroll_to(cx, offset);
+        pair.assert_same(cx, &format!("scrolled to {offset}"));
+    }
+    let counters = pair.counters(cx);
+    assert!(counters.verified > 0 && counters.relocations > 0, "{counters:?}");
+    assert!(kept.borrow().values().any(|rels| !rels.is_empty()), "the rows handed their boxes over to the context");
+    assert_eq!(pair.mismatches(cx), Vec::<String>::new());
 }
 
 #[test]
