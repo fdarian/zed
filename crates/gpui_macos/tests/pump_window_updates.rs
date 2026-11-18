@@ -56,7 +56,7 @@ fn main() {
 
         // AppKit's launch work.
         for _ in 0..100 {
-            pump_app_nonblocking();
+            pump_app_nonblocking(false);
             std::thread::sleep(Duration::from_millis(10));
         }
         UPDATES.store(0, SeqCst);
@@ -82,11 +82,11 @@ fn main() {
                     Instant::now() < deadline,
                     "move {step}: the windows were not updated"
                 );
-                pump_app_nonblocking();
+                pump_app_nonblocking(false);
                 std::thread::sleep(Duration::from_millis(1));
             }
             std::thread::sleep(Duration::from_millis(3));
-            pump_app_nonblocking();
+            pump_app_nonblocking(false);
         }
         let updates = UPDATES.load(SeqCst);
         assert!(

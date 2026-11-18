@@ -72,7 +72,6 @@ const NSUTF8StringEncoding: NSUInteger = 4;
 const MAC_PLATFORM_IVAR: &str = "platform";
 static mut APP_CLASS: *const Class = ptr::null();
 static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
-static YIELD_AFTER_KEY_EVENT: AtomicBool = AtomicBool::new(false);
 static REGISTERED_MAC_PLATFORM: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 #[ctor(unsafe)]
@@ -214,6 +213,18 @@ pub(crate) struct MacPlatformState {
     /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
     cursor_visible: Arc<AtomicBool>,
     system_notifications: crate::system_notifications::SystemNotificationState,
+    yield_after_key_event: bool,
+    key_event_pending: bool,
+}
+
+/// What one call of [`pump_app_nonblocking`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PumpOutcome {
+    /// A display-link frame step ran during the call.
+    pub stepped: bool,
+    /// The call left a key event queued, or ended after sending one, because of the
+    /// `yield_after_key` argument; the embedder has to pump again.
+    pub yielded_to_key: bool,
 }
 
 impl MacPlatform {
@@ -263,6 +274,8 @@ impl MacPlatform {
             keyboard_mapper,
             cursor_visible: Arc::new(AtomicBool::new(true)),
             system_notifications: crate::system_notifications::SystemNotificationState::new(),
+            yield_after_key_event: false,
+            key_event_pending: false,
         }))
     }
 
@@ -283,18 +296,25 @@ impl MacPlatform {
         platform
     }
 
-    /// Makes the pump end after a key event, so the embedder runs once per key event.
+    /// Makes [`Self::pump_events`] give each key event a pump of its own.
     ///
     /// An embedder whose event handlers run a JavaScript engine needs a microtask checkpoint
-    /// after each key, as a browser runs one after each task. The pump sends every event that is
-    /// queued in one call, so with several keys queued the handlers of all of them would run
-    /// before the embedder could run a checkpoint. With this on, [`pump_app_nonblocking`] stops
-    /// dequeuing after a key event (`keyDown`, `keyUp` or `flagsChanged`), posts the block that
+    /// before and after each key, as a browser runs one around each task. The pump sends every
+    /// event that is queued in one call, so with several keys queued the handlers of all of them
+    /// would run before the embedder could run a checkpoint. With this on, the pump stops before a
+    /// key event (`keyDown`, `keyUp` or `flagsChanged`) once an event was sent or a step ran in
+    /// the call, and after it when the key is the first thing the call sends, posts the block that
     /// has the embedder pump again, and returns without running the run loop's sources. Mouse and
-    /// other events are still dequeued together. Off by default. It is a setting of the process, so
-    /// it takes no instance: an embedder that holds no `MacPlatform` (a test platform) can set it.
-    pub fn set_yield_after_key_event(yield_after: bool) {
-        YIELD_AFTER_KEY_EVENT.store(yield_after, Ordering::Relaxed);
+    /// other events are still dequeued together. Off by default.
+    pub fn set_yield_after_key_event(&self, yes: bool) {
+        self.0.lock().yield_after_key_event = yes;
+    }
+
+    /// Whether the last [`Self::pump_events`] left a key event queued or ended after sending one,
+    /// so the embedder has to pump again without waiting for a wake. Always false with
+    /// [`Self::set_yield_after_key_event`] off.
+    pub fn key_event_pending(&self) -> bool {
+        self.0.lock().key_event_pending
     }
 
     /// Processes pending AppKit work without waiting for new events.
@@ -303,7 +323,7 @@ impl MacPlatform {
     pub fn pump_events(&self) -> bool {
         assert_main_thread("MacPlatform::pump_events");
 
-        {
+        let yield_after_key = {
             let mut state = self.0.lock();
             match &mut state.mode {
                 MacPlatformMode::Blocking => panic!("pump_events requires new_embedded"),
@@ -318,13 +338,16 @@ impl MacPlatform {
                 }
                 MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated) => return false,
             }
-        }
+            state.yield_after_key_event
+        };
 
-        unsafe {
+        let outcome = unsafe {
             let pool = NSAutoreleasePool::new(nil);
-            let _ = pump_app_nonblocking();
+            let outcome = pump_app_nonblocking(yield_after_key);
             pool.drain();
-        }
+            outcome
+        };
+        self.0.lock().key_event_pending = outcome.yielded_to_key;
 
         self.finish_embedded_run()
     }
@@ -666,18 +689,50 @@ fn drain_mode() -> id {
 /// it. So once a step has run since `steps_at_start`, the dequeuing goes on in a mode with no
 /// sources, where nothing else runs: a pass of the default mode would run the next step.
 ///
-/// Returns true when it stopped after a key event because of `set_yield_after_key_event`; events
-/// may still be queued then.
-unsafe fn drain_events(app: id, steps_at_start: usize) -> bool {
+/// With `yield_after_key`, a key event gets a checkpoint on both sides: once an event was sent or
+/// a step ran in this call, the next event is peeked in the drain mode (which runs nothing), and a
+/// key event stays queued for the next call; and the call ends after sending a key event. Returns
+/// true in both cases; events may still be queued then.
+unsafe fn drain_events(app: id, steps_at_start: usize, yield_after_key: bool) -> bool {
     unsafe {
         let distant_past: id = msg_send![class!(NSDate), distantPast];
+        let mut sent_any = false;
         for _ in 0..256 {
             let stepped = crate::link_steps() != steps_at_start;
-            let mode = if stepped {
+            let mut mode = if stepped {
                 drain_mode()
             } else {
                 kCFRunLoopDefaultMode as id
             };
+            if yield_after_key {
+                if sent_any || stepped {
+                    let next: id = msg_send![app,
+                        nextEventMatchingMask: NSUInteger::MAX
+                        untilDate: distant_past
+                        inMode: drain_mode()
+                        dequeue: NO
+                    ];
+                    if next != nil && is_key_event(next) {
+                        return true;
+                    }
+                } else {
+                    // The pass of the default mode that finds the first event can run a step,
+                    // which can queue a key; peeking it first keeps that key out of this call.
+                    let first: id = msg_send![app,
+                        nextEventMatchingMask: NSUInteger::MAX
+                        untilDate: distant_past
+                        inMode: mode
+                        dequeue: NO
+                    ];
+                    if crate::link_steps() != steps_at_start {
+                        continue;
+                    }
+                    if first == nil {
+                        break;
+                    }
+                    mode = drain_mode();
+                }
+            }
             let event: id = msg_send![app,
                 nextEventMatchingMask: NSUInteger::MAX
                 untilDate: distant_past
@@ -691,12 +746,13 @@ unsafe fn drain_events(app: id, steps_at_start: usize) -> bool {
                 break;
             }
             let _: () = msg_send![app, sendEvent: event];
+            sent_any = true;
             // `sendEvent:` begins an implicit Core Animation transaction. From macOS 26, AppKit's
             // update cycle commits one that began before the next frame boundary from a timer at
             // that boundary, which wakes the embedder once more. Committed here, it leaves the
             // update cycle nothing to commit, and no timer is armed.
             let _: () = msg_send![class!(CATransaction), flush];
-            if YIELD_AFTER_KEY_EVENT.load(Ordering::Relaxed) && is_key_event(event) {
+            if yield_after_key && is_key_event(event) {
                 return true;
             }
         }
@@ -713,8 +769,8 @@ unsafe fn is_key_event(event: id) -> bool {
     }
 }
 
-/// Handles what is ready now without blocking and returns whether a display-link frame step ran
-/// during the call, which is one main-queue drain and at most one step per window. A caller that
+/// Handles what is ready now without blocking and reports whether a display-link frame step ran
+/// during the call (`PumpOutcome::stepped`), which is one main-queue drain and at most one step per window. A caller that
 /// steps the display links itself after the pump must skip that step when this returns true: the
 /// pump's step was the frame, and a second would draw twice.
 ///
@@ -724,11 +780,11 @@ unsafe fn is_key_event(event: id) -> bool {
 /// 256-iteration cap (about 2 s at 120 Hz) with no NSEvent dequeued and no JS run. After a step
 /// the NSEvents that are queued are still dequeued (see `drain_events`), and the call returns.
 /// When a step stopped the link, the call posts a block so the embedder pumps once more; while a
-/// link runs, its next tick wakes the embedder. With `MacPlatform::set_yield_after_key_event` on,
-/// the call also ends after a key event, with the same block posted and no run loop source
-/// handled; it still returns true when a step ran.
+/// link runs, its next tick wakes the embedder. With `yield_after_key` the call also ends around a
+/// key event (see `MacPlatform::set_yield_after_key_event`), with the same block posted and
+/// `yielded_to_key` set; after a step or a yield no run loop source is handled.
 #[doc(hidden)]
-pub unsafe fn pump_app_nonblocking() -> bool {
+pub unsafe fn pump_app_nonblocking(yield_after_key: bool) -> PumpOutcome {
     unsafe {
         // NSApplication::run sleeps until the next display-link wake, which
         // blocks embedded hosts. Drain only work that is ready now.
@@ -736,17 +792,14 @@ pub unsafe fn pump_app_nonblocking() -> bool {
         let steps_at_start = crate::link_steps();
         let stops_at_start = crate::link_stops();
 
-        let yielded = drain_events(app, steps_at_start);
+        let yielded_to_key = drain_events(app, steps_at_start, yield_after_key);
         let stepped = crate::link_steps() != steps_at_start;
-        if yielded || (stepped && crate::link_stops() != stops_at_start) {
+        if yielded_to_key || (stepped && crate::link_stops() != stops_at_start) {
             DispatchQueue::main().exec_async(|| {});
         }
         // The call is over after a step: the sources below would run the next one.
-        if stepped {
-            return true;
-        }
-        if yielded {
-            return false;
+        if stepped || yielded_to_key {
+            return PumpOutcome { stepped, yielded_to_key };
         }
         // No `updateWindows` here: `sendEvent:` sets `windowsNeedUpdate`, which installs a run loop
         // observer that updates the windows once, in the next pass of the loop (the polls below,
@@ -756,19 +809,22 @@ pub unsafe fn pump_app_nonblocking() -> bool {
         // sources that are still signalled would wait for a message that is gone.
         for _ in 0..256 {
             if CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1) != kCFRunLoopRunHandledSource {
-                return crate::link_steps() != steps_at_start;
+                return PumpOutcome {
+                    stepped: crate::link_steps() != steps_at_start,
+                    yielded_to_key: false,
+                };
             }
             if crate::link_steps() != steps_at_start {
-                let yielded = drain_events(app, steps_at_start);
-                if yielded || crate::link_stops() != stops_at_start {
+                let yielded_to_key = drain_events(app, steps_at_start, yield_after_key);
+                if yielded_to_key || crate::link_stops() != stops_at_start {
                     DispatchQueue::main().exec_async(|| {});
                 }
-                return true;
+                return PumpOutcome { stepped: true, yielded_to_key };
             }
         }
         // Still finding sources to handle: have the embedder pump again.
         DispatchQueue::main().exec_async(|| {});
-        false
+        PumpOutcome::default()
     }
 }
 

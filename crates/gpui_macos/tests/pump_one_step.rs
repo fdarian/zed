@@ -137,7 +137,7 @@ fn main() {
         post_application_defined_from_the_main_queue();
         posted += EVENTS_PER_PUMP;
         let before = frames();
-        let stepped = unsafe { pump_app_nonblocking() };
+        let stepped = unsafe { pump_app_nonblocking(false).stepped };
         let drawn = frames() - before;
         assert!(drawn <= 1, "one pump ran {drawn} frames");
         assert!(drawn == 0 || stepped, "a pump drew a frame and did not say a step ran");
@@ -165,7 +165,7 @@ fn main() {
     let mut waits = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
-        let stepped = unsafe { pump_app_nonblocking() };
+        let stepped = unsafe { pump_app_nonblocking(false).stepped };
         let wait = rearm_and_wait(Duration::from_millis(100));
         if stepped {
             waits.push(wait.expect("a running link did not wake the embedder within 100 ms"));
@@ -187,7 +187,7 @@ fn main() {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         assert!(Instant::now() < deadline, "the link did not stop");
-        let stepped = unsafe { pump_app_nonblocking() };
+        let stepped = unsafe { pump_app_nonblocking(false).stepped };
         let woke = rearm_and_wait(Duration::from_millis(150)).is_some();
         if stepped {
             assert!(woke, "a pump ran a step and no wake followed it (step {})", steps_until_quiet + 1);
@@ -198,7 +198,7 @@ fn main() {
     }
     assert!(steps_until_quiet >= 2, "{steps_until_quiet} steps after the last frame request");
     std::thread::sleep(Duration::from_millis(300));
-    assert!(!unsafe { pump_app_nonblocking() }, "the link ran after it stopped");
+    assert!(!unsafe { pump_app_nonblocking(false).stepped }, "the link ran after it stopped");
     assert!(rearm_and_wait(Duration::from_millis(300)).is_none(), "a stopped link woke the embedder");
 
     let median = waits[waits.len() / 2];
