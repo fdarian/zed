@@ -881,6 +881,16 @@ impl MacWindowState {
             .is_some()
     }
 
+    /// Whether a window whose link was started has a frame request and a running link, the rest
+    /// of what [`step_started_display_links`] checks beside `first_step_pending`.
+    fn is_owed_first_step(&self) -> bool {
+        self.frame_requested
+            && self
+                .frame_source
+                .as_ref()
+                .is_some_and(WindowFrameSource::is_running)
+    }
+
     /// `start_display_link` for a link that a frame request or the window becoming visible
     /// starts: the window is then owed an eager first step (`step_started_display_links`).
     fn start_display_link_for_first_step(&mut self) {
@@ -3492,12 +3502,9 @@ pub fn step_started_display_links() {
     for window_state in started.iter().filter_map(Weak::upgrade) {
         let wants_step = {
             let mut lock = window_state.lock();
-            std::mem::take(&mut lock.first_step_pending)
-                && lock.frame_requested
-                && lock
-                    .frame_source
-                    .as_ref()
-                    .is_some_and(WindowFrameSource::is_running)
+            let owed = lock.first_step_pending;
+            lock.first_step_pending = false;
+            owed && lock.is_owed_first_step()
         };
         if wants_step {
             unsafe {
@@ -3508,6 +3515,21 @@ pub fn step_started_display_links() {
             window_state.lock().last_eager_step = Some(Instant::now());
         }
     }
+}
+
+/// Whether [`step_started_display_links`] would step a window now: a link started and still
+/// waits for its first step, the window still has a frame request and the link is still running.
+/// Takes nothing from the list.
+pub fn started_display_links_pending() -> bool {
+    STARTED_LINKS.with_borrow(|started| {
+        started
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|window_state| {
+                let lock = window_state.lock();
+                lock.first_step_pending && lock.is_owed_first_step()
+            })
+    })
 }
 
 /// Forgets the windows [`step_started_display_links`] would step; their links keep running.
