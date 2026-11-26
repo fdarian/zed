@@ -216,6 +216,9 @@ pub(crate) struct MacPlatformState {
     on_system_wake: Option<Box<dyn FnMut()>>,
     system_wake_observer_registered: bool,
     quit: Option<Box<dyn FnMut() -> bool>>,
+    /// Embedded only: a quit was requested and the quit callback has not yet completed (it is
+    /// running, or it declined and a retry is queued). Further requests are dropped meanwhile.
+    termination_requested: bool,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -274,6 +277,7 @@ impl MacPlatform {
             find_pasteboard: Pasteboard::find(),
             reopen: None,
             quit: None,
+            termination_requested: false,
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
@@ -345,7 +349,8 @@ impl MacPlatform {
     ///
     /// Returns `None` once a quit was requested: the Quit action, the last window closing under
     /// `LastWindowClosed`, the quit Apple Event, or a `terminate:` call. The quit callback has run by
-    /// then. AppKit is never allowed to exit the process in embedded mode, so the host exits.
+    /// then, and the platform stopped handling queued work within that same call. AppKit is never
+    /// allowed to exit the process in embedded mode, so the host exits.
     pub fn pump_events_reporting_step(&self) -> Option<PumpOutcome> {
         assert_main_thread("MacPlatform::pump_events");
 
@@ -378,20 +383,63 @@ impl MacPlatform {
         self.finish_embedded_run().then_some(outcome)
     }
 
-    /// Marks an embedded platform terminated and runs the quit callback; a second call does nothing.
-    fn begin_termination(&self) {
-        let mut lock = self.0.lock();
-        match lock.mode {
-            MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated) => return,
-            MacPlatformMode::Embedded(_) => {
-                lock.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated);
+    /// A request to quit, from the Quit action, the quit Apple Event or AppKit's `terminate:`.
+    ///
+    /// Blocking mode runs the quit callback every time, as AppKit is about to exit the process. In
+    /// embedded mode the host exits, so the request runs the callback once at a time and, when it
+    /// completes, marks the platform Terminated; later requests do nothing.
+    fn request_termination(&self) {
+        {
+            let mut lock = self.0.lock();
+            match lock.mode {
+                MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated) => return,
+                MacPlatformMode::Embedded(_) => {
+                    if lock.termination_requested {
+                        return;
+                    }
+                    lock.termination_requested = true;
+                }
+                MacPlatformMode::Blocking => {}
             }
-            MacPlatformMode::Blocking => {}
         }
-        if let Some(mut callback) = lock.quit.take() {
-            drop(lock);
-            callback();
-            self.0.lock().quit.get_or_insert(callback);
+        self.attempt_termination();
+    }
+
+    fn attempt_termination(&self) {
+        let mut lock = self.0.lock();
+        let embedded = matches!(lock.mode, MacPlatformMode::Embedded(_));
+        let completed = match lock.quit.take() {
+            Some(mut callback) => {
+                drop(lock);
+                let completed = callback();
+                self.0.lock().quit.get_or_insert(callback);
+                completed
+            }
+            None => true,
+        };
+        if !embedded {
+            return;
+        }
+        if completed {
+            self.0.lock().mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated);
+            // AppKit's own `terminate:` posts this before it exits; observers in the process (WebKit
+            // flushing website data, window restoration) rely on it. The delegate's
+            // `applicationWillTerminate:` receives it too and finds the platform Terminated.
+            unsafe {
+                let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+                let app: id = msg_send![APP_CLASS, sharedApplication];
+                let name = ns_string("NSApplicationWillTerminateNotification");
+                let _: () = msg_send![center, postNotificationName: name object: app];
+            }
+        } else {
+            // The callback declines while GPUI's App is borrowed, and then it has not shut down. Try
+            // again once the borrow is released: the main queue runs after the stack unwinds.
+            unsafe {
+                DispatchQueue::main().exec_async_f(
+                    self as *const Self as *mut c_void,
+                    retry_embedded_termination,
+                );
+            }
         }
     }
 
@@ -735,12 +783,16 @@ fn drain_mode() -> id {
 /// With `yield_after_key`, a key event gets a checkpoint on both sides: once an event was sent or
 /// a step ran in this call, the next event is peeked in the drain mode (which runs nothing), and a
 /// key event stays queued for the next call; and the call ends after sending a key event. Returns
-/// true in both cases; events may still be queued then.
+/// true in both cases; events may still be queued then. An embedded platform that has quit
+/// (`embedded_terminated`) ends the call at once, with events left queued.
 unsafe fn drain_events(app: id, steps_at_start: usize, yield_after_key: bool) -> bool {
     unsafe {
         let distant_past: id = msg_send![class!(NSDate), distantPast];
         let mut sent_any = false;
         for _ in 0..256 {
+            if embedded_terminated() {
+                return false;
+            }
             let stepped = crate::link_steps() != steps_at_start;
             let mut mode = if stepped {
                 drain_mode()
@@ -767,6 +819,9 @@ unsafe fn drain_events(app: id, steps_at_start: usize, yield_after_key: bool) ->
                         inMode: mode
                         dequeue: NO
                     ];
+                    if embedded_terminated() {
+                        return false;
+                    }
                     if crate::link_steps() != steps_at_start {
                         continue;
                     }
@@ -782,6 +837,9 @@ unsafe fn drain_events(app: id, steps_at_start: usize, yield_after_key: bool) ->
                 inMode: mode
                 dequeue: YES
             ];
+            if embedded_terminated() {
+                return false;
+            }
             if event == nil {
                 if !stepped && crate::link_steps() != steps_at_start {
                     continue;
@@ -789,6 +847,9 @@ unsafe fn drain_events(app: id, steps_at_start: usize, yield_after_key: bool) ->
                 break;
             }
             let _: () = msg_send![app, sendEvent: event];
+            if embedded_terminated() {
+                return false;
+            }
             sent_any = true;
             // `sendEvent:` begins an implicit Core Animation transaction. From macOS 26, AppKit's
             // update cycle commits one that began before the next frame boundary from a timer at
@@ -801,6 +862,18 @@ unsafe fn drain_events(app: id, steps_at_start: usize, yield_after_key: bool) ->
         }
         false
     }
+}
+
+/// Whether the registered embedded platform has quit. The pump stops handling work as soon as it
+/// has, so no event, source or display-link step runs after the quit callback.
+fn embedded_terminated() -> bool {
+    let registered = REGISTERED_MAC_PLATFORM.load(Ordering::Acquire);
+    if registered.is_null() {
+        return false;
+    }
+    // SAFETY: Drop nulls REGISTERED_MAC_PLATFORM before freeing MacPlatform.
+    let platform = unsafe { &*(registered as *const MacPlatform) };
+    platform.0.lock().mode == MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated)
 }
 
 unsafe fn is_key_event(event: id) -> bool {
@@ -825,7 +898,9 @@ unsafe fn is_key_event(event: id) -> bool {
 /// When a step stopped the link, the call posts a block so the embedder pumps once more; while a
 /// link runs, its next tick wakes the embedder. With `yield_after_key` the call also ends around a
 /// key event (see `MacPlatform::set_yield_after_key_event`), with the same block posted and
-/// `yielded_to_key` set; after a step or a yield no run loop source is handled.
+/// `yielded_to_key` set; after a step or a yield no run loop source is handled. Once the platform has
+/// quit, nothing more is handled: the call returns after the event, source or step that requested
+/// it.
 #[doc(hidden)]
 pub unsafe fn pump_app_nonblocking(yield_after_key: bool) -> PumpOutcome {
     unsafe {
@@ -837,6 +912,9 @@ pub unsafe fn pump_app_nonblocking(yield_after_key: bool) -> PumpOutcome {
 
         let yielded_to_key = drain_events(app, steps_at_start, yield_after_key);
         let stepped = crate::link_steps() != steps_at_start;
+        if embedded_terminated() {
+            return PumpOutcome { stepped, yielded_to_key: false };
+        }
         if yielded_to_key || (stepped && crate::link_stops() != stops_at_start) {
             DispatchQueue::main().exec_async(|| {});
         }
@@ -857,8 +935,17 @@ pub unsafe fn pump_app_nonblocking(yield_after_key: bool) -> PumpOutcome {
                     yielded_to_key: false,
                 };
             }
+            if embedded_terminated() {
+                return PumpOutcome {
+                    stepped: crate::link_steps() != steps_at_start,
+                    yielded_to_key: false,
+                };
+            }
             if crate::link_steps() != steps_at_start {
                 let yielded_to_key = drain_events(app, steps_at_start, yield_after_key);
+                if embedded_terminated() {
+                    return PumpOutcome { stepped: true, yielded_to_key: false };
+                }
                 if yielded_to_key || crate::link_stops() != stops_at_start {
                     DispatchQueue::main().exec_async(|| {});
                 }
@@ -997,7 +1084,7 @@ impl Platform for MacPlatform {
         // inside the host's pump) is never called.
         extern "C" fn begin_embedded_termination(context: *mut c_void) {
             if let Some(platform) = registered_mac_platform(context) {
-                platform.begin_termination();
+                platform.request_termination();
             }
         }
     }
@@ -1741,6 +1828,12 @@ unsafe fn get_mac_platform(object: &mut Object) -> Option<&MacPlatform> {
     }
 }
 
+extern "C" fn retry_embedded_termination(context: *mut c_void) {
+    if let Some(platform) = registered_mac_platform(context) {
+        platform.attempt_termination();
+    }
+}
+
 fn registered_mac_platform<'a>(context: *mut c_void) -> Option<&'a MacPlatform> {
     let registered = REGISTERED_MAC_PLATFORM.load(Ordering::Acquire);
     if registered.is_null() || registered != context {
@@ -1751,8 +1844,25 @@ fn registered_mac_platform<'a>(context: *mut c_void) -> Option<&'a MacPlatform> 
     }
 }
 
-extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
+extern "C" fn will_finish_launching(this: &mut Object, _: Sel, _: id) {
     unsafe {
+        if let Some(platform) = get_mac_platform(this)
+            && matches!(platform.0.lock().mode, MacPlatformMode::Embedded(_))
+        {
+            // A custom quit handler replaces AppKit's, which defers `terminate:` with
+            // `CFRunLoopPerformBlock`; that block stays stranded when the pump returns early. It is
+            // installed here and not in `applicationDidFinishLaunching:` so that a quit Apple Event
+            // that arrives during launch (a logout) is not answered by AppKit's handler, which would
+            // reach `NSTerminateCancel` and cancel it. AppKit does not replace it later: a quit sent
+            // to the process after launch finished still reaches this handler.
+            let manager: id = msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
+            let _: () = msg_send![manager,
+                setEventHandler: this as *mut Object as id
+                andSelector: sel!(handleQuitAppleEvent:withReplyEvent:)
+                forEventClass: CORE_EVENT_CLASS
+                andEventID: AE_QUIT_APPLICATION
+            ];
+        }
         let user_defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
 
         // The autofill heuristic controller causes slowdown and high CPU usage.
@@ -1809,15 +1919,6 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             callback();
         }
         if embedded {
-            // A custom quit handler replaces AppKit's, which defers `terminate:` with
-            // `CFRunLoopPerformBlock`; that block stays stranded when the pump returns early.
-            let manager: id = msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
-            let _: () = msg_send![manager,
-                setEventHandler: observer
-                andSelector: sel!(handleQuitAppleEvent:withReplyEvent:)
-                forEventClass: CORE_EVENT_CLASS
-                andEventID: AE_QUIT_APPLICATION
-            ];
             stop_app_immediately();
         }
     }
@@ -1859,7 +1960,7 @@ extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
         return NS_TERMINATE_NOW;
     }
     // Cancelling keeps AppKit from calling `exit()` inside the host's pump.
-    platform.begin_termination();
+    platform.request_termination();
     NS_TERMINATE_CANCEL
 }
 
@@ -1869,14 +1970,14 @@ extern "C" fn handle_quit_apple_event(this: &mut Object, _: Sel, _event: id, _re
     let Some(platform) = (unsafe { get_mac_platform(this) }) else {
         return;
     };
-    platform.begin_termination();
+    platform.request_termination();
 }
 
 extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
     let Some(platform) = (unsafe { get_mac_platform(this) }) else {
         return;
     };
-    platform.begin_termination();
+    platform.request_termination();
 }
 
 extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
