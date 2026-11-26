@@ -14,17 +14,24 @@
 //! disabled until [`run_loop_pumped`] enables it again. A message that is still pending then
 //! fires at once, so nothing is lost between the pump and the re-arm.
 //!
-//! Input needs a third source. AppKit receives every WindowServer event on the thread
-//! `com.apple.NSEventThread` and hands it to the main thread with `CFRunLoopPerformBlock` on the
-//! main run loop plus `CFRunLoopWakeUp`. Nothing runs that run loop here, so CoreFoundation
-//! ignores the wake-up and sends no message to a port that is watched. An observer on
-//! NSEventThread's run loop turns every iteration of it into a message on the main queue, which
-//! is watched.
+//! Two more mechanisms cover work that is handed to the main run loop with `CFRunLoopWakeUp`
+//! from another thread. Nothing runs that run loop here, so CoreFoundation ignores the wake-up
+//! and sends no message to a port that is watched, unless the byte it checks is cleared:
+//!
+//! - While a hook is installed, [`crate::main_run_loop_wakeups::enable`] clears that byte, so
+//!   every off-thread `CFRunLoopWakeUp` of the main run loop reaches the watched wake port: an
+//!   Apple Event (a quit from the Dock, `terminate()`), which AE.framework signals from a
+//!   dispatch worker and then wakes, and WebKit's replies. Without it a quit waits for an
+//!   unrelated wake.
+//! - Input needs its own source. AppKit receives every WindowServer event on the thread
+//!   `com.apple.NSEventThread` and hands it to the main thread with `CFRunLoopPerformBlock` on
+//!   the main run loop plus `CFRunLoopWakeUp`. An observer on NSEventThread's run loop turns
+//!   every iteration of it into a message on the main queue, which is watched.
 
 use std::{
     ffi::c_void,
     mem, ptr,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, Once, PoisonError},
     thread::JoinHandle,
 };
 
@@ -87,6 +94,8 @@ struct Watch {
     ports: [mach_port_t; 2],
     thread: JoinHandle<()>,
     event_thread_observer: EventThreadObserver,
+    /// Whether `start` took a count on [`crate::main_run_loop_wakeups`], which `stop` gives back.
+    wakeups_enabled: bool,
 }
 
 struct EventThreadObserver {
@@ -98,6 +107,7 @@ struct EventThreadObserver {
 unsafe impl Send for EventThreadObserver {}
 
 static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
+static WARNED: Once = Once::new();
 
 /// Installs the hook that the helper thread calls whenever the main run loop has work, or removes
 /// it with `None`. Must run on the main thread. The hook is called from the helper thread, at
@@ -158,6 +168,18 @@ fn start(hook: WakeHook) -> Watch {
             }),
         );
     }
+    let wakeups_enabled = match crate::main_run_loop_wakeups::enable() {
+        Ok(()) => true,
+        Err(error) => {
+            WARNED.call_once(|| {
+                log::warn!(
+                    "the main run loop's wake-ups cannot be enabled ({error}): work signalled from \
+                     other threads, such as an Apple Event (quit), only reaches the host on its next wake"
+                )
+            });
+            false
+        }
+    };
     let thread = std::thread::Builder::new()
         .name("gpui run loop wake".into())
         .spawn(move || watch_ports(kqueue, hook))
@@ -167,6 +189,7 @@ fn start(hook: WakeHook) -> Watch {
         ports,
         thread,
         event_thread_observer: unsafe { observe_event_thread() },
+        wakeups_enabled,
     }
 }
 
@@ -183,6 +206,9 @@ fn stop(watch: Watch) {
         .join()
         .expect("the run loop wake thread panicked");
     unsafe { libc::close(watch.kqueue) };
+    if watch.wakeups_enabled {
+        crate::main_run_loop_wakeups::disable();
+    }
 }
 
 /// Posts `event` to the application from NSEventThread, the way AppKit hands WindowServer input to

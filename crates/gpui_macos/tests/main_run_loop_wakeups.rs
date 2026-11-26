@@ -85,21 +85,9 @@ extern "C" fn enable_inside_a_run(_timer: CFRunLoopTimerRef, _info: *mut c_void)
 fn main() {
     // NSEventThread, which the wake watch observes, exists once the application does.
     let _: id = unsafe { msg_send![class!(NSApplication), sharedApplication] };
-    let wakes = Arc::new(AtomicUsize::new(0));
-    set_run_loop_wake_hook(Some({
-        let wakes = wakes.clone();
-        Arc::new(move || {
-            wakes.fetch_add(1, SeqCst);
-        })
-    }));
-    settle(&wakes);
-    wakes.store(0, SeqCst);
 
-    // As it is: the wake is dropped, which is what the embedder is up against.
-    wake_main_run_loop_from_another_thread();
-    assert_quiet(&wakes, 0, "a wake from another thread reached the run loop before enable");
-
-    // Inside a run of the run loop, where a page is made (a frame is being drawn).
+    // Inside a run of the run loop, where a page is made (a frame is being drawn). No hook is
+    // installed yet: the watch takes a count of its own.
     unsafe {
         let timer = CFRunLoopTimerCreate(
             ptr::null(),
@@ -116,11 +104,24 @@ fn main() {
         CFRelease(timer as *const c_void);
     }
     assert_eq!(ENABLE_INSIDE_A_RUN.lock().unwrap().take(), Some(Ok(())));
-    assert_eq!(main_run_loop_wakeups::enable(), Err(Error::AlreadyEnabled));
+    // Reference counted: a second enable counts, and each disable answers one; an extra one does
+    // nothing.
+    assert_eq!(main_run_loop_wakeups::enable(), Ok(()));
+    main_run_loop_wakeups::disable();
+    main_run_loop_wakeups::disable();
+    main_run_loop_wakeups::disable();
+
+    // Installing a hook enables the wakes by itself: every wake from another thread is seen, once
+    // the last one was received.
+    let wakes = Arc::new(AtomicUsize::new(0));
+    set_run_loop_wake_hook(Some({
+        let wakes = wakes.clone();
+        Arc::new(move || {
+            wakes.fetch_add(1, SeqCst);
+        })
+    }));
     settle(&wakes);
     wakes.store(0, SeqCst);
-
-    // Enabled: every wake from another thread is seen, once the last one was received.
     for round in 1..=3 {
         wake_main_run_loop_from_another_thread();
         wait_for(&wakes, 1);
@@ -129,23 +130,38 @@ fn main() {
         wakes.store(0, SeqCst);
     }
 
-    // Disabled: back to dropping them.
+    // Another user comes and goes while the watch still holds its count: the wakes stay.
+    assert_eq!(main_run_loop_wakeups::enable(), Ok(()));
     main_run_loop_wakeups::disable();
-    main_run_loop_wakeups::disable();
-    settle(&wakes);
-    wakes.store(0, SeqCst);
-    wake_main_run_loop_from_another_thread();
-    assert_quiet(&wakes, 0, "a wake reached the run loop after disable");
-
-    // And it can be enabled again, outside a run.
-    main_run_loop_wakeups::enable().expect("enable again");
     settle(&wakes);
     wakes.store(0, SeqCst);
     wake_main_run_loop_from_another_thread();
     wait_for(&wakes, 1);
     pump_main_run_loop();
+    assert_quiet(&wakes, 1, "a wake after another user's disable");
+    wakes.store(0, SeqCst);
+
+    // The other user outlives the watch: replacing the hook gives the watch's count back and
+    // takes one for the new hook, and the wakes stay throughout.
+    assert_eq!(main_run_loop_wakeups::enable(), Ok(()));
+    set_run_loop_wake_hook(Some({
+        let wakes = wakes.clone();
+        Arc::new(move || {
+            wakes.fetch_add(1, SeqCst);
+        })
+    }));
     main_run_loop_wakeups::disable();
+    settle(&wakes);
+    wakes.store(0, SeqCst);
+    wake_main_run_loop_from_another_thread();
+    wait_for(&wakes, 1);
+    pump_main_run_loop();
 
     set_run_loop_wake_hook(None);
+
+    // With every user gone, it can be enabled and disabled again, outside a run.
+    main_run_loop_wakeups::enable().expect("enable again");
+    main_run_loop_wakeups::disable();
+
     println!("main_run_loop_wakeups: ok");
 }

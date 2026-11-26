@@ -3,8 +3,15 @@
 //!
 //! An embedder such as a JavaScript runtime owns the main thread and only pumps the main run loop.
 //! WebKit answers the UI process from its IPC thread with `CFRunLoopWakeUp(CFRunLoopGetMain())`,
-//! and CoreFoundation returns from that without sending the wake message when the run loop is not
-//! inside a run, so the port set that [`crate::set_run_loop_wake_hook`] watches never hears of it.
+//! and AppKit's Apple Event handling (a quit from the Dock) signals a source and wakes the same way
+//! from a dispatch worker. CoreFoundation returns from that without sending the wake message when
+//! the run loop is not inside a run, so the port set that [`crate::set_run_loop_wake_hook`] watches
+//! never hears of it.
+//!
+//! The two users are the run-loop watch itself (`run_loop_wake.rs`, for as long as a hook is
+//! installed) and the webview pulse in `packages/native` (for as long as a page exists). They share
+//! the byte, so [`enable`] and [`disable`] are reference counted: the first successful `enable`
+//! clears it, the last matching `disable` puts it back.
 //!
 //! The decision is a byte inside the `__CFRunLoop` object. `CFRunLoopWakeUp` reads the run
 //! depth `d` (a byte), then the byte at `run_loop + d + FLAG`, and sends the message only when that
@@ -102,7 +109,6 @@ pub enum DecodeError {
 pub enum Error {
     NotMainThread,
     UnsupportedArchitecture,
-    AlreadyEnabled,
     NoWakeUpSymbol,
     Decode(DecodeError),
     /// The object `CFRunLoopGetMain` returned is not as large as the byte's offset.
@@ -125,7 +131,6 @@ impl fmt::Display for Error {
         match self {
             Error::NotMainThread => write!(f, "not on the main thread"),
             Error::UnsupportedArchitecture => write!(f, "only aarch64 is supported"),
-            Error::AlreadyEnabled => write!(f, "already enabled"),
             Error::NoWakeUpSymbol => write!(f, "CFRunLoopWakeUp was not found"),
             Error::Decode(error) => write!(f, "the code of CFRunLoopWakeUp is not as expected: {error:?}"),
             Error::ObjectTooSmall { size, needed } => {
@@ -149,6 +154,8 @@ impl std::error::Error for Error {}
 struct Enabled {
     flag: usize,
     original: u8,
+    /// Successful `enable`s that no `disable` has answered yet.
+    users: usize,
 }
 
 static ENABLED: Mutex<Option<Enabled>> = Mutex::new(None);
@@ -156,13 +163,17 @@ static ENABLED: Mutex<Option<Enabled>> = Mutex::new(None);
 /// Makes a `CFRunLoopWakeUp` of the main run loop from another thread send its message while the
 /// main run loop is not running, so that the watch of [`crate::set_run_loop_wake_hook`] sees it.
 /// Must run on the main thread; inside a run of the main run loop or not.
+///
+/// Reference counted: the first call validates the layout and clears the byte, later ones only
+/// count. Every `Ok` must be answered by one [`disable`]; an `Err` must not be.
 pub fn enable() -> Result<(), Error> {
     if unsafe { libc::pthread_main_np() } != 1 {
         return Err(Error::NotMainThread);
     }
     let mut enabled = ENABLED.lock().unwrap_or_else(PoisonError::into_inner);
-    if enabled.is_some() {
-        return Err(Error::AlreadyEnabled);
+    if let Some(enabled) = enabled.as_mut() {
+        enabled.users += 1;
+        return Ok(());
     }
     let layout = wake_up_layout()?;
     let run_loop = unsafe { CFRunLoopGetMain() };
@@ -174,15 +185,21 @@ pub fn enable() -> Result<(), Error> {
     check_on_a_run_loop_of_its_own(layout)?;
 
     unsafe { write_byte(run_loop, layout.flag, 0) };
-    *enabled = Some(Enabled { flag: layout.flag, original });
+    *enabled = Some(Enabled { flag: layout.flag, original, users: 1 });
     Ok(())
 }
 
-/// Puts the byte back as [`enable`] found it. Does nothing when it is not enabled.
+/// Answers one successful [`enable`]; the last one puts the byte back as `enable` found it. Does
+/// nothing when nothing is enabled.
 pub fn disable() {
     let mut enabled = ENABLED.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(enabled) = enabled.take() {
-        unsafe { write_byte(CFRunLoopGetMain(), enabled.flag, enabled.original) };
+    let Some(state) = enabled.as_mut() else {
+        return;
+    };
+    state.users -= 1;
+    if state.users == 0 {
+        unsafe { write_byte(CFRunLoopGetMain(), state.flag, state.original) };
+        *enabled = None;
     }
 }
 
