@@ -66,6 +66,13 @@ use std::{
     },
 };
 
+// NSApplicationTerminateReply values, returned from `applicationShouldTerminate:`.
+const NS_TERMINATE_CANCEL: NSUInteger = 0;
+const NS_TERMINATE_NOW: NSUInteger = 1;
+// kCoreEventClass ('aevt') and kAEQuitApplication ('quit').
+const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
+const AE_QUIT_APPLICATION: u32 = u32::from_be_bytes(*b"quit");
+
 #[allow(non_upper_case_globals)]
 const NSUTF8StringEncoding: NSUInteger = 4;
 
@@ -98,6 +105,14 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(applicationShouldHandleReopen:hasVisibleWindows:),
                 should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
+            );
+            decl.add_method(
+                sel!(applicationShouldTerminate:),
+                should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
+            );
+            decl.add_method(
+                sel!(handleQuitAppleEvent:withReplyEvent:),
+                handle_quit_apple_event as extern "C" fn(&mut Object, Sel, id, id),
             );
             decl.add_method(
                 sel!(applicationWillTerminate:),
@@ -319,7 +334,7 @@ impl MacPlatform {
 
     /// Processes pending AppKit work without waiting for new events.
     ///
-    /// Returns `false` after the application receives its termination callback.
+    /// Returns `false` once a quit was requested (see [`Self::pump_events_reporting_step`]).
     pub fn pump_events(&self) -> bool {
         self.pump_events_reporting_step().is_some()
     }
@@ -328,7 +343,9 @@ impl MacPlatform {
     /// display links itself must skip that when `stepped` is set: the pump's step was the frame
     /// (see [`pump_app_nonblocking`]).
     ///
-    /// Returns `None` once the application has received its termination callback.
+    /// Returns `None` once a quit was requested: the Quit action, the last window closing under
+    /// `LastWindowClosed`, the quit Apple Event, or a `terminate:` call. The quit callback has run by
+    /// then. AppKit is never allowed to exit the process in embedded mode, so the host exits.
     pub fn pump_events_reporting_step(&self) -> Option<PumpOutcome> {
         assert_main_thread("MacPlatform::pump_events");
 
@@ -359,6 +376,23 @@ impl MacPlatform {
         self.0.lock().key_event_pending = outcome.yielded_to_key;
 
         self.finish_embedded_run().then_some(outcome)
+    }
+
+    /// Marks an embedded platform terminated and runs the quit callback; a second call does nothing.
+    fn begin_termination(&self) {
+        let mut lock = self.0.lock();
+        match lock.mode {
+            MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated) => return,
+            MacPlatformMode::Embedded(_) => {
+                lock.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated);
+            }
+            MacPlatformMode::Blocking => {}
+        }
+        if let Some(mut callback) = lock.quit.take() {
+            drop(lock);
+            callback();
+            self.0.lock().quit.get_or_insert(callback);
+        }
     }
 
     fn finish_embedded_run(&self) -> bool {
@@ -940,14 +974,30 @@ impl Platform for MacPlatform {
         // this, we make quitting the application asynchronous so that we aren't holding borrows to
         // the app state on the stack when we actually terminate the app.
 
+        let embedded = matches!(self.0.lock().mode, MacPlatformMode::Embedded(_));
         unsafe {
-            DispatchQueue::main().exec_async_f(ptr::null_mut(), quit);
+            if embedded {
+                DispatchQueue::main().exec_async_f(
+                    self as *const Self as *mut c_void,
+                    begin_embedded_termination,
+                );
+            } else {
+                DispatchQueue::main().exec_async_f(ptr::null_mut(), quit);
+            }
         }
 
         extern "C" fn quit(_: *mut c_void) {
             unsafe {
                 let app = NSApplication::sharedApplication(nil);
                 let _: () = msg_send![app, terminate: nil];
+            }
+        }
+
+        // In embedded mode the host owns process exit, so `terminate:` (which ends in `exit()`
+        // inside the host's pump) is never called.
+        extern "C" fn begin_embedded_termination(context: *mut c_void) {
+            if let Some(platform) = registered_mac_platform(context) {
+                platform.begin_termination();
             }
         }
     }
@@ -1759,6 +1809,15 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             callback();
         }
         if embedded {
+            // A custom quit handler replaces AppKit's, which defers `terminate:` with
+            // `CFRunLoopPerformBlock`; that block stays stranded when the pump returns early.
+            let manager: id = msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
+            let _: () = msg_send![manager,
+                setEventHandler: observer
+                andSelector: sel!(handleQuitAppleEvent:withReplyEvent:)
+                forEventClass: CORE_EVENT_CLASS
+                andEventID: AE_QUIT_APPLICATION
+            ];
             stop_app_immediately();
         }
     }
@@ -1792,19 +1851,32 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
     }
 }
 
+extern "C" fn should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
+    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
+        return NS_TERMINATE_NOW;
+    };
+    if !matches!(platform.0.lock().mode, MacPlatformMode::Embedded(_)) {
+        return NS_TERMINATE_NOW;
+    }
+    // Cancelling keeps AppKit from calling `exit()` inside the host's pump.
+    platform.begin_termination();
+    NS_TERMINATE_CANCEL
+}
+
+// Runs synchronously and returns, so the Apple Event is answered with success: answering it with
+// `NSTerminateCancel` would cancel a logout or restart.
+extern "C" fn handle_quit_apple_event(this: &mut Object, _: Sel, _event: id, _reply: id) {
+    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
+        return;
+    };
+    platform.begin_termination();
+}
+
 extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
     let Some(platform) = (unsafe { get_mac_platform(this) }) else {
         return;
     };
-    let mut lock = platform.0.lock();
-    if matches!(lock.mode, MacPlatformMode::Embedded(_)) {
-        lock.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated);
-    }
-    if let Some(mut callback) = lock.quit.take() {
-        drop(lock);
-        callback();
-        platform.0.lock().quit.get_or_insert(callback);
-    }
+    platform.begin_termination();
 }
 
 extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
