@@ -190,9 +190,9 @@ impl Render for Page {
                         });
                         if bar.rotated.get() {
                             let turn = crate::TransformationMatrix::unit().rotate(crate::radians(0.1));
-                            window.with_transform(turn, |window| { window.paint_scroll_thumb(&state, thumb, plan, moved, repaint); });
+                            window.with_transform(turn, |window| { window.paint_scroll_thumb(state.scroll_key(), thumb, plan, moved, repaint); });
                         } else {
-                            window.paint_scroll_thumb(&state, thumb, plan, moved, repaint);
+                            window.paint_scroll_thumb(state.scroll_key(), thumb, plan, moved, repaint);
                         }
                     })
                     .into_any_element(),
@@ -641,7 +641,7 @@ fn a_frame_after_a_scroll_is_drawn_as_it_is_without_the_classifier(cx: &mut Test
 
 /// The frame shown as text: the scene with its draw orders and every hitbox by value, and the
 /// hit test at the pointer.
-fn shown(window: &mut Window) -> String {
+pub(super) fn shown(window: &mut Window) -> String {
     use std::fmt::Write as _;
 
     let frame = &window.rendered_frame;

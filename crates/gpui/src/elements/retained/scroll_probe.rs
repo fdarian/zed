@@ -14,6 +14,13 @@ pub(crate) struct ScrollSource {
     pub(crate) hitboxes: Rc<RecordedHitboxes>,
 }
 
+impl ScrollSource {
+    /// What a root that was culled holds.
+    pub(crate) fn nothing() -> Self {
+        Self { operations: Rc::from(Vec::new()), hitboxes: Rc::new(RecordedHitboxes::new(Vec::new(), None)) }
+    }
+}
+
 impl RetainedState {
     /// How far from its recording the root was last put, if it has one.
     pub(crate) fn placed_by(&self) -> Option<Point<Pixels>> {
@@ -29,6 +36,12 @@ impl RetainedState {
             return None;
         }
         Some(ScrollSource { operations: paint.operations.clone()?, hitboxes: recorded.prepaint.hitboxes.clone() })
+    }
+
+    /// Whether the root was recorded where culling left it out: it painted and hit nothing, and is put wherever the
+    /// scroll takes it with nothing to move.
+    pub(crate) fn is_recorded_culled(&self) -> bool {
+        self.recorded.as_ref().is_some_and(|recorded| recorded.relocation.as_ref().is_some_and(|relocation| relocation.culled))
     }
 
     /// Whether the recording is one a scroll can put elsewhere: it can be moved, and holds what a

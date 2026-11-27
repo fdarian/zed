@@ -2461,6 +2461,7 @@ impl Window {
                 _ => uncut_mask,
             };
             entries.push(LiftedElement {
+                scroll_owner: None,
                 content,
                 z: stub.z,
                 ordinal,

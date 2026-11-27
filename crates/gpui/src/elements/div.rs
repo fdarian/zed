@@ -25,7 +25,7 @@ use crate::{
     MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, OverflowAnchor, OverscrollBehavior,
     ParentElement, Position, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
     StyleRefinement, Styled, Task, TooltipId, TransformationMatrix, Visibility, Window, WindowControlArea, point, px,
-    scroll_routing, size,
+    ScrollKey, scroll_routing, size,
     sticky::{self, StickyInsets},
     tab_stop::PaintedChild,
     window::{LiftedElement, StateOwner, WindowRegion},
@@ -1792,6 +1792,17 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Runs when a frame moved the content of this scroller by `shift` without building it (see
+    /// [`Window::note_scroll_moved`]): what the element's build would have done with the new offset
+    /// outside the frame, such as the boxes its own children wrote. Only [`Div`] runs it.
+    fn on_scroll_translated(
+        mut self,
+        translated: impl Fn(&mut Window, &mut App, Point<Pixels>) + 'static,
+    ) -> Self {
+        self.interactivity().scroll_translated = Some(std::rc::Rc::new(translated));
+        self
+    }
+
     /// What this element does with wheel delta it cannot scroll, per axis, like CSS
     /// `overscroll-behavior`. The default hands it to the next scroll container up.
     fn overscroll_behavior(mut self, x: OverscrollBehavior, y: OverscrollBehavior) -> Self {
@@ -2133,8 +2144,10 @@ fn prepaint_child(
         prepaint_unlifted_child(child, layout_ids.get(index).copied(), window, cx);
         return;
     };
+    let root = child.downcast_mut::<crate::Retained>().is_some_and(|root| root.is_relocatable());
     let ticket = window.begin_lift();
     child.prepaint(window, cx);
+    window.scroll_patch_note_lifted_child(&ticket, root);
     #[cfg(feature = "stacker")]
     let element = mem::replace(child, StackSafe::new(Empty.into_any_element())).into_inner();
     #[cfg(not(feature = "stacker"))]
@@ -2160,6 +2173,7 @@ fn prepaint_unlifted_child(
     {
         let bounds = window.layout_bounds(layout_id);
         if window.lies_outside_the_mask(layout_id, bounds, outset) {
+            window.scroll_patch_note_culled();
             child.prepaint_culled(window, cx);
             return;
         }
@@ -2535,6 +2549,13 @@ impl Div {
         }
 
         let overlay_prepainter = self.interactivity.overlay_prepainter.take();
+        let scroll_patch_offset = self.interactivity.scroll_offset.clone();
+        let scroll_patch_handle = self.interactivity.tracked_scroll_handle.clone();
+        let scroll_translated = self.interactivity.scroll_translated.clone();
+        let reorders_children = self.stacking_context
+            || self.paint_ranks.is_some()
+            || self.prepaint_order_fn.is_some()
+            || content_lock.is_some();
         let content_end = self.interactivity.content_end;
         let scrollbar_size = self.interactivity.scrollbar_size;
         let paint_order = self.paint_ranks.as_ref().map(|_| self.child_paint_order());
@@ -2618,6 +2639,10 @@ impl Div {
                         sticky::within(scrollport, containing_block, || {
                             let mut prepaint_children_in_context = |window: &mut Window| {
                                 let children_hitboxes_start = window.next_frame.hitboxes.len();
+                                let scroll_patch_div = scroll_patch_offset.clone().and_then(|offset| {
+                                    let mark = window.scroll_patch_begin_div(scroll_routing::scroller_id(&offset))?;
+                                    Some((offset, mark))
+                                });
                                 if self.stacking_context {
                                     window.begin_stacking_context();
                                 }
@@ -2667,6 +2692,17 @@ impl Div {
                                 if self.stacking_context {
                                     self.lifted =
                                         window.end_stacking_context(children_hitboxes_start);
+                                }
+                                if let Some((offset, mark)) = scroll_patch_div {
+                                    window.scroll_patch_end_div(
+                                        mark,
+                                        crate::window::DivScroll {
+                                            offset,
+                                            handle: scroll_patch_handle.clone(),
+                                            translated: scroll_translated.clone(),
+                                            reorders: reorders_children,
+                                        },
+                                    );
                                 }
                             };
                             // A hidden element paints nothing of its own, so nothing is lifted out of
@@ -2743,6 +2779,7 @@ impl Div {
             .filter(|_| !self.children_lifting)
             .map(|_| self.child_paint_order());
         let document_order = self.document_order.clone();
+        let scroll_patch_id = self.interactivity.scroll_offset.as_ref().map(scroll_routing::scroller_id);
         window.with_image_cache(image_cache, |window| {
             self.interactivity.paint(
                 global_id,
@@ -2767,6 +2804,7 @@ impl Div {
                         window.paint_lifted(entry, context_node.unwrap(), cx);
                     }
 
+                    let scroll_patch_paint = scroll_patch_id.and_then(|id| window.scroll_patch_begin_div_paint(id));
                     let in_flow_start = window.next_frame.tab_stops.paint_index();
                     // Tab stops register while painting, so they follow the paint order and are
                     // put back in document order afterwards.
@@ -2795,6 +2833,9 @@ impl Div {
                                 markers: markers_start..window.lift_marker_count(),
                             });
                         }
+                    }
+                    if let Some(mark) = scroll_patch_paint {
+                        window.scroll_patch_end_div_paint(mark);
                     }
                     window.restore_children_tab_order(in_flow_start, &painted);
                     let in_flow = in_flow_start..window.next_frame.tab_stops.paint_index();
@@ -2972,6 +3013,8 @@ pub struct Interactivity {
     pub(crate) no_scrollbar: Point<bool>,
     pub(crate) overlay_painter:
         Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static>>,
+    /// Told when a frame moved the content of this scroller in place, see [`InteractiveElement::on_scroll_translated`].
+    pub(crate) scroll_translated: Option<crate::ScrollTranslated>,
     pub(crate) overlay_prepainter:
         Option<Box<dyn FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static>>,
     pub(crate) key_context: Option<KeyContext>,
@@ -4632,6 +4675,7 @@ impl Interactivity {
                     // `claim` clamped every axis it moved to `max_offset`, the extent of the
                     // last layout, so no size or extent changed: a wheel is a scroll write,
                     // and a read of `scrollTop` after it needs no layout pass.
+                    window.note_scroll_moved(current_view);
                     cx.notify_scroll_only(current_view);
                 }
             });
@@ -4684,6 +4728,7 @@ impl Interactivity {
                 scroll_offset.y += delta_y;
                 scroll_offset.x += delta_x;
                 if *scroll_offset != old_scroll_offset {
+                    window.note_scroll_moved(current_view);
                     cx.notify(current_view);
                 }
             }
@@ -5656,6 +5701,23 @@ impl ScrollHandle {
         state
             .anchoring
             .before_layout(engine, layout_id, enabled, offset, jumped, scale_factor);
+    }
+
+    /// See [`ScrollAnchoring::state_for_tests`].
+    #[cfg(test)]
+    pub(crate) fn anchoring_for_tests(&self) -> (bool, Point<Pixels>) {
+        self.0.borrow().anchoring.state_for_tests()
+    }
+
+    /// See [`ScrollAnchoring::note_scrolled_in_place`].
+    pub(crate) fn note_scrolled_in_place(&self, offset: Point<Pixels>) {
+        self.0.borrow_mut().anchoring.note_scrolled_in_place(offset);
+    }
+
+    /// The key a scroll-only frame knows the scroller by (see [`Window::paint_scroll_thumb`]): the same for
+    /// every clone of the handle.
+    pub fn scroll_key(&self) -> ScrollKey {
+        scroll_routing::scroller_id(&self.0.borrow().offset)
     }
 
     /// See [`ScrollAnchoring::would_act`].

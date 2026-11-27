@@ -90,6 +90,8 @@ mod scroll_patch;
 #[cfg(test)]
 mod scroll_patch_tests;
 #[cfg(test)]
+mod scroll_patch_div_tests;
+#[cfg(test)]
 mod splice_patch_tests;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
@@ -101,8 +103,9 @@ pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub use scroll_patch::{
     ScrollApplyDecline, ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason, ScrollThumbMiss, ScrollThumbMoved,
-    ScrollThumbPlan, ScrollThumbRepaint, ScrollThumbRepainter, ScrollThumbRepaints,
+    ScrollThumbPlan, ScrollThumbRepaint, ScrollThumbRepainter, ScrollThumbRepaints, ScrollTranslated,
 };
+pub(crate) use scroll_patch::DivScroll;
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame, RecordingRewrite};
 pub(crate) use patch_splice::{FIELDS, Positions, RowPart};
 pub(crate) use scroll_patch::{RowSurroundings, ScrollFrame, ScrollPatchDraw, ScrollPatchWindow};
@@ -1204,6 +1207,23 @@ impl Hitbox {
         }
     }
 
+    /// The hitbox of an element that a scroller moved by `shift` while the clip around it stayed: its box
+    /// moved and everything else as it was. `None` for a hitbox that has more than a box and a mask to
+    /// move (a clip path, nested clips, a transform), which only a build puts there.
+    pub(crate) fn scrolled_by(&self, shift: Point<Pixels>) -> Option<Hitbox> {
+        if self.unclipped
+            || self.clip.is_some()
+            || self.exact_clips.is_some()
+            || self.space.is_some()
+            || self.local_clip.is_some()
+        {
+            return None;
+        }
+        let mut moved = self.clone();
+        moved.bounds.origin += shift;
+        Some(moved)
+    }
+
     /// The hitbox as text, for comparing the frames of two builds of the same subtree.
     pub(crate) fn describe(&self) -> String {
         format!(
@@ -1481,6 +1501,9 @@ impl PaintContext {
 /// before) its in-flow content. Everything a normal paint of the element from its place in the tree
 /// would have seen is captured when it is handed over.
 pub(crate) struct LiftedElement {
+    /// The `div` scroller whose content this is, when a frame that moves the content in place has to count what
+    /// it paints (see [`Window::scroll_patch_note_lifted_child`]).
+    scroll_owner: Option<crate::scroll_routing::ScrollerId>,
     content: LiftedContent,
     pub(crate) z: i32,
     /// Position in the tree among the elements handed over to the same context.
@@ -5169,6 +5192,7 @@ impl Window {
         let mask = self.content_mask().bounds;
         let slack = px(1.);
         let scale_factor = self.scale_factor();
+        let tracing = self.scroll_patch_begin_cull(mask);
         let Some(space) = self.outset_space(layout_id, bounds) else {
             return false;
         };
@@ -5187,6 +5211,9 @@ impl Window {
         // Noted before the capture is looked at: a layout record made while an element holds the
         // capture is skipped after it lets go.
         self.note_cull_reach(reach);
+        if tracing {
+            self.scroll_patch_note_cull_reach(reach);
+        }
         if self.captured_identity.is_some() || self.captured_hitbox.is_some() {
             return false;
         }
@@ -5208,6 +5235,9 @@ impl Window {
         extent.origin += snapped_offset;
         let extent = inflate(self.bounds_in_window(extent));
         self.note_cull_reach(extent);
+        if tracing {
+            self.scroll_patch_note_cull_reach(extent);
+        }
         apart(extent)
     }
 
@@ -7372,6 +7402,7 @@ impl Window {
         let told = cell.is_some() || (hole.is_none() && open.is_some_and(|open| open.direct && !open.culled));
         let content_mask = self.content_mask();
         let entry = LiftedElement {
+            scroll_owner: self.scroll_patch_take_lift_owner(),
             content: LiftedContent::Element(element),
             z,
             ordinal: ticket.ordinal,
@@ -7491,6 +7522,7 @@ impl Window {
         };
         let outer_cut = entry.cut.filter(|_| !regional).map(|cut| self.paint_cut.replace(cut));
         let image_cache = entry.image_cache.take();
+        let scroll_ops = entry.scroll_owner.map(|owner| (owner, self.next_frame.scene.len()));
         let content = &mut entry.content;
         let owners = &entry.owners;
         let ordinal = entry.ordinal;
@@ -7521,6 +7553,9 @@ impl Window {
         });
         if let Some(outer_cut) = outer_cut {
             self.paint_cut = outer_cut;
+        }
+        if let Some((owner, start)) = scroll_ops {
+            self.scroll_patch_lifted_painted(owner, start);
         }
         mem::swap(&mut self.transform_stack, &mut entry.transforms);
         mem::swap(

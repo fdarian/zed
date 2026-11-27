@@ -68,7 +68,11 @@ use crate::scroll_routing::ScrollerId;
 use crate::ListState;
 use shift::ShiftPlan;
 
+mod div;
 mod shift;
+
+pub(crate) use div::{DivFrame, DivScroll};
+pub use div::ScrollTranslated;
 
 /// Why a frame drawn after a list scroll is not a pure translate of the frame shown, the first of
 /// them, in the order the checks run.
@@ -186,11 +190,22 @@ pub enum ScrollPatchCause {
     /// [`ScrollPatchReason::Membership`]: rows come in and the list did not note how it builds them
     /// (the window around it could not be restored).
     NoBuilder,
+    /// [`ScrollPatchReason::NotRelocatable`]: a child of a `div` scroller that was culled would not be at the new
+    /// position, so it has to be built.
+    Entered,
+    /// [`ScrollPatchReason::NotRelocatable`]: a `div` scroller's content holds something no root holds that is not a
+    /// hitbox that moves with it: an operation, or a hitbox with a clip of its own.
+    Unrooted,
+    /// [`ScrollPatchReason::NotRelocatable`]: a list or another scroller is inside the `div` scroller.
+    Nested,
+    /// [`ScrollPatchReason::NotRelocatable`]: the `div` scroller paints its children in a stacking context or in an
+    /// order of its own, or holds a sticky or escaping box, which a scroll does not move as the rest.
+    Layered,
 }
 
 impl ScrollPatchCause {
     /// Every cause.
-    pub const ALL: [ScrollPatchCause; 15] = [
+    pub const ALL: [ScrollPatchCause; 19] = [
         ScrollPatchCause::NoRun,
         ScrollPatchCause::NoRecording,
         ScrollPatchCause::Unmovable,
@@ -206,14 +221,22 @@ impl ScrollPatchCause {
         ScrollPatchCause::UnmeasuredOverdraw,
         ScrollPatchCause::Disjoint,
         ScrollPatchCause::NoBuilder,
+        ScrollPatchCause::Entered,
+        ScrollPatchCause::Unrooted,
+        ScrollPatchCause::Nested,
+        ScrollPatchCause::Layered,
     ];
 
     /// The reason it is a cause of.
     pub fn reason(self) -> ScrollPatchReason {
         match self {
-            ScrollPatchCause::NoRun | ScrollPatchCause::NoRecording | ScrollPatchCause::Unmovable => {
-                ScrollPatchReason::NotRelocatable
-            }
+            ScrollPatchCause::NoRun
+            | ScrollPatchCause::NoRecording
+            | ScrollPatchCause::Unmovable
+            | ScrollPatchCause::Entered
+            | ScrollPatchCause::Unrooted
+            | ScrollPatchCause::Nested
+            | ScrollPatchCause::Layered => ScrollPatchReason::NotRelocatable,
             ScrollPatchCause::RegionTop | ScrollPatchCause::RegionBottom | ScrollPatchCause::RegionSide => {
                 ScrollPatchReason::Region
             }
@@ -247,6 +270,10 @@ impl ScrollPatchCause {
             ScrollPatchCause::UnmeasuredOverdraw => "unmeasuredOverdraw",
             ScrollPatchCause::Disjoint => "disjoint",
             ScrollPatchCause::NoBuilder => "noBuilder",
+            ScrollPatchCause::Entered => "entered",
+            ScrollPatchCause::Unrooted => "unrooted",
+            ScrollPatchCause::Nested => "nested",
+            ScrollPatchCause::Layered => "layered",
         }
     }
 
@@ -397,6 +424,9 @@ pub(super) struct ScrollRun {
     /// Where its hitboxes and its scene operations are in the frame.
     hitboxes: Range<usize>,
     ops: Range<usize>,
+    /// The ids of its hitboxes, for a root in a `div` scroller: a root that is lifted into a stacking context has its
+    /// hitboxes taken out of where `hitboxes` was noted, and the context puts them elsewhere.
+    hitbox_ids: Vec<HitboxId>,
     /// How far from its recording it was put.
     delta: Point<Pixels>,
     /// The content mask around the root in prepaint, and whether an exact clip cut it.
@@ -522,6 +552,14 @@ struct ThumbMove {
 struct OpenList {
     id: ScrollerId,
     start: usize,
+    /// The scroller is a `div` and its roots are children, not rows.
+    div: bool,
+    /// Something that scrolls or paints in its own right opened inside it.
+    nested: bool,
+    /// The children of a scroller that culling left out.
+    culled: Vec<div::Culled>,
+    /// The hitboxes of the children that are lifted and are not roots.
+    lifted_hitboxes: Vec<HitboxId>,
 }
 
 /// The window around the rows of a list where it builds them, for a frame that scrolls the list to build
@@ -547,8 +585,13 @@ pub(crate) struct ScrollFrame {
     lists: Vec<ListFrame>,
     runs: Vec<ScrollRun>,
     thumbs: Vec<ScrollThumb>,
+    divs: Vec<DivFrame>,
     open: Vec<OpenList>,
     row: Option<usize>,
+    /// What culling tested for the child it last culled, see [`Window::scroll_patch_note_culled`].
+    cull: div::CullTrace,
+    /// The scroller whose lifted child is about to be handed to its stacking context.
+    lift_owner: Option<ScrollerId>,
     /// Where in `runs` the paint of the roots is.
     painted: usize,
     viewport: Size<Pixels>,
@@ -561,9 +604,11 @@ impl ScrollFrame {
         self.lists.clear();
         self.runs.clear();
         self.thumbs.clear();
+        self.divs.clear();
         self.open.clear();
         self.row = None;
         self.painted = 0;
+        self.cull.reset();
     }
 
     /// Moves the places in the vectors of the frame that the runs hold, after a patch put other items in
@@ -571,6 +616,10 @@ impl ScrollFrame {
     /// still a run of the frame.
     pub(crate) fn remap_runs(&mut self, run: &mut dyn FnMut(&mut Range<usize>, &mut Range<usize>) -> bool) {
         self.runs.retain_mut(|scroll| run(&mut scroll.hitboxes, &mut scroll.ops));
+        // What a div holds besides its runs is not remapped: a splice leaves it to a frame built whole.
+        for div in &mut self.divs {
+            div.stale = true;
+        }
     }
 
     /// Calls `f` with the cell that holds the dispatch node each list's rows hang off.
@@ -623,6 +672,9 @@ impl ScrollFrame {
     /// much the hitboxes and the operations of the frame grew or shrank.
     pub(super) fn edit_runs(&mut self, edit: RunEdit, hitboxes: isize, operations: isize) {
         let after = edit.from + edit.added.len();
+        for div in &mut self.divs {
+            div.stale = true;
+        }
         self.runs.splice(edit.from..edit.from + edit.removed, edit.added);
         for run in &mut self.runs[after..] {
             run.hitboxes = shifted(&run.hitboxes, hitboxes);
@@ -661,7 +713,7 @@ fn shifted(range: &Range<usize>, by: isize) -> Range<usize> {
 #[derive(Clone, Copy, Default)]
 struct Held {
     reasons: u16,
-    causes: u16,
+    causes: u32,
 }
 
 impl Held {
@@ -723,6 +775,8 @@ struct Prediction {
     /// Where each bar of the frame shown has its thumb once the rows are moved: the index of the
     /// bar, and the bounds if the thumb moves.
     thumbs: Vec<(usize, Option<Bounds<Pixels>>)>,
+    /// For the scroll of a `div`: the offset it is at, and `list` is the scroller. Its content moves by `shift`.
+    div: Option<Point<Pixels>>,
 }
 
 pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window, &App) -> Option<ScrollPatchReason>>;
@@ -823,7 +877,10 @@ impl Window {
         frame.thumbs.retain(|thumb| thumb.list != id);
         match frame.open.last() {
             Some(open) if open.id == id => frame.runs.truncate(open.start),
-            _ => frame.open.push(OpenList { id, start: frame.runs.len() }),
+            _ => {
+                frame.mark_nested();
+                frame.open.push(OpenList { id, start: frame.runs.len(), div: false, nested: false, culled: Vec::new(), lifted_hitboxes: Vec::new() })
+            }
         }
     }
 
@@ -895,8 +952,7 @@ impl Window {
     pub(crate) fn scroll_patch_begin_root(&self) -> Option<usize> {
         let frame = &self.next_frame.scroll;
         (self.scroll_patch_records()
-            && !frame.open.is_empty()
-            && frame.row.is_some()
+            && frame.open.last().is_some_and(|open| open.div || frame.row.is_some())
             && !self.is_recording_any_relocation())
         .then(|| self.next_frame.hitboxes.len())
     }
@@ -921,8 +977,20 @@ impl Window {
         let ambient = self.content_mask();
         let exact_clips = self.exact_clips.is_some();
         let hitboxes = hitboxes_start..self.next_frame.hitboxes.len();
+        let in_div = self.next_frame.scroll.open.last().is_some_and(|open| open.div);
+        let hitbox_ids: Vec<HitboxId> = match in_div {
+            true => self.next_frame.hitboxes[hitboxes.clone()].iter().map(|hitbox| hitbox.id).collect(),
+            false => Vec::new(),
+        };
         let frame = &mut self.next_frame.scroll;
-        let (Some(open), Some(row)) = (frame.open.last(), frame.row) else {
+        let Some(open) = frame.open.last() else {
+            return;
+        };
+        // A child of a div is numbered by the order it is put in.
+        let Some(row) = (match open.div {
+            true => Some(frame.runs.len() - open.start),
+            false => frame.row,
+        }) else {
             return;
         };
         let list = open.id;
@@ -932,6 +1000,7 @@ impl Window {
             id: id.clone(),
             hitboxes,
             ops: 0..0,
+            hitbox_ids,
             delta,
             paint_mask: ambient,
             ambient,
@@ -961,7 +1030,7 @@ impl Window {
         }
     }
 
-    /// Paints the thumb of a bar over `list` (`None` when the bar paints none: it is not shown, or
+    /// Paints the thumb of a bar over the list or scroller `scroller` (`None` when the bar paints none: it is not shown, or
     /// the content fits) and notes the bar for a frame that moves the rows without building it.
     /// `plan` says, once the list is scrolled and before the frame is built, where the thumb goes
     /// or why it cannot go there, and `moved` runs after the rows were moved with the thumb.
@@ -974,7 +1043,7 @@ impl Window {
     /// [`Window::set_scroll_patch_gate`]).
     pub fn paint_scroll_thumb(
         &mut self,
-        list: &ListState,
+        scroller: crate::ScrollKey,
         thumb: Option<PaintQuad>,
         plan: ScrollThumbPlan,
         moved: ScrollThumbMoved,
@@ -999,7 +1068,7 @@ impl Window {
             Some(bounds) if one_quad => ThumbPaint::Quad { op: first, bounds, opacity },
             _ => ThumbPaint::Untracked,
         };
-        self.next_frame.scroll.thumbs.push(ScrollThumb { list: list.scroller_id(), paint, plan, moved, repaint });
+        self.next_frame.scroll.thumbs.push(ScrollThumb { list: scroller, paint, plan, moved, repaint });
         true
     }
 
@@ -1197,6 +1266,10 @@ impl Window {
     fn scroll_verdict(&self, view: EntityId, measured: Pixels, cx: &App) -> Verdict {
         use ScrollPatchReason as Reason;
 
+        if self.a_div_scrolled() {
+            return self.div_verdict(view, cx);
+        }
+
         let shown = &self.rendered_frame.scroll;
         let (list, gate) = match self.scrolled_list(measured, cx) {
             Ok(subject) => (subject.list, subject.gate),
@@ -1298,21 +1371,7 @@ impl Window {
         if places.len() != list.rows.len() {
             held.cause(ScrollPatchCause::NoRun);
         }
-        let mut thumbs = Vec::new();
-        for (index, thumb) in shown.thumbs.iter().enumerate() {
-            if matches!(thumb.paint, ThumbPaint::Untracked) {
-                held.cause(ScrollPatchCause::ThumbTrack);
-                continue;
-            }
-            let drawn = match thumb.paint {
-                ThumbPaint::Quad { bounds, .. } => Some(bounds),
-                ThumbPaint::Nothing | ThumbPaint::Untracked => None,
-            };
-            match (thumb.plan)(self, drawn) {
-                Ok(bounds) => thumbs.push((index, bounds)),
-                Err(miss) => held.cause(miss.cause()),
-            }
-        }
+        let thumbs = self.plan_thumbs(&mut held);
 
         if held.first().is_some() {
             return Verdict { held, prediction: None };
@@ -1329,6 +1388,7 @@ impl Window {
                 rebuilds,
                 deltas: places.into_iter().map(|(run, total, _)| (run.id.clone(), total)).collect(),
                 thumbs,
+                div: None,
             }),
         }
     }
@@ -1356,6 +1416,12 @@ impl Window {
             return;
         };
         let built = &self.rendered_frame.scroll;
+        if prediction.div.is_some() {
+            if !self.div_prediction_held(&prediction) {
+                self.scroll_patch.counters.mispredicted += 1;
+            }
+            return;
+        }
         let same = built.lists.iter().find(|list| list.id == prediction.list).is_some_and(|list| {
             list.rows == prediction.rows
                 && built.runs_of(list.id).count() == list.rows.len()
@@ -1404,6 +1470,8 @@ struct ScrollMove {
     total: Point<Pixels>,
     source: ScrollSource,
     clip: ReplayClip,
+    /// Where each hitbox of the root is in the frame shown, when the run's range does not say it.
+    hitbox_at: Option<Vec<usize>>,
 }
 
 /// How the rows of a list that leave and come in are taken out of the frame shown and put in it, planned
@@ -1418,6 +1486,8 @@ struct MembershipPlan {
     rebuilt: usize,
     /// The rows that are built, in the order of the list, with where they are put.
     groups: Vec<RowsIn>,
+    /// The hitboxes of a `div` scroller's content that no root holds, and where the scroll puts each.
+    scrolled_hitboxes: Vec<(usize, Hitbox)>,
 }
 
 /// Rows that are built, and where in the frame shown they are put: after `at` in the vectors, and among the
@@ -1511,6 +1581,9 @@ impl Window {
         &self,
         prediction: &Prediction,
     ) -> Result<(Vec<ScrollMove>, Vec<ThumbMove>, MembershipPlan), ScrollApplyDecline> {
+        if prediction.div.is_some() {
+            return self.plan_div_moves(prediction);
+        }
         let shown = &self.rendered_frame.scroll;
         let list = shown
             .lists
@@ -1545,44 +1618,9 @@ impl Window {
                 }
                 continue;
             }
-            let total = run.delta + prediction.shift;
-            let source = self
-                .peek_element_state(&run.id, |state: &RetainedState| state.scroll_source())
-                .flatten()
-                .ok_or(ScrollApplyDecline::Recording)?;
-            if source.operations.len() != run.ops.len() {
-                return Err(ScrollApplyDecline::Operations);
-            }
-            if source.hitboxes.hitboxes.len() != run.hitboxes.len() {
-                return Err(ScrollApplyDecline::Hitboxes);
-            }
-            let clip = self.replay_clip(&run.paint_mask);
-            for (recorded, shown) in source.hitboxes.hitboxes.iter().zip(&self.rendered_frame.hitboxes[run.hitboxes.clone()]) {
-                if recorded.id != shown.id || (recorded.unclipped && !total.is_zero()) {
-                    return Err(ScrollApplyDecline::Hitboxes);
-                }
-            }
-            moves.push(ScrollMove { run: *index, total, source, clip });
+            moves.push(self.plan_run_move(*index, run, prediction.shift, None)?);
         }
-        let mut thumbs = Vec::with_capacity(prediction.thumbs.len());
-        for (index, bounds) in &prediction.thumbs {
-            let quad = match (bounds, shown.thumbs[*index].paint) {
-                (Some(bounds), ThumbPaint::Quad { op, bounds: painted, .. }) => {
-                    let PaintOperation::Quad(old) = &self.rendered_frame.scene.paint_operations[op] else {
-                        return Err(ScrollApplyDecline::Thumb);
-                    };
-                    // The quad is made as `device_quad` makes it: snapped to the device pixel, and
-                    // placed by the offset the painted one had.
-                    let offset = old.bounds.origin - self.snap_bounds(painted).origin;
-                    let mut quad = *old;
-                    quad.bounds = Bounds { origin: self.snap_bounds(*bounds).origin + offset, size: self.snap_bounds(*bounds).size };
-                    Some((quad, *bounds))
-                }
-                (None, _) | (Some(_), ThumbPaint::Nothing) => None,
-                (Some(_), ThumbPaint::Untracked) => return Err(ScrollApplyDecline::Thumb),
-            };
-            thumbs.push(ThumbMove { thumb: *index, quad });
-        }
+        let thumbs = self.plan_thumb_moves(prediction)?;
 
         let mut membership = MembershipPlan::default();
         if !prediction.removes || prediction.rows == list.rows && replaced.is_empty() {
@@ -1666,6 +1704,77 @@ impl Window {
             });
         }
         Ok((moves, thumbs, membership))
+    }
+
+    /// How the run at `index` is put `shift` further: made from its recording, and checked before anything is written.
+    fn plan_run_move(
+        &self,
+        index: usize,
+        run: &ScrollRun,
+        shift: Point<Pixels>,
+        places: Option<&FxHashMap<HitboxId, usize>>,
+    ) -> Result<ScrollMove, ScrollApplyDecline> {
+        let total = run.delta + shift;
+        let source = self.peek_element_state(&run.id, |state: &RetainedState| {
+            state.scroll_source().or_else(|| state.is_recorded_culled().then(ScrollSource::nothing))
+        });
+        let source = source.flatten().ok_or(ScrollApplyDecline::Recording)?;
+        if source.operations.len() != run.ops.len() {
+            return Err(ScrollApplyDecline::Operations);
+        }
+        let clip = self.replay_clip(&run.paint_mask);
+        let hitbox_at = match places {
+            None => {
+                if source.hitboxes.hitboxes.len() != run.hitboxes.len() {
+                    return Err(ScrollApplyDecline::Hitboxes);
+                }
+                for (recorded, shown) in source.hitboxes.hitboxes.iter().zip(&self.rendered_frame.hitboxes[run.hitboxes.clone()]) {
+                    if recorded.id != shown.id || (recorded.unclipped && !total.is_zero()) {
+                        return Err(ScrollApplyDecline::Hitboxes);
+                    }
+                }
+                None
+            }
+            Some(places) => {
+                if source.hitboxes.hitboxes.len() != run.hitbox_ids.len() {
+                    return Err(ScrollApplyDecline::Hitboxes);
+                }
+                let mut at = Vec::with_capacity(run.hitbox_ids.len());
+                for (recorded, id) in source.hitboxes.hitboxes.iter().zip(&run.hitbox_ids) {
+                    match places.get(id) {
+                        Some(ix) if recorded.id == *id && !(recorded.unclipped && !total.is_zero()) => at.push(*ix),
+                        _ => return Err(ScrollApplyDecline::Hitboxes),
+                    }
+                }
+                Some(at)
+            }
+        };
+        Ok(ScrollMove { run: index, total, source, clip, hitbox_at })
+    }
+
+    /// Where each thumb that the scroll moves is put, as the owner's bar would paint it.
+    fn plan_thumb_moves(&self, prediction: &Prediction) -> Result<Vec<ThumbMove>, ScrollApplyDecline> {
+        let shown = &self.rendered_frame.scroll;
+        let mut thumbs = Vec::with_capacity(prediction.thumbs.len());
+        for (index, bounds) in &prediction.thumbs {
+            let quad = match (bounds, shown.thumbs[*index].paint) {
+                (Some(bounds), ThumbPaint::Quad { op, bounds: painted, .. }) => {
+                    let PaintOperation::Quad(old) = &self.rendered_frame.scene.paint_operations[op] else {
+                        return Err(ScrollApplyDecline::Thumb);
+                    };
+                    // The quad is made as `device_quad` makes it: snapped to the device pixel, and
+                    // placed by the offset the painted one had.
+                    let offset = old.bounds.origin - self.snap_bounds(painted).origin;
+                    let mut quad = *old;
+                    quad.bounds = Bounds { origin: self.snap_bounds(*bounds).origin + offset, size: self.snap_bounds(*bounds).size };
+                    Some((quad, *bounds))
+                }
+                (None, _) | (Some(_), ThumbPaint::Nothing) => None,
+                (Some(_), ThumbPaint::Untracked) => return Err(ScrollApplyDecline::Thumb),
+            };
+            thumbs.push(ThumbMove { thumb: *index, quad });
+        }
+        Ok(thumbs)
     }
 
     /// Builds the rows of the plan that come in, as the list builds them, in the scratch frame: each is
@@ -1905,10 +2014,22 @@ impl Window {
             moved_extents.extend(frame.scene.paint_operations[run.ops.clone()].iter().map(PaintOperation::extent));
             moved_ranges.push(run.ops.clone());
             let recorded = movement.source.hitboxes.hitboxes.iter();
-            for (slot, recorded) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(recorded) {
-                let mut moved = recorded.relocated(movement.total, &run.surroundings());
-                moved.parent = slot.parent;
-                *slot = moved;
+            match &movement.hitbox_at {
+                None => {
+                    for (slot, recorded) in frame.hitboxes[run.hitboxes.clone()].iter_mut().zip(recorded) {
+                        let mut moved = recorded.relocated(movement.total, &run.surroundings());
+                        moved.parent = slot.parent;
+                        *slot = moved;
+                    }
+                }
+                Some(at) => {
+                    for (ix, recorded) in at.iter().zip(recorded) {
+                        let slot = &mut frame.hitboxes[*ix];
+                        let mut moved = recorded.relocated(movement.total, &run.surroundings());
+                        moved.parent = slot.parent;
+                        *slot = moved;
+                    }
+                }
             }
             // The reach is where the root paints in the frame shown, and the next scroll is judged from this frame.
             let moved_by = movement.total - run.delta;
@@ -1980,6 +2101,10 @@ impl Window {
             }
             bars.push(thumb.moved.clone());
         }
+        let translated = match prediction.div {
+            Some(_) => self.write_div_moved(prediction, membership.scrolled_hitboxes),
+            None => None,
+        };
         let frame = &mut self.rendered_frame;
         frame.scene.rebuild_moved();
         self.damage.end(&frame.scene);
@@ -2004,6 +2129,9 @@ impl Window {
             if let Some(hook) = hook {
                 hook(RetainedPhase::Scrolled(prediction.shift), total, self, cx);
             }
+        }
+        if let Some(translated) = translated {
+            translated(self, cx, prediction.shift);
         }
     }
 

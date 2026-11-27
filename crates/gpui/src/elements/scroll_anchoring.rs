@@ -60,6 +60,23 @@ impl ScrollAnchoring {
         }
     }
 
+    /// Whether the scroller has an anchor, and the offset the last step left.
+    #[cfg(test)]
+    pub(crate) fn state_for_tests(&self) -> (bool, Point<Pixels>) {
+        (self.anchor.is_some(), self.left_offset)
+    }
+
+    /// What a frame that moved the scroller's content without laying out leaves behind: the scroll is not the one
+    /// the last step left, so the anchor is dropped (the next layout picks another), and the offset is where the
+    /// step would have left it.
+    pub(crate) fn note_scrolled_in_place(&mut self, offset: Point<Pixels>) {
+        self.note_offset(offset, false);
+        if offset.y == Pixels::ZERO {
+            self.anchor = None;
+        }
+        self.left_offset = offset;
+    }
+
     /// Blink's `NotifyBeforeLayout`: keeps the anchor, or picks one if the scroller has none, from
     /// the boxes of the last layout and the tree and styles of the one that is about to run. An
     /// anchor that left the scroller, is hidden or is `overflow-anchor: none` now is replaced, as

@@ -400,6 +400,11 @@ impl ListState {
         crate::scroll_routing::scroller_id_of_state(&self.0)
     }
 
+    /// The key a scroll-only frame knows the list by (see [`crate::Window::paint_scroll_thumb`]).
+    pub fn scroll_key(&self) -> crate::ScrollKey {
+        self.scroller_id()
+    }
+
     /// Construct a new list state, for storage on a view.
     ///
     /// The overdraw parameter controls how much extra space is rendered

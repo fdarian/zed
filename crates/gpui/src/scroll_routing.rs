@@ -50,6 +50,9 @@ pub enum OverscrollBehavior {
 /// Identifies one scroll container across frames: the address of its offset cell.
 pub(crate) type ScrollerId = usize;
 
+/// [`ScrollerId`] as a public owner of a bar names a scroller (see [`crate::Window::paint_scroll_thumb`]).
+pub type ScrollKey = usize;
+
 /// The id of a scroller that is not a `Div`, from the address of its state.
 pub(crate) fn scroller_id_of_state<T>(state: &Rc<T>) -> ScrollerId {
     Rc::as_ptr(state) as usize

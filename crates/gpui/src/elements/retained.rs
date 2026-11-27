@@ -317,6 +317,10 @@ impl Retained {
         self
     }
 
+    pub(crate) fn is_relocatable(&self) -> bool {
+        self.overscan.is_some()
+    }
+
     /// Where the state of the element is kept, which is what the id of an element on the stack
     /// would give it.
     fn global_id(&mut self, window: &mut Window) -> GlobalElementId {
