@@ -92,6 +92,8 @@ mod scroll_patch_tests;
 #[cfg(test)]
 mod scroll_patch_div_tests;
 #[cfg(test)]
+mod scroll_patch_pending_glyph_tests;
+#[cfg(test)]
 mod splice_patch_tests;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
