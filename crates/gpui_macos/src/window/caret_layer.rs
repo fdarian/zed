@@ -39,6 +39,18 @@ pub(super) struct CaretLayerState {
     animated_for: Option<(Instant, Hsla)>,
 }
 
+impl Drop for CaretLayerState {
+    fn drop(&mut self) {
+        // SAFETY: Window state is dropped on the AppKit main thread, and `layer` is the one retained
+        // in `layer_in`, owned by this state alone besides its superlayer.
+        unsafe {
+            let _: () = msg_send![self.layer, removeAllAnimations];
+            let _: () = msg_send![self.layer, removeFromSuperlayer];
+            let _: () = msg_send![self.layer, release];
+        }
+    }
+}
+
 fn logging() -> bool {
     static LOGGING: OnceLock<bool> = OnceLock::new();
     *LOGGING.get_or_init(|| std::env::var_os("GPUI_CARET_LAYER_LOG").is_some())
