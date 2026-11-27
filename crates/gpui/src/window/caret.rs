@@ -6,6 +6,8 @@
 //! whose only live thing is a caret submits no GPU work and asks for no frame. Every other caret is
 //! a quad of the scene that the renderer is told to draw lit or transparent for each frame, and the
 //! window asks for a frame of its own at each change of phase, which draws nothing but the caret.
+//! A caret that the window cannot address (see [`Window::paint_caret`]) is painted lit or
+//! transparent by `paint_caret` itself, and its painter ticks ([`Window::caret_needs_ticks`]).
 //!
 //! The scene that is drawn is never changed for this: the renderer is given the indices of the
 //! quads to leave out of the picture.
@@ -61,8 +63,11 @@ struct PresentedCaret {
 enum Shown {
     /// On the platform's layer: the picture has no quad for it.
     OnLayer,
-    /// In the picture, lit or transparent.
+    /// In the picture, lit or transparent, as the renderer is told for each frame.
     Drawn { lit: bool },
+    /// In the picture as the painter made it, lit or transparent: the window cannot blink it, so
+    /// the painter ticks (see [`Window::caret_needs_ticks`]).
+    Painted,
 }
 
 /// What a window keeps of the carets it presents.
@@ -115,6 +120,21 @@ impl Window {
         self.caret.presented.iter().any(|caret| caret.shown == Shown::OnLayer)
     }
 
+    /// Whether the last presented frame shows a caret that the window did not blink: one it could
+    /// not (a composed window, a platform that cannot leave a quad out of a frame, an effect group
+    /// or text clip around it), which [`Window::paint_caret`] painted lit or transparent for the
+    /// phase it was in. Its painter has to paint it again at each change of phase for it to blink,
+    /// as the one that was told so by `paint_caret` does. A caret the window blinks, on a layer or
+    /// off it, is not counted.
+    pub fn caret_needs_ticks(&self) -> bool {
+        self.caret.presented.iter().any(|caret| caret.shown == Shown::Painted)
+    }
+
+    /// Whether a caret whose blink restarted at `anchor` is lit now.
+    pub(crate) fn caret_lit_now(&self, anchor: Instant) -> bool {
+        caret_visible(self.caret.executor.now().saturating_duration_since(anchor))
+    }
+
     /// Whether this window blinks its carets itself, on a layer or by drawing them lit and
     /// transparent: a window that does not (a composed one, on a platform that cannot) draws the
     /// carets of its scene lit, and an app that wants one to blink has to repaint it.
@@ -143,7 +163,8 @@ impl Window {
         let now = self.caret.executor.now();
         let draws_hidden_quads = self.platform_window.draws_hidden_quads();
         let on_layer = found.last().filter(|top| {
-            self.platform_window.supports_caret_layer()
+            !top.caret.painter_blinks
+                && self.platform_window.supports_caret_layer()
                 && top.caret.layer_allowed
                 && top.quad.is_some()
                 && !mask_rounds_inside(&top.caret.quad.content_mask, top.bounds)
@@ -158,7 +179,9 @@ impl Window {
         for caret in &found {
             let color = caret.caret.color();
             let since_anchor = now.saturating_duration_since(caret.caret.blink_anchor);
-            let shown = if Some(caret.operation) == on_layer {
+            let shown = if caret.caret.painter_blinks {
+                Shown::Painted
+            } else if Some(caret.operation) == on_layer {
                 layer = Some(CaretLayer { bounds: caret.bounds, color, anchor: caret.caret.blink_anchor, since_anchor });
                 Shown::OnLayer
             } else if draws_hidden_quads && caret.quad.is_some() {
@@ -169,7 +192,7 @@ impl Window {
                 Shown::Drawn { lit: true }
             };
             if let Some(quad) = caret.quad
-                && shown != (Shown::Drawn { lit: true })
+                && matches!(shown, Shown::OnLayer | Shown::Drawn { lit: false })
             {
                 frame.hidden_quads.push(quad);
             }
@@ -206,7 +229,21 @@ impl Window {
         if self.caret.sent_layer.take().is_some() {
             self.platform_window.set_caret_layer(None);
         }
-        self.caret.presented.clear();
+        self.caret.presented = self
+            .rendered_frame
+            .scene
+            .paint_operations
+            .iter()
+            .filter_map(|painted| match painted {
+                PaintOperation::Caret(caret) => Some(PresentedCaret {
+                    bounds: caret.quad.window_bounds().intersect(&caret.quad.content_mask.bounds),
+                    color: caret.color(),
+                    shown: Shown::Painted,
+                }),
+                _ => None,
+            })
+            .filter(|caret| !caret.bounds.is_empty())
+            .collect();
         self.caret.wanted_blink = None;
         self.caret.blink = None;
     }

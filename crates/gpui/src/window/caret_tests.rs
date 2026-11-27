@@ -76,7 +76,7 @@ fn a_caret_is_recorded_with_its_bounds_mask_colour_and_anchor_and_drawn_as_a_qua
 #[test]
 fn a_translation_moves_the_bounds_and_still_allows_a_layer() {
     let anchor = Instant::now();
-    let plain = carets(move |window| window.paint_caret(bar(10.), ink(), anchor));
+    let plain = carets(move |window| { window.paint_caret(bar(10.), ink(), anchor); });
     let moved = carets(move |window| {
         window.with_transform(TransformationMatrix::from_css([1., 0., 0., 1., 7., 3.]), |window| {
             window.paint_caret(bar(10.), ink(), anchor);
@@ -93,7 +93,7 @@ fn a_caret_under_a_general_transform_is_not_for_a_layer_and_keeps_the_matrix_to_
     let anchor = Instant::now();
     let rotated = carets(move |window| {
         let rotation = TransformationMatrix::unit().rotate(crate::radians(0.3));
-        window.with_transform(rotation, |window| window.paint_caret(bar(10.), ink(), anchor));
+        window.with_transform(rotation, |window| { window.paint_caret(bar(10.), ink(), anchor); });
     });
     assert_eq!(rotated.len(), 1);
     assert!(!rotated[0].layer_allowed);
@@ -104,14 +104,14 @@ fn a_caret_under_a_general_transform_is_not_for_a_layer_and_keeps_the_matrix_to_
 fn a_caret_under_an_opacity_below_one_is_not_for_a_layer_and_is_faded() {
     let anchor = Instant::now();
     let faded = carets(move |window| {
-        window.with_element_opacity(Some(0.5), |window| window.paint_caret(bar(10.), ink(), anchor));
+        window.with_element_opacity(Some(0.5), |window| { window.paint_caret(bar(10.), ink(), anchor); });
     });
     assert_eq!(faded.len(), 1);
     assert!(!faded[0].layer_allowed);
     assert_eq!(faded[0].color().a, 0.5);
 
     let opaque = carets(move |window| {
-        window.with_element_opacity(Some(1.), |window| window.paint_caret(bar(10.), ink(), anchor));
+        window.with_element_opacity(Some(1.), |window| { window.paint_caret(bar(10.), ink(), anchor); });
     });
     assert!(opaque[0].layer_allowed);
 }
@@ -123,7 +123,7 @@ fn a_caret_inside_an_effect_group_is_not_for_a_layer() {
         let carets = painted(effect_groups, move |window| {
             window.paint_caret(bar(10.), ink(), anchor);
             let effect = crate::GroupEffect { opacity: 0.5, ..crate::GroupEffect::default() };
-            window.with_effect_group(effect, None, |window| window.paint_caret(bar(30.), ink(), anchor));
+            window.with_effect_group(effect, None, |window| { window.paint_caret(bar(30.), ink(), anchor); });
         })
         .0;
         let allowed: Vec<bool> = carets.iter().map(|caret| caret.layer_allowed).collect();
@@ -218,7 +218,7 @@ mod presenting {
 
     #[test]
     fn a_caret_nothing_covers_is_shown_by_a_layer() {
-        assert!(eligible(|window, anchor| window.paint_caret(bar(10.), ink(), anchor)));
+        assert!(eligible(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); }));
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod presenting {
     #[test]
     fn a_caret_a_paint_does_not_allow_a_layer_for_stays_off_it() {
         assert!(!eligible(|window, anchor| {
-            window.with_element_opacity(Some(0.5), |window| window.paint_caret(bar(10.), ink(), anchor));
+            window.with_element_opacity(Some(0.5), |window| { window.paint_caret(bar(10.), ink(), anchor); });
         }));
     }
 
@@ -252,7 +252,7 @@ mod presenting {
     fn a_caret_the_content_mask_clips_away_is_not_shown_at_all() {
         let mut fixture = Fixture::new(|window, anchor| {
             let mask = ContentMask::from_bounds(Bounds::new(point(px(200.), px(200.)), size(px(10.), px(10.))));
-            window.with_content_mask(Some(mask), |window| window.paint_caret(bar(10.), ink(), anchor));
+            window.with_content_mask(Some(mask), |window| { window.paint_caret(bar(10.), ink(), anchor); });
         });
         fixture.show();
         assert!(!fixture.on_layer());
@@ -268,7 +268,7 @@ mod presenting {
                     Bounds::new(point(px(mask_origin), px(0.)), size(px(100.), px(100.))),
                     CornerRadii::from(Corners::all(px(20.))),
                 );
-                window.with_content_mask(Some(mask), |window| window.paint_caret(bar(mask_origin + 1.), ink(), anchor));
+                window.with_content_mask(Some(mask), |window| { window.paint_caret(bar(mask_origin + 1.), ink(), anchor); });
             }
         };
         // The caret is in the corner of the mask, then it is at the same distance from the edge but the mask is not
@@ -279,14 +279,14 @@ mod presenting {
                 Bounds::new(point(px(0.), px(0.)), size(px(100.), px(100.))),
                 CornerRadii::from(Corners::all(px(20.))),
             );
-            window.with_content_mask(Some(mask), |window| window.paint_caret(Bounds::new(point(px(40.), px(40.)), size(px(1.), px(16.))), ink(), anchor));
+            window.with_content_mask(Some(mask), |window| { window.paint_caret(Bounds::new(point(px(40.), px(40.)), size(px(1.), px(16.))), ink(), anchor); });
         };
         assert!(eligible(straight));
     }
 
     #[test]
     fn a_window_that_is_composed_shows_no_layer_and_takes_back_the_one_it_had() {
-        let mut fixture = Fixture::new(|window, anchor| window.paint_caret(bar(10.), ink(), anchor));
+        let mut fixture = Fixture::new(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); });
         fixture.show();
         assert!(fixture.layer().is_some());
         fixture.window.update(|_, window, _| {
@@ -298,7 +298,7 @@ mod presenting {
     }
 
     #[test]
-    fn a_platform_without_a_layer_draws_the_caret_and_blinks_it_itself() {
+    fn a_platform_without_a_layer_draws_the_caret_and_leaves_its_blink_to_the_painter() {
         let mut fixture = Fixture::new(|window, anchor| {
             window.paint_caret(bar(10.), ink(), anchor);
             window.paint_quad(fill(block(5., 0.), white()));
@@ -312,9 +312,96 @@ mod presenting {
         assert!(fixture.last_draw().hidden_quads.is_empty());
     }
 
+    /// What `paint_caret` returned the last time the fixture painted, and the colour of the quads
+    /// of the shown frame.
+    fn painted_blink(paint: impl Fn(&mut Window, Instant) + 'static, since: Duration, unsupported: bool, compose: bool) -> (Fixture, Vec<f32>) {
+        let mut fixture = Fixture::new(paint);
+        fixture.app.advance_clock(since);
+        fixture.window.update(|_, window, _| {
+            if unsupported {
+                window.platform_window.as_test().unwrap().set_carets_unsupported();
+            }
+            if compose {
+                window.create_native_surface().expect("the test platform composes");
+            }
+        });
+        fixture.show();
+        let alphas = fixture.window.update(|_, window, _| {
+            window.rendered_frame.scene.quads.iter().map(|quad| quad.background.as_solid().unwrap().a).collect()
+        });
+        (fixture, alphas)
+    }
+
+    #[test]
+    fn a_caret_the_platform_cannot_leave_out_is_painted_in_the_phase_it_is_in_and_asks_for_ticks() {
+        let returned = Rc::new(Cell::new(None));
+        let record = returned.clone();
+        let paint = move |window: &mut Window, anchor| record.set(Some(window.paint_caret(bar(10.), ink(), anchor)));
+        let (mut fixture, alphas) = painted_blink(paint.clone(), Duration::from_millis(100), true, false);
+        assert_eq!(returned.get(), Some(true));
+        assert_eq!(alphas, vec![1.], "lit in the first half second");
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()));
+        assert!(!fixture.on_layer());
+        assert!(fixture.last_draw().hidden_quads.is_empty());
+
+        let (mut fixture, alphas) = painted_blink(paint, Duration::from_millis(600), true, false);
+        assert_eq!(alphas, vec![0.], "dark in the second");
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()));
+        fixture.app.advance_clock(Duration::from_millis(600));
+        fixture.app.run_until_parked();
+        assert!(!fixture.window.update(|_, window, _| window.needs_present.get()), "the painter ticks, the window does not");
+    }
+
+    #[test]
+    fn a_caret_in_a_composed_window_is_painted_in_its_phase_and_asks_for_ticks() {
+        let returned = Rc::new(Cell::new(None));
+        let record = returned.clone();
+        let paint = move |window: &mut Window, anchor| record.set(Some(window.paint_caret(bar(10.), ink(), anchor)));
+        let (mut fixture, alphas) = painted_blink(paint, Duration::from_millis(700), false, true);
+        assert_eq!(returned.get(), Some(true));
+        assert_eq!(alphas, vec![0.]);
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()));
+        assert_eq!(fixture.layer(), None);
+    }
+
+    #[test]
+    fn a_caret_in_an_effect_group_is_painted_in_its_phase_and_asks_for_ticks() {
+        let returned = Rc::new(Cell::new(None));
+        let record = returned.clone();
+        let paint = move |window: &mut Window, anchor| {
+            let effect = crate::GroupEffect { opacity: 0.5, ..crate::GroupEffect::default() };
+            window.with_effect_group(effect, None, |window| record.set(Some(window.paint_caret(bar(10.), ink(), anchor))));
+        };
+        let (mut fixture, _) = painted_blink(paint, Duration::from_millis(100), false, false);
+        assert_eq!(returned.get(), Some(true));
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()));
+        assert!(!fixture.on_layer());
+    }
+
+    #[test]
+    fn a_caret_the_window_blinks_asks_the_painter_for_no_ticks() {
+        let returned = Rc::new(Cell::new(None));
+        let record = returned.clone();
+        let paint = move |window: &mut Window, anchor| record.set(Some(window.paint_caret(bar(10.), ink(), anchor)));
+        let (mut fixture, alphas) = painted_blink(paint.clone(), Duration::from_millis(700), false, false);
+        assert_eq!(returned.get(), Some(false));
+        assert_eq!(alphas, vec![1.], "the scene keeps it lit, the layer blinks it");
+        assert!(fixture.on_layer());
+        assert!(!fixture.window.update(|_, window, _| window.caret_needs_ticks()));
+
+        let off_the_layer = move |window: &mut Window, anchor| {
+            paint(window, anchor);
+            window.paint_quad(fill(block(5., 0.), white()));
+        };
+        let (mut fixture, _) = painted_blink(off_the_layer, Duration::from_millis(700), false, false);
+        assert_eq!(returned.get(), Some(false));
+        assert!(!fixture.on_layer());
+        assert!(!fixture.window.update(|_, window, _| window.caret_needs_ticks()), "the window draws it lit and dark itself");
+    }
+
     #[test]
     fn the_layer_is_told_where_the_caret_is_and_what_blinks_it() {
-        let mut fixture = Fixture::new(|window, anchor| window.paint_caret(bar(10.), ink(), anchor));
+        let mut fixture = Fixture::new(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); });
         fixture.app.advance_clock(Duration::from_millis(120));
         fixture.show();
         let layer = fixture.layer().expect("the caret is on the layer");
@@ -329,7 +416,7 @@ mod presenting {
 
     #[test]
     fn a_caret_on_the_layer_asks_for_no_frame() {
-        let mut fixture = Fixture::new(|window, anchor| window.paint_caret(bar(10.), ink(), anchor));
+        let mut fixture = Fixture::new(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); });
         fixture.show();
         // What the first draw and present asked for is served.
         fixture.window.update(|_, window, _| {
@@ -383,7 +470,7 @@ mod presenting {
     fn a_frame_that_moves_the_caret_damages_where_it_was_and_where_it_is() {
         let x = Rc::new(Cell::new(10.));
         let moved = x.clone();
-        let mut fixture = Fixture::new(move |window, anchor| window.paint_caret(bar(moved.get()), ink(), anchor));
+        let mut fixture = Fixture::new(move |window, anchor| { window.paint_caret(bar(moved.get()), ink(), anchor); });
         fixture.show();
         x.set(80.);
         fixture.window.draw();

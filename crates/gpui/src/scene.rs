@@ -543,7 +543,13 @@ impl Scene {
         if self.hidden {
             return;
         }
-        caret.layer_allowed &= !self.in_effect_group();
+        // A recording made outside a group may be replayed in one, which cannot hide its quad.
+        let grouped = self.in_effect_group();
+        caret.layer_allowed &= !grouped;
+        caret.painter_blinks |= grouped;
+        if caret.painter_blinks && !caret.lit {
+            caret.quad.background = crate::transparent_black().into();
+        }
         self.record_with(|| PaintOperation::Caret(caret));
         self.place_recorded_quad(caret.quad);
     }
@@ -1683,6 +1689,14 @@ pub(crate) struct Caret {
     /// transform, an element opacity below 1 or inside an effect group: a layer is neither
     /// transformed nor composited with what is around it.
     pub(crate) layer_allowed: bool,
+    /// Whether the window cannot blink the caret, so the painter does: `quad` is then drawn lit or
+    /// transparent as the phase was when it was painted (`lit`), and the painter has to paint it
+    /// again at each change of phase. A window cannot blink what its renderer cannot be told to
+    /// leave out (a composed window, a platform without hidden quads) or what an effect group or
+    /// text clip composites with what is around it.
+    pub(crate) painter_blinks: bool,
+    /// The phase of the blink when it was painted.
+    pub(crate) lit: bool,
 }
 
 // What a platform reads at present to show the caret as a layer: nothing reads it until it can.
@@ -5566,7 +5580,7 @@ mod tests {
     }
 
     fn caret(x: f32, y: f32) -> Caret {
-        Caret { quad: quad(x, y, 2., 16.), blink_anchor: Instant::now(), layer_allowed: true }
+        Caret { quad: quad(x, y, 2., 16.), blink_anchor: Instant::now(), layer_allowed: true, painter_blinks: false, lit: true }
     }
 
     fn caret_bounds(scene: &Scene) -> Vec<Bounds<ScaledPixels>> {
