@@ -238,8 +238,12 @@ impl Window {
     /// A child of a scroller that is a `div` was prepainted and is about to be handed to a stacking context. A root has its
     /// own run; what is not a root paints where the context does, which the scroller keeps an eye on: the ids of what it
     /// inserted, and (when the context paints it, see [`Window::scroll_patch_lifted_painted`]) what it painted.
+    ///
+    /// What a root that is built in this frame hands to a stacking context of its own is the root's: its recording holds it
+    /// (the root's run, which the paint of the root notes), and the operations it paints are numbered in the recording
+    /// it is painted into, not in the frame.
     pub(crate) fn scroll_patch_note_lifted_child(&mut self, ticket: &LiftTicket, root: bool) {
-        if root {
+        if root || self.is_recording_any_relocation() {
             return;
         }
         let Some(open) = self.next_frame.scroll.open.last_mut().filter(|open| open.div) else {

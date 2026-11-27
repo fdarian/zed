@@ -53,6 +53,8 @@ struct Page {
     hitboxes: bool,
     /// Another scroller in the content.
     nested: bool,
+    /// Each root is a stacking context of its own that an absolute box in it is handed to.
+    row_context: bool,
     bar: Option<Bar>,
     key: Rc<Cell<u64>>,
     /// How far each frame that moved the content in place said it moved it.
@@ -65,11 +67,17 @@ impl Render for Page {
         let rows: Vec<_> = (0..ROWS)
             .map(|ix| {
                 let hitboxes = page.hitboxes;
+                let row_context = page.row_context;
                 let spacer = page.spacer;
                 let mut row = retained(("row", ix), page.key.get(), move |_, _| {
                     let row = div().id(("row", ix)).w(px(80.)).h(px(ROW)).bg(crate::hsla(ix as f32 / 100., 0.5, 0.5, 1.));
                     let row = if spacer { row.absolute().top(px(ix as f32 * ROW)) } else { row };
                     let row = if hitboxes { row.always_hitbox() } else { row };
+                    let row = if row_context {
+                        row.stacking_context().child(div().absolute().top(px(2.)).left(px(2.)).w(px(10.)).h(px(10.)).bg(crate::red()))
+                    } else {
+                        row
+                    };
                     row.into_any_element()
                 });
                 if let Some(overscan) = page.overscan {
@@ -148,8 +156,11 @@ impl Render for Page {
         } else {
             scroller.children(rows)
         };
+        // What the window paints before the scroller, so that the operations of its roots do not start where a recording's do.
+        let before = (0..if self.row_context { 20 } else { 0 })
+            .map(|ix| div().absolute().unlifted().left(px(300. + ix as f32)).top(px(0.)).w(px(1.)).h(px(1.)).bg(crate::blue()));
         // The window's own stacking context, which holds what is positioned.
-        div().size_full().stacking_context().child(content).into_any_element()
+        div().size_full().stacking_context().children(before).child(content).into_any_element()
     }
 }
 
@@ -232,6 +243,7 @@ impl Page {
             spacer_paints: false,
             hitboxes: true,
             nested: false,
+            row_context: false,
             bar: None,
             key: Rc::new(Cell::new(1)),
             told: Rc::default(),
@@ -360,6 +372,39 @@ fn what_the_scroller_paints_that_no_root_holds_is_unrooted(cx: &mut TestAppConte
     let fixture = Fixture::open(cx, page);
     fixture.scroll(cx, 10., 12., 5.);
     only(&fixture.counters(cx), ScrollPatchReason::NotRelocatable, &[ScrollPatchCause::Unrooted]);
+}
+
+#[gpui::test]
+fn what_a_root_built_in_the_frame_hands_to_a_context_of_its_own_is_the_roots(cx: &mut TestAppContext) {
+    let page = || {
+        let mut page = Page::standard();
+        page.row_context = true;
+        page
+    };
+    let fixture = Fixture::open(cx, page());
+    fixture.point_at(cx, 10., 12.);
+    // Every root is built in the frame shown: the boxes it hands to its own context are painted in its recording (a recording
+    // buffer of its own, whose operations are numbered there and not in the frame), and are no operations that no root holds.
+    fixture.page.key.set(2);
+    fixture.with_window(cx, |window| window.refresh());
+    fixture.draw(cx);
+    fixture.scroll(cx, 10., 12., 5.);
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.patched, counters.mispredicted), (1, 1, 1, 0), "{counters:?}");
+    assert_eq!(counters.held_cause(ScrollPatchCause::Unrooted), 0, "{counters:?}");
+    // And what it leaves is what the build gives.
+    let translated = fixture.with_window(cx, shown);
+    let built = {
+        let fixture = Fixture::open(cx, page());
+        fixture.point_at(cx, 10., 12.);
+        fixture.with_window(cx, |window| window.set_scroll_patch(false));
+        fixture.page.key.set(2);
+        fixture.with_window(cx, |window| window.refresh());
+        fixture.draw(cx);
+        fixture.scroll(cx, 10., 12., 5.);
+        fixture.with_window(cx, shown)
+    };
+    assert!(translated == built, "{}", super::retained::first_difference(&translated, &built));
 }
 
 #[gpui::test]
