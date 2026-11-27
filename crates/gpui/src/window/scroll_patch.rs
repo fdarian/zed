@@ -1177,8 +1177,8 @@ impl Window {
     pub fn repaint_scroll_thumbs(&mut self, repaints: ScrollThumbRepaints, cx: &mut App) {
         let ScrollThumbRepaints { writes, vanishes, done } = repaints;
         if !writes.is_empty() {
-            // `plan_splice` declines a patch that replaces the operation of a thumb, so a thumb here still
-            // has its quad; one that does not is left as it is.
+            // A splice that replaces the operation of a thumb puts the thumb the scratch frame noted in its place, or
+            // `plan_splice` declines it, so a thumb here still has its quad; one that does not is left as it is.
             let edits: Vec<(usize, PaintOperation)> = writes
                 .into_iter()
                 .filter_map(|(index, quad)| match self.rendered_frame.scroll.thumbs[index].paint {

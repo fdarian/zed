@@ -777,4 +777,5 @@ fn a_scroller_inside_a_root_is_no_scroller_of_the_frame_shown(cx: &mut TestAppCo
     let key = fixture.page.handle.scroll_key();
     assert_eq!(gated.borrow().last(), Some(&Some(key)));
     assert_eq!(*settled.borrow(), [key], "the scroller in the root is not noted as the frame shown's");
+    assert_eq!(fixture.page.inner.offset(), point(px(0.), px(-20.)), "and it is where the script put it");
 }
