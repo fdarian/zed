@@ -1204,9 +1204,28 @@ pub trait PlatformDispatcher: Send + Sync {
     }
 }
 
+/// What a platform's font loader makes of a font file, read without adding the font.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontFileInfo {
+    /// The family the font is filed under: what a `font-family` has to name to reach it.
+    pub family_name: String,
+    /// The full (display) name.
+    pub full_name: String,
+    /// The PostScript name.
+    pub postscript_name: String,
+    /// Whether the font has a glyph for "m", which GPUI measures text with and refuses a font without.
+    pub has_glyph_for_m: bool,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
+    /// What [`PlatformTextSystem::add_fonts`] would file `font` under, or the reason it would refuse it,
+    /// so a caller can learn a font's family without parsing the container itself (WOFF and WOFF2 hold the
+    /// name table compressed). The default is for platforms that cannot say.
+    fn font_file_info(&self, _font: &[u8]) -> Result<FontFileInfo> {
+        anyhow::bail!("this platform cannot read a font without adding it")
+    }
     /// Get all available font names.
     fn all_font_names(&self) -> Vec<String>;
     /// Get the font ID for a font descriptor.

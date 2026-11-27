@@ -65,6 +65,9 @@ pub(crate) use window::*;
 
 #[cfg(feature = "font-kit")]
 pub(crate) use text_system::*;
+// A host that has to read a font before it adds it (Ghia's `@font-face`) builds a text system of its own in tests.
+#[cfg(feature = "font-kit")]
+pub use text_system::MacTextSystem;
 
 pub use display::{MacDisplay, MacScreen};
 pub use platform::{MacPlatform, PumpOutcome, pump_app_nonblocking};

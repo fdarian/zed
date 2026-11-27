@@ -35,7 +35,7 @@ use font_kit::{
     sources::mem::MemSource,
 };
 use gpui::{
-    Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun,
+    Bounds, DevicePixels, Font, FontFallbacks, FontFileInfo, FontFeatures, FontId, FontMetrics, FontRun,
     FontSmoothing, FontStyle, FontVariations, FontWeight, GlyphId, Halt, Hsla, LineBox, LineLayout, Pixels, PlatformTextSystem,
     RenderGlyphParams, Result, Rgba, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun, SharedString,
     Size, TextRenderingMode, UsedFont, point, px, size, swap_rgba_pa_to_bgra,
@@ -247,6 +247,24 @@ impl Default for MacTextSystem {
 impl PlatformTextSystem for MacTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
+    }
+
+    fn font_file_info(&self, font: &[u8]) -> Result<FontFileInfo> {
+        // core-text's own `family_name()`, `display_name()` and `postscript_name()` panic on a font
+        // without the name, which is how font-kit asks when it adds the font.
+        use core_text::font::CTFontNameSpecifier;
+        let font = owned_font_handle(font.to_vec())?.load()?;
+        let name = |specifier, what| {
+            font.native_font()
+                .get_string_by_name_key(specifier)
+                .ok_or_else(|| anyhow!("the font has no {what} name"))
+        };
+        Ok(FontFileInfo {
+            family_name: name(CTFontNameSpecifier::Family, "family")?,
+            full_name: name(CTFontNameSpecifier::Full, "full")?,
+            postscript_name: name(CTFontNameSpecifier::PostScript, "PostScript")?,
+            has_glyph_for_m: font.glyph_for_char('m').is_some(),
+        })
     }
 
     fn all_font_names(&self) -> Vec<String> {
@@ -491,12 +509,20 @@ fn font_smoothing_allowed_by_user() -> bool {
 /// the bytes in an `Arc` and builds a `CFData` copy from them for the font
 /// and for every `load()` of its handle.
 ///
+/// WOFF and WOFF2 take this path too: Core Text unpacks them, where font-kit
+/// would read their bytes as a Mac resource fork and fail.
+///
 /// Collections and Mac resource-fork fonts have no descriptor-from-data path
 /// (font-kit unpacks them into a new buffer), so they keep font-kit's.
 fn owned_font_handle(bytes: Vec<u8>) -> Result<Handle> {
     const OTTO: &[u8] = b"OTTO";
     const TRUETYPE: &[u8] = &[0, 1, 0, 0];
-    if !(bytes.starts_with(OTTO) || bytes.starts_with(TRUETYPE)) {
+    const WOFF: &[u8] = b"wOFF";
+    const WOFF2: &[u8] = b"wOF2";
+    if ![OTTO, TRUETYPE, WOFF, WOFF2]
+        .iter()
+        .any(|signature| bytes.starts_with(signature))
+    {
         return Ok(Handle::from_memory(Arc::new(bytes), 0));
     }
 
@@ -1818,7 +1844,7 @@ mod lenient_font_attributes {
 mod tests {
     use crate::MacTextSystem;
     use gpui::{
-        Font, FontFeatures, FontRun, FontSmoothing, FontVariations, FontWeight, GlyphId,
+        Font, FontFeatures, FontFileInfo, FontRun, FontSmoothing, FontVariations, FontWeight, GlyphId,
         PlatformTextSystem, RenderGlyphParams, UsedFont, font, px,
     };
     use std::sync::Arc;
@@ -2831,6 +2857,88 @@ mod tests {
                 (advance - chrome).abs() < 0.02,
                 "{size}px wght {wght} opsz {opsz}: {advance}, Chrome {chrome}"
             );
+        }
+    }
+
+    const FIXTURES: &str = "../../../packages/react/src/__tests__/fixtures";
+
+    /// The fixtures are gpuix's, so these tests need the checkout this crate is a submodule of.
+    fn fixture(name: &str) -> Option<Vec<u8>> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(FIXTURES)
+            .join(name);
+        let file = std::fs::read(&path).ok();
+        if file.is_none() {
+            eprintln!("skipped: {} is not in this checkout", path.display());
+        }
+        file
+    }
+
+    #[test]
+    fn test_woff_and_woff2_fonts_load_through_core_text_under_the_family_it_reports() {
+        for name in ["gpuix-test-square.ttf", "gpuix-test-square.woff", "gpuix-test-square.woff2"] {
+            let Some(file) = fixture(name) else { return };
+            let system = MacTextSystem::new();
+            let info = system.font_file_info(&file).expect(name);
+            assert_eq!(
+                info,
+                FontFileInfo {
+                    family_name: "GpuixTestSquare".into(),
+                    full_name: "GpuixTestSquare Regular".into(),
+                    postscript_name: "GpuixTestSquare-Regular".into(),
+                    has_glyph_for_m: true,
+                },
+                "{name}"
+            );
+            assert!(matches!(
+                super::owned_font_handle(file.clone()).unwrap(),
+                font_kit::handle::Handle::Native { .. }
+            ));
+            system.add_fonts(vec![file.into()]).expect(name);
+            let font_id = system.font_id(&font("GpuixTestSquare")).expect(name);
+            // "m" is one em wide in the fixture.
+            let run = FontRun {
+                font_id,
+                len: 1,
+                font_size: None,
+                line_height: None,
+                normal_line_height: false,
+            };
+            let width = f32::from(system.layout_line("m", px(20.), &[run], 1.).width);
+            assert!((width - 20.).abs() < 0.01, "{name}: {width}");
+        }
+    }
+
+    /// `add_fonts` takes a font without a full name and the first lookup of its family panics in
+    /// core-text, so `font_file_info` is what a caller asks first.
+    #[test]
+    fn test_a_font_without_a_name_core_text_needs_is_refused_by_its_info() {
+        let system = MacTextSystem::new();
+        for name in ["gpuix-test-nameless.ttf", "gpuix-test-nameless.woff", "gpuix-test-nameless.woff2"] {
+            let Some(file) = fixture(name) else { return };
+            let error = system.font_file_info(&file).unwrap_err();
+            assert_eq!(error.to_string(), "the font has no full name", "{name}");
+        }
+    }
+
+    #[test]
+    fn test_a_font_core_text_cannot_read_is_refused_not_aborted() {
+        let system = MacTextSystem::new();
+        let (Some(woff), Some(woff2)) = (
+            fixture("gpuix-test-square.woff"),
+            fixture("gpuix-test-square.woff2"),
+        ) else {
+            return;
+        };
+        for file in [
+            b"wOFF".to_vec(),
+            b"wOF2".to_vec(),
+            b"wOF2\0\0\0\0\0\0\0\0\0\0\0\0".to_vec(),
+            woff2[..120].to_vec(),
+            woff[..120].to_vec(),
+        ] {
+            assert!(system.font_file_info(&file).is_err());
+            assert!(system.add_fonts(vec![file.into()]).is_err());
         }
     }
 

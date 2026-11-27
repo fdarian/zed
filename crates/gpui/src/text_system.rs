@@ -122,6 +122,11 @@ impl TextSystem {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How the platform would name a font file, without adding it. See [`PlatformTextSystem::font_file_info`].
+    pub fn font_file_info(&self, font: &[u8]) -> Result<crate::FontFileInfo> {
+        self.platform_text_system.font_file_info(font)
+    }
+
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform_text_system.add_fonts(fonts)?;
