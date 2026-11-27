@@ -145,7 +145,8 @@ impl Window {
     ///
     /// This also turns `true` for a caret that was the window's to blink and no longer is, which
     /// no painter was told of: a window that became composed, and a recording made outside an
-    /// effect group that is replayed inside one.
+    /// effect group that is replayed inside one. The window asks for a frame that is a tick when that
+    /// happens, so the page can run its painters again and arm their blink.
     pub fn caret_needs_ticks(&self) -> bool {
         self.caret.presented.iter().any(|caret| caret.shown == Shown::Painted)
     }
@@ -175,6 +176,7 @@ impl Window {
     /// layer and adds what changed to the damage of the frame. The scene is drawn without the quads
     /// this returns.
     pub(crate) fn present_carets(&mut self) -> CaretFrame {
+        let blinked_before = self.window_blinks_a_caret();
         let scene = &self.rendered_frame.scene;
         let mut found: SmallVec<[Found; 2]> = SmallVec::new();
         for (operation, painted) in scene.paint_operations.iter().enumerate() {
@@ -246,6 +248,7 @@ impl Window {
         self.damage.end(&self.rendered_frame.scene);
         self.caret.presented = presented;
         self.caret.wanted_blink = wanted_blink;
+        self.ask_page_to_tick_carets(blinked_before);
 
         let (window_size, scale_factor) = (self.viewport_size, self.scale_factor());
         let sent = layer.map(|layer| SentLayer {
@@ -264,6 +267,7 @@ impl Window {
 
     /// Takes the layer away when the window is composed, which draws its carets as they are.
     pub(crate) fn release_caret_layer(&mut self) {
+        let blinked_before = self.window_blinks_a_caret();
         if self.caret.sent_layer.take().is_some() {
             self.platform_window.set_caret_layer(None);
         }
@@ -284,6 +288,23 @@ impl Window {
             .collect();
         self.caret.wanted_blink = None;
         self.caret.blink = None;
+        self.ask_page_to_tick_carets(blinked_before);
+    }
+
+    /// A caret the window blinked and stopped blinking (the window became composed, or a recording of
+    /// the caret was replayed under an effect group) was painted by nobody who knows it has to tick:
+    /// its painter was replayed, not run. One frame that is a tick lets the page run its painters
+    /// again, which then read [`Window::caret_needs_ticks`] and arm their own blink. A caret that
+    /// comes up as one the page has to blink, with none the window blinked before it, was painted
+    /// by a painter that said so, and needs nothing.
+    fn ask_page_to_tick_carets(&mut self, blinked_before: bool) {
+        if blinked_before && self.caret_needs_ticks() {
+            self.invalidator.request_tick();
+        }
+    }
+
+    fn window_blinks_a_caret(&self) -> bool {
+        self.caret.presented.iter().any(|caret| matches!(caret.shown, Shown::OnLayer | Shown::Drawn { .. }))
     }
 
     /// Asks for the frame that draws the carets again when one changes phase, after a present. A

@@ -176,10 +176,16 @@ mod presenting {
         }
 
         fn present(&mut self) {
+            self.present_asking();
+        }
+
+        /// Shows the scene as it is, and says whether that left the window asking for a frame.
+        fn present_asking(&mut self) -> bool {
             self.window.update(|_, window, cx| {
                 window.present();
                 window.arm_caret_blink(cx);
-            });
+                window.invalidator.is_dirty()
+            })
         }
 
         /// Time passes, and the frame that the window asked of itself is shown, if it asked for one.
@@ -354,6 +360,28 @@ mod presenting {
         assert!(!fixture.on_layer());
         assert_eq!(fixture.layer(), None);
         assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()), "the page has to blink it now");
+    }
+
+    #[test]
+    fn a_window_that_stops_blinking_a_caret_asks_for_a_frame_so_the_page_paints_it_again() {
+        let mut fixture = Fixture::new(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); });
+        fixture.window.draw();
+        assert!(!fixture.present_asking(), "a caret on the layer asks for nothing");
+        fixture.window.update(|_, window, _| {
+            window.create_native_surface().expect("the test platform composes");
+        });
+        // The scene is shown again as it was drawn, as a window that became composed does: the painter was not run.
+        assert!(fixture.present_asking(), "the page runs its painters again");
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()));
+        fixture.window.draw();
+        assert!(!fixture.present_asking(), "the page painted it, and it ticks now");
+    }
+
+    #[test]
+    fn a_caret_painted_by_a_painter_that_was_told_asks_for_no_frame() {
+        let (mut fixture, _) = painted_blink(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); }, Duration::from_millis(100), true, false);
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()));
+        assert!(!fixture.present_asking());
     }
 
     #[test]
@@ -738,18 +766,18 @@ mod patching {
             cx.update_window(window, |_, window, cx| {
                 window.draw(cx).clear(cx);
                 window.present();
-                (window.caret_on_layer(), window.caret_needs_ticks())
+                (window.caret_on_layer(), window.caret_needs_ticks(), window.invalidator.is_dirty())
             })
             .unwrap()
         };
-        assert_eq!(show(cx), (true, false), "outside a group the window blinks it");
+        assert_eq!(show(cx), (true, false, false), "outside a group the window blinks it, and asks for no frame");
         // The first frame records the root and the next ones replay it.
         show(cx);
         let before = painted.get();
         show(cx);
         assert_eq!(painted.get(), before, "the root is replayed");
         grouped.set(true);
-        assert_eq!(show(cx), (false, true), "inside one it is the page's to blink");
+        assert_eq!(show(cx), (false, true, true), "inside one it is the page's to blink, and the page is asked for a frame to paint it");
         assert_eq!(painted.get(), before, "the recording was replayed and not painted again");
     }
 }
