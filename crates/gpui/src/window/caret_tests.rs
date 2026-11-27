@@ -135,7 +135,7 @@ mod presenting {
     use super::{Painter, bar, ink};
     use crate::{
         Bounds, ContentMask, Corners, CornerRadii, Pixels, TestApp, TestAppWindow, Window, caret_visible,
-        BorderStyle, Edges, fill, point, px, quad, size, transparent_black, until_phase_change, white,
+        BorderStyle, Edges, TransformationMatrix, fill, point, px, quad, size, transparent_black, until_phase_change, white,
     };
     use scheduler::Instant;
     use std::cell::Cell;
@@ -276,6 +276,36 @@ mod presenting {
         assert!(!eligible(border_after_caret(box_around(10.), 0., transparent_black().into(), 1.)));
         // A border wide enough to reach it from the box that surrounds it.
         assert!(!eligible(border_after_caret(box_around(0.), 0., transparent_black().into(), 10.)));
+    }
+
+    #[test]
+    fn a_caret_that_touches_the_inner_edge_of_a_border_stays_on_the_layer() {
+        // The caret is x 10..11, y 4..20: its left edge is at the box's left plus the border, and
+        // its top at the box's top plus the border (a textarea with no padding).
+        let flush = Bounds::new(point(px(9.), px(3.)), size(px(100.), px(50.)));
+        assert!(eligible(border_after_caret(flush, 0., transparent_black().into(), 1.)));
+        // One pixel less and the border is under it.
+        let overlapping = Bounds::new(point(px(10.), px(3.)), size(px(100.), px(50.)));
+        assert!(!eligible(border_after_caret(overlapping, 0., transparent_black().into(), 1.)));
+        let overlapping = Bounds::new(point(px(9.), px(4.)), size(px(100.), px(50.)));
+        assert!(!eligible(border_after_caret(overlapping, 0., transparent_black().into(), 1.)));
+    }
+
+    #[test]
+    fn a_rotated_border_quad_is_taken_for_its_box_and_takes_the_caret_off_the_layer() {
+        let rotation = TransformationMatrix::unit().rotate(crate::radians(0.05));
+        assert!(!eligible(move |window, anchor| {
+            window.paint_caret(bar(10.), ink(), anchor);
+            window.with_transform(rotation, |window| {
+                window.paint_quad(quad(box_around(0.), 0., crate::Background::from(transparent_black()), Edges::all(px(1.)), ink(), BorderStyle::Solid));
+            });
+        }));
+    }
+
+    #[test]
+    fn a_transparent_gradient_background_is_taken_for_its_box() {
+        let gradient = crate::linear_gradient(90., crate::linear_color_stop(transparent_black(), 0.), crate::linear_color_stop(transparent_black(), 1.));
+        assert!(!eligible(border_after_caret(box_around(0.), 0., gradient, 1.)));
     }
 
     #[test]

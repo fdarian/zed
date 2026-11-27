@@ -415,11 +415,12 @@ fn border_only(quad: &crate::scene::Quad) -> bool {
 }
 
 /// Whether the border of a quad drawn with no background reaches `area`, which the box of the quad
-/// does not say: a bordered input is one box around its text and its caret. The border is
-/// taken to be the box less its interior inset by the border widths and by a pixel for the
-/// antialiasing, and less the corner of that interior that a rounded corner reaches into, which is taken
-/// as a square of the radius it has left (more than the arc covers, so this never says no for a caret
-/// the border draws over).
+/// does not say: a bordered input is one box around its text and its caret. On a straight edge the
+/// border is the box less its interior inset by the border width: bounds and widths are snapped
+/// device pixels, and the shader draws no border on an interior pixel, so a caret that touches the
+/// inner edge is clear of it. A rounded inner corner reaches into that interior, taken as a square of
+/// the radius it has left, a pixel further in for the antialiasing (more than the arc covers, so this
+/// never says no for a caret the border draws over).
 fn quad_border_reaches(quad: &crate::scene::Quad, area: Bounds<ScaledPixels>) -> bool {
     use crate::{Point, Size};
     let drawn = quad.bounds.intersect(&quad.content_mask.bounds);
@@ -430,13 +431,14 @@ fn quad_border_reaches(quad: &crate::scene::Quad, area: Bounds<ScaledPixels>) ->
     if !widths.any(|width| width.0 > 0.) {
         return false;
     }
-    let antialiasing = ScaledPixels(1.);
-    let (left, top) = (quad.bounds.left() + widths.left + antialiasing, quad.bounds.top() + widths.top + antialiasing);
-    let (right, bottom) = (quad.bounds.right() - widths.right - antialiasing, quad.bounds.bottom() - widths.bottom - antialiasing);
+    let (left, top) = (quad.bounds.left() + widths.left, quad.bounds.top() + widths.top);
+    let (right, bottom) = (quad.bounds.right() - widths.right, quad.bounds.bottom() - widths.bottom);
     let interior = Bounds::from_corners(Point { x: left, y: top }, Point { x: right, y: bottom });
     if interior.is_empty() || !area.is_contained_within(&interior) {
         return true;
     }
+    let antialiasing = ScaledPixels(1.);
+    let (left, top, right, bottom) = (left + antialiasing, top + antialiasing, right - antialiasing, bottom - antialiasing);
     let corner = |radius: ScaledPixels, radius_y: ScaledPixels, across: ScaledPixels, down: ScaledPixels| {
         let radius_y = if radius_y.0 == 0. { radius } else { radius_y };
         Size {
