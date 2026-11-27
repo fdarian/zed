@@ -53,6 +53,9 @@ pub(crate) struct TestWindowState {
     scale_factor: f32,
     plain_draws: usize,
     damage_draws: Vec<crate::window::DamageDraw>,
+    caret_layer: Option<crate::CaretLayer>,
+    caret_layer_calls: usize,
+    carets_unsupported: bool,
     last_composition_frame: Option<CompositionFrame>,
     composed_frames: usize,
     native_surface_events: Rc<RefCell<Vec<NativeSurfaceEvent>>>,
@@ -255,6 +258,9 @@ impl TestWindow {
             last_mouse_movement: Point::default(),
             plain_draws: 0,
             damage_draws: Vec::new(),
+            caret_layer: None,
+            caret_layer_calls: 0,
+            carets_unsupported: false,
             last_composition_frame: None,
             composed_frames: 0,
             native_surface_events: Rc::new(RefCell::new(Vec::new())),
@@ -264,6 +270,21 @@ impl TestWindow {
     /// The frames drawn with `draw_with_damage`, what each was told changed and what each held.
     pub fn damage_draws(&self) -> Vec<crate::window::DamageDraw> {
         self.0.lock().damage_draws.clone()
+    }
+
+    /// The caret layer the platform was last told to show, if any.
+    pub fn caret_layer(&self) -> Option<crate::CaretLayer> {
+        self.0.lock().caret_layer
+    }
+
+    /// How many times the platform was told about the caret layer.
+    pub fn caret_layer_calls(&self) -> usize {
+        self.0.lock().caret_layer_calls
+    }
+
+    /// Makes the window a platform that neither shows a caret layer nor leaves quads out.
+    pub fn set_carets_unsupported(&self) {
+        self.0.lock().carets_unsupported = true;
     }
 
     /// How many frames were drawn without composition, which a window without native surfaces does.
@@ -624,12 +645,26 @@ impl PlatformWindow for TestWindow {
         self.draw_scene(scene);
     }
 
-    fn draw_with_damage(&self, scene: &Scene, damage: Option<crate::FrameDamage>) {
+    fn draw_with_damage(&self, scene: &Scene, damage: Option<crate::FrameDamage>, hidden_quads: &[usize]) {
         let mut state = self.0.lock();
         state.plain_draws += 1;
-        state.damage_draws.push(crate::window::DamageDraw::record(scene, damage));
+        state.damage_draws.push(crate::window::DamageDraw::record(scene, damage, hidden_quads));
         drop(state);
         self.draw_scene(scene);
+    }
+
+    fn draws_hidden_quads(&self) -> bool {
+        !self.0.lock().carets_unsupported
+    }
+
+    fn supports_caret_layer(&self) -> bool {
+        !self.0.lock().carets_unsupported
+    }
+
+    fn set_caret_layer(&self, layer: Option<crate::CaretLayer>) {
+        let mut state = self.0.lock();
+        state.caret_layer = layer;
+        state.caret_layer_calls += 1;
     }
 
     fn draw_composed(&self, composed: ComposedScene<'_>) {

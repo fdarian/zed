@@ -897,9 +897,29 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// device pixels, in which `scene` can differ from the scene that was drawn before (rectangles
     /// to draw, and pixels of the picture before to move into place first if it has a shift), and
     /// `None` is all of it. A platform that cannot draw part of a window draws all of it.
-    fn draw_with_damage(&self, scene: &Scene, damage: Option<FrameDamage>) {
-        let _ = damage;
+    ///
+    /// `hidden_quads` are indices into `scene.quads` of quads the picture leaves out (a text
+    /// caret that is dark, or that a layer shows, see [`PlatformWindow::set_caret_layer`]): they
+    /// are drawn transparent, and the scene is not changed. A platform that does not draw them
+    /// says so with [`PlatformWindow::draws_hidden_quads`].
+    fn draw_with_damage(&self, scene: &Scene, damage: Option<FrameDamage>, hidden_quads: &[usize]) {
+        let _ = (damage, hidden_quads);
         self.draw(scene);
+    }
+    /// Whether [`PlatformWindow::draw_with_damage`] leaves out the quads it is given.
+    fn draws_hidden_quads(&self) -> bool {
+        false
+    }
+    /// Whether [`PlatformWindow::set_caret_layer`] shows a layer, which the compositor blinks.
+    fn supports_caret_layer(&self) -> bool {
+        false
+    }
+    /// Shows the text caret as a layer above the window's picture, which blinks without the window
+    /// drawing or asking for a frame (see [`crate::CaretLayer`]), or hides it (`None`). The picture it is
+    /// shown with leaves the caret's quad out. Called before the frame it belongs to is drawn, and
+    /// only when the caret changed.
+    fn set_caret_layer(&self, layer: Option<crate::CaretLayer>) {
+        let _ = layer;
     }
     /// Draws a frame that has native surfaces (see [`NativeSurface`](crate::NativeSurface)): the GPUI layers each
     /// draw the primitives of `scene` in their order range, the native layers are placed between

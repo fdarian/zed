@@ -76,6 +76,11 @@ pub(crate) struct WindowComposition {
 }
 
 impl WindowComposition {
+    /// Whether the window has made a native surface, which draws it composed.
+    pub(crate) fn is_composed(&self) -> bool {
+        self.state.is_some()
+    }
+
     pub(super) fn state(&self) -> Option<&Rc<RefCell<CompositionState>>> {
         self.state.as_ref()
     }
@@ -196,11 +201,14 @@ fn placement(placeholder: &NativeSurfacePlaceholder, scale_factor: f32, window: 
 /// Shows the frame the window last drew. A window that never made a native surface hands its scene
 /// to the platform with the damage of the frame (see [`crate::window::damage`]), as if there were no composition.
 pub(crate) fn present(window: &mut Window) {
-    let damage = window.take_damage();
     let Some(state) = window.composition.state.clone() else {
-        window.platform_window.draw_with_damage(&window.rendered_frame.scene, damage);
+        let carets = window.present_carets();
+        let damage = window.take_damage();
+        window.platform_window.draw_with_damage(&window.rendered_frame.scene, damage, &carets.hidden_quads);
         return;
     };
+    window.take_damage();
+    window.release_caret_layer();
     let scale_factor = window.scale_factor();
     let window_bounds = Bounds::new(Point::default(), window.viewport_size);
     let scene = &window.rendered_frame.scene;

@@ -545,11 +545,13 @@ pub struct DamageDraw {
     pub damage: Option<FrameDamage>,
     /// The primitives of the scene, by what they paint.
     pub primitives: Vec<(String, Bounds<ScaledPixels>)>,
+    /// The indices of the quads of the scene that the frame was told to leave out.
+    pub hidden_quads: Vec<usize>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl DamageDraw {
-    pub(crate) fn record(scene: &Scene, damage: Option<FrameDamage>) -> Self {
+    pub(crate) fn record(scene: &Scene, damage: Option<FrameDamage>, hidden_quads: &[usize]) -> Self {
         let mut primitives = Vec::new();
         macro_rules! take {
             ($($field:ident => $kind:ident),*) => {$(
@@ -563,7 +565,7 @@ impl DamageDraw {
         }
         take!(shadows => Shadow, quads => Quad, underlines => Underline, monochrome_sprites => MonochromeSprite,
             subpixel_sprites => SubpixelSprite, polychrome_sprites => PolychromeSprite);
-        Self { damage, primitives }
+        Self { damage, primitives, hidden_quads: hidden_quads.to_vec() }
     }
 
     /// The primitives that this frame has and `before` did not, or the other way around: where the

@@ -8,7 +8,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EffectGroup, FrameDamage, IsZero,
-    MAX_GROUP_EXTENT, MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point,
+    Hsla, MAX_GROUP_EXTENT, MaskComposite, MaskLayer, OrderRange, PaintSurface, Path, Point,
     MonochromeSprite, PolychromeSprite, PrimitiveBatch, Quad, ResolvedClipPath, ResolvedFilter, ScaledPixels, Scene,
     Shadow, Size, TransformationMatrix, Underline, filter_margin, point, size,
 };
@@ -156,6 +156,10 @@ pub struct MetalRenderer {
     #[cfg(test)]
     plain_run_fold_area: f32,
     partial: PartialRedraw,
+    /// The quads of the scene being drawn that are drawn transparent, ascending: for the frame of
+    /// `draw_with_damage` that is running, and empty otherwise. It means the quads of the scene
+    /// itself, never those of an effect group's own scene.
+    hidden_quads: Vec<usize>,
 }
 
 /// What [`MetalRenderer::draw_with_damage`] keeps between frames, so that a frame that changes part
@@ -300,6 +304,7 @@ impl MetalRenderer {
             #[cfg(test)]
             plain_run_fold_area: 0.,
             partial: PartialRedraw::default(),
+            hidden_quads: Vec::new(),
         }
     }
 
@@ -402,12 +407,19 @@ impl MetalRenderer {
     /// the picture is kept in a texture of its own, a damaged frame draws only the damaged part of it
     /// and every frame copies it to the drawable. The scene must not have an effect group, a native
     /// surface or a surface, and the window must be opaque; a scene that does is drawn whole.
-    pub fn draw_with_damage(&mut self, scene: &Scene, damage: Option<FrameDamage>) {
+    ///
+    /// The quads of `scene.quads` at the indices of `hidden_quads` (ascending) are drawn
+    /// transparent: the scene is not changed, so a text caret that is dark, or shown by a layer of
+    /// the window, is left out of the picture.
+    pub fn draw_with_damage(&mut self, scene: &Scene, damage: Option<FrameDamage>, hidden_quads: &[usize]) {
+        self.hidden_quads.clear();
+        self.hidden_quads.extend_from_slice(hidden_quads);
         if self.draws_in_part(scene) {
             self.draw_frame(scene, OrderRange::ALL, Some(damage));
         } else {
             self.draw_orders(scene, OrderRange::ALL);
         }
+        self.hidden_quads.clear();
     }
 
     /// Whether `scene` can go through the persistent target: an effect group reads and writes the
@@ -1121,7 +1133,8 @@ impl MetalRenderer {
                 .end_encoding();
             return Ok(());
         }
-        let instance_bindings = write_instances(scene, writer).with_context(|| {
+        let hidden_quads = if self.group_depth.get() == 0 { self.hidden_quads.clone() } else { Vec::new() };
+        let instance_bindings = write_instances(scene, &hidden_quads, writer).with_context(|| {
             format!(
                 "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                 scene.paths.len(),
@@ -1160,7 +1173,17 @@ impl MetalRenderer {
                     Ok(())
                 })?,
                 PrimitiveBatch::Quads(range) => self.per_scissor(command_encoder, |encoder, scissor| {
-                    let Some(quads) = culled(&scene.quads[range.clone()], scissor, Quad::window_bounds, |quad| quad.content_mask.bounds) else {
+                    let Some(quads) = culled_with(
+                        &scene.quads[range.clone()],
+                        scissor,
+                        Quad::window_bounds,
+                        |quad| quad.content_mask.bounds,
+                        |at, quad| {
+                            if hidden_quads.binary_search(&(range.start + at)).is_ok() {
+                                hide_quad(quad);
+                            }
+                        },
+                    ) else {
                         self.draw_quads(&scene.quads, range.clone(), &instance_bindings, viewport_size, encoder);
                         return Ok(());
                     };
@@ -3599,18 +3622,34 @@ fn culled<T: Clone>(
     drawn: impl Fn(&T) -> Bounds<ScaledPixels>,
     content_mask: impl Fn(&T) -> Bounds<ScaledPixels>,
 ) -> Option<Vec<T>> {
+    culled_with(items, scissor, drawn, content_mask, |_, _| {})
+}
+
+/// [`culled`] with `edit` applied to each primitive kept, given its index in `items`.
+fn culled_with<T: Clone>(
+    items: &[T],
+    scissor: Option<[u64; 4]>,
+    drawn: impl Fn(&T) -> Bounds<ScaledPixels>,
+    content_mask: impl Fn(&T) -> Bounds<ScaledPixels>,
+    edit: impl Fn(usize, &mut T),
+) -> Option<Vec<T>> {
     let [x, y, width, height] = scissor?;
     let (left, top) = (x as f32, y as f32);
     let (right, bottom) = (left + width as f32, top + height as f32);
     Some(
         items
             .iter()
-            .filter(|item| {
+            .enumerate()
+            .filter(|(_, item)| {
                 let (drawn, mask) = (drawn(item), content_mask(item));
                 drawn.left().0.max(mask.left().0).max(left) < drawn.right().0.min(mask.right().0).min(right)
                     && drawn.top().0.max(mask.top().0).max(top) < drawn.bottom().0.min(mask.bottom().0).min(bottom)
             })
-            .cloned()
+            .map(|(at, item)| {
+                let mut item = item.clone();
+                edit(at, &mut item);
+                item
+            })
             .collect(),
     )
 }
@@ -3631,9 +3670,24 @@ struct InstanceBindings {
     surfaces: InstanceBinding,
 }
 
-fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
+/// A caret has no border: the background is all it draws.
+fn hide_quad(quad: &mut Quad) {
+    quad.background = Hsla::transparent_black().into();
+}
+
+fn write_instances(scene: &Scene, hidden_quads: &[usize], writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
-        quads: writer.write(&scene.quads)?,
+        quads: if hidden_quads.is_empty() {
+            writer.write(&scene.quads)?
+        } else {
+            writer.write_iter(scene.quads.iter().enumerate().map(|(at, quad)| {
+                let mut quad = *quad;
+                if hidden_quads.binary_search(&at).is_ok() {
+                    hide_quad(&mut quad);
+                }
+                quad
+            }))?
+        },
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
@@ -4150,6 +4204,33 @@ mod tests {
             .expect("the frame is drawn in part");
         let whole = partial.render_scene_partial_to_image(&next, None, window).expect("the frame is drawn whole");
         assert!(drawn == whole, "the frame drawn in part is not the frame drawn whole");
+    }
+
+    /// A quad the frame is told to hide is drawn transparent, in a frame drawn whole and in one drawn in part (whose
+    /// quads are culled per scissor, by their index in the scene), and the scene is not changed.
+    #[test]
+    fn a_hidden_quad_is_the_frame_without_it() {
+        let window = size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32));
+        let backdrop = translucent(full_bounds(), gpui::hsla(0.6, 0.5, 0.4, 1.), 0.);
+        let before = translucent(area(2., 2., 6., 6.), gpui::hsla(0.1, 1., 0.5, 1.), 0.);
+        let caret = translucent(area(20., 10., 2., 16.), gpui::hsla(0., 0., 1., 1.), 0.);
+        let with = scene_of(&[backdrop, before, caret]);
+        let without = scene_of(&[backdrop, before]);
+        let expected = MetalHeadlessRenderer::new().render_scene_to_image(&without, window).expect("the frame is drawn");
+        let shown = MetalHeadlessRenderer::new().render_scene_to_image(&with, window).expect("the frame is drawn");
+        assert!(shown != expected, "the caret shows when it is not hidden");
+
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        renderer.hidden_quads = vec![2];
+        let whole = renderer.render_scene_partial_to_image(&with, None, window).expect("the frame is drawn whole");
+        assert!(whole == expected, "the hidden quad is in the frame drawn whole");
+        let in_part = renderer
+            .render_scene_partial_to_image(&with, damage(18, 8, 8, 20), window)
+            .expect("the frame is drawn in part");
+        assert!(in_part == expected, "the hidden quad is in the frame drawn in part");
+        renderer.hidden_quads.clear();
+        let lit = renderer.render_scene_partial_to_image(&with, damage(18, 8, 8, 20), window).expect("the frame is drawn in part");
+        assert!(lit == shown, "the quad is drawn again when it is not hidden");
     }
 
     #[test]

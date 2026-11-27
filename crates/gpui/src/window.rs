@@ -66,6 +66,7 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+mod caret;
 pub(crate) mod damage;
 mod patch;
 mod patch_splice;
@@ -92,6 +93,7 @@ mod scroll_patch_tests;
 mod splice_patch_tests;
 
 pub use a11y::{A11yRelation, A11ySubtreeBuilder};
+pub use caret::{CARET_BLINK, CaretLayer, caret_visible, until_phase_change};
 #[cfg(any(test, feature = "test-support"))]
 pub use damage::{DamageDraw, DamageSteps};
 pub use damage::{FrameDamage, Shift};
@@ -2301,6 +2303,7 @@ pub struct Window {
     pub(crate) retained: RetainedWindow,
     pub(crate) patch: PatchWindow,
     pub(crate) damage: damage::DamageLedger,
+    pub(crate) caret: caret::CaretPresenter,
     /// What the frames drawn after a list scroll are classified by, see [`scroll_patch`].
     pub(crate) scroll_patch: ScrollPatchWindow,
 }
@@ -2759,12 +2762,13 @@ impl Window {
                 }
 
                 handle
-                    .update(&mut cx, |_, window, _| {
+                    .update(&mut cx, |_, window, cx| {
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                         {
                             window.platform_window.schedule_frame();
                         }
+                        window.arm_caret_blink(cx);
                     })
                     .log_err();
 
@@ -3047,6 +3051,7 @@ impl Window {
             retained: RetainedWindow::default(),
             patch: PatchWindow::default(),
             damage: damage::DamageLedger::new(),
+            caret: caret::CaretPresenter::new(cx.background_executor().clone()),
             scroll_patch: ScrollPatchWindow::default(),
         })
     }

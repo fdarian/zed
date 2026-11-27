@@ -76,6 +76,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod caret_layer;
 mod composition;
 #[cfg(any(test, feature = "test-support"))]
 pub use composition::overlay_drawn_frames;
@@ -707,6 +708,7 @@ struct MacWindowState {
     sheet_parent: Option<id>,
     pointer_locked: bool,
     last_mouse_movement: Point<Pixels>,
+    caret_layer: Option<caret_layer::CaretLayerState>,
     /// A scale factor a test chose over the display's, like `--force-device-scale-factor`.
     #[cfg(any(test, feature = "test-support"))]
     forced_scale_factor: Option<f32>,
@@ -1256,6 +1258,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 pointer_locked: false,
                 last_mouse_movement: Point::default(),
+                caret_layer: None,
                 #[cfg(any(test, feature = "test-support"))]
                 forced_scale_factor: None,
                 accesskit_adapter: None,
@@ -2211,9 +2214,28 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
-    fn draw_with_damage(&self, scene: &gpui::Scene, damage: Option<gpui::FrameDamage>) {
+    fn draw_with_damage(&self, scene: &gpui::Scene, damage: Option<gpui::FrameDamage>, hidden_quads: &[usize]) {
         let mut this = self.0.lock();
-        this.renderer.draw_with_damage(scene, damage);
+        this.renderer.draw_with_damage(scene, damage, hidden_quads);
+    }
+
+    fn draws_hidden_quads(&self) -> bool {
+        true
+    }
+
+    fn supports_caret_layer(&self) -> bool {
+        true
+    }
+
+    fn set_caret_layer(&self, layer: Option<gpui::CaretLayer>) {
+        let mut this = self.0.lock();
+        let scale_factor = this.scale_factor();
+        // SAFETY: Window state is only touched from the AppKit main thread, and the view is live
+        // while the window state is.
+        unsafe {
+            let host: id = msg_send![this.native_view.as_ptr() as id, layer];
+            caret_layer::set(&mut this.caret_layer, host, scale_factor, layer);
+        }
     }
 
     fn draw_composed(&self, scene: gpui::ComposedScene<'_>) {
