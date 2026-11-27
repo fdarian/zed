@@ -207,6 +207,7 @@ pub(crate) struct MacPlatformState {
     renderer_context: renderer::Context,
     headless: bool,
     keep_window_frames: bool,
+    invisible_windows: bool,
     mode: MacPlatformMode,
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
@@ -268,6 +269,7 @@ impl MacPlatform {
         Self(Mutex::new(MacPlatformState {
             headless,
             keep_window_frames: false,
+            invisible_windows: false,
             mode: MacPlatformMode::Blocking,
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
@@ -302,6 +304,13 @@ impl MacPlatform {
     /// screen and capped to its visible frame, so a window asked off every screen has none.
     pub fn keep_window_frames(&self) {
         self.0.lock().keep_window_frames = true;
+    }
+
+    /// Windows opened after this are fully transparent and ignore the mouse: not seen or clicked,
+    /// but they still run, because AppKit counts a transparent window on a screen as visible and
+    /// only a visible one starts a display link. For tests that open live windows.
+    pub fn invisible_windows(&self) {
+        self.0.lock().invisible_windows = true;
     }
 
     /// Creates a platform whose AppKit event loop is driven by a foreign main loop.
@@ -1215,6 +1224,7 @@ impl Platform for MacPlatform {
             background_executor,
             renderer_context,
             keep_window_frames,
+            invisible_windows,
         ) = {
             let guard = self.0.lock();
             (
@@ -1223,6 +1233,7 @@ impl Platform for MacPlatform {
                 guard.background_executor.clone(),
                 guard.renderer_context.clone(),
                 guard.keep_window_frames,
+                guard.invisible_windows,
             )
         };
 
@@ -1234,6 +1245,7 @@ impl Platform for MacPlatform {
             background_executor,
             renderer_context,
             keep_window_frames,
+            invisible_windows,
         )))
     }
 
