@@ -533,7 +533,7 @@ enum ThumbPaint {
 }
 
 /// The bar of a list as the frame shown painted it.
-struct ScrollThumb {
+pub(crate) struct ScrollThumb {
     list: ScrollerId,
     paint: ThumbPaint,
     plan: ScrollThumbPlan,
@@ -680,20 +680,80 @@ impl ScrollFrame {
         }
     }
 
-    /// Whether a thumb is painted by one of the operations in `operations`.
-    pub(crate) fn holds_thumb_in(&self, operations: &Range<usize>) -> bool {
-        self.thumbs.iter().any(|thumb| matches!(thumb.paint, ThumbPaint::Quad { op, .. } if operations.contains(&op)))
+    /// The scrollers whose thumb is painted by one of the operations in `operations`.
+    pub(crate) fn thumb_owners_in(&self, operations: &Range<usize>) -> Vec<ScrollerId> {
+        self.thumbs
+            .iter()
+            .filter(|thumb| matches!(thumb.paint, ThumbPaint::Quad { op, .. } if operations.contains(&op)))
+            .map(|thumb| thumb.list)
+            .collect()
     }
 
-    /// Moves the operation of each thumb: `operation` says where the one it has went, and a thumb that
-    /// goes nowhere is one that cannot be put elsewhere.
-    pub(crate) fn remap_thumbs(&mut self, operation: &mut dyn FnMut(usize) -> Option<usize>) {
+    /// The operations the thumbs of the scroller are painted by.
+    #[cfg(test)]
+    pub(crate) fn thumb_operations(&self, scroller: ScrollerId) -> Vec<usize> {
+        self.thumbs
+            .iter()
+            .filter(|thumb| thumb.list == scroller)
+            .filter_map(|thumb| match thumb.paint {
+                ThumbPaint::Quad { op, .. } => Some(op),
+                ThumbPaint::Nothing | ThumbPaint::Untracked => None,
+            })
+            .collect()
+    }
+
+    /// Whether the scroller is a list, whose rows and runs a splice does not carry over from the scratch
+    /// frame.
+    pub(crate) fn is_list(&self, scroller: ScrollerId) -> bool {
+        self.lists.iter().any(|list| list.id == scroller)
+    }
+
+    /// Whether a thumb is noted for the scroller.
+    pub(crate) fn holds_thumb_of(&self, scroller: ScrollerId) -> bool {
+        self.thumbs.iter().any(|thumb| thumb.list == scroller)
+    }
+
+    /// Takes out the thumbs painted by one of the operations in `operations` or noted for one of the `scrollers`,
+    /// with the operation of each counted from where `operations` begins.
+    pub(crate) fn take_thumbs(&mut self, operations: &Range<usize>, scrollers: &[ScrollerId]) -> Vec<ScrollThumb> {
+        let (taken, kept) = std::mem::take(&mut self.thumbs).into_iter().partition(|thumb| {
+            scrollers.contains(&thumb.list)
+                || matches!(thumb.paint, ThumbPaint::Quad { op, .. } if operations.contains(&op))
+        });
+        self.thumbs = kept;
+        let mut taken: Vec<ScrollThumb> = taken;
+        for thumb in &mut taken {
+            if let ThumbPaint::Quad { op, bounds, opacity } = thumb.paint {
+                thumb.paint = ThumbPaint::Quad { op: op - operations.start, bounds, opacity };
+            }
+        }
+        taken
+    }
+
+    /// Moves the operation of each thumb after a splice put `put` (thumbs of the scratch frame, their
+    /// operations counted from the start of the part) in the place of the part `operations`: `shift` is how much the
+    /// operations after the part moved. A thumb painted inside the part is the one of the scroller that `put` holds,
+    /// and where `put` has none it is one that cannot be put elsewhere.
+    pub(crate) fn splice_thumbs(&mut self, operations: &Range<usize>, shift: isize, put: Vec<ScrollThumb>) {
+        self.thumbs.retain(|thumb| {
+            !(matches!(thumb.paint, ThumbPaint::Quad { op, .. } if operations.contains(&op))
+                && put.iter().any(|put| put.list == thumb.list))
+        });
         for thumb in &mut self.thumbs {
             let ThumbPaint::Quad { op, bounds, opacity } = thumb.paint else { continue };
-            thumb.paint = match operation(op) {
-                Some(op) => ThumbPaint::Quad { op, bounds, opacity },
-                None => ThumbPaint::Untracked,
+            thumb.paint = if op < operations.start {
+                continue;
+            } else if op >= operations.end {
+                ThumbPaint::Quad { op: (op as isize + shift) as usize, bounds, opacity }
+            } else {
+                ThumbPaint::Untracked
             };
+        }
+        for mut thumb in put {
+            if let ThumbPaint::Quad { op, bounds, opacity } = thumb.paint {
+                thumb.paint = ThumbPaint::Quad { op: op + operations.start, bounds, opacity };
+            }
+            self.thumbs.push(thumb);
         }
     }
 

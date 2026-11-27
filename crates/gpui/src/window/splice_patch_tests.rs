@@ -6,9 +6,9 @@
 
 use crate::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Context, Edges, ElementId, FocusHandle, InteractiveElement, IntoElement,
-    ListAlignment, ListState, Modifiers, OverflowAnchor, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, PatchCounters, PatchDecline,
+    Bounds, ListAlignment, ListState, Modifiers, OverflowAnchor, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, PatchCounters, PatchDecline,
     PlatformInput, Point, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div,
-    green, list, point, px, red, retained, size,
+    fill, green, list, point, px, red, retained, size,
 };
 use crate::NonRelocatable;
 use std::cell::{Cell, RefCell};
@@ -75,6 +75,17 @@ struct State {
     /// the unit, or as the panel when `wide` is set: the unit is clear of the corner until they are.
     panel: Cell<bool>,
     wide: Cell<bool>,
+    /// The unit holds a scroller with a bar that notes its thumb for the scroll patch.
+    bar: Cell<Option<BarOf>>,
+    bar_handle: ScrollHandle,
+    bar_rows: ListState,
+}
+
+/// What the scroller of the bar in the unit is.
+#[derive(Clone, Copy, PartialEq)]
+enum BarOf {
+    Div,
+    List,
 }
 
 impl State {
@@ -107,6 +118,9 @@ impl State {
             tooltip: Cell::new(true),
             panel: Cell::new(false),
             wide: Cell::new(false),
+            bar: Cell::new(None),
+            bar_handle: ScrollHandle::new(),
+            bar_rows: ListState::new(10, ListAlignment::Top, px(0.)).with_uniform_item_height(px(10.)),
         })
     }
 
@@ -177,7 +191,42 @@ impl State {
         for index in grouped..count {
             unit = unit.child(self.kid(index));
         }
+        if let Some(bar) = self.bar.get() {
+            unit = unit.child(self.bar_scroller(bar));
+        }
         unit.into_any_element()
+    }
+
+    /// A scroller 40 by 20 whose bar is a thumb of 6 by 8 at its right edge.
+    fn bar_scroller(&self, of: BarOf) -> AnyElement {
+        let key = match of {
+            BarOf::Div => self.bar_handle.scroll_key(),
+            BarOf::List => self.bar_rows.scroll_key(),
+        };
+        let overlay = move |bounds: Bounds<crate::Pixels>, window: &mut Window, _: &mut App| {
+            let thumb = fill(Bounds::new(bounds.origin + point(px(34.), px(0.)), size(px(6.), px(8.))), crate::black());
+            let plan = Rc::new(|_: &Window, _: Option<Bounds<crate::Pixels>>| Ok(None));
+            let moved = Rc::new(|_: &mut Window, _: &mut App| {});
+            let repaint = Rc::new(|_: &Window, _: Option<Bounds<crate::Pixels>>| Ok(None));
+            window.paint_scroll_thumb(key, Some(thumb), plan, moved, repaint);
+        };
+        match of {
+            BarOf::Div => div()
+                .id("bar")
+                .w(px(40.))
+                .h(px(20.))
+                .flex_none()
+                .overflow_y_scroll()
+                .track_scroll(&self.bar_handle)
+                .paint_overlay(overlay)
+                .child(div().h(px(80.)))
+                .into_any_element(),
+            BarOf::List => list(self.bar_rows.clone(), |_, _, _| div().h(px(10.)).into_any_element())
+                .w(px(40.))
+                .h(px(20.))
+                .paint_overlay(overlay)
+                .into_any_element(),
+        }
     }
 
     fn sibling(&self) -> AnyElement {
@@ -1642,4 +1691,82 @@ fn patches_that_move_the_anchor_and_frames_after_them_leave_the_offset_a_frame_b
         pair.assert_same(cx, &format!("{what}, wheeled"));
         assert_eq!(pair.patched.state.scroll.offset().y, pair.whole.state.scroll.offset().y, "{what}: the offset");
     }
+}
+
+/// The operations that paint the thumb of the bar in the unit, in the frame shown, and what each is.
+fn thumb_quads(page: &Fixture, cx: &mut TestAppContext) -> Vec<(usize, bool)> {
+    let key = page.state.bar_handle.scroll_key();
+    cx.update_window(page.window, |_, window, _| {
+        let scene = &window.rendered_frame.scene.paint_operations;
+        window
+            .rendered_frame
+            .scroll
+            .thumb_operations(key)
+            .into_iter()
+            .map(|op| (op, matches!(scene[op], crate::scene::PaintOperation::Quad(_))))
+            .collect()
+    })
+    .unwrap()
+}
+
+#[gpui::test]
+fn a_root_spliced_with_the_bar_of_a_scroller_in_it_notes_the_thumb_the_scratch_frame_painted(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    state.bar.set(Some(BarOf::Div));
+    let page = Fixture::new(cx, state);
+    // A frame that replays the unit does not note its bar again: the thumb is the one a frame built whole noted.
+    page.draw_whole(cx);
+    let shown = thumb_quads(&page, cx);
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    let mut relayouts = page.patches(cx).relayout_patches;
+    for (kids, what) in [(7, "3 to 7"), (1, "7 to 1"), (5, "1 to 5")] {
+        page.state.change(kids);
+        page.tick(cx);
+        let after = page.patches(cx);
+        assert_eq!(after.relayout_patches, relayouts + 1, "{what}: {:?}", page.state.seen.borrow());
+        assert_eq!(after.declines(PatchDecline::Splice), 0, "{what}: {:?}", page.state.seen.borrow());
+        relayouts = after.relayout_patches;
+        let spliced = thumb_quads(&page, cx);
+        page.assert_whole(cx, what);
+        let whole = thumb_quads(&page, cx);
+        assert_eq!(spliced, whole, "{what}: the operation of the thumb is where the frame built whole paints it");
+        assert!(spliced.iter().all(|(_, quad)| *quad), "{what}: {spliced:?}");
+    }
+}
+
+#[gpui::test]
+fn a_root_spliced_without_the_bar_it_held_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    state.bar.set(Some(BarOf::Div));
+    let page = Fixture::new(cx, state);
+    page.draw_whole(cx);
+    let before = page.patches(cx);
+    page.state.bar.set(None);
+    page.state.change(7);
+    page.tick(cx);
+    let after = page.patches(cx);
+    let seen = page.state.seen.borrow();
+    assert_eq!(after.relayout_patches, before.relayout_patches, "{seen:?}");
+    assert_eq!(after.declines(PatchDecline::Splice), before.declines(PatchDecline::Splice) + 1, "{seen:?}");
+    drop(seen);
+    page.assert_whole(cx, "a bar that the patch does not paint");
+}
+
+/// A list inside a root keeps it from being a patchable unit before a splice is planned, so the thumb of a list in a spliced
+/// part, which `plan_splice` declines, cannot come up through a root: the frame is built whole.
+#[gpui::test]
+fn a_root_that_holds_a_list_with_a_bar_is_not_a_unit_and_the_frame_is_built_whole(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    state.bar.set(Some(BarOf::List));
+    let page = Fixture::new(cx, state);
+    page.draw_whole(cx);
+    let before = page.patches(cx);
+    page.state.change(7);
+    page.tick(cx);
+    let after = page.patches(cx);
+    let seen = page.state.seen.borrow();
+    assert_eq!(after.relayout_patches, before.relayout_patches, "{seen:?}");
+    assert_eq!(after.declines(PatchDecline::UnknownUnit), before.declines(PatchDecline::UnknownUnit) + 1, "{seen:?}");
+    drop(seen);
+    page.assert_whole(cx, "the bar of a list");
 }

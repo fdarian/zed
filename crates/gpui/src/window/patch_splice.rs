@@ -37,7 +37,7 @@
 use super::*;
 use crate::DispatchNode;
 use crate::elements::{RetainedState, ScrollerRecord};
-use super::scroll_patch::{PlaceEdit, RunEdit};
+use super::scroll_patch::{PlaceEdit, RunEdit, ScrollThumb};
 use crate::scene::PaintOperation;
 
 /// The number of positions that a [`PrepaintStateIndex`] and a [`PaintIndex`] hold.
@@ -249,6 +249,9 @@ pub(super) struct Splice {
     /// For rows: what the splice does to the places of the rows of the list.
     places: Option<PlaceEdit>,
     old_hitbox_ids: Vec<HitboxId>,
+    /// The thumbs the scratch frame noted for the bars in the part, with their operations counted from where the
+    /// part begins.
+    thumbs: Vec<ScrollThumb>,
     operations: Vec<PaintOperation>,
     hitboxes: Vec<Hitbox>,
     tooltips: Vec<Option<TooltipRequest>>,
@@ -415,11 +418,14 @@ impl Window {
         if !(self.frame_holds(id, old_pre, old_paint, &source.hitboxes.hitboxes, &source.tab_stops) && scratch_deferred) {
             return Err(PatchDecline::Splice);
         }
-        // The thumbs are repainted from the plan made before the splice, which cannot write one that goes with the
-        // part: the frame is built whole.
-        if self.rendered_frame.scroll.holds_thumb_in(&(old_paint.start.scene_index..old_paint.end.scene_index)) {
+        // The thumbs are repainted from the plan made before the splice, which can only write one that the splice
+        // puts again: a bar the part held that the scratch frame did not note (or a list's, whose rows the splice
+        // does not carry over) leaves a thumb that goes with nothing in the part, and the frame is built whole.
+        let held = self.rendered_frame.scroll.thumb_owners_in(&(old_paint.start.scene_index..old_paint.end.scene_index));
+        if held.iter().any(|scroller| self.rendered_frame.scroll.is_list(*scroller) || !self.next_frame.scroll.holds_thumb_of(*scroller)) {
             return Err(PatchDecline::Splice);
         }
+        let scratch_operations = paint.start.scene_index..paint.end.scene_index;
         let nodes = old_pre.start.dispatch_tree_index..old_pre.end.dispatch_tree_index;
         let nodes_parent = match nodes.is_empty() {
             true => dispatch_parent,
@@ -429,6 +435,7 @@ impl Window {
         let mut splice = self.take_from_scratch(old_pre.clone(), old_paint.clone(), prepaint, paint, operations, nodes_parent);
         splice.keeps_recording = keeps_recording;
         splice.old_hitbox_ids = old_hitbox_ids;
+        splice.thumbs = self.next_frame.scroll.take_thumbs(&scratch_operations, &held);
         Ok(splice)
     }
 
@@ -456,6 +463,7 @@ impl Window {
             runs: None,
             places: None,
             old_hitbox_ids: Vec::new(),
+            thumbs: Vec::new(),
             operations,
             hitboxes: scratch.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec(),
             tooltips: scratch.tooltip_requests[prepaint.start.tooltips_index..prepaint.end.tooltips_index].to_vec(),
@@ -527,6 +535,7 @@ impl Window {
             runs: Some(runs),
             places: Some(places),
             old_hitbox_ids: parts.iter().flat_map(|part| part.hitboxes.hitboxes.iter().map(|hitbox| hitbox.id)).collect(),
+            thumbs: Vec::new(),
             operations: Vec::new(),
             hitboxes: Vec::new(),
             tooltips: Vec::new(),
@@ -732,11 +741,7 @@ impl Window {
                 true
             });
         }
-        self.rendered_frame.scroll.remap_thumbs(&mut |operation| match place_in_part(&operations_part, &(operation..operation + 1)) {
-            Place::Before => Some(operation),
-            Place::After => Some((operation as isize + paint_cut.delta[OPERATIONS]) as usize),
-            Place::Encloses | Place::Inside => None,
-        });
+        self.rendered_frame.scroll.splice_thumbs(&operations_part, paint_cut.delta[OPERATIONS], mem::take(&mut splice.thumbs));
 
         if let Some(identity) = self.captured_identity.clone() {
             let held = self.captured_hitbox.is_some_and(|held| splice.old_hitbox_ids.contains(&held));
