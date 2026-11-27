@@ -80,6 +80,11 @@ pub(crate) struct CaretPresenter {
     wanted_blink: Option<Instant>,
     /// The frame this window asked of itself for that time, and when it is for.
     blink: Option<(Instant, Task<()>)>,
+    /// A test asked for the carets a window cannot blink: see [`Window::force_painted_carets`].
+    painted_forced: bool,
+    /// How many effect groups and text clips are open around what is being painted, which a
+    /// recording's own scene does not know of.
+    pub(super) ambient_effects: usize,
 }
 
 impl CaretPresenter {
@@ -94,7 +99,7 @@ impl CaretPresenter {
     }
 
     pub(crate) fn new(executor: BackgroundExecutor) -> Self {
-        Self { executor, presented: SmallVec::new(), sent_layer: None, wanted_blink: None, blink: None }
+        Self { executor, presented: SmallVec::new(), sent_layer: None, wanted_blink: None, blink: None, painted_forced: false, ambient_effects: 0 }
     }
 }
 
@@ -139,7 +144,16 @@ impl Window {
     /// transparent: a window that does not (a composed one, on a platform that cannot) draws the
     /// carets of its scene lit, and an app that wants one to blink has to repaint it.
     pub fn blinks_carets(&self) -> bool {
-        !self.composition.is_composed() && self.platform_window.draws_hidden_quads()
+        !self.composition.is_composed() && self.platform_window.draws_hidden_quads() && !self.caret.painted_forced
+    }
+
+    /// Makes the window treat every caret as one it cannot blink, as a composed window does, so that
+    /// a test can look at what a painter does then: `paint_caret` paints the phase it is in and
+    /// returns `true`. The next frame is drawn again.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn force_painted_carets(&mut self, enabled: bool) {
+        self.caret.painted_forced = enabled;
+        self.refresh();
     }
 
     /// Decides how the scene about to be presented shows its carets, tells the platform of its

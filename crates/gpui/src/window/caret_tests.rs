@@ -400,6 +400,23 @@ mod presenting {
     }
 
     #[test]
+    fn a_test_can_force_the_carets_a_window_cannot_blink() {
+        let returned = Rc::new(Cell::new(None));
+        let record = returned.clone();
+        let paint = move |window: &mut Window, anchor| record.set(Some(window.paint_caret(bar(10.), ink(), anchor)));
+        let mut fixture = Fixture::new(paint);
+        fixture.window.update(|_, window, _| window.force_painted_carets(true));
+        fixture.show();
+        assert_eq!(returned.get(), Some(true));
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks() && !window.blinks_carets()));
+        assert!(!fixture.on_layer());
+        fixture.window.update(|_, window, _| window.force_painted_carets(false));
+        fixture.show();
+        assert_eq!(returned.get(), Some(false));
+        assert!(fixture.on_layer());
+    }
+
+    #[test]
     fn the_layer_is_told_where_the_caret_is_and_what_blinks_it() {
         let mut fixture = Fixture::new(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); });
         fixture.app.advance_clock(Duration::from_millis(120));

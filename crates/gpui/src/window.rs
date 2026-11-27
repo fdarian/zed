@@ -7687,7 +7687,9 @@ impl Window {
         self.next_frame
             .scene
             .start_group(effect, content_mask, reserved);
+        self.caret.ambient_effects += 1;
         let result = f(self);
+        self.caret.ambient_effects -= 1;
         self.next_frame.scene.end_group();
         result
     }
@@ -7721,7 +7723,9 @@ impl Window {
     pub fn with_text_clip<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.invalidator.debug_assert_paint();
         self.next_frame.scene.start_text_clip();
+        self.caret.ambient_effects += 1;
         let result = f(self);
+        self.caret.ambient_effects -= 1;
         self.next_frame.scene.end_text_clip();
         result
     }
@@ -8345,7 +8349,8 @@ impl Window {
     /// transparent for the phase it is in now, and this returns `true`: the painter has to paint it
     /// again at each change of phase, [`until_phase_change`] away, which is what
     /// [`Window::caret_needs_ticks`] reports for the frame last presented. It returns `false` when
-    /// the window blinks it, and when nothing was painted.
+    /// the window blinks it, and when nothing was painted. A painter that is not told so here, because
+    /// it is painted alone by a patch outside the group around it, hears it from `caret_needs_ticks`.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_caret(&mut self, bounds: Bounds<Pixels>, color: Hsla, blink_anchor: Instant) -> bool {
@@ -8357,10 +8362,10 @@ impl Window {
         let opacity = self.element_opacity();
         let layer_allowed = opacity >= 1. && !self.placement().general;
         let quad = self.device_quad(fill(bounds, color), opacity);
-        let painter_blinks = !self.blinks_carets() || self.next_frame.scene.in_effect_group();
+        // A recording is made in a scene of its own, which does not hold the group it will be put under.
+        let painter_blinks = !self.blinks_carets() || self.caret.ambient_effects > 0;
         let lit = self.caret_lit_now(blink_anchor);
-        self.next_frame.scene.insert_caret(Caret { quad, blink_anchor, layer_allowed, painter_blinks, lit });
-        painter_blinks
+        self.next_frame.scene.insert_caret(Caret { quad, blink_anchor, layer_allowed, painter_blinks, lit })
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.

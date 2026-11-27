@@ -539,9 +539,11 @@ impl Scene {
     /// Records a text caret, which the renderer draws as the opaque quad it holds until a platform
     /// shows it another way: see [`Caret`]. Whether a layer may show it is also withdrawn by an
     /// effect group or text clip that is open here, which a recording replayed under one is.
-    pub(crate) fn insert_caret(&mut self, mut caret: Caret) {
+    ///
+    /// Returns whether the caret is blinked by its painter, which this scene's groups may make so.
+    pub(crate) fn insert_caret(&mut self, mut caret: Caret) -> bool {
         if self.hidden {
-            return;
+            return false;
         }
         // A recording made outside a group may be replayed in one, which cannot hide its quad.
         let grouped = self.in_effect_group();
@@ -552,6 +554,7 @@ impl Scene {
         }
         self.record_with(|| PaintOperation::Caret(caret));
         self.place_recorded_quad(caret.quad);
+        caret.painter_blinks
     }
 
     /// Whether what is inserted now is painted inside an effect group, a flat opacity or a text clip,
@@ -1334,7 +1337,7 @@ impl Scene {
         match operation {
             PaintOperation::Primitive(primitive) => self.replay_primitive(primitive),
             PaintOperation::Quad(quad) => self.insert_quad(*quad),
-            PaintOperation::Caret(caret) => self.insert_caret(*caret),
+            PaintOperation::Caret(caret) => { self.insert_caret(*caret); }
             PaintOperation::Image(sprite) => self.insert_image(*sprite),
             PaintOperation::PendingGlyph(glyph) => self.insert_pending_glyph(glyph.clone()),
             PaintOperation::NativeSurface(placeholder) => self.insert_native_surface(placeholder.clone()),
@@ -5690,9 +5693,9 @@ mod tests {
         for effects in [true, false] {
             let mut scene = Scene::default();
             scene.set_effect_groups_enabled(effects);
-            scene.insert_caret(caret(10., 20.));
+            assert!(!scene.insert_caret(caret(10., 20.)));
             scene.start_group(GroupEffect { opacity: 0.5, ..GroupEffect::default() }, mask(), None);
-            scene.insert_caret(caret(10., 20.));
+            assert!(scene.insert_caret(caret(10., 20.)), "the painter blinks what a group composites");
             scene.end_group();
             let allowed: Vec<bool> = scene
                 .paint_operations
