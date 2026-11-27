@@ -294,9 +294,10 @@ impl Window {
     /// A caret the window blinked and stopped blinking (the window became composed, or a recording of
     /// the caret was replayed under an effect group) was painted by nobody who knows it has to tick:
     /// its painter was replayed, not run. One frame that is a tick lets the page run its painters
-    /// again, which then read [`Window::caret_needs_ticks`] and arm their own blink. A caret that
-    /// comes up as one the page has to blink, with none the window blinked before it, was painted
-    /// by a painter that said so, and needs nothing.
+    /// again, which then read [`Window::caret_needs_ticks`] and arm their own blink. With no caret
+    /// the window blinked before, nothing is asked for: such a caret was painted by a painter that
+    /// `paint_caret` told, except one whose quad is not in the scene (see `present_carets`),
+    /// which no painter was told of and which stays lit until the page paints again.
     fn ask_page_to_tick_carets(&mut self, blinked_before: bool) {
         if blinked_before && self.caret_needs_ticks() {
             self.invalidator.request_tick();
@@ -363,7 +364,8 @@ fn quad_of(scene: &crate::Scene, caret: &Caret) -> Option<usize> {
 /// Whether an operation painted after `operation` draws over `area`, or may: what a native surface
 /// or a surface of frames draws is not a box that can be told. A group draws inside its content mask
 /// grown by what its filters spread, which is where a mask that a box escaping its clip widened
-/// reaches too, so a group is looked at where it ends.
+/// reaches too, so a group is looked at where it ends. A backdrop filter reads from its mask grown by
+/// its own margin, which is looked at as well.
 fn operations_after_overlap(scene: &crate::Scene, operation: usize, area: Bounds<ScaledPixels>) -> bool {
     use crate::scene::{Extent, group_reach};
     let mut open_groups: SmallVec<[(Bounds<ScaledPixels>, &crate::GroupEffect); 2]> = SmallVec::new();
@@ -380,7 +382,14 @@ fn operations_after_overlap(scene: &crate::Scene, operation: usize, area: Bounds
                 false
             }
             PaintOperation::EndGroup => match open_groups.pop() {
-                Some((mask, effect)) => group_reach(mask, &effect.filters).intersects(&area),
+                Some((mask, effect)) => {
+                    group_reach(mask, &effect.filters).intersects(&area)
+                        // A backdrop filter samples the pixels behind the mask, grown by what it spreads
+                        // (the Metal renderer copies that region), so it reads the caret from further off
+                        // than the group paints.
+                        || (!effect.backdrop_filters.is_empty()
+                            && group_reach(mask, &effect.backdrop_filters).intersects(&area))
+                }
                 // A group that was opened before the caret and closes after it holds the caret.
                 None => true,
             },

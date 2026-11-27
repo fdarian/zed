@@ -305,6 +305,30 @@ mod presenting {
     }
 
     #[test]
+    fn a_backdrop_blur_reads_the_caret_from_beyond_the_mask_and_takes_it_off_the_layer() {
+        // The mask starts 10 px right of the caret's box (x 10 to 11); a backdrop blur of 8 samples about 24 px
+        // around it, though the group paints nothing but inside the mask.
+        let backdrop_blurred = |blur: f32| {
+            move |window: &mut Window, anchor: Instant| {
+                window.paint_caret(bar(10.), ink(), anchor);
+                let mask = ContentMask::from_bounds(Bounds::new(point(px(21.), px(0.)), size(px(30.), px(30.))));
+                window.with_content_mask(Some(mask), |window| {
+                    let effect = crate::GroupEffect {
+                        backdrop_filters: vec![crate::ResolvedFilter::Blur { x: blur, y: blur }],
+                        ..crate::GroupEffect::default()
+                    };
+                    window.with_effect_group(effect, None, |window| {
+                        window.paint_quad(fill(block(21., 0.), white()));
+                        window.paint_quad(fill(block(26., 5.), white()));
+                    });
+                });
+            }
+        };
+        assert!(eligible(backdrop_blurred(0.)), "no filter, no reach");
+        assert!(!eligible(backdrop_blurred(8.)), "the backdrop blur samples the caret");
+    }
+
+    #[test]
     fn a_caret_a_paint_does_not_allow_a_layer_for_stays_off_it() {
         assert!(!eligible(|window, anchor| {
             window.with_element_opacity(Some(0.5), |window| { window.paint_caret(bar(10.), ink(), anchor); });

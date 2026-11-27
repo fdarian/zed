@@ -745,7 +745,7 @@ impl Window {
                 continue;
             }
             let differs = built.len() != patched.len()
-                || built.iter().zip(patched).any(|(built, patched)| built.differs_from(patched));
+                || built.iter().zip(patched).any(|(built, patched)| built.differs_as_built(patched));
             if differs {
                 differences.push(format!(
                     "{id:?}\n{}",

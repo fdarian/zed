@@ -1801,6 +1801,18 @@ impl PaintOperation {
     /// Whether the operations paint differently, compared field by field through their debug
     /// form: most of what they hold has no equality, and an effect that fades is not a box.
     pub(crate) fn differs_from(&self, other: &PaintOperation) -> bool {
+        self.differs(other, true)
+    }
+
+    /// [`differs_from`](Self::differs_from) for comparing a recording with the frame built whole, which a
+    /// phase change cannot repaint: the `lit` of a caret that the window blinks is only the clock at the
+    /// paint there, so it is left out. A patch keeps comparing it, since a caret painted outside the group
+    /// it is spliced into is blinked by its painter at the group's replay although it does not say so.
+    pub(crate) fn differs_as_built(&self, other: &PaintOperation) -> bool {
+        self.differs(other, false)
+    }
+
+    fn differs(&self, other: &PaintOperation, window_phase_is_content: bool) -> bool {
         if !self.same_kind(other) {
             return true;
         }
@@ -1808,7 +1820,7 @@ impl PaintOperation {
         // their fields: formatting two of them costs a hundred thousand instructions, a root of a hundred
         // operations several million. A kind whose fields are all compared says so either way, and the debug form
         // tells apart only the kinds that are not.
-        if let Some(equal) = self.fields_equal(other) {
+        if let Some(equal) = self.fields_equal(other, window_phase_is_content) {
             return !equal;
         }
         match (self, other) {
@@ -1824,7 +1836,7 @@ impl PaintOperation {
     /// Whether the fields of the operations are equal, for a kind whose fields are all compared here: `None` for any
     /// other kind, which the debug form decides. A field that is not equal to itself (a NaN) makes the operations
     /// differ, which at worst has a patch write an operation again.
-    fn fields_equal(&self, other: &PaintOperation) -> Option<bool> {
+    fn fields_equal(&self, other: &PaintOperation, window_phase_is_content: bool) -> Option<bool> {
         match (self, other) {
             (PaintOperation::Primitive(Primitive::MonochromeSprite(a)), PaintOperation::Primitive(Primitive::MonochromeSprite(b))) => {
                 // Every field of `MonochromeSprite`, in the order it declares them.
@@ -1847,7 +1859,7 @@ impl PaintOperation {
                         && a.blink_anchor == b.blink_anchor
                         && a.layer_allowed == b.layer_allowed
                         && a.painter_blinks == b.painter_blinks
-                        && a.lit == b.lit,
+                        && ((!window_phase_is_content && !a.painter_blinks) || a.lit == b.lit),
                 )
             }
             (PaintOperation::StartLayer(a), PaintOperation::StartLayer(b)) => Some(a == b),
@@ -5359,7 +5371,7 @@ mod tests {
 
     /// What `differs_from` says without the debug form, which is `fields_equal` having an answer.
     fn told_by_fields(left: &PaintOperation, right: &PaintOperation) -> Option<bool> {
-        left.fields_equal(right).map(|equal| !equal)
+        left.fields_equal(right, true).map(|equal| !equal)
     }
 
     #[test]
@@ -5740,5 +5752,11 @@ mod tests {
             assert_eq!(told_by_fields(&same, &changed), Some(true), "caret field {field}");
         }
         assert!(!same.same_kind(&PaintOperation::Quad(base.quad)));
+        // Against the frame built whole, the phase of a caret that the window blinks is not what it paints.
+        let dark = PaintOperation::Caret(Caret { lit: false, ..base });
+        assert!(!same.differs_as_built(&dark));
+        let painted = PaintOperation::Caret(Caret { painter_blinks: true, ..base });
+        let painted_dark = PaintOperation::Caret(Caret { painter_blinks: true, lit: false, ..base });
+        assert!(painted.differs_as_built(&painted_dark));
     }
 }
