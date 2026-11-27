@@ -1583,10 +1583,25 @@ struct LiftList {
     next_ordinal: u32,
 }
 
+/// Whether culling leaves out what is painted within `reach`: it does not touch `mask`. A mask with no area hides
+/// everything, whatever touches its edge: a box wholly below an `overflow: hidden` clip has the clip's mask cut down to a
+/// line at its top edge.
+pub(crate) fn reach_is_apart_from_mask(mask: Bounds<Pixels>, reach: Bounds<Pixels>) -> bool {
+    mask.size.width <= px(0.)
+        || mask.size.height <= px(0.)
+        || reach.right() < mask.left()
+        || reach.left() > mask.right()
+        || reach.bottom() < mask.top()
+        || reach.top() > mask.bottom()
+}
+
 /// Where an element being lifted started, see [`Window::begin_lift`].
 pub(crate) struct LiftTicket {
     ordinal: u32,
     hitboxes_start: usize,
+    /// The scroller whose child this is, when the child is not a root: its stacking context paints it, and the scroller keeps
+    /// an eye on what it paints (see [`Window::scroll_patch_note_lifted_child`]).
+    scroll_owner: Option<crate::scroll_routing::ScrollerId>,
 }
 
 /// Identifies a lifted element that is a retained subtree whose paint is replayed from its own
@@ -5197,16 +5212,7 @@ impl Window {
             return false;
         };
         let inflate = |bounds: Bounds<Pixels>| space.inflate(bounds, outset, slack);
-        // A mask with no area hides everything, whatever touches its edge: a box wholly below an
-        // `overflow: hidden` clip has the clip's mask cut down to a line at its top edge.
-        let mask_is_empty = mask.size.width <= px(0.) || mask.size.height <= px(0.);
-        let apart = |reach: Bounds<Pixels>| {
-            mask_is_empty
-                || reach.right() < mask.left()
-                || reach.left() > mask.right()
-                || reach.bottom() < mask.top()
-                || reach.top() > mask.bottom()
-        };
+        let apart = |reach: Bounds<Pixels>| reach_is_apart_from_mask(mask, reach);
         let reach = inflate(self.bounds_in_window(space.own_box(bounds)));
         // Noted before the capture is looked at: a layout record made while an element holds the
         // capture is skipped after it lets go.
@@ -7374,6 +7380,7 @@ impl Window {
         LiftTicket {
             ordinal,
             hitboxes_start: self.next_frame.hitboxes.len(),
+            scroll_owner: None,
         }
     }
 
@@ -7402,7 +7409,7 @@ impl Window {
         let told = cell.is_some() || (hole.is_none() && open.is_some_and(|open| open.direct && !open.culled));
         let content_mask = self.content_mask();
         let entry = LiftedElement {
-            scroll_owner: self.scroll_patch_take_lift_owner(),
+            scroll_owner: ticket.scroll_owner,
             content: LiftedContent::Element(element),
             z,
             ordinal: ticket.ordinal,

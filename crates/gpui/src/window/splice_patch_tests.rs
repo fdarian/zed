@@ -283,7 +283,7 @@ impl Fixture {
             window.set_dom_hit_testing(true);
             window.set_contained_patches(true);
             window.set_scroll_patch(true);
-            window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
+            window.set_scroll_patch_gate(Some(Rc::new(|_, _, _| None)));
             let patched = state.clone();
             window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
                 let mut units = Vec::new();

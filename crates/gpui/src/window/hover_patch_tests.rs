@@ -173,7 +173,7 @@ impl Fixture {
                 window.force_effect_groups();
             }
             window.set_scroll_patch(true);
-            window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
+            window.set_scroll_patch_gate(Some(Rc::new(|_, _, _| None)));
             let knobs = knobs.clone();
             window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
                 let units = knobs
@@ -836,7 +836,7 @@ impl TallList {
         cx.update_window(window, |_, window, _| {
             window.set_dom_hit_testing(true);
             window.set_scroll_patch(translates);
-            window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
+            window.set_scroll_patch_gate(Some(Rc::new(|_, _, _| None)));
             window.set_frame_patcher(translates.then(|| Rc::new(move |window: &mut Window, cx: &mut App| {
                 let units = watched
                     .1

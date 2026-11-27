@@ -1794,12 +1794,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Runs when a frame moved the content of this scroller without building it (see
     /// [`Window::note_scroll_moved`]): what the element's build would have done with the new offset
-    /// outside the frame, such as the boxes its own children wrote. Only [`Div`] runs it.
+    /// outside the frame, such as the boxes its own children wrote. Only [`Div`] runs it. `ready` says whether it can run
+    /// now: a frame that finds it cannot is built whole instead.
     fn on_scroll_translated(
         mut self,
+        ready: impl Fn() -> bool + 'static,
         translated: impl Fn(&mut Window, &mut App, crate::ScrollTranslation) + 'static,
     ) -> Self {
-        self.interactivity().scroll_translated = Some(std::rc::Rc::new(translated));
+        self.interactivity().scroll_translated =
+            Some(crate::ScrollTranslated { ready: std::rc::Rc::new(ready), run: std::rc::Rc::new(translated) });
         self
     }
 
@@ -2145,9 +2148,9 @@ fn prepaint_child(
         return;
     };
     let root = child.downcast_mut::<crate::Retained>().is_some_and(|root| root.is_relocatable());
-    let ticket = window.begin_lift();
+    let mut ticket = window.begin_lift();
     child.prepaint(window, cx);
-    window.scroll_patch_note_lifted_child(&ticket, root);
+    window.scroll_patch_note_lifted_child(&mut ticket, root);
     #[cfg(feature = "stacker")]
     let element = mem::replace(child, StackSafe::new(Empty.into_any_element())).into_inner();
     #[cfg(not(feature = "stacker"))]

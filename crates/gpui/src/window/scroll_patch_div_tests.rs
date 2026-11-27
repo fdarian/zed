@@ -5,7 +5,7 @@ use super::scroll_patch_tests::shown;
 use crate::{
     AnyWindowHandle, AppContext as _, Bounds, Context, Edges, InteractiveElement, IntoElement, MouseMoveEvent, ParentElement,
     PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollPatchReason, ScrollThumbMiss, ScrollWheelEvent,
-    StatefulInteractiveElement as _, Styled, TestAppContext, Window, div, fill, point, px, retained, size,
+    Position, ScrollApplyDecline, StatefulInteractiveElement as _, Styled, TestAppContext, Window, div, fill, point, px, retained, size,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -30,11 +30,27 @@ impl Bar {
         Self { alpha: Rc::new(Cell::new(1.)), length: Rc::new(Cell::new(20.)), moved: Rc::default() }
     }
 
-    fn thumb(handle: &ScrollHandle, length: f32) -> Bounds<crate::Pixels> {
+    fn thumb(handle: &ScrollHandle, length: f32, horizontal: bool) -> Bounds<crate::Pixels> {
         let travel = VIEW - length;
-        let top = f32::from(-handle.offset().y) / (ROW * ROWS as f32 - VIEW) * travel;
-        Bounds::new(point(px(92.), px(top)), size(px(6.), px(length)))
+        let offset = if horizontal { handle.offset().x } else { handle.offset().y };
+        let along = f32::from(-offset) / (ROW * ROWS as f32 - VIEW) * travel;
+        match horizontal {
+            true => Bounds::new(point(px(along), px(92.)), size(px(length), px(6.))),
+            false => Bounds::new(point(px(92.), px(along)), size(px(6.), px(length))),
+        }
     }
+}
+
+/// What the scroller holds besides its roots that is painted in an order of its own.
+#[derive(Clone, Copy, PartialEq)]
+enum Layer {
+    None,
+    /// The scroller is a stacking context of its own.
+    Context,
+    /// A `position: sticky` child.
+    Sticky,
+    /// A positioned child with a `z-index`, which its stacking context paints.
+    ZIndex,
 }
 
 #[derive(Clone)]
@@ -55,6 +71,11 @@ struct Page {
     nested: bool,
     /// Each root is a stacking context of its own that an absolute box in it is handed to.
     row_context: bool,
+    layer: Layer,
+    /// The scroller scrolls along x, and the roots are columns (only with a box that holds them).
+    horizontal: bool,
+    /// Whether the owner of the scroller can be told that a frame moved its content.
+    ready: Rc<Cell<bool>>,
     bar: Option<Bar>,
     key: Rc<Cell<u64>>,
     /// How far each frame that moved the content in place said it moved it.
@@ -69,9 +90,15 @@ impl Render for Page {
                 let hitboxes = page.hitboxes;
                 let row_context = page.row_context;
                 let spacer = page.spacer;
+                let horizontal = page.horizontal;
                 let mut row = retained(("row", ix), page.key.get(), move |_, _| {
-                    let row = div().id(("row", ix)).w(px(80.)).h(px(ROW)).bg(crate::hsla(ix as f32 / 100., 0.5, 0.5, 1.));
-                    let row = if spacer { row.absolute().top(px(ix as f32 * ROW)) } else { row };
+                    let row = div().id(("row", ix)).bg(crate::hsla(ix as f32 / 100., 0.5, 0.5, 1.));
+                    let row = if horizontal { row.w(px(ROW)).h(px(80.)) } else { row.w(px(80.)).h(px(ROW)) };
+                    let row = match (spacer, horizontal) {
+                        (true, true) => row.absolute().left(px(ix as f32 * ROW)),
+                        (true, false) => row.absolute().top(px(ix as f32 * ROW)),
+                        (false, _) => row,
+                    };
                     let row = if hitboxes { row.always_hitbox() } else { row };
                     let row = if row_context {
                         row.stacking_context().child(div().absolute().top(px(2.)).left(px(2.)).w(px(10.)).h(px(10.)).bg(crate::red()))
@@ -92,27 +119,33 @@ impl Render for Page {
                 row.into_any_element()
             })
             .collect();
-        let mut scroller = div()
+        let scroller = div()
             .id("scroller")
             .w(px(100.))
             .h(px(VIEW))
-            .overflow_y_scroll()
             .track_scroll(&self.handle)
-            .on_scroll_translated({
-                let told = self.told.clone();
-                move |_, _, translation| told.borrow_mut().push(translation.shift)
-            });
+            .on_scroll_translated(
+                {
+                    let ready = self.ready.clone();
+                    move || ready.get()
+                },
+                {
+                    let told = self.told.clone();
+                    move |_, _, translation| told.borrow_mut().push(translation.shift)
+                },
+            );
+        let mut scroller = if self.horizontal { scroller.overflow_x_scroll() } else { scroller.overflow_y_scroll() };
         scroller.style().allow_concurrent_scroll = Some(true);
         let scroller = match self.bar.clone() {
             None => scroller,
             Some(bar) => {
-                let handle = self.handle.clone();
+                let (handle, horizontal) = (self.handle.clone(), self.horizontal);
                 scroller.paint_overlay(move |_, window, _| {
                     let painted = (bar.alpha.get(), bar.length.get());
                     let thumb = (painted.0 > 0.).then(|| {
                         let mut color = crate::black();
                         color.a = painted.0;
-                        fill(Bar::thumb(&handle, painted.1), color)
+                        fill(Bar::thumb(&handle, painted.1, horizontal), color)
                     });
                     let plan = Rc::new({
                         let (bar, handle) = (bar.clone(), handle.clone());
@@ -126,7 +159,7 @@ impl Render for Page {
                             if bar.length.get() != painted.1 {
                                 return Err(ScrollThumbMiss::Size);
                             }
-                            let next = Bar::thumb(&handle, painted.1);
+                            let next = Bar::thumb(&handle, painted.1, horizontal);
                             Ok((drawn != Some(next)).then_some(next))
                         }
                     });
@@ -144,8 +177,20 @@ impl Render for Page {
         } else {
             scroller
         };
+        let scroller = match self.layer {
+            Layer::None => scroller,
+            Layer::Context => scroller.stacking_context(),
+            Layer::Sticky => {
+                let mut sticky = div().id("sticky").w(px(40.)).h(px(10.)).bg(crate::black());
+                sticky.style().position = Some(Position::Sticky);
+                sticky.style().inset.top = Some(px(0.).into());
+                scroller.child(sticky)
+            }
+            Layer::ZIndex => scroller.child(div().id("raised").relative().z_index(1).w(px(10.)).h(px(10.)).bg(crate::red())),
+        };
         let content = if self.spacer {
-            let mut spacer = div().relative().w_full().h(px(ROW * ROWS as f32));
+            let spacer = div().relative();
+            let mut spacer = if self.horizontal { spacer.w(px(ROW * ROWS as f32)).h_full() } else { spacer.w_full().h(px(ROW * ROWS as f32)) };
             if self.spacer_hitbox {
                 spacer = spacer.always_hitbox();
             }
@@ -181,7 +226,7 @@ impl Fixture {
         cx.update_window(window, |_, window, _| {
             window.set_dom_hit_testing(true);
             window.set_scroll_patch(true);
-            window.set_scroll_patch_gate(Some(Rc::new(|_, _| None)));
+            window.set_scroll_patch_gate(Some(Rc::new(|_, _, _| None)));
         })
         .unwrap();
         let fixture = Self { window, page };
@@ -211,12 +256,9 @@ impl Fixture {
     /// the one shown after it.
     fn scroll(&self, cx: &mut TestAppContext, x: f32, y: f32, by: f32) {
         self.point_at(cx, x, y);
+        let delta = if self.page.horizontal { point(px(-by), px(0.)) } else { point(px(0.), px(-by)) };
         cx.update_window(self.window, |_, window, cx| {
-            let event = ScrollWheelEvent {
-                position: point(px(x), px(y)),
-                delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
-                ..Default::default()
-            };
+            let event = ScrollWheelEvent { position: point(px(x), px(y)), delta: ScrollDelta::Pixels(delta), ..Default::default() };
             window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
         })
         .unwrap();
@@ -244,6 +286,9 @@ impl Page {
             hitboxes: true,
             nested: false,
             row_context: false,
+            layer: Layer::None,
+            horizontal: false,
+            ready: Rc::new(Cell::new(true)),
             bar: None,
             key: Rc::new(Cell::new(1)),
             told: Rc::default(),
@@ -440,7 +485,7 @@ fn a_pointer_that_moved_is_a_hover_change(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_commit_the_owner_reports_is_an_edit(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx);
-    fixture.with_window(cx, |window| window.set_scroll_patch_gate(Some(Rc::new(|_, _| Some(ScrollPatchReason::Edited)))));
+    fixture.with_window(cx, |window| window.set_scroll_patch_gate(Some(Rc::new(|_, _, _| Some(ScrollPatchReason::Edited)))));
     fixture.scroll(cx, 10., 12., 5.);
     only(&fixture.counters(cx), ScrollPatchReason::Edited, &[]);
 }
@@ -579,4 +624,115 @@ fn a_thumb_that_the_scroll_moves_is_checked_against_the_frame_built_whole(cx: &m
         assert_eq!(window.retention_mismatches(), &[] as &[String]);
         assert!(window.retained_counters().verified >= 1);
     });
+}
+
+#[gpui::test]
+fn a_translate_of_a_horizontal_scroller_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    let page = || {
+        let mut page = Page::standard();
+        page.horizontal = true;
+        page.bar = Some(Bar::new());
+        page
+    };
+    let wheels = [5., 5., 7., -3., -4., 6., 2., -2., 1.];
+    let (translated, counters) = after_wheels(cx, page(), true, &wheels);
+    let (built, off) = after_wheels(cx, page(), false, &wheels);
+    assert_eq!(off.frames, 0, "{off:?}");
+    assert!(counters.patched >= 4, "{counters:?}");
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    for cause in [ScrollPatchCause::ThumbSize, ScrollPatchCause::ThumbAlpha, ScrollPatchCause::ThumbAppear, ScrollPatchCause::ThumbTrack] {
+        assert_eq!(counters.held_cause(cause), 0, "{cause:?}: {counters:?}");
+    }
+    assert_the_same(&translated, &built, &counters, "a horizontal scroller");
+}
+
+#[gpui::test]
+fn a_horizontal_wheel_moves_the_offset_along_x_only(cx: &mut TestAppContext) {
+    let mut page = Page::standard();
+    page.horizontal = true;
+    let fixture = Fixture::open(cx, page);
+    fixture.scroll(cx, 10., 12., 5.);
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.patched), (1, 1, 1), "{counters:?}");
+    assert_eq!(fixture.page.handle.offset(), point(px(-5.), px(0.)));
+    assert_eq!(*fixture.page.told.borrow(), [point(px(-5.), px(0.))]);
+}
+
+#[gpui::test]
+fn a_scroller_moved_past_its_range_along_x_is_not_a_translate(cx: &mut TestAppContext) {
+    let mut page = Page::standard();
+    page.horizontal = true;
+    let fixture = Fixture::open(cx, page);
+    let max = fixture.page.handle.max_offset().x;
+    assert!(max > px(0.), "the content is wider than the scroller");
+    let view = cx.update_window(fixture.window, |view, _, _| view.entity_id()).unwrap();
+    for (offset, eligible) in [(px(-5.), 1), (-max - px(50.), 0), (px(20.), 0)] {
+        let before = fixture.counters(cx);
+        fixture.page.handle.set_offset(point(offset, px(0.)));
+        fixture.with_window(cx, |window| window.note_scroll_moved(view));
+        fixture.draw(cx);
+        let counters = fixture.counters(cx);
+        assert_eq!(counters.frames, before.frames + 1, "{offset:?}: {counters:?}");
+        assert_eq!(counters.eligible, before.eligible + eligible, "{offset:?}: {counters:?}");
+        assert_eq!(counters.reasons(ScrollPatchReason::Other), before.reasons(ScrollPatchReason::Other) + (1 - eligible), "{offset:?}: {counters:?}");
+        // The frame built whole is the one the next scroll is judged from.
+        fixture.draw(cx);
+    }
+}
+
+#[gpui::test]
+fn what_holds_the_content_in_an_order_of_its_own_is_layered(cx: &mut TestAppContext) {
+    for layer in [Layer::Context, Layer::Sticky] {
+        let mut page = Page::standard();
+        page.layer = layer;
+        let fixture = Fixture::open(cx, page);
+        fixture.scroll(cx, 10., 12., 5.);
+        let counters = fixture.counters(cx);
+        assert_eq!((counters.frames, counters.eligible), (1, 0), "{counters:?}");
+        assert_eq!(counters.held_cause(ScrollPatchCause::Layered), 1, "a stacking context: {counters:?}");
+    }
+}
+
+#[gpui::test]
+fn a_child_with_a_z_index_is_what_no_root_holds(cx: &mut TestAppContext) {
+    let mut page = Page::standard();
+    page.layer = Layer::ZIndex;
+    let fixture = Fixture::open(cx, page);
+    fixture.scroll(cx, 10., 12., 5.);
+    only(&fixture.counters(cx), ScrollPatchReason::NotRelocatable, &[ScrollPatchCause::Unrooted]);
+}
+
+#[gpui::test]
+fn the_owner_is_given_the_scroller_the_translate_moves(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx);
+    let (gated, settled) = (Rc::new(RefCell::new(Vec::new())), Rc::new(RefCell::new(Vec::new())));
+    fixture.with_window(cx, |window| {
+        let log = gated.clone();
+        window.set_scroll_patch_gate(Some(Rc::new(move |_, _, translating| {
+            log.borrow_mut().push(translating);
+            None
+        })));
+        let log = settled.clone();
+        window.set_scroll_patch_settled(Some(Rc::new(move |_, _, moved| log.borrow_mut().push(moved))));
+    });
+    fixture.scroll(cx, 10., 12., 5.);
+    let key = fixture.page.handle.scroll_key();
+    assert_eq!(gated.borrow().last(), Some(&Some(key)));
+    assert_eq!(*settled.borrow(), [key]);
+}
+
+#[gpui::test]
+fn an_owner_that_cannot_be_told_declines_the_translate(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx);
+    fixture.page.ready.set(false);
+    fixture.scroll(cx, 10., 12., 5.);
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.patched), (1, 1, 0), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::Window), 1, "{counters:?}");
+    assert!(fixture.page.told.borrow().is_empty());
+    // The frame is built whole: the scroller is where the wheel put it.
+    assert_eq!(fixture.page.handle.offset().y, px(-5.));
+    fixture.page.ready.set(true);
+    fixture.scroll(cx, 10., 12., 5.);
+    assert_eq!(fixture.counters(cx).patched, 1, "{:?}", fixture.counters(cx));
 }

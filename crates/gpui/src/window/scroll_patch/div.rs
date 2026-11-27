@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use super::*;
 use crate::elements::snap_scroll_offset;
 use crate::ScrollHandle;
+use crate::window::reach_is_apart_from_mask;
 
 /// What a frame that moved the content of a scroller in place tells the owner of the scroller.
 pub struct ScrollTranslation {
@@ -26,7 +27,13 @@ pub struct ScrollTranslation {
 
 /// Tells the owner of a scroller that a frame moved its content in place, without building it (see
 /// [`crate::InteractiveElement::on_scroll_translated`]).
-pub type ScrollTranslated = Rc<dyn Fn(&mut Window, &mut App, ScrollTranslation)>;
+#[derive(Clone)]
+pub struct ScrollTranslated {
+    /// Whether the owner can be told now. A translate that finds it cannot is declined before it writes anything
+    /// ([`ScrollApplyDecline::Window`]), and the frame is built whole.
+    pub ready: Rc<dyn Fn() -> bool>,
+    pub run: Rc<dyn Fn(&mut Window, &mut App, ScrollTranslation)>,
+}
 
 /// What a scroller says of its prepaint to the frame it leaves, see [`Window::scroll_patch_end_div`].
 pub(crate) struct DivScroll {
@@ -44,7 +51,6 @@ pub(crate) struct DivMark {
     escapes: u32,
 }
 
-/// Where the paint of the children of a scroller begins.
 pub(crate) struct DivPaint {
     id: ScrollerId,
     start: usize,
@@ -61,13 +67,7 @@ pub(super) struct Culled {
 impl Culled {
     /// Whether culling would leave the child out of a frame that has the content moved by `shift`.
     fn stays_apart(&self, shift: Point<Pixels>) -> bool {
-        let mask = self.mask;
-        mask.size.width <= px(0.)
-            || mask.size.height <= px(0.)
-            || self.reaches.iter().all(|reach| {
-                let reach = Bounds::new(reach.origin + shift, reach.size);
-                reach.right() < mask.left() || reach.left() > mask.right() || reach.bottom() < mask.top() || reach.top() > mask.bottom()
-            })
+        self.reaches.iter().all(|reach| reach_is_apart_from_mask(self.mask, Bounds::new(reach.origin + shift, reach.size)))
     }
 }
 
@@ -161,7 +161,6 @@ impl Window {
         Some(mark)
     }
 
-    /// The scroller prepainted its children.
     pub(crate) fn scroll_patch_end_div(&mut self, mark: DivMark, div: DivScroll) {
         let clip = self.content_mask();
         let (stickies, escapes) = (self.retained.sticky.get(), self.escapes_prepainted());
@@ -242,7 +241,7 @@ impl Window {
     /// What a root that is built in this frame hands to a stacking context of its own is the root's: its recording holds it
     /// (the root's run, which the paint of the root notes), and the operations it paints are numbered in the recording
     /// it is painted into, not in the frame.
-    pub(crate) fn scroll_patch_note_lifted_child(&mut self, ticket: &LiftTicket, root: bool) {
+    pub(crate) fn scroll_patch_note_lifted_child(&mut self, ticket: &mut LiftTicket, root: bool) {
         if root || self.is_recording_any_relocation() {
             return;
         }
@@ -250,11 +249,7 @@ impl Window {
             return;
         };
         open.lifted_hitboxes.extend(self.next_frame.hitboxes[ticket.hitboxes_start..].iter().map(|hitbox| hitbox.id));
-        self.next_frame.scroll.lift_owner = Some(open.id);
-    }
-
-    pub(crate) fn scroll_patch_take_lift_owner(&mut self) -> Option<ScrollerId> {
-        self.next_frame.scroll.lift_owner.take()
+        ticket.scroll_owner = Some(open.id);
     }
 
     /// The stacking context painted a lifted child of the scroller `owner` that is not a root, from the operation `start`.
@@ -316,7 +311,6 @@ impl Window {
         count
     }
 
-    /// Where each hitbox of the frame shown is, by id.
     pub(super) fn hitbox_places(&self) -> FxHashMap<HitboxId, usize> {
         self.rendered_frame.hitboxes.iter().enumerate().map(|(ix, hitbox)| (hitbox.id, ix)).collect()
     }
@@ -326,7 +320,9 @@ impl Window {
         use ScrollPatchReason as Reason;
 
         let shown = &self.rendered_frame.scroll;
-        let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self, cx));
+        let mut moved = shown.divs.iter().filter(|div| div.moved());
+        let (first, second) = (moved.next(), moved.next());
+        let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self, cx, first.filter(|_| second.is_none()).map(|div| div.id)));
         // A row that a patch repainted is shown as the patch painted it, and its recording is of the paint before.
         if self.scroll_patch.gate.is_none()
             || gate == Some(Reason::Other)
@@ -336,8 +332,7 @@ impl Window {
         {
             return Verdict::other();
         }
-        let mut moved = shown.divs.iter().filter(|div| div.moved());
-        let (Some(div), None) = (moved.next(), moved.next()) else {
+        let (Some(div), None) = (first, second) else {
             return Verdict::other();
         };
         if div.stale || shown.lists.iter().any(|list| list.state.scrolled() != list.scrolled) {
@@ -487,6 +482,9 @@ impl Window {
             .iter()
             .find(|div| div.id == prediction.list)
             .ok_or(ScrollApplyDecline::Runs)?;
+        if div.translated.as_ref().is_some_and(|owner| !(owner.ready)()) {
+            return Err(ScrollApplyDecline::Window);
+        }
         let places = self.hitbox_places();
         let mut moves = Vec::new();
         for (index, run) in self.div_runs(div.id) {

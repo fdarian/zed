@@ -299,7 +299,7 @@ pub enum ScrollApplyDecline {
     /// The operation a thumb painted in the frame shown is not the quad it noted.
     Thumb,
     /// The window is in a state a frame is not swapped in: it only lays out, measures, or an
-    /// input is being dispatched.
+    /// input is being dispatched. Or the owner of a scroller cannot be told of the move now.
     Window,
     /// A row that comes in was built and is not a relocatable root with a recording and a run, or a row
     /// that leaves has none to take out.
@@ -590,8 +590,6 @@ pub(crate) struct ScrollFrame {
     row: Option<usize>,
     /// What culling tested for the child it last culled, see [`Window::scroll_patch_note_culled`].
     cull: div::CullTrace,
-    /// The scroller whose lifted child is about to be handed to its stacking context.
-    lift_owner: Option<ScrollerId>,
     /// Where in `runs` the paint of the roots is.
     painted: usize,
     viewport: Size<Pixels>,
@@ -779,8 +777,8 @@ struct Prediction {
     div: Option<Point<Pixels>>,
 }
 
-pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window, &App) -> Option<ScrollPatchReason>>;
-pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App)>;
+pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window, &App, Option<crate::ScrollKey>) -> Option<ScrollPatchReason>>;
+pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App, crate::ScrollKey)>;
 pub(crate) type ScrollPatchRegistries = Rc<dyn Fn(&Window) -> String>;
 
 #[derive(Default)]
@@ -822,16 +820,22 @@ impl Window {
     /// an animation of its own has frames to run, [`ScrollPatchReason::Clock`] when something
     /// that follows the clock asked for the next frame and [`ScrollPatchReason::Other`] when it
     /// has no whole frame shown. It runs once per classified frame, before the frame is built,
-    /// with the [`App`] for the entities that hold what it reads.
-    pub fn set_scroll_patch_gate(&mut self, gate: Option<Rc<dyn Fn(&Window, &App) -> Option<ScrollPatchReason>>>) {
+    /// with the [`App`] for the entities that hold what it reads, and the key of the scroller the
+    /// frame would be a move of, if exactly one scroller that the frame shown knows has moved: a
+    /// scroller it does not know (one inside a recorded subtree) moves nothing, so what the owner
+    /// finds moved besides that scroller is an edit.
+    pub fn set_scroll_patch_gate(
+        &mut self,
+        gate: Option<Rc<dyn Fn(&Window, &App, Option<crate::ScrollKey>) -> Option<ScrollPatchReason>>>,
+    ) {
         self.scroll_patch.gate = gate;
     }
 
     /// Lets the owner of the window follow a frame that moved the rows in place: `settled` runs
     /// after the draw (as a callback deferred from it), for what the owner does after a frame
     /// that built the content under the pointer, such as following a hover once a scroll that
-    /// ended has moved the rows.
-    pub fn set_scroll_patch_settled(&mut self, settled: Option<Rc<dyn Fn(&mut Window, &mut App)>>) {
+    /// ended has moved the rows. It is given the key of the scroller whose content the frame moved.
+    pub fn set_scroll_patch_settled(&mut self, settled: Option<Rc<dyn Fn(&mut Window, &mut App, crate::ScrollKey)>>) {
         self.scroll_patch.settled = settled;
     }
 
@@ -1036,8 +1040,8 @@ impl Window {
     /// or why it cannot go there, and `moved` runs after the rows were moved with the thumb.
     /// `repaint` says, with no scroll, whether the thumb is to be painted another color (see
     /// [`Window::plan_scroll_thumb_repaints`]). Returns whether the frame being built notes the bar: a
-    /// window whose scroll patch is off, or a pass that only lays out, does not, and then nothing
-    /// repaints the thumb. A
+    /// window whose scroll patch is off, a pass that only lays out, or a bar inside a recording (a root that a
+    /// translate moves as a whole holds it), does not, and then nothing repaints the thumb. A
     /// bar that does not note itself is not known to a translate, which would leave its thumb
     /// where it was: a list whose bar is painted that way is declined for by the owner (see
     /// [`Window::set_scroll_patch_gate`]).
@@ -1055,16 +1059,17 @@ impl Window {
         if let Some(quad) = thumb {
             self.paint_quad(quad);
         }
-        if !self.scroll_patch_records() {
+        // A bar inside a recording moves with what holds it: the roots that hold it are moved as a whole, and it is no
+        // scroller of the frame shown, so a translate has nothing to plan for it.
+        if !self.scroll_patch_records() || self.is_recording_any_relocation() {
             return false;
         }
         let end = self.next_frame.scene.len();
         let one_quad = end == first + 1
             && matches!(self.next_frame.scene.paint_operations[first], PaintOperation::Quad(_))
-            && !self.placement().general
-            && !self.is_recording_any_relocation();
+            && !self.placement().general;
         let paint = match bounds {
-            _ if end == first && !self.is_recording_any_relocation() => ThumbPaint::Nothing,
+            _ if end == first => ThumbPaint::Nothing,
             Some(bounds) if one_quad => ThumbPaint::Quad { op: first, bounds, opacity },
             _ => ThumbPaint::Untracked,
         };
@@ -1197,7 +1202,9 @@ impl Window {
     /// drawn, by being measured.
     fn scrolled_list(&self, measured: Pixels, cx: &App) -> Result<ScrolledList<'_>, Verdict> {
         let shown = &self.rendered_frame.scroll;
-        let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self, cx));
+        let mut moved = shown.lists.iter().filter(|list| list.state.scrolled() != list.scrolled + measured);
+        let (first, second) = (moved.next(), moved.next());
+        let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self, cx, first.filter(|_| second.is_none()).map(|list| list.id)));
         // A row that a patch repainted is shown as the patch painted it, and its recording is of the paint
         // before: a translate would put that back.
         if self.scroll_patch.gate.is_none() || gate == Some(ScrollPatchReason::Other) || shown.lists.is_empty() || self.patch.recordings_stale {
@@ -1206,8 +1213,7 @@ impl Window {
         if shown.viewport != self.viewport_size || shown.scale_factor != self.scale_factor {
             return Err(Verdict::other());
         }
-        let mut moved = shown.lists.iter().filter(|list| list.state.scrolled() != list.scrolled + measured);
-        let (Some(list), None) = (moved.next(), moved.next()) else {
+        let (Some(list), None) = (first, second) else {
             return Err(Verdict::other());
         };
         if list.state.is_settling() {
@@ -1566,7 +1572,8 @@ impl Window {
         self.needs_present.set(true);
         self.reset_cursor_style(cx);
         if let Some(settled) = self.scroll_patch.settled.clone() {
-            self.defer(cx, move |window, cx| settled(window, cx));
+            let moved = prediction.list;
+            self.defer(cx, move |window, cx| settled(window, cx, moved));
         }
         if !self.drawing_for_frame_request {
             self.platform_window.schedule_frame();
@@ -2130,8 +2137,8 @@ impl Window {
                 hook(RetainedPhase::Scrolled(prediction.shift), total, self, cx);
             }
         }
-        if let Some((translated, translation)) = translated {
-            translated(self, cx, translation);
+        if let Some((owner, translation)) = translated {
+            (owner.run)(self, cx, translation);
         }
     }
 
