@@ -15,9 +15,18 @@ use super::*;
 use crate::elements::snap_scroll_offset;
 use crate::ScrollHandle;
 
-/// Tells the owner of a scroller that a frame moved its content in place, by `shift`, without building it (see
+/// What a frame that moved the content of a scroller in place tells the owner of the scroller.
+pub struct ScrollTranslation {
+    /// How far the content moved.
+    pub shift: Point<Pixels>,
+    /// The roots the frame moved from their recordings: what they hold is moved with them, and what is between the
+    /// scroller and them is not.
+    pub roots: Vec<GlobalElementId>,
+}
+
+/// Tells the owner of a scroller that a frame moved its content in place, without building it (see
 /// [`crate::InteractiveElement::on_scroll_translated`]).
-pub type ScrollTranslated = Rc<dyn Fn(&mut Window, &mut App, Point<Pixels>)>;
+pub type ScrollTranslated = Rc<dyn Fn(&mut Window, &mut App, ScrollTranslation)>;
 
 /// What a scroller says of its prepaint to the frame it leaves, see [`Window::scroll_patch_end_div`].
 pub(crate) struct DivScroll {
@@ -494,7 +503,11 @@ impl Window {
 
     /// Writes what a translate of a scroller's content leaves outside its runs, once the runs are moved: the hitboxes no
     /// root holds, what the scroller's own state says of its offset, and what its owner does for the move.
-    pub(super) fn write_div_moved(&mut self, prediction: &Prediction, scrolled_hitboxes: Vec<(usize, Hitbox)>) -> Option<ScrollTranslated> {
+    pub(super) fn write_div_moved(
+        &mut self,
+        prediction: &Prediction,
+        scrolled_hitboxes: Vec<(usize, Hitbox)>,
+    ) -> Option<(ScrollTranslated, ScrollTranslation)> {
         for (ix, hitbox) in scrolled_hitboxes {
             self.rendered_frame.hitboxes[ix] = hitbox;
         }
@@ -511,7 +524,9 @@ impl Window {
         if let Some(handle) = &div.handle {
             handle.note_scrolled_in_place(offset);
         }
-        div.translated.clone()
+        let translated = div.translated.clone()?;
+        let roots = self.div_runs(prediction.list).map(|(_, run)| run.id.clone()).collect();
+        Some((translated, ScrollTranslation { shift, roots }))
     }
 
     /// Whether the runs of the scroller the frame built are what a translate predicted: the same ones, each put from

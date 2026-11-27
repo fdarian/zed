@@ -1792,12 +1792,12 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Runs when a frame moved the content of this scroller by `shift` without building it (see
+    /// Runs when a frame moved the content of this scroller without building it (see
     /// [`Window::note_scroll_moved`]): what the element's build would have done with the new offset
     /// outside the frame, such as the boxes its own children wrote. Only [`Div`] runs it.
     fn on_scroll_translated(
         mut self,
-        translated: impl Fn(&mut Window, &mut App, Point<Pixels>) + 'static,
+        translated: impl Fn(&mut Window, &mut App, crate::ScrollTranslation) + 'static,
     ) -> Self {
         self.interactivity().scroll_translated = Some(std::rc::Rc::new(translated));
         self
@@ -2552,10 +2552,7 @@ impl Div {
         let scroll_patch_offset = self.interactivity.scroll_offset.clone();
         let scroll_patch_handle = self.interactivity.tracked_scroll_handle.clone();
         let scroll_translated = self.interactivity.scroll_translated.clone();
-        let reorders_children = self.stacking_context
-            || self.paint_ranks.is_some()
-            || self.prepaint_order_fn.is_some()
-            || content_lock.is_some();
+        let reorders_children = self.stacking_context || self.prepaint_order_fn.is_some() || content_lock.is_some();
         let content_end = self.interactivity.content_end;
         let scrollbar_size = self.interactivity.scrollbar_size;
         let paint_order = self.paint_ranks.as_ref().map(|_| self.child_paint_order());
@@ -2700,7 +2697,8 @@ impl Div {
                                             offset,
                                             handle: scroll_patch_handle.clone(),
                                             translated: scroll_translated.clone(),
-                                            reorders: reorders_children,
+                                            // The ranks order the children only where no stacking context holds them.
+                                            reorders: reorders_children || (self.paint_ranks.is_some() && !lifting),
                                         },
                                     );
                                 }

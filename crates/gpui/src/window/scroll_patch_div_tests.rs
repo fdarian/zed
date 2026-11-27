@@ -92,7 +92,7 @@ impl Render for Page {
             .track_scroll(&self.handle)
             .on_scroll_translated({
                 let told = self.told.clone();
-                move |_, _, shift| told.borrow_mut().push(shift)
+                move |_, _, translation| told.borrow_mut().push(translation.shift)
             });
         scroller.style().allow_concurrent_scroll = Some(true);
         let scroller = match self.bar.clone() {

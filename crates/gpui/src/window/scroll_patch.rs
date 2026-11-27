@@ -72,7 +72,7 @@ mod div;
 mod shift;
 
 pub(crate) use div::{DivFrame, DivScroll};
-pub use div::ScrollTranslated;
+pub use div::{ScrollTranslated, ScrollTranslation};
 
 /// Why a frame drawn after a list scroll is not a pure translate of the frame shown, the first of
 /// them, in the order the checks run.
@@ -2130,8 +2130,8 @@ impl Window {
                 hook(RetainedPhase::Scrolled(prediction.shift), total, self, cx);
             }
         }
-        if let Some(translated) = translated {
-            translated(self, cx, prediction.shift);
+        if let Some((translated, translation)) = translated {
+            translated(self, cx, translation);
         }
     }
 
