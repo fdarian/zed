@@ -1093,6 +1093,7 @@ impl MacWindow {
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
         keep_frame: bool,
+        invisible: bool,
     ) -> Self {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
@@ -1182,6 +1183,13 @@ impl MacWindow {
             );
             assert!(!native_window.is_null());
             (*native_window).set_ivar(KEEPS_FRAME_IVAR, if keep_frame { YES } else { NO });
+            if invisible {
+                // Before the window is ordered in, so not one frame of it is composited. AppKit's
+                // occlusion state still counts a transparent window on a screen as visible, which a
+                // display link needs, and a window on no screen has no display to link to.
+                let _: () = msg_send![native_window, setAlphaValue: 0.0f64];
+                let _: () = msg_send![native_window, setIgnoresMouseEvents: YES];
+            }
             let () = msg_send![
                 native_window,
                 registerForDraggedTypes:
@@ -1428,6 +1436,14 @@ impl MacWindow {
                         }
                     }
                 }
+            }
+
+            if invisible && sheet_parent.is_none() && native_window.level() < NSFloatingWindowLevel {
+                // After the window kind's level, and only raised: a pop-up keeps its higher level
+                // and a sheet is attached to its parent's window. Above the other apps' windows,
+                // which a window that nobody sees can be, so that what lies over its place does
+                // not make it occluded and stop its link.
+                native_window.setLevel_(NSFloatingWindowLevel);
             }
 
             if focus && show {
