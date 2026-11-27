@@ -81,6 +81,10 @@ struct State {
     bar_rows: ListState,
     /// The bar notes a thumb for each axis, none for the horizontal one, as the bar of a scroller does.
     bar_axes: Cell<bool>,
+    /// The bar is in the sibling, not in the unit: it can only be put there when `bar_swaps` holds, which has the sibling hold
+    /// a placeholder of the bar's size from the start so that it keeps its boxes when the bar moves.
+    bar_in_sibling: Cell<bool>,
+    bar_swaps: Cell<bool>,
     /// The bar paints its thumb: it is off (noted with none) while it is not.
     bar_shown: Cell<bool>,
     /// The footer of the page paints the thumb of a bar of its own, after the unit, which a tick repaints in the color `fade`
@@ -131,6 +135,8 @@ impl State {
             bar_handle: ScrollHandle::new(),
             bar_rows: ListState::new(10, ListAlignment::Top, px(0.)).with_uniform_item_height(px(10.)),
             bar_axes: Cell::new(false),
+            bar_in_sibling: Cell::new(false),
+            bar_swaps: Cell::new(false),
             bar_shown: Cell::new(true),
             footer_bar: Cell::new(false),
             footer_handle: ScrollHandle::new(),
@@ -206,7 +212,10 @@ impl State {
             unit = unit.child(self.kid(index));
         }
         if let Some(bar) = self.bar.get() {
-            unit = unit.child(self.bar_scroller(bar));
+            unit = unit.child(match self.bar_in_sibling.get() {
+                true => self.bar_placeholder(),
+                false => self.bar_scroller(bar),
+            });
         }
         unit.into_any_element()
     }
@@ -247,9 +256,22 @@ impl State {
         }
     }
 
+    /// What is where the bar is not, of the size of its scroller, so that the unit and the sibling keep their boxes when the bar moves
+    /// from one to the other.
+    fn bar_placeholder(&self) -> AnyElement {
+        div().id("bar").w(px(40.)).h(px(20.)).flex_none().overflow_y_scroll().child(div().h(px(80.))).into_any_element()
+    }
+
     fn sibling(&self) -> AnyElement {
         let color = if self.sibling_green.get() { green() } else { red() };
-        div().id("sib").w(px(60.)).h(px(20.)).flex_none().bg(color).into_any_element()
+        let mut sibling = div().id("sib").w(px(60.)).h(px(20.)).flex_none().bg(color);
+        if let Some(bar) = self.bar.get().filter(|_| self.bar_swaps.get()) {
+            sibling = sibling.child(match self.bar_in_sibling.get() {
+                true => self.bar_scroller(bar),
+                false => self.bar_placeholder(),
+            });
+        }
+        sibling.into_any_element()
     }
 }
 
@@ -298,7 +320,7 @@ impl Render for Page {
             unit.into_any_element()
         };
         let sibling_state = state.clone();
-        let sibling = retained(SIBLING, 2_000, move |_, _| sibling_state.sibling()).patchable();
+        let sibling = retained(SIBLING, 2_000 + u64::from(state.bar_in_sibling.get()), move |_, _| sibling_state.sibling()).patchable();
         let rows = state.list.as_ref().map(|rows| {
             list(rows.clone(), move |index, _, _| {
                 retained(("row", index), 3_000, move |_, _| {
@@ -1837,8 +1859,11 @@ fn a_thumb_repainted_in_the_tick_that_splices_a_root_before_it_is_written_to_the
     assert_eq!(bar_fill, footer_fill, "both are painted black");
     let faded = format!("{:?}", crate::Background::from(green()));
     let mut relayouts = page.patches(cx).relayout_patches;
-    for (kids, what) in [(7, "3 to 7"), (1, "7 to 1")] {
+    // The bar notes one thumb in the frame shown, then two, then one again: the thumbs of the frame move by one each time, so
+    // a write by the place the plan found the footer's thumb at would land on the bar's.
+    for (kids, axes, what) in [(7, true, "3 to 7, one thumb for the bar to two"), (1, false, "7 to 1, two thumbs for the bar to one")] {
         page.state.change(kids);
+        page.state.bar_axes.set(axes);
         page.state.fade.set(Some(green()));
         page.tick(cx);
         let after = page.patches(cx);
@@ -1850,6 +1875,23 @@ fn a_thumb_repainted_in_the_tick_that_splices_a_root_before_it_is_written_to_the
         page.state.fade.set(None);
         page.draw_whole(cx);
     }
+}
+
+#[gpui::test]
+fn a_bar_moved_from_one_patched_root_to_another_declines_the_splice_and_the_frame_is_built_whole(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    state.bar.set(Some(BarOf::Div));
+    state.bar_swaps.set(true);
+    let page = Fixture::new(cx, state);
+    page.draw_whole(cx);
+    let before = page.patches(cx);
+    page.state.bar_in_sibling.set(true);
+    page.state.patch_sibling.set(true);
+    page.state.change(7);
+    page.tick(cx);
+    let after = page.patches(cx);
+    assert_eq!(after.declines(PatchDecline::Splice), before.declines(PatchDecline::Splice) + 1, "{:?}", page.state.seen.borrow());
+    page.assert_whole(cx, "a scroller whose bar was painted in one root and is in another");
 }
 
 #[gpui::test]

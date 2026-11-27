@@ -510,7 +510,9 @@ pub type ScrollThumbRepainter =
 pub struct ScrollThumbRepaints {
     /// The color each thumb is written with, by the bar it belongs to and not by where the frame keeps it: a splice
     /// between the plan and the write moves the thumbs of the frame.
-    writes: Vec<(ThumbKey, Background)>,
+    /// The repainter of each is the one the thumb had at the plan: a splice that put the scroller since replaced it with the
+    /// scratch frame's, which is painted in the color of now, so the write is dropped.
+    writes: Vec<(ThumbKey, ScrollThumbRepainter, Background)>,
     /// A thumb is written with no color at all: the frame built whole paints none there.
     vanishes: bool,
     done: Vec<Box<dyn FnOnce(&mut Window, &mut App)>>,
@@ -535,7 +537,7 @@ enum ThumbPaint {
 }
 
 /// Which thumb of the frame a bar noted: the scroller, and the place of the thumb among the ones that scroller noted (one
-/// per axis, in the same order every frame).
+/// per axis, x then y, noted every frame whether the bar shows it or not, so a thumb keeps its place).
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct ThumbKey {
     scroller: ScrollerId,
@@ -701,6 +703,15 @@ impl ScrollFrame {
         owners
     }
 
+    /// Whether a thumb of one of the `scrollers` is one quad painted outside `operations`: a scroller put in a part
+    /// whose bar was painted elsewhere in the frame (a scroller reparented from one root to another in a patch), so
+    /// what the part replaces does not hold the whole of it.
+    pub(crate) fn thumb_outside(&self, operations: &Range<usize>, scrollers: &[ScrollerId]) -> bool {
+        self.thumbs.iter().any(|thumb| {
+            scrollers.contains(&thumb.list) && matches!(thumb.paint, ThumbPaint::Quad { op, .. } if !operations.contains(&op))
+        })
+    }
+
     /// The thumbs the frame keeps for the scroller, with the operation of each that is one quad.
     #[cfg(test)]
     pub(crate) fn thumb_entries(&self, scroller: ScrollerId) -> Vec<Option<usize>> {
@@ -742,7 +753,8 @@ impl ScrollFrame {
     }
 
     /// Takes out the thumbs noted for one of the `scrollers` or painted by one of the operations in `operations`, with
-    /// the operation of each counted from where `operations` begins.
+    /// the operation of each counted from where `operations` begins. A quad of a scroller in `scrollers` lies inside
+    /// `operations`: [`Self::thumb_outside`] is false.
     pub(crate) fn take_thumbs(&mut self, operations: &Range<usize>, scrollers: &[ScrollerId]) -> Vec<ScrollThumb> {
         let (mut taken, kept): (Vec<ScrollThumb>, Vec<ScrollThumb>) =
             std::mem::take(&mut self.thumbs).into_iter().partition(|thumb| {
@@ -751,7 +763,6 @@ impl ScrollFrame {
         self.thumbs = kept;
         for thumb in &mut taken {
             if let ThumbPaint::Quad { op, bounds, opacity } = thumb.paint {
-                debug_assert!(operations.contains(&op), "a thumb taken with a part is painted inside it: {op} is outside {operations:?}");
                 thumb.paint = ThumbPaint::Quad { op: op - operations.start, bounds, opacity };
             }
         }
@@ -1204,7 +1215,7 @@ impl Window {
             };
             repaints.vanishes |= repaint.background.is_transparent();
             let background = repaint.background.opacity(opacity).scale_gradient(self.scale_factor);
-            repaints.writes.push((frame.scroll.thumb_key(index), background));
+            repaints.writes.push((frame.scroll.thumb_key(index), thumb.repaint.clone(), background));
             repaints.done.push(repaint.done);
         }
         Ok(repaints)
@@ -1215,18 +1226,22 @@ impl Window {
     /// and tells each owner. The frame is presented.
     pub fn repaint_scroll_thumbs(&mut self, repaints: ScrollThumbRepaints, cx: &mut App) {
         let ScrollThumbRepaints { writes, vanishes, done } = repaints;
-        if !writes.is_empty() {
-            // The thumbs are found by the bar they belong to, as a splice since the plan may have moved them (or put a new
-            // quad where one was). One that is not a quad of the scene any more is left as it is.
-            let edits: Vec<(usize, PaintOperation)> = writes
-                .into_iter()
-                .filter_map(|(key, background)| {
-                    let index = self.rendered_frame.scroll.thumb_index(key)?;
-                    let ThumbPaint::Quad { op, .. } = self.rendered_frame.scroll.thumbs[index].paint else { return None };
-                    let PaintOperation::Quad(current) = &self.rendered_frame.scene.paint_operations[op] else { return None };
-                    Some((op, PaintOperation::Quad(Quad { background, ..*current })))
-                })
-                .collect();
+        // The thumbs are found by the bar they belong to, as a splice since the plan may have moved them (or put a new
+        // quad where one was). One that is not a quad of the scene any more is left as it is.
+        let edits: Vec<(usize, PaintOperation)> = writes
+            .into_iter()
+            .filter_map(|(key, repaint, background)| {
+                let index = self.rendered_frame.scroll.thumb_index(key)?;
+                let thumb = &self.rendered_frame.scroll.thumbs[index];
+                if !Rc::ptr_eq(&thumb.repaint, &repaint) {
+                    return None;
+                }
+                let ThumbPaint::Quad { op, .. } = thumb.paint else { return None };
+                let PaintOperation::Quad(current) = &self.rendered_frame.scene.paint_operations[op] else { return None };
+                Some((op, PaintOperation::Quad(Quad { background, ..*current })))
+            })
+            .collect();
+        if !edits.is_empty() {
             self.patch.counters.thumb_repaints += edits.len() as u64;
             let scene = &mut self.rendered_frame.scene;
             self.damage.begin(scene);

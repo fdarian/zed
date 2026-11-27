@@ -430,7 +430,9 @@ impl Window {
                 scrollers.push(*scroller);
             }
         }
-        if held.iter().any(|scroller| !scratch.holds_thumb_of(*scroller)) || scrollers.iter().any(|scroller| scratch.is_list(*scroller) || self.rendered_frame.scroll.is_list(*scroller)) {
+        if held.iter().any(|scroller| !scratch.holds_thumb_of(*scroller))
+            || scratch.thumb_outside(&scratch_operations, &scrollers)
+            || scrollers.iter().any(|scroller| scratch.is_list(*scroller) || self.rendered_frame.scroll.is_list(*scroller)) {
             return Err(PatchDecline::Splice);
         }
         let nodes = old_pre.start.dispatch_tree_index..old_pre.end.dispatch_tree_index;
