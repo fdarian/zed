@@ -14,7 +14,7 @@
 
 use super::Window;
 use crate::scene::{Caret, PaintOperation};
-use crate::{App, BackgroundExecutor, Bounds, ContentMask, Hsla, ScaledPixels, Task};
+use crate::{App, BackgroundExecutor, Bounds, ContentMask, Hsla, Pixels, ScaledPixels, Size, Task};
 use scheduler::Instant;
 use smallvec::SmallVec;
 use std::time::Duration;
@@ -70,12 +70,23 @@ enum Shown {
     Painted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SentLayer {
+    bounds: Bounds<ScaledPixels>,
+    color: Hsla,
+    anchor: Instant,
+    window_size: Size<Pixels>,
+    scale_factor: f32,
+}
+
 /// What a window keeps of the carets it presents.
 pub(crate) struct CaretPresenter {
     executor: BackgroundExecutor,
     presented: SmallVec<[PresentedCaret; 2]>,
-    /// What the platform was last told for its layer: none, or where, in what colour, from when.
-    sent_layer: Option<(Bounds<ScaledPixels>, Hsla, Instant)>,
+    /// What the platform was last told for its layer: none, or where, in what colour, from when, and
+    /// in a window of what size and scale, since the platform places the layer against its host's
+    /// size and has to place it again when that changes.
+    sent_layer: Option<SentLayer>,
     /// When a caret drawn by the renderer changes phase next, as the last present saw it.
     wanted_blink: Option<Instant>,
     /// The frame this window asked of itself for that time, and when it is for.
@@ -230,7 +241,14 @@ impl Window {
         self.caret.presented = presented;
         self.caret.wanted_blink = wanted_blink;
 
-        let sent = layer.map(|layer| (layer.bounds, layer.color, layer.anchor));
+        let (window_size, scale_factor) = (self.viewport_size, self.scale_factor());
+        let sent = layer.map(|layer| SentLayer {
+            bounds: layer.bounds,
+            color: layer.color,
+            anchor: layer.anchor,
+            window_size,
+            scale_factor,
+        });
         if sent != self.caret.sent_layer {
             self.caret.sent_layer = sent;
             self.platform_window.set_caret_layer(layer);

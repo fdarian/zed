@@ -432,6 +432,33 @@ mod presenting {
     }
 
     #[test]
+    fn the_layer_is_placed_again_when_the_window_is_resized_or_its_scale_changes() {
+        let mut fixture = Fixture::new(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); });
+        fixture.show();
+        let calls = |fixture: &mut Fixture| fixture.window.update(|_, window, _| window.platform_window.as_test().unwrap().caret_layer_calls());
+        let first = calls(&mut fixture);
+        fixture.show();
+        assert_eq!(calls(&mut fixture), first, "nothing changed, the platform is told nothing");
+
+        fixture.window.update(|_, window, cx| {
+            window.platform_window.as_test().unwrap().simulate_resize(size(px(300.), px(500.)));
+            window.bounds_changed(cx);
+        });
+        fixture.show();
+        assert_eq!(calls(&mut fixture), first + 1, "a resize places the layer again");
+        assert!(fixture.on_layer());
+
+        fixture.window.update(|_, window, cx| {
+            window.platform_window.force_scale_factor(1.);
+            window.bounds_changed(cx);
+        });
+        fixture.show();
+        assert_eq!(calls(&mut fixture), first + 2, "a scale change places it again");
+        fixture.show();
+        assert_eq!(calls(&mut fixture), first + 2);
+    }
+
+    #[test]
     fn a_caret_on_the_layer_asks_for_no_frame() {
         let mut fixture = Fixture::new(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); });
         fixture.show();
