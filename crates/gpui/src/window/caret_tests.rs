@@ -515,3 +515,97 @@ mod presenting {
         assert_eq!(until_phase_change(ms(1620)), ms(380));
     }
 }
+
+mod patching {
+    use crate::{
+        AnyWindowHandle, App, AppContext as _, Bounds, Context, ElementId, IntoElement, ParentElement, Render, Styled, TestAppContext, Window,
+        canvas, div, point, px, retained, size,
+    };
+    use scheduler::Instant;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    fn caret_element(anchor: Instant) -> crate::AnyElement {
+        canvas(
+            |_, _, _| (),
+            move |_, (): (), window, _| {
+                let bar = Bounds::new(point(px(10.), px(4.)), size(px(1.), px(16.)));
+                window.paint_caret(bar, super::ink(), anchor);
+            },
+        )
+        .w(px(20.))
+        .h(px(20.))
+        .into_any_element()
+    }
+
+    /// The caret is in a root a patch paints alone, inside an effect group that a patch does not paint.
+    struct Page {
+        anchor: Instant,
+    }
+
+    impl Render for Page {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let anchor = self.anchor;
+            div().size_full().child(
+                div()
+                    .w(px(100.))
+                    .h(px(40.))
+                    .opacity(0.5)
+                    .child(retained(("caret", 0usize), 1u64, move |_, _| caret_element(anchor)).patchable())
+                    .child(div().w(px(10.)).h(px(10.)).bg(crate::red())),
+            )
+        }
+    }
+
+    /// The colour of the quads the frame draws that are the carets' (the narrow ones: a bar a pixel wide, doubled on this display).
+    fn caret_alphas(cx: &mut TestAppContext, window: AnyWindowHandle) -> Vec<f32> {
+        cx.update_window(window, |_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            let mut quads: Vec<&crate::Quad> = scene.quads.iter().collect();
+            for group in &scene.groups {
+                quads.extend(group.scene.quads.iter());
+            }
+            quads
+                .into_iter()
+                .filter(|quad| quad.bounds.size.width.0 < 4.)
+                .map(|quad| quad.background.as_solid().unwrap().a)
+                .collect()
+        })
+        .unwrap()
+    }
+
+    #[gpui::test]
+    fn a_caret_in_an_effect_group_that_a_patch_paints_alone_is_drawn_lit_and_dark_in_turn(cx: &mut TestAppContext) {
+        let anchor = cx.executor().now();
+        let window = AnyWindowHandle::from(cx.open_window(size(px(200.), px(100.)), move |_, _| Page { anchor }));
+        let patches = Rc::new(Cell::new(0usize));
+        cx.update_window(window, |_, window, _| {
+            window.force_effect_groups();
+            let counted = patches.clone();
+            window.set_frame_patcher(Some(Rc::new(move |window: &mut Window, cx: &mut App| {
+                counted.set(counted.get() + 1);
+                window
+                    .repaint_in_place(vec![(ElementId::from(("caret", 0usize)), caret_element(anchor))], cx, |_, _| true)
+                    .is_ok()
+            })));
+        })
+        .unwrap();
+        let draw = |cx: &mut TestAppContext| cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        draw(cx);
+        draw(cx);
+        let mut seen = vec![caret_alphas(cx, window)];
+        for _ in 0..4 {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            cx.update_window(window, |_, window, cx| {
+                window.request_tick();
+                window.draw(cx).clear(cx)
+            })
+            .unwrap();
+            seen.push(caret_alphas(cx, window));
+        }
+        let counters = cx.update_window(window, |_, window, _| window.patch_counters()).unwrap();
+        assert!(counters.patched_frames >= 4, "the ticks are patched: {counters:?}");
+        assert_eq!(seen, vec![vec![1.], vec![0.], vec![1.], vec![0.], vec![1.]]);
+    }
+}

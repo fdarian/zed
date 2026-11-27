@@ -1842,7 +1842,13 @@ impl PaintOperation {
             }
             (PaintOperation::Quad(a), PaintOperation::Quad(b)) => Some(quads_equal(a, b)),
             (PaintOperation::Caret(a), PaintOperation::Caret(b)) => {
-                Some(quads_equal(&a.quad, &b.quad) && a.blink_anchor == b.blink_anchor && a.layer_allowed == b.layer_allowed)
+                Some(
+                    quads_equal(&a.quad, &b.quad)
+                        && a.blink_anchor == b.blink_anchor
+                        && a.layer_allowed == b.layer_allowed
+                        && a.painter_blinks == b.painter_blinks
+                        && a.lit == b.lit,
+                )
             }
             (PaintOperation::StartLayer(a), PaintOperation::StartLayer(b)) => Some(a == b),
             (PaintOperation::WidenGroups(a), PaintOperation::WidenGroups(b)) => Some(a == b),
@@ -5719,6 +5725,8 @@ mod tests {
             Caret { quad: quad(11., 20., 2., 16.), ..base },
             Caret { blink_anchor: later, ..base },
             Caret { layer_allowed: false, ..base },
+            Caret { painter_blinks: true, ..base },
+            Caret { lit: false, ..base },
         ]
         .into_iter()
         .enumerate()
