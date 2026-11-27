@@ -142,6 +142,10 @@ impl Window {
     /// phase it was in. Its painter has to paint it again at each change of phase for it to blink,
     /// as the one that was told so by `paint_caret` does. A caret the window blinks, on a layer or
     /// off it, is not counted.
+    ///
+    /// This also turns `true` for a caret that was the window's to blink and no longer is, which
+    /// no painter was told of: a window that became composed, and a recording made outside an
+    /// effect group that is replayed inside one.
     pub fn caret_needs_ticks(&self) -> bool {
         self.caret.presented.iter().any(|caret| caret.shown == Shown::Painted)
     }
@@ -214,7 +218,9 @@ impl Window {
                 wanted_blink = Some(wanted_blink.map_or(deadline, |earlier| earlier.min(deadline)));
                 Shown::Drawn { lit: caret_visible(since_anchor) }
             } else {
-                Shown::Drawn { lit: true }
+                // Nothing here can leave the quad out of a frame, and the painter did not paint it for a
+                // phase: it is drawn lit unless the painter is told to blink it.
+                Shown::Painted
             };
             if let Some(quad) = caret.quad
                 && matches!(shown, Shown::OnLayer | Shown::Drawn { lit: false })

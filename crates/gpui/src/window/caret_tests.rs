@@ -289,12 +289,14 @@ mod presenting {
         let mut fixture = Fixture::new(|window, anchor| { window.paint_caret(bar(10.), ink(), anchor); });
         fixture.show();
         assert!(fixture.layer().is_some());
+        assert!(!fixture.window.update(|_, window, _| window.caret_needs_ticks()), "the window blinks it");
         fixture.window.update(|_, window, _| {
             window.create_native_surface().expect("the test platform composes");
         });
         fixture.show();
         assert!(!fixture.on_layer());
         assert_eq!(fixture.layer(), None);
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()), "the page has to blink it now");
     }
 
     #[test]
@@ -306,6 +308,7 @@ mod presenting {
         fixture.window.update(|_, window, _| window.platform_window.as_test().unwrap().set_carets_unsupported());
         fixture.show();
         assert!(!fixture.on_layer());
+        assert!(fixture.window.update(|_, window, _| window.caret_needs_ticks()), "the page has to blink it");
         fixture.app.advance_clock(Duration::from_millis(600));
         fixture.app.run_until_parked();
         assert!(!fixture.window.update(|_, window, _| window.needs_present.get()), "nothing blinks it");
@@ -634,5 +637,62 @@ mod patching {
         let counters = cx.update_window(window, |_, window, _| window.patch_counters()).unwrap();
         assert!(counters.patched_frames >= 4, "the ticks are patched: {counters:?}");
         assert_eq!(seen, vec![vec![1.], vec![0.], vec![1.], vec![0.], vec![1.]]);
+    }
+
+    /// A caret in a root that is recorded outside an effect group and then put under one.
+    struct Regrouped {
+        anchor: Instant,
+        grouped: Rc<Cell<bool>>,
+        painted: Rc<Cell<usize>>,
+    }
+
+    impl Render for Regrouped {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (anchor, painted) = (self.anchor, self.painted.clone());
+            let caret = retained(("caret", 0usize), 1u64, move |_, _| {
+                let painted = painted.clone();
+                canvas(
+                    |_, _, _| (),
+                    move |_, (): (), window, _| {
+                        painted.set(painted.get() + 1);
+                        window.paint_caret(Bounds::new(point(px(10.), px(4.)), size(px(1.), px(16.))), super::ink(), anchor);
+                    },
+                )
+                .w(px(20.))
+                .h(px(20.))
+                .into_any_element()
+            });
+            let opacity = if self.grouped.get() { 0.5 } else { 1. };
+            div().size_full().child(div().w(px(100.)).h(px(40.)).opacity(opacity).child(caret).child(div().w(px(10.)).h(px(10.)).bg(crate::red())))
+        }
+    }
+
+    #[gpui::test]
+    fn a_recording_with_a_caret_replayed_in_an_effect_group_asks_the_page_for_ticks(cx: &mut TestAppContext) {
+        let anchor = cx.executor().now();
+        let (grouped, painted) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(0usize)));
+        let (knob, count) = (grouped.clone(), painted.clone());
+        let handle = cx.open_window(size(px(200.), px(100.)), move |_, _| Regrouped { anchor, grouped: knob, painted: count });
+        let window = AnyWindowHandle::from(handle);
+        cx.update_window(window, |_, window, _| window.force_effect_groups()).unwrap();
+        let show = |cx: &mut TestAppContext| {
+            // Not a refresh, which builds every retained root again.
+            handle.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.update_window(window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.present();
+                (window.caret_on_layer(), window.caret_needs_ticks())
+            })
+            .unwrap()
+        };
+        assert_eq!(show(cx), (true, false), "outside a group the window blinks it");
+        // The first frame records the root and the next ones replay it.
+        show(cx);
+        let before = painted.get();
+        show(cx);
+        assert_eq!(painted.get(), before, "the root is replayed");
+        grouped.set(true);
+        assert_eq!(show(cx), (false, true), "inside one it is the page's to blink");
+        assert_eq!(painted.get(), before, "the recording was replayed and not painted again");
     }
 }
