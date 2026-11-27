@@ -108,7 +108,8 @@ pub(super) unsafe fn set(state: &mut Option<CaretLayerState>, host: id, scale_fa
             let _: () = msg_send![layer, removeAnimationForKey: ns_string(ANIMATION_KEY)];
             let number = |value: f64| -> id { msg_send![class!(NSNumber), numberWithDouble: value] };
             let values: id = msg_send![class!(NSArray), arrayWithObjects: [number(1.), number(0.)].as_ptr() count: 2usize];
-            let key_times: id = msg_send![class!(NSArray), arrayWithObjects: [number(0.), number(0.5)].as_ptr() count: 2usize];
+            // A discrete animation has one more key time than values: the value holds from its time to the next.
+            let key_times: id = msg_send![class!(NSArray), arrayWithObjects: [number(0.), number(0.5), number(1.)].as_ptr() count: 3usize];
             let animation: id = msg_send![class!(CAKeyframeAnimation), animationWithKeyPath: ns_string("opacity")];
             let _: () = msg_send![animation, setValues: values];
             let _: () = msg_send![animation, setKeyTimes: key_times];
