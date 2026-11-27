@@ -1438,10 +1438,11 @@ impl MacWindow {
                 }
             }
 
-            if invisible {
-                // After the window kind's level. Above the other apps' windows, which a window that
-                // nobody sees can be, so that what lies over its place does not make it occluded
-                // and stop its link.
+            if invisible && sheet_parent.is_none() && native_window.level() < NSFloatingWindowLevel {
+                // After the window kind's level, and only raised: a pop-up keeps its higher level
+                // and a sheet is attached to its parent's window. Above the other apps' windows,
+                // which a window that nobody sees can be, so that what lies over its place does
+                // not make it occluded and stop its link.
                 native_window.setLevel_(NSFloatingWindowLevel);
             }
 

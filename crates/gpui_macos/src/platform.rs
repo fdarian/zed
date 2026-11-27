@@ -306,9 +306,12 @@ impl MacPlatform {
         self.0.lock().keep_window_frames = true;
     }
 
-    /// Windows opened after this are fully transparent and ignore the mouse: not seen or clicked,
-    /// but they still run, because AppKit counts a transparent window on a screen as visible and
-    /// only a visible one starts a display link. For tests that open live windows.
+    /// Windows gpui opens after this are fully transparent, ignore the mouse and, when their kind's
+    /// level is lower, sit at the floating level (never lowered, sheets left alone): not seen or
+    /// clicked, but they still run, because AppKit counts a transparent window on a screen as
+    /// visible and only a visible one starts a display link; the level keeps another app's window
+    /// from occluding them. AppKit's own panels, alerts and menus are not covered. For tests that
+    /// open live windows.
     pub fn invisible_windows(&self) {
         self.0.lock().invisible_windows = true;
     }
