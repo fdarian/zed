@@ -2250,6 +2250,17 @@ fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
     }
 }
 
+/// Where a group can paint: what its content mask lets through, grown by what its filters spread.
+pub(crate) fn group_reach(mask: Bounds<ScaledPixels>, filters: &[ResolvedFilter]) -> Bounds<ScaledPixels> {
+    let margin = filter_margin(filters);
+    mask.extend(Edges {
+        top: ScaledPixels(margin.top),
+        right: ScaledPixels(margin.right),
+        bottom: ScaledPixels(margin.bottom),
+        left: ScaledPixels(margin.left),
+    })
+}
+
 /// Keeps a group's bounds to what can show: what the content mask lets through, plus what the
 /// filters spread before it is cut, and never beyond what a texture can hold.
 fn limit_group_bounds(
@@ -2257,13 +2268,7 @@ fn limit_group_bounds(
     content_mask: &ContentMask<ScaledPixels>,
     filters: &[ResolvedFilter],
 ) -> Option<Bounds<ScaledPixels>> {
-    let margin = filter_margin(filters);
-    let reach = content_mask.bounds.extend(Edges {
-        top: ScaledPixels(margin.top),
-        right: ScaledPixels(margin.right),
-        bottom: ScaledPixels(margin.bottom),
-        left: ScaledPixels(margin.left),
-    });
+    let reach = group_reach(content_mask.bounds, filters);
     let mut limited = bounds.intersect(&reach);
     if limited.is_empty() {
         return None;

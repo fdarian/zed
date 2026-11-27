@@ -339,15 +339,41 @@ fn quad_of(scene: &crate::Scene, caret: &Caret) -> Option<usize> {
     })
 }
 
-/// Whether an operation painted after `operation` draws over `area`, or may: what a group, a native
-/// surface or a surface of frames draws is not a box that can be told.
+/// Whether an operation painted after `operation` draws over `area`, or may: what a native surface
+/// or a surface of frames draws is not a box that can be told. A group draws inside its content mask
+/// grown by what its filters spread, which is where a mask that a box escaping its clip widened
+/// reaches too, so a group is looked at where it ends.
 fn operations_after_overlap(scene: &crate::Scene, operation: usize, area: Bounds<ScaledPixels>) -> bool {
-    use crate::scene::Extent;
-    scene.paint_operations[operation + 1..].iter().any(|later| match later.extent() {
-        Extent::Nowhere | Extent::Mark => false,
-        Extent::Area(drawn) => drawn.intersects(&area),
-        Extent::Unknown => true,
-    })
+    use crate::scene::{Extent, group_reach};
+    let mut open_groups: SmallVec<[(Bounds<ScaledPixels>, &crate::GroupEffect); 2]> = SmallVec::new();
+    for later in &scene.paint_operations[operation + 1..] {
+        let overlaps = match later {
+            PaintOperation::StartGroup { effect, content_mask, .. } => {
+                open_groups.push((content_mask.bounds, effect));
+                false
+            }
+            PaintOperation::WidenGroups(escaped) => {
+                for (mask, _) in &mut open_groups {
+                    *mask = mask.union(&escaped.bounds);
+                }
+                false
+            }
+            PaintOperation::EndGroup => match open_groups.pop() {
+                Some((mask, effect)) => group_reach(mask, &effect.filters).intersects(&area),
+                // A group that was opened before the caret and closes after it holds the caret.
+                None => true,
+            },
+            other => match other.extent() {
+                Extent::Nowhere | Extent::Mark => false,
+                Extent::Area(drawn) => drawn.intersects(&area),
+                Extent::Unknown => true,
+            },
+        };
+        if overlaps {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether the rounded corners of `mask` cut `area`: a layer is a rectangle.

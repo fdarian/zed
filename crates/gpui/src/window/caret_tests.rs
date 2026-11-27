@@ -241,6 +241,63 @@ mod presenting {
         }));
     }
 
+    /// A caret, then a group that fades what is in `mask` (and paints something inside it).
+    fn with_group_after_caret(mask: Bounds<Pixels>) -> impl Fn(&mut Window, Instant) {
+        move |window, anchor| {
+            window.paint_caret(bar(10.), ink(), anchor);
+            window.with_content_mask(Some(ContentMask::from_bounds(mask)), |window| {
+                let effect = crate::GroupEffect { opacity: 0.5, ..crate::GroupEffect::default() };
+                window.with_effect_group(effect, None, |window| {
+                    window.paint_quad(fill(block(mask.origin.x.0, mask.origin.y.0), white()));
+                    window.paint_quad(fill(block(mask.origin.x.0 + 5., mask.origin.y.0 + 5.), white()));
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn a_group_painted_after_the_caret_but_not_over_it_leaves_it_on_the_layer() {
+        for effect_groups in [true, false] {
+            let mut fixture = Fixture::new(with_group_after_caret(block(100., 100.)));
+            fixture.window.update(|_, window, _| if effect_groups { window.force_effect_groups() });
+            fixture.show();
+            assert!(fixture.on_layer(), "effect groups forced: {effect_groups}");
+        }
+    }
+
+    #[test]
+    fn a_group_that_reaches_the_caret_takes_it_off_the_layer() {
+        for effect_groups in [true, false] {
+            let mut fixture = Fixture::new(with_group_after_caret(block(5., 0.)));
+            fixture.window.update(|_, window, _| if effect_groups { window.force_effect_groups() });
+            fixture.show();
+            assert!(!fixture.on_layer(), "effect groups forced: {effect_groups}");
+        }
+    }
+
+    #[test]
+    fn a_blur_spreads_a_group_over_a_caret_next_to_it() {
+        // The mask starts 10 px right of the caret's box (x 10 to 11); a blur of 8 reaches about 24 px.
+        let blurred = |blur: f32| {
+            move |window: &mut Window, anchor: Instant| {
+                window.paint_caret(bar(10.), ink(), anchor);
+                let mask = ContentMask::from_bounds(Bounds::new(point(px(21.), px(0.)), size(px(30.), px(30.))));
+                window.with_content_mask(Some(mask), |window| {
+                    let effect = crate::GroupEffect {
+                        filters: vec![crate::ResolvedFilter::Blur { x: blur, y: blur }],
+                        ..crate::GroupEffect::default()
+                    };
+                    window.with_effect_group(effect, None, |window| {
+                        window.paint_quad(fill(block(21., 0.), white()));
+                        window.paint_quad(fill(block(26., 5.), white()));
+                    });
+                });
+            }
+        };
+        assert!(eligible(blurred(0.)), "no filter, no reach");
+        assert!(!eligible(blurred(8.)), "the blur reaches the caret");
+    }
+
     #[test]
     fn a_caret_a_paint_does_not_allow_a_layer_for_stays_off_it() {
         assert!(!eligible(|window, anchor| {
