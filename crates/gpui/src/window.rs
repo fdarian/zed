@@ -9,7 +9,7 @@ use crate::shrink::clear_shrinking;
 use crate::{
     Action, Anchor, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BackgroundTile, BorderStyle, GroupEffect, Bounds, BoxShadow,
-    Capslock, Context, CornerRadii, Corners, CursorHideMode, CursorStyle, Escape, Decorations, DevicePixels,
+    Capslock, Caret, Context, CornerRadii, Corners, CursorHideMode, CursorStyle, Escape, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, DragOperation, Edges, Effect, Entity,
     EntityId, ellipse_corner_sdf, EventEmitter, FileDropEvent, FontId, FontSmoothing, Global, GlobalElementId, GlyphId, GlyphTransform, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, KeyListener,
@@ -81,6 +81,8 @@ mod membership_patch_tests;
 mod patch_tests;
 #[cfg(test)]
 mod transform_tests;
+#[cfg(test)]
+mod caret_tests;
 mod prompts;
 mod retained;
 mod scroll_patch;
@@ -8322,6 +8324,27 @@ impl Window {
         let opacity = self.element_opacity();
         let quad = self.device_quad(quad, opacity);
         self.next_frame.scene.insert_quad(quad);
+    }
+
+    /// Paint a text caret of `color` over `bounds` into the scene for the next frame at the current
+    /// stacking context. `blink_anchor` is when its blink last restarted: it is lit for the first
+    /// half second of every second from then. The renderer draws it as an opaque quad; the scene
+    /// keeps it as an operation of its own so that a platform may show it another way.
+    ///
+    /// A layer may show it only when nothing transforms it beyond a translation, no element opacity
+    /// fades it, and no effect group, filter or text clip is open around it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_caret(&mut self, bounds: Bounds<Pixels>, color: Hsla, blink_anchor: Instant) {
+        self.invalidator.debug_assert_paint();
+        if self.paints_nothing() {
+            return;
+        }
+
+        let opacity = self.element_opacity();
+        let layer_allowed = opacity >= 1. && !self.placement().general;
+        let quad = self.device_quad(fill(bounds, color), opacity);
+        self.next_frame.scene.insert_caret(Caret { quad, blink_anchor, layer_allowed });
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.

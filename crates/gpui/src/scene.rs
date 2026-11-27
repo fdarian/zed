@@ -10,6 +10,7 @@ use crate::{
     GroupEffect, Hsla, MAX_GROUP_EXTENT, Pixels, Point, Radians, RenderGlyphParams, ResolvedFilter, ScaledPixels, Size,
     bounds_tree::BoundsTree, composition::{NativeSurfacePlaceholder, OrderRange}, filter_margin, point, visual_bounds,
 };
+use scheduler::Instant;
 mod split;
 
 use std::{
@@ -532,6 +533,29 @@ impl Scene {
             return;
         }
         self.record_with(|| PaintOperation::Quad(quad));
+        self.place_recorded_quad(quad);
+    }
+
+    /// Records a text caret, which the renderer draws as the opaque quad it holds until a platform
+    /// shows it another way: see [`Caret`]. Whether a layer may show it is also withdrawn by an
+    /// effect group or text clip that is open here, which a recording replayed under one is.
+    pub(crate) fn insert_caret(&mut self, mut caret: Caret) {
+        if self.hidden {
+            return;
+        }
+        caret.layer_allowed &= !self.in_effect_group();
+        self.record_with(|| PaintOperation::Caret(caret));
+        self.place_recorded_quad(caret.quad);
+    }
+
+    /// Whether what is inserted now is painted inside an effect group, a flat opacity or a text clip,
+    /// which composite it with what is around it.
+    pub(crate) fn in_effect_group(&self) -> bool {
+        !self.group_stack.is_empty() || !self.flat_opacities.is_empty() || !self.text_clips.is_empty()
+    }
+
+    /// Routes the quad that the operation just recorded paints.
+    fn place_recorded_quad(&mut self, quad: Quad) {
         if quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty() {
             return;
         }
@@ -1184,6 +1208,13 @@ impl Scene {
                 PaintOperation::Primitive(Primitive::Quad(quad)) | PaintOperation::Quad(quad) => {
                     write!(out, "{}", text(quad, modulo_arcs))
                 }
+                PaintOperation::Caret(caret) => write!(
+                    out,
+                    "caret {} {:?} {}",
+                    text(&caret.quad, modulo_arcs),
+                    caret.blink_anchor,
+                    caret.layer_allowed
+                ),
                 PaintOperation::Primitive(Primitive::Path(path)) => write!(out, "{}", text(path, modulo_arcs)),
                 PaintOperation::Primitive(Primitive::Underline(underline)) => write!(out, "{}", text(underline, modulo_arcs)),
                 PaintOperation::Primitive(Primitive::MonochromeSprite(sprite)) => write!(out, "{}", text(sprite, modulo_arcs)),
@@ -1297,6 +1328,7 @@ impl Scene {
         match operation {
             PaintOperation::Primitive(primitive) => self.replay_primitive(primitive),
             PaintOperation::Quad(quad) => self.insert_quad(*quad),
+            PaintOperation::Caret(caret) => self.insert_caret(*caret),
             PaintOperation::Image(sprite) => self.insert_image(*sprite),
             PaintOperation::PendingGlyph(glyph) => self.insert_pending_glyph(glyph.clone()),
             PaintOperation::NativeSurface(placeholder) => self.insert_native_surface(placeholder.clone()),
@@ -1436,6 +1468,10 @@ impl Scene {
             PaintOperation::Primitive(primitive) => primitive,
             PaintOperation::Quad(quad) => {
                 copy = Primitive::Quad(*quad);
+                &copy
+            }
+            PaintOperation::Caret(caret) => {
+                copy = Primitive::Quad(caret.quad);
                 &copy
             }
             PaintOperation::Image(sprite) => {
@@ -1632,12 +1668,46 @@ impl PrimitiveKind {
     ];
 }
 
+/// A text caret, which blinks. It is an operation of its own so that a platform that can show it
+/// as a layer animated by the compositor can, without the scene being drawn for each blink: until
+/// then it is the opaque quad `quad` holds, which the renderer draws and a recording moves like
+/// any quad (the bounds as painted, the content mask, the colour with the element's opacity and
+/// the placement under a transform).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Caret {
+    pub(crate) quad: Quad,
+    /// When the blink was last restarted: the caret is lit for the first half second of every
+    /// second from here.
+    pub(crate) blink_anchor: Instant,
+    /// Whether a layer may show the caret in the place of the quad. Not under a general
+    /// transform, an element opacity below 1 or inside an effect group: a layer is neither
+    /// transformed nor composited with what is around it.
+    pub(crate) layer_allowed: bool,
+}
+
+// What a platform reads at present to show the caret as a layer: nothing reads it until it can.
+#[allow(dead_code)]
+impl Caret {
+    pub(crate) fn bounds(&self) -> Bounds<ScaledPixels> {
+        self.quad.bounds
+    }
+
+    pub(crate) fn content_mask(&self) -> &ContentMask<ScaledPixels> {
+        &self.quad.content_mask
+    }
+
+    pub(crate) fn color(&self) -> Hsla {
+        self.quad.background.as_solid().expect("a caret is painted with a solid colour")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     /// A quad before a border-only one is split around its empty interior, which depends on the
     /// content mask it ends up with: see [`Scene::insert_quad`].
     Quad(Quad),
+    Caret(Caret),
     Image(PolychromeSprite),
     /// A glyph of a patchable root that the content mask clips away: it holds what the sprite
     /// would, without the atlas tile, which painting it would have rasterized.
@@ -1683,6 +1753,9 @@ impl PaintOperation {
                 primitive.window_bounds().intersect(&primitive.content_mask().bounds).is_empty()
             }
             PaintOperation::Quad(quad) => quad.window_bounds().intersect(&quad.content_mask.bounds).is_empty(),
+            PaintOperation::Caret(caret) => {
+                caret.quad.window_bounds().intersect(&caret.quad.content_mask.bounds).is_empty()
+            }
             PaintOperation::Image(sprite) => sprite.window_bounds().intersect(&sprite.content_mask.bounds).is_empty(),
             PaintOperation::PendingGlyph(glyph) => glyph.is_clipped_away(),
             PaintOperation::NativeSurface(placeholder) => placeholder.is_clipped_away(),
@@ -1750,23 +1823,9 @@ impl PaintOperation {
                         && a.clip_transformation == b.clip_transformation,
                 )
             }
-            (PaintOperation::Quad(a), PaintOperation::Quad(b)) => {
-                // Every field of `Quad`, in the order it declares them.
-                Some(
-                    a.order == b.order
-                        && a.border_styles == b.border_styles
-                        && a.bounds == b.bounds
-                        && a.content_mask == b.content_mask
-                        && a.background == b.background
-                        && a.border_colors == b.border_colors
-                        && a.border_inner_colors == b.border_inner_colors
-                        && a.corner_radii == b.corner_radii
-                        && a.corner_radii_y == b.corner_radii_y
-                        && a.border_widths == b.border_widths
-                        && a.background_tile == b.background_tile
-                        && a.transformation == b.transformation
-                        && a.local_clip == b.local_clip,
-                )
+            (PaintOperation::Quad(a), PaintOperation::Quad(b)) => Some(quads_equal(a, b)),
+            (PaintOperation::Caret(a), PaintOperation::Caret(b)) => {
+                Some(quads_equal(&a.quad, &b.quad) && a.blink_anchor == b.blink_anchor && a.layer_allowed == b.layer_allowed)
             }
             (PaintOperation::StartLayer(a), PaintOperation::StartLayer(b)) => Some(a == b),
             (PaintOperation::WidenGroups(a), PaintOperation::WidenGroups(b)) => Some(a == b),
@@ -1782,6 +1841,23 @@ impl PaintOperation {
             _ => None,
         }
     }
+}
+
+/// Every field of `Quad`, in the order it declares them.
+fn quads_equal(a: &Quad, b: &Quad) -> bool {
+    a.order == b.order
+        && a.border_styles == b.border_styles
+        && a.bounds == b.bounds
+        && a.content_mask == b.content_mask
+        && a.background == b.background
+        && a.border_colors == b.border_colors
+        && a.border_inner_colors == b.border_inner_colors
+        && a.corner_radii == b.corner_radii
+        && a.corner_radii_y == b.corner_radii_y
+        && a.border_widths == b.border_widths
+        && a.background_tile == b.background_tile
+        && a.transformation == b.transformation
+        && a.local_clip == b.local_clip
 }
 
 /// What a native surface placeholder paints, which is all of it but the hitbox: a build of the same
@@ -1971,6 +2047,7 @@ impl PaintOperation {
                     primitive_placement(&Primitive::Quad(*quad))
                 }
             }
+            PaintOperation::Caret(caret) => primitive_placement(&Primitive::Quad(caret.quad)),
             PaintOperation::Image(sprite) => primitive_placement(&Primitive::PolychromeSprite(*sprite)),
             PaintOperation::PendingGlyph(_) => Placement::Nowhere,
             _ => Placement::Other,
@@ -2014,6 +2091,10 @@ impl PaintOperation {
             // A quad that is drawn as strips draws inside the box it is a part of.
             PaintOperation::Quad(quad) => {
                 let clipped = quad.window_bounds().intersect(&quad.content_mask.bounds);
+                if clipped.is_empty() { Extent::Nowhere } else { Extent::Area(clipped) }
+            }
+            PaintOperation::Caret(caret) => {
+                let clipped = caret.quad.window_bounds().intersect(&caret.quad.content_mask.bounds);
                 if clipped.is_empty() { Extent::Nowhere } else { Extent::Area(clipped) }
             }
             PaintOperation::Image(sprite) => slot_extent(primitive_placement(&Primitive::PolychromeSprite(*sprite))),
@@ -2439,6 +2520,14 @@ impl TranslatedOperations<'_> {
                     clip_mask(&mut quad.content_mask, &clip.snapped);
                 }
                 PaintOperation::Quad(quad)
+            }
+            PaintOperation::Caret(caret) => {
+                let mut caret = *caret;
+                caret.quad.translate(delta);
+                if clipped {
+                    clip_mask(&mut caret.quad.content_mask, &clip.snapped);
+                }
+                PaintOperation::Caret(caret)
             }
             PaintOperation::Image(sprite) => {
                 let mut sprite = *sprite;
@@ -5474,5 +5563,152 @@ mod tests {
             verifier_text(sprite_under(narrower)),
             "masks of other bounds differ whatever their radii"
         );
+    }
+
+    fn caret(x: f32, y: f32) -> Caret {
+        Caret { quad: quad(x, y, 2., 16.), blink_anchor: Instant::now(), layer_allowed: true }
+    }
+
+    fn caret_bounds(scene: &Scene) -> Vec<Bounds<ScaledPixels>> {
+        scene
+            .paint_operations
+            .iter()
+            .filter_map(|operation| match operation {
+                PaintOperation::Caret(caret) => Some(caret.bounds()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_caret_is_logged_as_itself_and_drawn_as_its_quad() {
+        let mut scene = Scene::default();
+        let caret = caret(10., 20.);
+        scene.insert_caret(caret);
+        scene.finish();
+        assert_eq!(scene.paint_operations.len(), 1);
+        assert!(matches!(scene.paint_operations[0], PaintOperation::Caret(_)));
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!((scene.quads[0].bounds, scene.quads[0].background), (caret.bounds(), caret.quad.background));
+        assert_eq!(caret.color(), red());
+        assert!(matches!(scene.paint_operations[0].extent(), Extent::Area(area) if area == caret.bounds()));
+    }
+
+    #[test]
+    fn a_caret_replays_and_is_rebuilt_from_the_log_like_a_quad() {
+        let mut recorded = Scene::default();
+        recorded.insert_quad(quad(0., 0., 30., 30.));
+        recorded.insert_caret(caret(10., 20.));
+        recorded.insert_quad(quad(5., 5., 30., 30.));
+        let mut replayed = Scene::default();
+        replayed.replay(0..recorded.len(), &recorded);
+        let mut rebuilt = Scene::default();
+        rebuilt.replay(0..recorded.len(), &recorded);
+        rebuilt.rebuild_from_operations();
+        for scene in [&mut recorded, &mut replayed, &mut rebuilt] {
+            scene.finish();
+        }
+        for scene in [&replayed, &rebuilt] {
+            assert_eq!(describe(scene), describe(&recorded));
+            assert_eq!(scene.quads.len(), 3);
+            assert_eq!(caret_bounds(scene), vec![bounds(10., 20., 2., 16.)]);
+            assert!(
+                scene.quads.iter().map(|quad| quad.order).eq(recorded.quads.iter().map(|quad| quad.order)),
+                "the caret is ordered as the quad it is"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caret_is_translated_and_clipped_like_a_quad() {
+        let mut recorded = Scene::default();
+        recorded.insert_caret(caret(10., 20.));
+        let delta = point(ScaledPixels(7.), ScaledPixels(-5.));
+        let mut moved = Scene::default();
+        moved.replay_translated(&recorded.paint_operations, delta, &clip(0., 0., 11., 400.), PrimitiveCount::Replayed);
+        moved.finish();
+        // The clip ends at x 11, so the 2 wide caret at 17 is cut away; the bounds moved all the same.
+        assert_eq!(caret_bounds(&moved), vec![bounds(17., 15., 2., 16.)]);
+        assert!(moved.quads.is_empty());
+
+        let mut moved = Scene::default();
+        moved.replay_translated(&recorded.paint_operations, delta, &clip(0., 0., 400., 400.), PrimitiveCount::Replayed);
+        moved.finish();
+        assert_eq!(caret_bounds(&moved), vec![bounds(17., 15., 2., 16.)]);
+        assert_eq!(moved.quads[0].bounds, bounds(17., 15., 2., 16.));
+
+        let mut overwritten = vec![PaintOperation::EndLayer];
+        TranslatedOperations::new(&recorded.paint_operations, delta, &clip(0., 0., 400., 400.)).overwrite(&mut overwritten);
+        let PaintOperation::Caret(written) = &overwritten[0] else { panic!("the slot holds the caret") };
+        assert_eq!(written.bounds(), bounds(17., 15., 2., 16.));
+        assert!(written.layer_allowed);
+    }
+
+    #[test]
+    fn a_caret_is_spliced_like_a_quad() {
+        let mut scene = Scene::default();
+        scene.insert_quad(quad(0., 0., 30., 30.));
+        scene.insert_caret(caret(10., 20.));
+        scene.insert_quad(quad(5., 5., 30., 30.));
+        scene.finish();
+        scene.splice_operations(1..2, vec![PaintOperation::Caret(caret(40., 50.)), PaintOperation::Quad(quad(60., 60., 4., 4.))]);
+        scene.finish();
+        assert_eq!(scene.paint_operations.len(), 4);
+        assert_eq!(caret_bounds(&scene), vec![bounds(40., 50., 2., 16.)]);
+        assert_eq!(scene.quads.len(), 4);
+        assert!(scene.quads.iter().any(|quad| quad.bounds == bounds(40., 50., 2., 16.)));
+    }
+
+    #[test]
+    fn a_caret_that_the_mask_clips_away_is_recorded_and_draws_nothing() {
+        let mut scene = Scene::default();
+        let mut hidden = caret(10., 20.);
+        hidden.quad.content_mask.bounds = bounds(100., 100., 5., 5.);
+        scene.insert_caret(hidden);
+        scene.finish();
+        assert_eq!(scene.paint_operations.len(), 1);
+        assert!(scene.quads.is_empty());
+        assert!(matches!(scene.paint_operations[0].extent(), Extent::Nowhere));
+    }
+
+    #[test]
+    fn a_caret_in_an_effect_group_is_not_for_a_layer() {
+        for effects in [true, false] {
+            let mut scene = Scene::default();
+            scene.set_effect_groups_enabled(effects);
+            scene.insert_caret(caret(10., 20.));
+            scene.start_group(GroupEffect { opacity: 0.5, ..GroupEffect::default() }, mask(), None);
+            scene.insert_caret(caret(10., 20.));
+            scene.end_group();
+            let allowed: Vec<bool> = scene
+                .paint_operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    PaintOperation::Caret(caret) => Some(caret.layer_allowed),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(allowed, vec![true, false], "effect groups enabled: {effects}");
+        }
+    }
+
+    #[test]
+    fn carets_that_differ_in_any_field_differ() {
+        let base = caret(10., 20.);
+        let same = PaintOperation::Caret(base);
+        assert_eq!(told_by_fields(&same, &same), Some(false));
+        let later = Instant::now() + std::time::Duration::from_millis(5);
+        for (field, changed) in [
+            Caret { quad: quad(11., 20., 2., 16.), ..base },
+            Caret { blink_anchor: later, ..base },
+            Caret { layer_allowed: false, ..base },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let changed = PaintOperation::Caret(changed);
+            assert_eq!(told_by_fields(&same, &changed), Some(true), "caret field {field}");
+        }
+        assert!(!same.same_kind(&PaintOperation::Quad(base.quad)));
     }
 }
