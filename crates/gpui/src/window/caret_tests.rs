@@ -135,7 +135,7 @@ mod presenting {
     use super::{Painter, bar, ink};
     use crate::{
         Bounds, ContentMask, Corners, CornerRadii, Pixels, TestApp, TestAppWindow, Window, caret_visible,
-        fill, point, px, size, until_phase_change, white,
+        BorderStyle, Edges, fill, point, px, quad, size, transparent_black, until_phase_change, white,
     };
     use scheduler::Instant;
     use std::cell::Cell;
@@ -245,6 +245,48 @@ mod presenting {
             window.paint_caret(bar(10.), ink(), anchor);
             window.paint_quad(fill(block(100., 100.), white()));
         }));
+    }
+
+    /// A box with a border and no background, painted after the caret as an input's border is.
+    fn border_after_caret(bounds: Bounds<Pixels>, radius: f32, background: crate::Background, width: f32) -> impl Fn(&mut Window, Instant) {
+        move |window, anchor| {
+            window.paint_caret(bar(10.), ink(), anchor);
+            window.paint_quad(quad(bounds, radius, background, Edges::all(px(width)), ink(), BorderStyle::Solid));
+        }
+    }
+
+    fn box_around(x: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(x), px(0.)), size(px(100.), px(50.)))
+    }
+
+    #[test]
+    fn a_border_drawn_around_the_caret_leaves_it_on_the_layer() {
+        assert!(eligible(border_after_caret(box_around(0.), 0., transparent_black().into(), 1.)));
+        assert!(eligible(border_after_caret(box_around(0.), 6., transparent_black().into(), 1.)));
+    }
+
+    #[test]
+    fn a_quad_with_no_background_and_no_border_draws_nothing_over_the_caret() {
+        assert!(eligible(border_after_caret(box_around(0.), 0., transparent_black().into(), 0.)));
+    }
+
+    #[test]
+    fn a_border_band_that_crosses_the_caret_takes_it_off_the_layer() {
+        // The left side of the border is at the caret's x.
+        assert!(!eligible(border_after_caret(box_around(10.), 0., transparent_black().into(), 1.)));
+        // A border wide enough to reach it from the box that surrounds it.
+        assert!(!eligible(border_after_caret(box_around(0.), 0., transparent_black().into(), 10.)));
+    }
+
+    #[test]
+    fn a_rounded_inner_corner_that_reaches_the_caret_takes_it_off_the_layer() {
+        assert!(!eligible(border_after_caret(box_around(0.), 20., transparent_black().into(), 1.)));
+    }
+
+    #[test]
+    fn a_border_over_a_background_that_is_not_transparent_takes_the_caret_off_the_layer() {
+        assert!(!eligible(border_after_caret(box_around(0.), 0., white().into(), 1.)));
+        assert!(!eligible(border_after_caret(box_around(0.), 0., ink().opacity(0.01).into(), 1.)));
     }
 
     /// A caret, then a group that fades what is in `mask` (and paints something inside it).

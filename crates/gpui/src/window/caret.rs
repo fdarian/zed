@@ -393,6 +393,7 @@ fn operations_after_overlap(scene: &crate::Scene, operation: usize, area: Bounds
                 // A group that was opened before the caret and closes after it holds the caret.
                 None => true,
             },
+            PaintOperation::Quad(quad) if border_only(quad) => quad_border_reaches(quad, area),
             other => match other.extent() {
                 Extent::Nowhere | Extent::Mark => false,
                 Extent::Area(drawn) => drawn.intersects(&area),
@@ -404,6 +405,60 @@ fn operations_after_overlap(scene: &crate::Scene, operation: usize, area: Bounds
         }
     }
     false
+}
+
+/// Whether a quad draws nothing but its border: a transparent solid background (no gradient or
+/// pattern) and nothing that moves or turns its box, so that its border band can be told from its box.
+fn border_only(quad: &crate::scene::Quad) -> bool {
+    quad.background.as_solid().is_some_and(|color| color.is_transparent())
+        && quad.transformation == crate::TransformationMatrix::unit()
+}
+
+/// Whether the border of a quad drawn with no background reaches `area`, which the box of the quad
+/// does not say: a bordered input is one box around its text and its caret. The border is
+/// taken to be the box less its interior inset by the border widths and by a pixel for the
+/// antialiasing, and less the corner of that interior that a rounded corner reaches into, which is taken
+/// as a square of the radius it has left (more than the arc covers, so this never says no for a caret
+/// the border draws over).
+fn quad_border_reaches(quad: &crate::scene::Quad, area: Bounds<ScaledPixels>) -> bool {
+    use crate::{Point, Size};
+    let drawn = quad.bounds.intersect(&quad.content_mask.bounds);
+    if drawn.is_empty() || !drawn.intersects(&area) {
+        return false;
+    }
+    let widths = &quad.border_widths;
+    if !widths.any(|width| width.0 > 0.) {
+        return false;
+    }
+    let antialiasing = ScaledPixels(1.);
+    let (left, top) = (quad.bounds.left() + widths.left + antialiasing, quad.bounds.top() + widths.top + antialiasing);
+    let (right, bottom) = (quad.bounds.right() - widths.right - antialiasing, quad.bounds.bottom() - widths.bottom - antialiasing);
+    let interior = Bounds::from_corners(Point { x: left, y: top }, Point { x: right, y: bottom });
+    if interior.is_empty() || !area.is_contained_within(&interior) {
+        return true;
+    }
+    let corner = |radius: ScaledPixels, radius_y: ScaledPixels, across: ScaledPixels, down: ScaledPixels| {
+        let radius_y = if radius_y.0 == 0. { radius } else { radius_y };
+        Size {
+            width: ScaledPixels((radius.0 - across.0).max(0.)),
+            height: ScaledPixels((radius_y.0 - down.0).max(0.)),
+        }
+    };
+    let radii = &quad.corner_radii;
+    let radii_y = &quad.corner_radii_y;
+    let squares = [
+        (corner(radii.top_left, radii_y.top_left, widths.left, widths.top), (left, top), (false, false)),
+        (corner(radii.top_right, radii_y.top_right, widths.right, widths.top), (right, top), (true, false)),
+        (corner(radii.bottom_left, radii_y.bottom_left, widths.left, widths.bottom), (left, bottom), (false, true)),
+        (corner(radii.bottom_right, radii_y.bottom_right, widths.right, widths.bottom), (right, bottom), (true, true)),
+    ];
+    squares.into_iter().any(|(extent, (x, y), (from_right, from_bottom))| {
+        let origin = Point {
+            x: if from_right { x - extent.width } else { x },
+            y: if from_bottom { y - extent.height } else { y },
+        };
+        extent.width.0 > 0. && extent.height.0 > 0. && Bounds { origin, size: extent }.intersects(&area)
+    })
 }
 
 /// Whether the rounded corners of `mask` cut `area`: a layer is a rectangle.
