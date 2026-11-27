@@ -744,8 +744,10 @@ fn an_owner_that_cannot_be_told_declines_the_translate(cx: &mut TestAppContext) 
     assert_eq!((counters.frames, counters.eligible, counters.patched), (1, 1, 0), "{counters:?}");
     assert_eq!(counters.apply_declines(ScrollApplyDecline::Window), 1, "{counters:?}");
     assert!(fixture.page.told.borrow().is_empty());
-    // The frame is built whole: the scroller is where the wheel put it.
     assert_eq!(fixture.page.handle.offset().y, px(-5.));
+    let (built, _) = after_wheels(cx, Page::standard(), false, &[5.]);
+    let declined = fixture.with_window(cx, shown);
+    assert!(declined == built[0], "the frame shown was built whole\n{}", super::retained::first_difference(&declined, &built[0]));
     fixture.page.ready.set(true);
     fixture.scroll(cx, 10., 12., 5.);
     assert_eq!(fixture.counters(cx).patched, 1, "{:?}", fixture.counters(cx));
@@ -756,13 +758,15 @@ fn a_scroller_inside_a_root_is_no_scroller_of_the_frame_shown(cx: &mut TestAppCo
     let mut page = Page::standard();
     page.row_scroller = true;
     let fixture = Fixture::open(cx, page);
-    let gated = Rc::new(RefCell::new(Vec::new()));
-    let log = gated.clone();
+    let (gated, settled) = (Rc::new(RefCell::new(Vec::new())), Rc::new(RefCell::new(Vec::new())));
     fixture.with_window(cx, |window| {
+        let log = gated.clone();
         window.set_scroll_patch_gate(Some(Rc::new(move |_, _, translating| {
             log.borrow_mut().push(translating);
             None
         })));
+        let log = settled.clone();
+        window.set_scroll_patch_settled(Some(Rc::new(move |_, _, moved| log.borrow_mut().push(moved))));
     });
     // A script moved the scroller in the root: the frame shown knows nothing of it, so what the wheel moves is the one scroller the
     // owner is told of, and the scroller in the root is for the owner to find moved (`Retain::sources_changed`).
@@ -770,6 +774,7 @@ fn a_scroller_inside_a_root_is_no_scroller_of_the_frame_shown(cx: &mut TestAppCo
     fixture.scroll(cx, 80., 80., 5.);
     let counters = fixture.counters(cx);
     assert_eq!((counters.frames, counters.eligible, counters.patched), (1, 1, 1), "{counters:?}");
-    assert_eq!(gated.borrow().last(), Some(&Some(fixture.page.handle.scroll_key())));
-    assert_eq!(fixture.page.inner.offset(), point(px(0.), px(-20.)));
+    let key = fixture.page.handle.scroll_key();
+    assert_eq!(gated.borrow().last(), Some(&Some(key)));
+    assert_eq!(*settled.borrow(), [key], "the scroller in the root is not noted as the frame shown's");
 }
