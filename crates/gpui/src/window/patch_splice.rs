@@ -418,14 +418,21 @@ impl Window {
         if !(self.frame_holds(id, old_pre, old_paint, &source.hitboxes.hitboxes, &source.tab_stops) && scratch_deferred) {
             return Err(PatchDecline::Splice);
         }
-        // The thumbs are repainted from the plan made before the splice, which can only write one that the splice
-        // puts again: a bar the part held that the scratch frame did not note (or a list's, whose rows the splice
-        // does not carry over) leaves a thumb that goes with nothing in the part, and the frame is built whole.
+        // The thumbs are repainted by the bar they belong to, after the splice, so a splice puts the thumbs the scratch frame
+        // noted for the bars in its part. A bar the part held that the scratch frame did not note leaves a thumb that goes with
+        // nothing in the part, and a list's rows and runs are not carried over from the scratch frame: both are built whole.
+        let scratch_operations = paint.start.scene_index..paint.end.scene_index;
         let held = self.rendered_frame.scroll.thumb_owners_in(&(old_paint.start.scene_index..old_paint.end.scene_index));
-        if held.iter().any(|scroller| self.rendered_frame.scroll.is_list(*scroller) || !self.next_frame.scroll.holds_thumb_of(*scroller)) {
+        let scratch = &self.next_frame.scroll;
+        let mut scrollers = scratch.thumb_owners_in(&scratch_operations);
+        for scroller in &held {
+            if !scrollers.contains(scroller) {
+                scrollers.push(*scroller);
+            }
+        }
+        if held.iter().any(|scroller| !scratch.holds_thumb_of(*scroller)) || scrollers.iter().any(|scroller| scratch.is_list(*scroller) || self.rendered_frame.scroll.is_list(*scroller)) {
             return Err(PatchDecline::Splice);
         }
-        let scratch_operations = paint.start.scene_index..paint.end.scene_index;
         let nodes = old_pre.start.dispatch_tree_index..old_pre.end.dispatch_tree_index;
         let nodes_parent = match nodes.is_empty() {
             true => dispatch_parent,
@@ -435,7 +442,7 @@ impl Window {
         let mut splice = self.take_from_scratch(old_pre.clone(), old_paint.clone(), prepaint, paint, operations, nodes_parent);
         splice.keeps_recording = keeps_recording;
         splice.old_hitbox_ids = old_hitbox_ids;
-        splice.thumbs = self.next_frame.scroll.take_thumbs(&scratch_operations, &held);
+        splice.thumbs = self.next_frame.scroll.take_thumbs(&scratch_operations, &scrollers);
         Ok(splice)
     }
 

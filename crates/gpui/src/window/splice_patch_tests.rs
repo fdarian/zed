@@ -7,7 +7,7 @@
 use crate::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Context, Edges, ElementId, FocusHandle, InteractiveElement, IntoElement,
     Bounds, ListAlignment, ListState, Modifiers, OverflowAnchor, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, PatchCounters, PatchDecline,
-    PlatformInput, Point, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div,
+    PlatformInput, Point, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollThumbRepaint, ScrollWheelEvent, StatefulInteractiveElement, Styled, TestAppContext, Window, blue, div,
     fill, green, list, point, px, red, retained, size,
 };
 use crate::NonRelocatable;
@@ -79,6 +79,15 @@ struct State {
     bar: Cell<Option<BarOf>>,
     bar_handle: ScrollHandle,
     bar_rows: ListState,
+    /// The bar notes a thumb for each axis, none for the horizontal one, as the bar of a scroller does.
+    bar_axes: Cell<bool>,
+    /// The bar paints its thumb: it is off (noted with none) while it is not.
+    bar_shown: Cell<bool>,
+    /// The footer of the page paints the thumb of a bar of its own, after the unit, which a tick repaints in the color `fade`
+    /// says, as the bar of a list that fades is.
+    footer_bar: Cell<bool>,
+    footer_handle: ScrollHandle,
+    fade: Cell<Option<crate::Hsla>>,
 }
 
 /// What the scroller of the bar in the unit is.
@@ -121,6 +130,11 @@ impl State {
             bar: Cell::new(None),
             bar_handle: ScrollHandle::new(),
             bar_rows: ListState::new(10, ListAlignment::Top, px(0.)).with_uniform_item_height(px(10.)),
+            bar_axes: Cell::new(false),
+            bar_shown: Cell::new(true),
+            footer_bar: Cell::new(false),
+            footer_handle: ScrollHandle::new(),
+            fade: Cell::new(None),
         })
     }
 
@@ -203,12 +217,16 @@ impl State {
             BarOf::Div => self.bar_handle.scroll_key(),
             BarOf::List => self.bar_rows.scroll_key(),
         };
+        let (axes, shown) = (self.bar_axes.get(), self.bar_shown.get());
         let overlay = move |bounds: Bounds<crate::Pixels>, window: &mut Window, _: &mut App| {
             let thumb = fill(Bounds::new(bounds.origin + point(px(34.), px(0.)), size(px(6.), px(8.))), crate::black());
             let plan = Rc::new(|_: &Window, _: Option<Bounds<crate::Pixels>>| Ok(None));
             let moved = Rc::new(|_: &mut Window, _: &mut App| {});
             let repaint = Rc::new(|_: &Window, _: Option<Bounds<crate::Pixels>>| Ok(None));
-            window.paint_scroll_thumb(key, Some(thumb), plan, moved, repaint);
+            if axes {
+                window.paint_scroll_thumb(key, None, plan.clone(), moved.clone(), repaint.clone());
+            }
+            window.paint_scroll_thumb(key, shown.then_some(thumb), plan, moved, repaint);
         };
         match of {
             BarOf::Div => div()
@@ -297,11 +315,24 @@ impl Render for Page {
         if let Some(rows) = first {
             page = page.child(rows);
         }
+        let mut footer = div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green());
+        if state.footer_bar.get() {
+            let (key, fade) = (state.footer_handle.scroll_key(), state.clone());
+            footer = footer.paint_overlay(move |bounds: Bounds<crate::Pixels>, window: &mut Window, _: &mut App| {
+                let thumb = fill(Bounds::new(bounds.origin + point(px(40.), px(0.)), size(px(6.), px(8.))), crate::black());
+                let plan = Rc::new(|_: &Window, _: Option<Bounds<crate::Pixels>>| Ok(None));
+                let moved = Rc::new(|_: &mut Window, _: &mut App| {});
+                let repaint = Rc::new(move |_: &Window, _: Option<Bounds<crate::Pixels>>| {
+                    Ok(fade.fade.get().map(|color| ScrollThumbRepaint { background: color.into(), done: Box::new(|_: &mut Window, _: &mut App| {}) }))
+                });
+                window.paint_scroll_thumb(key, Some(thumb), plan, moved, repaint);
+            });
+        }
         let mut page = page
             .child(div().id("header").w(px(60.)).h(px(20.)).flex_none().bg(green()))
             .child(unit)
             .child(sibling)
-            .child(div().id("footer").w(px(60.)).h(px(20.)).flex_none().bg(green()));
+            .child(footer);
         if let Some(rows) = last {
             page = page.child(rows);
         }
@@ -350,7 +381,12 @@ impl Fixture {
                 if units.is_empty() {
                     return false;
                 }
+                // A tick repaints the thumbs of the bars that fade in the same draw, planned before the patch and written after it.
+                let repaints = patched.footer_bar.get().then(|| window.plan_scroll_thumb_repaints().expect("the thumbs are repainted alone"));
                 let outcome = window.repaint_in_place(units, cx, |_, _| true);
+                if let (Some(repaints), Ok(_)) = (repaints, &outcome) {
+                    window.repaint_scroll_thumbs(repaints, cx);
+                }
                 patched.seen.borrow_mut().push(outcome.as_ref().map(|_| ()).map_err(|decline| *decline));
                 outcome.is_ok()
             })));
@@ -1769,4 +1805,97 @@ fn a_root_that_holds_a_list_with_a_bar_is_not_a_unit_and_the_frame_is_built_whol
     assert_eq!(after.declines(PatchDecline::UnknownUnit), before.declines(PatchDecline::UnknownUnit) + 1, "{seen:?}");
     drop(seen);
     page.assert_whole(cx, "the bar of a list");
+}
+
+/// What the thumbs the frame shown keeps for the scroller are: the operation of each that is a quad, and none of the others.
+fn thumb_entries(page: &Fixture, scroller: crate::ScrollKey, cx: &mut TestAppContext) -> Vec<Option<usize>> {
+    cx.update_window(page.window, |_, window, _| window.rendered_frame.scroll.thumb_entries(scroller)).unwrap()
+}
+
+/// What the quad at the operation the thumb of the scroller is painted by is filled with.
+fn thumb_fill(page: &Fixture, scroller: crate::ScrollKey, cx: &mut TestAppContext) -> String {
+    cx.update_window(page.window, |_, window, _| {
+        let ops = window.rendered_frame.scroll.thumb_operations(scroller);
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        match &window.rendered_frame.scene.paint_operations[ops[0]] {
+            crate::scene::PaintOperation::Quad(quad) => format!("{:?}", quad.background),
+            other => panic!("the thumb is not a quad: {other:?}"),
+        }
+    })
+    .unwrap()
+}
+
+#[gpui::test]
+fn a_thumb_repainted_in_the_tick_that_splices_a_root_before_it_is_written_to_the_thumb_and_to_no_other(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    state.bar.set(Some(BarOf::Div));
+    state.footer_bar.set(true);
+    let page = Fixture::new(cx, state);
+    page.draw_whole(cx);
+    let (bar, footer) = (page.state.bar_handle.scroll_key(), page.state.footer_handle.scroll_key());
+    let (bar_fill, footer_fill) = (thumb_fill(&page, bar, cx), thumb_fill(&page, footer, cx));
+    assert_eq!(bar_fill, footer_fill, "both are painted black");
+    let faded = format!("{:?}", crate::Background::from(green()));
+    let mut relayouts = page.patches(cx).relayout_patches;
+    for (kids, what) in [(7, "3 to 7"), (1, "7 to 1")] {
+        page.state.change(kids);
+        page.state.fade.set(Some(green()));
+        page.tick(cx);
+        let after = page.patches(cx);
+        assert_eq!(after.relayout_patches, relayouts + 1, "{what}: {:?}", page.state.seen.borrow());
+        assert_eq!(after.declines(PatchDecline::Splice), 0, "{what}: {:?}", page.state.seen.borrow());
+        relayouts = after.relayout_patches;
+        assert_eq!(thumb_fill(&page, footer, cx), faded, "{what}: the thumb that fades is written");
+        assert_eq!(thumb_fill(&page, bar, cx), bar_fill, "{what}: the thumb of the bar in the spliced root is not");
+        page.state.fade.set(None);
+        page.draw_whole(cx);
+    }
+}
+
+#[gpui::test]
+fn a_bar_that_notes_a_thumb_for_each_axis_keeps_them_when_the_root_is_spliced_again_and_again(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    state.bar.set(Some(BarOf::Div));
+    state.bar_axes.set(true);
+    let page = Fixture::new(cx, state);
+    page.draw_whole(cx);
+    let key = page.state.bar_handle.scroll_key();
+    let whole = thumb_entries(&page, key, cx);
+    assert_eq!((whole.len(), whole.iter().flatten().count()), (2, 1), "the horizontal axis paints none: {whole:?}");
+    let mut relayouts = page.patches(cx).relayout_patches;
+    for (round, kids) in [7, 1, 5, 2, 8, 3].into_iter().enumerate() {
+        page.state.change(kids);
+        page.tick(cx);
+        let after = page.patches(cx);
+        assert_eq!(after.relayout_patches, relayouts + 1, "round {round}: {:?}", page.state.seen.borrow());
+        relayouts = after.relayout_patches;
+        let spliced = thumb_entries(&page, key, cx);
+        assert_eq!(spliced.len(), 2, "round {round}: no thumb is left behind: {spliced:?}");
+        assert_eq!((spliced[0], spliced[1].is_some()), (None, true), "round {round}: the axes keep their places: {spliced:?}");
+        page.draw_whole(cx);
+        assert_eq!(thumb_entries(&page, key, cx), spliced, "round {round}: where the frame built whole paints them");
+    }
+}
+
+#[gpui::test]
+fn a_bar_that_turns_on_in_the_patch_leaves_no_thumb_the_frame_shown_noted_for_it_off(cx: &mut TestAppContext) {
+    let state = State::new(cx, 3, false);
+    state.bar.set(Some(BarOf::Div));
+    state.bar_axes.set(true);
+    state.bar_shown.set(false);
+    let page = Fixture::new(cx, state);
+    page.draw_whole(cx);
+    let key = page.state.bar_handle.scroll_key();
+    assert_eq!(thumb_entries(&page, key, cx), [None, None], "the bar is off");
+    let before = page.patches(cx);
+    page.state.bar_shown.set(true);
+    page.state.change(7);
+    page.tick(cx);
+    let after = page.patches(cx);
+    assert_eq!(after.relayout_patches, before.relayout_patches + 1, "{:?}", page.state.seen.borrow());
+    let spliced = thumb_entries(&page, key, cx);
+    assert_eq!(spliced.len(), 2, "the thumbs the bar noted off are replaced and not added to: {spliced:?}");
+    assert_eq!((spliced[0], spliced[1].is_some()), (None, true), "{spliced:?}");
+    page.draw_whole(cx);
+    assert_eq!(thumb_entries(&page, key, cx), spliced);
 }
