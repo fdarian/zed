@@ -69,6 +69,9 @@ struct Page {
     hitboxes: bool,
     /// Another scroller in the content.
     nested: bool,
+    /// A scroller in each root, which a script moves (`inner`).
+    row_scroller: bool,
+    inner: ScrollHandle,
     /// Each root is a stacking context of its own that an absolute box in it is handed to.
     row_context: bool,
     layer: Layer,
@@ -88,6 +91,8 @@ impl Render for Page {
         let rows: Vec<_> = (0..ROWS)
             .map(|ix| {
                 let hitboxes = page.hitboxes;
+                let row_scroller = page.row_scroller;
+                let inner = page.inner.clone();
                 let row_context = page.row_context;
                 let spacer = page.spacer;
                 let horizontal = page.horizontal;
@@ -100,6 +105,13 @@ impl Render for Page {
                         (false, _) => row,
                     };
                     let row = if hitboxes { row.always_hitbox() } else { row };
+                    let row = if row_scroller && ix == 1 {
+                        let mut scroller = div().id("row-scroller").w(px(40.)).h(px(20.)).overflow_y_scroll().track_scroll(&inner).child(div().h(px(200.)).bg(crate::green()));
+                        scroller.style().allow_concurrent_scroll = Some(true);
+                        row.child(scroller)
+                    } else {
+                        row
+                    };
                     let row = if row_context {
                         row.stacking_context().child(div().absolute().top(px(2.)).left(px(2.)).w(px(10.)).h(px(10.)).bg(crate::red()))
                     } else {
@@ -285,6 +297,8 @@ impl Page {
             spacer_paints: false,
             hitboxes: true,
             nested: false,
+            row_scroller: false,
+            inner: ScrollHandle::new(),
             row_context: false,
             layer: Layer::None,
             horizontal: false,
@@ -735,4 +749,27 @@ fn an_owner_that_cannot_be_told_declines_the_translate(cx: &mut TestAppContext) 
     fixture.page.ready.set(true);
     fixture.scroll(cx, 10., 12., 5.);
     assert_eq!(fixture.counters(cx).patched, 1, "{:?}", fixture.counters(cx));
+}
+
+#[gpui::test]
+fn a_scroller_inside_a_root_is_no_scroller_of_the_frame_shown(cx: &mut TestAppContext) {
+    let mut page = Page::standard();
+    page.row_scroller = true;
+    let fixture = Fixture::open(cx, page);
+    let gated = Rc::new(RefCell::new(Vec::new()));
+    let log = gated.clone();
+    fixture.with_window(cx, |window| {
+        window.set_scroll_patch_gate(Some(Rc::new(move |_, _, translating| {
+            log.borrow_mut().push(translating);
+            None
+        })));
+    });
+    // A script moved the scroller in the root: the frame shown knows nothing of it, so what the wheel moves is the one scroller the
+    // owner is told of, and the scroller in the root is for the owner to find moved (`Retain::sources_changed`).
+    fixture.page.inner.set_offset(point(px(0.), px(-20.)));
+    fixture.scroll(cx, 80., 80., 5.);
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.patched), (1, 1, 1), "{counters:?}");
+    assert_eq!(gated.borrow().last(), Some(&Some(fixture.page.handle.scroll_key())));
+    assert_eq!(fixture.page.inner.offset(), point(px(0.), px(-20.)));
 }
