@@ -612,7 +612,7 @@ impl Window {
             // Where a rebuilt frame at the offset the frame shown has would put the boxes of layout.
             let layout_to_window =
                 self.pixel_snap_point(div.outer + snap_scroll_offset(div.scrolled, self.scale_factor)) + div.phase;
-            membership.entering.push(EnterIn { group, around, lift_z, at, anchor, runs_from, layout_to_window });
+            membership.entering.push(EnterIn { group, around, lift_z, at, anchor, runs_from, layout_to_window, offset: div.offset.clone() });
         }
         let thumbs = self.plan_thumb_moves(prediction)?;
         for id in &div.unrooted {

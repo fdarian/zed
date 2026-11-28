@@ -1826,6 +1826,8 @@ struct EnterIn {
     /// How far the window has the boxes of the layout of the page from where layout has them, around the content of the scroller in
     /// the frame shown.
     layout_to_window: Point<Pixels>,
+    /// The offset of the scroller, which the roots are put in the content of.
+    offset: Rc<RefCell<Point<Pixels>>>,
 }
 
 /// What the scratch frame left for rows that come in.
@@ -1860,11 +1862,9 @@ impl Window {
         let Some(prediction) = self.scroll_patch.predicted.take() else {
             return ScrollPatchDraw::Declined;
         };
-        if prediction.div.is_some() {
-            // The wheel of a frame built whole picks its anchor from the layout of the frame before it, which has the roots the
-            // translates before this one put in and not the ones this one does.
-            self.layout_engine_mut().lay_out_entered_roots_before_the_translate();
-        }
+        // The wheel of a frame built whole picks its anchor from the layout of the frame before it, which has the roots that the
+        // translates before this one put in, and not the ones this one does.
+        self.layout_engine_mut().lay_out_entered_roots_of_scrollers_that_moved();
         let planned = if cx.mode.skip_drawing() || self.layout_only || self.measuring || self.dispatch_depth.get() > 0 {
             Err(ScrollApplyDecline::Window)
         } else {
@@ -2375,15 +2375,16 @@ impl Window {
         let mut elements = Vec::with_capacity(entering.children.len());
         for child in &entering.children {
             let mut element = (child.build)(self, cx);
-            let (layout_id, measured) = element.layout_as_root_unsnapped_with_id(child.available, self, cx);
+            let measured = element.layout_as_root_unsnapped(child.available, self, cx);
             if (measured.width - child.size.width).abs() > px(0.01) || (measured.height - child.size.height).abs() > px(0.01) {
                 return Err(ScrollApplyDecline::Height);
             }
             // The layout of the page puts the root where the frame shown has it, less how far the window is from layout there. The
             // scroll anchor of the next layout is picked from that box, as it is in a frame built whole.
             if child.scrolls {
-                let scale_factor = self.scale_factor;
-                self.layout_engine_mut().note_entered_origin(layout_id, child.origin - group.layout_to_window, scale_factor);
+                let (scale_factor, offset) = (self.scale_factor, *group.offset.borrow());
+                let layout_id = self.layout_engine().last_computed().expect("the root of a child was just laid out");
+                self.layout_engine_mut().note_entered_origin(layout_id, child.origin - group.layout_to_window, scale_factor, &group.offset, offset);
             }
             elements.push(element);
         }
@@ -2393,7 +2394,9 @@ impl Window {
         let hitboxes_start = self.next_frame.hitboxes.len();
         for (child, element) in entering.children.iter().zip(&mut elements) {
             let origin = if child.scrolls { child.origin + shift } else { child.origin };
-            self.with_absolute_element_offset(origin, |window| {
+            // Where the page puts the root is not on a device pixel: it is painted on the one the origin rounds to, and what it reports of
+            // its box and snaps its edges from is the origin itself, as a row of a list is placed.
+            self.with_fractional_element_origin(origin, |window| {
                 window.with_positioned_frame(|window| {
                     let root = element.downcast_mut::<crate::Retained>().is_some_and(|root| root.is_relocatable());
                     let mut ticket = window.begin_lift();

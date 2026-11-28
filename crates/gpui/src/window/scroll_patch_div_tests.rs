@@ -1318,6 +1318,95 @@ fn an_edit_after_translates_that_put_every_visible_root_in_anchors_the_scroller_
     }
 }
 
+/// How the scroller moves after the translates that put the roots in, in a frame that is not a translate.
+#[derive(Clone, Copy, Debug)]
+enum Late {
+    /// A wheel that is built whole (the translate is off for it), with an edit of the owner in the same frame.
+    Wheel,
+    /// The owner moves the scroller (`ScrollHandle::set_offset`), with an edit in the same frame.
+    Script,
+}
+
+/// A translate that puts in the roots in view, then the scroller moves in a frame built whole, then the owner's `edit` in a frame of
+/// its own: the frames shown and the offset the scroller is left at.
+fn after_translates_and_a_move_built_whole(cx: &mut TestAppContext, patch: bool, late: Late, edit: Edit) -> (Vec<String>, crate::ScrollPatchCounters) {
+    let mut page = Page::standard();
+    let header: Rc<Cell<f32>> = Rc::default();
+    let border: Rc<Cell<f32>> = Rc::default();
+    page.header = Some(header.clone());
+    page.border_top = Some(border.clone());
+    let (push, nudge) = (page.push.clone(), page.nudge.clone());
+    // Roots 0 to 2 are in view, and the root 7 is the neighbor the ones that come in are put beside.
+    page.removed.borrow_mut().extend((0..ROWS).filter(|ix| !(0..3).contains(ix) && *ix != 7));
+    let fixture = Fixture::open(cx, page);
+    fixture.watch_removals(cx);
+    fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+    let mut frames = Vec::new();
+    // One translate puts in every root that is in view, so the pick of the next frame has no root of an earlier one to take.
+    fixture.point_at(cx, 10., 12.);
+    fixture.remove(&[0, 1, 2]);
+    fixture.enter(&[3, 4, 5, 6]);
+    fixture.scroll(cx, 10., 12., 90.);
+    frames.push(fixture.with_window(cx, shown));
+    fixture.page.key.set(2);
+    match late {
+        Late::Wheel => {
+            fixture.point_at(cx, 10., 12.);
+            fixture.page.shown_at.set(f32::from(fixture.page.handle.offset().y));
+            fixture.with_window(cx, |window| window.set_scroll_patch(false));
+            cx.update_window(fixture.window, |_, window, cx| {
+                window.refresh();
+                let event = ScrollWheelEvent { position: point(px(10.), px(12.)), delta: ScrollDelta::Pixels(point(px(0.), px(-15.))), ..Default::default() };
+                window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+            })
+            .unwrap();
+            fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+        }
+        Late::Script => {
+            let handle = fixture.page.handle.clone();
+            handle.set_offset(point(px(0.), handle.offset().y - px(15.)));
+            fixture.with_window(cx, |window| window.refresh());
+            fixture.draw(cx);
+        }
+    }
+    frames.push(fixture.with_window(cx, shown));
+    frames.push(format!("offset {:?}", fixture.page.handle.offset()));
+    // The pick of the frame that moved the scroller stands at this one.
+    header.set(edit.grows);
+    border.set(edit.border);
+    push.set(edit.pushes);
+    nudge.set((3, edit.nudges_first));
+    fixture.page.key.set(3);
+    fixture.with_window(cx, |window| window.refresh());
+    fixture.draw(cx);
+    frames.push(fixture.with_window(cx, shown));
+    frames.push(format!("offset {:?}", fixture.page.handle.offset()));
+    (frames, fixture.counters(cx))
+}
+
+#[gpui::test]
+fn a_scroller_that_moved_in_a_frame_built_whole_picks_the_roots_translates_put_in_as_the_frame_built_whole_does(cx: &mut TestAppContext) {
+    // The roots the last translate put in are not in the layout the pick of the frame after it reads, until the scroller moves: a wheel
+    // that is built whole (the pointer is under a hover, the commit is an edit) or a script moves it as much as another translate does,
+    // and the anchor that frame picked stands at the frame after it.
+    let edits = [
+        ("a box above grows", Edit { grows: 6., ..Edit::default() }),
+        ("the roots are put down", Edit { pushes: 7., ..Edit::default() }),
+        ("a box above grows and the roots are put down", Edit { grows: 10., pushes: 7., ..Edit::default() }),
+        ("the first root alone is put down", Edit { nudges_first: 7., grows: 3., ..Edit::default() }),
+        ("the border above the roots grows", Edit { border: 10., ..Edit::default() }),
+    ];
+    for late in [Late::Wheel, Late::Script] {
+        for (what, edit) in edits {
+            let what = format!("{what}, {late:?}");
+            let (translated, counters) = after_translates_and_a_move_built_whole(cx, true, late, edit);
+            let (built, _) = after_translates_and_a_move_built_whole(cx, false, late, edit);
+            assert_eq!((counters.patched, counters.mispredicted), (1, 0), "{what}: {counters:?}");
+            assert_the_same(&translated, &built, &counters, &what);
+        }
+    }
+}
+
 #[gpui::test]
 fn an_edit_that_moves_the_box_of_the_roots_and_puts_them_down_after_translates_drops_the_anchor_as_the_frame_built_whole_does(
     cx: &mut TestAppContext,

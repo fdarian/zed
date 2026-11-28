@@ -436,13 +436,6 @@ trait ElementObject {
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels>;
-
-    fn layout_as_root_unsnapped_with_id(
-        &mut self,
-        available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Size<Pixels>);
 }
 
 /// A wrapper around an implementer of [`Element`] that allows it to be drawn in a window.
@@ -841,17 +834,8 @@ impl<E: Element> Drawable<E> {
         window: &mut Window,
         cx: &mut App,
     ) -> Size<Pixels> {
-        self.layout_as_root_unsnapped_with_id(available_space, window, cx).1
-    }
-
-    pub(crate) fn layout_as_root_unsnapped_with_id(
-        &mut self,
-        available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Size<Pixels>) {
         let layout_id = self.layout_root(available_space, window, cx);
-        (layout_id, window.layout_unsnapped_size(layout_id))
+        window.layout_unsnapped_size(layout_id)
     }
 
     fn layout_root(
@@ -961,16 +945,6 @@ where
     ) -> Size<Pixels> {
         Drawable::layout_as_root_unsnapped(self, available_space, window, cx)
     }
-
-    #[inline]
-    fn layout_as_root_unsnapped_with_id(
-        &mut self,
-        available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Size<Pixels>) {
-        Drawable::layout_as_root_unsnapped_with_id(self, available_space, window, cx)
-    }
 }
 
 /// A dynamically typed element that can be used to store any element type.
@@ -1065,16 +1039,6 @@ impl AnyElement {
         cx: &mut App,
     ) -> Size<Pixels> {
         self.0.layout_as_root_unsnapped(available_space, window, cx)
-    }
-
-    /// [`Self::layout_as_root_unsnapped`] that also says which layout node the element is the root of.
-    pub(crate) fn layout_as_root_unsnapped_with_id(
-        &mut self,
-        available_space: Size<AvailableSpace>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Size<Pixels>) {
-        self.0.layout_as_root_unsnapped_with_id(available_space, window, cx)
     }
 
     /// Prepaints this element at the given absolute origin. The element is a layout root, so it is

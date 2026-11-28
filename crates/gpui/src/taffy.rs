@@ -404,7 +404,9 @@ pub struct TaffyLayoutEngine {
     unplaced: FxHashMap<LayoutId, Unplaced>,
     /// The places that [`Self::note_entered_origin`] recorded for roots of the scratch pass under way, which
     /// [`Self::mark_computed_unplaced`] takes.
-    entered_origins: FxHashMap<LayoutId, Point<f32>>,
+    entered_origins: FxHashMap<LayoutId, Entered>,
+    /// The root the last [`Self::compute_layout`] computed.
+    last_computed: Option<LayoutId>,
     /// A scroller is picking its anchor: a root of `unplaced` with a recorded place has it for the origin of its box.
     picking: bool,
     /// The pass under way is a scratch pass of a patch: the roots it computes are not the page, so computing them places nothing.
@@ -418,16 +420,27 @@ pub struct TaffyLayoutEngine {
     unmeasured_leaves: u64,
 }
 
+/// A root that a translate put in the page, where a layout of the page puts it, and the scroller it scrolls with.
+#[derive(Clone)]
+struct Entered {
+    /// The origin of its box (device pixels, in the coordinates of the page's layout root).
+    origin: Point<f32>,
+    /// The offset cell of the scroller the root is in the content of, and the offset it had when the root was put in.
+    scroller: Rc<RefCell<Point<Pixels>>>,
+    left_at: Point<Pixels>,
+}
+
 /// What a pick of a scroll anchor knows of a node that a scratch pass laid out as a root.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 enum Unplaced {
     /// A root that a translate put in the page, which a layout of the page puts at this origin (device pixels, in the coordinates of
     /// the page's layout root): the boxes of the layout the page had when the root came in, which a pick reads it from.
     At(Point<f32>),
-    /// A root that the latest translate put in: as [`Self::At`] once another translate comes. A frame built whole picks its anchor
-    /// from the layout before it, which does not have the roots that frame puts in, and it is that pick that stands at the next
-    /// frame (a frame after the wheel keeps the anchor), so no pick looks at the roots of the latest translate.
-    Fresh(Point<f32>),
+    /// A root that the latest translate put in, as long as its scroller is where that translate left it: it is [`Self::At`] once the
+    /// scroller moves (a wheel, a script, another translate). A frame built whole picks its anchor from the layout before it, which
+    /// does not have the roots that frame puts in, and it is that pick that stands at the next frame while the scroller does not
+    /// move, so no pick looks at the roots of the latest translate; a frame after a move picks anew, from the layout that has them.
+    Fresh(Entered),
     /// A node of a layout of a root, where the page would have put it is not known: no pick looks at it.
     Unknown,
 }
@@ -547,6 +560,7 @@ impl TaffyLayoutEngine {
             anchor_restyled_nodes: Vec::new(),
             unplaced: FxHashMap::default(),
             entered_origins: FxHashMap::default(),
+            last_computed: None,
             picking: false,
             in_scratch: false,
             hold_anchor_restyles: false,
@@ -783,8 +797,22 @@ impl TaffyLayoutEngine {
     /// Records where a layout of the page puts the root `id`, which the scratch pass under way laid out as a root of its own: the
     /// origin of its border box in the coordinates of the page's layout root, in logical pixels. A pick of a scroll anchor before
     /// the page lays the root out takes the box to be there, as it is in the layout the page had when the root was put in.
-    pub(crate) fn note_entered_origin(&mut self, id: LayoutId, origin: Point<Pixels>, scale_factor: f32) {
-        self.entered_origins.insert(id, point(origin.x.0 * scale_factor, origin.y.0 * scale_factor));
+    /// `scroller` is the offset of the scroller the root scrolls with, which is `offset` now.
+    pub(crate) fn note_entered_origin(
+        &mut self,
+        id: LayoutId,
+        origin: Point<Pixels>,
+        scale_factor: f32,
+        scroller: &Rc<RefCell<Point<Pixels>>>,
+        offset: Point<Pixels>,
+    ) {
+        let origin = point(origin.x.0 * scale_factor, origin.y.0 * scale_factor);
+        self.entered_origins.insert(id, Entered { origin, scroller: scroller.clone(), left_at: offset });
+    }
+
+    /// The root that the last [`Self::compute_layout`] computed: what the layout of an element as a root of its own was the layout of.
+    pub(crate) fn last_computed(&self) -> Option<LayoutId> {
+        self.last_computed
     }
 
     /// How many nodes hold the boxes of a layout of a root of their own, which no layout of the page has placed.
@@ -793,12 +821,14 @@ impl TaffyLayoutEngine {
         self.unplaced.len()
     }
 
-    /// A translate begins: the roots that the translates before it put in are in the layout that a frame built whole at this wheel
-    /// would pick its anchor from.
-    pub(crate) fn lay_out_entered_roots_before_the_translate(&mut self) {
+    /// The roots whose scroller moved since the translate that put them in are in the layout that a frame built whole at that move
+    /// picks its anchor from: they are [`Unplaced::At`] where that layout had them. A translate begins with it, and so does a pick.
+    pub(crate) fn lay_out_entered_roots_of_scrollers_that_moved(&mut self) {
         for unplaced in self.unplaced.values_mut() {
-            if let Unplaced::Fresh(origin) = *unplaced {
-                *unplaced = Unplaced::At(origin);
+            if let Unplaced::Fresh(entered) = unplaced
+                && *entered.scroller.borrow() != entered.left_at
+            {
+                *unplaced = Unplaced::At(entered.origin);
             }
         }
     }
@@ -811,8 +841,8 @@ impl TaffyLayoutEngine {
         for id in self.computed_layouts.iter().copied() {
             match entered.get(&id) {
                 // Its boxes below follow the root's, which a pick reads from the place.
-                Some(origin) => {
-                    self.unplaced.insert(id, Unplaced::Fresh(*origin));
+                Some(entered) => {
+                    self.unplaced.insert(id, Unplaced::Fresh(entered.clone()));
                 }
                 None => stack.push(id),
             }
@@ -1707,6 +1737,7 @@ impl TaffyLayoutEngine {
         self.detach_from_stale_parent(id);
         self.pick_scroll_anchors(window.scale_factor());
         self.give_back_stretched_widths(true);
+        self.last_computed = Some(id);
         if !self.computed_layouts.insert(id) {
             let stack = &mut self.layout_bounds_scratch_space;
             stack.push(id);
@@ -1779,6 +1810,7 @@ impl TaffyLayoutEngine {
     /// The boxes a pick reads are those of the layout before: a root a translate put in is where that layout had it. What was read
     /// of the boxes before is not what a pick reads, and what the pick reads is not what the layout after it does.
     fn begin_picking(&mut self) {
+        self.lay_out_entered_roots_of_scrollers_that_moved();
         let mut stack: Vec<LayoutId> = self
             .unplaced
             .iter()
@@ -5205,6 +5237,94 @@ mod tests {
                 engine.compute_layout(root, space(), window, cx);
                 assert!(!engine.has_unplaced(), "the page computing the root places it");
                 engine.end_pass();
+            });
+        }
+
+        /// A column of `rows` boxes of 10x10, a root of a scratch pass: the second is 10px below the first.
+        fn lay_out_a_root_of_its_own(
+            engine: &mut TaffyLayoutEngine,
+            key: u64,
+            entered: Option<(&Rc<RefCell<Point<Pixels>>>, Point<Pixels>)>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, [LayoutId; 2]) {
+            let boxed = || Style {
+                size: size(Length::Definite(px(10.).into()), Length::Definite(px(10.).into())),
+                ..Default::default()
+            };
+            engine.begin_scratch_pass();
+            let rows = [
+                engine.request_keyed_layout(key + 1, boxed(), REM, 1., &[]),
+                engine.request_keyed_layout(key + 2, boxed(), REM, 1., &[]),
+            ];
+            let column = Style { display: crate::Display::Flex, flex_direction: crate::FlexDirection::Column, ..Default::default() };
+            let root = engine.request_keyed_layout(key, column, REM, 1., &rows);
+            engine.compute_layout(root, space(), window, cx);
+            assert_eq!(engine.last_computed(), Some(root));
+            if let Some((scroller, offset)) = entered {
+                engine.note_entered_origin(root, point(px(7.), px(100.)), 1., scroller, offset);
+            }
+            engine.mark_computed_unplaced();
+            engine.end_pass_keeping_nodes();
+            (root, rows)
+        }
+
+        #[gpui::test]
+        fn a_root_a_translate_put_in_is_read_from_the_place_recorded_for_it_once_its_scroller_moves(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let scroller = Rc::new(RefCell::new(point(px(0.), px(-30.))));
+                let other = Rc::new(RefCell::new(point(px(0.), px(0.))));
+                // Where it had the offset when the root came in: `Fresh`. A root that the translate did not record is `Unknown`.
+                let (entered, [first, second]) = lay_out_a_root_of_its_own(&mut engine, 10, Some((&scroller, point(px(0.), px(-30.)))), window, cx);
+                let (unknown, [below_unknown, _]) = lay_out_a_root_of_its_own(&mut engine, 20, None, window, cx);
+                let (elsewhere, _) = lay_out_a_root_of_its_own(&mut engine, 30, Some((&other, point(px(0.), px(0.)))), window, cx);
+                assert!(engine.anchor_facts(entered).hidden, "Fresh");
+                assert!(engine.anchor_facts(unknown).hidden, "Unknown");
+
+                // A pick before the scroller moves reads the boxes of the scratch layout of the roots, as no pick looks at them.
+                engine.begin_picking();
+                assert!(engine.anchor_facts(entered).hidden && engine.anchor_facts(elsewhere).hidden);
+                assert_eq!(engine.layout_bounds(second, 1.).origin, point(px(0.), px(10.)), "Fresh: the layout of a root of its own");
+                engine.end_picking();
+
+                // The scroller of the first moves (a wheel, a script, a translate of its own): the root is At, and a pick reads it from
+                // the place recorded, and what is below it from there. The root of another scroller stays where it was, and so does
+                // `Unknown`, which no move places.
+                *scroller.borrow_mut() = point(px(0.), px(-45.));
+                assert_eq!(engine.layout_bounds(second, 1.).origin, point(px(0.), px(10.)), "outside a pick the boxes are the scratch layout's");
+                engine.begin_picking();
+                assert!(!engine.anchor_facts(entered).hidden, "At");
+                assert!(engine.anchor_facts(elsewhere).hidden, "the scroller of the root did not move");
+                assert!(engine.anchor_facts(unknown).hidden, "Unknown");
+                assert_eq!(engine.layout_bounds(entered, 1.).origin, point(px(7.), px(100.)));
+                assert_eq!(engine.layout_bounds(first, 1.).origin, point(px(7.), px(100.)));
+                assert_eq!(engine.layout_bounds(second, 1.).origin, point(px(7.), px(110.)));
+                assert_eq!(engine.layout_bounds(below_unknown, 1.).origin, point(px(0.), px(0.)), "a node of an Unknown root is read as laid out");
+                engine.end_picking();
+
+                // What a pick read is not what the layout after it does, and the root stays At when the scroller comes back.
+                assert_eq!(engine.layout_bounds(second, 1.).origin, point(px(0.), px(10.)));
+                *scroller.borrow_mut() = point(px(0.), px(-30.));
+                engine.begin_picking();
+                assert!(!engine.anchor_facts(entered).hidden);
+                engine.end_picking();
+            });
+        }
+
+        #[gpui::test]
+        fn a_translate_of_another_scroller_places_no_root_of_this_one(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let scroller = Rc::new(RefCell::new(point(px(0.), px(-30.))));
+                let (entered, _) = lay_out_a_root_of_its_own(&mut engine, 10, Some((&scroller, point(px(0.), px(-30.)))), window, cx);
+                engine.lay_out_entered_roots_of_scrollers_that_moved();
+                assert!(engine.anchor_facts(entered).hidden);
+                *scroller.borrow_mut() = point(px(0.), px(-31.));
+                engine.lay_out_entered_roots_of_scrollers_that_moved();
+                assert!(!engine.anchor_facts(entered).hidden);
             });
         }
 
