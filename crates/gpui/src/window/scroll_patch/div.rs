@@ -210,11 +210,12 @@ impl Window {
         let (viewport, scale_factor, mouse) = (self.viewport_size, self.scale_factor, self.mouse_position);
         let (element_offset, phase) = (self.element_offset(), self.element_origin_phase());
         let flow = mark.hitboxes..self.next_frame.hitboxes.len();
-        let place = self.layout_engine_mut().scroller_place(div.layout, scale_factor);
         let frame = &mut self.next_frame.scroll;
         let Some(open) = frame.open.pop() else {
             return;
         };
+        let place = self.layout_engine_mut().scroller_place(div.layout, scale_factor);
+        let frame = &mut self.next_frame.scroll;
         // What the content inserted that no root holds: the hitboxes of the elements between them.
         let held: FxHashSet<HitboxId> =
             frame.runs[open.start..].iter().filter(|run| run.list == open.id).flat_map(|run| run.hitbox_ids.iter().copied()).collect();

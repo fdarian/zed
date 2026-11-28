@@ -1011,10 +1011,6 @@ pub struct ScrollEntered {
     pub id: ElementId,
     /// Builds the retained root of the child, as the tree has it now.
     pub build: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
-    /// What the root is laid out in. The width of a child in a holder ([`ScrollEnteredOrigin::InHolder`]) is not read from here: it is
-    /// the area of the holder in device pixels as layout has it, which the window reads (no round trip through logical pixels in the
-    /// owner).
-    pub available: Size<AvailableSpace>,
     /// The size it comes out at: the translate declines when it comes out otherwise, which is a layout of what holds it.
     pub size: Size<Pixels>,
     /// Where the top left of its box is put in the frame shown.
@@ -1029,10 +1025,11 @@ pub struct ScrollEntered {
 /// Where a child that came in is put.
 #[derive(Clone, Copy, Debug)]
 pub enum ScrollEnteredOrigin {
-    /// At this point of the window of the frame shown, in logical pixels.
-    Window(Point<Pixels>),
+    /// At this point of the window of the frame shown, in logical pixels, laid out in `available`.
+    Window { origin: Point<Pixels>, available: Size<AvailableSpace> },
     /// Where the layout of the page puts a child that is absolute in a block of the frame shown, for a child that scrolls with the
-    /// content.
+    /// content. It is laid out in the area of the holder in device pixels as layout has it, which the window reads (no round trip
+    /// through logical pixels in the owner), and the height of its content.
     InHolder(ScrollEnteredInHolder),
 }
 
@@ -1065,7 +1062,7 @@ impl ScrollEntered {
     /// `to_window` is how far the window is from layout around the content of the scroller.
     fn page_origin(&self, window: &mut Window, scroller: &ScrollerPlace, to_window: Point<Pixels>) -> Option<Point<f32>> {
         match self.origin {
-            ScrollEnteredOrigin::Window(origin) => {
+            ScrollEnteredOrigin::Window { origin, .. } => {
                 let page = origin - to_window;
                 Some(point(page.x.0 * window.scale_factor, page.y.0 * window.scale_factor))
             }
@@ -1079,15 +1076,16 @@ impl ScrollEntered {
     /// What the root of the child is laid out in. A child in a holder is sized as taffy sizes an absolute child, against the area of the
     /// holder, which layout has in device pixels: the logical width handed to the layout of the root is the one that the layout
     /// multiplies by the scale back to that area, where there is one.
-    fn available_space(&self, window: &Window) -> Option<Size<AvailableSpace>> {
+    pub(super) fn available_space(&self, window: &Window) -> Option<Size<AvailableSpace>> {
         match self.origin {
-            ScrollEnteredOrigin::Window(_) => Some(self.available),
+            ScrollEnteredOrigin::Window { available, .. } => Some(available),
             ScrollEnteredOrigin::InHolder(in_holder) => {
                 let area = window.layout_engine.as_ref().expect("the layout engine is out only while a pass runs").absolute_area(in_holder.holder)?;
                 let scale = window.scale_factor;
                 let logical = area.width / scale;
-                let width = [logical, logical.next_down(), logical.next_up()].into_iter().find(|width| width * scale == area.width).unwrap_or(logical);
-                Some(Size { width: AvailableSpace::Definite(Pixels(width)), height: self.available.height })
+                // No width that multiplies back to the area is a layout that is not the page's at this scale: nothing is guessed.
+                let width = [logical, logical.next_down(), logical.next_up()].into_iter().find(|width| width * scale == area.width)?;
+                Some(Size { width: AvailableSpace::Definite(Pixels(width)), height: AvailableSpace::MinContent })
             }
         }
     }
@@ -1096,7 +1094,7 @@ impl ScrollEntered {
     /// (`Window::layout_unsnapped_bounds`: the layout origin in logical pixels, then the window's distance from layout).
     fn window_origin(&self, page: Point<f32>, scale: f32, to_window: Point<Pixels>) -> Point<Pixels> {
         match self.origin {
-            ScrollEnteredOrigin::Window(origin) => origin,
+            ScrollEnteredOrigin::Window { origin, .. } => origin,
             ScrollEnteredOrigin::InHolder(_) => point(Pixels(page.x / scale), Pixels(page.y / scale)) + to_window,
         }
     }

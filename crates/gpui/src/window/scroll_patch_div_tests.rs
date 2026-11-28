@@ -279,9 +279,11 @@ impl Page {
                     crate::ScrollEntered {
                         id: ("row", ix).into(),
                         build: Rc::new(move |_, _| page.row(ix)),
-                        available: size(crate::AvailableSpace::Definite(px(100.)), crate::AvailableSpace::MinContent),
                         size: size(px(80.), px(ROW)),
-                        origin: crate::ScrollEnteredOrigin::Window(point(px(0.), px(self.shown_at.get() + self.above + ix as f32 * ROW))),
+                        origin: crate::ScrollEnteredOrigin::Window {
+                            origin: point(px(0.), px(self.shown_at.get() + self.above + ix as f32 * ROW)),
+                            available: size(crate::AvailableSpace::Definite(px(100.)), crate::AvailableSpace::MinContent),
+                        },
                         scrolls: true,
                         lift_z: 0,
                     }
@@ -1647,4 +1649,94 @@ fn every_root_in_the_tree_that_a_translate_put_in_is_taken_out_and_replaced_by_t
     let (built, _) = after_membership(cx, Page::standard(), 0..4, false, &steps);
     assert_eq!((counters.patched, counters.mispredicted), (8, 0), "{counters:?}");
     assert_the_same(&translated, &built, &counters, "roots that all came in by a translate");
+}
+
+/// A holder whose width is `width` logical pixels and whose absolute child has a percentage width, as a page laid out whole has them at
+/// `scale`: the holder is a block of the window's layout engine with a border, which makes its area fractional in device pixels.
+fn laid_out_holder(window: &mut Window, cx: &mut App, width: f32, border: f32, scale: f32) -> (crate::LayoutId, crate::LayoutId) {
+    use crate::{DefiniteLength, Length, Style};
+    let definite = |pixels: f32| Length::Definite(px(pixels).into());
+    let rem = window.rem_size();
+    window.set_scale_factor(scale);
+    let mut engine = window.layout_engine.take().unwrap();
+    let child_style = Style {
+        position: Position::Absolute,
+        size: size(Length::Definite(DefiniteLength::Fraction(0.37)), definite(16.8)),
+        ..Default::default()
+    };
+    let child = engine.request_keyed_layout(2, child_style, rem, scale, &[]);
+    let holder_style = Style {
+        position: Position::Relative,
+        size: size(definite(width), definite(300.)),
+        border_widths: Edges { top: px(border).into(), left: px(border).into(), right: px(border).into(), bottom: px(border).into() },
+        ..Default::default()
+    };
+    let holder = engine.request_keyed_layout(3, holder_style, rem, scale, &[child]);
+    let space = size(crate::AvailableSpace::Definite(px(3000.)), crate::AvailableSpace::Definite(px(3000.)));
+    engine.compute_layout(holder, space, window, cx);
+    window.layout_engine = Some(engine);
+    (holder, child)
+}
+
+fn entered_in(holder: crate::LayoutId) -> crate::ScrollEntered {
+    crate::ScrollEntered {
+        id: ("row", 0usize).into(),
+        build: Rc::new(|_, _| div().into_any_element()),
+        size: size(px(0.), px(0.)),
+        origin: crate::ScrollEnteredOrigin::InHolder(crate::ScrollEnteredInHolder { holder, top: px(0.).into(), left: Some(px(0.).into()) }),
+        scrolls: true,
+        lift_z: 0,
+    }
+}
+
+#[gpui::test]
+fn a_child_in_a_holder_is_laid_out_in_the_area_of_the_holder_to_the_bit(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        // 203.37 px at 1.5 is 305.055 device pixels: a width whose device pixels are not a whole number of logical ones, and a border that
+        // is a fraction of both.
+        let scale = 1.5;
+        let (holder, whole_child) = laid_out_holder(window, cx, 203.37, 1.3, scale);
+        let engine = window.layout_engine.as_ref().unwrap();
+        let area = engine.absolute_area(holder).expect("a block that is laid out");
+        assert!(area.width.fract() != 0.0, "the area is fractional: {area:?}");
+        let whole = engine.layout_unsnapped_size(whole_child, scale).width;
+
+        let available = entered_in(holder).available_space(window).expect("a width that multiplies back to the area");
+        let crate::AvailableSpace::Definite(width) = available.width else { panic!("the width is definite: {available:?}") };
+        assert_eq!(width.0 * scale, area.width, "the width is the area in device pixels");
+        assert_eq!(available.height, crate::AvailableSpace::MinContent);
+
+        // The same child as a root of its own, laid out in that width: the percentage resolves to the width it has in the page.
+        let rem = window.rem_size();
+        let mut engine = window.layout_engine.take().unwrap();
+        let root_style = crate::Style {
+            size: size(crate::Length::Definite(crate::DefiniteLength::Fraction(0.37)), crate::Length::Definite(px(16.8).into())),
+            ..Default::default()
+        };
+        let root = engine.request_keyed_layout(20, root_style, rem, scale, &[]);
+        engine.begin_scratch_pass();
+        engine.compute_layout(root, available, window, cx);
+        let alone = engine.layout_unsnapped_size(root, scale).width;
+        engine.end_pass_keeping_nodes();
+        window.layout_engine = Some(engine);
+        assert_eq!(alone.0.to_bits(), whole.0.to_bits(), "the child alone is as wide as the child in the page");
+    });
+}
+
+#[gpui::test]
+fn a_child_in_a_holder_whose_area_no_width_multiplies_back_to_declines(cx: &mut TestAppContext) {
+    let cx = cx.add_empty_window();
+    cx.update(|window, cx| {
+        // At 1.7, 132 px is 224.390625 device pixels, which neither the width nor either neighbor of it in single precision times the scale gives.
+        let scale = 1.7_f32;
+        let (holder, _) = laid_out_holder(window, cx, 132., 0., scale);
+        let area = window.layout_engine.as_ref().unwrap().absolute_area(holder).expect("a block that is laid out").width;
+        let logical = area / scale;
+        assert!(
+            ![logical, logical.next_down(), logical.next_up()].into_iter().any(|width| width * scale == area),
+            "the case has no width that multiplies back: {area}"
+        );
+        assert!(entered_in(holder).available_space(window).is_none());
+    });
 }

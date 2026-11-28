@@ -6093,22 +6093,28 @@ mod entered_origin_tests {
     }
 
     /// A chain that does not end at the scroller or at a root that came in has no place: a row of a list is a root of its own whose seed
-    /// a pass drops, and so is what a scratch layout left that no layout of the page placed.
+    /// a pass drops, and so is what a scratch layout left that no layout of the page placed. A seed is not a place: it is summed only
+    /// into a scroller that was read with it.
     #[gpui::test]
     fn a_chain_that_ends_anywhere_else_has_no_place(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         cx.update(|window, cx| {
-            // The holder of a scroller that is somewhere else in the page: the walk reaches a root that is not the scroller, and the
-            // seed it had is not known any more.
             let mut page = Page::laid_out_whole(Spec::new(16.3, definite(10.), definite(4.), 1.), window, cx);
+            let unseeded = page.placed();
+            // The holder of a scroller that is somewhere else in the page: the walk reaches a root that is not the scroller.
             let elsewhere = ScrollerPlace { layout: page.child, origin: point(0., 0.) };
             page.engine.set_origin_seed(page.root, point(0.3, -0.2));
-            page.engine.layout_bounds(page.root, 1.);
+            let seeded = page.placed();
+            assert_ne!((seeded.x.to_bits(), seeded.y.to_bits()), (unseeded.x.to_bits(), unseeded.y.to_bits()), "the seed moves the page");
+            assert!(page.found(&elsewhere).is_none(), "a root with a seed that is not where the scroller is: no default is guessed");
+            let under = page.scroller(page.wrapper);
+            assert_same_bits(page.found(&under).expect("a scroller below the seeded root"), seeded, "a scroller below a seeded root");
+
             page.engine.end_pass_keeping_nodes();
             assert!(page.engine.origin_seeds.is_empty(), "a pass drops the seeds");
             assert!(page.found(&elsewhere).is_none(), "a seeded root whose seed is gone");
-            let root = ScrollerPlace { layout: page.root, origin: point(0., 0.) };
-            assert!(page.found(&root).is_some(), "the scroller is on the way up");
+            let root = page.scroller(page.root);
+            assert_same_bits(page.found(&root).expect("the scroller is on the way up"), unseeded, "from the root, with no seed");
 
             // A holder under a root of a scratch layout that no layout of the page placed.
             let mut engine = TaffyLayoutEngine::new();
@@ -6121,6 +6127,21 @@ mod entered_origin_tests {
             engine.end_pass_keeping_nodes();
             let scroller = ScrollerPlace { layout: child, origin: point(0., 0.) };
             assert!(engine.absolute_child_origin(holder, &scroller, px(0.).into(), Some(px(0.).into()), REM, 1.).is_none(), "below an Unknown root");
+        });
+    }
+
+    /// A node that was made the root of a layout of its own (`detach_for_relayout`) is on no chain to the scroller: nothing of the
+    /// page is summed through it, though it and the holder under it are not dirty.
+    #[gpui::test]
+    fn a_chain_through_a_node_that_was_detached_has_no_place(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let mut page = Page::laid_out_whole(Spec::new(16.3, definite(10.), definite(4.), 1.), window, cx);
+            let root = page.scroller(page.root);
+            assert!(page.found(&root).is_some());
+            page.engine.detach_for_relayout(page.mid);
+            assert!(!page.engine.taffy.dirty(page.mid.0).unwrap() && !page.engine.taffy.dirty(page.holder.0).unwrap(), "what is under the node is as it was laid out");
+            assert!(page.found(&root).is_none(), "a chain that reaches the node that left the tree");
         });
     }
 
