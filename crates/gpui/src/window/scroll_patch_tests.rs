@@ -550,12 +550,26 @@ fn a_window_without_an_owner_has_no_frame_to_translate(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn the_accessibility_tree_is_a_reason(cx: &mut TestAppContext) {
+fn a_screen_reader_that_came_since_the_frame_shown_is_a_reason(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, Some(100.), false);
+    fixture.point_at(cx, 10., 10.);
+    // The frame shown was built with no tree: a translate has none to edit, and the platform is told of a tree by a frame built whole.
+    // (A screen reader coming refreshes the window, which is `Edited` as well.)
+    fixture.wheel_with(cx, 10., 10., 5., |window, _| window.set_a11y_active_for_tests(true));
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible), (1, 0), "{counters:?}");
+    assert_eq!(counters.held(ScrollPatchReason::A11y), 1, "{counters:?}");
+}
+
+#[gpui::test]
+fn the_accessibility_tree_built_is_no_reason(cx: &mut TestAppContext) {
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| window.set_a11y_active_for_tests(true));
     fixture.draw(cx);
     fixture.scroll(cx, 10., 10., 5.);
-    only(&fixture.counters(cx), ScrollPatchReason::A11y);
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.patched), (1, 1, 1), "{counters:?}");
+    assert_eq!(counters.held(ScrollPatchReason::A11y), 0, "{counters:?}");
 }
 
 #[gpui::test]
@@ -597,10 +611,9 @@ fn every_reason_that_holds_is_counted_and_the_first_is_the_reason(cx: &mut TestA
     let fixture = Fixture::new(cx, Some(100.), false);
     fixture.with_window(cx, |window| {
         window.set_scroll_patch_gate(Some(Rc::new(|_, _, _| Some(ScrollPatchReason::Edited))));
-        window.set_a11y_active_for_tests(true);
     });
-    fixture.draw(cx);
-    fixture.scroll(cx, 10., 10., 40.);
+    fixture.point_at(cx, 10., 10.);
+    fixture.wheel_with(cx, 10., 10., 40., |window, _| window.set_a11y_active_for_tests(true));
     let counters = fixture.counters(cx);
     assert_eq!(counters.reasons(ScrollPatchReason::Edited), 1, "{counters:?}");
     assert_eq!(counters.reasons(ScrollPatchReason::Membership), 0, "{counters:?}");

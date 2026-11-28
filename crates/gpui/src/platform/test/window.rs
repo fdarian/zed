@@ -41,6 +41,8 @@ pub(crate) struct TestWindowState {
     appearance_change_callback: Option<Box<dyn FnMut()>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     frame_wake_count: Rc<Cell<usize>>,
+    /// The accessibility updates sent, kept while a test asks ([`TestWindow::record_a11y_updates`]).
+    a11y_updates: Option<Vec<accesskit::TreeUpdate>>,
     frame_scheduled: bool,
     frame_callback_pending: bool,
     input_handler: Option<PlatformInputHandler>,
@@ -212,6 +214,16 @@ impl HasDisplayHandle for TestWindow {
 }
 
 impl TestWindow {
+    /// Keeps the accessibility tree updates the window sends to its platform, from now on.
+    pub fn record_a11y_updates(&self) {
+        self.0.lock().a11y_updates.get_or_insert_with(Vec::new);
+    }
+
+    /// The accessibility tree updates the window sent since the last call, if it records them.
+    pub fn take_a11y_updates(&self) -> Vec<accesskit::TreeUpdate> {
+        self.0.lock().a11y_updates.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
@@ -247,6 +259,7 @@ impl TestWindow {
             appearance_change_callback: None,
             request_frame_callback: None,
             frame_wake_count: Rc::new(Cell::new(0)),
+            a11y_updates: None,
             frame_scheduled: false,
             frame_callback_pending: false,
             input_handler: None,
@@ -701,6 +714,12 @@ impl PlatformWindow for TestWindow {
             renderer.render_scene_to_image(scene, device_size)
         } else {
             anyhow::bail!("render_to_image not available: no HeadlessRenderer configured")
+        }
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        if let Some(updates) = self.0.lock().a11y_updates.as_mut() {
+            updates.push(tree_update);
         }
     }
 

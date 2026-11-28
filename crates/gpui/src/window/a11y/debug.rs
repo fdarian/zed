@@ -55,7 +55,7 @@ pub(crate) struct NodeCreator {
 
 #[derive(Default)]
 pub(crate) struct A11yDebug {
-    last_tree_update: Option<TreeUpdate>,
+    pub(super) last_tree_update: Option<TreeUpdate>,
     last_gpui_focus: Option<NodeId>,
     last_active_descendant: Option<NodeId>,
     /// Monotonic counter incremented on each captured frame, so a re-dump makes
@@ -94,6 +94,19 @@ impl A11yDebug {
             viewport_size: frame.viewport_size,
             scale_factor: frame.scale_factor,
         });
+    }
+
+    /// The retained update was edited in place by a scroll translate: it is a new frame of the tree.
+    pub(super) fn note_edited(&mut self) {
+        let Some(update) = self.last_tree_update.as_ref() else {
+            return;
+        };
+        self.frame_number += 1;
+        if let Some(frame) = self.last_frame.as_mut() {
+            frame.rendered_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+            frame.frame_number = self.frame_number;
+            frame.node_count = update.nodes.len();
+        }
     }
 
     #[cfg(debug_assertions)]

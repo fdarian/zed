@@ -6044,6 +6044,7 @@ impl Window {
         let a11y_active_end_of_frame = self.a11y.is_active();
 
         let should_send_a11y_update = a11y_active_start_of_frame && a11y_active_end_of_frame;
+        self.a11y.note_tree_sent(should_send_a11y_update);
 
         if a11y_active_start_of_frame {
             // Harvest frame metadata for the debug dump while the live window

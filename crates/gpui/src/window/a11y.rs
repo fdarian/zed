@@ -101,6 +101,9 @@
 use crate::*;
 
 pub(crate) mod debug;
+mod scroll;
+
+pub(crate) use scroll::{A11yFate, A11yRowEdit, A11yRowParts, A11yRowsScratch, A11yScrollEdit};
 
 use crate::{App, Bounds, FocusId, Pixels, SharedString, Window};
 use accesskit::{Action, NodeId, TreeUpdate};
@@ -160,6 +163,9 @@ pub(crate) struct A11y {
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    /// Whether the last frame that drew sent its tree to the platform, which is the tree a scroll
+    /// translate edits ([`Self::can_follow_scroll`]).
+    tree_sent: bool,
     /// What the maps above were given while a retained subtree recorded, see [`A11yMark`].
     journal: A11yJournal,
     /// The window's title, used to label the root node so assistive
@@ -192,6 +198,7 @@ impl A11y {
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
+            tree_sent: false,
             journal: A11yJournal::default(),
             window_title,
             last_focus_without_node: None,
