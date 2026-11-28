@@ -129,7 +129,7 @@ mod tests {
     #[test]
     #[ignore] // Requires macOS main thread
     fn test_foreground_tasks_run_with_run_until_parked() {
-        let mut cx = VisualTestAppContext::new(current_platform(false));
+        let mut cx = VisualTestAppContext::new(current_offscreen_platform());
 
         let task_ran = Rc::new(RefCell::new(false));
 
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     #[ignore] // Requires macOS main thread
     fn test_advance_clock_triggers_delayed_tasks() {
-        let mut cx = VisualTestAppContext::new(current_platform(false));
+        let mut cx = VisualTestAppContext::new(current_offscreen_platform());
 
         let task_ran = Rc::new(RefCell::new(false));
 
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     #[ignore] // Requires macOS main thread - window creation fails on test threads
     fn test_window_spawn_uses_test_dispatcher() {
-        let mut cx = VisualTestAppContext::new(current_platform(false));
+        let mut cx = VisualTestAppContext::new(current_offscreen_platform());
 
         let task_ran = Rc::new(RefCell::new(false));
 

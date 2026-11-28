@@ -10,7 +10,6 @@
 
 use std::{
     cell::{Cell, RefCell},
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering::SeqCst},
@@ -157,8 +156,11 @@ fn settle() {
     }
 }
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn main() {
-    let platform = Rc::new(MacPlatform::new_embedded());
+    let platform = support::hidden(MacPlatform::new_embedded());
     let app = Application::with_platform(platform.clone()).run_embedded(|cx: &mut App| {
         let window = cx.open_window(
             WindowOptions {

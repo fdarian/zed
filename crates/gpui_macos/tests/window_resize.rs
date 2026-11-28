@@ -2,7 +2,7 @@
 //! runs a test on.
 #![cfg(target_os = "macos")]
 
-use std::{rc::Rc, time::Duration};
+use std::time::Duration;
 
 use cocoa::foundation::NSSize;
 use gpui::{
@@ -41,8 +41,11 @@ fn set_content_size_as_appkit_does(window: &Window, width: f32, height: f32) {
     }
 }
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn main() {
-    gpui::Application::with_platform(Rc::new(MacPlatform::new(false))).run(|cx: &mut App| {
+    gpui::Application::with_platform(support::hidden(MacPlatform::new(false))).run(|cx: &mut App| {
         let window = cx
             .open_window(
                 WindowOptions {

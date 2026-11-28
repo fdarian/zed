@@ -10,7 +10,6 @@
 
 use std::{
     cell::Cell,
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering::SeqCst},
@@ -101,8 +100,11 @@ unsafe fn post_application_defined() {
     }
 }
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn main() {
-    let platform = Rc::new(MacPlatform::new_embedded());
+    let platform = support::hidden(MacPlatform::new_embedded());
     let _app = Application::with_platform(platform.clone()).run_embedded(|cx: &mut App| {
         cx.open_window(
             WindowOptions {

@@ -73,6 +73,9 @@ fn assert_quiet(wakes: &AtomicUsize, expected: usize) {
     );
 }
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn main() {
     // NSEventThread, which the wake observes, exists once the application does.
     let app: id = unsafe { msg_send![class!(NSApplication), sharedApplication] };
@@ -195,6 +198,7 @@ fn input_events(app: id) {
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: YES];
         // Only the events posted below are the window's.
         let _: () = msg_send![window, setIgnoresMouseEvents: YES];
+        support::hide_window(window);
         let _: () = msg_send![window, orderFrontRegardless];
         window
     };

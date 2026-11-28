@@ -29,6 +29,9 @@ const MOVES: usize = 100;
 
 static UPDATES: AtomicUsize = AtomicUsize::new(0);
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn main() {
     unsafe {
         let app: id = msg_send![class!(NSApplication), sharedApplication];
@@ -42,6 +45,7 @@ fn main() {
             defer: NO];
         let _: () = msg_send![window, setReleasedWhenClosed: NO];
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: YES];
+        support::hide_window(window);
         let _: () = msg_send![window, orderFrontRegardless];
         let window_number: i64 = msg_send![window, windowNumber];
 

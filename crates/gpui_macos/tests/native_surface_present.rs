@@ -174,8 +174,11 @@ fn frame(cx: &mut gpui::AsyncApp, window: gpui::WindowHandle<Demo>, change: impl
     })
 }
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn main() {
-    gpui::Application::with_platform(Rc::new(MacPlatform::new(false))).run(|cx: &mut App| {
+    gpui::Application::with_platform(support::hidden(MacPlatform::new(false))).run(|cx: &mut App| {
         let page = Rc::new(RefCell::new(Page::default()));
         let shared = page.clone();
         let window = cx
