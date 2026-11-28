@@ -88,6 +88,9 @@ struct Page {
     /// The roots the owner took out of the tree, and the ones of them a frame has not drawn yet.
     removed: Rc<RefCell<BTreeSet<usize>>>,
     pending: Rc<RefCell<Vec<usize>>>,
+    /// The roots the owner put in the tree and the frame has not drawn yet, and how far down the frame shown has the scroller.
+    entered: Rc<RefCell<Vec<usize>>>,
+    shown_at: Rc<Cell<f32>>,
     /// How far each frame that moved the content in place said it moved it.
     told: Rc<RefCell<Vec<crate::Point<crate::Pixels>>>>,
 }
@@ -97,58 +100,8 @@ impl Render for Page {
         let page = self.clone();
         // A view that renders draws every commit.
         page.pending.borrow_mut().clear();
-        let rows: Vec<_> = (0..ROWS)
-            .filter(|ix| !page.removed.borrow().contains(ix))
-            .map(|ix| {
-                let hitboxes = page.hitboxes;
-                let row_scroller = page.row_scroller;
-                let inner = page.inner.clone();
-                let row_context = page.row_context;
-                let row_escapes = page.row_escapes;
-                let spacer = page.spacer;
-                let horizontal = page.horizontal;
-                let mut row = retained(("row", ix), page.key.get(), move |_, _| {
-                    let row = div().id(("row", ix)).bg(crate::hsla(ix as f32 / 100., 0.5, 0.5, 1.));
-                    let row = if horizontal { row.w(px(ROW)).h(px(80.)) } else { row.w(px(80.)).h(px(ROW)) };
-                    let row = match (spacer, horizontal) {
-                        (true, true) => row.absolute().left(px(ix as f32 * ROW)),
-                        (true, false) => row.absolute().top(px(ix as f32 * ROW)),
-                        (false, _) => row,
-                    };
-                    let row = if hitboxes { row.always_hitbox() } else { row };
-                    let row = if row_scroller && ix == 1 {
-                        let mut scroller = div().id("row-scroller").w(px(40.)).h(px(20.)).overflow_y_scroll().track_scroll(&inner).child(div().h(px(200.)).bg(crate::green()));
-                        scroller.style().allow_concurrent_scroll = Some(true);
-                        row.child(scroller)
-                    } else {
-                        row
-                    };
-                    let row = if row_escapes {
-                        let mut escaped = div().left(px(30.)).top(px(2.)).w(px(10.)).h(px(10.)).bg(crate::red());
-                        escaped.style().position = Some(Position::AbsoluteInAncestor);
-                        row.stacking_context().child(div().overflow_hidden().w(px(20.)).h(px(20.)).child(escaped))
-                    } else {
-                        row
-                    };
-                    let row = if row_context {
-                        row.stacking_context().child(div().absolute().top(px(2.)).left(px(2.)).w(px(10.)).h(px(10.)).bg(crate::red()))
-                    } else {
-                        row
-                    };
-                    row.into_any_element()
-                });
-                if let Some(overscan) = page.overscan {
-                    row = row.relocatable(px(overscan));
-                }
-                if page.culls {
-                    row = row.cull_outset(Some(Edges::all(px(0.))));
-                }
-                if spacer {
-                    row = row.lift_z(0);
-                }
-                row.into_any_element()
-            })
-            .collect();
+        page.entered.borrow_mut().clear();
+        let rows: Vec<_> = (0..ROWS).filter(|ix| !page.removed.borrow().contains(ix)).map(|ix| page.row(ix)).collect();
         let scroller = div()
             .id("scroller")
             .w(px(100.))
@@ -239,6 +192,99 @@ impl Render for Page {
     }
 }
 
+
+impl Page {
+    /// The roots the commit put in, in groups that follow one another beside a root that stays.
+    fn groups(&self) -> Vec<crate::ScrollEntering> {
+        let mut rows = self.entered.borrow().clone();
+        rows.sort_unstable();
+        let (removed, entered) = (self.removed.borrow().clone(), rows.clone());
+        let stays = |ix: usize| ix < ROWS && !removed.contains(&ix) && !entered.contains(&ix);
+        let mut groups = Vec::new();
+        let mut at = 0;
+        while at < rows.len() {
+            let mut last = at;
+            while last + 1 < rows.len() && rows[last + 1] == rows[last] + 1 {
+                last += 1;
+            }
+            let (first, end) = (rows[at], rows[last]);
+            let (neighbor, follows) = match (first.checked_sub(1).filter(|ix| stays(*ix)), stays(end + 1)) {
+                (Some(before), _) => (before, true),
+                (None, true) => (end + 1, false),
+                (None, false) => panic!("a group of roots that come in has no root beside it"),
+            };
+            let children = rows[at..=last]
+                .iter()
+                .map(|ix| {
+                    let (page, ix) = (self.clone(), *ix);
+                    crate::ScrollEntered {
+                        id: ("row", ix).into(),
+                        build: Rc::new(move |_, _| page.row(ix)),
+                        available: size(crate::AvailableSpace::Definite(px(100.)), crate::AvailableSpace::MinContent),
+                        size: size(px(80.), px(ROW)),
+                        origin: point(px(0.), px(self.shown_at.get() + ix as f32 * ROW)),
+                        scrolls: true,
+                    }
+                })
+                .collect();
+            groups.push(crate::ScrollEntering { neighbor: ("row", neighbor).into(), follows, children });
+            at = last + 1;
+        }
+        groups
+    }
+
+    /// The root of the row `ix`, as the page builds it.
+    fn row(&self, ix: usize) -> crate::AnyElement {
+        let hitboxes = self.hitboxes;
+        let row_scroller = self.row_scroller;
+        let inner = self.inner.clone();
+        let row_context = self.row_context;
+        let row_escapes = self.row_escapes;
+        let spacer = self.spacer;
+        let horizontal = self.horizontal;
+        let mut row = retained(("row", ix), self.key.get(), move |_, _| {
+            let row = div().id(("row", ix)).bg(crate::hsla(ix as f32 / 100., 0.5, 0.5, 1.));
+            let row = if horizontal { row.w(px(ROW)).h(px(80.)) } else { row.w(px(80.)).h(px(ROW)) };
+            let row = match (spacer, horizontal) {
+                (true, true) => row.absolute().left(px(ix as f32 * ROW)),
+                (true, false) => row.absolute().top(px(ix as f32 * ROW)),
+                (false, _) => row,
+            };
+            let row = if hitboxes { row.always_hitbox() } else { row };
+            let row = if row_scroller && ix == 1 {
+                let mut scroller = div().id("row-scroller").w(px(40.)).h(px(20.)).overflow_y_scroll().track_scroll(&inner).child(div().h(px(200.)).bg(crate::green()));
+                scroller.style().allow_concurrent_scroll = Some(true);
+                row.child(scroller)
+            } else {
+                row
+            };
+            let row = if row_escapes {
+                let mut escaped = div().left(px(30.)).top(px(2.)).w(px(10.)).h(px(10.)).bg(crate::red());
+                escaped.style().position = Some(Position::AbsoluteInAncestor);
+                row.stacking_context().child(div().overflow_hidden().w(px(20.)).h(px(20.)).child(escaped))
+            } else {
+                row
+            };
+            let row = if row_context {
+                row.stacking_context().child(div().absolute().top(px(2.)).left(px(2.)).w(px(10.)).h(px(10.)).bg(crate::red()))
+            } else {
+                row
+            };
+            row.into_any_element()
+        });
+        if let Some(overscan) = self.overscan {
+            row = row.relocatable(px(overscan));
+        }
+        if self.culls {
+            row = row.cull_outset(Some(Edges::all(px(0.))));
+        }
+        if spacer {
+            row = row.lift_z(0);
+        }
+        row.into_any_element()
+    }
+}
+
 struct Fixture {
     window: AnyWindowHandle,
     page: Page,
@@ -286,6 +332,7 @@ impl Fixture {
     /// the one shown after it.
     fn scroll(&self, cx: &mut TestAppContext, x: f32, y: f32, by: f32) {
         self.point_at(cx, x, y);
+        self.page.shown_at.set(f32::from(self.page.handle.offset().y));
         let delta = if self.page.horizontal { point(px(-by), px(0.)) } else { point(px(0.), px(-by)) };
         cx.update_window(self.window, |_, window, cx| {
             let event = ScrollWheelEvent { position: point(px(x), px(y)), delta: ScrollDelta::Pixels(delta), ..Default::default() };
@@ -297,13 +344,25 @@ impl Fixture {
     /// The owner says that what it commits is roots taken out of the tree, which a frame that moves the content takes out of the
     /// frame; the commit is drawn when a frame is, which is when it forgets it.
     fn watch_removals(&self, cx: &mut TestAppContext) {
-        let (pending, drawn, told) = (self.page.pending.clone(), self.page.pending.clone(), self.page.pending.clone());
+        let page = self.page.clone();
         self.with_window(cx, move |window| {
-            window.set_scroll_patch_gate(Some(Rc::new(move |_, _, _| (!pending.borrow().is_empty()).then_some(ScrollPatchReason::Edited))));
-            window.set_scroll_patch_removals(Some(Rc::new(move |_, _, _| {
-                Some(ScrollRemovals { removed: told.borrow().iter().map(|ix| ("row", *ix).into()).collect(), gate: None })
+            let edited = page.clone();
+            window.set_scroll_patch_gate(Some(Rc::new(move |_, _, _| {
+                (!edited.pending.borrow().is_empty() || !edited.entered.borrow().is_empty()).then_some(ScrollPatchReason::Edited)
             })));
-            window.set_scroll_patch_settled(Some(Rc::new(move |_, _, _| drawn.borrow_mut().clear())));
+            let told = page.clone();
+            window.set_scroll_patch_removals(Some(Rc::new(move |_, _, _| {
+                Some(ScrollRemovals {
+                    removed: told.pending.borrow().iter().map(|ix| ("row", *ix).into()).collect(),
+                    entered: told.groups(),
+                    gate: None,
+                })
+            })));
+            let drawn = page.clone();
+            window.set_scroll_patch_settled(Some(Rc::new(move |_, _, _| {
+                drawn.pending.borrow_mut().clear();
+                drawn.entered.borrow_mut().clear();
+            })));
         });
     }
 
@@ -311,6 +370,14 @@ impl Fixture {
     fn remove(&self, rows: &[usize]) {
         self.page.removed.borrow_mut().extend(rows);
         self.page.pending.borrow_mut().extend(rows);
+    }
+
+    /// The owner puts the roots `rows` in the tree.
+    fn enter(&self, rows: &[usize]) {
+        for row in rows {
+            self.page.removed.borrow_mut().remove(row);
+        }
+        self.page.entered.borrow_mut().extend(rows);
     }
 
     fn counters(&self, cx: &mut TestAppContext) -> crate::ScrollPatchCounters {
@@ -345,6 +412,8 @@ impl Page {
             key: Rc::new(Cell::new(1)),
             removed: Rc::default(),
             pending: Rc::default(),
+            entered: Rc::default(),
+            shown_at: Rc::default(),
             told: Rc::default(),
         }
     }
@@ -1004,4 +1073,148 @@ fn a_commit_that_took_out_what_is_no_root_of_the_scroller_is_an_edit(cx: &mut Te
     fixture.page.pending.borrow_mut().push(500);
     fixture.scroll(cx, 10., 12., 5.);
     only(&fixture.counters(cx), ScrollPatchReason::Edited, &[]);
+}
+
+/// The frame shown after each wheel, when the owner took the roots of `steps` out of the tree and put others in before it. `visible` are the roots
+/// in the tree at the start.
+fn after_membership(
+    cx: &mut TestAppContext,
+    page: Page,
+    visible: std::ops::Range<usize>,
+    patch: bool,
+    steps: &[(f32, &[usize], &[usize])],
+) -> (Vec<String>, crate::ScrollPatchCounters) {
+    page.removed.borrow_mut().extend((0..ROWS).filter(|ix| !visible.contains(ix)));
+    let fixture = Fixture::open(cx, page);
+    fixture.watch_removals(cx);
+    fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+    let frames = steps
+        .iter()
+        .map(|(by, left, came)| {
+            fixture.point_at(cx, 10., 12.);
+            fixture.remove(left);
+            fixture.enter(came);
+            fixture.scroll(cx, 10., 12., *by);
+            fixture.with_window(cx, shown)
+        })
+        .collect();
+    (frames, fixture.counters(cx))
+}
+
+#[gpui::test]
+fn roots_that_a_commit_put_in_are_put_in_by_the_translate(cx: &mut TestAppContext) {
+    let steps: [(f32, &[usize], &[usize]); 5] = [(5., &[], &[4]), (5., &[], &[]), (4., &[], &[5, 6]), (-3., &[], &[]), (6., &[0], &[7])];
+    let (translated, counters) = after_membership(cx, Page::standard(), 0..4, true, &steps);
+    let (built, off) = after_membership(cx, Page::standard(), 0..4, false, &steps);
+    assert_eq!(off.frames, 0, "{off:?}");
+    assert_eq!((counters.patched, counters.mispredicted, counters.rows_built), (5, 0, 4), "{counters:?}");
+    assert_the_same(&translated, &built, &counters, "roots that come in");
+}
+
+#[gpui::test]
+fn roots_that_come_in_are_put_in_as_the_frame_built_whole_has_them(cx: &mut TestAppContext) {
+    let variants: [(&str, fn(&mut Page)); 5] = [
+        ("a box that holds the roots", |_| {}),
+        ("a box with a hitbox", |page| page.spacer_hitbox = true),
+        ("roots that are not culled", |page| page.culls = false),
+        ("roots that are stacking contexts", |page| page.row_context = true),
+        ("roots that escape a clip", |page| page.row_escapes = true),
+    ];
+    // Roots come in after the last, before the first, between the two groups that are left, and with the ones beside them leaving.
+    let steps: [(f32, &[usize], &[usize]); 8] = [
+        (5., &[], &[6]),
+        (4., &[], &[2]),
+        (3., &[3], &[1, 0]),
+        (-3., &[], &[]),
+        (6., &[4], &[7, 8]),
+        (-8., &[8], &[]),
+        (2., &[2], &[4]),
+        (1., &[4], &[2]),
+    ];
+    for (what, vary) in variants {
+        let page = || {
+            let mut page = Page::standard();
+            vary(&mut page);
+            page
+        };
+        let (translated, counters) = after_membership(cx, page(), 3..6, true, &steps);
+        let (built, off) = after_membership(cx, page(), 3..6, false, &steps);
+        assert_eq!(off.frames, 0, "{what}: {off:?}");
+        assert_eq!((counters.mispredicted, counters.patched), (0, 8), "{what}: {counters:?}");
+        assert_eq!(counters.rows_built, 8, "{what}: {counters:?}");
+        assert_the_same(&translated, &built, &counters, what);
+    }
+}
+
+#[gpui::test]
+fn a_commit_that_put_roots_in_is_checked_against_the_frame_built_whole_after_it(cx: &mut TestAppContext) {
+    // The frame that checks builds every subtree and leaves no recording to move the roots from, so each step is a window of its own.
+    // Where the roots that leave are beside the ones that come in, which are put at the point the others end or begin at.
+    type Case = (&'static [usize], f32, &'static [usize], &'static [usize]);
+    let cases: [Case; 6] = [
+        (&[3, 4, 5], 5., &[], &[6]),
+        (&[3, 4, 5], 4., &[], &[2]),
+        (&[3, 4, 5], 3., &[4], &[2, 6]),
+        (&[3, 4, 5], 6., &[3], &[6]),
+        (&[1, 3], 2., &[1], &[2]),
+        (&[1, 3], 2., &[3], &[2]),
+    ];
+    for (visible, by, left, came) in cases {
+        let page = Page::standard();
+        page.removed.borrow_mut().extend((0..ROWS).filter(|ix| !visible.contains(ix)));
+        let fixture = Fixture::open(cx, page);
+        fixture.watch_removals(cx);
+        fixture.point_at(cx, 10., 12.);
+        fixture.with_window(cx, |window| window.set_retention_verifier(Some(Rc::new(|_| String::new()))));
+        fixture.remove(left);
+        fixture.enter(came);
+        fixture.scroll(cx, 10., 12., by);
+        let counters = fixture.counters(cx);
+        let what = format!("{visible:?} {left:?} {came:?}");
+        assert_eq!((counters.patched, counters.rows_built, counters.mispredicted), (1, came.len() as u64, 0), "{what}: {counters:?}");
+        fixture.with_window(cx, |window| {
+            assert_eq!(window.retention_mismatches(), &[] as &[String], "{what}");
+            assert!(window.retained_counters().verified >= 1);
+        });
+    }
+}
+
+#[gpui::test]
+fn roots_that_come_in_beside_no_hitbox_are_an_edit(cx: &mut TestAppContext) {
+    let page = Page::standard();
+    page.removed.borrow_mut().extend(4..ROWS);
+    let page = Page { hitboxes: false, ..page };
+    let fixture = Fixture::open(cx, page);
+    fixture.watch_removals(cx);
+    fixture.point_at(cx, 10., 12.);
+    fixture.enter(&[4]);
+    fixture.scroll(cx, 10., 12., 5.);
+    only(&fixture.counters(cx), ScrollPatchReason::Edited, &[]);
+}
+
+#[gpui::test]
+fn what_is_under_the_pointer_in_a_root_that_came_in_is_hit(cx: &mut TestAppContext) {
+    // The pointer is where the root that comes in will be: 120 - 5 - 0 .. 150 - 5 .
+    let page = || {
+        let page = Page::standard();
+        page.removed.borrow_mut().extend((0..ROWS).filter(|ix| !(0..4).contains(ix)));
+        page
+    };
+    let run = |cx: &mut TestAppContext, patch: bool| {
+        let fixture = Fixture::open(cx, page());
+        fixture.watch_removals(cx);
+        fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+        let mut frames = Vec::new();
+        for (by, came) in [(5., &[4usize][..]), (2., &[][..])] {
+            fixture.point_at(cx, 10., 90.);
+            fixture.enter(came);
+            fixture.scroll(cx, 10., 90., by);
+            frames.push(fixture.with_window(cx, shown));
+        }
+        (frames, fixture.counters(cx))
+    };
+    let (translated, counters) = run(cx, true);
+    let (built, _) = run(cx, false);
+    assert_eq!((counters.patched, counters.rows_built, counters.mispredicted), (2, 1, 0), "{counters:?}");
+    assert_the_same(&translated, &built, &counters, "the pointer over a root that came in");
 }

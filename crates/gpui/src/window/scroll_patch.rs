@@ -60,7 +60,7 @@
 
 use super::*;
 use super::patch::Surroundings;
-use super::patch_splice::{HITBOXES, OPERATIONS, RowPart, Splice};
+use super::patch_splice::{EntryPoint, HITBOXES, OPERATIONS, RowPart, Splice};
 use super::retained::Effects;
 use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss, ScrollSource};
 use crate::scene::{Extent, PaintOperation, RecordedReach, ReplayClip, TranslatedOperations};
@@ -434,6 +434,11 @@ pub(super) struct ScrollRun {
     /// The root is lifted into a stacking context: its hitboxes are where the context put them and its recording's
     /// place among the hitboxes is where it was prepainted, so what takes the root out of the frame finds them by id.
     lifted: bool,
+    /// The z-index the context orders the lifted root by.
+    lift_z: Option<i32>,
+    /// Where the root of a `div` scroller that is lifted was prepainted, for a sibling that comes in to be built where the
+    /// context would have it.
+    around: Option<Rc<RowSurroundings>>,
     /// How far from its recording it was put.
     delta: Point<Pixels>,
     /// The content mask around the root in prepaint, and whether an exact clip cut it.
@@ -661,9 +666,10 @@ impl ScrollFrame {
     }
 
     /// The runs from `from` on were handed to a stacking context.
-    pub(crate) fn note_lifted_runs(&mut self, from: usize) {
+    pub(crate) fn note_lifted_runs(&mut self, from: usize, z: i32) {
         for run in self.runs.iter_mut().skip(from) {
             run.lifted = true;
+            run.lift_z = Some(z);
         }
     }
 
@@ -724,14 +730,16 @@ impl ScrollFrame {
                 div.stale = true;
             }
         }
-        self.runs.splice(edit.from..edit.from + edit.removed, edit.added);
         if edit.by_position {
+            // The runs that come in are made as they are in the frame once it is spliced.
             for run in &mut self.runs {
                 run.hitboxes = moved_past(&run.hitboxes, part.0, hitboxes);
                 run.ops = moved_past(&run.ops, part.1, operations);
             }
+            self.runs.splice(edit.from..edit.from + edit.removed, edit.added);
             return;
         }
+        self.runs.splice(edit.from..edit.from + edit.removed, edit.added);
         for run in &mut self.runs[after..] {
             run.hitboxes = shifted(&run.hitboxes, hitboxes);
             run.ops = shifted(&run.ops, operations);
@@ -945,6 +953,8 @@ struct Prediction {
     thumbs: Vec<(usize, Option<Bounds<Pixels>>)>,
     /// For the scroll of a `div`: the offset it is at, and `list` is the scroller. Its content moves by `shift`.
     div: Option<Point<Pixels>>,
+    /// For the scroll of a `div`: the children the commit put in.
+    entering: Vec<ScrollEntering>,
     /// For the scroll of a `div`: the roots of the content that the commit took out, which the frame takes out of the
     /// frame shown. The roots in `deltas` are the ones that stay.
     leaving: Vec<GlobalElementId>,
@@ -960,9 +970,38 @@ pub struct ScrollRemovals {
     /// The retained roots of the children that left, by the id each was built with. Nothing else of the frame
     /// changed: what stays is where the frame shown has it, once the scroll has moved it.
     pub removed: Vec<ElementId>,
+    /// The children that came in, in groups that follow one another in the tree. Each is built as its own root in a scratch frame
+    /// and put in the frame next to the root that stays beside it.
+    pub entered: Vec<ScrollEntering>,
     /// What [`Window::set_scroll_patch_gate`] says of the frame when the commit is not counted as an edit.
     pub gate: Option<ScrollPatchReason>,
 }
+/// Children of a `div` scroller's content that a commit created, and where they go: a run of children that follow one another,
+/// next to one that stays (see [`ScrollRemovals::entered`]).
+pub struct ScrollEntering {
+    /// The retained root that stays beside the group, by the id it was built with: a root of the scroller that the frame shown
+    /// holds, lifted into the stacking context that the group is.
+    pub neighbor: ElementId,
+    /// The group comes after the neighbor in the tree, or before it.
+    pub follows: bool,
+    pub children: Vec<ScrollEntered>,
+}
+
+/// A child that came in, built as the root of its own as the frame would build it.
+pub struct ScrollEntered {
+    /// The retained id the child is built with.
+    pub id: ElementId,
+    /// Builds the retained root of the child, as the tree has it now.
+    pub build: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+    /// What the root is laid out in, and the size it comes out at: the translate declines when it comes out otherwise, which is
+    /// a layout of what holds it.
+    pub available: Size<AvailableSpace>,
+    pub size: Size<Pixels>,
+    /// Where the top left of its box is put in the frame shown, and whether the scroll moves it with the content.
+    pub origin: Point<Pixels>,
+    pub scrolls: bool,
+}
+
 pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App, crate::ScrollKey)>;
 pub(crate) type ScrollPatchRegistries = Rc<dyn Fn(&Window) -> String>;
 
@@ -1144,6 +1183,20 @@ impl Window {
         self.paint_index().positions()
     }
 
+    /// Children of the `div` scroller `div` come in, in the scratch frame: their roots are runs of its content.
+    pub(crate) fn scroll_patch_begin_entering(&mut self, div: ScrollerId) {
+        let frame = &mut self.next_frame.scroll;
+        let start = frame.runs.len();
+        frame.open.push(OpenList { id: div, start, div: true, nested: false, culled: Vec::new(), lifted_hitboxes: Vec::new() });
+    }
+
+    /// The runs of the children the scratch frame prepainted for a `div` scroller.
+    fn scroll_patch_end_entering(&mut self) -> Vec<ScrollRun> {
+        let frame = &mut self.next_frame.scroll;
+        frame.open.pop();
+        mem::take(&mut frame.runs)
+    }
+
     /// The rows the scratch frame prepainted for a list, and painted: their runs.
     fn scroll_patch_end_rows(&mut self) -> Vec<ScrollRun> {
         let frame = &mut self.next_frame.scroll;
@@ -1184,6 +1237,8 @@ impl Window {
         let exact_clips = self.exact_clips.is_some();
         let hitboxes = hitboxes_start..self.next_frame.hitboxes.len();
         let in_div = self.next_frame.scroll.open.last().is_some_and(|open| open.div);
+        // A root that a stacking context takes is built where the context has it for a sibling that comes in.
+        let around = if in_div && self.lifting() { self.capture_row_surroundings() } else { None };
         let hitbox_ids: Vec<HitboxId> = match in_div {
             true => self.next_frame.hitboxes[hitboxes.clone()].iter().map(|hitbox| hitbox.id).collect(),
             false => Vec::new(),
@@ -1208,6 +1263,8 @@ impl Window {
             ops: 0..0,
             hitbox_ids,
             lifted: false,
+            lift_z: None,
+            around,
             delta,
             paint_mask: ambient,
             ambient,
@@ -1605,6 +1662,7 @@ impl Window {
                 deltas: places.into_iter().map(|(run, total, _)| (run.id.clone(), total)).collect(),
                 thumbs,
                 div: None,
+                entering: Vec::new(),
                 leaving: Vec::new(),
             }),
         }
@@ -1703,6 +1761,8 @@ struct MembershipPlan {
     rebuilt: usize,
     /// The rows that are built, in the order of the list, with where they are put.
     groups: Vec<RowsIn>,
+    /// The groups of children of a `div` scroller that are built and put beside a root the frame holds.
+    entering: Vec<EnterIn>,
     /// The hitboxes of a `div` scroller's content that no root holds, and where the scroll puts each.
     scrolled_hitboxes: Vec<(HitboxId, Hitbox)>,
 }
@@ -1716,6 +1776,19 @@ struct RowsIn {
     runs_from: usize,
     /// Where among the places of the list the places of the rows are put.
     places_from: usize,
+}
+
+/// A group of children of a `div` scroller that come in, and where they are put.
+struct EnterIn {
+    /// The group, by its place among those the prediction holds.
+    group: usize,
+    /// Where the neighbor was prepainted, which the children are built from.
+    around: Rc<RowSurroundings>,
+    lift_z: i32,
+    at: EntryPoint,
+    /// The hitbox of the neighbor that the hitboxes of the children are put next to, and whether after it.
+    anchor: (HitboxId, bool),
+    runs_from: usize,
 }
 
 /// What the scratch frame left for rows that come in.
@@ -2007,9 +2080,21 @@ impl Window {
         membership: &mut MembershipPlan,
         cx: &mut App,
     ) -> Result<Vec<RowsBuilt>, ScrollApplyDecline> {
+        enum Step {
+            Rows(RowsIn),
+            Enter(EnterIn),
+        }
+        let steps = mem::take(&mut membership.groups)
+            .into_iter()
+            .map(Step::Rows)
+            .chain(mem::take(&mut membership.entering).into_iter().map(Step::Enter));
         let mut built = Vec::new();
-        for group in mem::take(&mut membership.groups) {
-            match self.build_row_group(prediction, group, cx) {
+        for step in steps {
+            let rows = match step {
+                Step::Rows(group) => self.build_row_group(prediction, group, cx),
+                Step::Enter(group) => self.build_enter_group(prediction, group, cx),
+            };
+            match rows {
                 Ok(rows) => built.push(rows),
                 Err(decline) => {
                     // What the rows of the groups built so far recorded is of a frame that is not shown.
@@ -2077,6 +2162,140 @@ impl Window {
         self.a11y.resume(scratch.a11y_was_active);
         self.draw_pass = outside_pass;
         built
+    }
+
+    /// Builds the children of a `div` scroller that come in, as the scroller would build them, in the scratch frame: each is
+    /// requested and laid out as a root of its own in what the commit says (and declined when it comes out otherwise), and
+    /// prepainted where the scroll puts it, handed to the stacking context that holds the root they come in beside, which
+    /// paints it; then what they left is taken out for the splice that puts it in the frame shown next to that root. Nothing of
+    /// the frame shown is written.
+    fn build_enter_group(&mut self, prediction: &Prediction, group: EnterIn, cx: &mut App) -> Result<RowsBuilt, ScrollApplyDecline> {
+        self.requested_autoscroll = None;
+        let outside_pass = mem::replace(&mut self.draw_pass, 1);
+        let scratch = self.begin_scratch(cx);
+        let callbacks_from = self.next_frame_callbacks.borrow().len();
+        let built = self.build_enter_group_in(prediction.list, prediction.shift, &prediction.entering[group.group], &group, cx);
+        let serial = self.building_serial();
+        crate::view::remap_cached_views(&mut self.element_states, serial, &mut |_, _| false);
+        if built.is_err() {
+            let recordings = mem::take(&mut self.next_frame.retained_recordings);
+            self.forget_recordings(recordings);
+        }
+        let callbacks = callbacks_from..self.next_frame_callbacks.borrow().len();
+        self.forget_frame_callbacks(&[callbacks]);
+        // The roots were laid out as roots, which is not the layout of the page they are put in.
+        self.layout_engine_mut().mark_computed_unplaced();
+        self.clear_scratch_pass(scratch.layouts, cx, false);
+        self.a11y.resume(scratch.a11y_was_active);
+        self.draw_pass = outside_pass;
+        built
+    }
+
+    fn build_enter_group_in(
+        &mut self,
+        div: ScrollerId,
+        shift: Point<Pixels>,
+        entering: &ScrollEntering,
+        group: &EnterIn,
+        cx: &mut App,
+    ) -> Result<RowsBuilt, ScrollApplyDecline> {
+        let prepaint_start = self.prepaint_index();
+        let saved = self.enter_surroundings_in(group.around.layout_scope, &group.around.surroundings);
+        let drawn = self.draw_entering(div, shift, entering, group, cx);
+        self.leave_surroundings(saved);
+        let (effects, prepaint_end, paint_start, paint_end) = drawn?;
+
+        let after = self.effects().without_root_escapes(&effects);
+        if effects.reasons(&after) != 0 || self.redraw_before_present || self.requested_autoscroll.is_some() {
+            return Err(ScrollApplyDecline::Effects);
+        }
+        let mut runs = self.scroll_patch_end_entering();
+        let children = &entering.children;
+        if runs.len() != children.len() || runs.iter().zip(children).any(|(run, child)| run.id.last() != Some(&child.id) || !run.lifted) {
+            return Err(ScrollApplyDecline::Row);
+        }
+        for run in &runs {
+            if self.peek_element_state(&run.id, |state: &RetainedState| state.is_scroll_movable()) != Some(true) {
+                return Err(ScrollApplyDecline::Row);
+            }
+        }
+        if !self.next_frame.patchable.is_empty() || !self.next_frame.relocated.is_empty() || !self.next_frame.tab_stops.insertion_history.is_empty() {
+            return Err(ScrollApplyDecline::Row);
+        }
+        let (hitboxes_at, operations_at) = (group.at.prepaint[HITBOXES], group.at.paint[OPERATIONS]);
+        for run in &mut runs {
+            run.hitboxes = run.hitboxes.start + hitboxes_at..run.hitboxes.end + hitboxes_at;
+            run.ops = run.ops.start + operations_at..run.ops.end + operations_at;
+        }
+        let operations = mem::take(&mut self.next_frame.scene.paint_operations);
+        let edit = RunEdit { from: group.runs_from, removed: 0, added: runs, by_position: true };
+        let splice = self
+            .plan_lifted_insertion(&group.at, group.anchor, &prepaint_start..&prepaint_end, &paint_start..&paint_end, operations, edit)
+            .ok_or(ScrollApplyDecline::Splice)?;
+        Ok(RowsBuilt { splice, patchable: Vec::new(), relocated: Vec::new(), rows: children.len() })
+    }
+
+    /// Lays out, prepaints and paints the children of `entering` in the window as the neighbor's surroundings left it.
+    fn draw_entering(
+        &mut self,
+        div: ScrollerId,
+        shift: Point<Pixels>,
+        entering: &ScrollEntering,
+        group: &EnterIn,
+        cx: &mut App,
+    ) -> Result<(Effects, PrepaintStateIndex, PaintIndex, PaintIndex), ScrollApplyDecline> {
+        // The neighbor was prepainted inside the lift it is handed to the context by, which the surroundings count.
+        self.lifts_open = self.lifts_open.checked_sub(1).ok_or(ScrollApplyDecline::Row)?;
+        self.invalidator.set_phase(DrawPhase::Prepaint);
+        let before = self.effects();
+        let mut elements = Vec::with_capacity(entering.children.len());
+        for child in &entering.children {
+            let mut element = (child.build)(self, cx);
+            if element.layout_as_root_unsnapped(child.available, self, cx) != child.size {
+                return Err(ScrollApplyDecline::Height);
+            }
+            elements.push(element);
+        }
+        // The layout the children ran is not one nested in what they paint.
+        let effects = before.counting_layout_runs_of(&self.effects());
+        self.scroll_patch_begin_entering(div);
+        let hitboxes_start = self.next_frame.hitboxes.len();
+        for (child, element) in entering.children.iter().zip(&mut elements) {
+            let origin = if child.scrolls { child.origin + shift } else { child.origin };
+            self.with_absolute_element_offset(origin, |window| {
+                window.with_positioned_frame(|window| {
+                    let root = element.downcast_mut::<crate::Retained>().is_some_and(|root| root.is_relocatable());
+                    let mut ticket = window.begin_lift();
+                    element.prepaint(window, cx);
+                    window.scroll_patch_note_lifted_child(&mut ticket, root, group.lift_z);
+                    let handed = mem::replace(element, crate::Empty.into_any_element());
+                    window.finish_lift(ticket, group.lift_z, handed);
+                })
+            });
+            if self.take_autoscroll().is_some() {
+                return Err(ScrollApplyDecline::Effects);
+            }
+        }
+        let mut lifted = self.end_stacking_context(hitboxes_start);
+        if lifted.len() != elements.len() || lifted.iter().any(|entry| entry.z != group.lift_z) {
+            return Err(ScrollApplyDecline::Row);
+        }
+        let prepaint_end = self.prepaint_index();
+
+        self.invalidator.set_phase(DrawPhase::Paint);
+        let paint_start = self.paint_index();
+        // The scratch frame has no node open where the context is: the node the context paints the roots from is a stand-in, made
+        // after what the roots prepainted and taken out of the frame with it.
+        let context_node = self.next_frame.dispatch_tree.push_node();
+        self.begin_lift_paint();
+        for entry in &mut lifted {
+            self.paint_lifted(entry, context_node, cx);
+        }
+        let log = self.next_frame.tab_stops.paint_index();
+        self.end_lift_paint(log..log);
+        self.next_frame.dispatch_tree.pop_node();
+        let paint_end = self.paint_index();
+        Ok((effects, prepaint_end, paint_start, paint_end))
     }
 
     fn build_row_group_in(
@@ -2150,7 +2369,7 @@ impl Window {
                 &paint_start..&paint_end,
                 operations,
                 edit,
-                places,
+                Some(places),
             )
             .ok_or(ScrollApplyDecline::Splice)?;
         Ok(RowsBuilt {

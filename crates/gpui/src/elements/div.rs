@@ -2150,7 +2150,7 @@ fn prepaint_child(
     let root = child.downcast_mut::<crate::Retained>().is_some_and(|root| root.is_relocatable());
     let mut ticket = window.begin_lift();
     child.prepaint(window, cx);
-    window.scroll_patch_note_lifted_child(&mut ticket, root);
+    window.scroll_patch_note_lifted_child(&mut ticket, root, z);
     #[cfg(feature = "stacker")]
     let element = mem::replace(child, StackSafe::new(Empty.into_any_element())).into_inner();
     #[cfg(not(feature = "stacker"))]

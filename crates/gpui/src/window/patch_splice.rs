@@ -155,13 +155,16 @@ struct SideCut {
     /// Added to every position of a side whatever it is next to the part: the element states the
     /// paint accessed come after all that the prepaint did.
     lead: [isize; FIELDS],
+    /// The one vector that tells what is before the part and what is after, when the part is empty everywhere: roots that a
+    /// stacking context holds have their hitboxes noted where they were prepainted, which is not in the order of the tree.
+    witness: Option<usize>,
 }
 
 impl SideCut {
     /// A vector the part is not empty in, which tells what is before it and what is after: a
     /// position at its end, in a vector the part is empty in, could be either.
     fn witness(&self) -> Option<usize> {
-        (0..FIELDS).find(|field| self.start[*field] < self.end[*field])
+        (0..FIELDS).find(|field| self.start[*field] < self.end[*field]).or(self.witness)
     }
 
     /// Where a range that starts at `start` and ends at `end` is. A part that is empty everywhere is a
@@ -227,6 +230,20 @@ pub(crate) struct RowPart {
     pub(crate) tab_stops: Rc<[TabStopOperation]>,
 }
 
+/// Hitboxes put in the frame next to the one of the hitbox `anchor`: after it, or before it.
+pub(super) struct LiftedHitboxes {
+    anchor: HitboxId,
+    after: bool,
+    hitboxes: Vec<Hitbox>,
+}
+
+/// Where the roots that come in beside a root of a scroller are put in the frame shown.
+pub(super) struct EntryPoint {
+    pub(super) prepaint: [usize; FIELDS],
+    pub(super) paint: [usize; FIELDS],
+    pub(super) dispatch_parent: Option<DispatchNodeId>,
+}
+
 /// What the scratch frame left for a root that is spliced in, and where the root was.
 pub(super) struct Splice {
     /// Where the recording of the root was in the rendered frame.
@@ -252,6 +269,9 @@ pub(super) struct Splice {
     /// The hitboxes of the part are taken out of the frame by id, wherever a stacking context put them, and not by the
     /// range the recording says: the part is empty among the hitboxes.
     hitboxes_by_id: bool,
+    /// The hitboxes of roots that a stacking context holds and that come in: put next to the one of a root the frame has, by id,
+    /// wherever it is when the splice is made (`hitboxes` is empty then: the part has none where it is prepainted).
+    lifted_hitboxes: Option<LiftedHitboxes>,
     /// The thumbs the scratch frame noted for the bars in the part, with their operations counted from where the
     /// part begins.
     thumbs: Vec<ScrollThumb>,
@@ -304,12 +324,14 @@ impl Splice {
             end: pre.end.positions(),
             delta: [0; FIELDS],
             lead: [0; FIELDS],
+            witness: self.lifted_hitboxes.as_ref().map(|_| DISPATCH_NODES),
         };
         let mut painted = SideCut {
             start: paint.start.positions(),
             end: paint.end.positions(),
             delta: [0; FIELDS],
             lead: [0; FIELDS],
+            witness: None,
         };
         let old = |side: &SideCut, field: usize| (side.end[field] - side.start[field]) as isize;
         // The recordings made inside the root go, and so does the root's own, which is noted after
@@ -493,6 +515,7 @@ impl Window {
             places: None,
             old_hitbox_ids: Vec::new(),
             hitboxes_by_id: false,
+            lifted_hitboxes: None,
             thumbs: Vec::new(),
             operations,
             hitboxes: scratch.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec(),
@@ -586,6 +609,7 @@ impl Window {
             places,
             old_hitbox_ids,
             hitboxes_by_id: false,
+            lifted_hitboxes: None,
             thumbs: Vec::new(),
             operations: Vec::new(),
             hitboxes: Vec::new(),
@@ -653,6 +677,43 @@ impl Window {
         Some(splice)
     }
 
+    /// Where roots that come in beside the root `part` is the recording of are put, when a stacking context holds it (`by_id`
+    /// has the places of the hitboxes of the frame): before the root, or after it. What it prepainted is where its recording says,
+    /// its hitboxes are where the context put them, and what the context painted of it is bracketed by two marks which belong
+    /// to it. `None` if the frame does not hold what the root recorded where it recorded it.
+    pub(super) fn plan_root_entry(&self, part: &RowPart, by_id: &FxHashMap<HitboxId, usize>, follows: bool) -> Option<EntryPoint> {
+        if !self.frame_holds_hitboxes(&part.id, &part.prepaint, &part.paint, &part.hitboxes.hitboxes, &part.tab_stops, Some(by_id)) {
+            return None;
+        }
+        let operations = &self.rendered_frame.scene.paint_operations;
+        let (first, last) = (part.paint.start.positions()[OPERATIONS], part.paint.end.positions()[OPERATIONS]);
+        let bracketed = first > 0
+            && matches!(operations.get(first - 1), Some(PaintOperation::Replaced { .. }))
+            && matches!(operations.get(last), Some(PaintOperation::EndReplaced));
+        if !bracketed {
+            return None;
+        }
+        // The dispatch node the element that wraps the root pushes comes before the recording begins.
+        let wrapper = part.prepaint.start.dispatch_tree_index.checked_sub(1)?;
+        let dispatch_parent = self.rendered_frame.dispatch_tree.parent_of(wrapper);
+        let (mut prepaint, mut paint) = match follows {
+            false => (part.prepaint.start.positions(), part.paint.start.positions()),
+            true => (part.prepaint.end.positions(), part.paint.end.positions()),
+        };
+        match follows {
+            false => {
+                prepaint[DISPATCH_NODES] = wrapper;
+                paint[OPERATIONS] -= 1;
+            }
+            true => {
+                // The root's own recording is noted after its prepaint.
+                prepaint[RECORDINGS] += 1;
+                paint[OPERATIONS] += 1;
+            }
+        }
+        Some(EntryPoint { prepaint, paint, dispatch_parent })
+    }
+
     /// The splice that puts the rows the scratch frame was drawn with (`prepaint` and `paint` are what it
     /// holds, from its start) at `at` in the rendered frame, where `dispatch_parent` is the dispatch node
     /// that the rows hang off. Needs the scratch frame to have no deferred draws or publications. `runs`
@@ -665,7 +726,7 @@ impl Window {
         paint: Range<&PaintIndex>,
         operations: Vec<PaintOperation>,
         runs: RunEdit,
-        places: PlaceEdit,
+        places: Option<PlaceEdit>,
     ) -> Option<Splice> {
         let nothing_deferred = (prepaint.start.deferred_draws_index..prepaint.end.deferred_draws_index).is_empty()
             && (prepaint.start.layout_publications_index..prepaint.end.layout_publications_index).is_empty();
@@ -678,7 +739,23 @@ impl Window {
         splice.holds_root = false;
         splice.recordings = recordings;
         splice.runs = Some(runs);
-        splice.places = Some(places);
+        splice.places = places;
+        Some(splice)
+    }
+
+    /// [`Self::plan_insertion`] for roots that a stacking context holds: their hitboxes are put next to the hitbox `anchor` of the
+    /// root they come in beside, `after` it or before it.
+    pub(super) fn plan_lifted_insertion(
+        &mut self,
+        at: &EntryPoint,
+        anchor: (HitboxId, bool),
+        prepaint: Range<&PrepaintStateIndex>,
+        paint: Range<&PaintIndex>,
+        operations: Vec<PaintOperation>,
+        runs: RunEdit,
+    ) -> Option<Splice> {
+        let mut splice = self.plan_insertion((&at.prepaint, &at.paint), at.dispatch_parent, prepaint, paint, operations, runs, None)?;
+        splice.lifted_hitboxes = Some(LiftedHitboxes { anchor: anchor.0, after: anchor.1, hitboxes: mem::take(&mut splice.hitboxes) });
         Some(splice)
     }
 
@@ -879,6 +956,11 @@ impl Window {
             splice.prepaint_states,
         );
         frame.hitboxes.splice(pre.start.hitboxes_index..pre.end.hitboxes_index, splice.hitboxes);
+        if let Some(lifted) = splice.lifted_hitboxes {
+            let anchor = frame.hitboxes.iter().position(|hitbox| hitbox.id == lifted.anchor);
+            let at = anchor.map(|at| at + usize::from(lifted.after)).expect("a hitbox that roots are put beside is in the frame");
+            frame.hitboxes.splice(at..at, lifted.hitboxes);
+        }
         if splice.hitboxes_by_id {
             let gone: FxHashSet<HitboxId> = splice.old_hitbox_ids.iter().copied().collect();
             frame.hitboxes.retain(|hitbox| !gone.contains(&hitbox.id));

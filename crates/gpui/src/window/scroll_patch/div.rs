@@ -275,12 +275,12 @@ impl Window {
     /// What a root that is built in this frame hands to a stacking context of its own is the root's: its recording holds it
     /// (the root's run, which the paint of the root notes), and the operations it paints are numbered in the recording
     /// it is painted into, not in the frame.
-    pub(crate) fn scroll_patch_note_lifted_child(&mut self, ticket: &mut LiftTicket, root: bool) {
+    pub(crate) fn scroll_patch_note_lifted_child(&mut self, ticket: &mut LiftTicket, root: bool, z: i32) {
         if self.is_recording_any_relocation() {
             return;
         }
         if root {
-            self.next_frame.scroll.note_lifted_runs(ticket.runs_start);
+            self.next_frame.scroll.note_lifted_runs(ticket.runs_start, z);
             return;
         }
         let Some(open) = self.next_frame.scroll.open.last_mut().filter(|open| open.div) else {
@@ -362,8 +362,10 @@ impl Window {
         let (first, second) = (moved.next(), moved.next());
         let translating = first.filter(|_| second.is_none()).map(|div| div.id);
         let mut gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self, cx, translating));
-        // A commit that only took children out is not an edit when every one of them is a root of the scroller.
+        // A commit that only took children out, or put some in, is not an edit when every child that left is a root of the scroller and
+        // every group that came in has a root of the scroller beside it that a stacking context holds.
         let mut leaving = Vec::new();
+        let mut entering = Vec::new();
         if gate == Some(Reason::Edited)
             && let Some(removals) = self.scroll_patch.removals.as_ref().and_then(|removals| removals(self, cx, translating))
             && let Some(div) = translating.and_then(|id| shown.divs.iter().find(|div| div.id == id))
@@ -374,8 +376,21 @@ impl Window {
                 .iter()
                 .map(|id| runs.iter().find(|run| run.id.last() == Some(id)).map(|run| run.id.clone()))
                 .collect();
-            if let Some(roots) = roots.filter(|roots| !roots.is_empty()) {
+            let neighbors: Option<Vec<GlobalElementId>> = removals
+                .entered
+                .iter()
+                .map(|group| {
+                    let run = runs.iter().find(|run| run.id.last() == Some(&group.neighbor))?;
+                    let stays = run.lifted && run.around.is_some() && !run.hitbox_ids.is_empty() && !group.children.is_empty();
+                    stays.then(|| run.id.clone())
+                })
+                .collect();
+            if let (Some(roots), Some(neighbors)) = (roots, neighbors)
+                && !(roots.is_empty() && neighbors.is_empty())
+                && neighbors.iter().all(|neighbor| !roots.contains(neighbor))
+            {
                 leaving = roots;
+                entering = removals.entered;
                 gate = removals.gate;
             }
         }
@@ -502,6 +517,7 @@ impl Window {
                 deltas: places.into_iter().map(|(run, total, _)| (run.id.clone(), total)).collect(),
                 thumbs,
                 div: Some(offset),
+                entering,
                 leaving,
             }),
         }
@@ -562,6 +578,24 @@ impl Window {
         }
         if moves.is_empty() {
             return Err(ScrollApplyDecline::Runs);
+        }
+        for (group, entering) in prediction.entering.iter().enumerate() {
+            let (index, run) = self
+                .div_runs(div.id)
+                .find(|(_, run)| run.id.last() == Some(&entering.neighbor))
+                .ok_or(ScrollApplyDecline::Runs)?;
+            let part = self
+                .peek_element_state(&run.id, |state: &RetainedState| state.frame_part(self))
+                .flatten()
+                .ok_or(ScrollApplyDecline::Row)?;
+            let at = self.plan_root_entry(&part, &places, entering.follows).ok_or(ScrollApplyDecline::Splice)?;
+            let (around, lift_z) = run.around.clone().zip(run.lift_z).ok_or(ScrollApplyDecline::Row)?;
+            let anchor = match entering.follows {
+                true => (*run.hitbox_ids.last().ok_or(ScrollApplyDecline::Hitboxes)?, true),
+                false => (*run.hitbox_ids.first().ok_or(ScrollApplyDecline::Hitboxes)?, false),
+            };
+            let runs_from = index + usize::from(entering.follows);
+            membership.entering.push(EnterIn { group, around, lift_z, at, anchor, runs_from });
         }
         let thumbs = self.plan_thumb_moves(prediction)?;
         for id in &div.unrooted {

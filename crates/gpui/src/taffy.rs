@@ -397,6 +397,10 @@ pub struct TaffyLayoutEngine {
     unstable_requests: u64,
     /// The nodes with `NodeMeta::anchor_restyled` set in the pass under way.
     anchor_restyled_nodes: Vec<LayoutId>,
+    /// Nodes of roots that a scratch pass laid out (a patch that builds what a scroller's content comes to hold): they have the
+    /// boxes of a layout of their own as roots, which is no layout of the page. A scroller that picks its anchor before the layout
+    /// that puts them in the page does not look at them, as it does not look at a node that was never laid out.
+    unplaced: FxHashSet<LayoutId>,
     /// The end of the pass keeps the flags of `anchor_restyled_nodes`, see [`Self::hold_anchor_restyles`].
     hold_anchor_restyles: bool,
     /// The scrollers that asked for layout in the pass and have not picked their anchor yet.
@@ -519,6 +523,7 @@ impl TaffyLayoutEngine {
             probed: Vec::new(),
             unstable_requests: 0,
             anchor_restyled_nodes: Vec::new(),
+            unplaced: FxHashSet::default(),
             hold_anchor_restyles: false,
             anchor_scrollers: Vec::new(),
             unmeasured_leaves: 0,
@@ -712,6 +717,18 @@ impl TaffyLayoutEngine {
             self.collect_garbage();
         }
         self.end_pass_keeping_nodes();
+    }
+
+    /// Notes that the roots the pass laid out, and what is below them, hold the boxes of that layout and not of the page, which the
+    /// next pick of a scroll anchor is not to take for the layout before it.
+    pub(crate) fn mark_computed_unplaced(&mut self) {
+        let mut stack: Vec<LayoutId> = self.computed_layouts.iter().copied().collect();
+        while let Some(id) = stack.pop() {
+            if !self.unplaced.insert(id) {
+                continue;
+            }
+            stack.extend((0..self.taffy.child_count(id.0)).map(|index| LayoutId(self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE))));
+        }
     }
 
     /// [`Self::end_pass`] that frees no node, for a pass that laid out some roots of the page and not
@@ -1661,6 +1678,7 @@ impl TaffyLayoutEngine {
         // What was asked of the boxes above is of the boxes before the layout.
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
+        self.unplaced.clear();
     }
 
     /// The scrollers that anchor above `root`, from the nearest, as the frame before asked for them.
@@ -2589,7 +2607,7 @@ impl TaffyLayoutEngine {
         let overflow = [style.overflow.x, style.overflow.y];
         AnchorFacts {
             excluded: meta.anchor_excluded,
-            hidden: style.display == taffy::style::Display::None,
+            hidden: style.display == taffy::style::Display::None || self.unplaced.contains(&id),
             position: meta.position,
             is_static: meta.is_static,
             has_inset: meta.has_inset,
