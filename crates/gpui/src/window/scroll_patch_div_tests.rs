@@ -91,6 +91,8 @@ struct Page {
     /// The roots the owner put in the tree and the frame has not drawn yet, and how far down the frame shown has the scroller.
     entered: Rc<RefCell<Vec<usize>>>,
     shown_at: Rc<Cell<f32>>,
+    /// The z-index the first four roots are ordered by; the others are `auto`.
+    stay_z: i32,
     /// How far each frame that moved the content in place said it moved it.
     told: Rc<RefCell<Vec<crate::Point<crate::Pixels>>>>,
 }
@@ -224,6 +226,7 @@ impl Page {
                         size: size(px(80.), px(ROW)),
                         origin: point(px(0.), px(self.shown_at.get() + ix as f32 * ROW)),
                         scrolls: true,
+                        lift_z: 0,
                     }
                 })
                 .collect();
@@ -242,8 +245,10 @@ impl Page {
         let row_escapes = self.row_escapes;
         let spacer = self.spacer;
         let horizontal = self.horizontal;
+        let z = if ix < 4 { self.stay_z } else { 0 };
         let mut row = retained(("row", ix), self.key.get(), move |_, _| {
             let row = div().id(("row", ix)).bg(crate::hsla(ix as f32 / 100., 0.5, 0.5, 1.));
+            let row = if z == 0 { row } else { row.z_index(z) };
             let row = if horizontal { row.w(px(ROW)).h(px(80.)) } else { row.w(px(80.)).h(px(ROW)) };
             let row = match (spacer, horizontal) {
                 (true, true) => row.absolute().left(px(ix as f32 * ROW)),
@@ -279,7 +284,7 @@ impl Page {
             row = row.cull_outset(Some(Edges::all(px(0.))));
         }
         if spacer {
-            row = row.lift_z(0);
+            row = row.lift_z(z);
         }
         row.into_any_element()
     }
@@ -414,6 +419,7 @@ impl Page {
             pending: Rc::default(),
             entered: Rc::default(),
             shown_at: Rc::default(),
+            stay_z: 0,
             told: Rc::default(),
         }
     }
@@ -1177,6 +1183,16 @@ fn a_commit_that_put_roots_in_is_checked_against_the_frame_built_whole_after_it(
             assert!(window.retained_counters().verified >= 1);
         });
     }
+}
+
+#[gpui::test]
+fn roots_that_come_in_beside_a_root_of_another_z_index_are_the_frame_built_whole(cx: &mut TestAppContext) {
+    let page = || Page { stay_z: 1, ..Page::standard() };
+    let steps: [(f32, &[usize], &[usize]); 1] = [(5., &[], &[4])];
+    let (translated, counters) = after_membership(cx, page(), 0..4, true, &steps);
+    let (built, _) = after_membership(cx, page(), 0..4, false, &steps);
+    only(&counters, ScrollPatchReason::Edited, &[]);
+    assert_the_same(&translated, &built, &counters, "a root that comes in beside a root of another z-index");
 }
 
 #[gpui::test]

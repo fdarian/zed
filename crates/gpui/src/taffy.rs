@@ -716,6 +716,9 @@ impl TaffyLayoutEngine {
         {
             self.collect_garbage();
         }
+        // The pass laid out the page, whose boxes the nodes of a scratch pass have now (a scroller that picks its anchor before this
+        // pass asked for them already).
+        self.unplaced.clear();
         self.end_pass_keeping_nodes();
     }
 
@@ -5011,6 +5014,29 @@ mod tests {
                 AvailableSpace::Definite(px(300.)),
                 AvailableSpace::Definite(px(200.)),
             )
+        }
+
+        #[gpui::test]
+        fn nodes_a_scratch_pass_laid_out_are_placed_once_a_pass_of_the_page_ends(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                let root = engine.request_keyed_layout(1, flex(), REM, 1., &[leaf]);
+                engine.compute_layout(root, space(), window, cx);
+                engine.mark_computed_unplaced();
+                engine.end_pass_keeping_nodes();
+                assert!(engine.anchor_facts(leaf).hidden, "the end of a scratch pass leaves the boxes of the layout of a root");
+                assert!(engine.anchor_facts(root).hidden);
+
+                // A pass whose scrollers asked for no anchor still ends the mark.
+                let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                let root = engine.request_keyed_layout(1, flex(), REM, 1., &[leaf]);
+                engine.compute_layout(root, space(), window, cx);
+                engine.end_pass();
+                assert!(!engine.anchor_facts(leaf).hidden);
+                assert!(!engine.anchor_facts(root).hidden);
+            });
         }
 
         #[gpui::test]

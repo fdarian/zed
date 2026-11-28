@@ -1002,6 +1002,9 @@ pub struct ScrollEntered {
     pub origin: Point<Pixels>,
     /// The scroll moves the child with the content (it is not fixed to the viewport).
     pub scrolls: bool,
+    /// The z-index the stacking context orders the root of the child by (0 for `auto`). The root is handed to the context the neighbor is
+    /// in, whose z-index the roots of the group take, so a child with another z-index is not built by a scroll.
+    pub lift_z: i32,
 }
 
 pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App, crate::ScrollKey)>;

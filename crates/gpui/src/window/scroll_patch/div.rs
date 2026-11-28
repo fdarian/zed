@@ -381,7 +381,13 @@ impl Window {
                 .iter()
                 .map(|group| {
                     let run = runs.iter().find(|run| run.id.last() == Some(&group.neighbor))?;
-                    let stays = run.lifted && run.around.is_some() && !run.hitbox_ids.is_empty() && !group.children.is_empty();
+                    // The roots of the group are handed to the context the neighbor is handed to, which orders them by the z-index
+                    // of the neighbor: a child that is ordered by another is not where a scroll puts it. A child that is a run of the
+                    // scroller already is not one that came in.
+                    let in_the_context = group.children.iter().all(|child| {
+                        run.lift_z == Some(child.lift_z) && !runs.iter().any(|held| held.id.last() == Some(&child.id))
+                    });
+                    let stays = run.lifted && run.around.is_some() && !run.hitbox_ids.is_empty() && !group.children.is_empty() && in_the_context;
                     stays.then(|| run.id.clone())
                 })
                 .collect();
