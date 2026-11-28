@@ -31,6 +31,7 @@ use objc::{
     runtime::{NO, YES},
     sel, sel_impl,
 };
+mod support;
 
 static BLOCKS_RUN: AtomicUsize = AtomicUsize::new(0);
 static TIMERS_FIRED: AtomicUsize = AtomicUsize::new(0);
@@ -72,9 +73,6 @@ fn assert_quiet(wakes: &AtomicUsize, expected: usize) {
         "a pumped run loop woke the hook"
     );
 }
-
-#[path = "support/mod.rs"]
-mod support;
 
 fn main() {
     // NSEventThread, which the wake observes, exists once the application does.

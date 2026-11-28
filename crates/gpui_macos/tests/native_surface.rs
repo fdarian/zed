@@ -30,6 +30,7 @@ use objc::{
     sel, sel_impl,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+mod support;
 
 static NATIVE_DOWNS: AtomicUsize = AtomicUsize::new(0);
 static GPUI_FIRST_DOWNS: AtomicUsize = AtomicUsize::new(0);
@@ -541,9 +542,6 @@ async fn frame_becomes(cx: &mut AsyncApp, view: id, expected: Frame, what: &str)
     assert_frame(frame(view), expected, what);
 }
 
-#[path = "support/mod.rs"]
-mod support;
-
 fn main() {
     // A window the window server composites is the only one a capture of its pixels can read: a
     // transparent one captures transparent. So the pixel checks run only when asked, in a window that
@@ -605,14 +603,18 @@ fn main() {
                     })
                     .unwrap()
             });
-            // A window of an app nobody activated counts as occluded and gets no frames.
+            // A window of an app nobody activated counts as occluded and gets no frames. The window
+            // is the key window (`focus: true`) either way. The keyboard stays safe in the hidden
+            // branch because the app is never activated, and the floating level (see
+            // `support::hidden`) is what keeps it from counting as occluded without activation.
             unsafe {
                 if capture_pixels {
                     let app: id = msg_send![class!(NSApplication), sharedApplication];
                     let _: () = msg_send![app, activateIgnoringOtherApps: YES];
                     let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
                 } else {
-                    // Not the key window, so a transparent window does not take the keyboard.
+                    // The app is not activated, so the key window does not take the keyboard; the
+                    // window is unoccluded only through its floating level.
                     let _: () = msg_send![ns_window, orderFront: nil];
                 }
             }

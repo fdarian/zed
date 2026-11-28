@@ -12,6 +12,7 @@ use gpui::{
 use gpui_macos::MacPlatform;
 use objc::{msg_send, runtime::Object, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+mod support;
 
 struct Empty;
 
@@ -40,9 +41,6 @@ fn set_content_size_as_appkit_does(window: &Window, width: f32, height: f32) {
         let _: () = msg_send![ns_window, setContentSize: NSSize::new(width as f64, height as f64)];
     }
 }
-
-#[path = "support/mod.rs"]
-mod support;
 
 fn main() {
     gpui::Application::with_platform(support::hidden(MacPlatform::new(false))).run(|cx: &mut App| {

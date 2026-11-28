@@ -22,6 +22,7 @@ use gpui::{
 use gpui_macos::MacPlatform;
 use objc::{class, msg_send, runtime::{BOOL, Class, YES}, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+mod support;
 
 const WINDOW_HEIGHT: f64 = 300.;
 
@@ -173,9 +174,6 @@ fn frame(cx: &mut gpui::AsyncApp, window: gpui::WindowHandle<Demo>, change: impl
         .unwrap()
     })
 }
-
-#[path = "support/mod.rs"]
-mod support;
 
 fn main() {
     gpui::Application::with_platform(support::hidden(MacPlatform::new(false))).run(|cx: &mut App| {

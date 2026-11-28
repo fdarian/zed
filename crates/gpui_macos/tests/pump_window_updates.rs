@@ -23,14 +23,12 @@ use objc::{
     runtime::{NO, YES},
     sel, sel_impl,
 };
+mod support;
 
 const EVENT_MOUSE_MOVED: u64 = 5;
 const MOVES: usize = 100;
 
 static UPDATES: AtomicUsize = AtomicUsize::new(0);
-
-#[path = "support/mod.rs"]
-mod support;
 
 fn main() {
     unsafe {

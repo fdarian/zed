@@ -26,6 +26,7 @@ use dispatch2::DispatchQueue;
 use gpui::{App, Application, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, size};
 use gpui_macos::{MacPlatform, pump_app_nonblocking, run_loop_pumped, set_run_loop_wake_hook};
 use objc::{class, msg_send, sel, sel_impl};
+mod support;
 
 const EVENT_APPLICATION_DEFINED: u64 = 15;
 const EVENTS_PER_PUMP: usize = 5;
@@ -99,9 +100,6 @@ unsafe fn post_application_defined() {
         let _: () = msg_send![app, postEvent: event atStart: false];
     }
 }
-
-#[path = "support/mod.rs"]
-mod support;
 
 fn main() {
     let platform = support::hidden(MacPlatform::new_embedded());
