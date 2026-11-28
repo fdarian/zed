@@ -330,6 +330,9 @@ impl A11y {
     }
 
     pub(crate) fn set_active_descendant(&mut self, node_id: NodeId) {
+        // A recording notes that the element asked, which a tree built with no focus around it (the scratch
+        // tree of a scroll translate) drops: see `A11yRecording::asked_active_descendant`.
+        self.nodes.active_descendant_asks += 1;
         // The active descendant must be a descendant of the focused container,
         // not the focused node itself.
         if self.nodes.node_is_focused(node_id) {
@@ -441,6 +444,7 @@ pub(crate) struct A11yMark {
     parent_children: usize,
     focus: Option<NodeId>,
     active_descendant: Option<NodeId>,
+    active_descendant_asks: usize,
 }
 
 /// The share of the accessibility tree that a retained subtree prepainted: its nodes, how they
@@ -455,6 +459,9 @@ pub(crate) struct A11yRecording {
     actions: Vec<(NodeId, Action, A11yActionListener)>,
     focus: Option<NodeId>,
     active_descendant: Option<NodeId>,
+    /// Whether an element in the subtree asked to be the active descendant of the focused container
+    /// around it (`aria_active_descendant`), whether or not a focus decided that it is.
+    asked_active_descendant: bool,
     #[cfg(debug_assertions)]
     node_info: Vec<(NodeId, debug::NodeDebugInfo)>,
 }
@@ -528,6 +535,7 @@ impl A11y {
                 .map_or(0, |parent| parent.children().len()),
             focus: self.nodes.focus,
             active_descendant: self.nodes.active_descendant,
+            active_descendant_asks: self.nodes.active_descendant_asks,
         }
     }
 
@@ -564,6 +572,7 @@ impl A11y {
                 .nodes
                 .active_descendant
                 .filter(|id| mark.active_descendant != Some(*id)),
+            asked_active_descendant: self.nodes.active_descendant_asks > mark.active_descendant_asks,
             #[cfg(debug_assertions)]
             node_info,
         }
@@ -608,6 +617,7 @@ impl A11y {
         if let Some(active_descendant) = recording.active_descendant {
             self.nodes.set_active_descendant(active_descendant);
         }
+        self.nodes.active_descendant_asks += usize::from(recording.asked_active_descendant);
         #[cfg(debug_assertions)]
         for (id, info) in &recording.node_info {
             self.nodes.record_node_info(*id, info.clone());
@@ -781,6 +791,8 @@ pub(crate) struct A11yNodeBuilder {
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
     active_descendant: Option<NodeId>,
+    /// How many times an element asked to be the active descendant, claimed or not.
+    active_descendant_asks: usize,
     /// Author id to node, in push (document) order; the first node to claim an
     /// id owns it, as with a DOM `id`.
     author_ids: FxHashMap<String, NodeId>,
@@ -804,6 +816,7 @@ impl A11yNodeBuilder {
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
+            active_descendant_asks: 0,
             author_ids: FxHashMap::default(),
             pending_relations: Vec::new(),
             relation_targets: FxHashSet::default(),
@@ -941,6 +954,7 @@ impl A11yNodeBuilder {
         self.nodes_stack.push(root_node);
         self.focus = None;
         self.active_descendant = None;
+        self.active_descendant_asks = 0;
     }
 
     /// Returns whether a node with the given ID has been pushed in this frame.

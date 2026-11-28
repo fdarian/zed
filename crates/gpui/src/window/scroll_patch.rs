@@ -322,9 +322,11 @@ pub enum ScrollApplyDecline {
     /// The frame shown does not hold what a row recorded where it recorded it (a stacking context moved
     /// it), or the rows to take out do not follow one another.
     Splice,
-    /// The accessibility tree is built and a row has no nodes recorded for it, or the tree the frame shown
-    /// sent is not what the rows say it is, or a row that leaves or comes in claims more than nodes: the
-    /// focus, an author id, a relation.
+    /// The accessibility tree is built and cannot be edited to what the translate makes: a row has no nodes
+    /// recorded for it, the tree the frame shown sent is not what the rows say it is, a row that leaves or
+    /// comes in holds the focus or has an author id that a relation names, a row that comes in names a
+    /// relation or asks to be the active descendant of a focus around the rows, or the tree has an active
+    /// descendant already (see `window/a11y/scroll.rs`).
     A11y,
 }
 

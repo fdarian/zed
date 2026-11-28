@@ -63,6 +63,11 @@ struct Shared {
     author_ids: Cell<bool>,
     /// A node outside the list that a relation of its own points at the author id of this row.
     described_row: Cell<Option<usize>>,
+    /// The page is inside a container that a focus handle tracks, around the node the rows hang off.
+    wrapper_focus: Cell<bool>,
+    wrapper: FocusHandle,
+    /// The row that asks to be the active descendant of the focused container around it.
+    asking_row: Cell<Option<usize>>,
     /// The key of the unit, which moves when what it holds does.
     version: Cell<u64>,
     patch_unit: Cell<bool>,
@@ -98,6 +103,9 @@ impl Shared {
             a11y: Cell::new(false),
             author_ids: Cell::new(false),
             described_row: Cell::new(None),
+            wrapper_focus: Cell::new(false),
+            wrapper: cx.update(|cx| cx.focus_handle()),
+            asking_row: Cell::new(None),
             version: Cell::new(0),
             patch_unit: Cell::new(false),
             patch_row: Cell::new(None),
@@ -151,6 +159,9 @@ impl Shared {
         }
         if self.author_ids.get() {
             row = row.accessibility_id(format!("row-id-{ix}"));
+        }
+        if self.asking_row.get() == Some(ix) {
+            row = row.aria_active_descendant();
         }
         if self.small_kids.get() > 0 {
             row = row.flex().flex_wrap().content_start().overflow_hidden();
@@ -282,7 +293,15 @@ impl Render for Page {
                 .child(div().id("over-small").absolute().top(px(LIST_TOP + 420.)).left(px(90.)).w(px(20.)).h(px(20.)).bg(blue()))
                 .child(deferred(div().id("lifted").absolute().top(px(LIST_TOP + 120.)).left(px(10.)).w(px(40.)).h(px(130.)).bg(green())));
         }
-        page
+        if shared.wrapper_focus.get() {
+            return div()
+                .id("wrapper")
+                .role(accesskit::Role::Group)
+                .track_focus(&shared.wrapper)
+                .child(page)
+                .into_any_element();
+        }
+        page.into_any_element()
     }
 }
 
@@ -436,6 +455,12 @@ impl Fixture {
 
     fn counters(&self, cx: &mut TestAppContext) -> crate::ScrollPatchCounters {
         cx.update_window(self.window, |_, window, _| window.scroll_patch_counters()).unwrap()
+    }
+
+    /// Focuses `handle` and draws the frame that has the focus.
+    fn focus(&self, cx: &mut TestAppContext, handle: &FocusHandle) {
+        self.with_window(cx, |window, cx| window.focus(handle, cx));
+        self.draw(cx);
     }
 
     fn with_window<R>(&self, cx: &mut TestAppContext, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
@@ -2174,4 +2199,90 @@ fn a_row_with_no_nodes_recorded_declines_the_translate_and_is_drawn_whole(cx: &m
     // The frame is built whole, in the same draw: what the page holds is drawn from the rows' recordings, and the row
     // that had none made here replays as it was recorded, so the frames are not compared.
     assert!(pair.translated.built_whole(cx) > serial, "a frame was swapped in");
+}
+
+#[gpui::test]
+fn a_row_named_by_a_relation_before_it_is_built_declines_when_it_comes_in(cx: &mut TestAppContext) {
+    // The relation names an author id that no node has when the frame is built: `resolve_relations` keeps it all the same.
+    let pair = Pair::a11y_with(cx, 5000., |shared| {
+        shared.author_ids.set(true);
+        shared.described_row.set(Some(25));
+    });
+    let mut declines = Vec::new();
+    for step in 1..=12 {
+        let before = pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y);
+        let to = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, to);
+        if pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y) > before {
+            declines.push(pair.translated.rows(cx));
+        }
+        pair.same(cx, &format!("step {step}"));
+        pair.same_platform_tree(cx, &format!("the platform's tree, step {step}"));
+    }
+    assert_eq!(declines.len(), 1, "{declines:?}");
+    assert!(declines[0].contains(&25), "the translate that brought the row in declined: {declines:?}");
+    let counters = pair.translated.counters(cx);
+    assert!(counters.patched >= 10, "the others are translates: {counters:?}");
+}
+
+#[gpui::test]
+fn a_focused_container_around_the_list_declines_only_for_a_row_that_comes_in_and_asks_for_the_active_descendant(cx: &mut TestAppContext) {
+    let open = |asking: Option<usize>, cx: &mut TestAppContext| {
+        let pair = Pair::a11y_with(cx, 5000., |shared| {
+            shared.wrapper_focus.set(true);
+            shared.asking_row.set(asking);
+        });
+        for fixture in [&pair.translated, &pair.built] {
+            let handle = fixture.shared.wrapper.clone();
+            fixture.focus(cx, &handle);
+        }
+        pair
+    };
+
+    // No row asks: the focus around the list costs nothing.
+    let pair = open(None, cx);
+    for step in 1..=8 {
+        let to = pair.translated.bringing_in_below(cx, 2);
+        pair.scroll_to(cx, to);
+        pair.same(cx, &format!("no row asks, step {step}"));
+    }
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (8, 8), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 0, "{counters:?}");
+
+    // A row that comes in asks: it is the active descendant of the focused container in a frame built whole.
+    let pair = open(Some(25), cx);
+    let mut declined = Vec::new();
+    for step in 1..=12 {
+        let before = pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y);
+        let to = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, to);
+        if pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y) > before {
+            declined.push((step, pair.translated.rows(cx)));
+        }
+        pair.same(cx, &format!("a row asks, step {step}"));
+    }
+    assert!(!declined.is_empty() && declined[0].1.contains(&25), "the row that asks declined the translate that brought it in: {declined:?}");
+    assert!(declined.iter().all(|(step, _)| *step >= declined[0].0), "no translate before it declined: {declined:?}");
+}
+
+#[gpui::test]
+fn a_focus_in_a_row_that_stays_is_a_translate_with_the_tree_built(cx: &mut TestAppContext) {
+    let pair = Pair::a11y(cx, 5000.);
+    // Row 3 has a focus handle.
+    for fixture in [&pair.translated, &pair.built] {
+        let handle = fixture.shared.focus[0].clone();
+        fixture.focus(cx, &handle);
+    }
+    pair.same(cx, "after the focus");
+    for step in 1..=3 {
+        let to = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, to);
+        assert!(pair.translated.rows(cx).contains(&3), "row 3 stays");
+        pair.same(cx, &format!("step {step}"));
+        pair.same_platform_tree(cx, &format!("the platform's tree, step {step}"));
+    }
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (3, 3), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 0, "{counters:?}");
 }
