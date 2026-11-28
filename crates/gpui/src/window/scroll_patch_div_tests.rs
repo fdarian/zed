@@ -281,7 +281,7 @@ impl Page {
                         build: Rc::new(move |_, _| page.row(ix)),
                         available: size(crate::AvailableSpace::Definite(px(100.)), crate::AvailableSpace::MinContent),
                         size: size(px(80.), px(ROW)),
-                        origin: point(px(0.), px(self.shown_at.get() + self.above + ix as f32 * ROW)),
+                        origin: crate::ScrollEnteredOrigin::Window(point(px(0.), px(self.shown_at.get() + self.above + ix as f32 * ROW))),
                         scrolls: true,
                         lift_z: 0,
                     }

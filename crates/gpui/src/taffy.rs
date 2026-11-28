@@ -795,18 +795,16 @@ impl TaffyLayoutEngine {
     }
 
     /// Records where a layout of the page puts the root `id`, which the scratch pass under way laid out as a root of its own: the
-    /// origin of its border box in the coordinates of the page's layout root, in logical pixels. A pick of a scroll anchor before
+    /// origin of its border box in the coordinates of the page's layout root, in device pixels. A pick of a scroll anchor before
     /// the page lays the root out takes the box to be there, as it is in the layout the page had when the root was put in.
     /// `scroller` is the offset of the scroller the root scrolls with, which is `offset` now.
     pub(crate) fn note_entered_origin(
         &mut self,
         id: LayoutId,
-        origin: Point<Pixels>,
-        scale_factor: f32,
+        origin: Point<f32>,
         scroller: &Rc<RefCell<Point<Pixels>>>,
         offset: Point<Pixels>,
     ) {
-        let origin = point(origin.x.0 * scale_factor, origin.y.0 * scale_factor);
         self.entered_origins.insert(id, Entered { origin, scroller: scroller.clone(), left_at: offset });
     }
 
@@ -5262,7 +5260,7 @@ mod tests {
             engine.compute_layout(root, space(), window, cx);
             assert_eq!(engine.last_computed(), Some(root));
             if let Some((scroller, offset)) = entered {
-                engine.note_entered_origin(root, point(px(7.), px(100.)), 1., scroller, offset);
+                engine.note_entered_origin(root, point(7., 100.), scroller, offset);
             }
             engine.mark_computed_unplaced();
             engine.end_pass_keeping_nodes();
@@ -5314,17 +5312,22 @@ mod tests {
         }
 
         #[gpui::test]
-        fn a_translate_of_another_scroller_places_no_root_of_this_one(cx: &mut TestAppContext) {
+        fn the_move_of_a_scroller_places_the_roots_recorded_with_it_and_no_other(cx: &mut TestAppContext) {
             let cx = cx.add_empty_window();
             cx.update(|window, cx| {
                 let mut engine = TaffyLayoutEngine::new();
-                let scroller = Rc::new(RefCell::new(point(px(0.), px(-30.))));
-                let (entered, _) = lay_out_a_root_of_its_own(&mut engine, 10, Some((&scroller, point(px(0.), px(-30.)))), window, cx);
+                let first = Rc::new(RefCell::new(point(px(0.), px(-30.))));
+                let second = Rc::new(RefCell::new(point(px(0.), px(-10.))));
+                let (of_first, _) = lay_out_a_root_of_its_own(&mut engine, 10, Some((&first, point(px(0.), px(-30.)))), window, cx);
+                let (of_second, _) = lay_out_a_root_of_its_own(&mut engine, 20, Some((&second, point(px(0.), px(-10.)))), window, cx);
+                // What a translate of a scroller begins with: no scroller has moved, so no root is placed.
                 engine.lay_out_entered_roots_of_scrollers_that_moved();
-                assert!(engine.anchor_facts(entered).hidden);
-                *scroller.borrow_mut() = point(px(0.), px(-31.));
+                assert!(engine.anchor_facts(of_first).hidden && engine.anchor_facts(of_second).hidden);
+                // The second moves: its root is placed, and the root of the first, whose scroller is where the translate left it, is not.
+                *second.borrow_mut() = point(px(0.), px(-11.));
                 engine.lay_out_entered_roots_of_scrollers_that_moved();
-                assert!(!engine.anchor_facts(entered).hidden);
+                assert!(engine.anchor_facts(of_first).hidden, "the scroller of the root did not move");
+                assert!(!engine.anchor_facts(of_second).hidden);
             });
         }
 

@@ -1014,13 +1014,58 @@ pub struct ScrollEntered {
     pub available: Size<AvailableSpace>,
     /// The size it comes out at: the translate declines when it comes out otherwise, which is a layout of what holds it.
     pub size: Size<Pixels>,
-    /// Where the top left of its box is put in the frame shown, and whether the scroll moves it with the content.
-    pub origin: Point<Pixels>,
+    /// Where the top left of its box is put in the frame shown.
+    pub origin: ScrollEnteredOrigin,
     /// The scroll moves the child with the content (it is not fixed to the viewport).
     pub scrolls: bool,
     /// The z-index the stacking context orders the root of the child by (0 for `auto`). The root is handed to the context the neighbor is
     /// in, whose z-index the roots of the group take, so a child with another z-index is not built by a scroll.
     pub lift_z: i32,
+}
+
+/// Where a child that came in is put.
+#[derive(Clone, Copy, Debug)]
+pub enum ScrollEnteredOrigin {
+    /// At this point of the window of the frame shown.
+    Window(Point<Pixels>),
+    /// Where the layout of the page puts a child that is absolute in `holder`, the box of its parent that the frame shown laid out, with
+    /// the arithmetic taffy does it with: single precision, in the coordinates of the page, which past 2^16 px differs from the sum of
+    /// two exact lengths by a rounding of the large one. Only for a child that scrolls with the content.
+    InHolder {
+        /// The origin of the border box of the holder in the window of the frame shown, in logical pixels, as layout measured it.
+        holder: Point<f64>,
+        /// How far the child is from the border box of the holder, in device pixels: the border and the `top` or `left`.
+        inside: Point<f32>,
+    },
+}
+
+impl ScrollEntered {
+    /// Where the layout of the page puts the box of the child, in device pixels and the coordinates of the page's layout root.
+    /// `to_window` is how far the window is from layout around the content of the scroller.
+    fn page_origin(&self, scale: f32, to_window: Point<Pixels>) -> Point<f32> {
+        match self.origin {
+            ScrollEnteredOrigin::Window(origin) => {
+                let page = origin - to_window;
+                point(page.x.0 * scale, page.y.0 * scale)
+            }
+            ScrollEnteredOrigin::InHolder { holder, inside } => {
+                let along = |holder: f64, to_window: Pixels, inside: f32| ((holder - f64::from(to_window.0)) * f64::from(scale)) as f32 + inside;
+                point(along(holder.x, to_window.x, inside.x), along(holder.y, to_window.y, inside.y))
+            }
+        }
+    }
+
+    /// Where the box of the child is in the window of the frame shown, as a frame built whole at the offset it has would put it
+    /// (`Window::layout_unsnapped_bounds`: the layout origin in logical pixels, then the window's distance from layout).
+    fn window_origin(&self, scale: f32, to_window: Point<Pixels>) -> Point<Pixels> {
+        match self.origin {
+            ScrollEnteredOrigin::Window(origin) => origin,
+            ScrollEnteredOrigin::InHolder { .. } => {
+                let page = self.page_origin(scale, to_window);
+                point(Pixels(page.x / scale), Pixels(page.y / scale)) + to_window
+            }
+        }
+    }
 }
 
 pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App, crate::ScrollKey)>;
@@ -2373,6 +2418,7 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         let before = self.effects();
         let mut elements = Vec::with_capacity(entering.children.len());
+        let mut origins = Vec::with_capacity(entering.children.len());
         for child in &entering.children {
             let mut element = (child.build)(self, cx);
             let measured = element.layout_as_root_unsnapped(child.available, self, cx);
@@ -2381,19 +2427,22 @@ impl Window {
             }
             // The layout of the page puts the root where the frame shown has it, less how far the window is from layout there. The
             // scroll anchor of the next layout is picked from that box, as it is in a frame built whole.
+            let origin = child.window_origin(self.scale_factor, group.layout_to_window);
             if child.scrolls {
                 let (scale_factor, offset) = (self.scale_factor, *group.offset.borrow());
                 let layout_id = self.layout_engine().last_computed().expect("the root of a child was just laid out");
-                self.layout_engine_mut().note_entered_origin(layout_id, child.origin - group.layout_to_window, scale_factor, &group.offset, offset);
+                let page = child.page_origin(scale_factor, group.layout_to_window);
+                self.layout_engine_mut().note_entered_origin(layout_id, page, &group.offset, offset);
             }
+            origins.push(origin);
             elements.push(element);
         }
         // The layout the children ran is not one nested in what they paint.
         let effects = before.counting_layout_runs_of(&self.effects());
         self.scroll_patch_begin_entering(div);
         let hitboxes_start = self.next_frame.hitboxes.len();
-        for (child, element) in entering.children.iter().zip(&mut elements) {
-            let origin = if child.scrolls { child.origin + shift } else { child.origin };
+        for ((child, element), origin) in entering.children.iter().zip(&mut elements).zip(origins) {
+            let origin = if child.scrolls { origin + shift } else { origin };
             // Where the page puts the root is not on a device pixel: it is painted on the one the origin rounds to, and what it reports of
             // its box and snaps its edges from is the origin itself, as a row of a list is placed.
             self.with_fractional_element_origin(origin, |window| {
@@ -2867,6 +2916,43 @@ impl Window {
         eprintln!("[retained] {message}");
         if self.retained.mismatches.len() < 32 {
             self.retained.mismatches.push(message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod entered_origin_tests {
+    use super::*;
+    use crate::{Pixels, point, px};
+
+    fn entered(origin: ScrollEnteredOrigin) -> ScrollEntered {
+        ScrollEntered {
+            id: "row".into(),
+            build: Rc::new(|_, _| unreachable!("the origin is worked out without building")),
+            available: crate::size(AvailableSpace::MinContent, AvailableSpace::MinContent),
+            size: crate::size(px(1.), px(1.)),
+            origin,
+            scrolls: true,
+            lift_z: 0,
+        }
+    }
+
+    /// Far down a spacer the `top` of a row is on a coarser grid than the exact sum with the holder: the page sums them in single
+    /// precision and the origin in the window is that sum plus how far the window is from layout, as `layout_unsnapped_bounds` has it.
+    #[test]
+    fn the_origin_in_a_holder_is_summed_in_single_precision_in_the_page() {
+        for scale in [1.0_f32, 2.0] {
+            let to_window = point(px(0.), px(-336_000.));
+            let holder_page = 16.3_f32;
+            let top = 20_003.0_f32 * 16.8 * scale;
+            let border = 1.0_f32;
+            let holder_window = f64::from((holder_page / scale) + to_window.y.0);
+            let entered = entered(ScrollEnteredOrigin::InHolder { holder: point(0., holder_window), inside: point(0., border + top) });
+            let page = entered.page_origin(scale, to_window).y;
+            let expected_page = (((holder_window - f64::from(to_window.y.0)) * f64::from(scale)) as f32) + (border + top);
+            assert_eq!(page.to_bits(), expected_page.to_bits());
+            let window = entered.window_origin(scale, to_window).y;
+            assert_eq!(window.0.to_bits(), (Pixels(page / scale) + to_window.y).0.to_bits());
         }
     }
 }
