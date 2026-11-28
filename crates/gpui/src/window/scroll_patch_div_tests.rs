@@ -806,9 +806,16 @@ fn a_root_left_unwritten_comes_in_as_the_frame_built_whole(cx: &mut TestAppConte
     // Each root of the overscan is clipped away for some wheels and comes into the clip: the first below the clip is
     // 20 from it, and the ones after are further.
     let wheels = [4., 4., 4., 4., 4., 4., 4., 4., 4., 4., -9., -9., -9., 3., 3.];
-    let (translated, counters) = after_wheels(cx, Page::standard(), true, &wheels);
-    let (built, _) = after_wheels(cx, Page::standard(), false, &wheels);
-    assert!(counters.patched >= 10, "{counters:?}");
-    assert_eq!(counters.mispredicted, 0, "{counters:?}");
-    assert_the_same(&translated, &built, &counters, "a box that holds the roots");
+    for (what, vary) in [("a box that holds the roots", (|_: &mut Page| {}) as fn(&mut Page)), ("roots that are stacking contexts", |page| page.row_context = true)] {
+        let page = || {
+            let mut page = Page::standard();
+            vary(&mut page);
+            page
+        };
+        let (translated, counters) = after_wheels(cx, page(), true, &wheels);
+        let (built, _) = after_wheels(cx, page(), false, &wheels);
+        assert!(counters.patched >= 10, "{what}: {counters:?}");
+        assert_eq!(counters.mispredicted, 0, "{what}: {counters:?}");
+        assert_the_same(&translated, &built, &counters, what);
+    }
 }

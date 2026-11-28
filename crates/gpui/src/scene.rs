@@ -2161,9 +2161,19 @@ pub(crate) enum RecordedReach {
 impl RecordedReach {
     pub(crate) fn of(operations: &[PaintOperation]) -> Self {
         let mut reach = RecordedReach::Nothing;
+        // As a translate tracks it: what is under a mask that replaced the one around is cut by the clip only if
+        // that mask was cut from the masks inside the recording.
+        let mut clipping: Vec<bool> = Vec::new();
         for operation in operations {
             let area = match operation {
-                PaintOperation::Replaced { .. } | PaintOperation::EndReplaced => return RecordedReach::Unsaid,
+                PaintOperation::Replaced { derived } => {
+                    clipping.push(*derived);
+                    continue;
+                }
+                PaintOperation::EndReplaced => {
+                    clipping.pop();
+                    continue;
+                }
                 // A layer that is not clipped away is put in the draw order, which what it holds overlapping is
                 // ordered by, so it counts as drawing where it is.
                 PaintOperation::StartLayer(bounds) if !bounds.is_empty() => *bounds,
@@ -2174,6 +2184,9 @@ impl RecordedReach {
                     Extent::Area(area) => area,
                 },
             };
+            if !clipping.last().copied().unwrap_or(true) {
+                return RecordedReach::Unsaid;
+            }
             reach = match reach {
                 RecordedReach::Area(held) => RecordedReach::Area(held.union(&area)),
                 _ => RecordedReach::Area(area),
@@ -5430,6 +5443,31 @@ mod tests {
         assert!(same.differs_from(&PaintOperation::Quad(quad(0., 0., 10., 11.))));
         assert!(same.differs_from(&PaintOperation::Quad(Quad { background: crate::blue().into(), ..quad(0., 0., 10., 10.) })));
         assert!(same.differs_from(&PaintOperation::EndLayer));
+    }
+
+    fn replay_clip(bounds: Bounds<ScaledPixels>) -> ReplayClip {
+        ReplayClip { snapped: bounds, plain: bounds }
+    }
+
+    #[test]
+    fn what_is_put_where_the_clip_cuts_all_of_it_is_clipped_away() {
+        let operations = [PaintOperation::Quad(quad(0., 100., 10., 10.)), PaintOperation::StartLayer(bounds(0., 100., 10., 10.))];
+        let reach = RecordedReach::of(&operations);
+        let clip = replay_clip(bounds(0., 0., 50., 50.));
+        assert!(!reach.is_clipped_away_by(point(ScaledPixels(0.), ScaledPixels(-60.)), &clip));
+        assert!(reach.is_clipped_away_by(point(ScaledPixels(0.), ScaledPixels(-30.)), &clip));
+        assert!(RecordedReach::of(&[PaintOperation::EndLayer]).is_clipped_away_by(point(ScaledPixels(0.), ScaledPixels(0.)), &clip));
+    }
+
+    #[test]
+    fn what_is_painted_under_a_mask_the_clip_does_not_cut_is_not_told_by_a_box() {
+        let under = |derived: bool| {
+            [PaintOperation::Replaced { derived }, PaintOperation::Quad(quad(0., 100., 10., 10.)), PaintOperation::EndReplaced]
+        };
+        assert_eq!(RecordedReach::of(&under(false)), RecordedReach::Unsaid);
+        assert!(matches!(RecordedReach::of(&under(true)), RecordedReach::Area(_)));
+        let clipped = [PaintOperation::Replaced { derived: false }, PaintOperation::Quad(quad(0., 0., 0., 0.)), PaintOperation::EndReplaced];
+        assert_eq!(RecordedReach::of(&clipped), RecordedReach::Nothing);
     }
 
     /// What `differs_from` says without the debug form, which is `fields_equal` having an answer.
