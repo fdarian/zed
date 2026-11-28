@@ -323,7 +323,9 @@ pub struct TaffyLayoutEngine {
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     /// How far from the device pixel it is painted on the origin of a layout root is, in device
-    /// pixels, see [`Self::set_origin_seed`]. Not dropped by a pass: it belongs to the root.
+    /// pixels, see [`Self::set_origin_seed`]. Dropped by every pass, like the boxes of the root it is
+    /// the seed of: a root of a pass that is gone has no seed left to read, which is why the origin of a node
+    /// in the page is not summed up to a root of it ([`Self::absolute_child_origin`]).
     origin_seeds: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
@@ -428,6 +430,14 @@ struct Entered {
     /// The offset cell of the scroller the root is in the content of, and the offset it had when the root was put in.
     scroller: Rc<RefCell<Point<Pixels>>>,
     left_at: Point<Pixels>,
+}
+
+/// Where a scroller was in the page of a frame: its layout node and the origin of its border box in the coordinates of the page's
+/// layout root, in device pixels (unrounded, with the seed of the root), as `layout_bounds` had it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScrollerPlace {
+    layout: LayoutId,
+    origin: Point<f32>,
 }
 
 /// What a pick of a scroll anchor knows of a node that a scratch pass laid out as a root.
@@ -810,7 +820,7 @@ impl TaffyLayoutEngine {
 
     /// The block `holder` as the layout of the page left it, for what it holds an absolute child in: its taffy layout, if it is a block
     /// that the page laid out whose inline axis runs from the left (the places the other displays give an absolute child are not
-    /// worked out here).
+    /// worked out here: taffy places the absolute children of a flex or a grid container by other sums).
     fn absolute_holder(&self, holder: LayoutId) -> Option<&taffy::Layout> {
         if self.meta.get(&holder).is_none() || self.taffy.dirty(holder.0).ok()? {
             return None;
@@ -833,38 +843,55 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// The size of the area that the absolute children of a block of this layout are sized against and their percentages are of, in
+    /// device pixels.
+    fn absolute_area_in(layout: &taffy::Layout) -> Size<f32> {
+        let inset = Self::absolute_inset(layout);
+        Size {
+            width: layout.size.width - (inset.left + inset.right),
+            height: layout.size.height - (inset.top + inset.bottom),
+        }
+    }
+
     /// The size of the area that the absolute children of the block `holder` are sized against and their percentages are of, in device
     /// pixels, as layout left it. `None` for a node that is not a block of the page's layout (see [`Self::absolute_holder`]).
     pub(crate) fn absolute_area(&self, holder: LayoutId) -> Option<Size<f32>> {
-        let layout = self.absolute_holder(holder)?;
-        let inset = Self::absolute_inset(layout);
-        Some(Size {
-            width: layout.size.width - (inset.left + inset.right),
-            height: layout.size.height - (inset.top + inset.bottom),
-        })
+        Some(Self::absolute_area_in(self.absolute_holder(holder)?))
+    }
+
+    /// Where the scroller `id` is in the page, as the frame being drawn lays it out: what a translate of the scroller reads the places
+    /// of the nodes in its content from ([`Self::absolute_child_origin`]), taken at the moment the window's distance from layout around
+    /// its content is, so that the two are of the same layout.
+    pub(crate) fn scroller_place(&mut self, id: LayoutId, scale_factor: f32) -> ScrollerPlace {
+        self.layout_bounds(id, scale_factor);
+        ScrollerPlace { layout: id, origin: self.absolute_outer_origins[&id] }
     }
 
     /// The origin of the border box of `id` in the coordinates of the page's layout root, in device pixels: what `layout_bounds` sums
-    /// from its parents, without caching it. A root that a translate put in has the place recorded for it and what is below it
-    /// follows. `None` for a node that has none (a root of a scratch layout whose place is not known).
-    fn page_origin(&self, id: LayoutId) -> Option<Point<f32>> {
+    /// from its parents, without caching it, the sums in the same order. The walk up from `id` ends at the scroller, whose place the
+    /// frame shown recorded, or at a root that a translate put in, whose place was recorded for it, and what is below it follows.
+    ///
+    /// `None` for a chain that ends anywhere else: the root of a layout that is not the page's (its origin seed, or where the page puts
+    /// it, is not known any more: a row of a list is such a root, so is a node that a layout of a root of its own left), a root that no
+    /// pick can place, or a node whose layout is not the one the frame shown had (dirty).
+    fn page_origin(&self, id: LayoutId, scroller: &ScrollerPlace) -> Option<Point<f32>> {
         let mut locations = Vec::new();
         let mut at = id;
         let mut origin = loop {
+            if self.taffy.dirty(at.0).ok()? {
+                return None;
+            }
+            if at == scroller.layout {
+                break scroller.origin;
+            }
             match self.unplaced.get(&at) {
                 Some(Unplaced::At(origin)) => break *origin,
                 Some(Unplaced::Fresh(entered)) => break entered.origin,
                 Some(Unplaced::Unknown) => return None,
                 None => {}
             }
-            let location = Point::from(self.taffy.layout(at.0).ok()?.location);
-            match self.taffy.parent(at.0) {
-                Some(parent) => {
-                    locations.push(location);
-                    at = LayoutId::from(parent);
-                }
-                None => break location + self.origin_seeds.get(&at).copied().unwrap_or_default(),
-            }
+            locations.push(Point::from(self.taffy.layout(at.0).ok()?.location));
+            at = LayoutId::from(self.taffy.parent(at.0)?);
         };
         for location in locations.into_iter().rev() {
             origin = origin + location;
@@ -877,11 +904,12 @@ impl TaffyLayoutEngine {
     /// page, plus `fl(top + margin.top) + (border.top + gutter.top)` (`perform_absolute_layout_on_absolute_children`), every sum in
     /// single precision; the static position of a child with no `left`. In device pixels, the coordinates of the page's layout root.
     ///
-    /// `None` when the holder is not laid out as a block (see [`Self::absolute_holder`]), or when a length is not one that is the same
-    /// in every frame (a `calc`).
+    /// `None` when the holder is not laid out as a block (see [`Self::absolute_holder`]), when its origin in the page is not known (see
+    /// [`Self::page_origin`]), or when a length is not one that is the same in every frame (a `calc`).
     pub(crate) fn absolute_child_origin(
         &mut self,
         holder: LayoutId,
+        scroller: &ScrollerPlace,
         top: DefiniteLength,
         left: Option<DefiniteLength>,
         rem_size: Pixels,
@@ -889,8 +917,7 @@ impl TaffyLayoutEngine {
     ) -> Option<Point<f32>> {
         use taffy::util::MaybeResolve as _;
         let layout = self.absolute_holder(holder)?;
-        let (padding, border, inset) = (layout.padding, layout.border, Self::absolute_inset(layout));
-        let area = self.absolute_area(holder)?;
+        let (padding, border, inset, area) = (layout.padding, layout.border, Self::absolute_inset(layout), Self::absolute_area_in(layout));
         let mut resolve = |length: DefiniteLength, basis: f32| -> Option<f32> {
             if matches!(length, DefiniteLength::Calc { .. }) {
                 return None;
@@ -909,7 +936,7 @@ impl TaffyLayoutEngine {
             }
         };
         let location = point(x_offset + inset.left, top + inset.top);
-        Some(self.page_origin(holder)? + location)
+        Some(self.page_origin(holder, scroller)? + location)
     }
 
     /// The root that the last [`Self::compute_layout`] computed: what the layout of an element as a root of its own was the layout of.
@@ -5831,52 +5858,119 @@ mod entered_origin_tests {
         size(AvailableSpace::Definite(px(3000.)), AvailableSpace::Definite(px(2_000_000.)))
     }
 
-    /// A page of a header of a fractional height and a block holder, `border` wide and `padding` deep, whose absolute child is at
-    /// `top` and `left` (`None`: auto), laid out whole at `scale`: the child as taffy places it.
+    /// What a page is made of: a header of a fractional height, a spacer that puts the holder far down, a wrapper with a fractional
+    /// padding, and a block holder with a `border` and a `padding` (logical pixels, more on the left) whose absolute child is at `top`
+    /// and `left` (`None`: auto).
+    #[derive(Clone)]
+    struct Spec {
+        header: f32,
+        spacer: f32,
+        border: f32,
+        padding: f32,
+        top: Length,
+        left: Length,
+        scale: f32,
+    }
+
+    impl Spec {
+        fn new(header: f32, top: Length, left: Length, scale: f32) -> Spec {
+            Spec { header, spacer: 100_000.3, border: 1., padding: 3., top, left, scale }
+        }
+
+        fn child_style(&self) -> Style {
+            Style {
+                position: Position::Absolute,
+                inset: Edges { top: self.top, left: self.left, right: Length::Auto, bottom: Length::Auto },
+                size: size(definite(80.), definite(16.8)),
+                ..Default::default()
+            }
+        }
+
+        fn holder_style(&self) -> Style {
+            let (border, padding) = (self.border, self.padding);
+            Style {
+                position: Position::Relative,
+                size: size(definite(200.), definite(400_000.)),
+                padding: Edges { top: px(padding).into(), left: px(padding + 2.).into(), right: px(padding).into(), bottom: px(padding).into() },
+                border_widths: Edges { top: px(border).into(), left: px(border * 2.).into(), right: px(border).into(), bottom: px(border).into() },
+                ..Default::default()
+            }
+        }
+    }
+
+    /// A page laid out whole: the child as taffy places it.
     struct Page {
         engine: TaffyLayoutEngine,
+        root: LayoutId,
+        wrapper: LayoutId,
+        mid: LayoutId,
         holder: LayoutId,
         child: LayoutId,
+        spec: Spec,
     }
 
     impl Page {
-        fn laid_out_whole(header_height: f32, top: Length, left: Length, scale: f32, window: &mut Window, cx: &mut App) -> Page {
+        fn laid_out_whole(spec: Spec, window: &mut Window, cx: &mut App) -> Page {
+            let scale = spec.scale;
             let mut engine = TaffyLayoutEngine::new();
-            let header = Style { size: size(definite(200.), definite(header_height)), ..Default::default() };
-            let child_style = Style {
-                position: Position::Absolute,
-                inset: Edges { top, left, right: Length::Auto, bottom: Length::Auto },
-                size: size(definite(80.), definite(16.8)),
-                ..Default::default()
-            };
-            let holder_style = Style {
-                position: Position::Relative,
-                size: size(definite(200.), definite(400_000.)),
-                padding: Edges { top: px(3.).into(), left: px(5.).into(), right: px(3.).into(), bottom: px(3.).into() },
-                border_widths: Edges { top: px(1.).into(), left: px(2.).into(), right: px(1.).into(), bottom: px(1.).into() },
-                ..Default::default()
-            };
+            let header = Style { size: size(definite(200.), definite(spec.header)), ..Default::default() };
             let header = engine.request_keyed_layout(1, header, REM, scale, &[]);
-            let child = engine.request_keyed_layout(2, child_style, REM, scale, &[]);
-            let holder = engine.request_keyed_layout(3, holder_style, REM, scale, &[child]);
+            let child = engine.request_keyed_layout(2, spec.child_style(), REM, scale, &[]);
+            let holder = engine.request_keyed_layout(3, spec.holder_style(), REM, scale, &[child]);
             // The page above the holder is long and fractional, so that the origin of the holder is on a coarser grid than its parts.
-            let spacer = engine.request_keyed_layout(5, Style { size: size(definite(200.), definite(100_000.3)), ..Default::default() }, REM, scale, &[]);
+            let spacer = engine.request_keyed_layout(5, Style { size: size(definite(200.), definite(spec.spacer)), ..Default::default() }, REM, scale, &[]);
+            // A block between the wrapper and the holder, so that a scroller above it has two places to sum.
+            let mid_style = Style { padding: Edges { top: px(0.35).into(), left: px(0.2).into(), ..Edges::<DefiniteLength>::zero() }, ..Default::default() };
+            let mid = engine.request_keyed_layout(7, mid_style, REM, scale, &[holder]);
             let wrapper_style = Style { padding: Edges { top: px(0.7).into(), ..Edges::<DefiniteLength>::zero() }, ..Default::default() };
-            let wrapper = engine.request_keyed_layout(6, wrapper_style, REM, scale, &[header, holder]);
+            let wrapper = engine.request_keyed_layout(6, wrapper_style, REM, scale, &[header, mid]);
             let root = engine.request_keyed_layout(4, Style::default(), REM, scale, &[spacer, wrapper]);
             engine.compute_layout(root, space(), window, cx);
-            Page { engine, holder, child }
+            Page { engine, root, wrapper, mid, holder, child, spec }
         }
 
-        /// Where taffy put the child, in device pixels, in the coordinates of the page.
+        /// Where the layout of the page has `node`, in device pixels, in the coordinates of the page.
+        fn origin_of(&mut self, node: LayoutId) -> Point<f32> {
+            self.engine.layout_bounds(node, 1.);
+            self.engine.absolute_outer_origins[&node]
+        }
+
+        /// Where taffy put the child.
         fn placed(&mut self) -> Point<f32> {
-            self.engine.layout_bounds(self.child, 1.);
-            self.engine.absolute_outer_origins[&self.child]
+            self.origin_of(self.child)
+        }
+
+        fn scroller(&mut self, node: LayoutId) -> ScrollerPlace {
+            self.engine.scroller_place(node, 1.)
+        }
+
+        /// Where the engine puts the child of the holder, as it is asked.
+        fn found(&mut self, scroller: &ScrollerPlace) -> Option<Point<f32>> {
+            let (top, left) = (length_of(self.spec.top), self.spec.left);
+            let left = (!matches!(left, Length::Auto)).then(|| length_of(left));
+            self.engine.absolute_child_origin(self.holder, scroller, top, left, REM, self.spec.scale)
+        }
+    }
+
+    fn length_of(length: Length) -> DefiniteLength {
+        match length {
+            Length::Definite(length) => length,
+            Length::Auto => panic!("auto is not a definite length"),
         }
     }
 
     fn assert_same_bits(found: Point<f32>, expected: Point<f32>, what: &str) {
         assert_eq!((found.x.to_bits(), found.y.to_bits()), (expected.x.to_bits(), expected.y.to_bits()), "{what}: {found:?} for {expected:?}");
+    }
+
+    /// The child is where the page laid out whole has it, from the root and from a node on the way down.
+    fn assert_placed_as_taffy_places_it(page: &mut Page, what: &str) {
+        let expected = page.placed();
+        for (name, node) in [("root", page.root), ("wrapper", page.wrapper), ("mid", page.mid), ("holder", page.holder)] {
+            let scroller = page.scroller(node);
+            let found = page.found(&scroller).expect("a block that is laid out, below the scroller");
+            assert_same_bits(found, expected, &format!("{what}, from the {name}"));
+        }
     }
 
     /// Far down a holder the `top` of a child is on a coarser grid than the exact sum with the origin of the holder, and the order
@@ -5890,16 +5984,40 @@ mod entered_origin_tests {
                 let tops = [0.0_f32, 0.5].into_iter().chain((0..40).map(|row| 16.8 * row as f32)).chain((0..40).map(|row| 16.8 * (20_000 + row) as f32)).chain((0..40).map(|row| 17.3 * (60_000 + row) as f32));
                 for (top, header) in tops.zip([16.3_f32, 17.7, 0.1, 33.9].into_iter().cycle()) {
                     for left in [Some(0.0_f32), Some(12.5), None] {
-                        let left_length = left.map_or(Length::Auto, definite);
-                        let mut page = Page::laid_out_whole(header, definite(top), left_length, scale, window, cx);
-                        let expected = page.placed();
-                        let found = page
-                            .engine
-                            .absolute_child_origin(page.holder, px(top).into(), left.map(|left| px(left).into()), REM, scale)
-                            .expect("a block that is laid out");
-                        assert_same_bits(found, expected, &format!("top {top}, left {left:?}, header {header}, scale {scale}"));
+                        let spec = Spec::new(header, definite(top), left.map_or(Length::Auto, definite), scale);
+                        let mut page = Page::laid_out_whole(spec, window, cx);
+                        assert_placed_as_taffy_places_it(&mut page, &format!("top {top}, left {left:?}, header {header}, scale {scale}"));
                     }
                 }
+            }
+        });
+    }
+
+    /// A border and a padding that are fractions of a device pixel, at a scale that makes them more so, where the grid of single
+    /// precision gets coarser (2^17, 2^18 and 2^19 device pixels): the places of the blocks on the way down are on the grid of 1/64 px that
+    /// layout puts them on, and the sum of two of them that crosses the power of two is not exact, so which two are summed first decides.
+    /// The wrapper is put from just below the power of two, in steps that move the crossing from the holder to what is above it.
+    #[gpui::test]
+    fn a_holder_with_fractional_edges_around_a_power_of_two_places_its_child_as_taffy_does(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let scale = 1.5_f32;
+            for (power, edges) in [(17, (0.3_f32, 0.7_f32)), (17, (0.7, 0.3)), (18, (0.3, 0.7)), (18, (0.7, 0.3)), (19, (0.3, 0.7))] {
+                let limit = (1_u32 << power) as f32;
+                let mut below = 0;
+                for step in 0..90 {
+                    let delta = 64. - 0.7 * step as f32;
+                    let mut spec = Spec::new(16.3, definite(0.3 + 7.31 * step as f32), if step % 2 == 0 { Length::Auto } else { definite(12.5) }, scale);
+                    spec.border = edges.0;
+                    spec.padding = edges.1;
+                    spec.spacer = (limit - delta) / scale;
+                    let mut page = Page::laid_out_whole(spec, window, cx);
+                    let (wrapper, holder) = (page.origin_of(page.wrapper), page.origin_of(page.holder));
+                    assert!(wrapper.y < limit, "the wrapper is below 2^{power}: {wrapper:?}");
+                    below += usize::from(holder.y < limit);
+                    assert_placed_as_taffy_places_it(&mut page, &format!("2^{power}, border {} and padding {}, step {step}", edges.0, edges.1));
+                }
+                assert!((1..90).contains(&below), "the holder is on both sides of 2^{power}: below it {below} times of 90");
             }
         });
     }
@@ -5911,40 +6029,98 @@ mod entered_origin_tests {
             for scale in [1.0_f32, 2.0] {
                 for fraction in [0.0_f32, 0.07, 0.3333, 0.5, 0.987] {
                     let top = Length::Definite(DefiniteLength::Fraction(fraction));
-                    let mut page = Page::laid_out_whole(16.3, top, definite(4.), scale, window, cx);
-                    let expected = page.placed();
-                    let found = page
-                        .engine
-                        .absolute_child_origin(page.holder, DefiniteLength::Fraction(fraction), Some(px(4.).into()), REM, scale)
-                        .expect("a block that is laid out");
-                    assert_same_bits(found, expected, &format!("{fraction} at {scale}"));
+                    let mut page = Page::laid_out_whole(Spec::new(16.3, top, definite(4.), scale), window, cx);
+                    assert_placed_as_taffy_places_it(&mut page, &format!("{fraction} at {scale}"));
                 }
             }
         });
     }
 
-    /// A holder that a translate put in is in the page where the place recorded for it says, and what is below it from there.
+    /// A holder that a translate put in is in the page where the place recorded for it says, and what is below it from there: its child
+    /// is where taffy puts it for a page that lays the holder out at that place.
     #[gpui::test]
     fn a_holder_that_a_translate_put_in_is_where_the_page_has_it(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         cx.update(|window, cx| {
-            let mut page = Page::laid_out_whole(16.3, definite(10.), definite(4.), 1., window, cx);
-            let expected = page.placed();
-            let in_the_page = page.engine.absolute_child_origin(page.holder, px(10.).into(), Some(px(4.).into()), REM, 1.).expect("laid out");
-            assert_same_bits(in_the_page, expected, "in the page");
+            for (scale, edges, spacer) in [(1.0_f32, (1.0_f32, 3.0_f32), 100_000.3_f32), (1.5, (0.3, 0.7), (131_072. - 64.) / 1.5), (2.0, (0.7, 0.3), (262_144. - 64.) / 2.)] {
+                for top in [10.0_f32, 16.8 * 20_000., 17.3 * 7_800.3] {
+                    let mut spec = Spec::new(16.3, definite(top), definite(4.), scale);
+                    spec.border = edges.0;
+                    spec.padding = edges.1;
+                    spec.spacer = spacer;
+                    let mut page = Page::laid_out_whole(spec.clone(), window, cx);
+                    let (expected, holder_at) = (page.placed(), page.origin_of(page.holder));
 
-            // The same holder as a root of a scratch layout of its own, which the page puts at (7, 100) once it lays it out.
+                    // The same holder as a root of a scratch layout of its own, which the page puts where it has the holder once it lays it out.
+                    let mut engine = TaffyLayoutEngine::new();
+                    let child = engine.request_keyed_layout(2, spec.child_style(), REM, scale, &[]);
+                    let holder = engine.request_keyed_layout(3, spec.holder_style(), REM, scale, &[child]);
+                    engine.begin_scratch_pass();
+                    engine.compute_layout(holder, space(), window, cx);
+                    let scroller = Rc::new(RefCell::new(point(px(0.), px(0.))));
+                    engine.note_entered_origin(holder, holder_at, &scroller, point(px(0.), px(0.)));
+                    engine.mark_computed_unplaced();
+                    engine.end_pass_keeping_nodes();
+                    // The scroller that holds it is somewhere else: the chain ends at the root that came in.
+                    let elsewhere = ScrollerPlace { layout: child, origin: point(1., 1.) };
+                    let origin = engine
+                        .absolute_child_origin(holder, &elsewhere, px(top).into(), Some(px(4.).into()), REM, scale)
+                        .expect("recorded");
+                    assert_same_bits(origin, expected, &format!("scale {scale}, top {top}, in a holder that came in"));
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn a_holder_whose_layout_is_not_the_one_the_page_had_has_no_place(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let mut page = Page::laid_out_whole(Spec::new(16.3, definite(10.), definite(4.), 1.), window, cx);
+            let scroller = page.scroller(page.root);
+            assert!(page.found(&scroller).is_some());
+            page.engine.taffy.mark_dirty(page.holder.0).unwrap();
+            assert!(page.found(&scroller).is_none(), "a holder that is dirty");
+
+            // A node on the way up that is dirty moves the holder, and so does the scroller.
+            let mut page = Page::laid_out_whole(Spec::new(16.3, definite(10.), definite(4.), 1.), window, cx);
+            let (root, wrapper) = (page.scroller(page.root), page.scroller(page.wrapper));
+            page.engine.taffy.mark_dirty(page.wrapper.0).unwrap();
+            assert!(page.engine.taffy.dirty(page.wrapper.0).unwrap() && !page.engine.taffy.dirty(page.holder.0).unwrap());
+            assert!(page.found(&root).is_none(), "a node of the chain that is dirty");
+            assert!(page.found(&wrapper).is_none(), "a scroller that is dirty");
+        });
+    }
+
+    /// A chain that does not end at the scroller or at a root that came in has no place: a row of a list is a root of its own whose seed
+    /// a pass drops, and so is what a scratch layout left that no layout of the page placed.
+    #[gpui::test]
+    fn a_chain_that_ends_anywhere_else_has_no_place(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            // The holder of a scroller that is somewhere else in the page: the walk reaches a root that is not the scroller, and the
+            // seed it had is not known any more.
+            let mut page = Page::laid_out_whole(Spec::new(16.3, definite(10.), definite(4.), 1.), window, cx);
+            let elsewhere = ScrollerPlace { layout: page.child, origin: point(0., 0.) };
+            page.engine.set_origin_seed(page.root, point(0.3, -0.2));
+            page.engine.layout_bounds(page.root, 1.);
+            page.engine.end_pass_keeping_nodes();
+            assert!(page.engine.origin_seeds.is_empty(), "a pass drops the seeds");
+            assert!(page.found(&elsewhere).is_none(), "a seeded root whose seed is gone");
+            let root = ScrollerPlace { layout: page.root, origin: point(0., 0.) };
+            assert!(page.found(&root).is_some(), "the scroller is on the way up");
+
+            // A holder under a root of a scratch layout that no layout of the page placed.
             let mut engine = TaffyLayoutEngine::new();
-            let child = engine.request_keyed_layout(2, Style::default(), REM, 1., &[]);
-            let holder = engine.request_keyed_layout(3, Style { size: size(definite(200.), definite(300.)), ..Default::default() }, REM, 1., &[child]);
+            let child = engine.request_keyed_layout(2, Spec::new(16.3, definite(10.), definite(4.), 1.).child_style(), REM, 1., &[]);
+            let holder = engine.request_keyed_layout(3, Style::default(), REM, 1., &[child]);
+            let below = engine.request_keyed_layout(4, Style::default(), REM, 1., &[holder]);
             engine.begin_scratch_pass();
-            engine.compute_layout(holder, space(), window, cx);
-            let scroller = Rc::new(RefCell::new(point(px(0.), px(0.))));
-            engine.note_entered_origin(holder, point(7., 100.), &scroller, point(px(0.), px(0.)));
+            engine.compute_layout(below, space(), window, cx);
             engine.mark_computed_unplaced();
             engine.end_pass_keeping_nodes();
-            let origin = engine.absolute_child_origin(holder, px(10.).into(), Some(px(4.).into()), REM, 1.).expect("recorded");
-            assert_same_bits(origin, point(11., 110.), "in a holder that came in");
+            let scroller = ScrollerPlace { layout: child, origin: point(0., 0.) };
+            assert!(engine.absolute_child_origin(holder, &scroller, px(0.).into(), Some(px(0.).into()), REM, 1.).is_none(), "below an Unknown root");
         });
     }
 
@@ -5957,10 +6133,12 @@ mod entered_origin_tests {
             let rtl = engine.request_keyed_layout(2, Style { direction: crate::Direction::Rtl, ..Default::default() }, REM, 1., &[]);
             let root = engine.request_keyed_layout(3, Style::default(), REM, 1., &[flex, rtl]);
             engine.compute_layout(root, space(), window, cx);
-            assert!(engine.absolute_child_origin(flex, px(0.).into(), Some(px(0.).into()), REM, 1.).is_none());
-            assert!(engine.absolute_child_origin(rtl, px(0.).into(), Some(px(0.).into()), REM, 1.).is_none());
-            assert!(engine.absolute_child_origin(root, px(0.).into(), Some(px(0.).into()), REM, 1.).is_some());
-            assert!(engine.absolute_child_origin(root, DefiniteLength::Calc { length: px(1.).into(), fraction: 0.5 }, None, REM, 1.).is_none());
+            let scroller = engine.scroller_place(root, 1.);
+            let at = |engine: &mut TaffyLayoutEngine, holder, top, left| engine.absolute_child_origin(holder, &scroller, top, left, REM, 1.);
+            assert!(at(&mut engine, flex, px(0.).into(), Some(px(0.).into())).is_none());
+            assert!(at(&mut engine, rtl, px(0.).into(), Some(px(0.).into())).is_none());
+            assert!(at(&mut engine, root, px(0.).into(), Some(px(0.).into())).is_some());
+            assert!(at(&mut engine, root, DefiniteLength::Calc { length: px(1.).into(), fraction: 0.5 }, None).is_none());
         });
     }
 }

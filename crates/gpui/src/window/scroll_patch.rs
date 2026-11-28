@@ -72,6 +72,7 @@ use super::retained::Effects;
 use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss, ScrollSource};
 use crate::scene::{Extent, PaintOperation, RecordedReach, ReplayClip, TranslatedOperations};
 use crate::scroll_routing::ScrollerId;
+pub(crate) use crate::taffy::ScrollerPlace;
 use crate::{DefiniteLength, ListState};
 use shift::ShiftPlan;
 
@@ -1010,7 +1011,9 @@ pub struct ScrollEntered {
     pub id: ElementId,
     /// Builds the retained root of the child, as the tree has it now.
     pub build: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
-    /// What the root is laid out in.
+    /// What the root is laid out in. The width of a child in a holder ([`ScrollEnteredOrigin::InHolder`]) is not read from here: it is
+    /// the area of the holder in device pixels as layout has it, which the window reads (no round trip through logical pixels in the
+    /// owner).
     pub available: Size<AvailableSpace>,
     /// The size it comes out at: the translate declines when it comes out otherwise, which is a layout of what holds it.
     pub size: Size<Pixels>,
@@ -1049,8 +1052,8 @@ pub struct ScrollEnteredInHolder {
 
 impl Window {
     /// The size that the absolute children of the block `holder` are sized against and their percentages are of, as layout left it,
-    /// in logical pixels: `None` for a node that is not a block that runs from the left, or not laid out. Meant for the owner that
-    /// works out a [`ScrollEntered`].
+    /// in logical pixels: `None` for a node that is not a block that runs from the left, or not laid out. Meant for the checks of the
+    /// owner that works out a [`ScrollEntered`]; the width a child is laid out in is read from the layout by the window, in device pixels.
     pub fn absolute_area_of(&self, holder: LayoutId) -> Option<Size<Pixels>> {
         let area = self.layout_engine.as_ref().expect("the layout engine is out only while a pass runs").absolute_area(holder)?;
         Some(Size { width: Pixels(area.width / self.scale_factor), height: Pixels(area.height / self.scale_factor) })
@@ -1060,7 +1063,7 @@ impl Window {
 impl ScrollEntered {
     /// Where the layout of the page puts the box of the child, in device pixels and the coordinates of the page's layout root.
     /// `to_window` is how far the window is from layout around the content of the scroller.
-    fn page_origin(&self, window: &mut Window, to_window: Point<Pixels>) -> Option<Point<f32>> {
+    fn page_origin(&self, window: &mut Window, scroller: &ScrollerPlace, to_window: Point<Pixels>) -> Option<Point<f32>> {
         match self.origin {
             ScrollEnteredOrigin::Window(origin) => {
                 let page = origin - to_window;
@@ -1068,7 +1071,23 @@ impl ScrollEntered {
             }
             ScrollEnteredOrigin::InHolder(in_holder) => {
                 let (rem_size, scale_factor) = (window.rem_size(), window.scale_factor);
-                window.layout_engine_mut().absolute_child_origin(in_holder.holder, in_holder.top, in_holder.left, rem_size, scale_factor)
+                window.layout_engine_mut().absolute_child_origin(in_holder.holder, scroller, in_holder.top, in_holder.left, rem_size, scale_factor)
+            }
+        }
+    }
+
+    /// What the root of the child is laid out in. A child in a holder is sized as taffy sizes an absolute child, against the area of the
+    /// holder, which layout has in device pixels: the logical width handed to the layout of the root is the one that the layout
+    /// multiplies by the scale back to that area, where there is one.
+    fn available_space(&self, window: &Window) -> Option<Size<AvailableSpace>> {
+        match self.origin {
+            ScrollEnteredOrigin::Window(_) => Some(self.available),
+            ScrollEnteredOrigin::InHolder(in_holder) => {
+                let area = window.layout_engine.as_ref().expect("the layout engine is out only while a pass runs").absolute_area(in_holder.holder)?;
+                let scale = window.scale_factor;
+                let logical = area.width / scale;
+                let width = [logical, logical.next_down(), logical.next_up()].into_iter().find(|width| width * scale == area.width).unwrap_or(logical);
+                Some(Size { width: AvailableSpace::Definite(Pixels(width)), height: self.available.height })
             }
         }
     }
@@ -1886,6 +1905,8 @@ struct EnterIn {
     /// How far the window has the boxes of the layout of the page from where layout has them, around the content of the scroller in
     /// the frame shown.
     layout_to_window: Point<Pixels>,
+    /// Where the page had the scroller in that layout, which the places of the nodes of its content are summed from.
+    scroller: ScrollerPlace,
     /// The offset of the scroller, which the roots are put in the content of.
     offset: Rc<RefCell<Point<Pixels>>>,
 }
@@ -2435,14 +2456,15 @@ impl Window {
         let mut elements = Vec::with_capacity(entering.children.len());
         let mut origins = Vec::with_capacity(entering.children.len());
         for child in &entering.children {
+            let available = child.available_space(self).ok_or(ScrollApplyDecline::Row)?;
             let mut element = (child.build)(self, cx);
-            let measured = element.layout_as_root_unsnapped(child.available, self, cx);
+            let measured = element.layout_as_root_unsnapped(available, self, cx);
             if (measured.width - child.size.width).abs() > px(0.01) || (measured.height - child.size.height).abs() > px(0.01) {
                 return Err(ScrollApplyDecline::Height);
             }
             // The layout of the page puts the root where the frame shown has it, less how far the window is from layout there. The
             // scroll anchor of the next layout is picked from that box, as it is in a frame built whole.
-            let page = child.page_origin(self, group.layout_to_window).ok_or(ScrollApplyDecline::Row)?;
+            let page = child.page_origin(self, &group.scroller, group.layout_to_window).ok_or(ScrollApplyDecline::Row)?;
             let origin = child.window_origin(page, self.scale_factor, group.layout_to_window);
             if child.scrolls {
                 let offset = *group.offset.borrow();

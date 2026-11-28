@@ -37,6 +37,8 @@ pub struct ScrollTranslated {
 
 /// What a scroller says of its prepaint to the frame it leaves, see [`Window::scroll_patch_end_div`].
 pub(crate) struct DivScroll {
+    /// The layout node of the scroller.
+    pub(crate) layout: LayoutId,
     pub(crate) offset: Rc<RefCell<Point<Pixels>>>,
     pub(crate) handle: Option<ScrollHandle>,
     pub(crate) translated: Option<ScrollTranslated>,
@@ -105,6 +107,9 @@ pub(crate) struct DivFrame {
     /// layout where the window has them (`Window::layout_unsnapped_bounds`).
     outer: Point<Pixels>,
     phase: Point<Pixels>,
+    /// Where the layout of the page had the scroller then: the nodes of its content are placed from it, as it is of the same layout
+    /// as `outer` and `phase`.
+    place: ScrollerPlace,
     /// The clip around the children.
     clip: ContentMask<Pixels>,
     culled: Vec<Culled>,
@@ -205,6 +210,7 @@ impl Window {
         let (viewport, scale_factor, mouse) = (self.viewport_size, self.scale_factor, self.mouse_position);
         let (element_offset, phase) = (self.element_offset(), self.element_origin_phase());
         let flow = mark.hitboxes..self.next_frame.hitboxes.len();
+        let place = self.layout_engine_mut().scroller_place(div.layout, scale_factor);
         let frame = &mut self.next_frame.scroll;
         let Some(open) = frame.open.pop() else {
             return;
@@ -240,6 +246,7 @@ impl Window {
             scrolled,
             outer,
             phase,
+            place,
             clip,
             culled: open.culled,
             unrooted,
@@ -612,7 +619,17 @@ impl Window {
             // Where a rebuilt frame at the offset the frame shown has would put the boxes of layout.
             let layout_to_window =
                 self.pixel_snap_point(div.outer + snap_scroll_offset(div.scrolled, self.scale_factor)) + div.phase;
-            membership.entering.push(EnterIn { group, around, lift_z, at, anchor, runs_from, layout_to_window, offset: div.offset.clone() });
+            membership.entering.push(EnterIn {
+                group,
+                around,
+                lift_z,
+                at,
+                anchor,
+                runs_from,
+                layout_to_window,
+                scroller: div.place,
+                offset: div.offset.clone(),
+            });
         }
         let thumbs = self.plan_thumb_moves(prediction)?;
         for id in &div.unrooted {
