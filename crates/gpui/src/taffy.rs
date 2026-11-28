@@ -722,8 +722,8 @@ impl TaffyLayoutEngine {
         self.end_pass_keeping_nodes();
     }
 
-    /// [`Self::end_pass`] of a pass that laid out the page: the nodes of a scratch pass that it did not reach are not in the page, and
-    /// have no boxes to mark. A patch's pass does not end the mark, as the next pass of the page is the one that places the nodes.
+    /// [`Self::end_pass`] of a frame: the nodes of a scratch pass that the page did not reach are not in it, and have no boxes to mark.
+    /// A patch's pass does not end the mark, as the next frame is the one that places the nodes.
     pub fn end_pass_of_page(&mut self) {
         self.unplaced.clear();
         self.end_pass();
@@ -736,11 +736,23 @@ impl TaffyLayoutEngine {
 
     /// The boxes of the layout of `root` are the page's where `root` is the page's root, which places the nodes below it.
     fn place_below(&mut self, root: LayoutId) {
-        if self.unplaced.is_empty() || self.in_scratch {
+        if self.in_scratch {
             return;
         }
+        self.place_subtree(root);
+    }
+
+    /// [`Self::place_below`] for a scratch pass that computed the page from its root: the boxes below `root` are the page's.
+    pub(crate) fn place_computed_page(&mut self, root: LayoutId) {
+        self.place_subtree(root);
+    }
+
+    fn place_subtree(&mut self, root: LayoutId) {
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
+            if self.unplaced.is_empty() {
+                return;
+            }
             self.unplaced.remove(&id);
             stack.extend((0..self.taffy.child_count(id.0)).map(|index| LayoutId(self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE))));
         }
@@ -5077,6 +5089,33 @@ mod tests {
                 assert!(!engine.anchor_facts(leaf).hidden);
                 assert!(!engine.anchor_facts(root).hidden);
                 engine.end_pass();
+            });
+        }
+
+        #[gpui::test]
+        fn a_scratch_pass_that_computes_the_page_from_its_root_places_the_roots_it_holds(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                // A root that a translate laid out as one of its own.
+                engine.begin_scratch_pass();
+                let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                engine.compute_layout(leaf, space(), window, cx);
+                engine.mark_computed_unplaced();
+                engine.end_pass_keeping_nodes();
+                assert!(engine.anchor_facts(leaf).hidden);
+
+                // A patch that lays out again attaches it to the page and computes the page in a scratch pass of its own, which
+                // places nothing by itself: that is the page's layout, and says so.
+                engine.begin_scratch_pass();
+                let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                let root = engine.request_keyed_layout(1, flex(), REM, 1., &[leaf]);
+                engine.compute_layout(root, space(), window, cx);
+                assert!(engine.anchor_facts(leaf).hidden);
+                engine.place_computed_page(root);
+                assert!(!engine.anchor_facts(leaf).hidden);
+                engine.end_pass_keeping_nodes();
+                assert!(!engine.anchor_facts(leaf).hidden, "the end of the pass does not mark them again");
             });
         }
 

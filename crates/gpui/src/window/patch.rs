@@ -1971,6 +1971,8 @@ impl Window {
         let unmeasured = self.layout_engine().unmeasured_leaves();
         self.stretch_layout_root(window_root.id, window_root.size);
         self.compute_layout_tracking_changes(window_root.id, window_root.size.into(), cx);
+        // The scratch pass skips this for what it computes as roots of their own; this computation is the page's, kept or declined.
+        self.layout_engine_mut().place_computed_page(window_root.id);
         let contained = self.layout_engine_mut().changes_stay_inside(root);
         self.layout_engine_mut().hold_anchor_restyles();
         // A leaf that layout measures and has no measure function would have been laid out empty.
