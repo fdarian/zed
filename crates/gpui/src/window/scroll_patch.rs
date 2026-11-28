@@ -984,6 +984,7 @@ pub struct ScrollEntering {
     pub neighbor: ElementId,
     /// The group comes after the neighbor in the tree, or before it.
     pub follows: bool,
+    /// The children of the group, in the order of the tree.
     pub children: Vec<ScrollEntered>,
 }
 
@@ -993,12 +994,13 @@ pub struct ScrollEntered {
     pub id: ElementId,
     /// Builds the retained root of the child, as the tree has it now.
     pub build: Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>,
-    /// What the root is laid out in, and the size it comes out at: the translate declines when it comes out otherwise, which is
-    /// a layout of what holds it.
+    /// What the root is laid out in.
     pub available: Size<AvailableSpace>,
+    /// The size it comes out at: the translate declines when it comes out otherwise, which is a layout of what holds it.
     pub size: Size<Pixels>,
     /// Where the top left of its box is put in the frame shown, and whether the scroll moves it with the content.
     pub origin: Point<Pixels>,
+    /// The scroll moves the child with the content (it is not fixed to the viewport).
     pub scrolls: bool,
 }
 
