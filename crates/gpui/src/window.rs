@@ -105,7 +105,7 @@ pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub use scroll_patch::{
     ScrollApplyDecline, ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason, ScrollThumbMiss, ScrollThumbMoved,
-    ScrollEntered, ScrollEnteredOrigin, ScrollEntering, ScrollRemovals, ScrollThumbPlan, ScrollThumbRepaint, ScrollThumbRepainter, ScrollThumbRepaints, ScrollTranslated, ScrollTranslation,
+    ScrollEntered, ScrollEnteredInHolder, ScrollEnteredOrigin, ScrollEntering, ScrollRemovals, ScrollThumbPlan, ScrollThumbRepaint, ScrollThumbRepainter, ScrollThumbRepaints, ScrollTranslated, ScrollTranslation,
 };
 pub(crate) use scroll_patch::DivScroll;
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame, RecordingRewrite};

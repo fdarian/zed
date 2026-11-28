@@ -808,6 +808,110 @@ impl TaffyLayoutEngine {
         self.entered_origins.insert(id, Entered { origin, scroller: scroller.clone(), left_at: offset });
     }
 
+    /// The block `holder` as the layout of the page left it, for what it holds an absolute child in: its taffy layout, if it is a block
+    /// that the page laid out whose inline axis runs from the left (the places the other displays give an absolute child are not
+    /// worked out here).
+    fn absolute_holder(&self, holder: LayoutId) -> Option<&taffy::Layout> {
+        if self.meta.get(&holder).is_none() || self.taffy.dirty(holder.0).ok()? {
+            return None;
+        }
+        let style = self.taffy.style(holder.0).ok()?;
+        (style.display == taffy::style::Display::Block && style.direction == taffy::style::Direction::Ltr).then_some(())?;
+        self.taffy.layout(holder.0).ok()
+    }
+
+    /// What taffy puts between the border box of a block and the area its absolute children are placed in and sized against, as
+    /// `perform_absolute_layout_on_absolute_children`'s caller has it: the border and the scrollbar gutter (on the right and the bottom,
+    /// for a block that runs from the left), in device pixels.
+    fn absolute_inset(layout: &taffy::Layout) -> TaffyRect<f32> {
+        let gutter = TaffyRect { left: 0.0, top: 0.0, right: layout.scrollbar_size.width, bottom: layout.scrollbar_size.height };
+        TaffyRect {
+            left: layout.border.left + gutter.left,
+            right: layout.border.right + gutter.right,
+            top: layout.border.top + gutter.top,
+            bottom: layout.border.bottom + gutter.bottom,
+        }
+    }
+
+    /// The size of the area that the absolute children of the block `holder` are sized against and their percentages are of, in device
+    /// pixels, as layout left it. `None` for a node that is not a block of the page's layout (see [`Self::absolute_holder`]).
+    pub(crate) fn absolute_area(&self, holder: LayoutId) -> Option<Size<f32>> {
+        let layout = self.absolute_holder(holder)?;
+        let inset = Self::absolute_inset(layout);
+        Some(Size {
+            width: layout.size.width - (inset.left + inset.right),
+            height: layout.size.height - (inset.top + inset.bottom),
+        })
+    }
+
+    /// The origin of the border box of `id` in the coordinates of the page's layout root, in device pixels: what `layout_bounds` sums
+    /// from its parents, without caching it. A root that a translate put in has the place recorded for it and what is below it
+    /// follows. `None` for a node that has none (a root of a scratch layout whose place is not known).
+    fn page_origin(&self, id: LayoutId) -> Option<Point<f32>> {
+        let mut locations = Vec::new();
+        let mut at = id;
+        let mut origin = loop {
+            match self.unplaced.get(&at) {
+                Some(Unplaced::At(origin)) => break *origin,
+                Some(Unplaced::Fresh(entered)) => break entered.origin,
+                Some(Unplaced::Unknown) => return None,
+                None => {}
+            }
+            let location = Point::from(self.taffy.layout(at.0).ok()?.location);
+            match self.taffy.parent(at.0) {
+                Some(parent) => {
+                    locations.push(location);
+                    at = LayoutId::from(parent);
+                }
+                None => break location + self.origin_seeds.get(&at).copied().unwrap_or_default(),
+            }
+        };
+        for location in locations.into_iter().rev() {
+            origin = origin + location;
+        }
+        Some(origin)
+    }
+
+    /// Where a layout of the page puts the border box of a child that is absolute in the block `holder`, with no margin and no
+    /// inset but `top` and `left` (`None`: `auto`), as taffy works it out for a frame built whole: the origin of the holder in the
+    /// page, plus `fl(top + margin.top) + (border.top + gutter.top)` (`perform_absolute_layout_on_absolute_children`), every sum in
+    /// single precision; the static position of a child with no `left`. In device pixels, the coordinates of the page's layout root.
+    ///
+    /// `None` when the holder is not laid out as a block (see [`Self::absolute_holder`]), or when a length is not one that is the same
+    /// in every frame (a `calc`).
+    pub(crate) fn absolute_child_origin(
+        &mut self,
+        holder: LayoutId,
+        top: DefiniteLength,
+        left: Option<DefiniteLength>,
+        rem_size: Pixels,
+        scale_factor: f32,
+    ) -> Option<Point<f32>> {
+        use taffy::util::MaybeResolve as _;
+        let layout = self.absolute_holder(holder)?;
+        let (padding, border, inset) = (layout.padding, layout.border, Self::absolute_inset(layout));
+        let area = self.absolute_area(holder)?;
+        let mut resolve = |length: DefiniteLength, basis: f32| -> Option<f32> {
+            if matches!(length, DefiniteLength::Calc { .. }) {
+                return None;
+            }
+            let length: taffy::style::LengthPercentageAuto = length.to_taffy(rem_size, scale_factor, &mut self.calcs);
+            length.maybe_resolve(basis, |_, _| unreachable!("a calc is not resolved"))
+        };
+        // No margin: what taffy adds is `+ 0.0`, which changes no value.
+        let top = resolve(top, area.height)? + 0.0;
+        let x_offset = match left {
+            Some(left) => resolve(left, area.width)? + 0.0,
+            None => {
+                // The static position: where the content of the block begins, whence taffy takes the offset of the area back.
+                let content_left = (padding.left + border.left) + 0.0;
+                (content_left + 0.0) - inset.left
+            }
+        };
+        let location = point(x_offset + inset.left, top + inset.top);
+        Some(self.page_origin(holder)? + location)
+    }
+
     /// The root that the last [`Self::compute_layout`] computed: what the layout of an element as a root of its own was the layout of.
     pub(crate) fn last_computed(&self) -> Option<LayoutId> {
         self.last_computed
@@ -5709,5 +5813,154 @@ mod tests {
                 assert!(engine.parked.is_empty());
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod entered_origin_tests {
+    use super::*;
+    use crate::{Edges, Position, TestAppContext, px};
+
+    const REM: Pixels = Pixels(16.);
+
+    fn definite(pixels: f32) -> Length {
+        Length::Definite(px(pixels).into())
+    }
+
+    fn space() -> Size<AvailableSpace> {
+        size(AvailableSpace::Definite(px(3000.)), AvailableSpace::Definite(px(2_000_000.)))
+    }
+
+    /// A page of a header of a fractional height and a block holder, `border` wide and `padding` deep, whose absolute child is at
+    /// `top` and `left` (`None`: auto), laid out whole at `scale`: the child as taffy places it.
+    struct Page {
+        engine: TaffyLayoutEngine,
+        holder: LayoutId,
+        child: LayoutId,
+    }
+
+    impl Page {
+        fn laid_out_whole(header_height: f32, top: Length, left: Length, scale: f32, window: &mut Window, cx: &mut App) -> Page {
+            let mut engine = TaffyLayoutEngine::new();
+            let header = Style { size: size(definite(200.), definite(header_height)), ..Default::default() };
+            let child_style = Style {
+                position: Position::Absolute,
+                inset: Edges { top, left, right: Length::Auto, bottom: Length::Auto },
+                size: size(definite(80.), definite(16.8)),
+                ..Default::default()
+            };
+            let holder_style = Style {
+                position: Position::Relative,
+                size: size(definite(200.), definite(400_000.)),
+                padding: Edges { top: px(3.).into(), left: px(5.).into(), right: px(3.).into(), bottom: px(3.).into() },
+                border_widths: Edges { top: px(1.).into(), left: px(2.).into(), right: px(1.).into(), bottom: px(1.).into() },
+                ..Default::default()
+            };
+            let header = engine.request_keyed_layout(1, header, REM, scale, &[]);
+            let child = engine.request_keyed_layout(2, child_style, REM, scale, &[]);
+            let holder = engine.request_keyed_layout(3, holder_style, REM, scale, &[child]);
+            // The page above the holder is long and fractional, so that the origin of the holder is on a coarser grid than its parts.
+            let spacer = engine.request_keyed_layout(5, Style { size: size(definite(200.), definite(100_000.3)), ..Default::default() }, REM, scale, &[]);
+            let wrapper_style = Style { padding: Edges { top: px(0.7).into(), ..Edges::<DefiniteLength>::zero() }, ..Default::default() };
+            let wrapper = engine.request_keyed_layout(6, wrapper_style, REM, scale, &[header, holder]);
+            let root = engine.request_keyed_layout(4, Style::default(), REM, scale, &[spacer, wrapper]);
+            engine.compute_layout(root, space(), window, cx);
+            Page { engine, holder, child }
+        }
+
+        /// Where taffy put the child, in device pixels, in the coordinates of the page.
+        fn placed(&mut self) -> Point<f32> {
+            self.engine.layout_bounds(self.child, 1.);
+            self.engine.absolute_outer_origins[&self.child]
+        }
+    }
+
+    fn assert_same_bits(found: Point<f32>, expected: Point<f32>, what: &str) {
+        assert_eq!((found.x.to_bits(), found.y.to_bits()), (expected.x.to_bits(), expected.y.to_bits()), "{what}: {found:?} for {expected:?}");
+    }
+
+    /// Far down a holder the `top` of a child is on a coarser grid than the exact sum with the origin of the holder, and the order
+    /// of the sums decides which way it rounds: the child is where taffy puts it for a page laid out whole, whatever the header
+    /// above the holder is (fractional heights) and whatever the scale.
+    #[gpui::test]
+    fn a_child_is_placed_as_a_page_laid_out_whole_places_it(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            for scale in [1.0_f32, 1.5, 2.0] {
+                let tops = [0.0_f32, 0.5].into_iter().chain((0..40).map(|row| 16.8 * row as f32)).chain((0..40).map(|row| 16.8 * (20_000 + row) as f32)).chain((0..40).map(|row| 17.3 * (60_000 + row) as f32));
+                for (top, header) in tops.zip([16.3_f32, 17.7, 0.1, 33.9].into_iter().cycle()) {
+                    for left in [Some(0.0_f32), Some(12.5), None] {
+                        let left_length = left.map_or(Length::Auto, definite);
+                        let mut page = Page::laid_out_whole(header, definite(top), left_length, scale, window, cx);
+                        let expected = page.placed();
+                        let found = page
+                            .engine
+                            .absolute_child_origin(page.holder, px(top).into(), left.map(|left| px(left).into()), REM, scale)
+                            .expect("a block that is laid out");
+                        assert_same_bits(found, expected, &format!("top {top}, left {left:?}, header {header}, scale {scale}"));
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn a_percentage_top_is_a_fraction_of_the_area_taffy_resolves_it_against(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            for scale in [1.0_f32, 2.0] {
+                for fraction in [0.0_f32, 0.07, 0.3333, 0.5, 0.987] {
+                    let top = Length::Definite(DefiniteLength::Fraction(fraction));
+                    let mut page = Page::laid_out_whole(16.3, top, definite(4.), scale, window, cx);
+                    let expected = page.placed();
+                    let found = page
+                        .engine
+                        .absolute_child_origin(page.holder, DefiniteLength::Fraction(fraction), Some(px(4.).into()), REM, scale)
+                        .expect("a block that is laid out");
+                    assert_same_bits(found, expected, &format!("{fraction} at {scale}"));
+                }
+            }
+        });
+    }
+
+    /// A holder that a translate put in is in the page where the place recorded for it says, and what is below it from there.
+    #[gpui::test]
+    fn a_holder_that_a_translate_put_in_is_where_the_page_has_it(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let mut page = Page::laid_out_whole(16.3, definite(10.), definite(4.), 1., window, cx);
+            let expected = page.placed();
+            let in_the_page = page.engine.absolute_child_origin(page.holder, px(10.).into(), Some(px(4.).into()), REM, 1.).expect("laid out");
+            assert_same_bits(in_the_page, expected, "in the page");
+
+            // The same holder as a root of a scratch layout of its own, which the page puts at (7, 100) once it lays it out.
+            let mut engine = TaffyLayoutEngine::new();
+            let child = engine.request_keyed_layout(2, Style::default(), REM, 1., &[]);
+            let holder = engine.request_keyed_layout(3, Style { size: size(definite(200.), definite(300.)), ..Default::default() }, REM, 1., &[child]);
+            engine.begin_scratch_pass();
+            engine.compute_layout(holder, space(), window, cx);
+            let scroller = Rc::new(RefCell::new(point(px(0.), px(0.))));
+            engine.note_entered_origin(holder, point(7., 100.), &scroller, point(px(0.), px(0.)));
+            engine.mark_computed_unplaced();
+            engine.end_pass_keeping_nodes();
+            let origin = engine.absolute_child_origin(holder, px(10.).into(), Some(px(4.).into()), REM, 1.).expect("recorded");
+            assert_same_bits(origin, point(11., 110.), "in a holder that came in");
+        });
+    }
+
+    #[gpui::test]
+    fn only_a_block_that_runs_from_the_left_has_a_place_for_a_child_worked_out(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            let mut engine = TaffyLayoutEngine::new();
+            let flex = engine.request_keyed_layout(1, Style { display: crate::Display::Flex, ..Default::default() }, REM, 1., &[]);
+            let rtl = engine.request_keyed_layout(2, Style { direction: crate::Direction::Rtl, ..Default::default() }, REM, 1., &[]);
+            let root = engine.request_keyed_layout(3, Style::default(), REM, 1., &[flex, rtl]);
+            engine.compute_layout(root, space(), window, cx);
+            assert!(engine.absolute_child_origin(flex, px(0.).into(), Some(px(0.).into()), REM, 1.).is_none());
+            assert!(engine.absolute_child_origin(rtl, px(0.).into(), Some(px(0.).into()), REM, 1.).is_none());
+            assert!(engine.absolute_child_origin(root, px(0.).into(), Some(px(0.).into()), REM, 1.).is_some());
+            assert!(engine.absolute_child_origin(root, DefiniteLength::Calc { length: px(1.).into(), fraction: 0.5 }, None, REM, 1.).is_none());
+        });
     }
 }
