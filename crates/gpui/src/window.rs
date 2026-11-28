@@ -105,7 +105,7 @@ pub use patch::{PatchCounters, PatchDecline, PatchOutcome, ScrollExtentChange};
 pub use retained::{FrameWorkCounters, NonReusable, NonRelocatable, RelocationMiss, RetainedCounters};
 pub use scroll_patch::{
     ScrollApplyDecline, ScrollPatchCause, ScrollPatchCounters, ScrollPatchReason, ScrollThumbMiss, ScrollThumbMoved,
-    ScrollThumbPlan, ScrollThumbRepaint, ScrollThumbRepainter, ScrollThumbRepaints, ScrollTranslated, ScrollTranslation,
+    ScrollRemovals, ScrollThumbPlan, ScrollThumbRepaint, ScrollThumbRepainter, ScrollThumbRepaints, ScrollTranslated, ScrollTranslation,
 };
 pub(crate) use scroll_patch::DivScroll;
 pub(crate) use patch::{PatchSource, PatchUnit, PatchWindow, PatchedFrame, RecordingRewrite};
@@ -1601,6 +1601,8 @@ pub(crate) fn reach_is_apart_from_mask(mask: Bounds<Pixels>, reach: Bounds<Pixel
 pub(crate) struct LiftTicket {
     ordinal: u32,
     hitboxes_start: usize,
+    /// How many runs the frame being built had, for the roots the element holds that are runs to be told from the others.
+    runs_start: usize,
     /// The scroller whose child this is, when the child is not a root: its stacking context paints it, and the scroller keeps
     /// an eye on what it paints (see [`Window::scroll_patch_note_lifted_child`]).
     scroll_owner: Option<crate::scroll_routing::ScrollerId>,
@@ -7382,6 +7384,7 @@ impl Window {
         LiftTicket {
             ordinal,
             hitboxes_start: self.next_frame.hitboxes.len(),
+            runs_start: self.next_frame.scroll.run_count(),
             scroll_owner: None,
         }
     }

@@ -249,6 +249,9 @@ pub(super) struct Splice {
     /// For rows: what the splice does to the places of the rows of the list.
     places: Option<PlaceEdit>,
     old_hitbox_ids: Vec<HitboxId>,
+    /// The hitboxes of the part are taken out of the frame by id, wherever a stacking context put them, and not by the
+    /// range the recording says: the part is empty among the hitboxes.
+    hitboxes_by_id: bool,
     /// The thumbs the scratch frame noted for the bars in the part, with their operations counted from where the
     /// part begins.
     thumbs: Vec<ScrollThumb>,
@@ -350,6 +353,20 @@ impl Window {
         hitboxes: &[Hitbox],
         tab_stops: &[TabStopOperation],
     ) -> bool {
+        self.frame_holds_hitboxes(id, pre, paint, hitboxes, tab_stops, None)
+    }
+
+    /// [`Self::frame_holds`] for a root that a stacking context lifted: the context put its hitboxes where it puts
+    /// them, which is not where the root prepainted, so the frame holds the hitboxes if it has each by id (`places`).
+    fn frame_holds_hitboxes(
+        &self,
+        id: &GlobalElementId,
+        pre: &Range<PrepaintStateIndex>,
+        paint: &Range<PaintIndex>,
+        hitboxes: &[Hitbox],
+        tab_stops: &[TabStopOperation],
+        by_id: Option<&FxHashMap<HitboxId, usize>>,
+    ) -> bool {
         let rendered = &self.rendered_frame;
         let fits = |range: Range<usize>, len: usize| range.start <= range.end && range.end <= len;
         let owns_recording = rendered
@@ -357,9 +374,12 @@ impl Window {
             .get(pre.end.retained_recordings_index)
             .is_some_and(|(key, _)| key.0 == *id && key.1 == TypeId::of::<RetainedState>());
         let held_hitboxes = pre.start.hitboxes_index..pre.end.hitboxes_index;
-        let holds_hitboxes = rendered.hitboxes.get(held_hitboxes).is_some_and(|held| {
-            held.len() == hitboxes.len() && held.iter().zip(hitboxes).all(|(held, recorded)| held.id == recorded.id)
-        });
+        let holds_hitboxes = match by_id {
+            Some(places) => hitboxes.iter().all(|recorded| places.contains_key(&recorded.id)),
+            None => rendered.hitboxes.get(held_hitboxes).is_some_and(|held| {
+                held.len() == hitboxes.len() && held.iter().zip(hitboxes).all(|(held, recorded)| held.id == recorded.id)
+            }),
+        };
         let held_tab_stops = paint.start.tab_handle_index..paint.end.tab_handle_index;
         let holds_tab_stops = rendered.tab_stops.insertion_history.get(held_tab_stops).is_some_and(|held| {
             held.len() == tab_stops.len()
@@ -472,6 +492,7 @@ impl Window {
             runs: None,
             places: None,
             old_hitbox_ids: Vec::new(),
+            hitboxes_by_id: false,
             thumbs: Vec::new(),
             operations,
             hitboxes: scratch.hitboxes[prepaint.start.hitboxes_index..prepaint.end.hitboxes_index].to_vec(),
@@ -529,21 +550,42 @@ impl Window {
                 return None;
             }
         }
+        Some(self.removal_splice(
+            pre,
+            paint,
+            parts.iter().flat_map(|part| part.hitboxes.hitboxes.iter().map(|hitbox| hitbox.id)).collect(),
+            rebuilt,
+            Some(runs),
+            Some(places),
+        ))
+    }
+
+    /// The splice that puts nothing in the part `pre` and `paint` say.
+    fn removal_splice(
+        &self,
+        pre: Range<[usize; FIELDS]>,
+        paint: Range<[usize; FIELDS]>,
+        old_hitbox_ids: Vec<HitboxId>,
+        keeps_states: bool,
+        runs: Option<RunEdit>,
+        places: Option<PlaceEdit>,
+    ) -> Splice {
         let empty = PrepaintStateIndex::default();
         let (start, end) = (empty.with_positions(pre.start), empty.with_positions(pre.end));
         let paint_empty = PaintIndex::default();
         let nodes = start.dispatch_tree_index..end.dispatch_tree_index;
         let nodes_parent = (!nodes.is_empty()).then(|| self.rendered_frame.dispatch_tree.parent_of(nodes.start)).flatten();
-        Some(Splice {
+        Splice {
             prepaint: start..end,
             paint: paint_empty.with_positions(paint.start)..paint_empty.with_positions(paint.end),
             keeps_recording: false,
             holds_root: false,
-            keeps_states: rebuilt,
+            keeps_states,
             recordings: Vec::new(),
-            runs: Some(runs),
-            places: Some(places),
-            old_hitbox_ids: parts.iter().flat_map(|part| part.hitboxes.hitboxes.iter().map(|hitbox| hitbox.id)).collect(),
+            runs,
+            places,
+            old_hitbox_ids,
+            hitboxes_by_id: false,
             thumbs: Vec::new(),
             operations: Vec::new(),
             hitboxes: Vec::new(),
@@ -561,7 +603,54 @@ impl Window {
             tab_stops: Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: Vec::new(),
-        })
+        }
+    }
+
+    /// The splice that takes the root `part` is the recording of out of the frame, a child of a `div` scroller that left
+    /// the tree, and puts nothing in its place: `runs` takes its run out. `by_id` is given for a root that a stacking context
+    /// lifted (the places of the hitboxes of the frame): what it prepainted is where its recording says, but its hitboxes are
+    /// where the context put them. `None` if the frame does not hold what the root recorded where it recorded it.
+    pub(super) fn plan_root_removal(
+        &self,
+        part: &RowPart,
+        by_id: Option<&FxHashMap<HitboxId, usize>>,
+        runs: RunEdit,
+    ) -> Option<Splice> {
+        if !self.frame_holds_hitboxes(&part.id, &part.prepaint, &part.paint, &part.hitboxes.hitboxes, &part.tab_stops, by_id) {
+            return None;
+        }
+        let (mut pre_start, mut pre_end) = (part.prepaint.start.positions(), part.prepaint.end.positions());
+        // The root's own recording is noted after its prepaint, and the dispatch node the element that wraps the root pushes comes
+        // before the recording begins.
+        pre_end[RECORDINGS] += 1;
+        pre_start[DISPATCH_NODES] = pre_start[DISPATCH_NODES].checked_sub(1)?;
+        if by_id.is_some() {
+            pre_start[HITBOXES] = pre_end[HITBOXES];
+        }
+        let (mut paint_start, mut paint_end) = (part.paint.start.positions(), part.paint.end.positions());
+        if by_id.is_some() {
+            // The stacking context paints what it lifted under a content mask of the child's own, which its marks bracket.
+            let operations = &self.rendered_frame.scene.paint_operations;
+            let (first, last) = (paint_start[OPERATIONS], paint_end[OPERATIONS]);
+            let bracketed = first > 0
+                && matches!(operations.get(first - 1), Some(PaintOperation::Replaced { .. }))
+                && matches!(operations.get(last), Some(PaintOperation::EndReplaced));
+            if !bracketed {
+                return None;
+            }
+            paint_start[OPERATIONS] -= 1;
+            paint_end[OPERATIONS] += 1;
+        }
+        let mut splice = self.removal_splice(
+            pre_start..pre_end,
+            paint_start..paint_end,
+            part.hitboxes.hitboxes.iter().map(|hitbox| hitbox.id).collect(),
+            false,
+            Some(runs),
+            None,
+        );
+        splice.hitboxes_by_id = by_id.is_some();
+        Some(splice)
     }
 
     /// The splice that puts the rows the scratch frame was drawn with (`prepaint` and `paint` are what it
@@ -701,7 +790,12 @@ impl Window {
         let hitboxes_part = pre_cut.start[HITBOXES]..pre_cut.end[HITBOXES];
         let operations_part = paint_cut.start[OPERATIONS]..paint_cut.end[OPERATIONS];
         match splice.runs.take() {
-            Some(edit) => self.rendered_frame.scroll.edit_runs(edit, pre_cut.delta[HITBOXES], paint_cut.delta[OPERATIONS]),
+            Some(edit) => self.rendered_frame.scroll.edit_runs(
+                edit,
+                pre_cut.delta[HITBOXES],
+                paint_cut.delta[OPERATIONS],
+                (&hitboxes_part, &operations_part),
+            ),
             None => self.rendered_frame.scroll.remap_runs(&mut |hitboxes, operations| {
                 // A run is told apart from the root by whichever of its two places the root has
                 // something in. A root that has nothing in either is a point, and a run is before or
@@ -785,6 +879,10 @@ impl Window {
             splice.prepaint_states,
         );
         frame.hitboxes.splice(pre.start.hitboxes_index..pre.end.hitboxes_index, splice.hitboxes);
+        if splice.hitboxes_by_id {
+            let gone: FxHashSet<HitboxId> = splice.old_hitbox_ids.iter().copied().collect();
+            frame.hitboxes.retain(|hitbox| !gone.contains(&hitbox.id));
+        }
         frame.tooltip_requests.splice(pre.start.tooltips_index..pre.end.tooltips_index, splice.tooltips);
         frame.dispatch_tree.splice_nodes(
             pre.start.dispatch_tree_index..pre.end.dispatch_tree_index,

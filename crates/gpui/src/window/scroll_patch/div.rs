@@ -116,7 +116,41 @@ pub(crate) struct DivFrame {
     pub(super) stale: bool,
 }
 
+/// `range` once the operations of `part` are replaced by as many more or fewer (`by`), or `None` when it is not clear which of
+/// its ends that moves: a range that holds part of the part.
+fn moved_over(range: &Range<usize>, part: &Range<usize>, by: isize) -> Option<Range<usize>> {
+    if range.end <= part.start {
+        Some(range.clone())
+    } else if range.start >= part.end {
+        Some(shifted(range, by))
+    } else if range.start <= part.start && part.end <= range.end {
+        Some(range.start..(range.end as isize + by) as usize)
+    } else {
+        None
+    }
+}
+
 impl DivFrame {
+    /// The operations of `part` were replaced by as many more or fewer (`by`): the ranges the frame keeps of what its
+    /// content painted follow, or the frame is stale when one of them holds a part of it.
+    pub(super) fn splice_operations(&mut self, part: &Range<usize>, by: isize) {
+        if by == 0 {
+            return;
+        }
+        let moved: Option<Vec<Range<usize>>> =
+            std::iter::once(&self.ops).chain(&self.lifted_ops).map(|range| moved_over(range, part, by)).collect();
+        match moved {
+            Some(moved) => {
+                let mut moved = moved.into_iter();
+                self.ops = moved.next().expect("the frame keeps the operations of its content");
+                for (range, moved) in self.lifted_ops.iter_mut().zip(moved) {
+                    *range = moved;
+                }
+            }
+            None => self.stale = true,
+        }
+    }
+
     /// Whether the scroller is at another offset than the one its content was built at.
     pub(super) fn moved(&self) -> bool {
         *self.offset.borrow() != self.scrolled
@@ -242,7 +276,11 @@ impl Window {
     /// (the root's run, which the paint of the root notes), and the operations it paints are numbered in the recording
     /// it is painted into, not in the frame.
     pub(crate) fn scroll_patch_note_lifted_child(&mut self, ticket: &mut LiftTicket, root: bool) {
-        if root || self.is_recording_any_relocation() {
+        if self.is_recording_any_relocation() {
+            return;
+        }
+        if root {
+            self.next_frame.scroll.note_lifted_runs(ticket.runs_start);
             return;
         }
         let Some(open) = self.next_frame.scroll.open.last_mut().filter(|open| open.div) else {
@@ -322,7 +360,25 @@ impl Window {
         let shown = &self.rendered_frame.scroll;
         let mut moved = shown.divs.iter().filter(|div| div.moved());
         let (first, second) = (moved.next(), moved.next());
-        let gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self, cx, first.filter(|_| second.is_none()).map(|div| div.id)));
+        let translating = first.filter(|_| second.is_none()).map(|div| div.id);
+        let mut gate = self.scroll_patch.gate.as_ref().and_then(|gate| gate(self, cx, translating));
+        // A commit that only took children out is not an edit when every one of them is a root of the scroller.
+        let mut leaving = Vec::new();
+        if gate == Some(Reason::Edited)
+            && let Some(removals) = self.scroll_patch.removals.as_ref().and_then(|removals| removals(self, cx, translating))
+            && let Some(div) = translating.and_then(|id| shown.divs.iter().find(|div| div.id == id))
+        {
+            let runs: Vec<&ScrollRun> = self.div_runs(div.id).map(|(_, run)| run).collect();
+            let roots: Option<Vec<GlobalElementId>> = removals
+                .removed
+                .iter()
+                .map(|id| runs.iter().find(|run| run.id.last() == Some(id)).map(|run| run.id.clone()))
+                .collect();
+            if let Some(roots) = roots.filter(|roots| !roots.is_empty()) {
+                leaving = roots;
+                gate = removals.gate;
+            }
+        }
         // A row that a patch repainted is shown as the patch painted it, and its recording is of the paint before.
         if self.scroll_patch.gate.is_none()
             || gate == Some(Reason::Other)
@@ -357,6 +413,7 @@ impl Window {
 
         let places: Vec<(&ScrollRun, Point<Pixels>, Result<(), ScrollMiss>)> = self
             .div_runs(div.id)
+            .filter(|(_, run)| !leaving.contains(&run.id))
             .map(|(_, run)| {
                 let total = run.delta + shift;
                 let place = self
@@ -392,7 +449,7 @@ impl Window {
 
         // Whatever the content painted that no root holds has to move with it, and only a hitbox of a plain
         // element does: the box moves, and the clip around it stays.
-        let mut held_ops: Vec<&Range<usize>> = places.iter().map(|(run, _, _)| &run.ops).collect();
+        let mut held_ops: Vec<&Range<usize>> = self.div_runs(div.id).map(|(_, run)| &run.ops).collect();
         held_ops.sort_by_key(|range| range.start);
         let unrooted_ops = std::iter::once(&div.ops)
             .chain(&div.lifted_ops)
@@ -445,6 +502,7 @@ impl Window {
                 deltas: places.into_iter().map(|(run, total, _)| (run.id.clone(), total)).collect(),
                 thumbs,
                 div: Some(offset),
+                leaving,
             }),
         }
     }
@@ -487,18 +545,29 @@ impl Window {
         }
         let places = self.hitbox_places();
         let mut moves = Vec::new();
+        let mut membership = MembershipPlan::default();
         for (index, run) in self.div_runs(div.id) {
+            if prediction.leaving.contains(&run.id) {
+                let part = self
+                    .peek_element_state(&run.id, |state: &RetainedState| state.frame_part(self))
+                    .flatten()
+                    .ok_or(ScrollApplyDecline::Row)?;
+                let edit = RunEdit { from: index, removed: 1, added: Vec::new(), by_position: true };
+                let removal = self.plan_root_removal(&part, run.lifted.then_some(&places), edit).ok_or(ScrollApplyDecline::Splice)?;
+                membership.removals.push(removal);
+                membership.removed += 1;
+                continue;
+            }
             moves.push(self.plan_run_move(index, run, prediction.shift, Some(&places))?);
         }
         if moves.is_empty() {
             return Err(ScrollApplyDecline::Runs);
         }
         let thumbs = self.plan_thumb_moves(prediction)?;
-        let mut membership = MembershipPlan::default();
         for id in &div.unrooted {
             let ix = *places.get(id).ok_or(ScrollApplyDecline::Hitboxes)?;
             let moved = self.rendered_frame.hitboxes[ix].scrolled_by(prediction.shift).ok_or(ScrollApplyDecline::Hitboxes)?;
-            membership.scrolled_hitboxes.push((ix, moved));
+            membership.scrolled_hitboxes.push((*id, moved));
         }
         Ok((moves, thumbs, membership))
     }
@@ -508,10 +577,15 @@ impl Window {
     pub(super) fn write_div_moved(
         &mut self,
         prediction: &Prediction,
-        scrolled_hitboxes: Vec<(usize, Hitbox)>,
+        scrolled_hitboxes: Vec<(HitboxId, Hitbox)>,
     ) -> Option<(ScrollTranslated, ScrollTranslation)> {
-        for (ix, hitbox) in scrolled_hitboxes {
-            self.rendered_frame.hitboxes[ix] = hitbox;
+        // By id: a root that was taken out of the frame took its hitboxes with it, and the places moved.
+        if !scrolled_hitboxes.is_empty() {
+            let places = self.hitbox_places();
+            for (id, hitbox) in scrolled_hitboxes {
+                let ix = *places.get(&id).expect("a hitbox no root holds is still in the frame the translate writes");
+                self.rendered_frame.hitboxes[ix] = hitbox;
+            }
         }
         let offset = prediction.div?;
         let div = self.rendered_frame.scroll.divs.iter_mut().find(|div| div.id == prediction.list)?;
@@ -543,5 +617,26 @@ impl Window {
                         *id == run.id && (delta.x - run.delta.x).abs() < px(0.01) && (delta.y - run.delta.y).abs() < px(0.01)
                     })
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_range_moves_with_the_operations_that_were_taken_out_before_it() {
+        let part = 10..13;
+        assert_eq!(moved_over(&(0..10), &part, -3), Some(0..10));
+        assert_eq!(moved_over(&(13..20), &part, -3), Some(10..17));
+        assert_eq!(moved_over(&(5..30), &part, -3), Some(5..27), "a range that holds the part shrinks with it");
+        assert_eq!(moved_over(&(0..0), &part, -3), Some(0..0), "a range not painted yet stays");
+    }
+
+    #[test]
+    fn a_range_that_holds_a_part_of_the_part_is_not_told() {
+        let part = 10..13;
+        assert_eq!(moved_over(&(5..11), &part, -3), None);
+        assert_eq!(moved_over(&(12..20), &part, -3), None);
     }
 }

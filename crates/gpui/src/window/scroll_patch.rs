@@ -413,6 +413,10 @@ pub(super) struct RunEdit {
     pub(super) from: usize,
     pub(super) removed: usize,
     pub(super) added: Vec<ScrollRun>,
+    /// The roots that are taken out are children of a `div` scroller, whose runs are not in the order of the frame's vectors
+    /// (a stacking context paints what it lifts where it paints it): the ranges the frame's other runs and scrollers keep
+    /// move by where they are, and not by the runs' place among the runs.
+    pub(super) by_position: bool,
 }
 
 /// A retained root painted inside a list.
@@ -427,6 +431,9 @@ pub(super) struct ScrollRun {
     /// The ids of its hitboxes, for a root in a `div` scroller: a root that is lifted into a stacking context has its
     /// hitboxes taken out of where `hitboxes` was noted, and the context puts them elsewhere.
     hitbox_ids: Vec<HitboxId>,
+    /// The root is lifted into a stacking context: its hitboxes are where the context put them and its recording's
+    /// place among the hitboxes is where it was prepainted, so what takes the root out of the frame finds them by id.
+    lifted: bool,
     /// How far from its recording it was put.
     delta: Point<Pixels>,
     /// The content mask around the root in prepaint, and whether an exact clip cut it.
@@ -649,6 +656,17 @@ impl ScrollFrame {
         }
     }
 
+    pub(crate) fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// The runs from `from` on were handed to a stacking context.
+    pub(crate) fn note_lifted_runs(&mut self, from: usize) {
+        for run in self.runs.iter_mut().skip(from) {
+            run.lifted = true;
+        }
+    }
+
     /// Calls `f` with the cell that holds the dispatch node each list's rows hang off.
     pub(super) fn for_each_dispatch_parent(&self, f: impl Fn(&Cell<Option<DispatchNodeId>>)) {
         for list in &self.lists {
@@ -697,12 +715,23 @@ impl ScrollFrame {
 
     /// Takes out and puts in the runs of rows that left and came in, and moves the ones after them by how
     /// much the hitboxes and the operations of the frame grew or shrank.
-    pub(super) fn edit_runs(&mut self, edit: RunEdit, hitboxes: isize, operations: isize) {
+    pub(super) fn edit_runs(&mut self, edit: RunEdit, hitboxes: isize, operations: isize, part: (&Range<usize>, &Range<usize>)) {
         let after = edit.from + edit.added.len();
         for div in &mut self.divs {
-            div.stale = true;
+            if edit.by_position {
+                div.splice_operations(part.1, operations);
+            } else {
+                div.stale = true;
+            }
         }
         self.runs.splice(edit.from..edit.from + edit.removed, edit.added);
+        if edit.by_position {
+            for run in &mut self.runs {
+                run.hitboxes = moved_past(&run.hitboxes, part.0, hitboxes);
+                run.ops = moved_past(&run.ops, part.1, operations);
+            }
+            return;
+        }
         for run in &mut self.runs[after..] {
             run.hitboxes = shifted(&run.hitboxes, hitboxes);
             run.ops = shifted(&run.ops, operations);
@@ -835,6 +864,14 @@ impl ScrollFrame {
     }
 }
 
+/// `range` after `by` items were put in the place of those of `part`: moved if it is after the part.
+fn moved_past(range: &Range<usize>, part: &Range<usize>, by: isize) -> Range<usize> {
+    if by == 0 || range.start < part.end {
+        return range.clone();
+    }
+    shifted(range, by)
+}
+
 fn shifted(range: &Range<usize>, by: isize) -> Range<usize> {
     (range.start as isize + by) as usize..(range.end as isize + by) as usize
 }
@@ -908,9 +945,24 @@ struct Prediction {
     thumbs: Vec<(usize, Option<Bounds<Pixels>>)>,
     /// For the scroll of a `div`: the offset it is at, and `list` is the scroller. Its content moves by `shift`.
     div: Option<Point<Pixels>>,
+    /// For the scroll of a `div`: the roots of the content that the commit took out, which the frame takes out of the
+    /// frame shown. The roots in `deltas` are the ones that stay.
+    leaving: Vec<GlobalElementId>,
 }
 
 pub(crate) type ScrollPatchGate = Rc<dyn Fn(&Window, &App, Option<crate::ScrollKey>) -> Option<ScrollPatchReason>>;
+pub(crate) type ScrollPatchRemovals = Rc<dyn Fn(&Window, &App, Option<crate::ScrollKey>) -> Option<ScrollRemovals>>;
+
+/// What the owner says of a commit that did nothing but take children out of the tree, when the frame drawn after a
+/// scroll of a `div` is asked whether it can be a translate with those children removed (see
+/// [`Window::set_scroll_patch_removals`]).
+pub struct ScrollRemovals {
+    /// The retained roots of the children that left, by the id each was built with. Nothing else of the frame
+    /// changed: what stays is where the frame shown has it, once the scroll has moved it.
+    pub removed: Vec<ElementId>,
+    /// What [`Window::set_scroll_patch_gate`] says of the frame when the commit is not counted as an edit.
+    pub gate: Option<ScrollPatchReason>,
+}
 pub(crate) type ScrollPatchSettled = Rc<dyn Fn(&mut Window, &mut App, crate::ScrollKey)>;
 pub(crate) type ScrollPatchRegistries = Rc<dyn Fn(&Window) -> String>;
 
@@ -924,6 +976,7 @@ pub(crate) struct ScrollPatchWindow {
     /// A tick was requested for the draw being classified (taken by [`Window::draw`] before it).
     ticked: bool,
     gate: Option<ScrollPatchGate>,
+    removals: Option<ScrollPatchRemovals>,
     predicted: Option<Prediction>,
     counters: ScrollPatchCounters,
 }
@@ -962,6 +1015,22 @@ impl Window {
         gate: Option<Rc<dyn Fn(&Window, &App, Option<crate::ScrollKey>) -> Option<ScrollPatchReason>>>,
     ) {
         self.scroll_patch.gate = gate;
+    }
+
+    /// Lets the owner of the window say, for a frame drawn after a scroll of a `div` that its gate called
+    /// [`ScrollPatchReason::Edited`], that the edit was only children taken out of the tree, and which: the frame is
+    /// then a translate that takes their roots out of the frame shown, if every child that left is a run of the
+    /// scroller. The owner promises that nothing that stays is moved or restyled by the commit: the roots that stay
+    /// are put where the scroll takes them and not laid out again. Asked with the same arguments as the gate, and
+    /// only when the gate said `Edited`.
+    pub fn set_scroll_patch_removals(&mut self, removals: Option<Rc<dyn Fn(&Window, &App, Option<crate::ScrollKey>) -> Option<ScrollRemovals>>>) {
+        self.scroll_patch.removals = removals;
+    }
+
+    /// Whether a scroll was noted that no draw has classified yet: the draw that comes may translate what the scroll moved,
+    /// and an owner that commits before it can leave that to it.
+    pub fn scroll_patch_pending(&self) -> bool {
+        self.scroll_patch.enabled && self.scroll_patch.scrolled.is_some()
     }
 
     /// Lets the owner of the window follow a frame that moved the rows in place: `settled` runs
@@ -1138,6 +1207,7 @@ impl Window {
             hitboxes,
             ops: 0..0,
             hitbox_ids,
+            lifted: false,
             delta,
             paint_mask: ambient,
             ambient,
@@ -1535,6 +1605,7 @@ impl Window {
                 deltas: places.into_iter().map(|(run, total, _)| (run.id.clone(), total)).collect(),
                 thumbs,
                 div: None,
+                leaving: Vec::new(),
             }),
         }
     }
@@ -1633,7 +1704,7 @@ struct MembershipPlan {
     /// The rows that are built, in the order of the list, with where they are put.
     groups: Vec<RowsIn>,
     /// The hitboxes of a `div` scroller's content that no root holds, and where the scroll puts each.
-    scrolled_hitboxes: Vec<(usize, Hitbox)>,
+    scrolled_hitboxes: Vec<(HitboxId, Hitbox)>,
 }
 
 /// Rows that are built, and where in the frame shown they are put: after `at` in the vectors, and among the
@@ -1788,7 +1859,7 @@ impl Window {
             let count = parts.len();
             // The rows that leave are the first of the list or the last: their parts are what lies between two places.
             let (first, last) = if is_tail { (runs.len() - count, runs.len()) } else { (0, count) };
-            let edit = RunEdit { from: first_run + first, removed: count, added: Vec::new() };
+            let edit = RunEdit { from: first_run + first, removed: count, added: Vec::new(), by_position: false };
             // The place where the rows that stay begin or end is the one the part leaves, and moves with the
             // splice. The places of the rows that leave go, those of their ends with them.
             let places = PlaceEdit {
@@ -1837,7 +1908,7 @@ impl Window {
                 let first_row = list.rows.start + replacing.start;
                 let parts: Vec<RowPart> =
                     replaced.iter().filter(|(row, _)| (first_row..first_row + count).contains(row)).map(|(_, part)| part.clone()).collect();
-                let edit = RunEdit { from: first_run + replacing.start, removed: count, added: Vec::new() };
+                let edit = RunEdit { from: first_run + replacing.start, removed: count, added: Vec::new(), by_position: false };
                 let places = PlaceEdit { list: list.id, from: replacing.start, removed: count, added: Vec::new() };
                 let footprint = (pre[replacing.start]..pre[replacing.end], paint[replacing.start]..paint[replacing.end]);
                 membership.removals.push(self.plan_removal(&parts, footprint, edit, places, true).ok_or(ScrollApplyDecline::Splice)?);
@@ -2057,7 +2128,7 @@ impl Window {
         }
         let operations = mem::take(&mut self.next_frame.scene.paint_operations);
         let dispatch_parent = prepaint.dispatch_parent().get();
-        let edit = RunEdit { from: group.runs_from, removed: 0, added: runs };
+        let edit = RunEdit { from: group.runs_from, removed: 0, added: runs, by_position: false };
         // Where each of the rows begins once the splice is made: the places of the scratch frame, from where the
         // rows are put.
         let added = prepaint_places

@@ -5,9 +5,11 @@ use super::scroll_patch_tests::{runs_shown, shown};
 use crate::{
     AnyWindowHandle, AppContext as _, Bounds, Context, Edges, InteractiveElement, IntoElement, MouseMoveEvent, ParentElement,
     PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollPatchReason, ScrollThumbMiss, ScrollWheelEvent,
-    Position, ScrollApplyDecline, StatefulInteractiveElement as _, Styled, TestAppContext, Window, div, fill, point, px, retained, size,
+    Position, ScrollApplyDecline, ScrollRemovals, StatefulInteractiveElement as _, Styled, TestAppContext, Window, div, fill, point, px,
+    retained, size,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 const ROW: f32 = 30.;
@@ -83,6 +85,9 @@ struct Page {
     ready: Rc<Cell<bool>>,
     bar: Option<Bar>,
     key: Rc<Cell<u64>>,
+    /// The roots the owner took out of the tree, and the ones of them a frame has not drawn yet.
+    removed: Rc<RefCell<BTreeSet<usize>>>,
+    pending: Rc<RefCell<Vec<usize>>>,
     /// How far each frame that moved the content in place said it moved it.
     told: Rc<RefCell<Vec<crate::Point<crate::Pixels>>>>,
 }
@@ -90,7 +95,10 @@ struct Page {
 impl Render for Page {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let page = self.clone();
+        // A view that renders draws every commit.
+        page.pending.borrow_mut().clear();
         let rows: Vec<_> = (0..ROWS)
+            .filter(|ix| !page.removed.borrow().contains(ix))
             .map(|ix| {
                 let hitboxes = page.hitboxes;
                 let row_scroller = page.row_scroller;
@@ -286,6 +294,25 @@ impl Fixture {
         .unwrap();
     }
 
+    /// The owner says that what it commits is roots taken out of the tree, which a frame that moves the content takes out of the
+    /// frame; the commit is drawn when a frame is, which is when it forgets it.
+    fn watch_removals(&self, cx: &mut TestAppContext) {
+        let (pending, drawn, told) = (self.page.pending.clone(), self.page.pending.clone(), self.page.pending.clone());
+        self.with_window(cx, move |window| {
+            window.set_scroll_patch_gate(Some(Rc::new(move |_, _, _| (!pending.borrow().is_empty()).then_some(ScrollPatchReason::Edited))));
+            window.set_scroll_patch_removals(Some(Rc::new(move |_, _, _| {
+                Some(ScrollRemovals { removed: told.borrow().iter().map(|ix| ("row", *ix).into()).collect(), gate: None })
+            })));
+            window.set_scroll_patch_settled(Some(Rc::new(move |_, _, _| drawn.borrow_mut().clear())));
+        });
+    }
+
+    /// The owner takes the roots `rows` out of the tree.
+    fn remove(&self, rows: &[usize]) {
+        self.page.removed.borrow_mut().extend(rows);
+        self.page.pending.borrow_mut().extend(rows);
+    }
+
     fn counters(&self, cx: &mut TestAppContext) -> crate::ScrollPatchCounters {
         cx.update_window(self.window, |_, window, _| window.scroll_patch_counters()).unwrap()
     }
@@ -316,6 +343,8 @@ impl Page {
             ready: Rc::new(Cell::new(true)),
             bar: None,
             key: Rc::new(Cell::new(1)),
+            removed: Rc::default(),
+            pending: Rc::default(),
             told: Rc::default(),
         }
     }
@@ -860,4 +889,119 @@ fn a_root_that_holds_an_escaped_box_is_written_while_it_stays_clipped_away(cx: &
     let (built, _) = after_wheels(cx, page(), false, &wheels);
     assert_eq!(counters.mispredicted, 0, "{counters:?}");
     assert_the_same(&translated, &built, &counters, "roots that hold an escaped box");
+}
+
+/// The frame shown after each wheel, when the owner took the roots of `steps` out of the tree before it, with the translate on or off.
+fn after_removals(cx: &mut TestAppContext, page: Page, patch: bool, steps: &[(f32, &[usize])]) -> (Vec<String>, crate::ScrollPatchCounters) {
+    after_removals_at(cx, page, patch, (10., 12.), steps)
+}
+
+/// [`after_removals`] with the pointer at `at`.
+fn after_removals_at(
+    cx: &mut TestAppContext,
+    page: Page,
+    patch: bool,
+    at: (f32, f32),
+    steps: &[(f32, &[usize])],
+) -> (Vec<String>, crate::ScrollPatchCounters) {
+    let fixture = Fixture::open(cx, page);
+    fixture.watch_removals(cx);
+    fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+    let frames = steps
+        .iter()
+        .map(|(by, rows)| {
+            fixture.point_at(cx, at.0, at.1);
+            fixture.remove(rows);
+            fixture.scroll(cx, at.0, at.1, *by);
+            fixture.with_window(cx, shown)
+        })
+        .collect();
+    (frames, fixture.counters(cx))
+}
+
+/// The roots that leave while the wheel moves the others: in the clip, in the overscan that is clipped away, and not the ones that follow.
+const REMOVALS: [(f32, &[usize]); 7] = [(5., &[6]), (5., &[]), (4., &[1]), (-3., &[5]), (4., &[]), (6., &[2, 4]), (2., &[])];
+
+#[gpui::test]
+fn roots_that_a_commit_took_out_are_taken_out_by_the_translate(cx: &mut TestAppContext) {
+    let variants: [(&str, fn(&mut Page)); 6] = [
+        ("a box that holds the roots", |_| {}),
+        ("a box with a hitbox", |page| page.spacer_hitbox = true),
+        ("roots with no hitbox", |page| page.hitboxes = false),
+        ("roots that are not culled", |page| page.culls = false),
+        ("roots that are stacking contexts", |page| page.row_context = true),
+        ("roots that escape a clip", |page| page.row_escapes = true),
+    ];
+    for (what, vary) in variants {
+        let page = || {
+            let mut page = Page::standard();
+            vary(&mut page);
+            page
+        };
+        let (translated, counters) = after_removals(cx, page(), true, &REMOVALS);
+        let (built, off) = after_removals(cx, page(), false, &REMOVALS);
+        assert_eq!(off.frames, 0, "{what}: {off:?}");
+        assert_eq!((counters.patched, counters.membership_frames, counters.rows_removed), (7, 4, 5), "{what}: {counters:?}");
+        assert_eq!((counters.mispredicted, counters.rows_built), (0, 0), "{what}: {counters:?}");
+        assert_the_same(&translated, &built, &counters, what);
+    }
+}
+
+#[gpui::test]
+fn roots_in_the_flow_that_a_commit_took_out_at_the_end_are_taken_out_by_the_translate(cx: &mut TestAppContext) {
+    // Nothing that stays is moved by the roots that were after it.
+    let steps: [(f32, &[usize]); 5] = [(3., &[99]), (3., &[98, 97]), (2., &[]), (-2., &[96]), (2., &[])];
+    for culls in [true, false] {
+        let page = || {
+            let mut page = Page::standard();
+            page.spacer = false;
+            page.culls = culls;
+            page
+        };
+        let (translated, counters) = after_removals(cx, page(), true, &steps);
+        let (built, _) = after_removals(cx, page(), false, &steps);
+        assert_eq!((counters.patched, counters.rows_removed, counters.mispredicted), (5, 4, 0), "culls {culls}: {counters:?}");
+        assert_the_same(&translated, &built, &counters, "roots in the flow");
+    }
+}
+
+#[gpui::test]
+fn a_removal_is_checked_against_the_frame_built_whole_after_it(cx: &mut TestAppContext) {
+    // The frame that checks builds every subtree and leaves no recording to move the roots from, so each step is a window of its own.
+    for (by, rows) in REMOVALS.iter().filter(|(_, rows)| !rows.is_empty()) {
+        let fixture = Fixture::open(cx, Page::standard());
+        fixture.watch_removals(cx);
+        fixture.point_at(cx, 10., 12.);
+        fixture.with_window(cx, |window| window.set_retention_verifier(Some(Rc::new(|_| String::new()))));
+        fixture.remove(rows);
+        fixture.scroll(cx, 10., 12., by.abs());
+        let counters = fixture.counters(cx);
+        assert_eq!((counters.patched, counters.rows_removed, counters.mispredicted), (1, rows.len() as u64, 0), "{rows:?}: {counters:?}");
+        fixture.with_window(cx, |window| {
+            assert_eq!(window.retention_mismatches(), &[] as &[String], "{rows:?}");
+            assert!(window.retained_counters().verified >= 1);
+        });
+    }
+}
+
+#[gpui::test]
+fn what_was_under_the_pointer_in_a_root_that_was_taken_out_is_not_hit(cx: &mut TestAppContext) {
+    // The pointer is over the second root, which the commit takes out.
+    let steps: [(f32, &[usize]); 2] = [(0.5, &[1]), (2., &[])];
+    let (translated, counters) = after_removals_at(cx, Page::standard(), true, (10., 45.), &steps);
+    let (built, _) = after_removals_at(cx, Page::standard(), false, (10., 45.), &steps);
+    assert_eq!((counters.patched, counters.rows_removed, counters.mispredicted), (2, 1, 0), "{counters:?}");
+    assert_the_same(&translated, &built, &counters, "the pointer over a root that left");
+    let hit = translated[0].lines().last().unwrap_or("");
+    assert!(!hit.contains("\"row\""), "no hit chain through the root that left: {hit}");
+}
+
+#[gpui::test]
+fn a_commit_that_took_out_what_is_no_root_of_the_scroller_is_an_edit(cx: &mut TestAppContext) {
+    let fixture = Fixture::open(cx, Page::standard());
+    fixture.watch_removals(cx);
+    fixture.point_at(cx, 10., 12.);
+    fixture.page.pending.borrow_mut().push(500);
+    fixture.scroll(cx, 10., 12., 5.);
+    only(&fixture.counters(cx), ScrollPatchReason::Edited, &[]);
 }
