@@ -1823,6 +1823,9 @@ struct EnterIn {
     /// The hitbox of the neighbor that the hitboxes of the children are put next to, and whether after it.
     anchor: (HitboxId, bool),
     runs_from: usize,
+    /// How far the window has the boxes of the layout of the page from where layout has them, around the content of the scroller in
+    /// the frame shown.
+    layout_to_window: Point<Pixels>,
 }
 
 /// What the scratch frame left for rows that come in.
@@ -1857,6 +1860,11 @@ impl Window {
         let Some(prediction) = self.scroll_patch.predicted.take() else {
             return ScrollPatchDraw::Declined;
         };
+        if prediction.div.is_some() {
+            // The wheel of a frame built whole picks its anchor from the layout of the frame before it, which has the roots the
+            // translates before this one put in and not the ones this one does.
+            self.layout_engine_mut().lay_out_entered_roots_before_the_translate();
+        }
         let planned = if cx.mode.skip_drawing() || self.layout_only || self.measuring || self.dispatch_depth.get() > 0 {
             Err(ScrollApplyDecline::Window)
         } else {
@@ -2367,9 +2375,15 @@ impl Window {
         let mut elements = Vec::with_capacity(entering.children.len());
         for child in &entering.children {
             let mut element = (child.build)(self, cx);
-            let measured = element.layout_as_root_unsnapped(child.available, self, cx);
+            let (layout_id, measured) = element.layout_as_root_unsnapped_with_id(child.available, self, cx);
             if (measured.width - child.size.width).abs() > px(0.01) || (measured.height - child.size.height).abs() > px(0.01) {
                 return Err(ScrollApplyDecline::Height);
+            }
+            // The layout of the page puts the root where the frame shown has it, less how far the window is from layout there. The
+            // scroll anchor of the next layout is picked from that box, as it is in a frame built whole.
+            if child.scrolls {
+                let scale_factor = self.scale_factor;
+                self.layout_engine_mut().note_entered_origin(layout_id, child.origin - group.layout_to_window, scale_factor);
             }
             elements.push(element);
         }

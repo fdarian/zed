@@ -101,6 +101,10 @@ pub(crate) struct DivFrame {
     translated: Option<ScrollTranslated>,
     /// The offset the content was built at, as prepaint left it.
     scrolled: Point<Pixels>,
+    /// The element offset around the scroller and the origin phase around its children, which with the scroll offset put the boxes of
+    /// layout where the window has them (`Window::layout_unsnapped_bounds`).
+    outer: Point<Pixels>,
+    phase: Point<Pixels>,
     /// The clip around the children.
     clip: ContentMask<Pixels>,
     culled: Vec<Culled>,
@@ -199,6 +203,7 @@ impl Window {
         let clip = self.content_mask();
         let (stickies, escapes) = (self.retained.sticky.get(), self.escapes_prepainted());
         let (viewport, scale_factor, mouse) = (self.viewport_size, self.scale_factor, self.mouse_position);
+        let (element_offset, phase) = (self.element_offset(), self.element_origin_phase());
         let flow = mark.hitboxes..self.next_frame.hitboxes.len();
         let frame = &mut self.next_frame.scroll;
         let Some(open) = frame.open.pop() else {
@@ -225,6 +230,7 @@ impl Window {
         frame.scale_factor = scale_factor;
         frame.mouse = mouse;
         let scrolled = *div.offset.borrow();
+        let outer = element_offset - snap_scroll_offset(scrolled, scale_factor);
         frame.divs.retain(|earlier| earlier.id != open.id);
         frame.divs.push(DivFrame {
             id: open.id,
@@ -232,6 +238,8 @@ impl Window {
             handle: div.handle,
             translated: div.translated,
             scrolled,
+            outer,
+            phase,
             clip,
             culled: open.culled,
             unrooted,
@@ -601,7 +609,10 @@ impl Window {
                 false => (*run.hitbox_ids.first().ok_or(ScrollApplyDecline::Hitboxes)?, false),
             };
             let runs_from = index + usize::from(entering.follows);
-            membership.entering.push(EnterIn { group, around, lift_z, at, anchor, runs_from });
+            // Where a rebuilt frame at the offset the frame shown has would put the boxes of layout.
+            let layout_to_window =
+                self.pixel_snap_point(div.outer + snap_scroll_offset(div.scrolled, self.scale_factor)) + div.phase;
+            membership.entering.push(EnterIn { group, around, lift_z, at, anchor, runs_from, layout_to_window });
         }
         let thumbs = self.plan_thumb_moves(prediction)?;
         for id in &div.unrooted {

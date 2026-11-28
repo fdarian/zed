@@ -397,10 +397,16 @@ pub struct TaffyLayoutEngine {
     unstable_requests: u64,
     /// The nodes with `NodeMeta::anchor_restyled` set in the pass under way.
     anchor_restyled_nodes: Vec<LayoutId>,
-    /// Nodes of roots that a scratch pass laid out (a patch that builds what a scroller's content comes to hold): they have the
-    /// boxes of a layout of their own as roots, which is no layout of the page. A scroller that picks its anchor before the layout
-    /// that puts them in the page does not look at them, as it does not look at a node that was never laid out.
-    unplaced: FxHashSet<LayoutId>,
+    /// Roots that a scratch pass laid out (a patch that builds what a scroller's content comes to hold) and the nodes below the
+    /// ones whose place is not known: they have the boxes of a layout of their own as roots, which is no layout of the page. A
+    /// scroller that picks its anchor before the layout that puts them in the page takes a root whose place is recorded
+    /// ([`Unplaced::At`]) at it, and does not look at a node that has none, as it does not look at a node that was never laid out.
+    unplaced: FxHashMap<LayoutId, Unplaced>,
+    /// The places that [`Self::note_entered_origin`] recorded for roots of the scratch pass under way, which
+    /// [`Self::mark_computed_unplaced`] takes.
+    entered_origins: FxHashMap<LayoutId, Point<f32>>,
+    /// A scroller is picking its anchor: a root of `unplaced` with a recorded place has it for the origin of its box.
+    picking: bool,
     /// The pass under way is a scratch pass of a patch: the roots it computes are not the page, so computing them places nothing.
     in_scratch: bool,
     /// The end of the pass keeps the flags of `anchor_restyled_nodes`, see [`Self::hold_anchor_restyles`].
@@ -410,6 +416,20 @@ pub struct TaffyLayoutEngine {
     /// Times taffy asked for the size of a leaf that layout measures and found no measure function
     /// on it: it was answered as empty.
     unmeasured_leaves: u64,
+}
+
+/// What a pick of a scroll anchor knows of a node that a scratch pass laid out as a root.
+#[derive(Clone, Copy, Debug)]
+enum Unplaced {
+    /// A root that a translate put in the page, which a layout of the page puts at this origin (device pixels, in the coordinates of
+    /// the page's layout root): the boxes of the layout the page had when the root came in, which a pick reads it from.
+    At(Point<f32>),
+    /// A root that the latest translate put in: as [`Self::At`] once another translate comes. A frame built whole picks its anchor
+    /// from the layout before it, which does not have the roots that frame puts in, and it is that pick that stands at the next
+    /// frame (a frame after the wheel keeps the anchor), so no pick looks at the roots of the latest translate.
+    Fresh(Point<f32>),
+    /// A node of a layout of a root, where the page would have put it is not known: no pick looks at it.
+    Unknown,
 }
 
 /// A scroll container that anchors, as the pass under way found it.
@@ -525,7 +545,9 @@ impl TaffyLayoutEngine {
             probed: Vec::new(),
             unstable_requests: 0,
             anchor_restyled_nodes: Vec::new(),
-            unplaced: FxHashSet::default(),
+            unplaced: FxHashMap::default(),
+            entered_origins: FxHashMap::default(),
+            picking: false,
             in_scratch: false,
             hold_anchor_restyles: false,
             anchor_scrollers: Vec::new(),
@@ -736,15 +758,15 @@ impl TaffyLayoutEngine {
 
     /// The boxes of the layout of `root` are the page's where `root` is the page's root, which places the nodes below it.
     fn place_below(&mut self, root: LayoutId) {
-        if self.in_scratch {
+        if self.in_scratch || self.unplaced.is_empty() {
             return;
         }
         self.place_subtree(root);
     }
 
-    /// [`Self::place_below`] for a scratch pass that computed the page from its root: the boxes below `root` are the page's.
-    pub(crate) fn place_computed_page(&mut self, root: LayoutId) {
-        self.place_subtree(root);
+    /// Whether roots that a translate put in still wait for the layout of the page to place them.
+    pub(crate) fn has_unplaced(&self) -> bool {
+        !self.unplaced.is_empty()
     }
 
     fn place_subtree(&mut self, root: LayoutId) {
@@ -758,12 +780,45 @@ impl TaffyLayoutEngine {
         }
     }
 
+    /// Records where a layout of the page puts the root `id`, which the scratch pass under way laid out as a root of its own: the
+    /// origin of its border box in the coordinates of the page's layout root, in logical pixels. A pick of a scroll anchor before
+    /// the page lays the root out takes the box to be there, as it is in the layout the page had when the root was put in.
+    pub(crate) fn note_entered_origin(&mut self, id: LayoutId, origin: Point<Pixels>, scale_factor: f32) {
+        self.entered_origins.insert(id, point(origin.x.0 * scale_factor, origin.y.0 * scale_factor));
+    }
+
+    /// How many nodes hold the boxes of a layout of a root of their own, which no layout of the page has placed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn unplaced_nodes(&self) -> usize {
+        self.unplaced.len()
+    }
+
+    /// A translate begins: the roots that the translates before it put in are in the layout that a frame built whole at this wheel
+    /// would pick its anchor from.
+    pub(crate) fn lay_out_entered_roots_before_the_translate(&mut self) {
+        for unplaced in self.unplaced.values_mut() {
+            if let Unplaced::Fresh(origin) = *unplaced {
+                *unplaced = Unplaced::At(origin);
+            }
+        }
+    }
+
     /// Notes that the roots the pass laid out, and what is below them, hold the boxes of that layout and not of the page, which the
-    /// next pick of a scroll anchor is not to take for the layout before it.
+    /// next pick of a scroll anchor is not to take for the layout before it, except for the roots whose place was recorded.
     pub(crate) fn mark_computed_unplaced(&mut self) {
-        let mut stack: Vec<LayoutId> = self.computed_layouts.iter().copied().collect();
+        let entered = std::mem::take(&mut self.entered_origins);
+        let mut stack: Vec<LayoutId> = Vec::new();
+        for id in self.computed_layouts.iter().copied() {
+            match entered.get(&id) {
+                // Its boxes below follow the root's, which a pick reads from the place.
+                Some(origin) => {
+                    self.unplaced.insert(id, Unplaced::Fresh(*origin));
+                }
+                None => stack.push(id),
+            }
+        }
         while let Some(id) = stack.pop() {
-            if !self.unplaced.insert(id) {
+            if self.unplaced.insert(id, Unplaced::Unknown).is_some() {
                 continue;
             }
             stack.extend((0..self.taffy.child_count(id.0)).map(|index| LayoutId(self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE))));
@@ -971,6 +1026,7 @@ impl TaffyLayoutEngine {
             self.scroll_reaches.remove(&id);
             self.unsnapped_scroll_reaches.remove(&id);
             self.parked.remove(&id);
+            self.unplaced.remove(&id);
             if let Some(key) = meta.key {
                 self.keys.remove(&key);
             }
@@ -1711,12 +1767,35 @@ impl TaffyLayoutEngine {
         if self.anchor_scrollers.is_empty() {
             return;
         }
+        self.begin_picking();
         for scroller in std::mem::take(&mut self.anchor_scrollers) {
             scroller
                 .handle
                 .pick_anchor(self, scroller.layout_id, scroller.enabled, scale_factor);
         }
-        // What was asked of the boxes above is of the boxes before the layout.
+        self.end_picking();
+    }
+
+    /// The boxes a pick reads are those of the layout before: a root a translate put in is where that layout had it. What was read
+    /// of the boxes before is not what a pick reads, and what the pick reads is not what the layout after it does.
+    fn begin_picking(&mut self) {
+        let mut stack: Vec<LayoutId> = self
+            .unplaced
+            .iter()
+            .filter(|(_, unplaced)| matches!(unplaced, Unplaced::At(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        while let Some(id) = stack.pop() {
+            self.absolute_layout_bounds.remove(&id);
+            self.absolute_outer_origins.remove(&id);
+            stack.extend((0..self.taffy.child_count(id.0)).map(|index| LayoutId(self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE))));
+        }
+        self.picking = true;
+    }
+
+    /// What was asked of the boxes above is of the boxes before the layout.
+    fn end_picking(&mut self) {
+        self.picking = false;
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
     }
@@ -1745,13 +1824,13 @@ impl TaffyLayoutEngine {
         if scrollers.is_empty() {
             return;
         }
+        self.begin_picking();
         for scroller in scrollers {
             scroller
                 .handle
                 .pick_anchor(self, scroller.layout_id, scroller.enabled, scale_factor);
         }
-        self.absolute_layout_bounds.clear();
-        self.absolute_outer_origins.clear();
+        self.end_picking();
     }
 
     /// Whether the step of any of the scrollers would scroll it, or drop its anchor, for the layout that was
@@ -2077,8 +2156,17 @@ impl TaffyLayoutEngine {
         let layout_size = layout.size;
         let parent = self.taffy.parent(id.0);
 
-        let absolute_outer_origin = match parent {
-            Some(parent_id) => {
+        let recorded = if self.picking {
+            match self.unplaced.get(&id) {
+                Some(Unplaced::At(origin)) => Some(*origin),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let absolute_outer_origin = match (recorded, parent) {
+            (Some(origin), _) => origin,
+            (None, Some(parent_id)) => {
                 let parent_id = LayoutId::from(parent_id);
                 self.layout_bounds(parent_id, scale_factor);
                 let parent_origin = *self
@@ -2087,7 +2175,7 @@ impl TaffyLayoutEngine {
                     .expect("parent absolute outer origin should be cached");
                 parent_origin + Point::from(layout_location)
             }
-            None => Point::from(layout_location) + self.origin_seeds.get(&id).copied().unwrap_or_default(),
+            (None, None) => Point::from(layout_location) + self.origin_seeds.get(&id).copied().unwrap_or_default(),
         };
         self.absolute_outer_origins
             .insert(id, absolute_outer_origin);
@@ -2647,7 +2735,7 @@ impl TaffyLayoutEngine {
         let overflow = [style.overflow.x, style.overflow.y];
         AnchorFacts {
             excluded: meta.anchor_excluded,
-            hidden: style.display == taffy::style::Display::None || self.unplaced.contains(&id),
+            hidden: style.display == taffy::style::Display::None || matches!(self.unplaced.get(&id), Some(Unplaced::Unknown | Unplaced::Fresh(_))),
             position: meta.position,
             is_static: meta.is_static,
             has_inset: meta.has_inset,
@@ -5093,29 +5181,30 @@ mod tests {
         }
 
         #[gpui::test]
-        fn a_scratch_pass_that_computes_the_page_from_its_root_places_the_roots_it_holds(cx: &mut TestAppContext) {
+        fn roots_that_wait_for_the_layout_of_the_page_are_told_and_the_page_places_them(cx: &mut TestAppContext) {
             let cx = cx.add_empty_window();
             cx.update(|window, cx| {
                 let mut engine = TaffyLayoutEngine::new();
-                // A root that a translate laid out as one of its own.
+                assert!(!engine.has_unplaced());
                 engine.begin_scratch_pass();
                 let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
                 engine.compute_layout(leaf, space(), window, cx);
                 engine.mark_computed_unplaced();
                 engine.end_pass_keeping_nodes();
-                assert!(engine.anchor_facts(leaf).hidden);
+                assert!(engine.has_unplaced());
 
-                // A patch that lays out again attaches it to the page and computes the page in a scratch pass of its own, which
-                // places nothing by itself: that is the page's layout, and says so.
+                // A scratch pass that lays out another root of its own, as a patch's does, places nothing.
                 engine.begin_scratch_pass();
+                let other = engine.request_keyed_layout(9, flex(), REM, 1., &[]);
+                engine.compute_layout(other, space(), window, cx);
+                engine.end_pass_keeping_nodes();
+                assert!(engine.has_unplaced());
+
                 let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
                 let root = engine.request_keyed_layout(1, flex(), REM, 1., &[leaf]);
                 engine.compute_layout(root, space(), window, cx);
-                assert!(engine.anchor_facts(leaf).hidden);
-                engine.place_computed_page(root);
-                assert!(!engine.anchor_facts(leaf).hidden);
-                engine.end_pass_keeping_nodes();
-                assert!(!engine.anchor_facts(leaf).hidden, "the end of the pass does not mark them again");
+                assert!(!engine.has_unplaced(), "the page computing the root places it");
+                engine.end_pass();
             });
         }
 

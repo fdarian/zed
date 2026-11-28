@@ -3,7 +3,7 @@
 
 use super::scroll_patch_tests::{runs_shown, shown};
 use crate::{
-    AnyWindowHandle, AppContext as _, Bounds, Context, Edges, InteractiveElement, IntoElement, MouseMoveEvent, ParentElement,
+    AnyWindowHandle, App, AppContext as _, ElementId, PatchDecline, Bounds, Context, Edges, InteractiveElement, IntoElement, MouseMoveEvent, ParentElement,
     PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollPatchReason, ScrollThumbMiss, ScrollWheelEvent,
     Position, ScrollApplyDecline, ScrollRemovals, StatefulInteractiveElement as _, Styled, TestAppContext, Window, div, fill, point, px,
     retained, size,
@@ -95,10 +95,51 @@ struct Page {
     stay_z: i32,
     /// A box above the roots that the owner grows (the edit of `an_edit_after_translates...`), if the page has one.
     header: Option<Rc<Cell<f32>>>,
+    /// How far from the top of the window the scroller is.
+    above: f32,
     /// How far the owner puts the roots down inside the box that holds them, which restyles each root.
     push: Rc<Cell<f32>>,
+    /// How far the owner puts down the one root that is `.0` (restyles that root alone).
+    nudge: Rc<Cell<(usize, f32)>>,
+    /// The top border of the box that holds the roots, which the owner grows: the roots are put down inside it.
+    border_top: Option<Rc<Cell<f32>>>,
     /// How far each frame that moved the content in place said it moved it.
     told: Rc<RefCell<Vec<crate::Point<crate::Pixels>>>>,
+    /// A retained root above the scroller that a patch lays out again (`after_translates_and_a_relayout_patch`), if the page has one.
+    unit: Option<Rc<Unit>>,
+}
+
+const UNIT: &str = "unit";
+
+/// The root above the roots, a box of a fixed height that clips its kids.
+struct Unit {
+    height: Cell<f32>,
+    kid_height: Cell<f32>,
+    version: Cell<u64>,
+    /// What each patch of the unit came to.
+    seen: RefCell<Vec<Result<(), PatchDecline>>>,
+}
+
+impl Unit {
+    const HEIGHT: f32 = 20.;
+
+    fn new() -> Rc<Self> {
+        Rc::new(Self { height: Cell::new(Self::HEIGHT), kid_height: Cell::new(8.), version: Cell::new(0), seen: RefCell::default() })
+    }
+
+    fn element(&self) -> crate::AnyElement {
+        let mut unit = div().id(UNIT).w(px(100.)).h(px(self.height.get())).overflow_hidden().bg(crate::blue());
+        for ix in 0..3usize {
+            unit = unit.child(div().id(("kid", ix)).h(px(self.kid_height.get())).bg(crate::red()));
+        }
+        unit.into_any_element()
+    }
+
+    fn changes(&self, height: f32, kid_height: f32) {
+        self.height.set(height);
+        self.kid_height.set(kid_height);
+        self.version.set(self.version.get() + 1);
+    }
 }
 
 impl Render for Page {
@@ -181,9 +222,13 @@ impl Render for Page {
             Some(height) => scroller.child(div().id("header").h(px(height.get()))),
             None => scroller,
         };
+
         let content = if self.spacer {
             let spacer = div().relative();
             let mut spacer = if self.horizontal { spacer.w(px(ROW * ROWS as f32)).h_full() } else { spacer.w_full().h(px(ROW * ROWS as f32)) };
+            if let Some(border) = &self.border_top {
+                spacer = spacer.border_t(px(border.get()));
+            }
             if self.spacer_hitbox {
                 spacer = spacer.always_hitbox();
             }
@@ -198,7 +243,11 @@ impl Render for Page {
         let before = (0..if self.row_context { 20 } else { 0 })
             .map(|ix| div().absolute().unlifted().left(px(300. + ix as f32)).top(px(0.)).w(px(1.)).h(px(1.)).bg(crate::blue()));
         // The window's own stacking context, which holds what is positioned.
-        div().size_full().stacking_context().children(before).child(content).into_any_element()
+        let unit = self.unit.as_ref().map(|unit| {
+            let build = unit.clone();
+            retained(UNIT, 1_000 + unit.version.get(), move |_, _| build.element()).patchable_relayout()
+        });
+        div().size_full().stacking_context().children(before).children(unit).child(content).into_any_element()
     }
 }
 
@@ -232,7 +281,7 @@ impl Page {
                         build: Rc::new(move |_, _| page.row(ix)),
                         available: size(crate::AvailableSpace::Definite(px(100.)), crate::AvailableSpace::MinContent),
                         size: size(px(80.), px(ROW)),
-                        origin: point(px(0.), px(self.shown_at.get() + ix as f32 * ROW)),
+                        origin: point(px(0.), px(self.shown_at.get() + self.above + ix as f32 * ROW)),
                         scrolls: true,
                         lift_z: 0,
                     }
@@ -254,7 +303,8 @@ impl Page {
         let spacer = self.spacer;
         let horizontal = self.horizontal;
         let z = if ix < 4 { self.stay_z } else { 0 };
-        let pushed = self.push.get();
+        let nudge = self.nudge.get();
+        let pushed = self.push.get() + if nudge.0 == ix { nudge.1 } else { 0. };
         let mut row = retained(("row", ix), self.key.get(), move |_, _| {
             let row = div().id(("row", ix)).bg(crate::hsla(ix as f32 / 100., 0.5, 0.5, 1.));
             let row = if z == 0 { row } else { row.z_index(z) };
@@ -431,7 +481,11 @@ impl Page {
             stay_z: 0,
             header: None,
             push: Rc::default(),
+            nudge: Rc::new(Cell::new((usize::MAX, 0.))),
+            border_top: None,
             told: Rc::default(),
+            unit: None,
+            above: 0.,
         }
     }
 }
@@ -1163,27 +1217,71 @@ fn a_pass_of_a_paint_only_patch_between_a_translate_and_the_next_frame_does_not_
     assert_the_same(&translated, &built, &counters, "a patch's pass between a translate and the frame that lays the roots out");
 }
 
-/// Four translates that put in every root that is in view, then the edit of the owner (a box above the roots grows, the roots are
-/// put down inside the box that holds them) drawn as a frame built whole: the frames shown and the offset the scroller is left at.
-fn after_translates_and_an_edit(cx: &mut TestAppContext, patch: bool, grows: f32, pushes: f32) -> (Vec<String>, crate::ScrollPatchCounters) {
+/// How the wheel moves the roots before the edit of `after_translates_and_an_edit`: each translate takes a root out of the tree and
+/// puts the next in, in the direction of the wheel.
+#[derive(Clone, Copy, Debug)]
+enum Wheel {
+    /// Four translates down: the roots 4 to 7 are in the tree and in view.
+    Down,
+    /// Five down, then three up, which put roots in at the top: the roots 2 to 5 are in the tree and in view.
+    UpAfterDown,
+}
+
+/// What the owner does to the page in the commit that is drawn after the translates.
+#[derive(Clone, Copy, Debug, Default)]
+struct Edit {
+    /// A box above the roots grows.
+    grows: f32,
+    /// Every root is put down inside the box that holds them.
+    pushes: f32,
+    /// Only the first root in view is put down.
+    nudges_first: f32,
+    /// The top border of the box that holds the roots grows, which puts them down inside it.
+    border: f32,
+}
+
+/// Translates that put in every root that is in view, then the edit of the owner drawn as a frame built whole: the frames shown and the
+/// offset the scroller is left at.
+fn after_translates_and_an_edit(cx: &mut TestAppContext, patch: bool, wheel: Wheel, edit: Edit) -> (Vec<String>, crate::ScrollPatchCounters) {
     let mut page = Page::standard();
     let header: Rc<Cell<f32>> = Rc::default();
+    let border: Rc<Cell<f32>> = Rc::default();
     page.header = Some(header.clone());
-    let push = page.push.clone();
+    page.border_top = Some(border.clone());
+    let (push, nudge) = (page.push.clone(), page.nudge.clone());
     page.removed.borrow_mut().extend((0..ROWS).filter(|ix| !(0..4).contains(ix)));
     let fixture = Fixture::open(cx, page);
     fixture.watch_removals(cx);
     fixture.with_window(cx, |window| window.set_scroll_patch(patch));
     let mut frames = Vec::new();
-    for ix in 0..4 {
+    let mut step = |left: usize, came: usize, by: f32| {
         fixture.point_at(cx, 10., 12.);
-        fixture.remove(&[ix]);
-        fixture.enter(&[ix + 4]);
-        fixture.scroll(cx, 10., 12., 30.);
+        fixture.remove(&[left]);
+        fixture.enter(&[came]);
+        fixture.scroll(cx, 10., 12., by);
         frames.push(fixture.with_window(cx, shown));
-    }
-    header.set(grows);
-    push.set(pushes);
+    };
+    let first = match wheel {
+        Wheel::Down => {
+            for ix in 0..4 {
+                step(ix, ix + 4, 30.);
+            }
+            4
+        }
+        Wheel::UpAfterDown => {
+            for ix in 0..5 {
+                step(ix, ix + 4, 30.);
+            }
+            for ix in 0..3 {
+                step(8 - ix, 4 - ix, -30.);
+            }
+            2
+        }
+    };
+    header.set(edit.grows);
+    border.set(edit.border);
+    push.set(edit.pushes);
+    nudge.set((first, edit.nudges_first));
     fixture.page.key.set(2);
     fixture.with_window(cx, |window| window.refresh());
     fixture.draw(cx);
@@ -1195,24 +1293,38 @@ fn after_translates_and_an_edit(cx: &mut TestAppContext, patch: bool, grows: f32
 #[gpui::test]
 fn an_edit_after_translates_that_put_every_visible_root_in_anchors_the_scroller_as_the_frame_built_whole_does(cx: &mut TestAppContext) {
     // CSS scroll anchoring admits the roots (absolute boxes of a relative box in the scroller) as an anchor. The roots that translates
-    // put in were laid out as roots of their own and are not the page's, so the pick of the next frame passes them over for the box
-    // that holds them: that is the same offset where the box moves as far as they do, and where they are put down inside it (which
-    // drops the anchor of a frame built whole) the box does not move.
-    for (what, grows, pushes) in [("a box above grows", 10., 0.), ("the roots are put down", 0., 7.)] {
-        let (translated, counters) = after_translates_and_an_edit(cx, true, grows, pushes);
-        let (built, _) = after_translates_and_an_edit(cx, false, grows, pushes);
-        assert_eq!((counters.patched, counters.mispredicted), (4, 0), "{what}: {counters:?}");
-        assert_the_same(&translated, &built, &counters, what);
+    // put in were laid out as roots of their own, and the pick of the next frame reads them where the page had them when they came in.
+    let edits = [
+        ("a box above grows", Edit { grows: 10., ..Edit::default() }),
+        ("the roots are put down", Edit { pushes: 7., ..Edit::default() }),
+        ("a box above grows and the roots are put down", Edit { grows: 10., pushes: 7., ..Edit::default() }),
+        ("the first root alone is put down", Edit { nudges_first: 7., ..Edit::default() }),
+        ("the first root alone is put down while a box above grows", Edit { grows: 10., nudges_first: 7., ..Edit::default() }),
+        ("the border above the roots grows", Edit { border: 10., ..Edit::default() }),
+        ("the border above the roots and a box above grow", Edit { border: 10., grows: 6., ..Edit::default() }),
+    ];
+    for wheel in [Wheel::Down, Wheel::UpAfterDown] {
+        let translates = match wheel {
+            Wheel::Down => 4,
+            Wheel::UpAfterDown => 8,
+        };
+        for (what, edit) in edits {
+            let what = format!("{what}, {wheel:?}");
+            let (translated, counters) = after_translates_and_an_edit(cx, true, wheel, edit);
+            let (built, _) = after_translates_and_an_edit(cx, false, wheel, edit);
+            assert_eq!((counters.patched, counters.mispredicted), (translates, 0), "{what}: {counters:?}");
+            assert_the_same(&translated, &built, &counters, &what);
+        }
     }
 }
 
 #[gpui::test]
-#[ignore = "known difference: see patch-frames.md, a pick of the anchor does not know the roots a translate put in"]
 fn an_edit_that_moves_the_box_of_the_roots_and_puts_them_down_after_translates_drops_the_anchor_as_the_frame_built_whole_does(
     cx: &mut TestAppContext,
 ) {
-    let (translated, counters) = after_translates_and_an_edit(cx, true, 10., 7.);
-    let (built, _) = after_translates_and_an_edit(cx, false, 10., 7.);
+    let edit = Edit { grows: 10., pushes: 7., ..Edit::default() };
+    let (translated, counters) = after_translates_and_an_edit(cx, true, Wheel::Down, edit);
+    let (built, _) = after_translates_and_an_edit(cx, false, Wheel::Down, edit);
     assert_the_same(&translated, &built, &counters, "a box above grows and the roots are put down");
 }
 
@@ -1345,4 +1457,105 @@ fn what_is_under_the_pointer_in_a_root_that_came_in_is_hit(cx: &mut TestAppConte
     let (built, _) = run(cx, false);
     assert_eq!((counters.patched, counters.rows_built, counters.mispredicted), (2, 1, 0), "{counters:?}");
     assert_the_same(&translated, &built, &counters, "the pointer over a root that came in");
+}
+
+/// Four translates that put in every root in view, then a change of the root `unit` above the scroller drawn as a patch that lays out again
+/// (or, with `patch` off, as a frame built whole), then the edit of the owner: the frames shown, the offset, and how many nodes of
+/// the layout held the boxes of a root of their own after the translates and after the patch.
+fn after_translates_and_a_relayout_patch(
+    cx: &mut TestAppContext,
+    patch: bool,
+    (height, kid_height): (f32, f32),
+) -> (Vec<String>, crate::ScrollPatchCounters, crate::PatchCounters, (usize, usize), Vec<Result<(), PatchDecline>>) {
+    let mut page = Page::standard();
+    let unit = Unit::new();
+    let header: Rc<Cell<f32>> = Rc::default();
+    page.header = Some(header.clone());
+    page.unit = Some(unit.clone());
+    page.above = Unit::HEIGHT;
+    let push = page.push.clone();
+    page.removed.borrow_mut().extend((0..ROWS).filter(|ix| !(0..4).contains(ix)));
+    let fixture = Fixture::open(cx, page);
+    fixture.watch_removals(cx);
+    fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+    fixture.with_window(cx, |window| window.set_contained_patches(patch));
+    cx.update_window(fixture.window, |_, window, _| {
+        let patched = unit.clone();
+        window.set_frame_patcher(patch.then(|| Rc::new(move |window: &mut Window, cx: &mut App| {
+            let outcome = window.repaint_in_place(vec![(ElementId::from(UNIT), patched.element())], cx, |_, _| true);
+            patched.seen.borrow_mut().push(outcome.as_ref().map(|_| ()).map_err(|decline| *decline));
+            outcome.is_ok()
+        }) as Rc<dyn Fn(&mut Window, &mut App) -> bool>));
+    })
+    .unwrap();
+    let mut frames = Vec::new();
+    for ix in 0..4 {
+        fixture.point_at(cx, 10., 60.);
+        fixture.remove(&[ix]);
+        fixture.enter(&[ix + 4]);
+        fixture.scroll(cx, 10., 60., 30.);
+        frames.push(fixture.with_window(cx, shown));
+    }
+    let unplaced = |cx: &mut TestAppContext| fixture.with_window(cx, |window| window.layout_engine().unplaced_nodes());
+    let after_translates = unplaced(cx);
+
+    // The tick is the same frame without the patcher: what it draws if the patch is declined.
+    unit.changes(height, kid_height);
+    cx.update_window(fixture.window, |_, window, cx| {
+        window.request_tick();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    frames.push(fixture.with_window(cx, shown));
+    frames.push(format!("offset {:?}", fixture.page.handle.offset()));
+    let after_patch = unplaced(cx);
+
+    header.set(10.);
+    push.set(7.);
+    fixture.page.key.set(2);
+    fixture.with_window(cx, |window| window.refresh());
+    fixture.draw(cx);
+    frames.push(fixture.with_window(cx, shown));
+    frames.push(format!("offset {:?}", fixture.page.handle.offset()));
+    let patches = fixture.with_window(cx, |window| window.patch_counters());
+    let seen = unit.seen.borrow().clone();
+    (frames, fixture.counters(cx), patches, (after_translates, after_patch), seen)
+}
+
+#[gpui::test]
+fn a_patch_that_lays_the_page_out_again_while_the_roots_translates_put_in_wait_is_declined_and_the_frame_built_whole_follows(cx: &mut TestAppContext) {
+    // The kids of the root grow inside the box it keeps, which is a patch where no root waits (`contained_patch_tests`), and the
+    // box itself grows, which moves the scroller below it. The roots the translates put in are not in the tree the patch computes, and
+    // hold the boxes of the layout of a root of their own: the pick of the scroll anchor is the frame built whole's, from the layout
+    // before, which the patch's layout would have replaced.
+    for (what, change) in [("the kids grow", (Unit::HEIGHT, 11.)), ("the box grows", (Unit::HEIGHT + 10., 8.))] {
+        let (translated, counters, patches, (after_translates, after_patch), seen) = after_translates_and_a_relayout_patch(cx, true, change);
+        let (built, _, off, _, _) = after_translates_and_a_relayout_patch(cx, false, change);
+        assert_eq!((counters.patched, counters.mispredicted), (4, 0), "{what}: {counters:?}");
+        assert_eq!(off.relayout_patches, 0, "{what}");
+        assert_eq!(after_translates, 4, "{what}: each root a translate put in holds the boxes of the layout of a root of its own");
+        assert_eq!((patches.relayout_patches, seen.as_slice()), (0, &[Err(PatchDecline::NotContained)][..]), "{what}: {patches:?}");
+        assert_eq!(after_patch, 0, "{what}: the frame built whole after the decline laid the roots out");
+        assert_the_same(&translated, &built, &counters, what);
+    }
+}
+
+#[gpui::test]
+fn every_root_in_the_tree_that_a_translate_put_in_is_taken_out_and_replaced_by_the_translates_after_it(cx: &mut TestAppContext) {
+    // Roots that a stacking context holds have their hitboxes where it put them, so the places of the roots that came in and left
+    // count more hitboxes than the frame holds: six translates down and two up leave none of the roots the page was built with.
+    let steps: [(f32, &[usize], &[usize]); 8] = [
+        (30., &[0], &[4]),
+        (30., &[1], &[5]),
+        (30., &[2], &[6]),
+        (30., &[3], &[7]),
+        (30., &[4], &[8]),
+        (30., &[5], &[9]),
+        (-30., &[9], &[5]),
+        (-30., &[8], &[4]),
+    ];
+    let (translated, counters) = after_membership(cx, Page::standard(), 0..4, true, &steps);
+    let (built, _) = after_membership(cx, Page::standard(), 0..4, false, &steps);
+    assert_eq!((counters.patched, counters.mispredicted), (8, 0), "{counters:?}");
+    assert_the_same(&translated, &built, &counters, "roots that all came in by a translate");
 }

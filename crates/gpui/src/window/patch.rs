@@ -70,7 +70,8 @@ pub enum PatchDecline {
     UnstableLayout,
     /// The root laid out again, and its box is not the one it had or a node outside it is laid out
     /// differently, or the anchor of a scroller around it moved and the scroller would be scrolled
-    /// (or lose its anchor): the patch would not be the frame built whole.
+    /// (or lose its anchor), or roots that a scroll put in wait for the layout of the page: the patch
+    /// would not be the frame built whole.
     NotContained,
     /// The root registered other things than it did, and the rendered frame does not hold what it
     /// recorded where it recorded it (a stacking context moved its hitboxes or tab stops), or two
@@ -1959,6 +1960,13 @@ impl Window {
         if window_root.engine != self.layout_engine_id() || !self.layout_node_alive(window_root.id) {
             return Err(PatchDecline::LayoutMismatch);
         }
+        // Roots that a translate put in wait for the layout of the page: they hold the boxes of the layout of a root of their own, and
+        // are not in the tree this layout computes. A scroller picks its anchor from the boxes of the layout before the layout that
+        // places them, which this one would replace (and a decline leaves to the frame built whole), so the frame built whole is the
+        // one that picks, and lays out.
+        if self.layout_engine().has_unplaced() {
+            return Err(PatchDecline::NotContained);
+        }
         // A root laid out as one of its own (a row of a list) is not in the tree the window computes.
         let mut node = root;
         while node != window_root.id {
@@ -1971,8 +1979,6 @@ impl Window {
         let unmeasured = self.layout_engine().unmeasured_leaves();
         self.stretch_layout_root(window_root.id, window_root.size);
         self.compute_layout_tracking_changes(window_root.id, window_root.size.into(), cx);
-        // The scratch pass skips this for what it computes as roots of their own; this computation is the page's, kept or declined.
-        self.layout_engine_mut().place_computed_page(window_root.id);
         let contained = self.layout_engine_mut().changes_stay_inside(root);
         self.layout_engine_mut().hold_anchor_restyles();
         // A leaf that layout measures and has no measure function would have been laid out empty.

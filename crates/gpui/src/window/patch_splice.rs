@@ -955,7 +955,12 @@ impl Window {
             pre.start.accessed_element_states_index..pre.end.accessed_element_states_index,
             splice.prepaint_states,
         );
-        frame.hitboxes.splice(pre.start.hitboxes_index..pre.end.hitboxes_index, splice.hitboxes);
+        // Roots that a stacking context lifted have their hitboxes where the context put them (by id, below), and what the prepaint
+        // counted of them is not where the vector has them: taking the lifted roots out and putting others in leaves the places
+        // of what was counted past the end of the vector, where an empty splice would not be.
+        if !(splice.lifted_hitboxes.is_some() || splice.hitboxes_by_id) || !splice.hitboxes.is_empty() {
+            frame.hitboxes.splice(pre.start.hitboxes_index..pre.end.hitboxes_index, splice.hitboxes);
+        }
         if let Some(lifted) = splice.lifted_hitboxes {
             let anchor = frame.hitboxes.iter().position(|hitbox| hitbox.id == lifted.anchor);
             let at = anchor.map(|at| at + usize::from(lifted.after)).expect("a hitbox that roots are put beside is in the frame");
