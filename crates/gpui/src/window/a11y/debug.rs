@@ -55,7 +55,7 @@ pub(crate) struct NodeCreator {
 
 #[derive(Default)]
 pub(crate) struct A11yDebug {
-    last_tree_update: Option<TreeUpdate>,
+    pub(super) last_tree_update: Option<TreeUpdate>,
     last_gpui_focus: Option<NodeId>,
     last_active_descendant: Option<NodeId>,
     /// Monotonic counter incremented on each captured frame, so a re-dump makes
@@ -94,6 +94,33 @@ impl A11yDebug {
             viewport_size: frame.viewport_size,
             scale_factor: frame.scale_factor,
         });
+    }
+
+    /// The node gpui had focused when the retained update was made.
+    pub(super) fn gpui_focus(&self) -> Option<NodeId> {
+        self.last_gpui_focus
+    }
+
+    /// The active descendant a node claimed when the retained update was made.
+    pub(super) fn active_descendant(&self) -> Option<NodeId> {
+        self.last_active_descendant
+    }
+
+    /// The retained update was edited in place by a scroll translate: it is a new frame of the tree, with
+    /// `tab_stop_count` tab stops.
+    pub(super) fn note_edited(&mut self, tab_stop_count: usize) {
+        let update = self.last_tree_update.as_ref().expect("an update that was edited was retained");
+        self.frame_number += 1;
+        let frame = self.last_frame.as_mut().expect("an update that was retained has its frame");
+        frame.rendered_at = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+        frame.frame_number = self.frame_number;
+        frame.node_count = update.nodes.len();
+        frame.tab_stop_count = tab_stop_count;
+    }
+
+    #[cfg(debug_assertions)]
+    pub(super) fn node_info_mut(&mut self) -> &mut FxHashMap<NodeId, NodeDebugInfo> {
+        &mut self.last_node_info
     }
 
     #[cfg(debug_assertions)]

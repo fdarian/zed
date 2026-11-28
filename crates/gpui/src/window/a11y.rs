@@ -101,6 +101,9 @@
 use crate::*;
 
 pub(crate) mod debug;
+mod scroll;
+
+pub(crate) use scroll::{A11yFate, A11yRowEdit, A11yRowParts, A11yRowsScratch, A11yScrollEdit};
 
 use crate::{App, Bounds, FocusId, Pixels, SharedString, Window};
 use accesskit::{Action, NodeId, TreeUpdate};
@@ -160,6 +163,9 @@ pub(crate) struct A11y {
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(crate) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
     pub(crate) action_listeners: FxHashMap<NodeId, Vec<(Action, A11yActionListener)>>,
+    /// Whether the last frame that drew sent its tree to the platform, which is the tree a scroll
+    /// translate edits ([`Self::can_follow_scroll`]).
+    tree_sent: bool,
     /// What the maps above were given while a retained subtree recorded, see [`A11yMark`].
     journal: A11yJournal,
     /// The window's title, used to label the root node so assistive
@@ -192,6 +198,7 @@ impl A11y {
             focus_ids: FxHashMap::default(),
             node_bounds: FxHashMap::default(),
             action_listeners: FxHashMap::default(),
+            tree_sent: false,
             journal: A11yJournal::default(),
             window_title,
             last_focus_without_node: None,
@@ -323,6 +330,9 @@ impl A11y {
     }
 
     pub(crate) fn set_active_descendant(&mut self, node_id: NodeId) {
+        // A recording notes that the element asked, which a tree built with no focus around it (the scratch
+        // tree of a scroll translate) drops: see `A11yRecording::asked_active_descendant`.
+        self.nodes.active_descendant_asks += 1;
         // The active descendant must be a descendant of the focused container,
         // not the focused node itself.
         if self.nodes.node_is_focused(node_id) {
@@ -434,6 +444,7 @@ pub(crate) struct A11yMark {
     parent_children: usize,
     focus: Option<NodeId>,
     active_descendant: Option<NodeId>,
+    active_descendant_asks: usize,
 }
 
 /// The share of the accessibility tree that a retained subtree prepainted: its nodes, how they
@@ -448,6 +459,9 @@ pub(crate) struct A11yRecording {
     actions: Vec<(NodeId, Action, A11yActionListener)>,
     focus: Option<NodeId>,
     active_descendant: Option<NodeId>,
+    /// Whether an element in the subtree asked to be the active descendant of the focused container
+    /// around it (`aria_active_descendant`), whether or not a focus decided that it is.
+    asked_active_descendant: bool,
     #[cfg(debug_assertions)]
     node_info: Vec<(NodeId, debug::NodeDebugInfo)>,
 }
@@ -467,7 +481,7 @@ impl A11yRecording {
             .map(|(id, bounds)| (*id, Bounds::new(bounds.origin + delta, bounds.size)))
             .collect::<Vec<_>>();
         format!(
-            "{:?}\nchildren {:?}\nauthors {:?}\nfocusables {:?}\nbounds {:?}\nactions {} focus {:?} {:?}",
+            "{:?}\nchildren {:?}\nauthors {:?}\nfocusables {:?}\nbounds {:?}\nactions {} focus {:?} {:?} asked {}",
             nodes,
             self.top_children,
             self.authors,
@@ -476,7 +490,19 @@ impl A11yRecording {
             self.actions.len(),
             self.focus,
             self.active_descendant,
+            self.asked_active_descendant,
         )
+    }
+}
+
+/// `rect` moved by `delta`, at `scale_factor` device pixels to a pixel.
+fn moved_bounds(rect: accesskit::Rect, delta: Point<Pixels>, scale_factor: f32) -> accesskit::Rect {
+    let (dx, dy) = (f64::from(delta.x.0 * scale_factor), f64::from(delta.y.0 * scale_factor));
+    accesskit::Rect {
+        x0: rect.x0 + dx,
+        y0: rect.y0 + dy,
+        x1: rect.x1 + dx,
+        y1: rect.y1 + dy,
     }
 }
 
@@ -484,16 +510,7 @@ impl A11yRecording {
 fn moved_node(node: &accesskit::Node, delta: Point<Pixels>, scale_factor: f32) -> accesskit::Node {
     let mut node = node.clone();
     if let Some(rect) = node.bounds() {
-        let (dx, dy) = (
-            f64::from(delta.x.0 * scale_factor),
-            f64::from(delta.y.0 * scale_factor),
-        );
-        node.set_bounds(accesskit::Rect {
-            x0: rect.x0 + dx,
-            y0: rect.y0 + dy,
-            x1: rect.x1 + dx,
-            y1: rect.y1 + dy,
-        });
+        node.set_bounds(moved_bounds(rect, delta, scale_factor));
     }
     node
 }
@@ -519,6 +536,7 @@ impl A11y {
                 .map_or(0, |parent| parent.children().len()),
             focus: self.nodes.focus,
             active_descendant: self.nodes.active_descendant,
+            active_descendant_asks: self.nodes.active_descendant_asks,
         }
     }
 
@@ -555,6 +573,7 @@ impl A11y {
                 .nodes
                 .active_descendant
                 .filter(|id| mark.active_descendant != Some(*id)),
+            asked_active_descendant: self.nodes.active_descendant_asks > mark.active_descendant_asks,
             #[cfg(debug_assertions)]
             node_info,
         }
@@ -599,6 +618,7 @@ impl A11y {
         if let Some(active_descendant) = recording.active_descendant {
             self.nodes.set_active_descendant(active_descendant);
         }
+        self.nodes.active_descendant_asks += usize::from(recording.asked_active_descendant);
         #[cfg(debug_assertions)]
         for (id, info) in &recording.node_info {
             self.nodes.record_node_info(*id, info.clone());
@@ -772,10 +792,15 @@ pub(crate) struct A11yNodeBuilder {
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
     active_descendant: Option<NodeId>,
+    /// How many times an element asked to be the active descendant, claimed or not.
+    active_descendant_asks: usize,
     /// Author id to node, in push (document) order; the first node to claim an
     /// id owns it, as with a DOM `id`.
     author_ids: FxHashMap<String, NodeId>,
     pending_relations: Vec<PendingRelation>,
+    /// The author ids the relations of the last frame finalized named, found or not: what a row that
+    /// comes in or leaves would change the resolution of.
+    relation_targets: FxHashSet<String>,
     /// The author ids claimed while a retained subtree records (`journal_depth` above zero).
     author_log: Vec<(String, NodeId)>,
     journal_depth: u32,
@@ -792,8 +817,10 @@ impl A11yNodeBuilder {
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
+            active_descendant_asks: 0,
             author_ids: FxHashMap::default(),
             pending_relations: Vec::new(),
+            relation_targets: FxHashSet::default(),
             author_log: Vec::new(),
             journal_depth: 0,
             #[cfg(debug_assertions)]
@@ -928,6 +955,7 @@ impl A11yNodeBuilder {
         self.nodes_stack.push(root_node);
         self.focus = None;
         self.active_descendant = None;
+        self.active_descendant_asks = 0;
     }
 
     /// Returns whether a node with the given ID has been pushed in this frame.
@@ -1034,6 +1062,10 @@ impl A11yNodeBuilder {
     /// `ActiveDescendant`.
     fn resolve_relations(&mut self) -> Option<NodeId> {
         let pending = std::mem::take(&mut self.pending_relations);
+        self.relation_targets = pending
+            .iter()
+            .flat_map(|relation| relation.author_ids.iter().map(|author| author.to_string()))
+            .collect();
         if pending.is_empty() {
             return None;
         }

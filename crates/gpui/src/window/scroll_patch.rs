@@ -40,6 +40,12 @@
 //! measured, one that does what a recording cannot repeat and a frame that does not hold what a row recorded
 //! where it recorded it decline the translate.
 //!
+//! **The accessibility tree.** With a screen reader connected a translate edits the tree the frame shown sent
+//! (`window/a11y/scroll.rs`): the nodes of the rows that stay are put where a replay puts them, those of the rows
+//! that leave are cut out, and those of the rows that come in (recorded in the scratch frame, which has a tree
+//! builder of its own for the purpose) are put in, and the platform is told of what changed. A tree that cannot
+//! be edited so declines the translate ([`ScrollApplyDecline::A11y`]).
+//!
 //! **Thumbs.** A list's overlay scrollbar paints a thumb that a scroll moves, so the owner notes
 //! each bar it paints for a list ([`Window::paint_scroll_thumb`]): the quad it painted, as the one
 //! operation it left in the frame, and two closures. Before the frame is built the first says,
@@ -61,6 +67,7 @@
 use super::*;
 use super::patch::Surroundings;
 use super::patch_splice::{EntryPoint, HITBOXES, OPERATIONS, RowPart, Splice};
+use super::a11y::{A11yFate, A11yRowEdit, A11yRowParts, A11yScrollEdit};
 use super::retained::Effects;
 use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss, ScrollSource};
 use crate::scene::{Extent, PaintOperation, RecordedReach, ReplayClip, TranslatedOperations};
@@ -100,7 +107,9 @@ pub enum ScrollPatchReason {
     Clip,
     /// The focus is in a row the list builds for it alone.
     Focus,
-    /// The accessibility tree is being built.
+    /// The frame shown has no accessibility tree for a translate to edit: it was built with none and a
+    /// screen reader is connected now, or the other way round. Or a `div` scroller's frame is drawn while a
+    /// tree is built, which has no rows to say what its offset moves.
     A11y,
     /// A smooth scroll or a scrollbar fade has frames of its own to run.
     ScrollAnimation,
@@ -313,11 +322,17 @@ pub enum ScrollApplyDecline {
     /// The frame shown does not hold what a row recorded where it recorded it (a stacking context moved
     /// it), or the rows to take out do not follow one another.
     Splice,
+    /// The accessibility tree is built and cannot be edited to what the translate makes: a row has no nodes
+    /// recorded for it, the tree the frame shown sent is not what the rows say it is, a row that leaves or
+    /// comes in holds the focus or has an author id that a relation names, a row that comes in names a
+    /// relation or asks to be the active descendant of a focus around the rows, or the tree has an active
+    /// descendant already (see `window/a11y/scroll.rs`).
+    A11y,
 }
 
 impl ScrollApplyDecline {
     /// Every reason.
-    pub const ALL: [ScrollApplyDecline; 10] = [
+    pub const ALL: [ScrollApplyDecline; 11] = [
         ScrollApplyDecline::Recording,
         ScrollApplyDecline::Operations,
         ScrollApplyDecline::Hitboxes,
@@ -328,6 +343,7 @@ impl ScrollApplyDecline {
         ScrollApplyDecline::Height,
         ScrollApplyDecline::Effects,
         ScrollApplyDecline::Splice,
+        ScrollApplyDecline::A11y,
     ];
 
     fn index(self) -> usize {
@@ -1635,7 +1651,7 @@ impl Window {
         if list.off_screen_focus || needed.off_screen_focus {
             held.reason(Reason::Focus);
         }
-        if self.a11y.is_active() {
+        if !self.a11y.can_follow_scroll() {
             held.reason(Reason::A11y);
         }
         match gate {
@@ -1740,6 +1756,8 @@ pub(crate) struct ScrollPatchTrace {
     /// The frame as [`Window::describe_frame`] says it, without the draw orders.
     frame: String,
     registries: String,
+    /// The tree the platform has, if a frame sent one.
+    a11y: Option<String>,
 }
 
 /// One row put where the new position puts it: everything that can decline is checked before
@@ -1770,6 +1788,17 @@ struct MembershipPlan {
     entering: Vec<EnterIn>,
     /// The hitboxes of a `div` scroller's content that no root holds, and where the scroll puts each.
     scrolled_hitboxes: Vec<(HitboxId, Hitbox)>,
+    /// What each row of the frame shown gave the accessibility tree and what the translate does to it,
+    /// when the tree is built.
+    a11y: Vec<A11yShown>,
+}
+
+/// A row of the frame shown as the accessibility tree has it.
+struct A11yShown {
+    row: usize,
+    parts: A11yRowParts,
+    /// How far from its recording the row is put, if it stays.
+    stays: Option<Point<Pixels>>,
 }
 
 /// Rows that are built, and where in the frame shown they are put: after `at` in the vectors, and among the
@@ -1804,6 +1833,8 @@ struct RowsBuilt {
     patchable: Vec<(ElementId, Option<Rc<PatchUnit>>)>,
     relocated: Vec<ElementId>,
     rows: usize,
+    /// What each of the rows gave the accessibility tree, when it is built.
+    a11y: Vec<(usize, A11yRowParts)>,
 }
 
 /// A row that comes in, built and laid out as its own root, waiting to be prepainted.
@@ -1847,8 +1878,17 @@ impl Window {
                 return ScrollPatchDraw::Declined;
             }
         };
+        let a11y = match self.plan_a11y_scroll(&prediction, &membership.a11y, &built) {
+            Ok(a11y) => a11y,
+            Err(decline) => {
+                self.forget_built(&built);
+                self.scroll_patch.counters.apply_declines[decline.index()] += 1;
+                self.scroll_patch.predicted = Some(prediction);
+                return ScrollPatchDraw::Declined;
+            }
+        };
         self.scroll_patch.counters.patched += 1;
-        self.write_scroll_moves(moves, thumbs, membership, built, &prediction, cx);
+        self.write_scroll_moves(moves, thumbs, membership, built, a11y, &prediction, cx);
 
         // The frame is the frame shown, which is current: what a draw does when it is over.
         self.invalidator.set_dirty(false);
@@ -1903,8 +1943,17 @@ impl Window {
         let mut moves = Vec::with_capacity(runs.len());
         let mut leaving: Vec<(usize, RowPart)> = Vec::new();
         let mut replaced: Vec<(usize, RowPart)> = Vec::new();
+        let mut a11y = Vec::new();
         for (index, run) in &runs {
             let rebuilt = prediction.rebuilds.contains(&run.row);
+            if self.a11y.is_active() {
+                let parts = self
+                    .peek_element_state(&run.id, |state: &RetainedState| state.a11y_parts())
+                    .flatten()
+                    .ok_or(ScrollApplyDecline::A11y)?;
+                let leaves = prediction.removes && !prediction.rows.contains(&run.row) || rebuilt;
+                a11y.push(A11yShown { row: run.row, parts, stays: (!leaves).then(|| run.delta + prediction.shift) });
+            }
             if prediction.removes && !prediction.rows.contains(&run.row) || rebuilt {
                 let part = self
                     .peek_element_state(&run.id, |state: &RetainedState| state.frame_part(self))
@@ -1920,7 +1969,7 @@ impl Window {
         }
         let thumbs = self.plan_thumb_moves(prediction)?;
 
-        let mut membership = MembershipPlan::default();
+        let mut membership = MembershipPlan { a11y, ..MembershipPlan::default() };
         if !prediction.removes || prediction.rows == list.rows && replaced.is_empty() {
             return Ok((moves, thumbs, membership));
         }
@@ -2104,15 +2153,60 @@ impl Window {
             match rows {
                 Ok(rows) => built.push(rows),
                 Err(decline) => {
-                    // What the rows of the groups built so far recorded is of a frame that is not shown.
-                    for rows in &built {
-                        self.forget_recordings(rows.splice.recordings().to_vec());
-                    }
+                    self.forget_built(&built);
                     return Err(decline);
                 }
             }
         }
         Ok(built)
+    }
+
+    /// What the rows of the groups built so far recorded is of a frame that is not shown.
+    fn forget_built(&mut self, built: &[RowsBuilt]) {
+        for rows in built {
+            self.forget_recordings(rows.splice.recordings().to_vec());
+        }
+    }
+
+    /// What the tree the platform has becomes when the rows are moved, taken out and put in, found before
+    /// anything is written. None when no tree is built.
+    fn plan_a11y_scroll(
+        &self,
+        prediction: &Prediction,
+        shown: &[A11yShown],
+        built: &[RowsBuilt],
+    ) -> Result<Option<A11yScrollEdit>, ScrollApplyDecline> {
+        if !self.a11y.is_active() {
+            return Ok(None);
+        }
+        let list = self
+            .rendered_frame
+            .scroll
+            .lists
+            .iter()
+            .find(|list| list.id == prediction.list)
+            .ok_or(ScrollApplyDecline::Runs)?;
+        let rows = match prediction.removes {
+            true => list.rows.start.min(prediction.rows.start)..list.rows.end.max(prediction.rows.end),
+            false => list.rows.clone(),
+        };
+        let mut edits = Vec::with_capacity(rows.len());
+        for row in rows {
+            let shown = shown.iter().find(|shown| shown.row == row);
+            let built = built.iter().flat_map(|rows| &rows.a11y).find(|(built, _)| *built == row).map(|(_, parts)| parts);
+            edits.push(match (shown, built) {
+                (Some(A11yShown { parts, stays: Some(total), .. }), _) => {
+                    A11yRowEdit { shown: Some(parts.clone()), fate: A11yFate::Moved(*total) }
+                }
+                (Some(A11yShown { parts, .. }), Some(built)) => {
+                    A11yRowEdit { shown: Some(parts.clone()), fate: A11yFate::Built(built.clone()) }
+                }
+                (Some(A11yShown { parts, .. }), None) => A11yRowEdit { shown: Some(parts.clone()), fate: A11yFate::Gone },
+                (None, Some(built)) => A11yRowEdit { shown: None, fate: A11yFate::Built(built.clone()) },
+                (None, None) => return Err(ScrollApplyDecline::A11y),
+            });
+        }
+        self.a11y.plan_scroll(edits, self.scale_factor).map(Some).ok_or(ScrollApplyDecline::A11y)
     }
 
     /// The recordings of rows built for a translate that is declined are of no frame: a frame built whole
@@ -2144,6 +2238,8 @@ impl Window {
         self.requested_autoscroll = None;
         let outside_pass = mem::replace(&mut self.draw_pass, 1);
         let scratch = self.begin_scratch(cx);
+        // A row records what it gives the tree, which the translate writes into the tree of the frame shown.
+        let a11y_scratch = scratch.a11y_was_active.then(|| self.a11y.begin_rows_scratch());
         let callbacks_from = self.next_frame_callbacks.borrow().len();
         let built = self.build_row_group_in(
             prediction.list,
@@ -2166,6 +2262,9 @@ impl Window {
         self.forget_frame_callbacks(&[callbacks]);
         // The scratch frame laid out some of the rows of the page: the nodes of the others are not garbage.
         self.clear_scratch_pass(scratch.layouts, cx, false);
+        if let Some(saved) = a11y_scratch {
+            self.a11y.end_rows_scratch(saved);
+        }
         self.a11y.resume(scratch.a11y_was_active);
         self.draw_pass = outside_pass;
         built
@@ -2245,6 +2344,8 @@ impl Window {
             patchable: self.next_frame.patchable.drain().collect(),
             relocated: self.next_frame.relocated.drain().collect(),
             rows: children.len(),
+            // A `div` scroller is held whole while a screen reader is on (`Window::div_verdict`).
+            a11y: Vec::new(),
             dispatch_parent: Some(group.at.dispatch_parent),
         })
     }
@@ -2360,6 +2461,18 @@ impl Window {
             run.hitboxes = run.hitboxes.start + hitboxes_at..run.hitboxes.end + hitboxes_at;
             run.ops = run.ops.start + operations_at..run.ops.end + operations_at;
         }
+        let a11y = match self.a11y.is_active() {
+            true => runs
+                .iter()
+                .map(|run| {
+                    self.peek_element_state(&run.id, |state: &RetainedState| state.a11y_parts())
+                        .flatten()
+                        .map(|parts| (run.row, parts))
+                        .ok_or(ScrollApplyDecline::A11y)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            false => Vec::new(),
+        };
         let operations = mem::take(&mut self.next_frame.scene.paint_operations);
         let dispatch_parent = prepaint.dispatch_parent().get();
         let edit = RunEdit { from: group.runs_from, removed: 0, added: runs, by_position: false };
@@ -2393,6 +2506,7 @@ impl Window {
             relocated: self.next_frame.relocated.drain().collect(),
             rows: rows.len(),
             dispatch_parent: None,
+            a11y,
         })
     }
 
@@ -2447,6 +2561,7 @@ impl Window {
         thumbs: Vec<ThumbMove>,
         membership: MembershipPlan,
         built: Vec<RowsBuilt>,
+        a11y: Option<A11yScrollEdit>,
         prediction: &Prediction,
         cx: &mut App,
     ) {
@@ -2573,6 +2688,10 @@ impl Window {
             Some(_) => self.write_div_moved(prediction, membership.scrolled_hitboxes),
             None => None,
         };
+        let tab_stops = self.rendered_frame.tab_stops.tab_stop_count();
+        if let Some(update) = a11y.and_then(|edit| self.a11y.apply_scroll(edit, tab_stops)) {
+            self.platform_window.a11y_tree_update(update);
+        }
         let frame = &mut self.rendered_frame;
         frame.scene.rebuild_moved();
         self.damage.end(&frame.scene);
@@ -2601,6 +2720,12 @@ impl Window {
         if let Some((owner, translation)) = translated {
             (owner.run)(self, cx, translation);
         }
+    }
+
+    /// The element id of the `nth` row run of the rendered frame.
+    #[cfg(test)]
+    pub(crate) fn scroll_run_id(&self, nth: usize) -> GlobalElementId {
+        self.rendered_frame.scroll.runs[nth].id.clone()
     }
 
     /// The rows each list of the rendered frame shows.
@@ -2688,7 +2813,8 @@ impl Window {
         let frame = self.describe_frame(false);
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         let registries = self.scroll_patch.registries.as_ref().map_or_else(String::new, |describe| describe(self));
-        ScrollPatchTrace { scene, frame, registries }
+        let a11y = self.a11y.describe_shown();
+        ScrollPatchTrace { scene, frame, registries, a11y }
     }
 
     /// Compares the frame a translate made with the frame built whole at the same instant.
@@ -2704,6 +2830,12 @@ impl Window {
             if patched != built {
                 differences.push(format!("{what}\n{}", super::retained::first_difference(patched, built)));
             }
+        }
+        if patched.a11y != built.a11y {
+            differences.push(format!(
+                "the accessibility tree\n{}",
+                super::retained::first_difference(patched.a11y.as_deref().unwrap_or("no tree"), built.a11y.as_deref().unwrap_or("no tree"))
+            ));
         }
         if differences.is_empty() {
             return;

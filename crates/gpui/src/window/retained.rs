@@ -1141,6 +1141,19 @@ pub(crate) struct PrepaintRecord {
     pub(crate) blockers: u16,
 }
 
+impl PrepaintRecord {
+    /// What the prepaint gave the accessibility tree, if the tree was built when it was recorded.
+    pub(crate) fn a11y_recording(&self) -> Option<Rc<a11y::A11yRecording>> {
+        self.a11y.clone()
+    }
+
+    /// Makes the recording one that was made while no tree was built.
+    #[cfg(test)]
+    pub(crate) fn forget_a11y(&mut self) {
+        self.a11y = None;
+    }
+}
+
 /// Where the state of the frame was when the paint of a retained subtree started.
 pub(crate) struct PaintMark {
     index: PaintIndex,
@@ -1150,6 +1163,13 @@ pub(crate) struct PaintMark {
     /// The stacking context being painted, by its place among them, and how many places in the tab
     /// stops its content had noted that elements were skipped when the paint began.
     lift_markers: Option<(usize, usize)>,
+}
+
+impl PaintRecord {
+    /// What the paint gave the accessibility tree, if the tree was built when it was recorded.
+    pub(crate) fn a11y_recording(&self) -> Option<Rc<a11y::A11yRecording>> {
+        self.a11y.clone()
+    }
 }
 
 /// What the paint of a retained subtree left in the frame.

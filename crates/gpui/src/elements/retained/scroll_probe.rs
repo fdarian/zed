@@ -38,6 +38,22 @@ impl RetainedState {
         Some(ScrollSource { operations: paint.operations.clone()?, hitboxes: recorded.prepaint.hitboxes.clone() })
     }
 
+    /// What the recording gave the accessibility tree: its nodes and the listeners of their actions. None
+    /// when the root has no recording or was recorded while no tree was built.
+    pub(crate) fn a11y_parts(&self) -> Option<crate::window::a11y::A11yRowParts> {
+        let recorded = self.recorded.as_ref()?;
+        Some(crate::window::a11y::A11yRowParts::new(
+            recorded.prepaint.a11y_recording()?,
+            recorded.paint.as_ref()?.a11y_recording()?,
+        ))
+    }
+
+    /// Makes the recording one that was made while no tree was built.
+    #[cfg(test)]
+    pub(crate) fn forget_a11y_recording(&mut self) {
+        self.recorded.as_mut().expect("the root has its recording").prepaint.forget_a11y();
+    }
+
     /// Whether the root was recorded where culling left it out: it painted and hit nothing, and is put wherever the
     /// scroll takes it with nothing to move.
     pub(crate) fn is_recorded_culled(&self) -> bool {

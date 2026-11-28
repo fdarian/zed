@@ -9,7 +9,7 @@ use crate::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Context, ElementId, EntityId, FocusHandle, InteractiveElement,
     IntoElement, ListAlignment, ListState, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, PatchDecline, PlatformInput, Point, Render, ScrollApplyDecline, ScrollDelta, ScrollPatchCause,
-    ScrollPatchReason, ScrollWheelEvent, Styled, TestAppContext, Window, blue, deferred,
+    ScrollPatchReason, ScrollWheelEvent, StatefulInteractiveElement as _, Styled, TestAppContext, Window, blue, deferred,
     div, green, list, point, px, red, retained, size,
 };
 use std::cell::{Cell, RefCell};
@@ -57,6 +57,17 @@ struct Shared {
     small_kids: Cell<usize>,
     /// The page has boxes painted before the list, after it and lifted above it, each over some of the rows.
     layers: Cell<bool>,
+    /// The rows are nodes of the accessibility tree, with an action each, and the page is a list.
+    a11y: Cell<bool>,
+    /// Each row has the author id `row-id-N`, as a DOM `id` is one.
+    author_ids: Cell<bool>,
+    /// A node outside the list that a relation of its own points at the author id of this row.
+    described_row: Cell<Option<usize>>,
+    /// The page is inside a container that a focus handle tracks, around the node the rows hang off.
+    wrapper_focus: Cell<bool>,
+    wrapper: FocusHandle,
+    /// The row that asks to be the active descendant of the focused container around it.
+    asking_row: Cell<Option<usize>>,
     /// The key of the unit, which moves when what it holds does.
     version: Cell<u64>,
     patch_unit: Cell<bool>,
@@ -89,6 +100,12 @@ impl Shared {
             row_kids: Cell::new(0),
             small_kids: Cell::new(0),
             layers: Cell::new(false),
+            a11y: Cell::new(false),
+            author_ids: Cell::new(false),
+            described_row: Cell::new(None),
+            wrapper_focus: Cell::new(false),
+            wrapper: cx.update(|cx| cx.focus_handle()),
+            asking_row: Cell::new(None),
             version: Cell::new(0),
             patch_unit: Cell::new(false),
             patch_row: Cell::new(None),
@@ -132,6 +149,19 @@ impl Shared {
                 .track_focus(handle)
                 .tab_stop(true)
                 .on_key_down(move |event, _, _| keys.log.borrow_mut().push(format!("row {ix} key {}", event.keystroke.key)));
+        }
+        if self.a11y.get() {
+            let acted = self.clone();
+            row = row
+                .role(accesskit::Role::ListItem)
+                .aria_label(format!("Row {ix}"))
+                .on_a11y_action(accesskit::Action::Click, move |_, _, _| acted.log.borrow_mut().push(format!("action {ix}")));
+        }
+        if self.author_ids.get() {
+            row = row.accessibility_id(format!("row-id-{ix}"));
+        }
+        if self.asking_row.get() == Some(ix) {
+            row = row.aria_active_descendant();
         }
         if self.small_kids.get() > 0 {
             row = row.flex().flex_wrap().content_start().overflow_hidden();
@@ -180,6 +210,47 @@ impl Shared {
     }
 }
 
+/// What a node is called in a dump that two windows are compared by: its label, or its role.
+fn node_name(nodes: &[(accesskit::NodeId, accesskit::Node)], id: accesskit::NodeId) -> String {
+    match nodes.iter().find(|(node, _)| *node == id) {
+        Some((_, node)) => node.label().map_or_else(|| format!("{:?}", node.role()), str::to_owned),
+        None => format!("(no node {id:?})"),
+    }
+}
+
+/// The nodes as text by name: what each is, where, and what it lists as its children.
+fn nodes_text(nodes: &[(accesskit::NodeId, accesskit::Node)]) -> Vec<String> {
+    nodes
+        .iter()
+        .map(|(id, node)| {
+            let children: Vec<_> = node.children().iter().map(|child| node_name(nodes, *child)).collect();
+            format!("{} {:?} {:?} children {children:?}", node_name(nodes, *id), node.role(), node.bounds())
+        })
+        .collect()
+}
+
+/// The tree the frame shown sent and what the window answers a screen reader from, by the names of the nodes.
+fn a11y_text(window: &Window) -> String {
+    let tree = window.a11y.last_tree_update().expect("the tree is built");
+    let name = |id: &accesskit::NodeId| node_name(&tree.nodes, *id);
+    let mut bounds: Vec<_> = window.a11y.node_bounds.iter().map(|(id, bounds)| (name(id), *bounds)).collect();
+    bounds.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut focusable: Vec<_> = window.a11y.focus_ids.keys().map(name).collect();
+    focusable.sort();
+    let mut actions: Vec<_> = window
+        .a11y
+        .action_listeners
+        .iter()
+        .map(|(id, listeners)| (name(id), listeners.iter().map(|(action, _)| *action).collect::<Vec<_>>()))
+        .collect();
+    actions.sort_by(|a, b| a.0.cmp(&b.0));
+    format!(
+        "a11y nodes {:#?}\nfocus {}\nbounds {bounds:?}\nfocusable {focusable:?}\nactions {actions:?}",
+        nodes_text(&tree.nodes),
+        name(&tree.focus),
+    )
+}
+
 struct Page(Rc<Shared>);
 
 impl Render for Page {
@@ -195,6 +266,22 @@ impl Render for Page {
         .w(px(LIST_W))
         .h(px(LIST_H));
         let mut page = div().id("page").w(px(400.)).h(px(LIST_TOP + LIST_H + 20.)).flex().flex_col();
+        if shared.a11y.get() {
+            page = page.role(accesskit::Role::List);
+        }
+        if let Some(row) = shared.described_row.get() {
+            page = page.child(
+                div()
+                    .id("describer")
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .w(px(1.))
+                    .h(px(1.))
+                    .role(accesskit::Role::Group)
+                    .a11y_relation(crate::A11yRelation::DescribedBy, [format!("row-id-{row}").into()]),
+            );
+        }
         if shared.layers.get() {
             // Under the list, and over its top rows only: what a row is ordered against depends on where the row is.
             page = page.child(div().id("under").absolute().top(px(LIST_TOP + 40.)).left(px(0.)).w(px(LIST_W)).h(px(90.)).bg(blue()));
@@ -206,7 +293,15 @@ impl Render for Page {
                 .child(div().id("over-small").absolute().top(px(LIST_TOP + 420.)).left(px(90.)).w(px(20.)).h(px(20.)).bg(blue()))
                 .child(deferred(div().id("lifted").absolute().top(px(LIST_TOP + 120.)).left(px(10.)).w(px(40.)).h(px(130.)).bg(green())));
         }
-        page
+        if shared.wrapper_focus.get() {
+            return div()
+                .id("wrapper")
+                .role(accesskit::Role::Group)
+                .track_focus(&shared.wrapper)
+                .child(page)
+                .into_any_element();
+        }
+        page.into_any_element()
     }
 }
 
@@ -214,6 +309,8 @@ struct Fixture {
     window: AnyWindowHandle,
     view: EntityId,
     shared: Rc<Shared>,
+    /// The nodes of the tree the platform has, as [`Fixture::platform_tree`] keeps them.
+    platform: RefCell<std::collections::BTreeMap<accesskit::NodeId, accesskit::Node>>,
 }
 
 impl Fixture {
@@ -238,6 +335,7 @@ impl Fixture {
         let view = cx
             .update_window(window, |view, window, cx| {
                 window.set_dom_hit_testing(true);
+                window.set_a11y_active_for_tests(shared.a11y.get());
                 window.set_contained_patches(true);
                 window.set_scroll_patch(patch);
                 window.set_scroll_patch_gate(Some(Rc::new(|_, _, _| None)));
@@ -262,7 +360,7 @@ impl Fixture {
                 view.entity_id()
             })
             .unwrap();
-        let fixture = Self { window, view, shared };
+        let fixture = Self { window, view, shared, platform: RefCell::default() };
         fixture.point_at(cx, POINTER);
         fixture.draw(cx);
         fixture
@@ -284,7 +382,13 @@ impl Fixture {
 
     /// A wheel event at the pointer that moves the rows up by `by`: the frame it draws is the frame shown.
     fn wheel(&self, cx: &mut TestAppContext, by: f32) {
+        self.wheel_after(cx, by, |_| {});
+    }
+
+    /// [`Self::wheel`], with `before` done to the window in the same update, so that nothing draws between.
+    fn wheel_after(&self, cx: &mut TestAppContext, by: f32, before: impl FnOnce(&mut Window)) {
         cx.update_window(self.window, |_, window, cx| {
+            before(window);
             let event = ScrollWheelEvent {
                 position: point(px(POINTER.0), px(POINTER.1)),
                 delta: ScrollDelta::Pixels(point(px(0.), px(-by))),
@@ -353,6 +457,12 @@ impl Fixture {
         cx.update_window(self.window, |_, window, _| window.scroll_patch_counters()).unwrap()
     }
 
+    /// Focuses `handle` and draws the frame that has the focus.
+    fn focus(&self, cx: &mut TestAppContext, handle: &FocusHandle) {
+        self.with_window(cx, |window, cx| window.focus(handle, cx));
+        self.draw(cx);
+    }
+
     fn with_window<R>(&self, cx: &mut TestAppContext, f: impl FnOnce(&mut Window, &mut App) -> R) -> R {
         cx.update_window(self.window, |_, window, cx| f(window, cx)).unwrap()
     }
@@ -397,6 +507,11 @@ impl Fixture {
             }
             text.push_str(&format!("\ntab order {forward:?} back {backward:?}"));
             text.push_str(&format!("\n{}", shared.list_text()));
+            if shared.a11y.get() {
+                // The ids of the nodes differ from one window to the other: the tree is said by the names of its nodes.
+                text = text.lines().filter(|line| !line.starts_with("a11y ")).collect::<Vec<_>>().join("\n");
+                text.push_str(&format!("\n{}", a11y_text(window)));
+            }
             same_window(&text)
         })
         .unwrap()
@@ -1811,4 +1926,367 @@ fn rows_that_come_and_go_are_drawn_over_a_shift_of_the_list(cx: &mut TestAppCont
     let counters = fixture.counters(cx);
     assert!(explained >= 10 && membership >= 10, "{explained} {membership} {counters:?}");
     assert!(counters.rows_built >= 10 && counters.rows_removed >= 1, "{counters:?}");
+}
+
+// With the accessibility tree built, a translate edits the tree the frame shown sent: the rows that stay have
+// the bounds a replay gives them, the rows that leave are out of it and the rows that come in are in it.
+
+impl Pair {
+    /// Rows that are nodes of the accessibility tree, under a list node, with a screen reader connected.
+    fn a11y(cx: &mut TestAppContext, overscan: f32) -> Self {
+        Self::a11y_with(cx, overscan, |_| {})
+    }
+
+    /// [`Self::a11y`], with the page `configure`d before it is drawn.
+    fn a11y_with(cx: &mut TestAppContext, overscan: f32, configure: impl Fn(&Shared)) -> Self {
+        let open = |cx: &mut TestAppContext, patch: bool| {
+            let shared = Shared::with_overdraw(cx, true, 0., overscan);
+            shared.a11y.set(true);
+            configure(&shared);
+            let fixture = Fixture::open(cx, patch, shared);
+            fixture.with_window(cx, |window, _| {
+                window.platform_window.as_test().expect("a test window").record_a11y_updates();
+            });
+            fixture.draw_whole(cx);
+            fixture
+        };
+        Self { translated: open(cx, true), built: open(cx, false) }
+    }
+
+    /// What the platform of each window holds, which is the same tree.
+    #[track_caller]
+    fn same_platform_tree(&self, cx: &mut TestAppContext, what: &str) {
+        let (translated, built) = (self.translated.platform_tree(cx), self.built.platform_tree(cx));
+        assert_same(&translated, &built, what);
+    }
+}
+
+impl Fixture {
+    /// The tree an adapter has made of the updates sent so far: a whole tree replaces what it had, a partial one
+    /// replaces the nodes it holds, and what the root no longer reaches is gone. As text, in the order of the ids.
+    fn platform_tree(&self, cx: &mut TestAppContext) -> String {
+        let updates = self.with_window(cx, |window, _| window.platform_window.as_test().expect("a test window").take_a11y_updates());
+        let mut held = self.platform.borrow_mut();
+        for update in updates {
+            if update.tree.is_some() {
+                held.clear();
+            }
+            held.extend(update.nodes);
+            let mut reached = BTreeSet::new();
+            let mut pending = vec![accesskit::NodeId(0)];
+            while let Some(id) = pending.pop() {
+                if reached.insert(id.0) {
+                    let node = held.get(&id).unwrap_or_else(|| panic!("the tree has no node {id:?}, which a node of it lists as a child"));
+                    pending.extend(node.children().iter().copied());
+                }
+            }
+            held.retain(|id, _| reached.contains(&id.0));
+        }
+        let nodes: Vec<_> = held.iter().map(|(id, node)| (*id, node.clone())).collect();
+        let mut lines = nodes_text(&nodes);
+        lines.sort();
+        format!("{lines:#?}")
+    }
+
+    /// The labels of the nodes the tree has, in its order.
+    fn tree_labels(&self, cx: &mut TestAppContext) -> Vec<String> {
+        self.with_window(cx, |window, _| {
+            window.a11y.last_tree_update().expect("the tree is built").nodes.iter().filter_map(|(_, node)| node.label().map(str::to_owned)).collect()
+        })
+    }
+
+    /// Asks the node of the row `ix` for its action, as a screen reader does, and says what ran.
+    fn press(&self, cx: &mut TestAppContext, ix: usize) -> Vec<String> {
+        self.shared.log.borrow_mut().clear();
+        let label = format!("Row {ix}");
+        let target = self.with_window(cx, |window, _| {
+            window.a11y.last_tree_update().expect("the tree is built").nodes.iter().find(|(_, node)| node.label() == Some(label.as_str())).map(|(id, _)| *id)
+        });
+        let Some(target) = target else {
+            return vec![format!("no node for row {ix}")];
+        };
+        self.with_window(cx, |window, cx| {
+            let request = accesskit::ActionRequest { action: accesskit::Action::Click, target_tree: accesskit::TreeId::ROOT, target_node: target, data: None };
+            window.handle_a11y_action(request, cx);
+        });
+        self.shared.log.borrow().clone()
+    }
+}
+
+#[gpui::test]
+fn with_the_accessibility_tree_built_rows_that_come_in_and_leave_are_a_translate_and_the_tree_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    for count in [1, 2, 5] {
+        let pair = Pair::a11y(cx, 5000.);
+        pair.same(cx, "before any scroll");
+        pair.same_platform_tree(cx, "the tree the platform has before any scroll");
+        let before = pair.translated.tree_labels(cx);
+        assert!(before.contains(&"Row 0".to_owned()), "{before:?}");
+
+        let mut frames = 0;
+        for step in 1..=12 {
+            let to = pair.translated.bringing_in_below(cx, count);
+            pair.scroll_to(cx, to);
+            frames += 1;
+            let counters = pair.translated.counters(cx);
+            assert_eq!((counters.frames, counters.patched, counters.membership_frames), (frames, frames, frames), "{counters:?}");
+            assert_eq!(counters.reasons(ScrollPatchReason::A11y), 0, "{counters:?}");
+            no_declines(&counters);
+            pair.same(cx, &format!("down by {count} rows, step {step}"));
+            pair.same_platform_tree(cx, &format!("the tree the platform has, down by {count} rows, step {step}"));
+        }
+        let labels = pair.translated.tree_labels(cx);
+        assert!(!labels.contains(&"Row 0".to_owned()), "a row that left is out of the tree: {labels:?}");
+        let rows = pair.translated.rows(cx);
+        assert!(labels.contains(&format!("Row {}", rows.end - 1)), "a row that came in is in it: {labels:?}");
+
+        for step in 1..=4 {
+            let to = pair.translated.bringing_in_above(cx, count);
+            pair.scroll_to(cx, to);
+            frames += 1;
+            let counters = pair.translated.counters(cx);
+            assert_eq!(counters.patched, frames, "{counters:?}");
+            no_declines(&counters);
+            pair.same(cx, &format!("up by {count} rows, step {step}"));
+            pair.same_platform_tree(cx, &format!("the tree the platform has, up by {count} rows, step {step}"));
+        }
+        assert_eq!(pair.built.counters(cx).frames, 0);
+    }
+}
+
+#[gpui::test]
+fn an_action_of_a_row_that_a_translate_put_in_or_moved_reaches_its_listener(cx: &mut TestAppContext) {
+    let pair = Pair::a11y(cx, 5000.);
+    let to = pair.translated.bringing_in_below(cx, 3);
+    pair.scroll_to(cx, to);
+    let counters = pair.translated.counters(cx);
+    assert_eq!(counters.patched, 1, "{counters:?}");
+    let rows = pair.translated.rows(cx);
+    for ix in [rows.start, rows.start + 2, rows.end - 3, rows.end - 1] {
+        let (translated, built) = (pair.translated.press(cx, ix), pair.built.press(cx, ix));
+        assert_eq!(translated, built, "the action of row {ix}");
+        assert_eq!(translated, vec![format!("action {ix}")], "row {ix} is in the tree");
+    }
+    pair.same(cx, "after the actions");
+}
+
+#[gpui::test]
+fn fifty_steps_with_the_accessibility_tree_built_are_the_frames_built_whole_under_the_verifier(cx: &mut TestAppContext) {
+    for overscan in [5000., 100.] {
+        let pair = Pair::a11y(cx, overscan);
+        pair.translated.with_window(cx, |window, _| {
+            window.set_retention_verifier(Some(Rc::new(|_| String::new())));
+        });
+        let counts = [1, 2, 5, 3, 1, 4];
+        let mut down = true;
+        for step in 0..50 {
+            let count = counts[step % counts.len()];
+            if step % 9 == 0 {
+                down = !down;
+            }
+            let rows = pair.translated.rows(cx);
+            let to = if down || rows.start < count {
+                pair.translated.bringing_in_below(cx, count)
+            } else {
+                pair.translated.bringing_in_above(cx, count)
+            };
+            pair.scroll_to(cx, to);
+            pair.same(cx, &format!("step {step}, overscan {overscan}"));
+            pair.same_platform_tree(cx, &format!("the platform's tree, step {step}, overscan {overscan}"));
+        }
+        let counters = pair.translated.counters(cx);
+        assert!(counters.patched >= 15, "{counters:?}");
+        assert_eq!(counters.mispredicted, 0, "{counters:?}");
+        assert_eq!(counters.reasons(ScrollPatchReason::A11y), 0, "{counters:?}");
+        no_declines(&counters);
+        if overscan < 1000. {
+            assert!(counters.rows_rebuilt > 0, "rows that stay and are built again are in the steps: {counters:?}");
+        }
+        pair.translated.with_window(cx, |window, _| {
+            assert_eq!(window.retention_mismatches(), &[] as &[String]);
+            assert!(window.retained_counters().verified >= 15);
+        });
+    }
+}
+
+#[gpui::test]
+fn a_screen_reader_that_comes_or_goes_between_two_scrolls_is_a_frame_built_whole_and_the_next_is_a_translate(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx, true);
+    let step = |cx: &mut TestAppContext, before: &dyn Fn(&mut Window)| {
+        let by = fixture.bringing_in_below(cx, 2) - fixture.scrolled();
+        fixture.wheel_after(cx, by, |window| before(window));
+    };
+    step(cx, &|_| {});
+    assert_eq!(fixture.counters(cx).patched, 1);
+
+    // The screen reader comes in the update that wheels: the frame shown was built with no tree, so there is none to edit.
+    step(cx, &|window| window.set_a11y_active_for_tests(true));
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (2, 1), "the frame that has the tree built for the first time is built whole: {counters:?}");
+    assert_eq!(counters.held(ScrollPatchReason::A11y), 1, "{counters:?}");
+    assert!(fixture.with_window(cx, |window, _| window.a11y.last_tree_update().is_some()));
+
+    step(cx, &|_| {});
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (3, 2), "the next is a translate that edits the tree: {counters:?}");
+    no_declines(&counters);
+
+    // And it goes: the next frame is built whole, with none, and the one after is a translate.
+    step(cx, &|window| window.set_a11y_active_for_tests(false));
+    let counters = fixture.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (4, 2), "{counters:?}");
+    assert_eq!(counters.held(ScrollPatchReason::A11y), 2, "{counters:?}");
+    step(cx, &|_| {});
+    assert_eq!(fixture.counters(cx).patched, 3);
+}
+
+#[gpui::test]
+fn rows_with_an_author_id_that_no_relation_names_are_a_translate_and_the_tree_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    let pair = Pair::a11y_with(cx, 5000., |shared| shared.author_ids.set(true));
+    for step in 1..=10 {
+        let to = pair.translated.bringing_in_below(cx, 2);
+        pair.scroll_to(cx, to);
+        pair.same(cx, &format!("step {step}"));
+        pair.same_platform_tree(cx, &format!("the platform's tree, step {step}"));
+    }
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (10, 10), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 0, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_row_whose_author_id_another_node_relates_to_is_a_frame_built_whole_when_it_leaves(cx: &mut TestAppContext) {
+    let pair = Pair::a11y_with(cx, 5000., |shared| {
+        shared.author_ids.set(true);
+        shared.described_row.set(Some(3));
+    });
+    let mut declined_at = None;
+    for step in 1..=8 {
+        let before = pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y);
+        let to = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, to);
+        let after = pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y);
+        if after > before {
+            declined_at = Some(pair.translated.rows(cx));
+            assert!(pair.translated.rows(cx).start > 3, "the step that takes row 3 out");
+        }
+        pair.same(cx, &format!("step {step}"));
+        pair.same_platform_tree(cx, &format!("the platform's tree, step {step}"));
+    }
+    assert!(declined_at.is_some(), "the translate that took the row out declined: {:?}", pair.translated.counters(cx));
+    let counters = pair.translated.counters(cx);
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 1, "{counters:?}");
+    assert!(counters.patched >= 5, "the steps that took no row that is named out are translates: {counters:?}");
+    // The relation resolves to the node of the row while it is there, as in the frame built whole.
+    let labels = pair.translated.tree_labels(cx);
+    assert!(!labels.contains(&"Row 3".to_owned()), "{labels:?}");
+}
+
+#[gpui::test]
+fn a_row_with_no_nodes_recorded_declines_the_translate_and_is_drawn_whole(cx: &mut TestAppContext) {
+    let pair = Pair::a11y(cx, 5000.);
+    // A row recorded while no tree was built, and no tree built since: it has nothing to move.
+    pair.translated.with_window(cx, |window, _| {
+        let id = window.scroll_run_id(1);
+        window.update_element_state(&id, |state: &mut crate::elements::RetainedState| state.forget_a11y_recording());
+    });
+    let serial = pair.translated.built_whole(cx);
+    let to = pair.translated.bringing_in_below(cx, 1);
+    pair.scroll_to(cx, to);
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.patched), (1, 1, 0), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 1, "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::Recording), 0, "{counters:?}");
+    // The frame is built whole, in the same draw: what the page holds is drawn from the rows' recordings, and the row
+    // that had none made here replays as it was recorded, so the frames are not compared.
+    assert!(pair.translated.built_whole(cx) > serial, "a frame was swapped in");
+}
+
+#[gpui::test]
+fn a_row_named_by_a_relation_before_it_is_built_declines_when_it_comes_in(cx: &mut TestAppContext) {
+    // The relation names an author id that no node has when the frame is built: `resolve_relations` keeps it all the same.
+    let pair = Pair::a11y_with(cx, 5000., |shared| {
+        shared.author_ids.set(true);
+        shared.described_row.set(Some(25));
+    });
+    let mut declines = Vec::new();
+    for step in 1..=12 {
+        let before = pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y);
+        let to = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, to);
+        if pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y) > before {
+            declines.push(pair.translated.rows(cx));
+        }
+        pair.same(cx, &format!("step {step}"));
+        pair.same_platform_tree(cx, &format!("the platform's tree, step {step}"));
+    }
+    assert_eq!(declines.len(), 1, "{declines:?}");
+    assert!(declines[0].contains(&25), "the translate that brought the row in declined: {declines:?}");
+    let counters = pair.translated.counters(cx);
+    assert!(counters.patched >= 10, "the others are translates: {counters:?}");
+}
+
+#[gpui::test]
+fn a_focused_container_around_the_list_declines_only_for_a_row_that_comes_in_and_asks_for_the_active_descendant(cx: &mut TestAppContext) {
+    let open = |asking: Option<usize>, cx: &mut TestAppContext| {
+        let pair = Pair::a11y_with(cx, 5000., |shared| {
+            shared.wrapper_focus.set(true);
+            shared.asking_row.set(asking);
+        });
+        for fixture in [&pair.translated, &pair.built] {
+            let handle = fixture.shared.wrapper.clone();
+            fixture.focus(cx, &handle);
+        }
+        pair
+    };
+
+    // No row asks: the focus around the list costs nothing.
+    let pair = open(None, cx);
+    for step in 1..=8 {
+        let to = pair.translated.bringing_in_below(cx, 2);
+        pair.scroll_to(cx, to);
+        pair.same(cx, &format!("no row asks, step {step}"));
+    }
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (8, 8), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 0, "{counters:?}");
+
+    // A row that comes in asks: it is the active descendant of the focused container in a frame built whole.
+    let pair = open(Some(25), cx);
+    let (mut declined_at, mut entered_at) = (None, None);
+    for step in 1..=12 {
+        let (rows_before, declines_before) =
+            (pair.translated.rows(cx), pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y));
+        let to = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, to);
+        if pair.translated.rows(cx).contains(&25) && !rows_before.contains(&25) {
+            entered_at.get_or_insert(step);
+        }
+        if pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y) > declines_before {
+            declined_at.get_or_insert(step);
+        }
+        pair.same(cx, &format!("a row asks, step {step}"));
+    }
+    assert!(entered_at.is_some(), "the steps bring row 25 in");
+    assert_eq!(declined_at, entered_at, "the first decline is the step that brings the row that asks in, and no step before it declined");
+}
+
+#[gpui::test]
+fn a_focus_in_a_row_that_stays_is_a_translate_with_the_tree_built(cx: &mut TestAppContext) {
+    let pair = Pair::a11y(cx, 5000.);
+    // Row 3 has a focus handle.
+    for fixture in [&pair.translated, &pair.built] {
+        let handle = fixture.shared.focus[0].clone();
+        fixture.focus(cx, &handle);
+    }
+    pair.same(cx, "after the focus");
+    for step in 1..=3 {
+        let to = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, to);
+        assert!(pair.translated.rows(cx).contains(&3), "row 3 stays");
+        pair.same(cx, &format!("step {step}"));
+        pair.same_platform_tree(cx, &format!("the platform's tree, step {step}"));
+    }
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (3, 3), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 0, "{counters:?}");
 }
