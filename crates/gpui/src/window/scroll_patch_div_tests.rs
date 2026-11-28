@@ -74,6 +74,8 @@ struct Page {
     inner: ScrollHandle,
     /// Each root is a stacking context of its own that an absolute box in it is handed to.
     row_context: bool,
+    /// Each root is a stacking context that holds a box that escapes the clip of the box it is in, to the root's own box.
+    row_escapes: bool,
     layer: Layer,
     /// The scroller scrolls along x, and the roots are columns (only with a box that holds them).
     horizontal: bool,
@@ -94,6 +96,7 @@ impl Render for Page {
                 let row_scroller = page.row_scroller;
                 let inner = page.inner.clone();
                 let row_context = page.row_context;
+                let row_escapes = page.row_escapes;
                 let spacer = page.spacer;
                 let horizontal = page.horizontal;
                 let mut row = retained(("row", ix), page.key.get(), move |_, _| {
@@ -109,6 +112,13 @@ impl Render for Page {
                         let mut scroller = div().id("row-scroller").w(px(40.)).h(px(20.)).overflow_y_scroll().track_scroll(&inner).child(div().h(px(200.)).bg(crate::green()));
                         scroller.style().allow_concurrent_scroll = Some(true);
                         row.child(scroller)
+                    } else {
+                        row
+                    };
+                    let row = if row_escapes {
+                        let mut escaped = div().left(px(30.)).top(px(2.)).w(px(10.)).h(px(10.)).bg(crate::red());
+                        escaped.style().position = Some(Position::AbsoluteInAncestor);
+                        row.stacking_context().child(div().overflow_hidden().w(px(20.)).h(px(20.)).child(escaped))
                     } else {
                         row
                     };
@@ -300,6 +310,7 @@ impl Page {
             row_scroller: false,
             inner: ScrollHandle::new(),
             row_context: false,
+            row_escapes: false,
             layer: Layer::None,
             horizontal: false,
             ready: Rc::new(Cell::new(true)),
@@ -803,8 +814,8 @@ fn a_root_that_stays_clipped_away_is_not_written_by_a_translate(cx: &mut TestApp
 
 #[gpui::test]
 fn a_root_left_unwritten_comes_in_as_the_frame_built_whole(cx: &mut TestAppContext) {
-    // Each root of the overscan is clipped away for some wheels and comes into the clip: the first below the clip is
-    // 20 from it, and the ones after are further.
+    // The root nearest below the clip is 20 from it, and the first wheels bring it into the clip and then the wheels back
+    // put it out again; the roots further down stay clipped away throughout, left as the frame holds them.
     let wheels = [4., 4., 4., 4., 4., 4., 4., 4., 4., 4., -9., -9., -9., 3., 3.];
     for (what, vary) in [("a box that holds the roots", (|_: &mut Page| {}) as fn(&mut Page)), ("roots that are stacking contexts", |page| page.row_context = true)] {
         let page = || {
@@ -818,4 +829,35 @@ fn a_root_left_unwritten_comes_in_as_the_frame_built_whole(cx: &mut TestAppConte
         assert_eq!(counters.mispredicted, 0, "{what}: {counters:?}");
         assert_the_same(&translated, &built, &counters, what);
     }
+}
+
+#[gpui::test]
+fn a_root_that_holds_an_escaped_box_is_written_while_it_stays_clipped_away(cx: &mut TestAppContext) {
+    // Where the box widens the groups to is a place in the frame even when it is clipped away (an empty rectangle
+    // at a point still widens a group to the point), so the root is put where it is as before and is not left.
+    let page = || {
+        let mut page = Page::standard();
+        page.row_escapes = true;
+        page
+    };
+    let wheels = [4., 4., 4., -4., 4., 4., 4.];
+    let fixture = Fixture::open(cx, page());
+    let mut written = 0;
+    for by in wheels {
+        let before = fixture.with_window(cx, runs_shown);
+        let patched = fixture.counters(cx).patched;
+        fixture.scroll(cx, 10., 12., by);
+        let after = fixture.with_window(cx, runs_shown);
+        assert_eq!(fixture.counters(cx).patched, patched + 1, "{by}");
+        for (ix, (before, after)) in before.iter().zip(&after).enumerate().skip(5) {
+            assert!(before.0.contains("WidenGroups"), "root {ix} holds the escaped box");
+            assert!(before.0 != after.0, "root {ix}, clipped away and holding an escaped box, was left by a wheel of {by}");
+            written += 1;
+        }
+    }
+    assert!(written > 0);
+    let (translated, counters) = after_wheels(cx, page(), true, &wheels);
+    let (built, _) = after_wheels(cx, page(), false, &wheels);
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    assert_the_same(&translated, &built, &counters, "roots that hold an escaped box");
 }

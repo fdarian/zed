@@ -2150,8 +2150,8 @@ impl PaintOperation {
 /// translate puts every one of them outside a clip is told without translating them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum RecordedReach {
-    /// A group, a native surface, a surface, or a mask that replaces the one around it: where it ends up is not
-    /// told by a box.
+    /// A group, a widening of the groups, a native surface, a surface, or a mask that replaces the one around it:
+    /// where it ends up is not told by a box.
     Unsaid,
     /// Every operation is clipped away or a mark that has no box.
     Nothing,
@@ -2177,7 +2177,9 @@ impl RecordedReach {
                 // A layer that is not clipped away is put in the draw order, which what it holds overlapping is
                 // ordered by, so it counts as drawing where it is.
                 PaintOperation::StartLayer(bounds) if !bounds.is_empty() => *bounds,
-                PaintOperation::WidenGroups(escaped) if !escaped.bounds.is_empty() => escaped.bounds,
+                // It unions its bounds, empty or not, into the content mask of every open group, so the box it was
+                // recorded with is not the place it is felt at.
+                PaintOperation::WidenGroups(_) => return RecordedReach::Unsaid,
                 operation => match operation.extent() {
                     Extent::Unknown => return RecordedReach::Unsaid,
                     Extent::Nowhere | Extent::Mark => continue,
@@ -2211,12 +2213,13 @@ impl RecordedReach {
 }
 
 impl PaintOperation {
-    /// Whether the operation draws nothing, opens no layer that a primitive is ordered by, and widens no group: what
-    /// the frame holds of a root that a translate leaves unwritten.
+    /// Whether the operation draws nothing, opens no layer that a primitive is ordered by, and widens no group (any
+    /// `WidenGroups` does, an empty box too: it still unions its origin into the groups' content masks): what the
+    /// frame holds of a root that a translate leaves unwritten.
     pub(crate) fn changes_no_pixel_or_order(&self) -> bool {
         match self {
             PaintOperation::StartLayer(bounds) => bounds.is_empty(),
-            PaintOperation::WidenGroups(escaped) => escaped.bounds.is_empty(),
+            PaintOperation::WidenGroups(_) => false,
             operation => matches!(operation.extent(), Extent::Nowhere | Extent::Mark),
         }
     }
@@ -5468,6 +5471,11 @@ mod tests {
         assert!(matches!(RecordedReach::of(&under(true)), RecordedReach::Area(_)));
         let clipped = [PaintOperation::Replaced { derived: false }, PaintOperation::Quad(quad(0., 0., 0., 0.)), PaintOperation::EndReplaced];
         assert_eq!(RecordedReach::of(&clipped), RecordedReach::Nothing);
+        // An empty box still unions its origin into the groups' content masks, so where it is told by no box.
+        let widened = |bounds| [PaintOperation::WidenGroups(ContentMask { bounds, ..mask() })];
+        assert_eq!(RecordedReach::of(&widened(bounds(5., 5., 0., 0.))), RecordedReach::Unsaid);
+        assert_eq!(RecordedReach::of(&widened(bounds(5., 5., 10., 10.))), RecordedReach::Unsaid);
+        assert!(!widened(bounds(5., 5., 0., 0.))[0].changes_no_pixel_or_order());
     }
 
     /// What `differs_from` says without the debug form, which is `fields_equal` having an answer.
