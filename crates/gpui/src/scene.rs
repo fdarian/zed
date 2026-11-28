@@ -2146,6 +2146,69 @@ impl PaintOperation {
     }
 }
 
+/// Where recorded operations draw or open a layer, as one box in the space they were recorded in, so that whether a
+/// translate puts every one of them outside a clip is told without translating them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RecordedReach {
+    /// A group, a native surface, a surface, or a mask that replaces the one around it: where it ends up is not
+    /// told by a box.
+    Unsaid,
+    /// Every operation is clipped away or a mark that has no box.
+    Nothing,
+    Area(Bounds<ScaledPixels>),
+}
+
+impl RecordedReach {
+    pub(crate) fn of(operations: &[PaintOperation]) -> Self {
+        let mut reach = RecordedReach::Nothing;
+        for operation in operations {
+            let area = match operation {
+                PaintOperation::Replaced { .. } | PaintOperation::EndReplaced => return RecordedReach::Unsaid,
+                // A layer that is not clipped away is put in the draw order, which what it holds overlapping is
+                // ordered by, so it counts as drawing where it is.
+                PaintOperation::StartLayer(bounds) if !bounds.is_empty() => *bounds,
+                PaintOperation::WidenGroups(escaped) if !escaped.bounds.is_empty() => escaped.bounds,
+                operation => match operation.extent() {
+                    Extent::Unknown => return RecordedReach::Unsaid,
+                    Extent::Nowhere | Extent::Mark => continue,
+                    Extent::Area(area) => area,
+                },
+            };
+            reach = match reach {
+                RecordedReach::Area(held) => RecordedReach::Area(held.union(&area)),
+                _ => RecordedReach::Area(area),
+            };
+        }
+        reach
+    }
+
+    /// Whether the operations put `delta` away and cut by `clip` (see [`TranslatedOperations`]) are all clipped
+    /// away or marks: a translate of them then writes what it finds. It is told with a pixel to spare, which only
+    /// leaves out an operation that a rounding could have kept.
+    pub(crate) fn is_clipped_away_by(&self, delta: Point<ScaledPixels>, clip: &ReplayClip) -> bool {
+        match self {
+            RecordedReach::Unsaid => false,
+            RecordedReach::Nothing => true,
+            RecordedReach::Area(area) => {
+                let moved = Bounds::new(area.origin + delta, area.size);
+                moved.intersect(&clip.snapped.dilate(ScaledPixels(1.))).is_empty()
+            }
+        }
+    }
+}
+
+impl PaintOperation {
+    /// Whether the operation draws nothing, opens no layer that a primitive is ordered by, and widens no group: what
+    /// the frame holds of a root that a translate leaves unwritten.
+    pub(crate) fn changes_no_pixel_or_order(&self) -> bool {
+        match self {
+            PaintOperation::StartLayer(bounds) => bounds.is_empty(),
+            PaintOperation::WidenGroups(escaped) => escaped.bounds.is_empty(),
+            operation => matches!(operation.extent(), Extent::Nowhere | Extent::Mark),
+        }
+    }
+}
+
 fn slot_extent(placement: Placement) -> Extent {
     match placement {
         Placement::Nowhere => Extent::Nowhere,

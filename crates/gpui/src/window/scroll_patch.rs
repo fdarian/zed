@@ -63,7 +63,7 @@ use super::patch::Surroundings;
 use super::patch_splice::{HITBOXES, OPERATIONS, RowPart, Splice};
 use super::retained::Effects;
 use crate::elements::{ListFrame, ReplayHook, RetainedPhase, RetainedState, ScrollMiss, ScrollSource};
-use crate::scene::{Extent, PaintOperation, ReplayClip, TranslatedOperations};
+use crate::scene::{Extent, PaintOperation, RecordedReach, ReplayClip, TranslatedOperations};
 use crate::scroll_routing::ScrollerId;
 use crate::ListState;
 use shift::ShiftPlan;
@@ -443,9 +443,26 @@ pub(super) struct ScrollRun {
     replayed: bool,
     /// Tells the owner of the root that it moved.
     hook: Option<ReplayHook>,
+    /// Where the recording paints, worked out the first time a scroll moves the root and kept for as long as the
+    /// recording is the same one.
+    recorded_reach: Option<(Rc<[PaintOperation]>, RecordedReach)>,
 }
 
 impl ScrollRun {
+    /// Whether the root is clipped away at `delta` from its recording, and so were it where it is put: every operation
+    /// of it that the frame holds is then too, and a move to `delta` writes the same.
+    fn is_clipped_away_at(&mut self, source: &ScrollSource, delta: Point<ScaledPixels>, clip: &ReplayClip) -> bool {
+        let reach = match &self.recorded_reach {
+            Some((operations, reach)) if Rc::ptr_eq(operations, &source.operations) => *reach,
+            _ => {
+                let reach = RecordedReach::of(&source.operations);
+                self.recorded_reach = Some((source.operations.clone(), reach));
+                reach
+            }
+        };
+        reach.is_clipped_away_by(delta, clip)
+    }
+
     /// The content mask that cuts the hitboxes of the root where a scroll puts it: the rectangle of
     /// `ambient`, as a replay and the build the verifier compares with cut by (a root is only put
     /// where it is clear of the corners of `ambient`, see `Window::clears_rounded_corners`).
@@ -729,6 +746,12 @@ impl ScrollFrame {
     #[cfg(test)]
     pub(crate) fn thumb_operations(&self, scroller: ScrollerId) -> Vec<usize> {
         self.thumb_entries(scroller).into_iter().flatten().collect()
+    }
+
+    /// Where the operations of each run are in the frame.
+    #[cfg(test)]
+    pub(crate) fn run_operations(&self) -> Vec<Range<usize>> {
+        self.runs.iter().map(|run| run.ops.clone()).collect()
     }
 
     /// Whether the scroller is a list, whose rows and runs a splice does not carry over from the scratch
@@ -1122,6 +1145,7 @@ impl Window {
             reach,
             replayed,
             hook,
+            recorded_reach: None,
         });
     }
 
@@ -2131,10 +2155,24 @@ impl Window {
         for movement in moves {
             let frame = &mut self.rendered_frame;
             let run = &mut frame.scroll.runs[movement.run];
-            moved_extents.extend(frame.scene.paint_operations[run.ops.clone()].iter().map(PaintOperation::extent));
-            TranslatedOperations::new(&movement.source.operations, movement.total.scale(scale_factor), &movement.clip)
-                .overwrite(&mut frame.scene.paint_operations[run.ops.clone()]);
-            moved_extents.extend(frame.scene.paint_operations[run.ops.clone()].iter().map(PaintOperation::extent));
+            let (before, after) = (run.delta.scale(scale_factor), movement.total.scale(scale_factor));
+            // A root that is clipped away where it was and where it goes is left as it is: what the frame holds of
+            // it is clipped away and draws nothing, and the move to where it is clipped away writes the same. The
+            // total it is put at when it comes in is made from its recording, so nothing of the stale operations
+            // is carried.
+            let hidden = run.is_clipped_away_at(&movement.source, before, &movement.clip)
+                && run.is_clipped_away_at(&movement.source, after, &movement.clip);
+            if hidden {
+                debug_assert!(
+                    frame.scene.paint_operations[run.ops.clone()].iter().all(PaintOperation::changes_no_pixel_or_order),
+                    "the frame holds operations of a root that is clipped away that change the picture"
+                );
+            } else {
+                moved_extents.extend(frame.scene.paint_operations[run.ops.clone()].iter().map(PaintOperation::extent));
+                TranslatedOperations::new(&movement.source.operations, after, &movement.clip)
+                    .overwrite(&mut frame.scene.paint_operations[run.ops.clone()]);
+                moved_extents.extend(frame.scene.paint_operations[run.ops.clone()].iter().map(PaintOperation::extent));
+            }
             moved_ranges.push(run.ops.clone());
             let recorded = movement.source.hitboxes.hitboxes.iter();
             match &movement.hitbox_at {

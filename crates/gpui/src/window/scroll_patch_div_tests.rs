@@ -1,7 +1,7 @@
 //! The frames drawn after the wheel moves a `div` scroller (see [`super::scroll_patch::div`]): the ones that move
 //! what the roots recorded and build nothing are the frames built whole, and each thing that cannot be moved says why.
 
-use super::scroll_patch_tests::shown;
+use super::scroll_patch_tests::{runs_shown, shown};
 use crate::{
     AnyWindowHandle, AppContext as _, Bounds, Context, Edges, InteractiveElement, IntoElement, MouseMoveEvent, ParentElement,
     PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollPatchCause, ScrollPatchReason, ScrollThumbMiss, ScrollWheelEvent,
@@ -778,4 +778,37 @@ fn a_scroller_inside_a_root_is_no_scroller_of_the_frame_shown(cx: &mut TestAppCo
     assert_eq!(gated.borrow().last(), Some(&Some(key)));
     assert_eq!(*settled.borrow(), [key], "the scroller in the root is not noted as the frame shown's");
     assert_eq!(fixture.page.inner.offset(), point(px(0.), px(-20.)), "and it is where the script put it");
+}
+
+#[gpui::test]
+fn a_root_that_stays_clipped_away_is_not_written_by_a_translate(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(cx);
+    let mut left = 0;
+    for by in [4., 4., 4., -4., 4., 4.] {
+        let before = fixture.with_window(cx, runs_shown);
+        let patched = fixture.counters(cx).patched;
+        fixture.scroll(cx, 10., 12., by);
+        let after = fixture.with_window(cx, runs_shown);
+        assert_eq!(fixture.counters(cx).patched, patched + 1, "{by}");
+        assert_eq!(before.len(), after.len());
+        for (before, after) in before.iter().zip(&after) {
+            if before.1 && after.1 {
+                assert_eq!(before.0, after.0, "a root that stays clipped away was written by a wheel of {by}");
+                left += 1;
+            }
+        }
+    }
+    assert!(left > 0, "a root of the overscan stayed clipped away");
+}
+
+#[gpui::test]
+fn a_root_left_unwritten_comes_in_as_the_frame_built_whole(cx: &mut TestAppContext) {
+    // Each root of the overscan is clipped away for some wheels and comes into the clip: the first below the clip is
+    // 20 from it, and the ones after are further.
+    let wheels = [4., 4., 4., 4., 4., 4., 4., 4., 4., 4., -9., -9., -9., 3., 3.];
+    let (translated, counters) = after_wheels(cx, Page::standard(), true, &wheels);
+    let (built, _) = after_wheels(cx, Page::standard(), false, &wheels);
+    assert!(counters.patched >= 10, "{counters:?}");
+    assert_eq!(counters.mispredicted, 0, "{counters:?}");
+    assert_the_same(&translated, &built, &counters, "a box that holds the roots");
 }

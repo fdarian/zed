@@ -656,6 +656,21 @@ pub(super) fn shown(window: &mut Window) -> String {
     without_identities_of_the_window(&out)
 }
 
+/// The operations each run of the frame shown holds, as the log keeps them, and whether none changes the picture.
+pub(super) fn runs_shown(window: &mut Window) -> Vec<(String, bool)> {
+    let frame = &window.rendered_frame;
+    frame
+        .scroll
+        .run_operations()
+        .into_iter()
+        .map(|range| {
+            let operations = &frame.scene.paint_operations[range];
+            let hidden = operations.iter().all(crate::scene::PaintOperation::changes_no_pixel_or_order);
+            (format!("{operations:?}"), hidden)
+        })
+        .collect()
+}
+
 /// `text` without the entity of the window and the hash of the paths, which two windows of one
 /// test differ in.
 fn without_identities_of_the_window(text: &str) -> String {
