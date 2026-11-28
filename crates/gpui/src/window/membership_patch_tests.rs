@@ -2252,18 +2252,22 @@ fn a_focused_container_around_the_list_declines_only_for_a_row_that_comes_in_and
 
     // A row that comes in asks: it is the active descendant of the focused container in a frame built whole.
     let pair = open(Some(25), cx);
-    let mut declined = Vec::new();
+    let (mut declined_at, mut entered_at) = (None, None);
     for step in 1..=12 {
-        let before = pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y);
+        let (rows_before, declines_before) =
+            (pair.translated.rows(cx), pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y));
         let to = pair.translated.bringing_in_below(cx, 1);
         pair.scroll_to(cx, to);
-        if pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y) > before {
-            declined.push((step, pair.translated.rows(cx)));
+        if pair.translated.rows(cx).contains(&25) && !rows_before.contains(&25) {
+            entered_at.get_or_insert(step);
+        }
+        if pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y) > declines_before {
+            declined_at.get_or_insert(step);
         }
         pair.same(cx, &format!("a row asks, step {step}"));
     }
-    assert!(!declined.is_empty() && declined[0].1.contains(&25), "the row that asks declined the translate that brought it in: {declined:?}");
-    assert!(declined.iter().all(|(step, _)| *step >= declined[0].0), "no translate before it declined: {declined:?}");
+    assert!(entered_at.is_some(), "the steps bring row 25 in");
+    assert_eq!(declined_at, entered_at, "the first decline is the step that brings the row that asks in, and no step before it declined");
 }
 
 #[gpui::test]

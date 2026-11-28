@@ -34,14 +34,13 @@ impl A11yRowParts {
         Self { prepaint, paint }
     }
 
-    /// Whether the row holds the focus. Its `active_descendant` is not asked: a row that claimed it is in a tree
-    /// that has one, which declines the translate whole, and the scratch tree a row that comes in is built in
-    /// has no focus to let it claim (what it asked is `asked_active_descendant`).
+    /// Whether the row holds the focus. Its `active_descendant` is not looked at: a row that claimed it is in a
+    /// tree that has one, which `plan_scroll` declines for, and the scratch tree a row that comes in is built
+    /// in has no focus to let it claim.
     fn holds_focus(&self) -> bool {
         self.prepaint.focus.is_some()
     }
 
-    /// Whether an element of the row asked to be the active descendant of the focused container around it.
     fn asks_active_descendant(&self) -> bool {
         self.prepaint.asked_active_descendant
     }
@@ -578,6 +577,22 @@ mod tests {
             let (mut a11y, rows) = shown(focus, Default::default());
             let asking = Claims { asks_active_descendant: true, ..Default::default() };
             assert!(scroll_down(&mut a11y, &rows, asking).is_some());
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn an_ask_for_the_active_descendant_is_in_the_recording_around_a_replay_of_it() {
+        for (asks, expected) in [(true, true), (false, false)] {
+            let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, None);
+            a11y.sync_active_flag();
+            a11y.begin_frame();
+            assert!(a11y.nodes.push(LIST, accesskit::Node::new(Role::List)));
+            let inner = comes_in(&mut a11y, 1, Claims { asks_active_descendant: asks, ..Default::default() });
+            assert_eq!(inner.prepaint.asked_active_descendant, asks, "the scratch tree dropped the claim, not the ask");
+            let mark = a11y.begin_recording();
+            a11y.replay(&inner.prepaint, point(px(0.), px(0.)), 1.);
+            let outer = a11y.end_recording(mark);
+            assert_eq!(outer.asked_active_descendant, expected);
         }
     }
 

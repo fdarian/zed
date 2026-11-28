@@ -481,7 +481,7 @@ impl A11yRecording {
             .map(|(id, bounds)| (*id, Bounds::new(bounds.origin + delta, bounds.size)))
             .collect::<Vec<_>>();
         format!(
-            "{:?}\nchildren {:?}\nauthors {:?}\nfocusables {:?}\nbounds {:?}\nactions {} focus {:?} {:?}",
+            "{:?}\nchildren {:?}\nauthors {:?}\nfocusables {:?}\nbounds {:?}\nactions {} focus {:?} {:?} asked {}",
             nodes,
             self.top_children,
             self.authors,
@@ -490,6 +490,7 @@ impl A11yRecording {
             self.actions.len(),
             self.focus,
             self.active_descendant,
+            self.asked_active_descendant,
         )
     }
 }
