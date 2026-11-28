@@ -1793,6 +1793,8 @@ struct EnterIn {
 
 /// What the scratch frame left for rows that come in.
 struct RowsBuilt {
+    /// The node the roots of a patch hang off, when it is not the one of the list.
+    dispatch_parent: Option<Option<DispatchNodeId>>,
     splice: Splice,
     patchable: Vec<(ElementId, Option<Rc<PatchUnit>>)>,
     relocated: Vec<ElementId>,
@@ -2219,7 +2221,7 @@ impl Window {
                 return Err(ScrollApplyDecline::Row);
             }
         }
-        if !self.next_frame.patchable.is_empty() || !self.next_frame.relocated.is_empty() || !self.next_frame.tab_stops.insertion_history.is_empty() {
+        if !self.next_frame.tab_stops.insertion_history.is_empty() {
             return Err(ScrollApplyDecline::Row);
         }
         let (hitboxes_at, operations_at) = (group.at.prepaint[HITBOXES], group.at.paint[OPERATIONS]);
@@ -2232,7 +2234,14 @@ impl Window {
         let splice = self
             .plan_lifted_insertion(&group.at, group.anchor, &prepaint_start..&prepaint_end, &paint_start..&paint_end, operations, edit)
             .ok_or(ScrollApplyDecline::Splice)?;
-        Ok(RowsBuilt { splice, patchable: Vec::new(), relocated: Vec::new(), rows: children.len() })
+        // The roots that a patch repaints hang off the node their parent's own node is, as the roots of the frame built whole do.
+        Ok(RowsBuilt {
+            splice,
+            patchable: self.next_frame.patchable.drain().collect(),
+            relocated: self.next_frame.relocated.drain().collect(),
+            rows: children.len(),
+            dispatch_parent: Some(group.at.dispatch_parent),
+        })
     }
 
     /// Lays out, prepaints and paints the children of `entering` in the window as the neighbor's surroundings left it.
@@ -2251,7 +2260,8 @@ impl Window {
         let mut elements = Vec::with_capacity(entering.children.len());
         for child in &entering.children {
             let mut element = (child.build)(self, cx);
-            if element.layout_as_root_unsnapped(child.available, self, cx) != child.size {
+            let measured = element.layout_as_root_unsnapped(child.available, self, cx);
+            if (measured.width - child.size.width).abs() > px(0.01) || (measured.height - child.size.height).abs() > px(0.01) {
                 return Err(ScrollApplyDecline::Height);
             }
             elements.push(element);
@@ -2377,6 +2387,7 @@ impl Window {
             patchable: self.next_frame.patchable.drain().collect(),
             relocated: self.next_frame.relocated.drain().collect(),
             rows: rows.len(),
+            dispatch_parent: None,
         })
     }
 
@@ -2503,7 +2514,8 @@ impl Window {
             let mut units = Vec::new();
             for rows in built {
                 self.scroll_patch.counters.rows_built += rows.rows as u64;
-                units.extend(rows.patchable);
+                let parent = rows.dispatch_parent;
+                units.extend(rows.patchable.into_iter().map(|unit| (unit, parent)));
                 self.rendered_frame.relocated.extend(rows.relocated);
                 splices.push(rows.splice);
             }
@@ -2522,10 +2534,10 @@ impl Window {
                 .find(|list| list.id == prediction.list)
                 .and_then(|list| list.dispatch_parent().map(Cell::get))
                 .flatten();
-            for (id, unit) in units {
+            for ((id, unit), parent) in units {
                 use std::collections::hash_map::Entry;
                 if let Some(unit) = &unit {
-                    unit.dispatch_parent.set(dispatch_parent);
+                    unit.dispatch_parent.set(parent.unwrap_or(dispatch_parent));
                 }
                 match self.rendered_frame.patchable.entry(id) {
                     Entry::Vacant(entry) => {
