@@ -9,9 +9,12 @@
 //! the nodes that changed, as an update of its own, and the maps that the actions are answered from
 //! (`node_bounds`, `focus_ids`, `action_listeners`) follow.
 //!
-//! What a translate cannot say stays a frame built whole: a row that holds the focus or claims an
-//! author id leaves or comes in (a relation resolves against the whole tree), rows that do not
-//! hang off one node or are not where the tree has them.
+//! What a translate cannot say stays a frame built whole: a row that holds the focus leaves or comes in; a
+//! row that comes in names a relation (a relation resolves against the whole tree); a row that comes in or
+//! leaves has an author id that a relation of the frame names; the tree has an active descendant, or the
+//! focus is in the node the rows hang off or above it (a row that comes in could claim the active
+//! descendant, which the scratch tree builder has no focus to decide); rows that do not hang off one node
+//! or are not where the tree has them.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -31,12 +34,15 @@ impl A11yRowParts {
         Self { prepaint, paint }
     }
 
-    /// Whether the row cannot come into the tree or leave it without a frame built whole.
-    fn claims_more_than_nodes(&self) -> bool {
-        self.prepaint.focus.is_some()
-            || self.prepaint.active_descendant.is_some()
-            || !self.prepaint.authors.is_empty()
-            || !self.prepaint.relations.is_empty()
+    /// Whether the row holds the focus or the active descendant.
+    fn holds_focus(&self) -> bool {
+        self.prepaint.focus.is_some() || self.prepaint.active_descendant.is_some()
+    }
+
+    /// Whether one of the author ids the row claims is named by a relation of the frame, so that the row
+    /// coming in or leaving changes what the relation resolves to.
+    fn is_named_by(&self, targets: &FxHashSet<String>) -> bool {
+        self.prepaint.authors.iter().any(|(author, _)| targets.contains(author))
     }
 }
 
@@ -79,11 +85,6 @@ pub(crate) struct A11yRowsScratch {
     journal: A11yJournal,
 }
 
-fn moved_bounds(rect: accesskit::Rect, delta: Point<Pixels>, scale_factor: f32) -> accesskit::Rect {
-    let (dx, dy) = (f64::from(delta.x.0 * scale_factor), f64::from(delta.y.0 * scale_factor));
-    accesskit::Rect { x0: rect.x0 + dx, y0: rect.y0 + dy, x1: rect.x1 + dx, y1: rect.y1 + dy }
-}
-
 impl A11y {
     /// Whether a frame drawn now would build a tree.
     fn would_be_active(&self) -> bool {
@@ -105,12 +106,22 @@ impl A11y {
         }
     }
 
-    /// The tree the frame shown sent, as text: its nodes in order and its focus.
-    pub(crate) fn describe_shown(&self) -> String {
-        match &self.debug.last_tree_update {
-            Some(tree) => format!("{:?}\nfocus {:?}", tree.nodes, tree.focus),
-            None => String::new(),
+    /// The tree the frame shown sent, as text: its nodes in order and its focus. None before any frame sent one.
+    pub(crate) fn describe_shown(&self) -> Option<String> {
+        let tree = self.debug.last_tree_update.as_ref()?;
+        Some(format!("{:?}\nfocus {:?}", tree.nodes, tree.focus))
+    }
+
+    /// Whether `target` is `focus` or below it in `tree`, whose nodes follow their children.
+    fn is_inside(tree: &TreeUpdate, focus: NodeId, target: NodeId) -> bool {
+        let mut inside = FxHashSet::default();
+        inside.insert(focus);
+        for (id, node) in tree.nodes.iter().rev() {
+            if inside.contains(id) {
+                inside.extend(node.children().iter().copied());
+            }
         }
+        inside.contains(&target)
     }
 
     /// Puts the tree being built away and starts one for the rows a translate builds, which the
@@ -147,15 +158,25 @@ impl A11y {
         let old_len: usize = shown.iter().map(|parts| parts.prepaint.nodes.len()).sum();
         let first = shown.iter().find_map(|parts| parts.prepaint.nodes.first());
 
+        // A row that comes in could claim the active descendant of a focused container that the scratch tree
+        // builder, which has no focus, cannot know of.
+        if self.debug.active_descendant().is_some() {
+            return None;
+        }
         for row in &rows {
-            if let Some(parts) = row.shown.as_ref().filter(|_| !matches!(row.fate, A11yFate::Moved(_))) {
-                let holds_focus = parts.prepaint.nodes.iter().any(|(id, _)| *id == tree.focus);
-                if parts.claims_more_than_nodes() || holds_focus {
+            let leaving = row.shown.as_ref().filter(|_| !matches!(row.fate, A11yFate::Moved(_)));
+            let coming = match &row.fate {
+                A11yFate::Built(parts) => Some(parts),
+                _ => None,
+            };
+            if let Some(parts) = leaving {
+                let holds_node_focus = parts.prepaint.nodes.iter().any(|(id, _)| *id == tree.focus);
+                if parts.holds_focus() || holds_node_focus || parts.is_named_by(&self.nodes.relation_targets) {
                     return None;
                 }
             }
-            if let A11yFate::Built(parts) = &row.fate
-                && parts.claims_more_than_nodes()
+            if let Some(parts) = coming
+                && (parts.holds_focus() || !parts.prepaint.relations.is_empty() || parts.is_named_by(&self.nodes.relation_targets))
             {
                 return None;
             }
@@ -178,6 +199,9 @@ impl A11y {
         let first_child = old_children.first()?;
         let parent_at = end + tree.nodes.get(end..)?.iter().position(|(_, node)| node.children().contains(first_child))?;
         let (parent_id, parent) = (tree.nodes[parent_at].0, &tree.nodes[parent_at].1);
+        if self.debug.gpui_focus().is_some_and(|focus| Self::is_inside(tree, focus, parent_id)) {
+            return None;
+        }
         let children_at = parent.children().iter().position(|child| child == first_child)?;
         if parent.children().get(children_at..children_at + old_children.len()) != Some(&old_children[..]) {
             return None;
@@ -224,7 +248,7 @@ impl A11y {
     }
 
     /// Writes the tree a translate planned, and returns what the platform is to be told of.
-    pub(crate) fn apply_scroll(&mut self, edit: A11yScrollEdit) -> Option<TreeUpdate> {
+    pub(crate) fn apply_scroll(&mut self, edit: A11yScrollEdit, tab_stop_count: usize) -> Option<TreeUpdate> {
         let tree = self.debug.last_tree_update.as_mut().expect("a translate that planned a tree has the one it edits");
         let (old_len, new_len) = (edit.block.len(), edit.nodes.len());
         tree.nodes.splice(edit.block, edit.nodes);
@@ -267,12 +291,258 @@ impl A11y {
                 _ => {}
             }
         }
-        self.debug.note_edited();
+        #[cfg(debug_assertions)]
+        {
+            let info = self.debug.node_info_mut();
+            for row in &edit.rows {
+                if let Some(parts) = row.shown.as_ref().filter(|_| !matches!(row.fate, A11yFate::Moved(_))) {
+                    for (id, _) in &parts.prepaint.nodes {
+                        info.remove(id);
+                    }
+                }
+                if let A11yFate::Built(parts) = &row.fate {
+                    info.extend(parts.prepaint.node_info.iter().cloned());
+                }
+            }
+        }
+        self.debug.note_edited(tab_stop_count);
         (!edit.changed.is_empty()).then(|| TreeUpdate {
             nodes: edit.changed,
             tree: None,
             tree_id: accesskit::TreeId::ROOT,
             focus,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{point, px};
+    use accesskit::Role;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    const LIST: NodeId = NodeId(1000);
+    const SEARCH: NodeId = NodeId(2000);
+    const ITEM: NodeId = NodeId(2001);
+
+    #[derive(Clone, Copy, Default)]
+    struct Claims {
+        author: Option<&'static str>,
+        relation: Option<&'static str>,
+        focus: bool,
+    }
+
+    /// Records the row `key` as a retained root records one: a node with bounds, and what it claims.
+    fn record(a11y: &mut A11y, key: u64, claims: Claims) -> A11yRowParts {
+        let mark = a11y.begin_recording();
+        let id = NodeId(key);
+        let mut node = accesskit::Node::new(Role::ListItem);
+        let top = key as f64 * 10.;
+        node.set_bounds(accesskit::Rect { x0: 0., y0: top, x1: 50., y1: top + 10. });
+        if let Some(author) = claims.author {
+            node.set_author_id(author);
+        }
+        assert!(a11y.nodes.push(id, node));
+        if let Some(target) = claims.relation {
+            a11y.nodes.defer_relation(id, A11yRelation::LabelledBy, &[target.into()]);
+        }
+        if claims.focus {
+            a11y.set_focusable(id, FocusId::default());
+            a11y.set_focus(id);
+        }
+        a11y.nodes.pop();
+        let prepaint = Rc::new(a11y.end_recording(mark));
+        let mark = a11y.begin_recording();
+        let paint = Rc::new(a11y.end_recording(mark));
+        A11yRowParts::new(prepaint, paint)
+    }
+
+    /// Where the focus is, outside the rows.
+    #[derive(Clone, Copy)]
+    enum Focus {
+        Nowhere,
+        /// A node beside the list that has nothing to do with it.
+        Search,
+        /// A container beside the list with an item that claims the active descendant.
+        SearchWithActiveDescendant,
+        /// The node the rows hang off.
+        List,
+    }
+
+    /// A frame with the rows 1 to 3 under the list, as a frame built whole sends it.
+    fn shown(focus: Focus, claims: [Claims; 3]) -> (A11y, Vec<A11yRowParts>) {
+        let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, None);
+        a11y.sync_active_flag();
+        a11y.begin_frame();
+        let focusable = |a11y: &mut A11y, id: NodeId| {
+            a11y.set_focusable(id, FocusId::default());
+            a11y.set_focus(id);
+        };
+        assert!(a11y.nodes.push(SEARCH, accesskit::Node::new(Role::SearchInput)));
+        match focus {
+            Focus::Search => focusable(&mut a11y, SEARCH),
+            Focus::SearchWithActiveDescendant => {
+                focusable(&mut a11y, SEARCH);
+                assert!(a11y.nodes.push(ITEM, accesskit::Node::new(Role::ListBoxOption)));
+                a11y.set_active_descendant(ITEM);
+                a11y.nodes.pop();
+            }
+            Focus::Nowhere | Focus::List => {}
+        }
+        a11y.nodes.pop();
+        assert!(a11y.nodes.push(LIST, accesskit::Node::new(Role::List)));
+        if matches!(focus, Focus::List) {
+            focusable(&mut a11y, LIST);
+        }
+        let rows = (0..3).map(|row| record(&mut a11y, row as u64 + 1, claims[row])).collect();
+        a11y.nodes.pop();
+        let _ = a11y.end_frame(crate::window::a11y::debug::FrameDebugInfo::default());
+        a11y.note_tree_sent(true);
+        (a11y, rows)
+    }
+
+    fn comes_in(a11y: &mut A11y, key: u64, claims: Claims) -> A11yRowParts {
+        let saved = a11y.begin_rows_scratch();
+        let parts = record(a11y, key, claims);
+        a11y.end_rows_scratch(saved);
+        parts
+    }
+
+    fn stays(parts: &A11yRowParts) -> A11yRowEdit {
+        A11yRowEdit { shown: Some(parts.clone()), fate: A11yFate::Moved(point(px(0.), px(-30.))) }
+    }
+
+    fn leaves(parts: &A11yRowParts) -> A11yRowEdit {
+        A11yRowEdit { shown: Some(parts.clone()), fate: A11yFate::Gone }
+    }
+
+    fn enters(parts: A11yRowParts) -> A11yRowEdit {
+        A11yRowEdit { shown: None, fate: A11yFate::Built(parts) }
+    }
+
+    /// The first row leaves, the others stay and a new one comes in below.
+    fn scroll_down(a11y: &mut A11y, rows: &[A11yRowParts], entering: Claims) -> Option<A11yScrollEdit> {
+        let incoming = comes_in(a11y, 4, entering);
+        a11y.plan_scroll(vec![leaves(&rows[0]), stays(&rows[1]), stays(&rows[2]), enters(incoming)], 1.)
+    }
+
+    fn tree_mut(a11y: &mut A11y) -> &mut TreeUpdate {
+        a11y.debug.last_tree_update.as_mut().expect("a frame sent a tree")
+    }
+
+    #[core::prelude::v1::test]
+    fn rows_that_claim_nothing_leave_stay_and_come_in() {
+        let (mut a11y, rows) = shown(Focus::Search, Default::default());
+        let edit = scroll_down(&mut a11y, &rows, Claims::default()).expect("a plain tree is edited");
+        let update = a11y.apply_scroll(edit, 0).expect("the platform is told");
+        let tree = a11y.debug.last_tree_update.as_ref().unwrap();
+        let ids: Vec<u64> = tree.nodes.iter().map(|(id, _)| id.0).collect();
+        assert_eq!(ids, [SEARCH.0, 2, 3, 4, LIST.0, 0]);
+        let list = &tree.nodes.iter().find(|(id, _)| *id == LIST).unwrap().1;
+        assert_eq!(list.children(), [NodeId(2), NodeId(3), NodeId(4)]);
+        let second = &tree.nodes.iter().find(|(id, _)| id.0 == 2).unwrap().1;
+        assert_eq!(second.bounds().map(|rect| rect.y0), Some(20. - 30.), "a row that stays is moved");
+        let told: Vec<u64> = update.nodes.iter().map(|(id, _)| id.0).collect();
+        assert_eq!(told, [2, 3, 4, LIST.0], "the nodes that moved, came in and list the children");
+        assert!(update.tree.is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn a_leaving_row_that_holds_the_focus_is_not_a_translate() {
+        let (mut a11y, rows) = shown(Focus::Nowhere, [Claims { focus: true, ..Default::default() }, Default::default(), Default::default()]);
+        // The tree's focus is elsewhere, so that only what the row recorded says it holds it.
+        tree_mut(&mut a11y).focus = ROOT_NODE_ID;
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn a_leaving_row_with_the_focus_of_the_tree_is_not_a_translate() {
+        let (mut a11y, rows) = shown(Focus::Nowhere, Default::default());
+        // The focus reached the node by a relation, which the row did not record.
+        tree_mut(&mut a11y).focus = NodeId(1);
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn an_entering_row_that_holds_the_focus_is_not_a_translate() {
+        let (mut a11y, rows) = shown(Focus::Nowhere, Default::default());
+        assert!(scroll_down(&mut a11y, &rows, Claims { focus: true, ..Default::default() }).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn an_entering_row_that_names_a_relation_is_not_a_translate() {
+        let (mut a11y, rows) = shown(Focus::Nowhere, Default::default());
+        assert!(scroll_down(&mut a11y, &rows, Claims { relation: Some("elsewhere"), ..Default::default() }).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn a_row_with_an_author_id_that_no_relation_names_is_a_translate() {
+        let claims = [Claims { author: Some("first"), ..Default::default() }, Default::default(), Default::default()];
+        let (mut a11y, rows) = shown(Focus::Nowhere, claims);
+        assert!(scroll_down(&mut a11y, &rows, Claims { author: Some("fourth"), ..Default::default() }).is_some());
+    }
+
+    #[core::prelude::v1::test]
+    fn a_leaving_row_whose_author_id_a_relation_names_is_not_a_translate() {
+        let claims = [Claims { author: Some("first"), ..Default::default() }, Default::default(), Default::default()];
+        let (mut a11y, rows) = shown(Focus::Nowhere, claims);
+        a11y.nodes.relation_targets.insert("first".to_owned());
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn an_entering_row_whose_author_id_a_relation_names_is_not_a_translate() {
+        let (mut a11y, rows) = shown(Focus::Nowhere, Default::default());
+        // A relation of the frame names an id that no node had: the row coming in would resolve it.
+        a11y.nodes.relation_targets.insert("fourth".to_owned());
+        assert!(scroll_down(&mut a11y, &rows, Claims { author: Some("fourth"), ..Default::default() }).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn rows_that_are_not_where_the_tree_has_them_are_not_a_translate() {
+        let (mut a11y, rows) = shown(Focus::Nowhere, Default::default());
+        tree_mut(&mut a11y).nodes.swap(1, 2);
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none(), "the order is not the order of the rows");
+
+        let (mut a11y, rows) = shown(Focus::Nowhere, Default::default());
+        for (id, _) in &mut tree_mut(&mut a11y).nodes {
+            if id.0 == 2 {
+                *id = NodeId(77);
+            }
+        }
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none(), "a node between the rows' is another");
+
+        let (mut a11y, rows) = shown(Focus::Nowhere, Default::default());
+        tree_mut(&mut a11y).nodes.retain(|(id, _)| id.0 != 1);
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none(), "a node of a row is not in the tree");
+
+        let (mut a11y, rows) = shown(Focus::Nowhere, Default::default());
+        for (id, node) in &mut tree_mut(&mut a11y).nodes {
+            if *id == LIST {
+                node.set_children(vec![NodeId(1), NodeId(3), NodeId(2)]);
+            }
+        }
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none(), "the node they hang off lists them in another order");
+    }
+
+    #[core::prelude::v1::test]
+    fn an_active_descendant_in_the_tree_is_not_a_translate() {
+        let (mut a11y, rows) = shown(Focus::SearchWithActiveDescendant, Default::default());
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn a_focus_in_the_node_the_rows_hang_off_is_not_a_translate() {
+        let (mut a11y, rows) = shown(Focus::List, Default::default());
+        assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn a_focus_beside_the_list_is_a_translate() {
+        for focus in [Focus::Nowhere, Focus::Search] {
+            let (mut a11y, rows) = shown(focus, Default::default());
+            assert!(scroll_down(&mut a11y, &rows, Claims::default()).is_some());
+        }
     }
 }

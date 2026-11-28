@@ -487,20 +487,22 @@ impl A11yRecording {
     }
 }
 
+/// `rect` moved by `delta`, at `scale_factor` device pixels to a pixel.
+fn moved_bounds(rect: accesskit::Rect, delta: Point<Pixels>, scale_factor: f32) -> accesskit::Rect {
+    let (dx, dy) = (f64::from(delta.x.0 * scale_factor), f64::from(delta.y.0 * scale_factor));
+    accesskit::Rect {
+        x0: rect.x0 + dx,
+        y0: rect.y0 + dy,
+        x1: rect.x1 + dx,
+        y1: rect.y1 + dy,
+    }
+}
+
 /// `node` with its bounds moved by `delta`.
 fn moved_node(node: &accesskit::Node, delta: Point<Pixels>, scale_factor: f32) -> accesskit::Node {
     let mut node = node.clone();
     if let Some(rect) = node.bounds() {
-        let (dx, dy) = (
-            f64::from(delta.x.0 * scale_factor),
-            f64::from(delta.y.0 * scale_factor),
-        );
-        node.set_bounds(accesskit::Rect {
-            x0: rect.x0 + dx,
-            y0: rect.y0 + dy,
-            x1: rect.x1 + dx,
-            y1: rect.y1 + dy,
-        });
+        node.set_bounds(moved_bounds(rect, delta, scale_factor));
     }
     node
 }
@@ -783,6 +785,9 @@ pub(crate) struct A11yNodeBuilder {
     /// id owns it, as with a DOM `id`.
     author_ids: FxHashMap<String, NodeId>,
     pending_relations: Vec<PendingRelation>,
+    /// The author ids the relations of the last frame finalized named, found or not: what a row that
+    /// comes in or leaves would change the resolution of.
+    relation_targets: FxHashSet<String>,
     /// The author ids claimed while a retained subtree records (`journal_depth` above zero).
     author_log: Vec<(String, NodeId)>,
     journal_depth: u32,
@@ -801,6 +806,7 @@ impl A11yNodeBuilder {
             active_descendant: None,
             author_ids: FxHashMap::default(),
             pending_relations: Vec::new(),
+            relation_targets: FxHashSet::default(),
             author_log: Vec::new(),
             journal_depth: 0,
             #[cfg(debug_assertions)]
@@ -1041,6 +1047,10 @@ impl A11yNodeBuilder {
     /// `ActiveDescendant`.
     fn resolve_relations(&mut self) -> Option<NodeId> {
         let pending = std::mem::take(&mut self.pending_relations);
+        self.relation_targets = pending
+            .iter()
+            .flat_map(|relation| relation.author_ids.iter().map(|author| author.to_string()))
+            .collect();
         if pending.is_empty() {
             return None;
         }

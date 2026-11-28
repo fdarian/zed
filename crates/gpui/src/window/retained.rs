@@ -1146,6 +1146,12 @@ impl PrepaintRecord {
     pub(crate) fn a11y_recording(&self) -> Option<Rc<a11y::A11yRecording>> {
         self.a11y.clone()
     }
+
+    /// Makes the recording one that was made while no tree was built.
+    #[cfg(test)]
+    pub(crate) fn forget_a11y(&mut self) {
+        self.a11y = None;
+    }
 }
 
 /// Where the state of the frame was when the paint of a retained subtree started.

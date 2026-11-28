@@ -1596,8 +1596,8 @@ pub(crate) struct ScrollPatchTrace {
     /// The frame as [`Window::describe_frame`] says it, without the draw orders.
     frame: String,
     registries: String,
-    /// The tree the platform has.
-    a11y: String,
+    /// The tree the platform has, if a frame sent one.
+    a11y: Option<String>,
 }
 
 /// One row put where the new position puts it: everything that can decline is checked before
@@ -2339,7 +2339,8 @@ impl Window {
             Some(_) => self.write_div_moved(prediction, membership.scrolled_hitboxes),
             None => None,
         };
-        if let Some(update) = a11y.and_then(|edit| self.a11y.apply_scroll(edit)) {
+        let tab_stops = self.rendered_frame.tab_stops.tab_stop_count();
+        if let Some(update) = a11y.and_then(|edit| self.a11y.apply_scroll(edit, tab_stops)) {
             self.platform_window.a11y_tree_update(update);
         }
         let frame = &mut self.rendered_frame;
@@ -2370,6 +2371,12 @@ impl Window {
         if let Some((owner, translation)) = translated {
             (owner.run)(self, cx, translation);
         }
+    }
+
+    /// The element id of the `nth` row run of the rendered frame.
+    #[cfg(test)]
+    pub(crate) fn scroll_run_id(&self, nth: usize) -> GlobalElementId {
+        self.rendered_frame.scroll.runs[nth].id.clone()
     }
 
     /// The rows each list of the rendered frame shows.
@@ -2470,11 +2477,16 @@ impl Window {
             ("the scene with its draw orders", &patched.scene, &built.scene),
             ("the frame", &patched.frame, &built.frame),
             ("what the owner keeps outside the frame", &patched.registries, &built.registries),
-            ("the accessibility tree", &patched.a11y, &built.a11y),
         ] {
             if patched != built {
                 differences.push(format!("{what}\n{}", super::retained::first_difference(patched, built)));
             }
+        }
+        if patched.a11y != built.a11y {
+            differences.push(format!(
+                "the accessibility tree\n{}",
+                super::retained::first_difference(patched.a11y.as_deref().unwrap_or("no tree"), built.a11y.as_deref().unwrap_or("no tree"))
+            ));
         }
         if differences.is_empty() {
             return;

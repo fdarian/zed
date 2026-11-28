@@ -59,6 +59,10 @@ struct Shared {
     layers: Cell<bool>,
     /// The rows are nodes of the accessibility tree, with an action each, and the page is a list.
     a11y: Cell<bool>,
+    /// Each row has the author id `row-id-N`, as a DOM `id` is one.
+    author_ids: Cell<bool>,
+    /// A node outside the list that a relation of its own points at the author id of this row.
+    described_row: Cell<Option<usize>>,
     /// The key of the unit, which moves when what it holds does.
     version: Cell<u64>,
     patch_unit: Cell<bool>,
@@ -92,6 +96,8 @@ impl Shared {
             small_kids: Cell::new(0),
             layers: Cell::new(false),
             a11y: Cell::new(false),
+            author_ids: Cell::new(false),
+            described_row: Cell::new(None),
             version: Cell::new(0),
             patch_unit: Cell::new(false),
             patch_row: Cell::new(None),
@@ -142,6 +148,9 @@ impl Shared {
                 .role(accesskit::Role::ListItem)
                 .aria_label(format!("Row {ix}"))
                 .on_a11y_action(accesskit::Action::Click, move |_, _, _| acted.log.borrow_mut().push(format!("action {ix}")));
+        }
+        if self.author_ids.get() {
+            row = row.accessibility_id(format!("row-id-{ix}"));
         }
         if self.small_kids.get() > 0 {
             row = row.flex().flex_wrap().content_start().overflow_hidden();
@@ -248,6 +257,19 @@ impl Render for Page {
         let mut page = div().id("page").w(px(400.)).h(px(LIST_TOP + LIST_H + 20.)).flex().flex_col();
         if shared.a11y.get() {
             page = page.role(accesskit::Role::List);
+        }
+        if let Some(row) = shared.described_row.get() {
+            page = page.child(
+                div()
+                    .id("describer")
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .w(px(1.))
+                    .h(px(1.))
+                    .role(accesskit::Role::Group)
+                    .a11y_relation(crate::A11yRelation::DescribedBy, [format!("row-id-{row}").into()]),
+            );
         }
         if shared.layers.get() {
             // Under the list, and over its top rows only: what a row is ordered against depends on where the row is.
@@ -1887,9 +1909,15 @@ fn rows_that_come_and_go_are_drawn_over_a_shift_of_the_list(cx: &mut TestAppCont
 impl Pair {
     /// Rows that are nodes of the accessibility tree, under a list node, with a screen reader connected.
     fn a11y(cx: &mut TestAppContext, overscan: f32) -> Self {
+        Self::a11y_with(cx, overscan, |_| {})
+    }
+
+    /// [`Self::a11y`], with the page `configure`d before it is drawn.
+    fn a11y_with(cx: &mut TestAppContext, overscan: f32, configure: impl Fn(&Shared)) -> Self {
         let open = |cx: &mut TestAppContext, patch: bool| {
             let shared = Shared::with_overdraw(cx, true, 0., overscan);
             shared.a11y.set(true);
+            configure(&shared);
             let fixture = Fixture::open(cx, patch, shared);
             fixture.with_window(cx, |window, _| {
                 window.platform_window.as_test().expect("a test window").record_a11y_updates();
@@ -2084,4 +2112,66 @@ fn a_screen_reader_that_comes_or_goes_between_two_scrolls_is_a_frame_built_whole
     assert_eq!(counters.held(ScrollPatchReason::A11y), 2, "{counters:?}");
     step(cx, &|_| {});
     assert_eq!(fixture.counters(cx).patched, 3);
+}
+
+#[gpui::test]
+fn rows_with_an_author_id_that_no_relation_names_are_a_translate_and_the_tree_is_the_frame_built_whole(cx: &mut TestAppContext) {
+    let pair = Pair::a11y_with(cx, 5000., |shared| shared.author_ids.set(true));
+    for step in 1..=10 {
+        let to = pair.translated.bringing_in_below(cx, 2);
+        pair.scroll_to(cx, to);
+        pair.same(cx, &format!("step {step}"));
+        pair.same_platform_tree(cx, &format!("the platform's tree, step {step}"));
+    }
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.patched), (10, 10), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 0, "{counters:?}");
+}
+
+#[gpui::test]
+fn a_row_whose_author_id_another_node_relates_to_is_a_frame_built_whole_when_it_leaves(cx: &mut TestAppContext) {
+    let pair = Pair::a11y_with(cx, 5000., |shared| {
+        shared.author_ids.set(true);
+        shared.described_row.set(Some(3));
+    });
+    let mut declined_at = None;
+    for step in 1..=8 {
+        let before = pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y);
+        let to = pair.translated.bringing_in_below(cx, 1);
+        pair.scroll_to(cx, to);
+        let after = pair.translated.counters(cx).apply_declines(ScrollApplyDecline::A11y);
+        if after > before {
+            declined_at = Some(pair.translated.rows(cx));
+            assert!(pair.translated.rows(cx).start > 3, "the step that takes row 3 out");
+        }
+        pair.same(cx, &format!("step {step}"));
+        pair.same_platform_tree(cx, &format!("the platform's tree, step {step}"));
+    }
+    assert!(declined_at.is_some(), "the translate that took the row out declined: {:?}", pair.translated.counters(cx));
+    let counters = pair.translated.counters(cx);
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 1, "{counters:?}");
+    assert!(counters.patched >= 5, "the steps that took no row that is named out are translates: {counters:?}");
+    // The relation resolves to the node of the row while it is there, as in the frame built whole.
+    let labels = pair.translated.tree_labels(cx);
+    assert!(!labels.contains(&"Row 3".to_owned()), "{labels:?}");
+}
+
+#[gpui::test]
+fn a_row_with_no_nodes_recorded_declines_the_translate_and_is_drawn_whole(cx: &mut TestAppContext) {
+    let pair = Pair::a11y(cx, 5000.);
+    // A row recorded while no tree was built, and no tree built since: it has nothing to move.
+    pair.translated.with_window(cx, |window, _| {
+        let id = window.scroll_run_id(1);
+        window.update_element_state(&id, |state: &mut crate::elements::RetainedState| state.forget_a11y_recording());
+    });
+    let serial = pair.translated.built_whole(cx);
+    let to = pair.translated.bringing_in_below(cx, 1);
+    pair.scroll_to(cx, to);
+    let counters = pair.translated.counters(cx);
+    assert_eq!((counters.frames, counters.eligible, counters.patched), (1, 1, 0), "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::A11y), 1, "{counters:?}");
+    assert_eq!(counters.apply_declines(ScrollApplyDecline::Recording), 0, "{counters:?}");
+    // The frame is built whole, in the same draw: what the page holds is drawn from the rows' recordings, and the row
+    // that had none made here replays as it was recorded, so the frames are not compared.
+    assert!(pair.translated.built_whole(cx) > serial, "a frame was swapped in");
 }

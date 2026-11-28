@@ -219,9 +219,16 @@ impl TestWindow {
         self.0.lock().a11y_updates.get_or_insert_with(Vec::new);
     }
 
-    /// The accessibility tree updates the window sent since the last call, if it records them.
+    /// The accessibility tree updates the window sent since the last call. The window has to record them
+    /// ([`Self::record_a11y_updates`]).
     pub fn take_a11y_updates(&self) -> Vec<accesskit::TreeUpdate> {
-        self.0.lock().a11y_updates.as_mut().map(std::mem::take).unwrap_or_default()
+        std::mem::take(
+            self.0
+                .lock()
+                .a11y_updates
+                .as_mut()
+                .expect("a window that is asked for its accessibility updates records them"),
+        )
     }
 
     pub(crate) fn new(

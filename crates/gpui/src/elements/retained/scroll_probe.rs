@@ -48,6 +48,12 @@ impl RetainedState {
         ))
     }
 
+    /// Makes the recording one that was made while no tree was built.
+    #[cfg(test)]
+    pub(crate) fn forget_a11y_recording(&mut self) {
+        self.recorded.as_mut().expect("the root has its recording").prepaint.forget_a11y();
+    }
+
     /// Whether the root was recorded where culling left it out: it painted and hit nothing, and is put wherever the
     /// scroll takes it with nothing to move.
     pub(crate) fn is_recorded_culled(&self) -> bool {
