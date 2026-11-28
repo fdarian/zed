@@ -30,6 +30,7 @@ use objc::{
     sel, sel_impl,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+mod support;
 
 static NATIVE_DOWNS: AtomicUsize = AtomicUsize::new(0);
 static GPUI_FIRST_DOWNS: AtomicUsize = AtomicUsize::new(0);
@@ -542,7 +543,12 @@ async fn frame_becomes(cx: &mut AsyncApp, view: id, expected: Frame, what: &str)
 }
 
 fn main() {
-    gpui::Application::with_platform(Rc::new(MacPlatform::new(false))).run(|cx: &mut App| {
+    // A window the window server composites is the only one a capture of its pixels can read: a
+    // transparent one captures transparent. So the pixel checks run only when asked, in a window that
+    // shows; everything else is checked on the AppKit side, in one that does not.
+    let capture_pixels = std::env::var_os("GHIA_TEST_CAPTURE_WINDOW").is_some_and(|value| value == "1");
+    let platform = if capture_pixels { Rc::new(MacPlatform::new(false)) } else { support::hidden(MacPlatform::new(false)) };
+    gpui::Application::with_platform(platform).run(move |cx: &mut App| {
         let window = cx
             .open_window(
                 WindowOptions {
@@ -597,11 +603,20 @@ fn main() {
                     })
                     .unwrap()
             });
-            // A window of an app nobody activated counts as occluded and gets no frames.
+            // A window of an app nobody activated counts as occluded and gets no frames. The window
+            // is the key window (`focus: true`) either way. The keyboard stays safe in the hidden
+            // branch because the app is never activated, and the floating level (see
+            // `support::hidden`) is what keeps it from counting as occluded without activation.
             unsafe {
-                let app: id = msg_send![class!(NSApplication), sharedApplication];
-                let _: () = msg_send![app, activateIgnoringOtherApps: YES];
-                let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+                if capture_pixels {
+                    let app: id = msg_send![class!(NSApplication), sharedApplication];
+                    let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+                    let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+                } else {
+                    // The app is not activated, so the key window does not take the keyboard; the
+                    // window is unoccluded only through its floating level.
+                    let _: () = msg_send![ns_window, orderFront: nil];
+                }
             }
             settle(cx).await;
             let content: NSSize = unsafe {
@@ -853,66 +868,70 @@ fn main() {
                 println!("cursor rects: {} rects, area {area}", rects.len());
             }
 
-            // The composited window, captured by the process itself: the layers as the window server
-            // shows them.
-            let capture = Capture::of(ns_window);
-            capture.save("popover.png");
-            println!("capture {}x{} at {}x", capture.width, capture.height, capture.scale);
-            assert_eq!(capture.at(300., 80.), Paint::Magenta, "the GPUI marker above the native view");
-            assert_eq!(capture.at(100., 250.), Paint::Green, "the native view's color");
-            assert_eq!(capture.at(360., 120.), Paint::Orange, "the badge is above the native view's corner");
-            assert_eq!(capture.at(120., 180.), Paint::Yellow, "the popover is above the native view");
-            assert_eq!(capture.at(510., 130.), Paint::Blue, "the second native view");
-            assert_ne!(capture.at(442., 62.), Paint::Blue, "the second native view's corner is rounded off");
-            assert_eq!(capture.at(400., 330.), Paint::White, "beside the native view");
-            aligned(&capture).expect("at rest");
+            if capture_pixels {
+                // The composited window, captured by the process itself: the layers as the window server
+                // shows them.
+                let capture = Capture::of(ns_window);
+                capture.save("popover.png");
+                println!("capture {}x{} at {}x", capture.width, capture.height, capture.scale);
+                assert_eq!(capture.at(300., 80.), Paint::Magenta, "the GPUI marker above the native view");
+                assert_eq!(capture.at(100., 250.), Paint::Green, "the native view's color");
+                assert_eq!(capture.at(360., 120.), Paint::Orange, "the badge is above the native view's corner");
+                assert_eq!(capture.at(120., 180.), Paint::Yellow, "the popover is above the native view");
+                assert_eq!(capture.at(510., 130.), Paint::Blue, "the second native view");
+                assert_ne!(capture.at(442., 62.), Paint::Blue, "the second native view's corner is rounded off");
+                assert_eq!(capture.at(400., 330.), Paint::White, "beside the native view");
+                aligned(&capture).expect("at rest");
 
-            // Scroll the container, and capture while the frames that follow are drawn: every capture
-            // must be consistent in itself, and the last must show the new offset.
-            let mut inconsistent = 0;
-            let mut total = 0;
-            for offset in [-7., -13., -20., -31., -37., -50., -90., 0., -40., 0., -90., 0., -25., -60., 0.] {
-                cx.update(|cx| {
-                    window
-                        .update(cx, |demo, _, cx| {
-                            demo.scroll.set_offset(gpui::point(px(0.), px(offset)));
-                            cx.notify();
-                        })
-                        .unwrap()
-                });
-                // The native view's top is at 100 + offset, cut at the scroller's top edge at 60.
-                let expected = capture.row((100. + offset as f64).max(60.));
-                let mut shown = false;
-                for attempt in 0..300 {
-                    let seen = Capture::of(ns_window);
-                    total += 1;
-                    match aligned(&seen) {
-                        Ok(row) if row.abs_diff(expected) <= 1 => {
-                            println!(
-                                "offset {offset:>4}: native view top at row {row} (expected {expected}) after {attempt} earlier captures"
-                            );
-                            seen.save(&format!("offset{}.png", -offset as i32));
-                            shown = true;
-                            break;
+                // Scroll the container, and capture while the frames that follow are drawn: every capture
+                // must be consistent in itself, and the last must show the new offset.
+                let mut inconsistent = 0;
+                let mut total = 0;
+                for offset in [-7., -13., -20., -31., -37., -50., -90., 0., -40., 0., -90., 0., -25., -60., 0.] {
+                    cx.update(|cx| {
+                        window
+                            .update(cx, |demo, _, cx| {
+                                demo.scroll.set_offset(gpui::point(px(0.), px(offset)));
+                                cx.notify();
+                            })
+                            .unwrap()
+                    });
+                    // The native view's top is at 100 + offset, cut at the scroller's top edge at 60.
+                    let expected = capture.row((100. + offset as f64).max(60.));
+                    let mut shown = false;
+                    for attempt in 0..300 {
+                        let seen = Capture::of(ns_window);
+                        total += 1;
+                        match aligned(&seen) {
+                            Ok(row) if row.abs_diff(expected) <= 1 => {
+                                println!(
+                                    "offset {offset:>4}: native view top at row {row} (expected {expected}) after {attempt} earlier captures"
+                                );
+                                seen.save(&format!("offset{}.png", -offset as i32));
+                                shown = true;
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!("offset {offset}, capture {attempt}: {error}");
+                                seen.save(&format!("bad_{}_{attempt}.png", -offset as i32));
+                                inconsistent += 1;
+                            }
                         }
-                        Ok(_) => {}
-                        Err(error) => {
-                            eprintln!("offset {offset}, capture {attempt}: {error}");
-                            seen.save(&format!("bad_{}_{attempt}.png", -offset as i32));
-                            inconsistent += 1;
-                        }
+                        cx.background_executor().timer(Duration::from_millis(2)).await;
                     }
-                    cx.background_executor().timer(Duration::from_millis(2)).await;
+                    assert!(shown, "the native view never reached offset {offset}");
+                    // And once settled, the capture right after is aligned with the marker.
+                    aligned(&Capture::of(ns_window)).unwrap_or_else(|error| panic!("settled at {offset}: {error}"));
                 }
-                assert!(shown, "the native view never reached offset {offset}");
-                // And once settled, the capture right after is aligned with the marker.
-                aligned(&Capture::of(ns_window)).unwrap_or_else(|error| panic!("settled at {offset}: {error}"));
+                println!("captures during the scroll: {total}, out of step: {inconsistent}");
+                // A frame's transaction is flushed as the frame ends, so a capture lands between the two halves of a
+                // frame only when the machine is busy (about 1% of captures in the release e2e under heavy CPU load, none on a
+                // quiet one; a debug build under load measured up to 17%). A frame behind for good fails the aligned checks above.
+                assert!(inconsistent * 2 <= total, "the native view was out of step in {inconsistent} of {total} captures");
+            } else {
+                println!("native_surface: pixel checks skipped, the window is transparent (GHIA_TEST_CAPTURE_WINDOW=1 shows it and runs them)");
             }
-            println!("captures during the scroll: {total}, out of step: {inconsistent}");
-            // A frame's transaction is flushed as the frame ends, so a capture lands between the two halves of a
-            // frame only when the machine is busy (about 1% of captures in the release e2e under heavy CPU load, none on a
-            // quiet one; a debug build under load measured up to 17%). A frame behind for good fails the aligned checks above.
-            assert!(inconsistent * 2 <= total, "the native view was out of step in {inconsistent} of {total} captures");
 
             // The window loses its second surface: the container goes with it.
             cx.update(|cx| {

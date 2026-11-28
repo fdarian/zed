@@ -10,7 +10,6 @@
 
 use std::{
     cell::Cell,
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering::SeqCst},
@@ -27,6 +26,7 @@ use dispatch2::DispatchQueue;
 use gpui::{App, Application, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, size};
 use gpui_macos::{MacPlatform, pump_app_nonblocking, run_loop_pumped, set_run_loop_wake_hook};
 use objc::{class, msg_send, sel, sel_impl};
+mod support;
 
 const EVENT_APPLICATION_DEFINED: u64 = 15;
 const EVENTS_PER_PUMP: usize = 5;
@@ -102,7 +102,7 @@ unsafe fn post_application_defined() {
 }
 
 fn main() {
-    let platform = Rc::new(MacPlatform::new_embedded());
+    let platform = support::hidden(MacPlatform::new_embedded());
     let _app = Application::with_platform(platform.clone()).run_embedded(|cx: &mut App| {
         cx.open_window(
             WindowOptions {

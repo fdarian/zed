@@ -31,6 +31,7 @@ use objc::{
     runtime::{NO, YES},
     sel, sel_impl,
 };
+mod support;
 
 static BLOCKS_RUN: AtomicUsize = AtomicUsize::new(0);
 static TIMERS_FIRED: AtomicUsize = AtomicUsize::new(0);
@@ -195,6 +196,7 @@ fn input_events(app: id) {
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: YES];
         // Only the events posted below are the window's.
         let _: () = msg_send![window, setIgnoresMouseEvents: YES];
+        support::hide_window(window);
         let _: () = msg_send![window, orderFrontRegardless];
         window
     };

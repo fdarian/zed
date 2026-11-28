@@ -10,7 +10,6 @@
 
 use std::{
     cell::{Cell, RefCell},
-    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering::SeqCst},
@@ -29,6 +28,7 @@ use gpui::{
 };
 use gpui_macos::{MacPlatform, PumpOutcome, pump_app_nonblocking, run_loop_pumped, set_run_loop_wake_hook};
 use objc::{class, msg_send, sel, sel_impl};
+mod support;
 
 const EVENT_MOUSE_MOVED: u64 = 5;
 const EVENT_KEY_DOWN: u64 = 10;
@@ -158,7 +158,7 @@ fn settle() {
 }
 
 fn main() {
-    let platform = Rc::new(MacPlatform::new_embedded());
+    let platform = support::hidden(MacPlatform::new_embedded());
     let app = Application::with_platform(platform.clone()).run_embedded(|cx: &mut App| {
         let window = cx.open_window(
             WindowOptions {

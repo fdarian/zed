@@ -23,6 +23,7 @@ use objc::{
     runtime::{NO, YES},
     sel, sel_impl,
 };
+mod support;
 
 const EVENT_MOUSE_MOVED: u64 = 5;
 const MOVES: usize = 100;
@@ -42,6 +43,7 @@ fn main() {
             defer: NO];
         let _: () = msg_send![window, setReleasedWhenClosed: NO];
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: YES];
+        support::hide_window(window);
         let _: () = msg_send![window, orderFrontRegardless];
         let window_number: i64 = msg_send![window, windowNumber];
 
