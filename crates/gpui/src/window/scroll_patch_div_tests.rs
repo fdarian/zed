@@ -1118,6 +1118,41 @@ fn roots_that_a_commit_put_in_are_put_in_by_the_translate(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn a_pass_of_a_paint_only_patch_between_a_translate_and_the_next_frame_does_not_place_the_roots_that_came_in(cx: &mut TestAppContext) {
+    // The roots that came in hold the boxes of the layout of a root of their own until the page lays them out: a patch that ends a
+    // pass of the engine in between (a hover) leaves them so, and the scroller that picks its anchor before the next frame's layout
+    // does not take one of them.
+    let run = |cx: &mut TestAppContext, patch: bool| {
+        let page = Page::standard();
+        page.removed.borrow_mut().extend((0..ROWS).filter(|ix| !(3..6).contains(ix)));
+        let fixture = Fixture::open(cx, page);
+        fixture.watch_removals(cx);
+        fixture.with_window(cx, |window| window.set_scroll_patch(patch));
+        let mut frames = Vec::new();
+        for (by, came) in [(5., &[6usize][..]), (4., &[2][..])] {
+            fixture.point_at(cx, 10., 12.);
+            fixture.enter(came);
+            fixture.scroll(cx, 10., 12., by);
+            frames.push(fixture.with_window(cx, shown));
+            cx.update_window(fixture.window, |_, window, cx| {
+                let scratch = window.begin_scratch(cx);
+                window.clear_scratch_pass(scratch.layouts, cx, true);
+                window.a11y.resume(scratch.a11y_was_active);
+            })
+            .unwrap();
+            fixture.draw(cx);
+            frames.push(fixture.with_window(cx, shown));
+            frames.push(format!("offset {:?}", fixture.page.handle.offset()));
+        }
+        (frames, fixture.counters(cx))
+    };
+    let (translated, counters) = run(cx, true);
+    let (built, _) = run(cx, false);
+    assert_eq!((counters.patched, counters.rows_built, counters.mispredicted), (2, 2, 0), "{counters:?}");
+    assert_the_same(&translated, &built, &counters, "a patch's pass between a translate and the frame that lays the roots out");
+}
+
+#[gpui::test]
 fn roots_that_come_in_are_put_in_as_the_frame_built_whole_has_them(cx: &mut TestAppContext) {
     let variants: [(&str, fn(&mut Page)); 5] = [
         ("a box that holds the roots", |_| {}),
@@ -1193,6 +1228,19 @@ fn roots_that_come_in_beside_a_root_of_another_z_index_are_the_frame_built_whole
     let (built, _) = after_membership(cx, page(), 0..4, false, &steps);
     only(&counters, ScrollPatchReason::Edited, &[]);
     assert_the_same(&translated, &built, &counters, "a root that comes in beside a root of another z-index");
+}
+
+#[gpui::test]
+fn a_child_that_comes_in_and_is_a_root_already_is_an_edit(cx: &mut TestAppContext) {
+    // The owner says root 4 came in while the frame shown has it as a root of the scroller: it is not one that came in.
+    let page = Page::standard();
+    page.removed.borrow_mut().extend((0..ROWS).filter(|ix| !(3..6).contains(ix)));
+    let fixture = Fixture::open(cx, page);
+    fixture.watch_removals(cx);
+    fixture.point_at(cx, 10., 12.);
+    fixture.enter(&[4]);
+    fixture.scroll(cx, 10., 12., 5.);
+    only(&fixture.counters(cx), ScrollPatchReason::Edited, &[]);
 }
 
 #[gpui::test]

@@ -1291,6 +1291,7 @@ impl Window {
     /// Makes the scratch frame a clean one to draw the roots into.
     pub(super) fn begin_scratch(&mut self, cx: &mut App) -> Scratch {
         cx.entities.clear_accessed();
+        self.layout_engine_mut().begin_scratch_pass();
         debug_assert!(
             self.next_frame.hitboxes.is_empty() && self.next_frame.scene.len() == 0,
             "the frame being built is empty between draws"

@@ -401,6 +401,8 @@ pub struct TaffyLayoutEngine {
     /// boxes of a layout of their own as roots, which is no layout of the page. A scroller that picks its anchor before the layout
     /// that puts them in the page does not look at them, as it does not look at a node that was never laid out.
     unplaced: FxHashSet<LayoutId>,
+    /// The pass under way is a scratch pass of a patch: the roots it computes are not the page, so computing them places nothing.
+    in_scratch: bool,
     /// The end of the pass keeps the flags of `anchor_restyled_nodes`, see [`Self::hold_anchor_restyles`].
     hold_anchor_restyles: bool,
     /// The scrollers that asked for layout in the pass and have not picked their anchor yet.
@@ -524,6 +526,7 @@ impl TaffyLayoutEngine {
             unstable_requests: 0,
             anchor_restyled_nodes: Vec::new(),
             unplaced: FxHashSet::default(),
+            in_scratch: false,
             hold_anchor_restyles: false,
             anchor_scrollers: Vec::new(),
             unmeasured_leaves: 0,
@@ -716,10 +719,31 @@ impl TaffyLayoutEngine {
         {
             self.collect_garbage();
         }
-        // The pass laid out the page, whose boxes the nodes of a scratch pass have now (a scroller that picks its anchor before this
-        // pass asked for them already).
-        self.unplaced.clear();
         self.end_pass_keeping_nodes();
+    }
+
+    /// [`Self::end_pass`] of a pass that laid out the page: the nodes of a scratch pass that it did not reach are not in the page, and
+    /// have no boxes to mark. A patch's pass does not end the mark, as the next pass of the page is the one that places the nodes.
+    pub fn end_pass_of_page(&mut self) {
+        self.unplaced.clear();
+        self.end_pass();
+    }
+
+    /// Begins the scratch pass of a patch, which [`Self::end_pass`] and [`Self::end_pass_keeping_nodes`] end.
+    pub(crate) fn begin_scratch_pass(&mut self) {
+        self.in_scratch = true;
+    }
+
+    /// The boxes of the layout of `root` are the page's where `root` is the page's root, which places the nodes below it.
+    fn place_below(&mut self, root: LayoutId) {
+        if self.unplaced.is_empty() || self.in_scratch {
+            return;
+        }
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            self.unplaced.remove(&id);
+            stack.extend((0..self.taffy.child_count(id.0)).map(|index| LayoutId(self.taffy.child_at_index(id.0, index).expect(EXPECT_MESSAGE))));
+        }
     }
 
     /// Notes that the roots the pass laid out, and what is below them, hold the boxes of that layout and not of the page, which the
@@ -751,6 +775,7 @@ impl TaffyLayoutEngine {
             self.clear_anchor_restyles();
         }
         self.anchor_scrollers.clear();
+        self.in_scratch = false;
         self.pass += 1;
         self.counters.passes += 1;
     }
@@ -782,7 +807,7 @@ impl TaffyLayoutEngine {
     /// ones that no root laid out in the pass reaches.
     pub fn end_frame(&mut self) {
         self.collect_garbage();
-        self.end_pass();
+        self.end_pass_of_page();
         if self.calcs.len() > self.calcs_after_sweep {
             self.sweep_calcs();
         }
@@ -1649,6 +1674,7 @@ impl TaffyLayoutEngine {
         let containing_width = containing_width.map(|width| width.map(|width| width.0 * scale_factor));
         self.run_taffy_in(id, available_space, containing_width, scale_factor, window, cx);
         self.settle_containing_blocks(id, available_space, scale_factor, window, cx);
+        self.place_below(id);
     }
 
     /// Notes a scroll container that asked for layout in this pass, to pick its anchor before the
@@ -1681,7 +1707,6 @@ impl TaffyLayoutEngine {
         // What was asked of the boxes above is of the boxes before the layout.
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
-        self.unplaced.clear();
     }
 
     /// The scrollers that anchor above `root`, from the nearest, as the frame before asked for them.
@@ -5017,10 +5042,11 @@ mod tests {
         }
 
         #[gpui::test]
-        fn nodes_a_scratch_pass_laid_out_are_placed_once_a_pass_of_the_page_ends(cx: &mut TestAppContext) {
+        fn nodes_a_scratch_pass_laid_out_are_placed_once_the_page_computes_them(cx: &mut TestAppContext) {
             let cx = cx.add_empty_window();
             cx.update(|window, cx| {
                 let mut engine = TaffyLayoutEngine::new();
+                engine.begin_scratch_pass();
                 let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
                 let root = engine.request_keyed_layout(1, flex(), REM, 1., &[leaf]);
                 engine.compute_layout(root, space(), window, cx);
@@ -5029,13 +5055,44 @@ mod tests {
                 assert!(engine.anchor_facts(leaf).hidden, "the end of a scratch pass leaves the boxes of the layout of a root");
                 assert!(engine.anchor_facts(root).hidden);
 
-                // A pass whose scrollers asked for no anchor still ends the mark.
+                // Another patch's pass, which collects, does not end the mark: the page has not placed them.
+                engine.begin_scratch_pass();
+                let other = engine.request_keyed_layout(9, flex(), REM, 1., &[]);
+                engine.compute_layout(other, space(), window, cx);
+                engine.end_pass();
+                assert!(engine.anchor_facts(leaf).hidden);
+                assert!(engine.anchor_facts(root).hidden);
+
+                // A scratch pass that computes a node of them leaves it unplaced too.
+                engine.begin_scratch_pass();
+                let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                engine.compute_layout(leaf, space(), window, cx);
+                engine.end_pass_keeping_nodes();
+                assert!(engine.anchor_facts(leaf).hidden);
+
+                // The page computing the root places it and what is below.
                 let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
                 let root = engine.request_keyed_layout(1, flex(), REM, 1., &[leaf]);
                 engine.compute_layout(root, space(), window, cx);
-                engine.end_pass();
                 assert!(!engine.anchor_facts(leaf).hidden);
                 assert!(!engine.anchor_facts(root).hidden);
+                engine.end_pass();
+            });
+        }
+
+        #[gpui::test]
+        fn the_end_of_a_pass_of_the_page_places_the_nodes_it_did_not_compute(cx: &mut TestAppContext) {
+            let cx = cx.add_empty_window();
+            cx.update(|window, cx| {
+                let mut engine = TaffyLayoutEngine::new();
+                engine.begin_scratch_pass();
+                let leaf = engine.request_keyed_layout(2, flex(), REM, 1., &[]);
+                engine.compute_layout(leaf, space(), window, cx);
+                engine.mark_computed_unplaced();
+                engine.end_pass_keeping_nodes();
+                assert!(engine.anchor_facts(leaf).hidden);
+                engine.end_pass_of_page();
+                assert!(!engine.anchor_facts(leaf).hidden);
             });
         }
 

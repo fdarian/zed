@@ -2305,6 +2305,7 @@ impl Window {
         group: &EnterIn,
         cx: &mut App,
     ) -> Result<RowsBuilt, ScrollApplyDecline> {
+        debug_assert!(!self.a11y.is_active(), "the roots are built in a scratch frame, which the accessibility tree is suspended in");
         let prepaint_start = self.prepaint_index();
         let saved = self.enter_surroundings_in(group.around.layout_scope, &group.around.surroundings);
         let drawn = self.draw_entering(div, shift, entering, group, cx);
